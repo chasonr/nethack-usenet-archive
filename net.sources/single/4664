@@ -1,0 +1,1287 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,bf6f7b5e7fd4225b,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-08-04 15:42:36 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!watmath!clyde!caip!topaz!husc6!harvard!panda!genrad!decvax!decwrl!sun!saber!imagen!turner
+From: turner@imagen.UUCP
+Newsgroups: net.sources
+Subject: ARC for BSD4.2 (part 3 of 5)
+Message-ID: <457@imagen.UUCP>
+Date: Mon, 4-Aug-86 18:42:36 EDT
+Article-I.D.: imagen.457
+Posted: Mon Aug  4 18:42:36 1986
+Date-Received: Sat, 9-Aug-86 05:25:07 EDT
+Distribution: net
+Organization: The Houses of the Holy
+Lines: 1267
+
+
+This is my hacked version of the arc program that was posted to the net, I
+have modified it to run under Unix BSD4.2. if you want it to run under 
+SVR2 you probably will have to change the opendir, scandir, and closedir
+calls, I don't really know System 5. IMPORTANT: this is a BETA test version
+i doubt severly that there are no bugs, please report any that you find to me.
+
+1) I don't have a PC handy so i have no idea if it still works on the PC; to
+	compile it for the PC edit arc.h and arcs.c and change the #defines,
+	the define ST is for the Atari 520ST and with luck that will be done
+	shortly. If you compile it for the PC you will need the routines for 
+	opendir etc. that are in shar part 5, otherwise you can ignore that 
+	shar file.
+2) the Makefile is configured to compile for debugging (-g) (shows ya what 
+	kind of faith i have in my code (:-)
+3) everything seems to work for both arc files created on the PC and on BSD4.2
+	with the exception of the t (test) option which gives strange results,
+	i suspect the problem is in the code not the archive
+4) there is one bug that i know of, if you archive a 0 length file, arc will
+	blow up (floating point exception) when you try to extract it; the
+	question is should the check happen when you add the file, extract
+	it, or should if create a 0 length file ? you decide.
+5) send flames etc. to me, because of the way postnews works here my signature
+	will probably be at the end of each shar file, if not its:
+----
+Name:	James M. Turner
+Mail:	Imagen Corp. 2650 San Tomas Expressway, P.O. Box 58101
+        Santa Clara, CA 95052-8101
+AT&T:	(408) 986-9400
+UUCP:	...{decvax,ucbvax}!decwrl!imagen!turner
+CompuServe: 76327,1575
+GEnie     : D-ARCANGEL
+----
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create:
+#	arcpack.c
+#	arcrun.c
+#	arcs.c
+#	arcsq.c
+#	arcsvc.c
+# This archive created: Mon Aug  4 14:46:18 1986
+# By:	D'arc Angel (The Houses of the Holy)
+export PATH; PATH=/bin:/usr/bin:$PATH
+echo shar: "extracting 'arcpack.c'" '(9695 characters)'
+if test -f 'arcpack.c'
+then
+	echo shar: "will not over-write existing file 'arcpack.c'"
+else
+sed 's/^	X//' << \SHAR_EOF > 'arcpack.c'
+	Xstatic char *RCSid = "$Header: arcpack.c,v 1.2 86/07/15 07:53:48 turner Exp $";
+	X
+	X/*
+	X * $Log:	arcpack.c,v $
+	X * Revision 1.2  86/07/15  07:53:48  turner
+	X * 
+	X * 
+	X * Revision 1.1  86/06/26  15:00:37  turner
+	X * initial version
+	X * 
+	X * 
+	X */
+	X
+	X/*  ARC - Archive utility - ARCPACK
+	X
+	X$define(tag,$$segment(@1,$$index(@1,=)+1))#
+	X$define(version,Version $tag(
+	XTED_VERSION DB =3.37), created on $tag(
+	XTED_DATE DB =02/03/86) at $tag(
+	XTED_TIME DB =22:58:01))#
+	X$undefine(tag)#
+	X    $version
+	X
+	X(C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+	X
+	X    By:  Thom Henderson
+	X
+	X    Description:
+	X         This file contains the routines used to compress a file
+	X         when placing it in an archive.
+	X
+	X    Language:
+	X         Computer Innovations Optimizing C86
+	X*/
+	X#include <stdio.h>
+	X#include "arc.h"
+	X
+	X/* stuff for non-repeat packing */
+	X
+	X#define DLE 0x90                       /* repeat sequence marker */
+	X
+	Xstatic unsigned char state;            /* current packing state */
+	X
+	X/* non-repeat packing states */
+	X
+	X#define NOHIST  0                      /* don't consider previous input*/
+	X#define SENTCHAR 1                     /* lastchar set, no lookahead yet */
+	X#define SENDNEWC 2                     /* run over, send new char next */
+	X#define SENDCNT 3                      /* newchar set, send count next */
+	X
+	X/* packing results */
+	X
+	Xstatic long stdlen;                    /* length for standard packing */
+	Xstatic int crcval;                     /* CRC check value */
+	X
+	Xpack(f,t,hdr)                          /* pack file into an archive */
+	XFILE *f, *t;                           /* source, destination */
+	Xstruct heads *hdr;                     /* pointer to header data */
+	X{
+	X int c;                             /* one character of stream */
+	X    long ncrlen;                       /* length after packing */
+	X    long huflen;                       /* length after squeezing */
+	X    long lzwlen;                       /* length after crunching */
+	X    long pred_sq(), file_sq();         /* stuff for squeezing */
+	X    long pred_cm();                    /* dynamic crunching cleanup */
+	X    char tnam[STRLEN];                /* temporary name buffer */
+	X    char *makefnam();                  /* filename fixer upper */
+	X    FILE *crn = NULL;                  /* temporary crunch file */
+	X
+	X    /* first pass - see which method is best */
+	X
+	X    if(!nocomp)                        /* if storage kludge not active */
+	X    {    if(note)
+	X              printf(" analyzing, ");
+	X
+	X         if(arctemp)                   /* use temp area if specified */
+	X              sprintf(tnam,"%s$ARCTEMP.CRN",arctemp);
+	X         else makefnam("$ARCTEMP.CRN",arcname,tnam);
+	X#if MSDOS
+	X         crn = fopen(tnam,"wrb");
+	X#endif
+	X#if BSD | ST
+	X         crn = fopen(tnam,"w+");
+	X#endif
+	X         state = NOHIST;               /* initialize ncr packing */
+	X         stdlen =  ncrlen = 0;         /* reset size counters */
+	X         crcval = 0;                   /* initialize CRC check value */
+	X         setcode();                    /* initialize encryption */
+	X
+	X         init_cm(f,crn);               /* initialize for crunching */
+	X         init_sq();                    /* initialize for squeeze scan */
+	X
+	X         while((c=getc_ncr(f))!=EOF)   /* for each byte of file */
+	X         {    ncrlen++;                /* one more packed byte */
+	X              scan_sq(c);              /* see what squeezing can do */
+	X              putc_cm(c,crn);          /* see what crunching can do */
+	X         }
+	X         huflen = pred_sq();           /* finish up after squeezing */
+	X         lzwlen = pred_cm(crn);        /* finish up after crunching */
+	X    }
+	X    else                               /* else kludge the method */
+	X    {    stdlen = 0;                   /* make standard look best */
+	X         ncrlen = huflen = lzwlen = 1;
+	X    }
+	X
+	X    /* standard set-ups common to all methods */
+	X
+	X    fseek(f,0L,0);                     /* rewind input */
+	X    hdr->crc = crcval;                 /* note CRC check value */
+	X    hdr->length = stdlen;              /* set actual file length */
+	X    state = NOHIST;                    /* reinitialize ncr packing */
+	X    setcode();                         /* reinitialize encryption */
+	X
+	X    /* choose and use the shortest method */
+	X
+	X    if(stdlen<=ncrlen && stdlen<=huflen && stdlen<=lzwlen)
+	X    {    if(kludge)                    /*DEBUG*/
+	X              printf("(%ld) ",lzwlen-stdlen);
+	X         if(note)
+	X              printf("storing, ");     /* store without compression */
+	X         hdrver = 2;                   /* note packing method */
+	X         stdlen = crcval = 0;          /* recalc these for kludge */
+	X         while((c=getch(f))!=EOF)      /* store it straight */
+	X              putc_pak(c,t);
+	X         hdr->crc = crcval;
+	X         hdr->length = hdr->size = stdlen;
+	X    }
+	X
+	X    else if(ncrlen<huflen && ncrlen<lzwlen)
+	X    {    if(kludge)                    /*DEBUG*/
+	X              printf("(%ld) ",lzwlen-ncrlen);
+	X         if(note)
+	X              printf("packing, ");     /* pack with repeat suppression */
+	X         hdrver = 3;                   /* note packing method */
+	X         hdr->size = ncrlen;           /* set data length */
+	X         while((c=getc_ncr(f))!=EOF)
+	X              putc_pak(c,t);
+	X    }
+	X
+	X    else if(huflen<lzwlen)
+	X    {    if(kludge)                    /*DEBUG*/
+	X              printf("(%ld) ",lzwlen-huflen);
+	X         if(note)
+	X              printf("squeezing, ");
+	X         hdrver = 4;                   /* note packing method */
+	X         hdr->size = file_sq(f,t);     /* note final size */
+	X    }
+	X
+	X    else
+	X    {    if(kludge)                    /*DEBUG*/
+	X              printf("(%ld) ",huflen-lzwlen);
+	X         if(note)
+	X              printf("crunching, ");
+	X         hdrver = 8;
+	X         hdr->size = lzwlen;           /* size should not change */
+	X         if(crn)                       /* if temp was created */
+	X         {    fseek(crn,0L,0);         /* then copy over crunched temp */
+	X              while((c=fgetc(crn))!=EOF)
+	X                   putc_tst(c,t);
+	X         }
+	X         else                          /* else re-crunch */
+	X         {    init_cm(f,t);
+	X              while((c=getc_ncr(f))!=EOF)
+	X                   putc_cm(c,t);
+	X              pred_cm(t);              /* finish up after crunching */
+	X         }
+	X    }
+	X
+	X    /* standard cleanups common to all methods */
+	X
+	X    if(crn)                            /* get rid of crunch temporary */
+	X    {    fclose(crn);
+	X         if(unlink(tnam) && warn)
+	X         {    printf("Cannot delete temporary file %s\n",tnam);
+	X              nerrs++;
+	X         }
+	X    }
+	X    if(note)
+	X         printf("done.\n");
+	X}
+	X
+	X/*  Non-repeat compression - text is passed through normally, except that
+	X    a run of more than two is encoded as:
+	X
+	X         <char> <DLE> <count>
+	X
+	X    Special case: a count of zero indicates that the DLE is really a DLE,
+	X    not a repeat marker.
+	X*/
+	X
+	Xint getc_ncr(f)                        /* get bytes with collapsed runs */
+	XFILE *f;                               /* file to get from */
+	X{
+	X    static int lastc;                  /* value returned on last call */
+	X    static int repcnt;                 /* repetition counter */
+	X    static int c;                      /* latest value seen */
+	X
+	X    switch(state)                      /* depends on our state */
+	X    {
+	X    case NOHIST:                       /* no relevant history */
+	X         state = SENTCHAR;
+	X         return lastc = getch(f);      /* remember the value next time */
+	X
+	X    case SENTCHAR:                     /* char was sent. look ahead */
+	X         switch(lastc)                 /* action depends on char */
+	X         {
+	X         case DLE:                     /* if we sent a real DLE */
+	X              state = NOHIST;          /* then start over again */
+	X              return 0;                /* but note that the DLE was real */
+	X
+	X         case EOF:                     /* EOF is always a special case */
+	X              return EOF;
+	X
+	X         default:                      /* else test for a repeat */
+	X              for(repcnt=1; (c=getch(f))==lastc && repcnt<255; repcnt++)
+	X                   ;                   /* find end of run */
+	X
+	X              switch(repcnt)           /* action depends on run size */
+	X              {
+	X              case 1:                  /* not a repeat */
+	X                   return lastc = c;   /* but remember value next time */
+	X
+	X              case 2:                  /* a repeat, but too short */
+	X                   state = SENDNEWC;   /* send the second one next time */
+	X                   return lastc;
+	X
+	X              default:                 /* a run - compress it */
+	X                   state = SENDCNT;    /* send repeat count next time */
+	X                   return DLE;         /* send repeat marker this time */
+	X              }
+	X         }
+	X
+	X    case SENDNEWC:                     /* send second char of short run */
+	X         state = SENTCHAR;
+	X         return lastc = c;
+	X
+	X    case SENDCNT:                      /* sent DLE, now send count */
+	X         state = SENDNEWC;
+	X         return repcnt;
+	X
+	X    default:
+	X         abort("Bug - bad ncr state\n");
+	X    }
+	X}
+	X
+	Xstatic int getch(f)                    /* special get char for packing */
+	XFILE *f;                               /* file to get from */
+	X{
+	X int c;                             /* a char from the file */
+	X
+	X    if((c=fgetc(f))!=EOF)              /* if not the end of file */
+	X    {    crcval = addcrc(crcval,c);    /* then update CRC check value */
+	X         stdlen++;                     /* and bump length counter */
+	X    }
+	X
+	X    return c;
+	X}
+	X
+	Xputc_pak(c,f)                          /* put a packed byte into archive */
+	Xchar c;                                /* byte to put */
+	XFILE *f;                               /* archive to put it in */
+	X{
+	X    putc_tst(code(c),f);               /* put encoded byte, with checks */
+	X}
+SHAR_EOF
+if test 9695 -ne "`wc -c < 'arcpack.c'`"
+then
+	echo shar: "error transmitting 'arcpack.c'" '(should have been 9695 characters)'
+fi
+fi
+echo shar: "extracting 'arcrun.c'" '(4623 characters)'
+if test -f 'arcrun.c'
+then
+	echo shar: "will not over-write existing file 'arcrun.c'"
+else
+sed 's/^	X//' << \SHAR_EOF > 'arcrun.c'
+	Xstatic char *RCSid = "$Header: arcrun.c,v 1.2 86/07/15 07:53:55 turner Exp $";
+	X
+	X/*
+	X * $Log:	arcrun.c,v $
+	X * Revision 1.2  86/07/15  07:53:55  turner
+	X * 
+	X * 
+	X * Revision 1.1  86/06/26  15:00:40  turner
+	X * initial version
+	X * 
+	X * 
+	X */
+	X
+	X/*  ARC - Archive utility - ARCRUN
+	X
+	X$define(tag,$$segment(@1,$$index(@1,=)+1))#
+	X$define(version,Version $tag(
+	XTED_VERSION DB =1.17), created on $tag(
+	XTED_DATE DB =02/03/86) at $tag(
+	XTED_TIME DB =22:59:06))#
+	X$undefine(tag)#
+	X    $version
+	X
+	X(C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+	X
+	X    By:  Thom Henderson
+	X
+	X    Description:
+	X         This file contains the routines used to "run" a file
+	X         which is stored in an archive.  At present, all we really do
+	X         is (a) extract a temporary file, (b) give its name as a system
+	X         command, and then (c) delete the file.
+	X
+	X    Language:
+	X         Computer Innovations Optimizing C86
+	X*/
+	X#include <stdio.h>
+	X#include "arc.h"
+	X
+	Xrunarc(num,arg)                        /* run file from archive */
+	Xint num;                               /* number of arguments */
+	Xchar *arg[];                           /* pointers to arguments */
+	X{
+	X    struct heads hdr;                  /* file header */
+	X int run;                           /* true to run current file */
+	X int did[MAXARG];                  /* true when argument was used */
+	X int n;                             /* index */
+	X    char *makefnam();                  /* filename fixer */
+	X    char buf[STRLEN];                 /* filename buffer */
+	X    FILE *fopen();                     /* file opener */
+	X
+	X    for(n=0; n<num; n++)               /* for each argument */
+	X         did[n] = 0;                   /* reset usage flag */
+	X    rempath(num,arg);                  /* strip off paths */
+	X
+	X    openarc(0);                        /* open archive for reading */
+	X
+	X    if(num)                            /* if files were named */
+	X    {    while(readhdr(&hdr,arc))      /* while more files to check */
+	X         {    run = 0;                 /* reset run flag */
+	X              for(n=0; n<num; n++)     /* for each template given */
+	X              {    if(match(hdr.name,makefnam(arg[n],".*",buf)))
+	X                   {    run = 1;       /* turn on run flag */
+	X                        did[n] = 1;    /* turn on usage flag */
+	X                        break;         /* stop looking */
+	X                   }
+	X              }
+	X
+	X              if(run)                  /* if running this one */
+	X                   runfile(&hdr);      /* then do it */
+	X              else                     /* else just skip it */
+	X                   fseek(arc,hdr.size,1);
+	X         }
+	X    }
+	X
+	X    else while(readhdr(&hdr,arc))      /* else run all files */
+	X         runfile(&hdr);
+	X
+	X    closearc(0);                       /* close archive after changes */
+	X
+	X    if(note)
+	X    {    for(n=0; n<num; n++)          /* report unused args */
+	X         {    if(!did[n])
+	X              {    printf("File not found: %s\n",arg[n]);
+	X                   nerrs++;
+	X              }
+	X         }
+	X    }
+	X}
+	X
+	Xstatic runfile(hdr)                    /* run a file */
+	Xstruct heads *hdr;                     /* pointer to header data */
+	X{
+	X    FILE *tmp, *fopen();               /* temporary file */
+	X    char buf[STRLEN], *makefnam();    /* temp file name, fixer */
+	X    char sys[STRLEN];                 /* invocation command buffer */
+	X    char *dir, *gcdir();               /* directory stuff */
+	X
+	X    makefnam("$ARCTEMP",hdr->name,buf);
+	X
+	X    if(!strcmp(buf,"$ARCTEMP.BAS"))
+	X         strcpy(sys,"BASICA $ARCTEMP");
+	X
+	X    else if(!strcmp(buf,"$ARCTEMP.BAT")
+	X         || !strcmp(buf,"$ARCTEMP.COM")
+	X         || !strcmp(buf,"$ARCTEMP.EXE"))
+	X         strcpy(sys,"$ARCTEMP");
+	X
+	X    else
+	X    {    if(warn)
+	X         {    printf("File %s is not a .BAS, .BAT, .COM, or .EXE\n",
+	X                   hdr->name);
+	X              nerrs++;
+	X         }
+	X         fseek(arc,hdr->size,1);  /* skip this file */
+	X         return;
+	X    }
+	X
+	X    if(warn)
+	X         if(tmp=fopen(buf,"rb"))
+	X              abort("Temporary file %s already exists",buf);
+	X    if(!(tmp=fopen(makefnam("$ARCTEMP",hdr->name,buf),"wrb")))
+	X         abort("Unable to create temporary file %s",buf);
+	X
+	X    if(note)
+	X         printf("Invoking file: %s\n",hdr->name);
+	X
+	X    dir = gcdir("");                   /* see where we are */
+	X    unpack(arc,tmp,hdr);               /* unpack the entry */
+	X    fclose(tmp);                       /* release the file */
+	X    system(sys);                       /* try to invoke it */
+	X    chdir(dir); free(dir);             /* return to whence we started */
+	X    if(unlink(buf) && warn)
+	X    {    printf("Cannot unsave temporary file %s\n",buf);
+	X         nerrs++;
+	X    }
+	X}
+SHAR_EOF
+if test 4623 -ne "`wc -c < 'arcrun.c'`"
+then
+	echo shar: "error transmitting 'arcrun.c'" '(should have been 4623 characters)'
+fi
+fi
+echo shar: "extracting 'arcs.c'" '(2286 characters)'
+if test -f 'arcs.c'
+then
+	echo shar: "will not over-write existing file 'arcs.c'"
+else
+sed 's/^	X//' << \SHAR_EOF > 'arcs.c'
+	Xstatic char *RCSid = "$Header: arcs.c,v 1.2 86/07/15 07:53:59 turner Exp $";
+	X
+	X/*
+	X * $Log:	arcs.c,v $
+	X * Revision 1.2  86/07/15  07:53:59  turner
+	X * 
+	X * 
+	X * Revision 1.1  86/06/26  15:00:43  turner
+	X * initial version
+	X * 
+	X * 
+	X */
+	X
+	X/*  ARC - Archive utility - Archive file header format
+	X
+	X$define(tag,$$segment(@1,$$index(@1,=)+1))#
+	X$define(version,Version $tag(
+	XTED_VERSION DB =2.13), created on $tag(
+	XTED_DATE DB =01/07/86) at $tag(
+	XTED_TIME DB =17:17:32))#
+	X$undefine(tag)#
+	X    $version
+	X
+	X(C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+	X
+	X    By:  Thom Henderson
+	X
+	X    Description:
+	X         This file defines the format of an archive file header, excluding
+	X         the archive marker and the header version number.
+	X
+	X         Each entry in an archive begins with a one byte archive marker,
+	X         which is set to ARCMARK.  The marker is followed by a one byte
+	X         header type code, from zero to ARCVER.
+	X
+	X         If the header type code is zero, then it is an end marker, and
+	X         no more data should be read from the archive.
+	X
+	X         If the header type code is in the range 2 to ARCVER, then it is
+	X         followed by a standard archive header, which is defined below.
+	X
+	X         If the header type code is one, then it is followed by an older
+	X         format archive header.  The older format header does not contain
+	X         the true length.  A header should be read for a length of
+	X         sizeof(struct heads)-sizeof(long).  Then set length equal to size
+	X         and change the header version to 2.
+	X
+	X    Programming note:
+	X         The crc value given in the header is based on the unpacked data.
+	X
+	X    Language:
+	X         Computer Innovations Optimizing C86
+	X*/
+	X#define BSD   1
+	X#define ST    0
+	X#define MSDOS 0
+	X#if BSD | ST
+	X#define INT short
+	X#endif
+	X
+	X#if MSDOS
+	X#define INT int
+	X#endif
+	X
+	X#include "arcm.h"
+	X
+	Xstruct heads                           /* archive entry header format */
+	X{   char name[FNLEN];                 /* file name */
+	X    long size;                         /* size of file, in bytes */
+	X    unsigned INT date;                 /* creation date */
+	X    unsigned INT time;                 /* creation time */
+	X INT crc;                           /* cyclic redundancy check */
+	X    long length;                       /* true file length */
+	X}   ;
+SHAR_EOF
+if test 2286 -ne "`wc -c < 'arcs.c'`"
+then
+	echo shar: "error transmitting 'arcs.c'" '(should have been 2286 characters)'
+fi
+fi
+echo shar: "extracting 'arcsq.c'" '(16594 characters)'
+if test -f 'arcsq.c'
+then
+	echo shar: "will not over-write existing file 'arcsq.c'"
+else
+sed 's/^	X//' << \SHAR_EOF > 'arcsq.c'
+	Xstatic char *RCSid = "$Header: arcsq.c,v 1.2 86/07/15 07:54:05 turner Exp $";
+	X
+	X/*
+	X * $Log:	arcsq.c,v $
+	X * Revision 1.2  86/07/15  07:54:05  turner
+	X * 
+	X * 
+	X * Revision 1.1  86/06/26  15:00:48  turner
+	X * initial version
+	X * 
+	X * 
+	X */
+	X
+	X/*  ARC - Archive utility - ARCSQ
+	X
+	X$define(tag,$$segment(@1,$$index(@1,=)+1))#
+	X$define(version,Version $tag(
+	XTED_VERSION DB =3.10), created on $tag(
+	XTED_DATE DB =01/30/86) at $tag(
+	XTED_TIME DB =20:10:46))#
+	X$undefine(tag)#
+	X    $version
+	X
+	X(C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+	X
+	X    By:  Thom Henderson
+	X
+	X    Description:
+	X         This file contains the routines used to squeeze a file
+	X         when placing it in an archive.
+	X
+	X    Language:
+	X         Computer Innovations Optimizing C86
+	X
+	X    Programming notes:
+	X         Most of the routines used for the Huffman squeezing algorithm
+	X         were lifted from the SQ program by Dick Greenlaw, as adapted
+	X         to CI-C86 by Robert J. Beilstein.
+	X*/
+	X#include <stdio.h>
+	X
+	X/* stuff for Huffman squeezing */
+	X
+	X#define TRUE 1
+	X#define FALSE 0
+	X#define ERROR (-1)
+	X#define SPEOF 256                      /* special endfile token */
+	X#define NOCHILD -1                     /* marks end of path through tree */
+	X#define NUMVALS 257                    /* 256 data values plus SPEOF*/
+	X#define NUMNODES (NUMVALS+NUMVALS-1)   /* number of nodes */
+	X#define MAXCOUNT (unsigned) 65535      /* biggest unsigned integer */
+	X
+	X/* The following array of structures are the nodes of the
+	X   binary trees. The first NUMVALS nodes become the leaves of the
+	X   final tree and represent the values of the data bytes being
+	X   encoded and the special endfile, SPEOF.
+	X   The remaining nodes become the internal nodes of the final tree.
+	X*/
+	X
+	Xstruct nd                              /* shared by unsqueezer */
+	X{   unsigned weight;                   /* number of appearances */
+	X int tdepth;                        /* length on longest path in tree */
+	X int lchild, rchild;                /* indices to next level */
+	X}   node[NUMNODES];                    /* use large buffer */
+	X
+	Xstatic int dctreehd;                   /* index to head of final tree */
+	X
+	X/* This is the encoding table:
+	X   The bit strings have first bit in low bit.
+	X   Note that counts were scaled so code fits unsigned integer.
+	X*/
+	X
+	Xstatic int codelen[NUMVALS];           /* number of bits in code */
+	Xstatic unsigned code[NUMVALS];         /* code itself, right adjusted */
+	Xstatic unsigned tcode;                 /* temporary code value */
+	Xstatic long valcount[NUMVALS];         /* actual count of times seen */
+	X
+	X/* Variables used by encoding process */
+	X
+	Xstatic int curin;                      /* value currently being encoded */
+	Xstatic int cbitsrem;                   /* # of code string bits left */
+	Xstatic unsigned ccode;                 /* current code right justified */
+	X
+	Xinit_sq()                              /* prepare for scanning pass */
+	X{
+	X int i;                             /* node index */
+	X
+	X    /* Initialize all nodes to single element binary trees
+	X       with zero weight and depth.
+	X    */
+	X
+	X    for(i=0; i<NUMNODES; ++i)
+	X    {    node[i].weight = 0;
+	X         node[i].tdepth = 0;
+	X         node[i].lchild = NOCHILD;
+	X         node[i].rchild = NOCHILD;
+	X    }
+	X
+	X    for(i=0; i<NUMVALS; i++)
+	X         valcount[i] = 0;
+	X}
+	X
+	Xscan_sq(c)                             /* add a byte to the tables */
+	Xint c;                                 /* byte to add */
+	X{
+	X    unsigned *wp;                      /* speeds up weight counting */
+	X
+	X    /* Build frequency info in tree */
+	X
+	X    if(c == EOF)                       /* it's traditional */
+	X         c = SPEOF;                    /* dumb, but traditional */
+	X
+	X    if(*(wp = &node[c].weight) !=  MAXCOUNT)
+	X         ++(*wp);                      /* bump weight counter */
+	X
+	X    valcount[c]++;                     /* bump byte counter */
+	X}
+	X
+	Xlong pred_sq()                         /* predict size of squeezed file */
+	X{
+	X int i;
+	X int btlist[NUMVALS];               /* list of intermediate b-trees */
+	X int listlen;                       /* length of btlist */
+	X    unsigned ceiling;                  /* limit for scaling */
+	X    long size = 0;                     /* predicted size */
+	X int numnodes;                      /* # of nodes in simplified tree */
+	X
+	X    scan_sq(EOF);                      /* signal end of input */
+	X
+	X    ceiling = MAXCOUNT;
+	X
+	X    /* Keep trying to scale and encode */
+	X
+	X    do
+	X    {    scale(ceiling);
+	X         ceiling /= 2;                 /* in case we rescale */
+	X
+	X         /* Build list of single node binary trees having
+	X            leaves for the input values with non-zero counts
+	X         */
+	X
+	X         for(i=listlen=0; i<NUMVALS; ++i)
+	X         {    if(node[i].weight != 0)
+	X              {    node[i].tdepth = 0;
+	X                   btlist[listlen++] = i;
+	X              }
+	X         }
+	X
+	X         /* Arrange list of trees into a heap with the entry
+	X            indexing the node with the least weight at the top.
+	X         */
+	X
+	X         heap(btlist,listlen);
+	X
+	X         /* Convert the list of trees to a single decoding tree */
+	X
+	X         bld_tree(btlist,listlen);
+	X
+	X         /* Initialize the encoding table */
+	X
+	X         init_enc();
+	X
+	X         /* Try to build encoding table.
+	X            Fail if any code is > 16 bits long.
+	X         */
+	X    }    while(buildenc(0,dctreehd) == ERROR);
+	X
+	X    /* Initialize encoding variables */
+	X
+	X    cbitsrem = 0;                      /* force initial read */
+	X    curin = 0;                         /* anything but endfile */
+	X
+	X    for(i=0; i<NUMVALS; i++)           /* add bits for each code */
+	X         size += valcount[i] * codelen[i];
+	X
+	X    size = (size+7)/8;                 /* reduce to number of bytes */
+	X
+	X    numnodes = dctreehd<NUMVALS ? 0 : dctreehd-(NUMVALS-1);
+	X
+	X    size += sizeof(int) + 2*numnodes*sizeof(int);
+	X
+	X    return size;
+	X}
+	X
+	X/* The count of number of occurrances of each input value
+	X   have already been prevented from exceeding MAXCOUNT.
+	X   Now we must scale them so that their sum doesn't exceed
+	X   ceiling and yet no non-zero count can become zero.
+	X   This scaling prevents errors in the weights of the
+	X   interior nodes of the Huffman tree and also ensures that
+	X   the codes will fit in an unsigned integer. Rescaling is
+	X   used if necessary to limit the code length.
+	X*/
+	X
+	Xstatic scale(ceil)
+	Xunsigned ceil;                         /* upper limit on total weight */
+	X{
+	X    register int i,c;
+	X int ovflw, divisor;
+	X    unsigned w, sum;
+	X    unsigned char increased;           /* flag */
+	X
+	X    do
+	X    {    for(i=sum=ovflw=0; i<NUMVALS; ++i)
+	X         {    if(node[i].weight > (ceil-sum))
+	X                   ++ovflw;
+	X              sum += node[i].weight;
+	X         }
+	X
+	X         divisor = ovflw + 1;
+	X
+	X         /* Ensure no non-zero values are lost */
+	X
+	X         increased = FALSE;
+	X         for(i=0; i<NUMVALS; ++i)
+	X         {    w = node[i].weight;
+	X              if(w<divisor && w!=0)
+	X              {    /* Don't fail to provide a code if it's used at all */
+	X
+	X                   node[i].weight = divisor;
+	X                   increased = TRUE;
+	X              }
+	X         }
+	X    }    while(increased);
+	X
+	X    /* Scaling factor choosen, now scale */
+	X
+	X    if(divisor>1)
+	X         for(i=0; i<NUMVALS; ++i)
+	X              node[i].weight /= divisor;
+	X}
+	X
+	X/* heap() and adjust() maintain a list of binary trees as a
+	X   heap with the top indexing the binary tree on the list
+	X   which has the least weight or, in case of equal weights,
+	X   least depth in its longest path. The depth part is not
+	X   strictly necessary, but tends to avoid long codes which
+	X   might provoke rescaling.
+	X*/
+	X
+	Xstatic heap(list,length)
+	Xint list[], length;
+	X{
+	X    register int i;
+	X
+	X    for(i=(length-2)/2; i>=0; --i)
+	X         adjust(list,i,length-1);
+	X}
+	X
+	X/* Make a heap from a heap with a new top */
+	X
+	Xstatic adjust(list,top,bottom)
+	Xint list[], top, bottom;
+	X{
+	X    register int k, temp;
+	X
+	X    k = 2 * top + 1;                   /* left child of top */
+	X    temp = list[top];                  /* remember root node of top tree */
+	X
+	X    if(k<=bottom)
+	X    {    if(k<bottom && cmptrees(list[k],list[k+1]))
+	X              ++k;
+	X
+	X         /* k indexes "smaller" child (in heap of trees) of top */
+	X         /* now make top index "smaller" of old top and smallest child */
+	X
+	X         if(cmptrees(temp,list[k]))
+	X         {    list[top] = list[k];
+	X              list[k] = temp;
+	X
+	X              /* Make the changed list a heap */
+	X
+	X              adjust(list,k,bottom);   /* recursive */
+	X         }
+	X    }
+	X}
+	X
+	X/* Compare two trees, if a > b return true, else return false.
+	X   Note comparison rules in previous comments.
+	X*/
+	X
+	Xstatic cmptrees(a,b)
+	Xint a, b;                              /* root nodes of trees */
+	X{
+	X    if(node[a].weight > node[b].weight)
+	X         return TRUE;
+	X    if(node[a].weight == node[b].weight)
+	X         if(node[a].tdepth > node[b].tdepth)
+	X              return TRUE;
+	X    return FALSE;
+	X}
+	X
+	X/* HUFFMAN ALGORITHM: develops the single element trees
+	X   into a single binary tree by forming subtrees rooted in
+	X   interior nodes having weights equal to the sum of weights of all
+	X   their descendents and having depth counts indicating the
+	X   depth of their longest paths.
+	X
+	X   When all trees have been formed into a single tree satisfying
+	X   the heap property (on weight, with depth as a tie breaker)
+	X   then the binary code assigned to a leaf (value to be encoded)
+	X   is then the series of left (0) and right (1)
+	X   paths leading from the root to the leaf.
+	X   Note that trees are removed from the heaped list by
+	X   moving the last element over the top element and
+	X   reheaping the shorter list.
+	X*/
+	X
+	Xstatic bld_tree(list,len)
+	Xint list[];
+	Xint len;
+	X{
+	X    register int freenode;             /* next free node in tree */
+	X    register struct nd *frnp;          /* free node pointer */
+	X int lch, rch;                      /* temps for left, right children */
+	X int i;
+	X
+	X    /* Initialize index to next available (non-leaf) node.
+	X       Lower numbered nodes correspond to leaves (data values).
+	X    */
+	X
+	X    freenode = NUMVALS;
+	X
+	X    while(len>1)
+	X    {    /* Take from list two btrees with least weight
+	X            and build an interior node pointing to them.
+	X            This forms a new tree.
+	X         */
+	X
+	X         lch = list[0];                /* This one will be left child */
+	X
+	X         /* delete top (least) tree from the list of trees */
+	X
+	X         list[0] = list[--len];
+	X         adjust(list,0,len-1);
+	X
+	X         /* Take new top (least) tree. Reuse list slot later */
+	X
+	X         rch = list[0];                /* This one will be right child */
+	X
+	X         /* Form new tree from the two least trees using
+	X            a free node as root. Put the new tree in the list.
+	X         */
+	X
+	X         frnp = &node[freenode];       /* address of next free node */
+	X         list[0] = freenode++;         /* put at top for now */
+	X         frnp->lchild = lch;
+	X         frnp->rchild = rch;
+	X         frnp->weight = node[lch].weight + node[rch].weight;
+	X         frnp->tdepth = 1 + maxchar(node[lch].tdepth, node[rch].tdepth);
+	X
+	X         /* reheap list  to get least tree at top */
+	X
+	X         adjust(list,0,len-1);
+	X    }
+	X    dctreehd = list[0];                /* head of final tree */
+	X}
+	X
+	Xstatic maxchar(a,b)
+	X{
+	X    return a>b ? a : b;
+	X}
+	X
+	Xstatic init_enc()
+	X{
+	X    register int i;
+	X
+	X    /* Initialize encoding table */
+	X
+	X    for(i=0; i<NUMVALS; ++i)
+	X         codelen[i] = 0;
+	X}
+	X
+	X/* Recursive routine to walk the indicated subtree and level
+	X   and maintain the current path code in bstree. When a leaf
+	X   is found the entire code string and length are put into
+	X   the encoding table entry for the leaf's data value .
+	X
+	X   Returns ERROR if codes are too long.
+	X*/
+	X
+	Xstatic int buildenc(level,root)
+	Xint level;              /* level of tree being examined, from zero */
+	Xint root;               /* root of subtree is also data value if leaf */
+	X{
+	X    register int l, r;
+	X
+	X    l = node[root].lchild;
+	X    r = node[root].rchild;
+	X
+	X    if(l==NOCHILD && r==NOCHILD)
+	X    {    /* Leaf. Previous path determines bit string
+	X            code of length level (bits 0 to level - 1).
+	X            Ensures unused code bits are zero.
+	X         */
+	X
+	X         codelen[root] = level;
+	X         code[root] = tcode & (((unsigned)~0) >> (16-level));
+	X         return (level>16) ? ERROR : NULL;
+	X    }
+	X
+	X    else
+	X    {    if(l!=NOCHILD)
+	X         {    /* Clear path bit and continue deeper */
+	X
+	X              tcode &= ~(1 << level);
+	X              if(buildenc(level+1,l)==ERROR)
+	X                   return ERROR;       /* pass back bad statuses */
+	X         }
+	X         if(r!=NOCHILD)
+	X         {    /* Set path bit and continue deeper */
+	X
+	X              tcode |= 1 << level;
+	X              if(buildenc(level+1,r)==ERROR)
+	X                   return ERROR;       /* pass back bad statuses */
+	X         }
+	X    }
+	X    return NULL;                       /* it worked if we reach here */
+	X}
+	X
+	Xstatic put_int(n,f)                    /* output an integer */
+	Xint n;                                 /* integer to output */
+	XFILE *f;                               /* file to put it to */
+	X{
+	X    putc_pak(n&0xff,f);                /* first the low byte */
+	X    putc_pak(n>>8,f);                  /* then the high byte */
+	X}
+	X
+	X/* Write out the header of the compressed file */
+	X
+	Xstatic long wrt_head(ob)
+	XFILE *ob;
+	X{
+	X    register int l,r;
+	X int i, k;
+	X int numnodes;                      /* # of nodes in simplified tree */
+	X
+	X    /* Write out a simplified decoding tree. Only the interior
+	X       nodes are written. When a child is a leaf index
+	X       (representing a data value) it is recoded as
+	X       -(index + 1) to distinguish it from interior indexes
+	X       which are recoded as positive indexes in the new tree.
+	X
+	X       Note that this tree will be empty for an empty file.
+	X    */
+	X
+	X    numnodes = dctreehd<NUMVALS ? 0 : dctreehd-(NUMVALS-1);
+	X    put_int(numnodes,ob);
+	X
+	X    for(k=0, i=dctreehd; k<numnodes; ++k, --i)
+	X    {    l = node[i].lchild;
+	X         r = node[i].rchild;
+	X         l = l<NUMVALS ? -(l+1) : dctreehd-l;
+	X         r = r<NUMVALS ? -(r+1) : dctreehd-r;
+	X         put_int(l,ob);
+	X         put_int(r,ob);
+	X    }
+	X
+	X    return sizeof(int) + numnodes*2*sizeof(int);
+	X}
+	X
+	X/* Get an encoded byte or EOF. Reads from specified stream AS NEEDED.
+	X
+	X   There are two unsynchronized bit-byte relationships here.
+	X   The input stream bytes are converted to bit strings of
+	X   various lengths via the static variables named c...
+	X   These bit strings are concatenated without padding to
+	X   become the stream of encoded result bytes, which this
+	X   function returns one at a time. The EOF (end of file) is
+	X   converted to SPEOF for convenience and encoded like any
+	X   other input value. True EOF is returned after that.
+	X*/
+	X
+	Xstatic int gethuff(ib)                 /* Returns bytes except for EOF */
+	XFILE *ib;
+	X{
+	X int rbyte;                         /* Result byte value */
+	X int need, take;                    /* numbers of bits */
+	X
+	X    rbyte = 0;
+	X    need = 8;                          /* build one byte per call */
+	X
+	X    /* Loop to build a byte of encoded data.
+	X       Initialization forces read the first time.
+	X    */
+	X
+	Xloop:
+	X    if(cbitsrem>=need)                 /* if current code is big enough */
+	X    {    if(need==0)
+	X              return rbyte;
+	X
+	X         rbyte |= ccode << (8-need);   /* take what we need */
+	X         ccode >>= need;               /* and leave the rest */
+	X         cbitsrem -= need;
+	X         return rbyte & 0xff;
+	X    }
+	X
+	X    /* We need more than current code */
+	X
+	X    if(cbitsrem>0)
+	X    {    rbyte |= ccode << (8-need);   /* take what there is */
+	X         need -= cbitsrem;
+	X    }
+	X
+	X    /* No more bits in current code string */
+	X
+	X    if(curin==SPEOF)
+	X    {    /* The end of file token has been encoded. If
+	X            result byte has data return it and do EOF next time.
+	X         */
+	X
+	X         cbitsrem = 0;
+	X         return (need==8) ? EOF : rbyte + 0;
+	X    }
+	X
+	X    /* Get an input byte */
+	X
+	X    if((curin=getc_ncr(ib)) == EOF)
+	X         curin = SPEOF;                /* convenient for encoding */
+	X
+	X    ccode = code[curin];               /* get the new byte's code */
+	X    cbitsrem = codelen[curin];
+	X
+	X    goto loop;
+	X}
+	X
+	X/*  This routine is used to perform the actual squeeze operation.  It can
+	X    only be called after the file has been scanned.  It returns the true
+	X    length of the squeezed entry.
+	X*/
+	X
+	Xlong file_sq(f,t)                      /* squeeze a file into an archive */
+	XFILE *f;                               /* file to squeeze */
+	XFILE *t;                               /* archive to receive file */
+	X{
+	X int c;                             /* one byte of squeezed data */
+	X    long size;                         /* size after squeezing */
+	X
+	X    size = wrt_head(t);                /* write out the decode tree */
+	X
+	X    while((c=gethuff(f))!=EOF)
+	X    {    putc_pak(c,t);
+	X         size++;
+	X    }
+	X
+	X    return size;                       /* report true size */
+	X}
+SHAR_EOF
+if test 16594 -ne "`wc -c < 'arcsq.c'`"
+then
+	echo shar: "error transmitting 'arcsq.c'" '(should have been 16594 characters)'
+fi
+fi
+echo shar: "extracting 'arcsvc.c'" '(5097 characters)'
+if test -f 'arcsvc.c'
+then
+	echo shar: "will not over-write existing file 'arcsvc.c'"
+else
+sed 's/^	X//' << \SHAR_EOF > 'arcsvc.c'
+	Xstatic char *RCSid = "$Header: arcsvc.c,v 1.2 86/07/15 07:54:19 turner Exp $";
+	X
+	X/*
+	X * $Log:	arcsvc.c,v $
+	X * Revision 1.2  86/07/15  07:54:19  turner
+	X * 
+	X * 
+	X * Revision 1.1  86/06/26  15:00:57  turner
+	X * initial version
+	X * 
+	X * 
+	X */
+	X
+	X/*  ARC - Archive utility - ARCSVC
+	X
+	X$define(tag,$$segment(@1,$$index(@1,=)+1))#
+	X$define(version,Version $tag(
+	XTED_VERSION DB =2.15), created on $tag(
+	XTED_DATE DB =12/17/85) at $tag(
+	XTED_TIME DB =15:17:16))#
+	X$undefine(tag)#
+	X    $version
+	X
+	X(C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+	X
+	X    By:  Thom Henderson
+	X
+	X    Description:
+	X         This file contains service routines needed to maintain an archive.
+	X
+	X    Language:
+	X         Computer Innovations Optimizing C86
+	X*/
+	X#include <stdio.h>
+	X#include "arc.h"
+	X
+	Xopenarc(chg)                           /* open archive */
+	Xint chg;                               /* true to open for changes */
+	X{
+	X    FILE *fopen();                     /* file opener */
+	X
+	X    if(!(arc=fopen(arcname,"rb")))
+	X    {    if(chg)
+	X              printf("Creating new archive: %s\n",arcname);
+	X         else abort("Cannot read archive: %s",arcname);
+	X    }
+	X
+	X    if(chg)                            /* if opening for changes */
+	X         if(!(new=fopen(newname,"wb")))
+	X              abort("Cannot create archive copy: %s",newname);
+	X}
+	X
+	Xclosearc(chg)                          /* close an archive */
+	Xint chg;                               /* true if archive was changed */
+	X{
+	X    if(arc)                            /* if we had an initial archive */
+	X         fclose(arc);                  /* then close it */
+	X
+	X    if(chg)                            /* if things have changed */
+	X    {    setstamp(new,arcdate,arctime);/* archive matches newest file */
+	X         fclose(new);                  /* close the new copy */
+	X
+	X         if(arc)                       /* if we had an original archive */
+	X         {    if(keepbak)              /* if a backup is wanted */
+	X              {    unlink(bakname);    /* erase any old copies */
+	X                   if(rename(arcname,bakname))
+	X                        abort("Cannot rename %s to %s",arcname,bakname);
+	X                   printf("Keeping backup archive: %s\n",bakname);
+	X              }
+	X              else if(unlink(arcname))
+	X                   abort("Cannot delete old archive: %s",arcname);
+	X         }
+	X
+	X         if(rename(newname,arcname))
+	X              abort("Cannot rename %s to %s",newname,arcname);
+	X    }
+	X}
+	X
+	X/* CRC computation logic
+	X
+	X   The logic for this method of calculating the CRC 16 bit polynomial
+	X   is taken from an article by David Schwaderer in the April 1985
+	X   issue of PC Tech Journal.
+	X*/
+	X
+	Xstatic int crctab[] =                  /* CRC lookup table */
+	X{   0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
+	X    0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
+	X    0xCC01, 0x0CC0, 0x0D80, 0xCD41, 0x0F00, 0xCFC1, 0xCE81, 0x0E40,
+	X    0x0A00, 0xCAC1, 0xCB81, 0x0B40, 0xC901, 0x09C0, 0x0880, 0xC841,
+	X    0xD801, 0x18C0, 0x1980, 0xD941, 0x1B00, 0xDBC1, 0xDA81, 0x1A40,
+	X    0x1E00, 0xDEC1, 0xDF81, 0x1F40, 0xDD01, 0x1DC0, 0x1C80, 0xDC41,
+	X    0x1400, 0xD4C1, 0xD581, 0x1540, 0xD701, 0x17C0, 0x1680, 0xD641,
+	X    0xD201, 0x12C0, 0x1380, 0xD341, 0x1100, 0xD1C1, 0xD081, 0x1040,
+	X    0xF001, 0x30C0, 0x3180, 0xF141, 0x3300, 0xF3C1, 0xF281, 0x3240,
+	X    0x3600, 0xF6C1, 0xF781, 0x3740, 0xF501, 0x35C0, 0x3480, 0xF441,
+	X    0x3C00, 0xFCC1, 0xFD81, 0x3D40, 0xFF01, 0x3FC0, 0x3E80, 0xFE41,
+	X    0xFA01, 0x3AC0, 0x3B80, 0xFB41, 0x3900, 0xF9C1, 0xF881, 0x3840,
+	X    0x2800, 0xE8C1, 0xE981, 0x2940, 0xEB01, 0x2BC0, 0x2A80, 0xEA41,
+	X    0xEE01, 0x2EC0, 0x2F80, 0xEF41, 0x2D00, 0xEDC1, 0xEC81, 0x2C40,
+	X    0xE401, 0x24C0, 0x2580, 0xE541, 0x2700, 0xE7C1, 0xE681, 0x2640,
+	X    0x2200, 0xE2C1, 0xE381, 0x2340, 0xE101, 0x21C0, 0x2080, 0xE041,
+	X    0xA001, 0x60C0, 0x6180, 0xA141, 0x6300, 0xA3C1, 0xA281, 0x6240,
+	X    0x6600, 0xA6C1, 0xA781, 0x6740, 0xA501, 0x65C0, 0x6480, 0xA441,
+	X    0x6C00, 0xACC1, 0xAD81, 0x6D40, 0xAF01, 0x6FC0, 0x6E80, 0xAE41,
+	X    0xAA01, 0x6AC0, 0x6B80, 0xAB41, 0x6900, 0xA9C1, 0xA881, 0x6840,
+	X    0x7800, 0xB8C1, 0xB981, 0x7940, 0xBB01, 0x7BC0, 0x7A80, 0xBA41,
+	X    0xBE01, 0x7EC0, 0x7F80, 0xBF41, 0x7D00, 0xBDC1, 0xBC81, 0x7C40,
+	X    0xB401, 0x74C0, 0x7580, 0xB541, 0x7700, 0xB7C1, 0xB681, 0x7640,
+	X    0x7200, 0xB2C1, 0xB381, 0x7340, 0xB101, 0x71C0, 0x7080, 0xB041,
+	X    0x5000, 0x90C1, 0x9181, 0x5140, 0x9301, 0x53C0, 0x5280, 0x9241,
+	X    0x9601, 0x56C0, 0x5780, 0x9741, 0x5500, 0x95C1, 0x9481, 0x5440,
+	X    0x9C01, 0x5CC0, 0x5D80, 0x9D41, 0x5F00, 0x9FC1, 0x9E81, 0x5E40,
+	X    0x5A00, 0x9AC1, 0x9B81, 0x5B40, 0x9901, 0x59C0, 0x5880, 0x9841,
+	X    0x8801, 0x48C0, 0x4980, 0x8941, 0x4B00, 0x8BC1, 0x8A81, 0x4A40,
+	X    0x4E00, 0x8EC1, 0x8F81, 0x4F40, 0x8D01, 0x4DC0, 0x4C80, 0x8C41,
+	X    0x4400, 0x84C1, 0x8581, 0x4540, 0x8701, 0x47C0, 0x4680, 0x8641,
+	X    0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040
+	X};
+	Xint addcrc(crc,c)                      /* update a CRC check */
+	Xint crc;                               /* running CRC value */
+	Xunsigned char c;                       /* character to add */
+	X{
+	X    return ((crc>>8)&0x00ff) ^ crctab[(crc^c)&0x00ff];
+	X}
+SHAR_EOF
+if test 5097 -ne "`wc -c < 'arcsvc.c'`"
+then
+	echo shar: "error transmitting 'arcsvc.c'" '(should have been 5097 characters)'
+fi
+fi
+exit 0
+#	End of shell archive
+-- 
+----
+	"I ain't gay, but there are sure times when i wish i could say
+		that i wasn't straight"
+
+Name:	James M. Turner
+Mail:	Imagen Corp. 2650 San Tomas Expressway, P.O. Box 58101
+        Santa Clara, CA 95052-8101
+AT&T:	(408) 986-9400
+UUCP:	...{decvax,ucbvax}!decwrl!imagen!turner
+CompuServe: 76327,1575
+GEnie     : D-ARCANGEL
+
+

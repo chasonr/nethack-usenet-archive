@@ -1,0 +1,447 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,1446c3e2a5d26128,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-02-02 01:14:18 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxr!mhuxt!houxm!whuxl!whuxlm!akgua!gatech!ut-sally!topaz!lll-crg!well!farren
+From: farren@well.UUCP
+Newsgroups: net.sources
+Subject: gi - a DPaint to C converter
+Message-ID: <588@well.UUCP>
+Date: Sun, 2-Feb-86 04:14:18 EST
+Article-I.D.: well.588
+Posted: Sun Feb  2 04:14:18 1986
+Date-Received: Mon, 3-Feb-86 06:35:30 EST
+Organization: Whole Earth Lectronic Link, Sausalito, CA
+Lines: 428
+
+This is the source for gi, the Amiga image data generation program.
+For a complete description, read the posting in net.micro.amiga.
+
+#------------------ CUT HERE --------------------------#
+#!/bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #!/bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the file:
+#       gi.c
+# Created: Sat Feb 1 23:54:44 1986
+export PATH; PATH=/bin:$PATH
+echo shar: extracting "'gi.c'"
+sed 's/^X//' << \SHAR_EOF > 'gi.c'
+X/**********************************************************
+X*                                                         *
+X*   gi - a DeluxePaint to C data converter                *
+X*                                                         *
+X*   Copyright (c) 1986,  Michael J. Farren                *
+X*   This program may be freely distributed by any means   *
+X*   desired, but may not be sold in any form.             *
+X*                                                         *
+X**********************************************************/
+X
+X#include <stdio.h>
+X#undef NULL
+X#include <exec/types.h>
+X
+Xstruct BitMapHeader {
+X   UWORD w,h;      /* raster width, height, in pixels */
+X   WORD  x,y;      /* pixel position for saved image  */
+X   UBYTE nplanes;   /* number of bit planes in source  */
+X   UBYTE masking;   /* masking technique         */
+X   UBYTE compression;   /* compression algorithm      */
+X   UBYTE pad1;      /* padding to justify next entry   */
+X   UWORD transColor;   /* transparent "color number"      */
+X   UBYTE xAsp, yAsp;   /* x:y aspect ratio         */
+X   WORD  pageW, pageH;   /* source "page" size in pixels    */
+X   }  bmhd;
+XUBYTE Cmap[96],old_cmap[96];   /*  32 color storage */
+XAPTR *(raster_lines[400][6]);   /* pointers to raster lines in bit planes */
+XLONG colors_in_byte[8], colors_used[32], tran_table[32];
+XLONG twopowers[7] = { 1, 2, 4, 8, 16, 32, 64 };
+X
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X   WORD bytes_per_line;    /* Number of bytes per raster line */
+X   FILE *i_file, *o_file;
+X   UBYTE *buff_pointer, *body_data;    /* storage pointers */
+X   UBYTE *data_pointer, *buff_pointer_save;
+X   LONG body_data_size, buff_size;     /* size storage */
+X   LONG i, j, k, temp;     /* various temporary variables */
+X   UBYTE tempbyte;
+X
+X   /*  Check arguments, and try to open i/o files  */
+X
+X   if(argc != 3) {
+X      printf("\nUsage -> getimage <input file> <output file>\n");
+X      exit(20);
+X   }
+X
+X   if((i_file = fopen(argv[1], "r")) == 0 ) {
+X      printf("\nCould not open input file %s!\n", argv[1]);
+X      exit(20);
+X   }
+X
+X   if((o_file = fopen(argv[2], "w")) == 0 ) {
+X      printf("\nCould not open output file %s!\n", argv[2]);
+X      exit(20);
+X   }
+X
+X   /* Files are O.K. - skip over first 20 bytes ("FORM", length, "ILBM",
+X      "BMHD", length) */
+X
+X   printf("\nReading input file...\n");
+X   if(fseek(i_file, 20L, 0)) read_error();
+X
+X   /* Now, read in the BMHD structure */
+X
+X   chkread(&bmhd, sizeof(struct BitMapHeader), i_file);
+X
+X   /* Skip the CMAP label, and read in the color map length, then the color
+X      map data.  We assume that the color map length accurately reflects
+X      the number of bit planes, so don't bother to check the header entry
+X      bmhd.nplanes.  Also, all Amiga color maps will have an even number of
+X      entries, so don't bother padding the read out.  */
+X
+X   if(fseek(i_file, 4L, 1)) read_error();    /* skip the label */
+X   chkread(&temp, sizeof(LONG), i_file);          /* read the length */
+X
+X   i = 0;                  /* and read in the map */
+X   while( i < temp)
+X      chkread(&Cmap[i++], 1, i_file);
+X
+X   /* Now, check the next header.  If it isn't "GRAB", this isn't a
+X      brush file, so get out  */
+X
+X   chkread(&temp, sizeof(LONG), i_file);
+X   if(temp != ('G'<<24 | 'R'<<16 | 'A'<<8 | 'B')) {
+X      printf("\nThe input file is not a DeluxePaint brush file!\n");
+X      exit(20);
+X   }
+X
+X   /* It's probably a brush file.  Skip the next 12 bytes (the GRAB length,
+X      the GRAB coords, and the "BODY" label), then get the body length,
+X      then read the body data into body_data[] */
+X
+X   if(fseek(i_file, 12L, 1)) read_error();
+X   chkread(&body_data_size, sizeof(LONG), i_file);
+X   body_data = AllocMem(body_data_size, NULL);
+X   chkread(body_data, body_data_size, i_file);
+X
+X   /* Now, start the good stuff.  First, allocate enough memory to hold
+X      the entire bitmap for the image. */
+X
+X   bytes_per_line = (bmhd.w & 7 ? bmhd.w+8 : bmhd.w) >> 3;
+X   if(bytes_per_line & 1) bytes_per_line++;
+X
+X   buff_size = bytes_per_line * bmhd.h * bmhd.nplanes;
+X   buff_pointer = AllocMem(buff_size, NULL );
+X   buff_pointer_save = buff_pointer;
+X   data_pointer = body_data;
+X
+X   /* Next, go through the file line by line, bit plane by bit plane,
+X      and extract the image data, putting it into bitmap.  As this is
+X      being done, save pointers to each line in the raster_lines array. */
+X
+X   for(i=0; i!=bmhd.h; i++) {         /* # of lines high */
+X      for(j=0; j!=bmhd.nplanes; j++) {      /* # of planes      */
+X         raster_lines[i][j] = buff_pointer;   /* set the pointer */
+X         if(bmhd.compression == 1) {
+X
+X    /* if compressed, decompress */
+X
+X            expand_map(bytes_per_line, buff_pointer, &data_pointer);
+X         }
+X         else {
+X            for(k=0; k!=bytes_per_line; k++) {
+X               *(buff_pointer+k) = *(data_pointer++);
+X            }
+X         }
+X         buff_pointer += bytes_per_line;
+X      }
+X   }
+X
+X   FreeMem(body_data, body_data_size);   /* deallocate the body data block */
+X
+X/* Now, go through the data, determining the different colors used  */
+X
+Xcalc_color:
+X
+X   printf("\nAnalyzing data...");
+X   for(i=0; i!=twopowers[bmhd.nplanes]; colors_used[i++]=0);
+X   for(i=0; i!=bmhd.h; i++) {
+X      for(j=0; j!=bmhd.w; j++) {
+X         colors_used[get_a_bit(i,j)] = 1;
+X      }
+X   }
+X
+X/*  Show the current color register stuff */
+X
+Xstart_over:
+X
+X   printf("\nCurrent color register assignments for this picture are:\n");
+X
+X   for(i=0; i!=twopowers[bmhd.nplanes]; i++) {
+X      if(colors_used[i]) {
+X         printf("%2d -> R:%2d G:%2d B:%2d      ",
+X            i, Cmap[i*3]>>4, Cmap[i*3+1]>>4, Cmap[i*3+2]>>4);
+X      }
+X      else {
+X         printf("%2d -> Not Used            ",i);
+X      }
+X      if(i&1) printf("\n");
+X   }
+X
+X/*  Check to see if the user wants to change any of the register assignments.
+X    If so, do the appropriate transformations of the data base. */
+X
+X   printf("\nDo you wish to change assignments (y or n)? ");
+X   do {
+X      tempbyte = getchar();
+X   }
+X   while( (tempbyte!='y')
+X       && (tempbyte!='Y')
+X       && (tempbyte!='n')
+X       && (tempbyte!='N'));
+X
+X   if((tempbyte == 'y') || (tempbyte == 'Y')) {
+X      if(get_new_colors()) goto start_over; /* If invalid change, loop */
+X      printf("\nProcessing color change...");
+X      for(i=0; i!=96; old_cmap[i] = Cmap[i++]);   /* Save old colors */
+X      for(i=0; i!=bmhd.h; i++) {      /* lines */
+X         for(j=0; j!=bmhd.w; j++) {      /* bits */
+X            temp = get_a_bit(i,j);
+X            if(tran_table[temp]!=-1) {
+X               put_a_bit(i,j,tran_table[temp]);
+X               for(k=0; k!=3; k++) {            /* swap colors */
+X                  Cmap[tran_table[temp]*3+k] = old_cmap[temp*3+k];
+X               }
+X            }
+X         }
+X      }
+X      goto calc_color;    /* show the new arrangement */
+X   }
+X
+X/* Now, write the data to the output file, color map first, then data,
+X   plane by plane, line by line */
+X
+X   printf("\nWriting output file...");
+X
+X/* Output a few statistics */
+X
+X   fprintf(o_file, "/*   Image %s  */\n",argv[1]);
+X   fprintf(o_file, "     Width:    %d\n",bmhd.w);
+X   fprintf(o_file, "     Height:   %d\n",bmhd.h);
+X   fprintf(o_file, "     Depth:    %d  */\n",bmhd.nplanes);
+X
+X/* Start with the color map */
+X
+X   fprintf(o_file, "/* Color Map (xxxxxx = unused color) */\n\n");
+X   fprintf(o_file, "USHORT map[] = {\n");
+X   for(i=0; i!=twopowers[bmhd.nplanes]; i++) {
+X      fprintf(o_file, "   ");
+X      if(colors_used[i])
+X         make_word((Cmap[i*3]<<4)+Cmap[i*3+1]+(Cmap[i*3+2]>>4), o_file);
+X      else fprintf(o_file, "xxxxxx");
+X      if(i!=twopowers[bmhd.nplanes]-1) fprintf(o_file, ",");
+X      fprintf(o_file, "\n");
+X   }
+X   fprintf(o_file, "};\n\n");
+X
+X/* Now, do the data */
+X
+X   fprintf(o_file, "/* Image Data */\n\n");
+X   fprintf(o_file, "UWORD %s[%d] = {\n", argv[1], buff_size/2);
+X   for(i=0; i!=bmhd.nplanes; i++) {
+X      fprintf(o_file, "/* Bit Plane #%d */\n\n", i);
+X      for(j=0; j!=bmhd.h; j++) {
+X         fprintf(o_file, "   ");
+X         buff_pointer = raster_lines[j][i];
+X         for(k=0; k<bytes_per_line; ) {
+X            tempbyte = *(buff_pointer+(k++));
+X            make_word((tempbyte << 8) | *(buff_pointer+(k++)), o_file);
+X            fprintf(o_file, ",");
+X         }
+X         fprintf(o_file, "\n");
+X      }
+X      fprintf(o_file, "\n");
+X   }
+X   fseek(o_file, -3, 1);     /* back up to wipe out the last comma */
+X   fprintf(o_file, "\n};\n");
+X
+X/* Close up, clean up, and get out */
+X
+X   fclose(o_file);
+X   fclose(i_file);
+X   printf("\n");
+X   FreeMem(buff_pointer_save, buff_size);
+X}
+X
+X/*  read_error - called if a read error occured */
+X
+Xread_error()
+X{
+X   printf("\nRead error in input file, aborting\n");
+X   exit(20);
+X}
+X
+X/* chkread - reads from input file, checking for errors */
+X
+Xchkread(ptr, size, fd)
+XAPTR *ptr;
+XWORD size;
+XFILE *fd;
+X{
+X   WORD readin;
+X   readin = fread(ptr, size, 1, fd);
+X   if(readin != 1) read_error();
+X}
+X
+X/* expand_map - decompresses data compressed with the byte_run encoding
+X                scheme described in the IFF document.  A signed byte, x,
+X                is read from the input block.  If the signed value of x
+X                is negative, but not -128 ( 0x80 ), the next byte is read
+X                and is placed in the output block (-x+1) times.  If the
+X                signed value is positive, the next (x+1) bytes are copied
+X                directly to the output block.  If the signed value is -128,
+X                no operation is performed.
+X*/
+X
+X
+Xexpand_map(length, pointer, data_pointer)
+XWORD length;
+XUBYTE *pointer;
+XUBYTE **data_pointer;
+X{
+X
+X   WORD minus128 = -128;
+X   WORD temp;
+X   BYTE tempbyte;
+X   UBYTE tempubyte;
+X
+X   while( length > 0 )   {
+X      tempbyte = *((*data_pointer)++);
+X      temp = tempbyte;
+X      if (temp >= 0) {
+X         temp += 1;
+X         length-=temp;
+X         do {
+X            *(pointer++) = *((*data_pointer)++);
+X         }
+X         while (--temp > 0);
+X      }
+X      else if (temp != minus128) {
+X         temp = (-temp) + 1;
+X         length -= temp;
+X         tempubyte = *((*data_pointer)++);
+X         do {
+X            *(pointer++) = tempubyte;
+X         }
+X         while (--temp > 0);
+X      }
+X   }
+X}
+X
+X/* get_a_bit - returns the color value of the bit at location x,y in the
+X               image.
+X*/
+X
+Xget_a_bit(y, x)
+XLONG y, x;
+X{
+X   LONG xbyte, xbit,i;
+X   UBYTE tempbyte, color;
+X   UBYTE *pointer;
+X
+X   color = 0;                         /* start with no color */
+X   xbyte =x>>3;                       /* xbyte = the byte location of x */
+X   xbit = (1<<(x&7));                 /* xbit = the mask for the bit */
+X   for(i=0; i!=bmhd.nplanes; i++) {   /* do all the planes */
+X      pointer = raster_lines[y][i];          /* get the base address */
+X      tempbyte = *(pointer + xbyte);         /* get the proper byte  */
+X      if(tempbyte & xbit) color |= (1 << i); /* OR in the color bit  */
+X   }
+X   return color;
+X}
+X
+X/* put_a_bit - sets a given bit to a given color */
+X
+Xput_a_bit(y, x, color)
+XLONG y, x, color;
+X{
+X   LONG xbyte, xbit, i;
+X   UBYTE *pointer;
+X   UBYTE tempbyte;
+X
+X   for(i=0; i!=bmhd.nplanes; i++) {
+X      xbyte = x>>3;
+X      xbit = (1 << (x & 7));
+X      pointer = raster_lines[y][i];
+X      tempbyte = *(pointer + xbyte);   /* get the appropriate byte */
+X      tempbyte &= 0xff-xbit;           /* mask off the proper bit  */
+X      if(color & twopowers[i]) {       /* if the color bit is set, */
+X         tempbyte |= xbit;             /* set the bit in the byte  */
+X      }
+X      *(pointer + xbyte) = tempbyte;   /* save the modified byte   */
+X   }
+X}
+X
+X/* get_new_colors - get the users choices for register assignments */
+X
+Xget_new_colors()
+X{
+X   int i,j;
+X
+X   for(i=0; i!=twopowers[bmhd.nplanes]; tran_table[i++]=-1); /* reset */
+X   for(i=1; i!=twopowers[bmhd.nplanes]; i++) {
+X      if(colors_used[i]) {     /* for each color used in the original */
+Xgetnew:
+X         printf("\nOld color register %2d (R:%2d G:%2d B:%2d) new number:",
+X            i, Cmap[i*3]>>4, Cmap[i*3+1]>>4, Cmap[i*3+2]>>4);
+X         scanf("%d", &j);
+X         if((j<1) || (j>=twopowers[bmhd.nplanes])) {
+X            printf("\nRegister number must be greater than zero, and less than %2d.",
+X               twopowers[bmhd.nplanes]);
+X            printf("\nTry again.");
+X            goto getnew;
+X         }
+X         tran_table[i] = j;
+X      }
+X   }
+X
+X/* Check the translation table for duplicated register assignments. */
+X
+X   for(i=1; i!=twopowers[bmhd.nplanes]-1; i++) {
+X      for(j=i+1; j!=twopowers[bmhd.nplanes]; j++) {
+X         if((tran_table[i]==-1) || (tran_table[j]==-1)) continue;
+X         if(tran_table[i] == tran_table[j]) {
+X            printf("\nDuplicate color register assignment - try again.");
+X            return -1;
+X         }
+X      }
+X   }
+X   return 0;
+X}
+X
+X/* make_word - outputs a string representing a four-digit hex number */
+X
+Xmake_word(num, fp)
+XUWORD num;
+XFILE *fp;
+X{
+X   char temp[10];
+X
+X   sprintf(temp, "0000%x\0", num);
+X   fprintf(fp, "0x%s", &temp[strlen(temp)-4]);
+X}
+SHAR_EOF
+#       End of shell archive
+exit 0
+------
+-- 
+           Mike Farren
+           uucp: {your favorite backbone site}!hplabs!well!farren
+           Fido: Sci-Fido, Fidonode 125/84, (415)655-0667
+
+

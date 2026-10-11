@@ -1,0 +1,1071 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,13197827baf9c9c3,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-05-11 09:43:56 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site aplvax.UUCP
+Path: utzoo!watmath!clyde!akgua!sdcsvax!sdcrdcf!hplabs!hao!seismo!rlgvax!cvl!umcp-cs!aplvax!matt
+From: matt@aplvax.UUCP
+Newsgroups: net.sources
+Subject: ve.c - visual empire tool
+Message-ID: <588@aplvax.UUCP>
+Date: Fri, 11-May-84 12:43:56 EDT
+Article-I.D.: aplvax.588
+Posted: Fri May 11 12:43:56 1984
+Date-Received: Sun, 13-May-84 08:45:01 EDT
+Organization: JHU/Applied Physics Lab, Laurel, MD
+Lines: 1051
+
+This is the source code to ve(6) - a screen oriented empire
+tool (set net.games.emp).
+
+Compile as
+	cc -o ve ve.c -O -lcurses -ltermcap
+
+						matthew diaz
+Cut here:
+---------------------------8<-------------------------------------
+/*
+ *	V E
+ *
+ *	Visual Empire (with due respect to  Peter Langston)
+ *
+ *	Written by Matthew Diaz and Michael Baldwin
+ *
+ *	Syntax:
+ * 		ve [-a|c] census commodity map spy....
+ */
+
+#include <ctype.h>
+#include <stdio.h>
+#include <curses.h>
+#include <signal.h>
+
+/* Things you may want to change */
+#define VIPATH	"/usr/ucb/vi"
+#define EXPATH	"/usr/ucb/ex"
+
+
+#define	MAPSIZE	64
+#define	OFF	MAPSIZE/2
+#define MCOLS	79			/* Width of the map window */
+#define MLINES	17
+#define	NOX	0			/* Expand flags for getline */
+#define	EX	1
+#define	NOSU	0			/* Survey or no survey for mapdr */
+#define	SURV	1
+#define ESC	'\033'
+
+#define	ODD(x)		((x)&01)
+#define EVEN(x)		(!((x)&01))
+#define VALID(x, y)	(EVEN(x)&&EVEN(y)||ODD(x)&&ODD(y))
+#define	CTRL(c)		(('c')-0100)
+
+/* Offsets into sector arrays for various items */
+#define	CIV	0
+#define	MIL	1
+#define	FOOD	2
+#define	SH	3
+#define	GUN	4
+#define	PL	5
+#define	IRON	6
+#define	DUST	7
+#define	BAR	8
+#define	OIL	9
+#define	LCM	10
+#define	HCM	11
+#define	EFF	12
+#define	MOB	13
+#define	MIN	14
+#define	GMIN	15
+#define	FERT	16
+#define	PET	17
+#define	DES	18
+#define	COU	19
+#define CONT	20
+#define DEL	21
+
+char	usage[] = "Usage: ve [-c|a out] files...";
+
+/*
+ * If you want accounting change the filename below (make sure
+ * it is in 622 at least).  Everytime someone plays that version
+ * a line will be entered showing login name, elapsed time and
+ * date
+ */
+#ifdef ACCTNG
+char	acct[] = "/v0/usr/matt/.c/games/ve/veacct";
+#endif
+
+struct sector {
+	int	x, y;		/* Sector coordinates */
+	char	surv;		/* Survey value */
+	char	mark;		/* Mark character */
+	char	own;		/* Do you own or know that sector? */
+	int	val[30];	/* Values as described by items */
+	char	del[12];	/* Deliver routes */
+	char	cnt[12];	/* Contracts */
+} map[MAPSIZE][MAPSIZE];
+
+struct item {
+	char	*nm;		/* Item name - prefix */
+	int	len;		/* Length of prefix (for strncmp) */
+} items[] = {
+	"civ",	3,
+	"mil",	3,
+	"foo",	3,
+	"sh",	2,
+	"gun",	3,
+	"pl",	2,
+	"iro",	3,
+	"dus",	3,
+	"bar",	3,
+	"oil",	3,
+	"lcm",	3,
+	"hcm",	3,
+	"eff",	3,
+	"mob",	3,
+	"min",	3,
+	"gmi",	3,
+	"fer",	3,
+	"pet",	3,
+	"des",	3,
+	"cou",	3,
+	"con",	3,
+	"del",	3,
+	"",	0
+};
+
+int	docen();
+int	domap();
+int	docom();
+int	dospy();
+int	doint();
+
+struct funsw {			/* list of prefixes and functions */
+	char	*type;
+	int	(*func)();
+} fsw[] = {
+	"cen",	docen,
+	"map",	domap,
+	"com",	docom,
+	"spy",	dospy,
+	0,	0,
+};
+
+char	macros[127][BUFSIZ];	/* Les macros */
+char	peekc;			/* Lets you poke a character */
+int	startx;			/* Starting and last x values on map */
+int	starty;
+int	minx;			/* Min and max used for map reading */
+int	maxx;
+int	miny;
+int	curmark = '>';		/* Current marking character */
+int	range = 10;		/* Range for survey */
+int	curx, cury;		/* Current x and y coordinates in map array */
+
+FILE	*outf;			/* Output file pointer */
+char	oname[BUFSIZ];		/* Output file name */
+
+main(argc, argv)
+int	argc;
+char	*argv[];
+{
+	struct funsw	*fp;
+	char	buf[BUFSIZ];	/* Line buffer */
+	FILE	*inpf;		/* Input file pointer */
+#ifdef ACCTNG
+	FILE	*actf;		/* Accounting file */
+	long	sclock;
+	long	eclock;
+#endif
+
+	if (argc == 1)
+		puts(usage), exit(1);
+
+#ifdef ACCTNG
+	time(&sclock);
+#endif
+	argv++;
+	while (*argv)  {
+		/* Open/create command file */
+		if (**argv == '-' && (argv[0][1] == 'c'||argv[0][1] == 'a')) {
+			if ((outf = fopen(*++argv,
+			    (argv[0][1] == 'c') ? "w" : "a")) == NULL)
+				perror(*argv), exit(1);
+			strcpy(oname, *argv++);
+			continue;
+		}
+
+		/*
+		 * Process empire report files.  This is
+		 * done by looking at the second line of the file
+		 * which contains a string of the form
+		 * cen ... (e.g. cen # >cen.out)
+		 * The first word indicates the type of file it
+		 * is (census, map, etc).
+		 */
+		if ((inpf = fopen(*argv, "r")) == NULL)
+			perror(*argv), exit(1);
+		if (fgets(buf, sizeof buf, inpf) == NULL
+		 || fgets(buf, sizeof buf, inpf) == NULL)
+			printf("%s: wrong format\n", *argv), exit(1);
+
+		for (fp = fsw; *fp->type; fp++)
+			if (!strncmp(fp->type, buf, strlen(fp->type)))
+				(fp->func)(inpf);
+		fclose(inpf);
+		argv++;
+	}
+	
+	startx = minx + OFF;	/* Set to upper left corner of map */
+	if (ODD(startx))
+		startx--;
+	starty = miny + OFF;
+	if (ODD(starty))
+		starty--;
+
+	signal(SIGINT, SIG_IGN);	/* Ignore common signals */
+	signal(SIGQUIT, SIG_IGN);
+
+	initscr();			/* start up curses etc. */
+	startit();
+
+	commands();			/* process all commands */
+
+	move(LINES-1, 0);		/* done - move to bottom of screen */
+	clrtoeol();
+	refresh();
+
+#ifdef ACCTNG
+	/* save accounting information */
+	if ((actf = fopen(acct, "a")) != NULL) {
+		time(&eclock);
+		if (!getpw(getuid(), buf) && (bp = index(buf, ':')))
+			*bp = 0;
+		else
+			sprintf(buf, "%d", getuid());
+		eclock -= sclock;
+		fprintf(actf, "%s\t%2d:%02d\t%s", buf,
+			eclock/60, eclock % 60, ctime(&sclock));
+		fclose(actf);
+	}
+#endif
+	endit();			/* reset terminal */
+}
+
+/*
+ * Input file processing functions
+ *
+ * These routines parse the information from the input files,
+ * many times in a very ugly way.
+ *
+ * Each routine checks to see if there is a comma in the 4th position.
+ * This is to make certain that the line is of the form x,y and not
+ * another message (e.g. Bad weather).
+ */
+
+/*
+ * docen -	Read in the census file
+ */
+docen(inpf)
+FILE	*inpf;
+{
+	register int	x, y;
+	char	buf[BUFSIZ];
+	struct sector	*mp;
+
+	while (fgets(buf, sizeof buf, inpf) != NULL) {
+		if (buf[3] != ',')
+			continue;
+		x = atoi(buf);
+		y = atoi(&buf[4]);
+		mp = &map[x+OFF][y+OFF];
+		mp->own = 1;
+		mp->x = x;
+		mp->y = y;
+		mp->del[CIV] = buf[19];
+		mp->del[MIL] = buf[20];
+		mp->del[FOOD] = buf[21];
+		mp->cnt[CIV] = buf[23];
+		mp->cnt[MIL] = buf[24];
+		mp->cnt[FOOD] = buf[25];
+		mp->val[COU] = -1;
+		mp->val[DES] =
+			(buf[8]=='-') ? '~' : ((buf[8]=='^') ? '&' : buf[8]);
+		mp->val[EFF] = atoi(&buf[10]);
+		mp->val[MOB] = atoi(&buf[15]);
+		sscanf(&buf[31], "%d%d%d%d%d%d%d",
+			&mp->val[CIV], &mp->val[MIL], &mp->val[FOOD],
+			&mp->val[MIN], &mp->val[GMIN], &mp->val[FERT], 
+			&mp->val[PET]);
+	}
+}
+
+/*
+ * domap -	Do the map file.  This is a real kludge where you 
+ *		try to figure out where you are on the map by
+ *		looking at the coordinates on the side.
+ */
+domap(inpf)
+FILE	*inpf;
+{
+	register int	x, y;
+	int	sign;
+	char	minb[5];	/* Number buffers for min and max x */
+	char	maxb[5];
+	char	*sp = minb;
+	char	*lp = maxb;
+	char	buf[BUFSIZ];
+	char	*bp;
+
+	fgets(buf, sizeof buf, inpf);
+	/* Now determine the minimum x value */
+	*sp++ = buf[4];
+	*lp++ = buf[strlen(buf) - 2];
+	sign = (index(buf, '-')) ? -1 : 1;
+	fgets(buf, sizeof buf, inpf);
+	*sp++ = buf[4];
+	*lp++ = buf[strlen(buf) - 2];
+	*sp = 0;
+	*lp = 0;
+
+	minx = atoi(minb);
+	maxx = atoi(maxb);
+
+	if (sign == -1)  {
+		if (minx > 0)
+			minx *= -1;
+	} else if (minx > maxx)  {
+		maxx *= -1;
+		minx *= -1;
+	}
+
+	fgets(buf, sizeof buf, inpf);
+	miny = atoi(buf);
+
+	for (y = miny; buf[2] != ' '; y++) {
+		for (bp = &buf[4], x = minx; x <= maxx; x++, bp++) {
+			if (!map[x+OFF][y+OFF].val[DES])
+				map[x+OFF][y+OFF].val[DES] = *bp;
+		}
+		fgets(buf, sizeof buf, inpf);
+	}
+}
+
+/*
+ * docom -	Do the commodities
+ */
+docom(inpf)
+FILE	*inpf;
+{
+	register int	x, y;
+	char	buf[BUFSIZ];
+	struct sector	*mp;
+
+	while (fgets(buf, sizeof buf, inpf) != NULL) {
+		if (buf[3] != ',')
+			continue;
+		x = atoi(buf);
+		y = atoi(&buf[4]);
+		mp = &map[x+OFF][y+OFF];
+		mp->own = 1;
+		sscanf(&buf[14], "%c%c%c%c%c%c%c%c%c",
+			&mp->del[SH], &mp->del[GUN], &mp->del[PL],
+			&mp->del[IRON], &mp->del[DUST], &mp->del[BAR],
+			&mp->del[OIL], &mp->del[LCM], &mp->del[HCM]);
+		sscanf(&buf[24], "%c%c%c%c%c%c%c%c%c",
+			&mp->cnt[SH], &mp->cnt[GUN], &mp->cnt[PL],
+			&mp->cnt[IRON], &mp->cnt[DUST], &mp->cnt[BAR],
+			&mp->cnt[OIL], &mp->cnt[LCM], &mp->cnt[HCM]);
+		sscanf(&buf[34], "%d%d%d%d%d%d%d%d%d",
+			&mp->val[SH], &mp->val[GUN], &mp->val[PL],
+			&mp->val[IRON], &mp->val[DUST], &mp->val[BAR],
+			&mp->val[OIL], &mp->val[LCM], &mp->val[HCM]);
+	}
+}
+
+
+/*
+ * dospy -	Do the spy reports
+ */
+dospy(inpf)
+FILE	*inpf;
+{
+	register int	x, y;
+	char	buf[BUFSIZ];
+	struct sector	*mp;
+
+	while (fgets(buf, sizeof buf, inpf) != NULL) {
+		if (buf[3] != ',')
+			continue;
+		x = atoi(buf);
+		y = atoi(&buf[4]);
+		mp = &map[x+OFF][y+OFF];
+		if (mp->own)
+			continue;
+		mp->own = 1;
+		mp->val[COU] = atoi(&buf[8]);
+		if (buf[14] == 'N')	/* ignore "No report... */
+			continue;
+		mp->val[DES] = buf[11];
+		mp->val[EFF] = atoi(&buf[13]);
+		sscanf(&buf[18], "%d%d%d%d%d%d%d",
+			&mp->val[CIV], &mp->val[MIL], &mp->val[SH],
+			&mp->val[GUN], &mp->val[IRON], &mp->val[PL],
+			&mp->val[FOOD]);
+	}
+}
+
+/*
+ * commands -	Process the various input commands
+ */
+commands()
+{
+	register char	c;
+	register int	x, y;		/* Indexes into the map array */
+	register int	i;
+	register struct item	*ip;
+	int	tx, ty;
+	int	crou = -1;	/* current route */
+	int	status;
+	int	pflg = 1;	/* print census flag */
+	int	surmap = 0;	/* Set if surmap map should be displayed */
+	int	update = 0;
+	char	*bp;
+	char	buf[BUFSIZ];
+	char	prbuf[BUFSIZ];
+
+	x = y = OFF;		/* Initialize x and y */
+	mapdr(NOSU);		/* Draw map, census header and census */
+	cenhd();
+	pcen(y, x);
+
+	move(y-starty, x-startx);
+
+	while (refresh(), ((c = getac()) != 'q')) {
+		update = 0;
+		curx = x;
+		cury = y;
+		switch(c) {
+		case 'y':		/* Movement commands */
+			if (x > 0 && y > 0) {
+				x--;
+				y--;
+			}
+			break;
+
+		case 'u':
+			if (x < MAPSIZE - 2 && y > 0) {
+				x++;
+				y--;
+			}
+			break;
+
+		case 'j':
+			if (x < MAPSIZE - 3)
+				x += 2;
+			break;
+
+		case 'n':
+			if (x < MAPSIZE - 2 && y < MAPSIZE - 2) {
+				x++;
+				y++;
+			}
+			break;
+
+		case 'b':
+			if (x > 0 && y < MAPSIZE - 2) { 
+				x--;
+				y++;
+			}
+			break;
+
+		case 'g':
+			if (x > 1)
+				x -= 2;
+			break;
+
+		case CTRL(B):
+		case CTRL(N):
+			if (y < MAPSIZE - 7)
+				y += 6;
+			else if (y < MAPSIZE - 3)
+				y += 2;
+			break;
+
+		case CTRL(Y):
+		case CTRL(U):
+			if (y > 5)
+				y -= 6;
+			else if (y > 1)
+				y -= 2;
+			break;
+
+		case CTRL(G):
+			if (x > 5)
+				x -= 6;
+			else if (x > 1)
+				x -= 2;
+			break;
+
+		case CTRL(J):
+			if (x < MAPSIZE - 7)
+				x += 6;
+			else if (x < MAPSIZE - 3)
+				x += 2;
+			break;
+
+		case '\f':			/* Redraw the screen */
+			clear();
+			mapdr(surmap);
+			cenhd();
+			break;
+
+		case '?':			/* Do query at bottom */
+			doquest();
+			mapdr(surmap);
+			break;
+
+		case 'C':
+		case 'c':			/* Clear marks */
+			clearmks(c=='C');
+			mapdr(surmap);
+			break;
+
+		case 'M':			/* Reset mark */
+			curmark = '>';
+			break;
+
+		case 'm':			/* Change mark char */
+			getline(buf, "mark: ", NOX);
+			if (*buf)
+				curmark = *buf;
+			break;
+
+		case 'P':			/* Turn off census refresh */
+			pflg = (pflg == 0);
+			move(LINES-1, 0);
+			clrtoeol();
+			printw("Printing %s", pflg ? "on" : "off");
+			break;
+
+		case 'a':			/* Append to the file */
+			if (outf) {
+				getline(buf, "", EX);
+				if (*buf) {
+					strcat(buf, "\n");
+					fputs(buf, outf);
+				}
+			} else
+				putline("No output file specified - use O");
+			break;
+
+		case 'O':			/* Change/create output file */
+			getline(buf, "New output file: ", NOX);
+			if (outf)
+				fclose(outf);
+			if ((outf = fopen(buf, "a")) == NULL)
+				putline("%s: cannot create", buf);
+			else
+				strcpy(oname, buf);
+			break;
+
+		case 's':		/* Set a macro */
+			getline(buf, "macro name: ", NOX);
+			getline(macros[*buf], "define: ", NOX);
+			break;
+
+		case 'd':		/* Delete a macro */
+			getline(buf, "delete macro: ", NOX);
+			*macros[*buf] = 0; 
+			break;
+
+		case 'V':		/* Call vi */
+		case 'E':		/* Call ex */
+			if (outf) {
+				fclose(outf);
+				if (fork() == 0) {
+					endit();
+					if (c == 'V')
+						execl(VIPATH, "vi", oname, 0);
+					else
+						execl(EXPATH, "ex", oname, 0);
+				} else
+					wait(&status);
+				startit();
+				clear();
+				mapdr(surmap);
+				cenhd();
+				if ((outf = fopen(oname, "a")) == NULL)
+					putline("Cannot reopen %s", oname);
+			} else
+				putline("No output file");
+			break;
+
+		case 'S':			/* Survey */
+			getline(buf, "Survey: ", NOX);
+			survey(buf);
+			mapdr(surmap = SURV);
+			break;
+
+		case 'R':			/* Range for Survey */
+			sprintf(prbuf, "Range (%d): ", range*10);
+			getline(buf, prbuf, NOX);
+			if (*buf) {
+				range = atoi(buf)/10;
+				if (range < 1) {
+					putline("range should be >= 10");
+					range = 10;
+				}
+			}
+			break;
+
+		case CTRL(F):			/* Control F - flip maps */
+			mapdr((surmap = (surmap == NOSU)));
+			break;
+
+		case 'r':			/* route */
+			getline(buf, "Route: ");
+			for (crou = -1, ip = items; ip->len; ip++)
+				if (!strncmp(buf, ip->nm, ip->len))
+					crou = ip - items;
+			if (crou < 0)
+				putline("I don't know about %s", buf);
+			break;
+
+		case 'w':			/* walk along route */
+			if (crou > -1 && map[x][y].del[crou] != '.')
+				peekc = map[x][y].del[crou];
+			break;
+				
+		case 'p':			/* Print census */
+			break;
+
+		case 'l':
+			getline(buf, "Leap to: ");
+			if (*buf && (bp = (char *)index(buf, ','))) {
+				tx = atoi(buf) + OFF;
+				ty = atoi(++bp) + OFF;
+				if (tx > 0 && tx < MAPSIZE
+				 && ty > 0 && ty < MAPSIZE && VALID(tx, ty)) {
+					x = tx;
+					y = ty;
+				} else
+					putline("Illegal coordinates");
+			}
+			break;
+		}
+
+		if (x < startx || x > startx+MCOLS) {
+			startx = (x < startx) ? x : x-MCOLS;
+			update++;
+		}
+		if (y < starty || y > starty+MLINES) {
+			starty = (y < starty) ? y : y-MLINES;
+			update++;
+		}
+		if (update) {
+			mapdr(surmap);
+			touchwin(stdscr);
+		}
+		if (pflg || c == 'p')
+			pcen(y, x);
+		move(y-starty, x-startx);
+	}
+}
+
+/*
+ * doquest -	Parse the ? commands
+ */
+doquest()
+{
+	int	pass = 0;
+	char	buf[BUFSIZ];
+	char	*bp = buf;
+	char	*tp;
+
+	getline(bp, "?", NOX);
+	if (!*bp)
+		return;
+
+	clearmks(0);
+	for (;;) {
+		if (tp = (char *)index(bp, '&')) {
+			*tp++ = 0;
+			mark(bp, pass);
+			bp = tp;
+		} else {
+			mark(bp, pass);
+			break;
+		}
+		pass++;
+	}
+}
+
+
+/*
+ * mark -	Mark the chart according to the cmnd
+ */
+mark(sp, pass)
+char	*sp;
+int	pass;
+{
+	register int	itm1;
+	register int	itm2;
+	register int	x, y;
+	register int	num;
+	register int	val;
+	register int	markit;
+	register struct item	*ip;
+	register struct item	*tp;
+	char	cmd[20];
+	char	*cp = cmd;
+	struct sector	*mp;
+
+	while (isalpha(*cp++ = *sp++));		/* get first word */
+	*--cp = 0;
+	if (!*--sp)
+		return;
+	for (ip = items; ip->len; ip++)		/* check it */
+		if (!strncmp(cmd, ip->nm, ip->len))
+			break;
+
+	if (!ip->len) {
+		putline("I don't know about %s\n", cmd);
+		return;
+	}
+
+	itm1 = ip - items;
+	/*
+	 * at this point, cmd contains the left side, *sp
+	 * is the operator and sp+1 is the right side.
+	 */
+	num = (itm1 == DES) ? *(sp+1) : atoi(sp+1);
+	if (itm1 == CONT || itm1 == DEL) {
+		for (tp = items; tp->len; tp++)
+			if (!strncmp(sp+1, tp->nm, tp->len))
+				break;
+		if (!tp->len) {
+			putline("I don't know about %s", cmd);
+			return;
+		}
+		itm2 = tp - items;
+	}
+	for (y = 0; y < MAPSIZE; y++)
+		for (x = 0; x < MAPSIZE; x++) {
+			mp = &map[x][y];
+			if (!VALID(x, y) || !mp->own)
+				continue;
+			markit = 0;
+			val = mp->val[itm1];
+			if (itm1 == CONT) {
+				num = '$';
+				val = mp->cnt[itm2];
+			} else if (itm1 == DEL) {
+				num = '.';		/* KLUDGE */
+				*sp = '#';
+				val = mp->del[itm2];
+			}
+			switch( *sp) {
+			case '=':
+				if (val == num)
+					markit++;
+				break;
+
+			case '#':
+				if (val != num)
+					markit++;
+				break;
+
+			case '>':
+				if (val > num)
+					markit++;
+				break;
+
+			case '<':
+				if (val < num)
+					markit++;
+				break;
+			}
+			if (markit && (!pass || (pass && mp->mark)))
+				mp->mark = curmark;
+			else
+				if (mp->mark == curmark)
+					mp->mark = 0;
+		}
+}
+
+/*
+ * clearmks -	Clear the marks.  If all flag is set than ALL marks are
+ *		cleared otherwise just curmark marks are cleared.
+ */
+clearmks(all)
+int	all;
+{
+	register int	x, y;
+
+	for (y = 0; y < MAPSIZE; y++)
+		for (x = 0; x < MAPSIZE; x++)
+			if (all || map[x][y].mark == curmark)
+				map[x][y].mark = 0;
+}
+
+/*
+ * survey -	Do a surveygram for the given parameter
+ */
+survey(sp)
+char	*sp;
+{
+	register struct item	*ip;
+	register int	itm;
+	register int	x, y;
+	register struct sector	*mp;
+
+	for (ip = items; ip->len; ip++)
+		if (!strncmp(sp, ip->nm, ip->len))
+			break;
+	if (!ip->len) {
+		putline("I don't know about %s", sp);
+		return;
+	}
+
+	itm = ip - items;
+
+	for (y = 0; y < MAPSIZE; y++)
+		for (x = 0; x < MAPSIZE; x++)
+			if ((mp = &map[x][y])->own) {
+				mp->surv = mp->val[itm]/range;
+				if (mp->surv > 35)
+					mp->surv = '$';
+				else
+					mp->surv += (mp->surv>9)?('A'-10):'0';
+			}
+}
+			
+
+/*
+ * getline -	Get a line from the bottom of the screen,
+ *		using pr as a prompt if non-zero
+ *		If ex is set, then expand macros
+ */
+getline(bp, pr, ex)
+char	*bp;
+char	*pr;
+int	ex;
+{
+	register int	x;
+	register int	y;
+	char	c;
+	char	*mp;
+	char	*np;
+	char	nbuf[10];	/* Number buffer */
+	char	*ip = bp;
+
+	move(LINES-1, 0);
+	clrtoeol();
+	if (*pr)
+		addstr(pr);
+	while (refresh(), (c = getch()) != '\r') {
+		if (ex && *macros[c]) {		/* check for macros */
+			mp = macros[c];
+			while (*mp) {
+				if (*mp == '.') {	/* expand . */
+					mp++;
+					sprintf(np = nbuf, "%d,%d ",
+						curx-OFF, cury-OFF);
+					while (*ip++ = *np++);
+					ip--;
+					addstr(nbuf);
+				} else
+					addch( *ip++ = *mp++);
+			}
+			continue;
+		}
+		switch(c) {
+		case '\b':			/* backspace */
+			if (ip > bp) {
+				ip--;
+				addstr("\b \b");
+			}
+			continue;
+
+		case '\\':			/* backslash */
+			addstr("\\\b");
+			refresh();
+			c = getch();
+			break;
+
+		case '.':			/* expand . */
+			sprintf(np = nbuf, "%d,%d ", curx-OFF, cury-OFF);
+			while (*ip++ = *np++);
+			ip--;
+			addstr(nbuf);
+			continue;
+
+		case ESC:			/* jump to current pos */
+			getyx(stdscr, y, x);
+			move(cury-starty, curx-startx);
+			refresh();
+			sleep(1);
+			move(y, x);
+			continue;
+
+		case '\n':
+			continue;
+
+		case '@':			/* erase the line */
+			move(LINES-1, 0);
+			if (*pr)
+				addstr(pr);
+			clrtoeol();
+			*(ip = bp) = 0;
+			continue;
+		}
+		addch(*ip++ = c);
+	}
+	*ip = 0;
+}
+
+/*
+ * putline -	Do a printw at the bottom of the screen
+ */
+putline(fmt, a1, a2, a3, a4)
+{
+	move(LINES-1, 0);
+	printw(fmt, a1, a2, a3, a4);
+}
+
+/*
+ * cenhd -	Redraw the census listing
+ */
+cenhd()
+{
+	move(LINES-5, 0);
+	addstr("  sect  des   eff mob cmf cmf % * ");
+	addstr(" civ mil food  min gmin fert oil");
+	move(LINES-3, 0);
+	addstr("cou sgpidbolh sgpidbolh  ");
+	addstr("sh  gun  pl iron dust  bar  oil  lcm  hcm");
+}
+
+/*
+ * mapdr -	Redraw the map
+ */
+mapdr(sflg)
+register int	sflg;
+{
+	register int	x, y;
+	register struct sector	*mp;
+
+	for (y = starty; y < MAPSIZE && y <= starty + MLINES; y++)
+		for (x = startx; x < MAPSIZE && x < startx + MCOLS; x++) {
+			if (!VALID(x, y))
+				continue;
+			mp = &map[x][y];
+			mvaddch(y-starty, x-startx-1, (mp->mark)?mp->mark:' ');
+			if (sflg && mp->surv)
+				mvaddch(y-starty, x-startx, mp->surv);
+			else if (mp->val[DES])
+				mvaddch(y-starty, x-startx, mp->val[DES]);
+		}
+}
+
+/*
+ * pcen -	Print the census and commodities info
+ */
+pcen(y, x)
+register int	y, x;
+{
+	register struct sector	*mp = &map[x][y];
+
+	move(LINES-2, 0);
+	clrtoeol();
+	move(LINES-4, 0);
+	clrtoeol();
+	printw("%3d,%-3d  %c", x-OFF, y-OFF, mp->val[DES] ? mp->val[DES]:' ');
+	if (mp->own) {
+		printw("%6d%%%4d %c%c%c %c%c%c     %4d%4d%5d%5d%5d%5d%4d",
+			mp->val[EFF], mp->val[MOB],
+			mp->del[CIV], mp->del[MIL], mp->del[FOOD],
+			mp->cnt[CIV], mp->cnt[MIL], mp->cnt[FOOD],
+			mp->val[CIV], mp->val[MIL], mp->val[FOOD],
+			mp->val[MIN], mp->val[GMIN], mp->val[FERT],
+			mp->val[PET]);
+		move(LINES-2, 0);
+		if (mp->val[COU] == -1)
+			addstr("   ");
+		else
+			printw("%3d", mp->val[COU]);
+		if (mp->del[SH])
+			printw(" %c%c%c%c%c%c%c%c%c %c%c%c%c%c%c%c%c%c",
+				mp->del[SH], mp->del[GUN], mp->del[PL],
+				mp->del[IRON], mp->del[DUST], mp->del[BAR],
+				mp->del[OIL], mp->del[LCM], mp->del[HCM],
+				mp->cnt[SH], mp->cnt[GUN], mp->cnt[PL],
+				mp->cnt[IRON], mp->cnt[DUST], mp->cnt[BAR],
+				mp->cnt[OIL], mp->cnt[LCM], mp->cnt[HCM]);
+		else
+			addstr("                    ");
+			
+		printw("%4d%5d%4d%5d%5d%5d%5d%5d%5d",
+			mp->val[SH], mp->val[GUN], mp->val[PL],
+			mp->val[IRON], mp->val[DUST], mp->val[BAR],
+			mp->val[OIL], mp->val[LCM], mp->val[HCM]);
+	}
+}
+
+/*
+ * survdr -	Draw the survey map
+ */
+survdr()
+{
+	register int	x, y;
+
+	for (y = starty; y < MAPSIZE && y <= starty + MLINES; y++)
+		for (x = startx; x < MAPSIZE && x < startx + MCOLS; x++) {
+			if (!VALID(x, y))
+				continue;
+			if (map[x][y].surv)
+				mvaddch(y-starty, x-startx, map[x][y].surv);
+		}
+}
+
+/*
+ * getac -	Get a character.  Return peekc if non-zero
+ *		otherwise read a character from the keyboard
+ */
+getac()
+{
+	register char	tc;
+
+	if (peekc) {
+		tc = peekc;
+		peekc = 0;
+		return(tc);
+	} else
+		return(getch());
+}
+
+/*
+ * startit -	Set up the terminal
+ */
+startit()
+{
+	crmode();
+	noecho();
+	nonl();
+}
+
+/*
+ * endit -	Turn the terminal back to normal
+ */
+endit()
+{
+	nl();
+	echo();
+	crmode();
+	endwin();
+}
+
+

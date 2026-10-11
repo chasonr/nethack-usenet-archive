@@ -1,0 +1,346 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,d33693e21efb0144,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-06-14 10:12:05 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site digi-g.UUCP
+Path: utzoo!watmath!clyde!bonnie!akgua!whuxlm!whuxl!houxm!ihnp4!stolaf!umn-cs!digi-g!mark
+From: mark@digi-g.UUCP (Mark Mendel)
+Newsgroups: net.sources
+Subject: C long -> short name converter
+Message-ID: <665@digi-g.UUCP>
+Date: Fri, 14-Jun-85 13:12:05 EDT
+Article-I.D.: digi-g.665
+Posted: Fri Jun 14 13:12:05 1985
+Date-Received: Sun, 23-Jun-85 04:07:50 EDT
+Distribution: net
+Organization: Digigraphic Systems Corp., Mpls, MN
+Lines: 325
+
+It is hypothetical no longer!  A while back I asked if anybody had actually
+written a program to de-flexname C source.  I recieved one response, but
+that program generated a .h file that required flexnames in the C Preprocessor.
+Our cpp doesn't have flexnames.
+
+So, I hacked the posted ANSI C scanner into xcp: an extended C pre-preprocessor.
+Here is a sample makefile line to wire it in:
+
+INCLUDES = -I/usr/me/includes
+CFLAGS = whatever $(INCLUDES)
+
+.c.o:
+	xcp $(INCLUDES) $< >tmpxcp.c
+	$(CC) $(CFLAGS) -c tmpxcp.c
+	mv tmpxcp.o $*.o
+
+I haven't written a man page, but look at the start of the source for a
+terse description of the various options.
+
+My intent was to expand this program to handle further features of C that
+are frequently missing: enums, structure passing(?), etc.
+
+However, it turns out that our compiler already handles these, so I won't
+bother! If someone else does this, however, they'll probably need to also
+use the YACC part of the grammar.
+
+----------------------CUT HERE-------------------------------------------------
+# This is a shell archive.  Remove anything before this line, then
+# unpack it by saving it in a file and typing "sh file".  (Files
+# unpacked will be owned by you and have default permissions.)
+#
+# This archive contains:
+# xcp.l Makefile
+echo x - xcp.l
+cat > "xcp.l" << '//E*O*F xcp.l//'
+%{
+/* xcp - translate long names in C to unique shorter stuff.
+   
+   usage:  xcp [-n nameLength] [-I includeDirectory]... file.c >tmp.c
+	   cc -o file.c tmp.c
+	   rm tmp.c
+
+   xcp copies file to stdout, prefixing all non-reserved identifiers
+   more than nameLenghth (default: 8) characters long with a two alphabetic
+   characters.
+
+   The output is suitable input for the C compiler.
+
+   The two characters are based on a hash of the full name and are unlikely
+   to be the same for different identifiers.
+
+   The characters are in the range a-v, and are uppercase if the original
+   identifier starts with a lowercase letter, otherwise they are lower case.
+
+   Include files are processed and the orignal include directive is commented
+   out.  The -I option works just like cc.  xcp is not smart enough to 
+   detect #includes that are conditionally compiled out.  For this reason,
+   xcp generates a warning message only if it cannot open an include file.
+
+   #line directives are added to the output so that cc can give sensible error 
+   messages.
+
+   ====REVISIONS====
+   850612 MGM	Fixed handling of very long string constants.
+   Monday MGM	Mark G. Mendel, ORIGINAL
+*/
+
+#include <stdio.h>
+#include <ctype.h>
+
+#define	RET(val)	/* */
+
+%}
+
+D			[0-9]
+L			[a-zA-Z_]
+W			[ \t\v\f\n]
+
+%%
+"/*"			{ ECHO; comment(); }
+
+"auto"			{ ECHO; RET(AUTO); }
+"break"			{ ECHO; RET(BREAK); }
+"case"			{ ECHO; RET(CASE); }
+"char"			{ ECHO; RET(CHAR); }
+"const"			{ ECHO; RET(CONST); }
+"continue"		{ ECHO; RET(CONTINUE); }
+"default"		{ ECHO; RET(DEFAULT); }
+"do"			{ ECHO; RET(DO); }
+"double"		{ ECHO; RET(DOUBLE); }
+"else"			{ ECHO; RET(ELSE); }
+"enum"			{ ECHO; RET(ENUM); }
+"extern"		{ ECHO; RET(EXTERN); }
+"float"			{ ECHO; RET(FLOAT); }
+"for"			{ ECHO; RET(FOR); }
+"goto"			{ ECHO; RET(GOTO); }
+"if"			{ ECHO; RET(IF); }
+"int"			{ ECHO; RET(INT); }
+"long"			{ ECHO; RET(LONG); }
+"register"		{ ECHO; RET(REGISTER); }
+"return"		{ ECHO; RET(RETURN); }
+"short"			{ ECHO; RET(SHORT); }
+"signed"		{ ECHO; RET(SIGNED); }
+"sizeof"		{ ECHO; RET(SIZEOF); }
+"static"		{ ECHO; RET(STATIC); }
+"struct"		{ ECHO; RET(STRUCT); }
+"switch"		{ ECHO; RET(SWITCH); }
+"typedef"		{ ECHO; RET(TYPEDEF); }
+"union"			{ ECHO; RET(UNION); }
+"unsigned"		{ ECHO; RET(UNSIGNED); }
+"void"			{ ECHO; RET(VOID); }
+"volatile"		{ ECHO; RET(VOLATILE); }
+"while"			{ ECHO; RET(WHILE); }
+
+{L}({L}|{D})*		{ check_type(); }
+
+\"			{ ECHO; stringlit(); RET(STRING_LITERAL); }
+
+^"#"[ \t]*"include"[ \t]+	{ include( ); }
+
+.			{ ECHO;	/* pass all else */ }
+
+%%
+
+#define	MAXFILES	5	/* max depth of nested #includes */
+#define	MAXID		80	/* max char's in identifier 	*/
+
+/* external functions */
+char *rindex(), *strncat(), *strcpy();
+FILE *fopen();
+
+/* external variables */
+extern FILE *yyin;
+extern int yylineno;
+
+int	namlen = 8;	/* length of identifiers supported by compiler */
+
+char    **incdir;	/* include directories */
+int	nincdir = 0;
+
+char	basdir[64];	/* the directory of sourcefile */
+
+int inclev = 0;		/* current #include depth */
+char *fname[MAXFILES];	/* source file name stack */
+FILE *fp[MAXFILES];	/* source stream stack */
+int  fline[MAXFILES];	/* line counter stack */
+
+main(ac, av)
+    int ac; char **av;
+{
+    int junk;
+
+    if( !qscanargs( ac, av,
+	    "% n%-namelength!d I%-directory!*s sourcefile!s",
+	       &junk, &namlen, &junk, &nincdir, &incdir, &fname[0] ) )
+	exit( 1 );
+
+    if( !(yyin = fopen( fname[0], "r" )) )
+	Errprintf( "%s: can't read.\n", fname[0] );
+
+    /* calculate the source file directory */
+    if( **fname != '/' )
+	strcpy( basdir, "./" );
+
+    if( rindex( fname[0], '/' ) )
+	strncat( basdir, fname[0], rindex( fname[0], '/' ) - fname[0] );
+	
+    fprintf( yyout, "#line 1 \"%s\"\n", fname[0] );
+    yylex();
+}
+
+stringlit()
+{
+    int ch;
+
+    while( ch = input() ) {
+	putchar( ch );
+	if( ch == '\\' )
+	    putchar( input() );
+	else if( ch == '"' || ch == '\n' )
+	    break;
+    }
+    if( ch != '"' )
+	yyerror( "expected closing quote" );
+}
+
+comment()
+{
+	char c, c1;
+
+loop:
+	while ((c = input()) != '*' && c != 0)
+		putchar(c);
+
+	if( c != 0 )
+	    putchar( c );
+
+	if ((c1 = input()) != '/' && c != 0)
+	{
+		unput(c1);
+		goto loop;
+	}
+
+	if (c != 0)
+		putchar(c1);
+}
+
+
+/* transform long identifiers */
+int check_type()
+{
+    register char *cp;
+    register unsigned int h;
+
+    if( yyleng > namlen ) {
+	for( h=0, cp=yytext; *cp; ++cp )
+	    h = (h << 1) + ((h >> 15) & 1) + *cp;
+	putchar( h % 23 + (isupper(*yytext)? 'a': 'A') );
+	putchar( (h/23) % 23 + (isupper(*yytext)? 'a': 'A') );
+    }
+    ECHO;
+}
+
+int
+include()
+{
+    int quote, i;
+    char name[64], fullname[64], *cp;
+    FILE *nfp;
+
+    printf( "/*" );
+    ECHO;
+    quote = input();
+    putchar(quote);
+    if( quote != '"' && quote != '<' ) {
+	yyerror( "expected quote" );
+	return;
+    }
+    if( quote == '<' )
+	quote = '>';
+    cp = name;
+    while( (i = *cp = input()) != quote && i != 0 && i != '\n' ) {
+	putchar( i );
+	cp++;
+    };
+    if( i )
+	putchar(i);
+    while( (i = input()) && i != '\n' )
+	putchar(i);
+    printf("*/\n");
+    if( *cp != quote ) {
+	yyerror( "missing end quote" );
+	return;
+    }
+    *cp = 0;
+
+    while( 1 ) { /* do exactly once! */
+	if( quote == '"' ) {
+	    if( *name == '/' ) {
+		strcpy( fullname, name );
+		if( nfp = fopen( fullname ) )
+		    break;
+	    }
+	    sprintf( fullname, "%s%s", basdir, name );
+	    if( nfp = fopen( fullname, "r" ) )
+		break;
+	    for( i = 0; i < nincdir; ++i ) {
+		sprintf( fullname, "%s/%s", incdir[i], name );
+		if( nfp = fopen( fullname, "r" ) )
+		    break;
+	    }
+	    if( nfp ) break;
+	}
+	sprintf( fullname, "/usr/include/%s", name );
+	if( nfp = fopen( fullname, "r" ) )
+	    break;
+	yyerror( "can't read include file" );
+	return;
+    }
+
+    fp[ inclev ] = yyin;
+    fline[ inclev++ ] = yylineno;
+
+    yyin = nfp;
+    fname[inclev] = fullname;
+    printf( "#line 1 \"%s\"\n", name, fullname );
+}
+
+yywrap()
+{
+    extern FILE *yyout, *yyin;
+
+    fclose( yyin );
+    if( --inclev < 0 )
+	return(1);
+    yylineno = fline[ inclev ];
+    yyin = fp[ inclev ];
+    fprintf( yyout, "#line %d \"%s\"\n", yylineno, fname[inclev] );
+    return(0);
+}
+
+
+
+yyerror(s)
+char *s;
+{
+
+	fflush(stdout);
+	fprintf(stderr,"\"%s\":%d:%s\n", fname[inclev], yylineno, s );
+}
+//E*O*F xcp.l//
+echo x - Makefile
+cat > "Makefile" << '//E*O*F Makefile//'
+# note: the only routine used from the library ut.a is qscanargs(),
+# the command line processor distributed over the net a while back.
+# Let me know if you need the source.
+
+YFLAGS	= -d
+CFLAGS	= -O
+LFLAGS	=
+
+xcp	: xcp.o
+	cc -o xcp xcp.o /usr1/mark/lib/ut.a -ll
+//E*O*F Makefile//
+exit 0
+
+

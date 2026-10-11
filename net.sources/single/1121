@@ -1,0 +1,725 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,9b4f74adb28d3224,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-04-20 10:35:46 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site osu-dbs.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxl!ihnp4!cbosgd!osu-dbs!paul
+From: paul@osu-dbs.UUCP (Paul Placeway)
+Newsgroups: net.sources
+Subject: tcsh with editor (again) (4 of 7)
+Message-ID: <568@osu-dbs.UUCP>
+Date: Fri, 20-Apr-84 13:35:46 EST
+Article-I.D.: osu-dbs.568
+Posted: Fri Apr 20 13:35:46 1984
+Date-Received: Sat, 21-Apr-84 07:20:19 EST
+Organization: Ohio State U., CIS Dept., Columbus
+Lines: 705
+
+(I'm trying again for everyone who missed some of it)
+
+The following code is my changes to Ken Greer's tcsh.  I have added a visual
+mini-editor to the shell, and cleaned up the expansion routines some what.
+note that this is the 4.1 version.  When we get 4.2 up I'll repost the new
+changes.
+
+Please send any changes back to me so that I can update our version.
+
+Note: this is part 4 of 7, you need all of the parts to make tcsh.
+
+					Paul W. Placeway
+					The Ohio State University
+					(UUCP: cbosgd!osu-dbs!paul)
+					(CSNet: paul@ohio-state)
+
+================ cut here ================
+: This is a shar archive.  Extract with sh, not csh.
+echo x - tw.h
+cat > tw.h << '!Funky!Stuff!'
+#ifdef MAKE_TWENEX
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sgtty.h>
+#include "dir.h"
+#include <signal.h>
+#include <pwd.h>
+
+/*
+ * Input lines are parsed into doubly linked circular
+ * lists of words of the following form.
+ */
+struct	wordent {
+	char	*word;
+	struct	wordent *prev;
+	struct	wordent *next;
+};
+
+/*
+ * History list
+ *
+ * Each history list entry contains an embedded wordlist
+ * from the scanner, a number for the event, and a reference count
+ * to aid in discarding old entries.
+ *
+ * Essentially "invisible" entries are put on the history list
+ * when history substitution includes modifiers, and thrown away
+ * at the next discarding since their event numbers are very negative.
+ */
+struct	Hist {
+	struct	wordent Hlex;
+	int	Hnum;
+	int	Href;
+	struct	Hist *Hnext;
+} Histlist;
+
+/* Don't include stdio.h!  Csh doesn't like it!! */
+
+extern short SHIN, SHOUT;
+
+#define FREE_ITEMS(items)\
+{\
+    sighold (SIGINT);\
+    free_items (items);\
+    items = NULL;\
+    sigrelse (SIGINT);\
+}
+
+#define FREE_DIR(fd)\
+{\
+    sighold (SIGINT);\
+    closedir (fd);\
+    fd = NULL;\
+    sigrelse (SIGINT);\
+}
+
+#define TRUE		1
+#define FALSE		0
+#define ON		1
+#define OFF		0
+#define FILSIZ		512		/* Max reasonable file name length */
+#define ESC		'\033'
+#define equal(a, b)	(strcmp(a, b) == 0)
+
+#define is_set(var)	adrof(var)
+
+#define BUILTINS	"/usr/local/lib/builtins/" /* fake builtin bin */
+#define MAXITEMS 2048
+#define SEARCHLIST "HPATH"	/* Env. param for helpfile searchlist */
+#define DEFAULTLIST ":/u0/osu/man/cat1:/u0/osu/man/cat8:/u0/osu/man/cat6:/usr/man/cat1:/usr/man/cat8:/usr/man/cat6:/u0/local/man/cat1:/u0/local/man/cat8:/u0/local/man/cat6"    /* if no HPATH */
+
+extern char  PromptBuf[];
+
+extern char *getenv ();
+
+typedef enum {LIST, RECOGNIZE, PRINT_HELP} COMMAND;
+
+
+#define	beep()	write (SHOUT, BELL, 1)
+
+char *getentry();
+char GetAChar();
+char *tilde();
+char filetype();
+
+#ifndef DONT_EXTERN
+
+extern char *BELL;
+extern char *command_list[];  /* the pre-digested list of commands
+					 for speed and general usefullness */
+extern int numcommands;
+
+extern int commands_file;	/* for a global file discriptor */
+
+extern int  key_bindings[];	/* the currently assigned keys */
+extern int  bindings_are_inited;	/* for setup of bindings */
+						/* the first time */
+
+extern int  dirctr;		/* -1 0 1 2 ... */
+extern char dirflag[5];		/*  ' nn\0' - dir #s -  . 1 2 ... */
+
+
+#endif
+#endif
+
+#define	ERROR			-1
+#define	NO_OP			0
+#define	UP_HIST			1
+#define DOWN_HIST		2
+#define	COMPLETE		3
+#define	HELPME			4
+#define	LIST_CHOICES		5
+!Funky!Stuff!
+echo x - tw.help.c
+cat > tw.help.c << '!Funky!Stuff!'
+#define MAKE_TWENEX		/* flag to include definitions */
+#include "tw.h"
+
+
+/* actually look up and print documentation on a file.  Look down the path
+   for an approiate file, then print it.  Note that the printing is NOT 
+   PAGED.  This is because the function is NOT ment to look at manual pages,
+   it only does so if there is no .help file to look in. */
+
+do_help (command)
+char *command;
+{
+    char name[FILSIZ + 1];
+    char *cmd_p;
+    int f;
+    char curdir[128];		/* Current directory being looked at */
+    char *getenv();
+    register char *hpath;	/* The environment parameter */
+    char *skipslist();
+    char full[128], buf[512];	/* full path name and buffer for read */
+    int len;			/* length of read buffer */
+
+				/* copy the string to a safe place */
+    copyn (name, command, sizeof (name));
+
+			/* trim off the garbage that may be at the end */
+    for (cmd_p = name; *cmd_p != '\0'; cmd_p++) {
+	if (*cmd_p == ' ' || *cmd_p == '\t') *cmd_p = '\0';
+    }
+
+				/* if nothing left, return */
+    if (*name == '\0') return;
+
+		/* got is, now "cat" the file based on the path $HPATH */
+
+    hpath = getenv(SEARCHLIST);
+    if(hpath == (char *)0)
+        hpath = DEFAULTLIST;
+
+    while (1)
+    {
+	if(!*hpath)
+	{
+	    printf("No help file for %s\n", name);
+	    break;
+	}
+	nextslist(hpath, curdir);
+	hpath = skipslist(hpath);
+
+/* now make the full path name - try first /bar/foo.help, then /bar/foo.1,
+   /bar/foo.8, then finally /bar/foo.6 .  This is so that you don't spit
+   a binary at the tty when $HPATH == $PATH.  I know, I know, gotos are
+   BOGUS */
+
+	copyn (full, curdir, sizeof (full));
+	catn (full, "/", sizeof (full));
+	catn (full, name, sizeof (full));
+	catn (full, ".help", sizeof (full));
+	f = open (full, 0);	/* try to open for reading */
+	if (f != -1) goto cat_it;	/* no file there */
+
+	copyn (full, curdir, sizeof (full));
+	catn (full, "/", sizeof (full));
+	catn (full, name, sizeof (full));
+	catn (full, ".1", sizeof (full));
+	f = open (full, 0);	/* try to open for reading */
+	if (f != -1) goto cat_it;	/* no file there */
+
+	copyn (full, curdir, sizeof (full));
+	catn (full, "/", sizeof (full));
+	catn (full, name, sizeof (full));
+	catn (full, ".8", sizeof (full));
+	f = open (full, 0);	/* try to open for reading */
+	if (f != -1) goto cat_it;	/* no file there */
+
+	copyn (full, curdir, sizeof (full));
+	catn (full, "/", sizeof (full));
+	catn (full, name, sizeof (full));
+	catn (full, ".6", sizeof (full));
+	f = open (full, 0);	/* try to open for reading */
+	if (f == -1) continue;	/* no file there */
+
+cat_it:
+	while ((len = read (f, buf, 512)) != 0) {	/* the file is here */
+	    write (SHOUT, buf, len);			/* so cat it to the */
+	}						/* terminal */
+	break;
+    }
+}
+
+/* these next two are stolen from CMU's man(1) command for looking down 
+ * paths.  they are prety straight forward. */
+
+/*
+ * nextslist takes a search list and copies the next path in it
+ * to np.  A null search list entry is expanded to ".".
+ * If there are no entries in the search list, then np will point
+ * to a null string.
+ */
+
+nextslist(sl, np)
+  register char *sl;
+  register char *np;
+{
+    if(!*sl)
+	*np = '\000';
+    else if(*sl == ':')
+    {
+	*np++ = '.';
+	*np = '\000';
+    }
+    else
+    {
+	while(*sl && *sl != ':')
+	    *np++ = *sl++;
+	*np = '\000';
+    }
+}
+
+/*
+ * skipslist returns the pointer to the next entry in the search list.
+ */
+
+char *
+skipslist(sl)
+  register char *sl;
+{
+    while(*sl && *sl++ != ':');
+    return(sl);
+}
+
+!Funky!Stuff!
+echo x - tw.init.c
+cat > tw.init.c << '!Funky!Stuff!'
+#define MAKE_TWENEX		/* flag to include definitions */
+#include "tw.h"
+
+/*
+ * Build the command name list (and print the results).  This is a HACK until
+ * I can get the rehash command to include its results in the command list.
+ */
+
+char *extract_dir_from_path();
+int fcompare();
+
+static int tw_been_inited = 0;
+			/* to avoid double reading of commands file */
+
+extern struct	biltins {
+	char	*bname;
+	int	(*bfunct)();
+	short	minargs, maxargs;
+} bfunc[];
+
+extern struct	varent {
+	char	**vec;		/* Array of words which is the value */
+	char	*name;		/* Name of variable/alias */
+	struct	varent *link;
+} aliases;
+
+tw_clear_comm_list() {
+    register int i;
+
+/*     printf ("Building the completion path...");
+    flush(); */
+
+    if (numcommands != 0) {
+/* 	printf("Freeing..."); */
+        for (i = 0; command_list[i]; i++) {
+	    if (command_list[i] == 0) {
+		printf ("tried to free a null, i = %d\n", i);
+	    } else {
+		free (command_list[i]);
+	    }
+	    command_list[i] = NULL;
+	}
+	numcommands = 0;
+    }
+}
+
+tw_sort_comms () {
+    register int i,j;
+
+/*     printf ("sorting...");
+    flush(); */
+    
+/* sort the list. */
+    qsort (command_list, numcommands, sizeof (command_list[0]), fcompare);
+
+/* get rid of multiple entries */
+    for (i = 0; i < numcommands - 1; i++) {
+	if (strcmp (command_list[i], command_list[i+1]) == 0) {
+	    if (command_list[i] == 0) {
+		printf ("tried to free a null, i = %d, previous = %s\n", i,
+		    command_list [i-1]);
+	    } else {
+		free (command_list[i]);
+	    }
+	    for (j = i; j < numcommands; j++) {
+		command_list[j] = command_list[j+1];
+	    }
+	    numcommands--;	/* keep count right */
+	    i--;		/* to catch many versions */
+	}
+    }
+
+/*     print_by_column (looking_for_lognames ? NULL:tilded_dir, command_list,
+  			 numcommands, 1);	 */
+
+/*     printf ("Done.\n"); */
+    flush();
+}
+
+tw_add_comm_name (name)
+char *name;
+{
+    register int length;
+
+    if (numcommands >= MAXITEMS) {
+        printf ("\nYikes!! Too many commands in PATH!!\n");
+        return;
+    }
+
+    length = strlen(name) + 1;
+
+    if ((command_list[numcommands] = (char *)malloc (length)) == NULL) {
+        printf ("\nYikes!! I ran out of memory!!!\n");
+        return;
+    }
+
+    copyn (command_list[numcommands], name, MAXNAMLEN);
+    numcommands++;
+}
+
+tw_add_builtins() {
+    register char *cp;
+    register struct biltins *bptr;
+
+    for (bptr = bfunc; cp = bptr->bname; bptr++) {
+	tw_add_comm_name (cp);
+    }
+}
+
+tw_add_aliases ()
+{
+    register struct varent *vp;
+
+    vp = &aliases;
+
+    for (vp = vp->link; vp != 0; vp = vp->link) {
+	tw_add_comm_name(vp->name);
+    }
+
+}
+!Funky!Stuff!
+echo x - tw.main.c
+cat > tw.main.c << '!Funky!Stuff!'
+/* tw.c -- input parser main routines.  84/04/02 Paul Placeway */
+
+/* 
+ * This is a re-write of the routines by Ken Greer, Mike Ellis, and myself
+ * for doing twenex (Tops-20 (tm)) style command and file recognition,
+ * expansion, and listing, as well as other nice additions to my (inputl)
+ * input line parser for C-shell and other things.  This is styled after the
+ * Tops-20 COMND jsys, but somewhat changed to what I think it should be in
+ * Unix.
+ */
+
+#define MAKE_TWENEX		/* flag to include definitions */
+#define DONT_EXTERN		/* don't do the extern ... stuff */
+#include "tw.h"
+
+
+static char
+    *BELL = "\07";
+
+char *command_list[2048] = NULL;  /* the pre-digested list of commands
+					 for speed and general usefullness */
+int numcommands = 0;
+
+int commands_file = -1;	/* for a global file discriptor */
+
+int  key_bindings[256];	/* the currently assigned keys */
+int  bindings_are_inited = FALSE;	/* for setup of bindings */
+
+int  dirctr;		/* -1 0 1 2 ... */
+char dirflag[5];		/*  ' nn\0' - dir #s -  . 1 2 ... */
+
+/* the main routine -- the inputline and size are the location to place the
+ * expanded line into. */
+
+twenex (inputline, inputline_size)
+char   *inputline;		/* pointer to a buffer */
+int     inputline_size;		/* size of the buffer */
+{
+    register int numitems, num_read;
+    int hist_num = 0;
+    int hnumcntr;
+    char linebuf[512];
+    struct Hist *hp;
+
+    if (bindings_are_inited = FALSE) tw_init_bindings();
+
+    while (1) {
+	register char *str_end, last_char, should_retype;
+	char inputl();
+	COMMAND command;
+
+	last_char = inputl (PromptBuf, inputline, inputline_size);
+						/* PWP: use the editor */
+	num_read = strlen(inputline);
+
+	if (last_char == -1)		/* PWP: for end-of-file */
+	    break;			/* did i hear you screem HACK? */
+
+	last_char &= 0177;	/* keep it to 7 bits */
+
+	if (last_char == '\n' || num_read == inputline_size)
+	    break;		/* send the line */
+
+	switch (key_bindings[last_char]) {
+	    case UP_HIST:	/* ^P -- previous hist line */
+	        if (hist_num == 0)
+		    copyn(linebuf, inputline, 511);
+
+	        hp = Histlist.Hnext;
+	        if (hp == 0) {
+		    beep();
+		    ilpushback (inputline);
+		    break;
+	        }
+	        hist_num++;
+	        for (hnumcntr = 1; hnumcntr < hist_num; hnumcntr++) {
+		    if ((hp->Hnext) == 0) {
+		        beep();
+		        hist_num--;
+		        break;
+		    }
+		    hp = hp -> Hnext;
+	        }
+
+	        sprlex (inputline, &hp->Hlex);
+	        if (inputline[strlen(inputline)-1] == '\n')
+		    inputline[strlen(inputline)-1] = '\0';
+
+	        printprompt ();
+	        ilpushback (inputline);
+	        ilredisplay ();
+	        break;
+
+	    case DOWN_HIST:	/* ^N -- next hist line */
+	        if (hist_num == 0) {
+		    ilpushback (inputline);
+		    beep();
+		    break;
+	        }
+	        if (hist_num == 1) {
+		    copyn(inputline, linebuf, inputline_size);
+		    hist_num--;
+		    printprompt ();
+		    ilpushback (inputline);
+		    ilredisplay();
+		    break;
+	        }
+
+	        hp = Histlist.Hnext;
+	        hist_num--;
+	        for (hnumcntr = 1; hnumcntr < hist_num; hnumcntr++) {
+		    if ((hp->Hnext) == 0) break;
+		    hp = hp -> Hnext;
+	        }
+
+	        sprlex (inputline, &hp->Hlex);
+	        if (inputline[strlen(inputline)-1] == '\n')
+		    inputline[strlen(inputline)-1] = '\0';
+
+	        printprompt ();
+	        ilpushback (inputline);
+	        ilredisplay ();
+	        break;
+
+	    case COMPLETE:		/* RECOGNIZE */
+		do_recognize (inputline, inputline_size, num_read);
+		break;
+
+	    case HELPME:	/* help */
+		print_help (inputline, inputline_size, num_read);
+		break;
+
+	    case LIST_CHOICES:	/* LIST */
+		list_choices (inputline, inputline_size, num_read);
+		break;
+
+	    case NO_OP:		/* just push it back */
+		ilpushback (inputline);
+		break;
+
+	    case ERROR:
+	    default:
+		beep();		/* complain */
+		ilpushback (inputline);
+		break;
+
+	}			/* end case */
+    }				/* end while (1) */
+
+    return (num_read);
+}
+
+
+/* handle the keybindings stuff like initing them, binding them, and seeing
+   what is bound to a given key. */
+
+
+/* bind function func to key key */
+
+int
+tw_bind_to_key (func, key)
+int func;
+char key;
+{
+    if (key == -1) {		/* trap unsetings */
+	return (-1);
+    }
+
+    if ((func < 0) || (func > 10)) {
+	return(-1);
+    }
+
+    if (bindings_are_inited = FALSE) tw_init_bindings();
+
+    key_bindings[key] = func;
+}
+
+/* return what function is bound to key key */
+
+int
+tw_get_binding(key)
+char key;
+{
+    return (key_bindings[key]);
+}
+
+/* initilize the bindings */
+
+tw_init_bindings()
+{
+    register int i;
+
+    if (bindings_are_inited) return;
+
+    for (i=0; i<128; i++) {	/* assign all the keys */
+	key_bindings[i] = NO_OP;
+    }
+    key_bindings[020] = NO_OP;		/* ^P */
+    key_bindings[016] = NO_OP;		/* ^N */
+    key_bindings[033] = COMPLETE;	/* ^[ (ESC) */
+    key_bindings[000] = HELPME;		/* ^@ */
+    key_bindings[077] = LIST_CHOICES;	/* ? */
+
+    bindings_are_inited = TRUE;
+}
+
+
+/* the top level of the recognize and list procedures.  These are just to
+   save a little work on the part of twenex(). */
+
+/* do the recognize: take the inputline, expand the command name, if there is
+   a white space character, hand the stuff to the parse expander */
+
+do_recognize (inputline, inputline_size, num_read)
+char *inputline;
+int inputline_size;
+int num_read;
+{
+/*  CharPtr = &inputline[num_read]; */
+				/* do it!! */
+    if (tenematch (inputline, inputline_size, num_read, RECOGNIZE) != 1)
+	 		/* Beep = No match/ambiguous */
+	beep ();
+
+    flush ();
+    ilpushback (inputline);		/* pushback for editor */
+}
+
+/* run the list choices option:  Same as above, but use a parse list options
+   routine rather than an expander.  Nothing additional is pushed back onto
+   the line (just what was typed in). */
+
+list_choices (inputline, inputline_size, num_read)
+char *inputline;
+int inputline_size;
+int num_read;
+{
+    putchar ('\n');
+/*  CharPtr = &inputline[num_read]; */
+
+			/* do this early so that you can ^C it */
+    printprompt ();
+    ilpushback (inputline);		/* pushback for editor */
+    ilredisplay ();
+
+    tenematch (inputline, inputline_size, num_read, LIST);
+				/* do it!! */
+    flush ();
+}
+
+/* print help:  Figure out what command is being entered, expand the name,
+   then do a lookup on documentation of this command */
+
+print_help (inputline, inputline_size, num_read)
+char *inputline;
+int inputline_size;
+int num_read;
+{
+    putchar ('\n');
+/*  CharPtr = &inputline[num_read]; */
+
+			/* do this early so that you can ^C it */
+    printprompt ();
+    ilpushback (inputline);		/* pushback for editor */
+    ilredisplay ();
+
+    tenematch (inputline, inputline_size, num_read, PRINT_HELP);
+				/* do it!! */
+    flush ();
+}
+
+
+
+/*
+ * Concatonate src onto tail of des.
+ * Des is a string whose maximum length is count.
+ * Always null terminate.
+ */
+
+catn (des, src, count)
+register char *des, *src;
+register count;
+{
+    while (--count >= 0 && *des)
+	des++;
+    while (--count >= 0)
+	if ((*des++ = *src++) == 0)
+	    return;
+    *des = '\0';
+}
+
+max (a, b)
+{
+    if (a > b)
+	return (a);
+    return (b);
+}
+
+/*
+ * like strncpy but always leave room for trailing \0
+ * and always null terminate.
+ */
+copyn (des, src, count)
+register char *des, *src;
+register count;
+{
+    while (--count >= 0)
+	if ((*des++ = *src++) == 0)
+	    return;
+    *des = '\0';
+}
+!Funky!Stuff!
+
+

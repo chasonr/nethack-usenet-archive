@@ -1,0 +1,2150 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 162299,56ddff727290099e,start
+X-Google-Attributes: gid162299,public
+X-Google-ArrivalTime: 1985-04-11 11:33:09 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83 (MC840302); site mcvax.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!genrad!panda!talcott!harvard!seismo!mcvax!aeb
+From: aeb@mcvax.UUCP (Andries Brouwer)
+Newsgroups: net.sources.games
+Subject: Hack 1.0.2 - part 8 of 10
+Message-ID: <594@mcvax.UUCP>
+Date: Thu, 11-Apr-85 14:33:09 EST
+Article-I.D.: mcvax.594
+Posted: Thu Apr 11 14:33:09 1985
+Date-Received: Sat, 13-Apr-85 05:29:20 EST
+Reply-To: aeb@mcvax.UUCP (Andries Brouwer)
+Followup-To: net.games.hack
+Organization: CWI, Amsterdam
+Lines: 2128
+
+
+# This is a shell archive.  Remove anything before this line, then
+# unpack it by saving it in a file and typing "sh file".  (Files
+# unpacked will be owned by you and have default permissions.)
+#
+# This archive contains:
+# hack.shk.c hack.termcap.c hack.timeout.c hack.topl.c hack.track.c
+# hack.trap.c hack.tty.c
+
+echo x - hack.shk.c
+cat > "hack.shk.c" << '//E*O*F hack.shk.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.shk.c - version 1.0.2 */
+
+#include "hack.h"
+#ifdef QUEST
+int shlevel = 0;
+struct monst *shopkeeper = 0;
+struct obj *billobjs = 0;
+obfree(obj,merge) register struct obj *obj, *merge; {
+	free((char *) obj);
+}
+inshop(){ return(0); }
+addtobill(){}
+subfrombill(){}
+splitbill(){}
+dopay(){ return(0); }
+paybill(){}
+doinvbill(){ return(0); }
+shkdead(){}
+shkcatch(){ return(0); }
+shk_move(){ return(0); }
+replshk(mtmp,mtmp2) struct monst *mtmp, *mtmp2; {}
+char *shkname(){ return(""); }
+
+#else QUEST
+#include	"hack.mfndpos.h"
+#include	"def.mkroom.h"
+#include	"def.eshk.h"
+
+#define	ESHK(mon)	((struct eshk *)(&(mon->mextra[0])))
+#define	NOTANGRY(mon)	mon->mpeaceful
+#define	ANGRY(mon)	!NOTANGRY(mon)
+
+extern char plname[], *xname();
+extern struct obj *o_on();
+
+/* Descriptor of current shopkeeper. Note that the bill need not be
+   per-shopkeeper, since it is valid only when in a shop. */
+static struct monst *shopkeeper = 0;
+static struct bill_x *bill;
+static int shlevel = 0;	/* level of this shopkeeper */
+       struct obj *billobjs;	/* objects on bill with bp->useup */
+				/* only accessed here and by save & restore */
+static long int total;		/* filled by addupbill() */
+static long int followmsg;	/* last time of follow message */
+
+/*
+	invariants: obj->unpaid iff onbill(obj) [unless bp->useup]
+		obj->quan <= bp->bquan
+ */
+
+
+char shtypes[] = {	/* 8 shoptypes: 7 specialized, 1 mixed */
+	RING_SYM, WAND_SYM, WEAPON_SYM, FOOD_SYM, SCROLL_SYM,
+	POTION_SYM, ARMOR_SYM, 0
+};
+
+static char *shopnam[] = {
+	"engagement ring", "walking cane", "antique weapon",
+	"delicatessen", "second hand book", "liquor",
+	"used armor", "assorted antiques"
+};
+
+char *
+shkname(mtmp)				/* called in do_name.c */
+register struct monst *mtmp;
+{
+	return(ESHK(mtmp)->shknam);
+}
+
+shkdead(mtmp)				/* called in mon.c */
+register struct monst *mtmp;
+{
+	register struct eshk *eshk = ESHK(mtmp);
+
+	if(eshk->shoplevel == dlevel)
+		rooms[eshk->shoproom].rtype = 0;
+	if(mtmp == shopkeeper) {
+		setpaid();
+		shopkeeper = 0;
+		bill = (struct bill_x *) -1000;	/* dump core when referenced */
+	}
+}
+
+replshk(mtmp,mtmp2)
+register struct monst *mtmp, *mtmp2;
+{
+	if(mtmp == shopkeeper) {
+		shopkeeper = mtmp2;
+		bill = &(ESHK(shopkeeper)->bill[0]);
+	}
+}
+
+static
+setpaid(){	/* caller has checked that shopkeeper exists */
+		/* either we paid or left the shop or he just died */
+register struct obj *obj;
+register struct monst *mtmp;
+	for(obj = invent; obj; obj = obj->nobj)
+		obj->unpaid = 0;
+	for(obj = fobj; obj; obj = obj->nobj)
+		obj->unpaid = 0;
+	for(obj = fcobj; obj; obj = obj->nobj)
+		obj->unpaid = 0;
+	for(mtmp = fmon; mtmp; mtmp = mtmp->nmon)
+		for(obj = mtmp->minvent; obj; obj = obj->nobj)
+			obj->unpaid = 0;
+	for(mtmp = fallen_down; mtmp; mtmp = mtmp->nmon)
+		for(obj = mtmp->minvent; obj; obj = obj->nobj)
+			obj->unpaid = 0;
+	while(obj = billobjs){
+		billobjs = obj->nobj;
+		free((char *) obj);
+	}
+	ESHK(shopkeeper)->billct = 0;
+}
+
+static
+addupbill(){	/* delivers result in total */
+		/* caller has checked that shopkeeper exists */
+register ct = ESHK(shopkeeper)->billct;
+register struct bill_x *bp = bill;
+	total = 0;
+	while(ct--){
+		total += bp->price * bp->bquan;
+		bp++;
+	}
+}
+
+inshop(){
+register roomno = inroom(u.ux,u.uy);
+
+	/* Did we just leave a shop? */
+	if(u.uinshop &&
+	    (u.uinshop != roomno + 1 || shlevel != dlevel || !shopkeeper)) {
+		u.uinshop = 0;
+		if(shopkeeper) {
+		    if(ESHK(shopkeeper)->billct) {
+			pline("Somehow you escaped the shop without paying!");
+			addupbill();
+			pline("You stole for a total worth of %ld zorkmids.",
+				total);
+			ESHK(shopkeeper)->robbed += total;
+			setpaid();
+			if((rooms[ESHK(shopkeeper)->shoproom].rtype == GENERAL)
+			    == (rn2(3) == 0))
+			    ESHK(shopkeeper)->following = 1;
+		    }
+		    shopkeeper = 0;
+		    shlevel = 0;
+		}
+	}
+
+	/* Did we just enter a zoo of some kind? */
+	if(roomno >= 0) {
+		register int rt = rooms[roomno].rtype;
+		register struct monst *mtmp;
+		if(rt == ZOO) {
+			pline("Welcome to David's treasure zoo!");
+		} else
+		if(rt == SWAMP) {
+			pline("It looks rather muddy down here.");
+		} else
+		if(rt == MORGUE) {
+			if(midnight())
+				pline("Go away! Go away!");
+			else
+				pline("You get an uncanny feeling ...");
+		} else
+			rt = 0;
+		if(rt != 0) {
+			rooms[roomno].rtype = 0;
+			for(mtmp = fmon; mtmp; mtmp = mtmp->nmon)
+				if(rt != ZOO || !rn2(3))
+					mtmp->msleep = 0;
+		}
+	}
+
+	/* Did we just enter a shop? */
+	if(roomno >= 0 && rooms[roomno].rtype >= 8) {
+	    if(shlevel != dlevel || !shopkeeper
+				 || ESHK(shopkeeper)->shoproom != roomno)
+		findshk(roomno);
+	    if(!shopkeeper) {
+		rooms[roomno].rtype = 0;
+		u.uinshop = 0;
+	    } else if(!u.uinshop){
+		if(!ESHK(shopkeeper)->visitct ||
+		    strncmp(ESHK(shopkeeper)->customer, plname, PL_NSIZ)){
+		    /* He seems to be new here */
+		    ESHK(shopkeeper)->visitct = 0;
+		    ESHK(shopkeeper)->following = 0;
+		    (void) strncpy(ESHK(shopkeeper)->customer,plname,PL_NSIZ);
+		    NOTANGRY(shopkeeper) = 1;
+		}
+		if(!ESHK(shopkeeper)->following) {
+		    boolean box, pick;
+
+		    pline("Hello %s! Welcome%s to %s's %s shop!",
+			plname,
+			ESHK(shopkeeper)->visitct++ ? " again" : "",
+			shkname(shopkeeper),
+			shopnam[rooms[ESHK(shopkeeper)->shoproom].rtype - 8] );
+		    box = carrying(ICE_BOX);
+		    pick = carrying(PICK_AXE);
+		    if(box || pick) {
+			if(dochug(shopkeeper)) {
+				u.uinshop = 0;	/* he died moving */
+				return(0);
+			}
+			pline("Will you please leave your %s outside?",
+			    (box && pick) ? "box and pick-axe" :
+			    box ? "box" : "pick-axe");
+		    }
+		}
+		u.uinshop = roomno + 1;
+	    }
+	}
+	return(u.uinshop);
+}
+
+static
+findshk(roomno)
+register roomno;
+{
+register struct monst *mtmp;
+	for(mtmp = fmon; mtmp; mtmp = mtmp->nmon)
+	    if(mtmp->isshk && ESHK(mtmp)->shoproom == roomno
+			   && ESHK(mtmp)->shoplevel == dlevel) {
+		shopkeeper = mtmp;
+		bill = &(ESHK(shopkeeper)->bill[0]);
+		shlevel = dlevel;
+		if(ANGRY(shopkeeper) &&
+		   strncmp(ESHK(shopkeeper)->customer,plname,PL_NSIZ))
+			NOTANGRY(shopkeeper) = 1;
+		billobjs = 0;
+		return;
+	}
+	shopkeeper = 0;
+	shlevel = 0;
+	bill = (struct bill_x *) -1000;	/* dump core when referenced */
+}
+
+static struct bill_x *
+onbill(obj) register struct obj *obj; {
+register struct bill_x *bp;
+	if(!shopkeeper) return(0);
+	for(bp = bill; bp < &bill[ESHK(shopkeeper)->billct]; bp++)
+		if(bp->bo_id == obj->o_id) {
+			if(!obj->unpaid) pline("onbill: paid obj on bill?");
+			return(bp);
+		}
+	if(obj->unpaid) pline("onbill: unpaid obj not on bill?");
+	return(0);
+}
+
+/* called with two args on merge */
+obfree(obj,merge) register struct obj *obj, *merge; {
+register struct bill_x *bp = onbill(obj);
+register struct bill_x *bpm;
+	if(bp) {
+		if(!merge){
+			bp->useup = 1;
+			obj->unpaid = 0;	/* only for doinvbill */
+			obj->nobj = billobjs;
+			billobjs = obj;
+			return;
+		}
+		bpm = onbill(merge);
+		if(!bpm){
+			/* this used to be a rename */
+			impossible("obfree: not on bill??");
+			return;
+		} else {
+			/* this was a merger */
+			bpm->bquan += bp->bquan;
+			ESHK(shopkeeper)->billct--;
+			*bp = bill[ESHK(shopkeeper)->billct];
+		}
+	}
+	free((char *) obj);
+}
+
+static
+pay(tmp,shkp)
+long tmp;
+register struct monst *shkp;
+{
+	long robbed = ESHK(shkp)->robbed;
+
+	u.ugold -= tmp;
+	shkp->mgold += tmp;
+	flags.botl = 1;
+	if(robbed) {
+		robbed -= tmp;
+		if(robbed < 0) robbed = 0;
+		ESHK(shkp)->robbed = robbed;
+	}
+}
+
+dopay(){
+long ltmp;
+register struct bill_x *bp;
+register struct monst *shkp;
+int pass, tmp;
+
+	multi = 0;
+	(void) inshop();
+	for(shkp = fmon; shkp; shkp = shkp->nmon)
+		if(shkp->isshk && dist(shkp->mx,shkp->my) < 3)
+			break;
+	if(!shkp && u.uinshop &&
+	   inroom(shopkeeper->mx,shopkeeper->my) == ESHK(shopkeeper)->shoproom)
+		shkp = shopkeeper;
+
+	if(!shkp) {
+		pline("There is nobody here to receive your payment.");
+		return(0);
+	}
+	ltmp = ESHK(shkp)->robbed;
+	if(shkp != shopkeeper && NOTANGRY(shkp)) {
+		if(!ltmp) {
+			pline("You do not owe %s anything.", monnam(shkp));
+		} else
+		if(!u.ugold) {
+			pline("You have no money.");
+		} else {
+		    long ugold = u.ugold;
+
+		    if(u.ugold > ltmp) {
+			pline("You give %s the %ld gold pieces he asked for.",
+				monnam(shkp), ltmp);
+			pay(ltmp, shkp);
+		    } else {
+			pline("You give %s all your gold.", monnam(shkp));
+			pay(u.ugold, shkp);
+		    }
+		    if(ugold < ltmp/2) {
+			pline("Unfortunately, he doesn't look satisfied.");
+		    } else {
+			ESHK(shkp)->robbed = 0;
+			ESHK(shkp)->following = 0;
+			if(ESHK(shkp)->shoplevel != dlevel) {
+			/* For convenience's sake, let him disappear */
+			    shkp->minvent = 0;		/* %% */
+			    shkp->mgold = 0;
+			    mondead(shkp);
+			}
+		    }
+		}
+		return(1);
+	}
+		
+	if(!ESHK(shkp)->billct){
+		pline("You do not owe %s anything.", monnam(shkp));
+		if(!u.ugold){
+			pline("Moreover, you have no money.");
+			return(1);
+		}
+		if(ESHK(shkp)->robbed){
+#define min(a,b)	((a<b)?a:b)
+		    pline("But since his shop has been robbed recently,");
+		    pline("you %srepay %s's expenses.",
+		      (u.ugold < ESHK(shkp)->robbed) ? "partially " : "",
+		      monnam(shkp));
+		    pay(min(u.ugold, ESHK(shkp)->robbed), shkp);
+		    ESHK(shkp)->robbed = 0;
+		    return(1);
+		}
+		if(ANGRY(shkp)){
+			pline("But in order to appease %s,",
+				amonnam(shkp, "angry"));
+			if(u.ugold >= 1000){
+				ltmp = 1000;
+				pline(" you give him 1000 gold pieces.");
+			} else {
+				ltmp = u.ugold;
+				pline(" you give him all your money.");
+			}
+			pay(ltmp, shkp);
+			if(rn2(3)){
+				pline("%s calms down.", Monnam(shkp));
+				NOTANGRY(shkp) = 1;
+			} else	pline("%s is as angry as ever.",
+					Monnam(shkp));
+		}
+		return(1);
+	}
+	if(shkp != shopkeeper) {
+		impossible("dopay: not to shopkeeper?");
+		if(shopkeeper) setpaid();
+		return(0);
+	}
+	for(pass = 0; pass <= 1; pass++) {
+		tmp = 0;
+		while(tmp < ESHK(shopkeeper)->billct) {
+			bp = &bill[tmp];
+			if(!pass && !bp->useup) {
+				tmp++;
+				continue;
+			}
+			if(!dopayobj(bp)) return(1);
+			bill[tmp] = bill[--ESHK(shopkeeper)->billct];
+		}
+	}
+	pline("Thank you for shopping in %s's %s store!",
+		shkname(shopkeeper),
+		shopnam[rooms[ESHK(shopkeeper)->shoproom].rtype - 8]);
+	NOTANGRY(shopkeeper) = 1;
+	return(1);
+}
+
+/* return 1 if paid successfully */
+/*        0 if not enough money */
+/*       -1 if object could not be found (but was paid) */
+static
+dopayobj(bp) register struct bill_x *bp; {
+register struct obj *obj;
+long ltmp;
+
+	/* find the object on one of the lists */
+	if(bp->useup)
+		obj = o_on(bp->bo_id, billobjs);
+	else if(!(obj = o_on(bp->bo_id, invent)) &&
+		!(obj = o_on(bp->bo_id, fobj)) &&
+		!(obj = o_on(bp->bo_id, fcobj))) {
+		    register struct monst *mtmp;
+		    for(mtmp = fmon; mtmp; mtmp = mtmp->nmon)
+			if(obj = o_on(bp->bo_id, mtmp->minvent))
+			    break;
+		    for(mtmp = fallen_down; mtmp; mtmp = mtmp->nmon)
+			if(obj = o_on(bp->bo_id, mtmp->minvent))
+			    break;
+		}
+	if(!obj) {
+		impossible("Shopkeeper administration out of order.");
+		setpaid();	/* be nice to the player */
+		return(0);
+	}
+
+	if(!obj->unpaid && !bp->useup){
+		impossible("Paid object on bill??");
+		return(1);
+	}
+	obj->unpaid = 0;
+	ltmp = bp->price * bp->bquan;
+	if(ANGRY(shopkeeper)) ltmp += ltmp/3;
+	if(u.ugold < ltmp){
+		pline("You don't have gold enough to pay %s.",
+			doname(obj));
+		obj->unpaid = 1;
+		return(0);
+	}
+	pay(ltmp, shopkeeper);
+	pline("You bought %s for %ld gold piece%s.",
+		doname(obj), ltmp, plur(ltmp));
+	if(bp->useup) {
+		register struct obj *otmp = billobjs;
+		if(obj == billobjs)
+			billobjs = obj->nobj;
+		else {
+			while(otmp && otmp->nobj != obj) otmp = otmp->nobj;
+			if(otmp) otmp->nobj = obj->nobj;
+			else pline("Error in shopkeeper administration");
+		}
+		free((char *) obj);
+	}
+	return(1);
+}
+
+/* routine called after dying (or quitting) with nonempty bill */
+paybill(){
+	if(shopkeeper && ESHK(shopkeeper)->billct){
+		addupbill();
+		if(total > u.ugold){
+			shopkeeper->mgold += u.ugold;
+			u.ugold = 0;
+		pline("%s comes and takes all your possessions.",
+			Monnam(shopkeeper));
+		} else {
+			u.ugold -= total;
+			shopkeeper->mgold += total;
+	pline("%s comes and takes the %ld zorkmids you owed him.",
+		Monnam(shopkeeper), total);
+		}
+		setpaid();	/* in case we create bones */
+	}
+}
+
+/* called in hack.c when we pickup an object */
+addtobill(obj) register struct obj *obj; {
+register struct bill_x *bp;
+	if(!inshop() || (u.ux == ESHK(shopkeeper)->shk.x && u.uy == ESHK(shopkeeper)->shk.y) ||
+		(u.ux == ESHK(shopkeeper)->shd.x && u.uy == ESHK(shopkeeper)->shd.y) ||
+		onbill(obj) /* perhaps we threw it away earlier */
+	) return;
+	if(ESHK(shopkeeper)->billct == BILLSZ){
+		pline("You got that for free!");
+		return;
+	}
+	bp = &bill[ESHK(shopkeeper)->billct];
+	bp->bo_id = obj->o_id;
+	bp->bquan = obj->quan;
+	bp->useup = 0;
+	bp->price = getprice(obj);
+	ESHK(shopkeeper)->billct++;
+	obj->unpaid = 1;
+}
+
+splitbill(obj,otmp) register struct obj *obj, *otmp; {
+	/* otmp has been split off from obj */
+register struct bill_x *bp;
+register int tmp;
+	bp = onbill(obj);
+	if(!bp) {
+		impossible("splitbill: not on bill?");
+		return;
+	}
+	if(bp->bquan < otmp->quan) {
+		impossible("Negative quantity on bill??");
+	}
+	if(bp->bquan == otmp->quan) {
+		impossible("Zero quantity on bill??");
+	}
+	bp->bquan -= otmp->quan;
+
+	/* addtobill(otmp); */
+	if(ESHK(shopkeeper)->billct == BILLSZ) otmp->unpaid = 0;
+	else {
+		tmp = bp->price;
+		bp = &bill[ESHK(shopkeeper)->billct];
+		bp->bo_id = otmp->o_id;
+		bp->bquan = otmp->quan;
+		bp->useup = 0;
+		bp->price = tmp;
+		ESHK(shopkeeper)->billct++;
+	}
+}
+
+subfrombill(obj) register struct obj *obj; {
+long ltmp;
+register int tmp;
+register struct obj *otmp;
+register struct bill_x *bp;
+	if(!inshop() || (u.ux == ESHK(shopkeeper)->shk.x && u.uy == ESHK(shopkeeper)->shk.y) ||
+		(u.ux == ESHK(shopkeeper)->shd.x && u.uy == ESHK(shopkeeper)->shd.y))
+		return;
+	if((bp = onbill(obj)) != 0){
+		obj->unpaid = 0;
+		if(bp->bquan > obj->quan){
+			otmp = newobj(0);
+			*otmp = *obj;
+			bp->bo_id = otmp->o_id = flags.ident++;
+			otmp->quan = (bp->bquan -= obj->quan);
+			otmp->owt = 0;	/* superfluous */
+			otmp->onamelth = 0;
+			bp->useup = 1;
+			otmp->nobj = billobjs;
+			billobjs = otmp;
+			return;
+		}
+		ESHK(shopkeeper)->billct--;
+		*bp = bill[ESHK(shopkeeper)->billct];
+		return;
+	}
+	if(obj->unpaid){
+		pline("%s didn't notice.", Monnam(shopkeeper));
+		obj->unpaid = 0;
+		return;		/* %% */
+	}
+	/* he dropped something of his own - probably wants to sell it */
+	if(shopkeeper->msleep || shopkeeper->mfroz ||
+		inroom(shopkeeper->mx,shopkeeper->my) != ESHK(shopkeeper)->shoproom)
+		return;
+	if(ESHK(shopkeeper)->billct == BILLSZ ||
+	  ((tmp = shtypes[rooms[ESHK(shopkeeper)->shoproom].rtype-8]) && tmp != obj->olet)
+	  || index("_0", obj->olet)) {
+		pline("%s seems not interested.", Monnam(shopkeeper));
+		return;
+	}
+	ltmp = getprice(obj) * obj->quan;
+	if(ANGRY(shopkeeper)) {
+		ltmp /= 3;
+		NOTANGRY(shopkeeper) = 1;
+	} else	ltmp /= 2;
+	if(ESHK(shopkeeper)->robbed){
+		if((ESHK(shopkeeper)->robbed -= ltmp) < 0)
+			ESHK(shopkeeper)->robbed = 0;
+pline("Thank you for your contribution to restock this recently plundered shop.");
+		return;
+	}
+	if(ltmp > shopkeeper->mgold)
+		ltmp = shopkeeper->mgold;
+	pay(-ltmp, shopkeeper);
+	if(!ltmp)
+	pline("%s gladly accepts %s but cannot pay you at present.",
+		Monnam(shopkeeper), doname(obj));
+	else
+	pline("You sold %s and got %ld gold piece%s.", doname(obj), ltmp,
+		plur(ltmp));
+}
+
+doinvbill(mode)
+int mode;		/* 0: deliver count 1: paged */
+{
+	register unsigned tmp;
+	register struct obj *obj;
+	long totused, thisused;
+	char buf[BUFSZ];
+
+	if(mode == 0) {
+	    register int cnt = 0;
+
+	    if(shopkeeper)
+		for(tmp = 0; tmp < ESHK(shopkeeper)->billct; tmp++)
+		    if(bill[tmp].useup)
+			cnt++;
+	    return(cnt);
+	}
+
+	if(!shopkeeper) {
+		impossible("doinvbill: no shopkeeper?");
+		return(0);
+	}
+
+	set_pager(0);
+	if(page_line("Unpaid articles already used up:") || page_line(""))
+	    goto quit;
+
+	totused = 0;
+	for(tmp = 0; tmp < ESHK(shopkeeper)->billct; tmp++)
+	    if(bill[tmp].useup) {
+		register int cnt;
+
+		for(obj = billobjs; obj; obj = obj->nobj)
+			if(obj->o_id == bill[tmp].bo_id) break;
+		if(!obj) {
+			impossible("Bad shopkeeper administration.");
+			goto quit;
+		}
+		thisused = bill[tmp].price * bill[tmp].bquan;
+		totused += thisused;
+		(void) sprintf(buf, "x -  %s", doname(obj));
+		for(cnt = 0; buf[cnt]; cnt++);
+		while(cnt < 50)
+			buf[cnt++] = ' ';
+		(void) sprintf(&buf[cnt], " %5ld zorkmids", thisused);
+		if(page_line(buf))
+			goto quit;
+	}
+	(void) sprintf(buf, "Total:%50ld zorkmids", totused);
+	if(page_line("") || page_line(buf))
+		goto quit;
+	set_pager(1);
+	return(0);
+quit:
+	set_pager(2);
+	return(0);
+}
+
+static
+getprice(obj) register struct obj *obj; {
+register int tmp,ac;
+	switch(obj->olet){
+	case AMULET_SYM:
+		tmp = 10*rnd(500);
+		break;
+	case TOOL_SYM:
+		tmp = 10*rnd((obj->otyp == EXPENSIVE_CAMERA) ? 150 : 30);
+		break;
+	case RING_SYM:
+		tmp = 10*rnd(100);
+		break;
+	case WAND_SYM:
+		tmp = 10*rnd(100);
+		break;
+	case SCROLL_SYM:
+		tmp = 10*rnd(50);
+#ifdef MAIL
+		if(obj->otyp == SCR_MAIL)
+			tmp = rnd(5);
+#endif MAIL
+		break;
+	case POTION_SYM:
+		tmp = 10*rnd(50);
+		break;
+	case FOOD_SYM:
+		tmp = 10*rnd(5 + (2000/realhunger()));
+		break;
+	case GEM_SYM:
+		tmp = 10*rnd(20);
+		break;
+	case ARMOR_SYM:
+		ac = 10 - obj->spe;
+		tmp = 100 + (10-ac)*(10-ac)*rnd(20-ac);
+		break;
+	case WEAPON_SYM:
+		if(obj->otyp < BOOMERANG)
+			tmp = 5*rnd(10);
+		else if(obj->otyp == LONG_SWORD ||
+			obj->otyp == TWO_HANDED_SWORD)
+			tmp = 10*rnd(150);
+		else	tmp = 10*rnd(75);
+		break;
+	case CHAIN_SYM:
+		pline("Strange ..., carrying a chain?");
+	case BALL_SYM:
+		tmp = 10;
+		break;
+	default:
+		tmp = 10000;
+	}
+	return(tmp);
+}
+
+static
+realhunger(){	/* not completely foolproof */
+register tmp = u.uhunger;
+register struct obj *otmp = invent;
+	while(otmp){
+		if(otmp->olet == FOOD_SYM && !otmp->unpaid)
+			tmp += objects[otmp->otyp].nutrition;
+		otmp = otmp->nobj;
+	}
+	return((tmp <= 0) ? 1 : tmp);
+}
+
+shkcatch(obj)
+register struct obj *obj;
+{
+	register struct monst *shkp = shopkeeper;
+
+	if(u.uinshop && shkp && !shkp->mfroz && !shkp->msleep &&
+	    u.dx && u.dy &&
+	    inroom(u.ux+u.dx, u.uy+u.dy) + 1 == u.uinshop &&
+	    shkp->mx == ESHK(shkp)->shk.x && shkp->my == ESHK(shkp)->shk.y &&
+	    u.ux == ESHK(shkp)->shd.x && u.uy == ESHK(shkp)->shd.y) {
+		pline("%s nimbly catches the %s.", Monnam(shkp), xname(obj));
+		obj->nobj = shkp->minvent;
+		shkp->minvent = obj;
+		return(1);
+	}
+	return(0);
+}
+
+/*
+ * shk_move: return 1: he moved  0: he didnt  -1: let m_move do it
+ */
+shk_move(shkp)
+register struct monst *shkp;
+{
+	register struct monst *mtmp;
+	register struct permonst *mdat = shkp->data;
+	register xchar gx,gy,omx,omy,nx,ny,nix,niy;
+	register schar appr,i;
+	register int udist;
+	schar shkroom,chi,chcnt,cnt;
+	boolean uondoor, satdoor, avoid, badinv;
+	coord poss[9];
+	int info[9];
+	struct obj *ib = 0;
+
+	omx = shkp->mx;
+	omy = shkp->my;
+
+	if((udist = dist(omx,omy)) < 3) {
+		if(ANGRY(shkp)) {
+			(void) hitu(shkp, d(mdat->damn, mdat->damd)+1);
+			return(0);
+		}
+		if(ESHK(shkp)->following) {
+			if(strncmp(ESHK(shkp)->customer, plname, PL_NSIZ)){
+				pline("Hello %s! I was looking for %s.",
+					plname, ESHK(shkp)->customer);
+				ESHK(shkp)->following = 0;
+				return(0);
+			}
+			if(!ESHK(shkp)->robbed) {	/* impossible? */
+				ESHK(shkp)->following = 0;
+				return(0);
+			}
+			if(moves > followmsg+4) {
+				pline("Hello %s! Didn't you forget to pay?",
+					plname);
+				followmsg = moves;
+			}
+			if(udist < 2)
+				return(0);
+		}
+	}
+
+	shkroom = inroom(omx,omy);
+	appr = 1;
+	gx = ESHK(shkp)->shk.x;
+	gy = ESHK(shkp)->shk.y;
+	satdoor = (gx == omx && gy == omy);
+	if(ESHK(shkp)->following){
+		gx = u.ux;
+		gy = u.uy;
+		if(shkroom < 0 || shkroom != inroom(u.ux,u.uy))
+		    if(udist > 4)
+			return(-1);	/* leave it to m_move */
+	} else if(ANGRY(shkp)) {
+		long saveBlind = Blind;
+		Blind = 0;
+		if(shkp->mcansee && !Invis && cansee(omx,omy)) {
+			gx = u.ux;
+			gy = u.uy;
+		}
+		Blind = saveBlind;
+		avoid = FALSE;
+	} else {
+#define	GDIST(x,y)	((x-gx)*(x-gx)+(y-gy)*(y-gy))
+		if(Invis)
+		  avoid = FALSE;
+		else {
+		  uondoor = (u.ux == ESHK(shkp)->shd.x &&
+				u.uy == ESHK(shkp)->shd.y);
+		  if(uondoor) {
+		    if(ESHK(shkp)->billct)
+			pline("Hello %s! Will you please pay before leaving?",
+				plname);
+		    badinv = (carrying(PICK_AXE) || carrying(ICE_BOX));
+		    if(satdoor && badinv)
+			return(0);
+		    avoid = !badinv;
+		  } else {
+		    avoid = (u.uinshop && dist(gx,gy) > 8);
+		    badinv = FALSE;
+		  }
+
+		  if(((!ESHK(shkp)->robbed && !ESHK(shkp)->billct) || avoid)
+		  	&& GDIST(omx,omy) < 3){
+		  	if(!badinv && !online(omx,omy))
+				return(0);
+		  	if(satdoor)
+		  		appr = gx = gy = 0;
+		  }
+		}
+	}
+	if(omx == gx && omy == gy)
+		return(0);
+	if(shkp->mconf) {
+		avoid = FALSE;
+		appr = 0;
+	}
+	nix = omx;
+	niy = omy;
+	cnt = mfndpos(shkp,poss,info,ALLOW_SSM);
+	if(avoid && uondoor) {		/* perhaps we cannot avoid him */
+		for(i=0; i<cnt; i++)
+			if(!(info[i] & NOTONL)) goto notonl_ok;
+		avoid = FALSE;
+	notonl_ok:
+		;
+	}
+	chi = -1;
+	chcnt = 0;
+	for(i=0; i<cnt; i++){
+		nx = poss[i].x;
+		ny = poss[i].y;
+	   	if(levl[nx][ny].typ == ROOM
+		|| shkroom != ESHK(shkp)->shoproom
+		|| ESHK(shkp)->following) {
+#ifdef STUPID
+		    /* cater for stupid compilers */
+		    register int zz;
+#endif STUPID
+		    if(uondoor && (ib = sobj_at(ICE_BOX, nx, ny))) {
+			nix = nx; niy = ny; chi = i; break;
+		    }
+		    if(avoid && (info[i] & NOTONL))
+			continue;
+		    if((!appr && !rn2(++chcnt)) ||
+#ifdef STUPID
+			(appr && (zz = GDIST(nix,niy)) && zz > GDIST(nx,ny))
+#else
+			(appr && GDIST(nx,ny) < GDIST(nix,niy))
+#endif STUPID
+			) {
+			    nix = nx;
+			    niy = ny;
+			    chi = i;
+		    }
+		}
+	}
+	if(nix != omx || niy != omy){
+		if(info[chi] & ALLOW_M){
+			mtmp = m_at(nix,niy);
+			if(hitmm(shkp,mtmp) == 1 && rn2(3) &&
+			   hitmm(mtmp,shkp) == 2) return(2);
+			return(0);
+		} else if(info[chi] & ALLOW_U){
+			(void) hitu(shkp, d(mdat->damn, mdat->damd)+1);
+			return(0);
+		}
+		shkp->mx = nix;
+		shkp->my = niy;
+		pmon(shkp);
+		if(ib) {
+			freeobj(ib);
+			mpickobj(shkp, ib);
+		}
+		return(1);
+	}
+	return(0);
+}
+#endif QUEST
+
+online(x,y) {
+	return(x==u.ux || y==u.uy ||
+		(x-u.ux)*(x-u.ux) == (y-u.uy)*(y-u.uy));
+}
+
+/* Does this monster follow me downstairs? */
+follower(mtmp)
+register struct monst *mtmp;
+{
+	return( mtmp->mtame || index("1TVWZi&, ", mtmp->data->mlet) ||
+		(mtmp->isshk && ESHK(mtmp)->following) );
+}
+//E*O*F hack.shk.c//
+
+echo x - hack.termcap.c
+cat > "hack.termcap.c" << '//E*O*F hack.termcap.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.termcap.c - version 1.0.2 - added VS,VE,SG,TI,TO (Robert Viduya) */
+
+#include <stdio.h>
+#include "config.h"	/* for ROWNO and COLNO */
+#include "def.flag.h"	/* for flags.nonull */
+extern char *tgetstr(), *tgoto(), *getenv();
+extern long *alloc();
+
+#ifndef lint
+extern			/* it is defined in libtermlib (libtermcap) */
+#endif lint
+	short ospeed;		/* terminal baudrate; used by tputs */
+static char tbuf[512];
+static char *HO, *CL, *CE, *UP, *CM, *ND, *XD, *BC, *SO, *SE, *TI, *TE;
+static char *VS, *VE;
+static int SG;
+static char PC = '\0';
+char *CD;		/* tested in pri.c: docorner() */
+int CO, LI;		/* used in pri.c and whatis.c */
+
+startup()
+{
+	register char *term;
+	register char *tptr;
+	char *tbufptr, *pc;
+
+	tptr = (char *) alloc(1024);
+
+	tbufptr = tbuf;
+	if(!(term = getenv("TERM")))
+		error("Can't get TERM.");
+	if(!strcmp(term, "5620"))
+		flags.nonull = 1;	/* this should be a termcap flag */
+	if(tgetent(tptr,term) < 1)
+		error("Unknown terminal type: %s.", term);
+	if(pc = tgetstr("pc",&tbufptr))
+		PC = *pc;
+	if(!(BC = tgetstr("bc",&tbufptr))) {	
+		if(!tgetflag("bs"))
+			error("Terminal must backspace.");
+		BC = tbufptr;
+		tbufptr += 2;
+		*BC = '\b';
+	}
+	HO = tgetstr("ho", &tbufptr);
+	CO = tgetnum("co");
+	LI = tgetnum("li");
+	if(CO < COLNO || LI < ROWNO+2)
+		setclipped();
+	if(!(CL = tgetstr("cl",&tbufptr)) ||
+	   !(ND = tgetstr("nd", &tbufptr)) ||
+	    tgetflag("os"))
+		error("Hack needs CL, ND, and no OS.");
+	CE = tgetstr("ce",&tbufptr);
+	UP = tgetstr("up",&tbufptr);
+	/* It seems that xd is no longer supported, and we should use
+	   a linefeed instead; unfortunately this requires resetting
+	   CRMOD, and many output routines will have to be modified
+	   slightly. Let's leave that till the next release. */
+	XD = tgetstr("xd",&tbufptr);
+	if(!(CM = tgetstr("cm",&tbufptr))) {
+		if(!UP && !HO)
+			error("Hack needs CM or UP or HO.");
+		printf("Playing hack on terminals without cm is suspect...\n");
+		getret();
+	}
+	SO = tgetstr("so",&tbufptr);
+	SE = tgetstr("se",&tbufptr);
+	SG = tgetnum("sg");	/* -1: not fnd; else # of spaces left by so */
+	if(!SO || !SE || (SG > 0)) SO = SE = 0;
+	CD = tgetstr("cd",&tbufptr);
+	set_whole_screen();		/* uses LI and CD */
+	if(tbufptr-tbuf > sizeof(tbuf)) error("TERMCAP entry too big...\n");
+	free(tptr);
+}
+
+start_screen()
+{
+	xputs(TI);
+	xputs(VS);
+}
+
+end_screen()
+{
+	xputs(VE);
+	xputs(TE);
+}
+
+/* Cursor movements */
+extern xchar curx, cury;
+
+curs(x,y)
+register int x,y;	/* not xchar: perhaps xchar is unsigned and
+			   curx-x would be unsigned as well */
+{
+
+	if (y == cury && x == curx)
+		return;
+	if(abs(cury-y) <= 3 && abs(curx-x) <= 3)
+		nocmov(x,y);
+	else if((x <= 3 && abs(cury-y)<= 3) || (!CM && x<abs(curx-x))) {
+		(void) putchar('\r');
+		curx = 1;
+		nocmov(x,y);
+	} else if(!CM) {
+		nocmov(x,y);
+	} else
+		cmov(x,y);
+}
+
+nocmov(x,y)
+{
+	if (cury > y) {
+		if(UP) {
+			while (cury > y) {	/* Go up. */
+				xputs(UP);
+				cury--;
+			}
+		} else if(CM) {
+			cmov(x,y);
+		} else if(HO) {
+			home();
+			curs(x,y);
+		} /* else impossible("..."); */
+	} else if (cury < y) {
+		if(XD) {
+			while(cury < y) {
+				xputs(XD);
+				cury++;
+			}
+		} else if(CM) {
+			cmov(x,y);
+		} else {
+			while(cury < y) {
+				xputc('\n');
+				curx = 1;
+				cury++;
+			}
+		}
+	}
+	if (curx < x) {		/* Go to the right. */
+		while (curx < x) {
+			xputs(ND);
+			curx++;
+		}
+	} else if (curx > x) {
+		while (curx > x) {	/* Go to the left. */
+			xputs(BC);
+			curx--;
+		}
+	}
+}
+
+cmov(x,y)
+register x,y;
+{
+	xputs(tgoto(CM,x-1,y-1));
+	cury = y;
+	curx = x;
+}
+
+xputc(c) char c; {
+	(void) fputc(c,stdout);
+}
+
+xputs(s) char *s; {
+	tputs(s, 1, xputc);
+}
+
+cl_end() {
+	if(CE)
+		xputs(CE);
+	else {	/* no-CE fix - free after Harold Rynes */
+		/* this looks terrible, especially on a slow terminal
+		   but is better than nothing */
+		register cx = curx, cy = cury;
+
+		while(curx < COLNO) {
+			xputc(' ');
+			curx++;
+		}
+		curs(cx,cy);
+	}
+}
+
+clear_screen() {
+	xputs(CL);
+	curx = cury = 1;
+}
+
+home()
+{
+	if(HO)
+		xputs(HO);
+	else if(CM)
+		xputs(tgoto(CM,0,0));
+	else
+		curs(1,1);	/* using UP ... */
+	curx = cury = 1;
+}
+
+standoutbeg()
+{
+	if(SO) xputs(SO);
+}
+
+standoutend()
+{
+	if(SE) xputs(SE);
+}
+
+backsp()
+{
+	xputs(BC);
+	curx--;
+}
+
+bell()
+{
+	(void) putchar('\007');		/* curx does not change */
+	(void) fflush(stdout);
+}
+
+static short tmspc10[] = {		/* from termcap */
+	0, 2000, 1333, 909, 743, 666, 500, 333, 166, 83, 55, 41, 20, 10, 5
+};
+
+delay_output() {
+	/* delay 50 ms - could also use a 'nap'-system call */
+	/* BUG: if the padding character is visible, as it is on the 5620
+	   then this looks terrible. */
+	if(!flags.nonull)
+		tputs("50", 1, xputc);
+	else if(ospeed > 0 || ospeed < SIZE(tmspc10)) if(CM) {
+		/* delay by sending cm(here) an appropriate number of times */
+		register int cmlen = strlen(tgoto(CM, curx-1, cury-1));
+		register int i = 500 + tmspc10[ospeed]/2;
+
+		while(i > 0) {
+			cmov(curx,cury);
+			i -= cmlen*tmspc10[ospeed];
+		}
+	}
+}
+
+cl_eos()			/* free after Robert Viduya */
+{				/* must only be called with curx = 1 */
+
+	if(CD)
+		xputs(CD);
+	else {
+		register int cx = curx, cy = cury;
+		while(cury <= LI-2) {
+			cl_end();
+			xputc('\n');
+			curx = 1;
+			cury++;
+		}
+		cl_end();
+		curs(cx,cy);
+	}
+}
+//E*O*F hack.termcap.c//
+
+echo x - hack.timeout.c
+cat > "hack.timeout.c" << '//E*O*F hack.timeout.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.timeout.c - version 1.0.2 */
+
+#include	"hack.h"
+
+timeout(){
+register struct prop *upp;
+	for(upp = u.uprops; upp < u.uprops+SIZE(u.uprops); upp++)
+	    if((upp->p_flgs & TIMEOUT) && !--upp->p_flgs) {
+		if(upp->p_tofn) (*upp->p_tofn)();
+		else switch(upp - u.uprops){
+		case SICK:
+			pline("You die because of food poisoning");
+			killer = u.usick_cause;
+			done("died");
+			/* NOTREACHED */
+		case FAST:
+			pline("You feel yourself slowing down");
+			break;
+		case CONFUSION:
+			pline("You feel less confused now");
+			break;
+		case BLIND:
+			pline("You can see again");
+			setsee();
+			break;
+		case INVIS:
+			on_scr(u.ux,u.uy);
+			pline("You are no longer invisible.");
+		}
+	}
+}
+//E*O*F hack.timeout.c//
+
+echo x - hack.topl.c
+cat > "hack.topl.c" << '//E*O*F hack.topl.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.topl.c - version 1.0.2 */
+
+#include "hack.h"
+#include <stdio.h>
+extern char *eos();
+extern int CO;
+
+char toplines[BUFSZ];
+xchar tlx, tly;			/* set by pline; used by addtopl */
+
+struct topl {
+	struct topl *next_topl;
+	char *topl_text;
+} *old_toplines, *last_redone_topl;
+#define	OTLMAX	20		/* max nr of old toplines remembered */
+
+doredotopl(){
+	if(last_redone_topl)
+		last_redone_topl = last_redone_topl->next_topl;
+	if(!last_redone_topl)
+		last_redone_topl = old_toplines;
+	if(last_redone_topl){
+		(void) strcpy(toplines, last_redone_topl->topl_text);
+	}
+	redotoplin();
+	return(0);
+}
+
+redotoplin() {
+	home();
+	if(index(toplines, '\n')) cl_end();
+	putstr(toplines);
+	cl_end();
+	tlx = curx;
+	tly = cury;
+	flags.toplin = 1;
+	if(tly > 1)
+		more();
+}
+
+remember_topl() {
+register struct topl *tl;
+register int cnt = OTLMAX;
+	if(last_redone_topl &&
+	   !strcmp(toplines, last_redone_topl->topl_text)) return;
+	if(old_toplines &&
+	   !strcmp(toplines, old_toplines->topl_text)) return;
+	last_redone_topl = 0;
+	tl = (struct topl *)
+		alloc((unsigned)(strlen(toplines) + sizeof(struct topl) + 1));
+	tl->next_topl = old_toplines;
+	tl->topl_text = (char *)(tl + 1);
+	(void) strcpy(tl->topl_text, toplines);
+	old_toplines = tl;
+	while(cnt && tl){
+		cnt--;
+		tl = tl->next_topl;
+	}
+	if(tl && tl->next_topl){
+		free((char *) tl->next_topl);
+		tl->next_topl = 0;
+	}
+}
+
+addtopl(s) char *s; {
+	curs(tlx,tly);
+	if(tlx + strlen(s) > CO) putsym('\n');
+	putstr(s);
+	tlx = curx;
+	tly = cury;
+	flags.toplin = 1;
+}
+
+xmore(s)
+char *s;	/* allowed chars besides space/return */
+{
+	if(flags.toplin) {
+		curs(tlx, tly);
+		if(tlx + 8 > CO) putsym('\n'), tly++;
+	}
+
+	if(flags.standout)
+		standoutbeg();
+	putstr("--More--");
+	if(flags.standout)
+		standoutend();
+
+	xwaitforspace(s);
+	if(flags.toplin && tly > 1) {
+		home();
+		cl_end();
+		docorner(1, tly-1);
+	}
+	flags.toplin = 0;
+}
+
+more(){
+	xmore("");
+}
+
+cmore(s)
+register char *s;
+{
+	xmore(s);
+}
+
+clrlin(){
+	if(flags.toplin) {
+		home();
+		cl_end();
+		if(tly > 1) docorner(1, tly-1);
+		remember_topl();
+	}
+	flags.toplin = 0;
+}
+
+/*VARARGS1*/
+pline(line,arg1,arg2,arg3,arg4,arg5,arg6)
+register char *line,*arg1,*arg2,*arg3,*arg4,*arg5,*arg6;
+{
+	char pbuf[BUFSZ];
+	register char *bp = pbuf, *tl;
+	register int n,n0;
+
+	if(!line || !*line) return;
+	if(!index(line, '%')) (void) strcpy(pbuf,line); else
+	(void) sprintf(pbuf,line,arg1,arg2,arg3,arg4,arg5,arg6);
+	if(flags.toplin == 1 && !strcmp(pbuf, toplines)) return;
+	nscr();		/* %% */
+
+	/* If there is room on the line, print message on same line */
+	/* But messages like "You die..." deserve their own line */
+	n0 = strlen(bp);
+	if(flags.toplin == 1 && tly == 1 &&
+	    n0 + strlen(toplines) + 3 < CO-8 &&  /* leave room for --More-- */
+	    strncmp(bp, "You ", 4)) {
+		(void) strcat(toplines, "  ");
+		(void) strcat(toplines, bp);
+		tlx += 2;
+		addtopl(bp);
+		return;
+	}
+	if(flags.toplin == 1) more();
+	remember_topl();
+	toplines[0] = 0;
+	while(n0){
+		if(n0 >= CO){
+			/* look for appropriate cut point */
+			n0 = 0;
+			for(n = 0; n < CO; n++) if(bp[n] == ' ')
+				n0 = n;
+			if(!n0) for(n = 0; n < CO-1; n++)
+				if(!letter(bp[n])) n0 = n;
+			if(!n0) n0 = CO-2;
+		}
+		(void) strncpy((tl = eos(toplines)), bp, n0);
+		tl[n0] = 0;
+		bp += n0;
+
+		/* remove trailing spaces, but leave one */
+		while(n0 > 1 && tl[n0-1] == ' ' && tl[n0-2] == ' ')
+			tl[--n0] = 0;
+
+		n0 = strlen(bp);
+		if(n0 && tl[0]) (void) strcat(tl, "\n");
+	}
+	redotoplin();
+}
+
+putsym(c) char c; {
+	switch(c) {
+	case '\b':
+		backsp();
+		return;
+	case '\n':
+		curx = 1;
+		cury++;
+		if(cury > tly) tly = cury;
+		break;
+	default:
+		if(curx == CO)
+			putsym('\n');	/* 1 <= curx <= CO; avoid CO */
+		else
+			curx++;
+	}
+	(void) putchar(c);
+}
+
+putstr(s) register char *s; {
+	while(*s) putsym(*s++);
+}
+//E*O*F hack.topl.c//
+
+echo x - hack.track.c
+cat > "hack.track.c" << '//E*O*F hack.track.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.track.c - version 1.0.2 */
+
+#include "hack.h"
+
+#define	UTSZ	50
+
+coord utrack[UTSZ];
+int utcnt = 0;
+int utpnt = 0;
+
+initrack(){
+	utcnt = utpnt = 0;
+}
+
+/* add to track */
+settrack(){
+	if(utcnt < UTSZ) utcnt++;
+	if(utpnt == UTSZ) utpnt = 0;
+	utrack[utpnt].x = u.ux;
+	utrack[utpnt].y = u.uy;
+	utpnt++;
+}
+
+coord *
+gettrack(x,y) register x,y; {
+register int i,cnt,dist;
+coord tc;
+	cnt = utcnt;
+	for(i = utpnt-1; cnt--; i--){
+		if(i == -1) i = UTSZ-1;
+		tc = utrack[i];
+		dist = (x-tc.x)*(x-tc.x) + (y-tc.y)*(y-tc.y);
+		if(dist < 3)
+			return(dist ? &(utrack[i]) : 0);
+	}
+	return(0);
+}
+//E*O*F hack.track.c//
+
+echo x - hack.trap.c
+cat > "hack.trap.c" << '//E*O*F hack.trap.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.trap.c - version 1.0.2 */
+
+#include	"hack.h"
+
+extern struct monst *makemon();
+
+char vowels[] = "aeiou";
+
+char *traps[] = {
+	" bear trap",
+	"n arrow trap",
+	" dart trap",
+	" trapdoor",
+	" teleportation trap",
+	" pit",
+	" sleeping gas trap",
+	" piercer",
+	" mimic"
+};
+
+struct trap *
+maketrap(x,y,typ)
+register x,y,typ;
+{
+	register struct trap *ttmp;
+
+	ttmp = newtrap();
+	ttmp->ttyp = typ;
+	ttmp->tseen = 0;
+	ttmp->once = 0;
+	ttmp->tx = x;
+	ttmp->ty = y;
+	ttmp->ntrap = ftrap;
+	ftrap = ttmp;
+	return(ttmp);
+}
+
+dotrap(trap) register struct trap *trap; {
+	register int ttype = trap->ttyp;
+
+	nomul(0);
+	if(trap->tseen && !rn2(5) && ttype != PIT)
+		pline("You escape a%s.", traps[ttype]);
+	else {
+		trap->tseen = 1;
+		switch(ttype) {
+		case SLP_GAS_TRAP:
+			pline("A cloud of gas puts you to sleep!");
+			nomul(-rnd(25));
+			break;
+		case BEAR_TRAP:
+			if(Levitation) {
+				pline("You float over a bear trap.");
+				break;
+			}
+			u.utrap = 4 + rn2(4);
+			u.utraptype = TT_BEARTRAP;
+			pline("A bear trap closes on your foot!");
+			break;
+		case PIERC:
+			deltrap(trap);
+			if(makemon(PM_PIERCER,u.ux,u.uy)) {
+			  pline("A piercer suddenly drops from the ceiling!");
+			  if(uarmh)
+				pline("Its blow glances off your helmet.");
+			  else
+				(void) thitu(3,d(4,6),"falling piercer");
+			}
+			break;
+		case ARROW_TRAP:
+			pline("An arrow shoots out at you!");
+			if(!thitu(8,rnd(6),"arrow")){
+				mksobj_at(ARROW, u.ux, u.uy);
+				fobj->quan = 1;
+			}
+			break;
+		case TRAPDOOR:
+			if(!xdnstair) {
+pline("A trap door in the ceiling opens and a rock falls on your head!");
+if(uarmh) pline("Fortunately, you are wearing a helmet!");
+			losehp(uarmh ? 2 : d(2,10),"falling rock");
+			} else {
+			    register int newlevel = dlevel + 1;
+				while(!rn2(4) && newlevel < 29)
+					newlevel++;
+				pline("A trap door opens up under you!");
+				if(Levitation || u.ustuck) {
+ 				pline("For some reason you don't fall in.");
+					break;
+				}
+
+				goto_level(newlevel, FALSE);
+			}
+			break;
+		case DART_TRAP:
+			pline("A little dart shoots out at you!");
+			if(thitu(7,rnd(3),"little dart")) {
+			    if(!rn2(6))
+				poisoned("dart","poison dart");
+			} else {
+				mksobj_at(DART, u.ux, u.uy);
+				fobj->quan = 1;
+			}
+			break;
+		case TELEP_TRAP:
+			if(trap->once) {
+				deltrap(trap);
+				newsym(u.ux,u.uy);
+				vtele();
+			} else {
+				newsym(u.ux,u.uy);
+				tele();
+			}
+			break;
+		case PIT:
+			if(Levitation) {
+				pline("A pit opens up under you!");
+				pline("You don't fall in!");
+				break;
+			}
+			pline("You fall into a pit!");
+			u.utrap = rn1(6,2);
+			u.utraptype = TT_PIT;
+			losehp(rnd(6),"fall into a pit");
+			selftouch("Falling, you");
+			break;
+		default:
+			impossible("You hit a trap of type %u", trap->ttyp);
+		}
+	}
+}
+
+mintrap(mtmp) register struct monst *mtmp; {
+	register struct trap *trap = t_at(mtmp->mx, mtmp->my);
+	register int wasintrap = mtmp->mtrapped;
+
+	if(!trap) {
+		mtmp->mtrapped = 0;	/* perhaps teleported? */
+	} else if(wasintrap) {
+		if(!rn2(40)) mtmp->mtrapped = 0;
+	} else {
+	    register int tt = trap->ttyp;
+	    int in_sight = cansee(mtmp->mx,mtmp->my);
+	    extern char mlarge[];
+
+	    if(mtmp->mtrapseen & (1 << tt)) {
+		/* he has been in such a trap - perhaps he escapes */
+		if(rn2(4)) return(0);
+	    }
+	    mtmp->mtrapseen |= (1 << tt);
+	    switch (tt) {
+		case BEAR_TRAP:
+			if(index(mlarge, mtmp->data->mlet)) {
+				if(in_sight)
+				  pline("%s is caught in a bear trap!",
+					Monnam(mtmp));
+				else
+				  if(mtmp->data->mlet == 'o')
+			    pline("You hear the roaring of an angry bear!");
+				mtmp->mtrapped = 1;
+			}
+			break;
+		case PIT:
+			if(!index("Eyw", mtmp->data->mlet)) {
+				mtmp->mtrapped = 1;
+				if(in_sight)
+				  pline("%s falls in a pit!", Monnam(mtmp));
+			}
+			break;
+		case SLP_GAS_TRAP:
+			if(!mtmp->msleep && !mtmp->mfroz) {
+				mtmp->msleep = 1;
+				if(in_sight)
+				  pline("%s suddenly falls asleep!",
+					Monnam(mtmp));
+			}
+			break;
+		case TELEP_TRAP:
+			rloc(mtmp);
+			if(in_sight && !cansee(mtmp->mx,mtmp->my))
+				pline("%s suddenly disappears!",
+					Monnam(mtmp));
+			break;
+		case ARROW_TRAP:
+			if(in_sight) {
+				pline("%s is hit by an arrow!",
+					Monnam(mtmp));
+			}
+			mtmp->mhp -= 3;
+			break;
+		case DART_TRAP:
+			if(in_sight) {
+				pline("%s is hit by a dart!",
+					Monnam(mtmp));
+			}
+			mtmp->mhp -= 2;
+			/* not mondied here !! */
+			break;
+		case TRAPDOOR:
+			if(!xdnstair) {
+				mtmp->mhp -= 10;
+				if(in_sight)
+pline("A trap door in the ceiling opens and a rock hits %s!", monnam(mtmp));
+				break;
+			}
+			if(mtmp->data->mlet != 'w'){
+				fall_down(mtmp);
+				if(in_sight)
+		pline("Suddenly, %s disappears out of sight.", monnam(mtmp));
+				return(2);	/* no longer on this level */
+			}
+			break;
+		case PIERC:
+			break;
+		default:
+			impossible("Some monster encountered a strange trap.");
+	    }
+	}
+	return(mtmp->mtrapped);
+}
+
+selftouch(arg) char *arg; {
+	if(uwep && uwep->otyp == DEAD_COCKATRICE){
+		pline("%s touch the dead cockatrice.", arg);
+		pline("You turn to stone.");
+		killer = objects[uwep->otyp].oc_name;
+		done("died");
+	}
+}
+
+float_up(){
+	if(u.utrap) {
+		if(u.utraptype == TT_PIT) {
+			u.utrap = 0;
+			pline("You float up, out of the pit!");
+		} else {
+			pline("You float up, only your leg is still stuck.");
+		}
+	} else
+		pline("You start to float in the air!");
+}
+
+float_down(){
+	register struct trap *trap;
+	pline("You float gently to the ground.");
+	if(trap = t_at(u.ux,u.uy))
+		switch(trap->ttyp) {
+		case PIERC:
+			break;
+		case TRAPDOOR:
+			if(!xdnstair || u.ustuck) break;
+			/* fall into next case */
+		default:
+			dotrap(trap);
+	}
+	pickup(1);
+}
+
+vtele() {
+#include "def.mkroom.h"
+	register struct mkroom *croom;
+	for(croom = &rooms[0]; croom->hx >= 0; croom++)
+	    if(croom->rtype == VAULT) {
+		register x,y;
+
+		x = rn2(2) ? croom->lx : croom->hx;
+		y = rn2(2) ? croom->ly : croom->hy;
+		if(teleok(x,y)) {
+		    teleds(x,y);
+		    return;
+		}
+	    }
+	tele();
+}
+
+tele() {
+	extern coord getpos();
+	coord cc;
+	register int nux,nuy;
+
+	if(Teleport_control) {
+		pline("To what position do you want to be teleported?");
+		cc = getpos(1, "the desired position"); /* 1: force valid */
+		/* possible extensions: introduce a small error if
+		   magic power is low; allow transfer to solid rock */
+		if(teleok(cc.x, cc.y)){
+			teleds(cc.x, cc.y);
+			return;
+		}
+		pline("Sorry ...");
+	}
+	do {
+		nux = rnd(COLNO-1);
+		nuy = rn2(ROWNO);
+	} while(!teleok(nux, nuy));
+	teleds(nux, nuy);
+}
+
+teleds(nux, nuy)
+register int nux,nuy;
+{
+	if(Punished) unplacebc();
+	unsee();
+	u.utrap = 0;
+	u.ustuck = 0;
+	u.ux = nux;
+	u.uy = nuy;
+	setsee();
+	if(Punished) placebc(1);
+	if(u.uswallow){
+		u.uswldtim = u.uswallow = 0;
+		docrt();
+	}
+	nomul(0);
+	(void) inshop();
+	pickup(1);
+	if(!Blind) read_engr_at(u.ux,u.uy);
+}
+
+teleok(x,y) register int x,y; {	/* might throw him into a POOL */
+	return( isok(x,y) && !IS_ROCK(levl[x][y].typ) && !m_at(x,y) &&
+		!sobj_at(ENORMOUS_ROCK,x,y) && !t_at(x,y)
+	);
+	/* Note: gold is permitted (because of vaults) */
+}
+
+dotele() {
+	extern char pl_character[];
+
+	if(
+#ifdef WIZARD
+	   !wizard &&
+#endif WIZARD
+		      (!Teleportation || u.ulevel < 6 ||
+			(pl_character[0] != 'W' && u.ulevel < 10))) {
+		pline("You are not able to teleport at will.");
+		return(0);
+	}
+	if(u.uhunger <= 100 || u.ustr < 6) {
+		pline("You miss the strength for a teleport spell.");
+		return(1);
+	}
+	tele();
+	morehungry(100);
+	return(1);
+}
+
+placebc(attach) int attach; {
+	if(!uchain || !uball){
+		impossible("Where are your chain and ball??");
+		return;
+	}
+	uball->ox = uchain->ox = u.ux;
+	uball->oy = uchain->oy = u.uy;
+	if(attach){
+		uchain->nobj = fobj;
+		fobj = uchain;
+		if(!carried(uball)){
+			uball->nobj = fobj;
+			fobj = uball;
+		}
+	}
+}
+
+unplacebc(){
+	if(!carried(uball)){
+		freeobj(uball);
+		unpobj(uball);
+	}
+	freeobj(uchain);
+	unpobj(uchain);
+}
+
+#define MAXLEVEL	40
+
+level_tele() {
+register int newlevel;
+	if(Teleport_control) {
+	    char buf[BUFSZ];
+
+	    pline("To what level do you want to teleport? [type a number] ");
+	    getlin(buf);
+	    newlevel = atoi(buf);
+	} else {
+	    newlevel  = 5 + rn2(20);	/* 5 - 24 */
+	    if(dlevel == newlevel)
+		if(!xdnstair) newlevel--; else newlevel++;
+	}
+	if(newlevel >= 30) {
+	    if(newlevel >= MAXLEVEL) newlevel = MAXLEVEL-1;
+	    pline("You arrive at the center of the earth ...");
+	    pline("Unfortunately it is here that hell is located.");
+	    if(Fire_resistance) {
+		pline("But the fire doesn't seem to harm you.");
+	    } else {
+		pline("You burn to a crisp.");
+		dlevel = maxdlevel = newlevel;
+		killer = "visit to the hell";
+		done("burned");
+	    }
+	}
+	if(newlevel < 0) {
+	    newlevel = 0;
+	    pline("You are now high above the clouds ...");
+	    if(Levitation) {
+		pline("You float gently down to earth.");
+		done("escaped");
+	    }
+	    pline("Unfortunately, you don't know how to fly.");
+	    pline("You fall down a few thousand feet and break your neck.");
+	    dlevel = 0;
+	    killer = "fall";
+	    done("died");
+	}
+	if(newlevel == 0)
+	    done("escaped");
+	goto_level(newlevel, FALSE);
+}
+//E*O*F hack.trap.c//
+
+echo x - hack.tty.c
+cat > "hack.tty.c" << '//E*O*F hack.tty.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.tty.c - version 1.0.2 */
+
+#include	"hack.h"
+#include	<stdio.h>
+#include	<sgtty.h>
+#include	<ctype.h>	/* for isprint() */
+
+struct sgttyb inittyb, curttyb;
+extern short ospeed;
+char erase_char, kill_char;
+static boolean settty_needed = FALSE;
+
+/*
+ * Get initial state of terminal, set ospeed (for termcap routines)
+ * and switch off tab expansion if necessary.
+ * Called by startup() in termcap.c and after returning from ! or ^Z
+ */
+gettty(){
+	(void) gtty(0, &inittyb);
+	(void) gtty(0, &curttyb);
+	ospeed = inittyb.sg_ospeed;
+	erase_char = inittyb.sg_erase;
+	kill_char = inittyb.sg_kill;
+	getioctls();
+
+	/* do not expand tabs - they might be needed inside a cm sequence */
+	if(curttyb.sg_flags & XTABS) {
+		curttyb.sg_flags &= ~XTABS;
+		setctty();
+	}
+	settty_needed = TRUE;
+}
+
+/* fatal error */
+/*VARARGS1*/
+error(s,x,y) char *s; {
+	if(settty_needed)
+		settty((char *) 0);
+	printf(s,x,y);
+	putchar('\n');
+	exit(1);
+}
+
+/* reset terminal to original state */
+settty(s) char *s; {
+	clear_screen();
+	end_screen();
+	if(s) printf(s);
+	(void) fflush(stdout);
+	if(stty(0, &inittyb) == -1)
+		puts("Cannot change tty");
+	flags.echo = (inittyb.sg_flags & ECHO) ? ON : OFF;
+	flags.cbreak = (inittyb.sg_flags & CBREAK) ? ON : OFF;
+	setioctls();
+}
+
+setctty(){
+	if(stty(0, &curttyb) == -1) puts("Cannot change tty");
+}
+
+
+setftty(){
+	flags.cbreak = ON;
+	flags.echo = OFF;
+	setxtty();
+}
+
+setxtty(){
+register int ef = (flags.echo == ON) ? ECHO : 0;
+register int cf = (flags.cbreak == ON) ? CBREAK : 0;
+register int change = 0;
+	/* Should use (ECHO|CRMOD) here instead of ECHO */
+	if((curttyb.sg_flags & ECHO) != ef){
+		curttyb.sg_flags &= ~ECHO;
+		curttyb.sg_flags |= ef;
+		change++;
+	}
+	if((curttyb.sg_flags & CBREAK) != cf){
+		curttyb.sg_flags &= ~CBREAK;
+		curttyb.sg_flags |= cf;
+		change++;
+	}
+	if(change){
+		setctty();
+	}
+	start_screen();
+}
+
+getlin(bufp)
+register char *bufp;
+{
+	register char *obufp = bufp;
+	register int c;
+
+	flags.toplin = 2;		/* nonempty, no --More-- required */
+	for(;;) {
+		(void) fflush(stdout);
+		if((c = getchar()) == EOF) {
+			*bufp = 0;
+			return;
+		}
+		if(c == erase_char || c == '\b') {
+			if(bufp != obufp) {
+				bufp--;
+				putstr("\b \b"); /* putsym converts \b */
+			} else	bell();
+		} else if(c == '\n') {
+			*bufp = 0;
+			return;
+		} else if(c == kill_char || c == '\177') { /* Robert Viduya */
+			while(bufp != obufp) {
+				bufp--;
+				putstr("\b \b");
+			}
+		} else if(isprint(c)) {
+			*bufp = c;
+			bufp[1] = 0;
+			putstr(bufp);
+			if(bufp-obufp < BUFSZ-1 && bufp-obufp < COLNO)
+				bufp++;
+		} else
+			bell();
+	}
+}
+
+getret() {
+	xgetret("");
+}
+
+cgetret(s)
+register char *s;
+{
+	xgetret(s);
+}
+
+xgetret(s)
+register char *s;
+{
+	putsym('\n');
+	if(flags.standout)
+		standoutbeg();
+	putstr("Hit ");
+	putstr(flags.cbreak ? "space" : "return");
+	putstr(" to continue: ");
+	if(flags.standout)
+		standoutend();
+	xwaitforspace(s);
+}
+
+char morc;	/* tell the outside world what char he used */
+
+xwaitforspace(s)
+register char *s;	/* chars allowed besides space or return */
+{
+register int c;
+
+	(void) fflush(stdout);
+	morc = 0;
+
+	while((c = getchar()) != '\n') {
+	    if(c == EOF)
+		end_of_input();
+	    if(flags.cbreak) {
+		if(c == ' ') break;
+		if(s && index(s,c)) {
+			morc = c;
+			break;
+		}
+		bell();		/* useless if !cbreak */
+	    }
+	}
+}
+
+char *
+parse()
+{
+	static char inline[COLNO];
+	register foo;
+
+	flags.move = 1;
+	if(!Invis) curs_on_u(); else home();
+	(void) fflush(stdout);
+	while((foo = getchar()) >= '0' && foo <= '9')
+		multi += 10*multi+foo-'0';
+	if(multi) {
+		multi--;
+		save_cm = inline;
+	}
+	inline[0] = foo;
+	inline[1] = 0;
+	if(foo == EOF)
+		end_of_input();
+	if(foo == 'f' || foo == 'F'){
+		inline[1] = getchar();
+#ifdef QUEST
+		if(inline[1] == foo) inline[2] = getchar(); else
+#endif QUEST
+		inline[2] = 0;
+	}
+	if(foo == 'm' || foo == 'M'){
+		inline[1] = getchar();
+		inline[2] = 0;
+	}
+	clrlin();
+	return(inline);
+}
+
+char
+readchar() {
+	register int sym;
+	(void) fflush(stdout);
+	if((sym = getchar()) == EOF)
+		end_of_input();
+	if(flags.toplin == 1) flags.toplin = 2;
+	return((char) sym);
+}
+
+end_of_input()
+{
+	settty("End of input?\n");
+	clearlocks();
+	exit(0);
+}
+
+//E*O*F hack.tty.c//
+
+exit 0
+
+

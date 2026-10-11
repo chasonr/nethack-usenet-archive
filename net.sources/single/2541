@@ -1,0 +1,301 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,546f646959df0a8f,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-03-08 09:06:06 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83 (MC840302); site cernvax.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!bellcore!decvax!genrad!panda!talcott!harvard!seismo!mcvax!cernvax!apj
+From: apj@cernvax.UUCP (apj)
+Newsgroups: net.sources
+Subject: Increase the size of your IBM PC kbd
+Message-ID: <139@cernvax.UUCP>
+Date: Fri, 8-Mar-85 12:06:06 EST
+Article-I.D.: cernvax.139
+Posted: Fri Mar  8 12:06:06 1985
+Date-Received: Mon, 11-Mar-85 05:36:20 EST
+Reply-To: apj@cernvax.UUCP ()
+Organization: CERN, Geneva/Switzerland
+Lines: 280
+
+
+vectors 	segment at 0h
+
+	org	9h*4
+keyboard_int_vector	label	dword
+	org	16h*4
+keyboard_io_vector	label	dword
+vectors 	ends
+
+;==============================================================================
+
+rom_bios_data	segment at 40h
+	org	17h
+kbd_flag	db	?
+	org	1ah
+rom_buffer_head dw	?
+rom_buffer_tail dw	?
+kb_buffer	dw	16d dup (?)
+kb_buffer_end	label	word
+rom_bios_data	ends
+
+;==============================================================================
+
+code_seg	segment
+	assume	cs:code_seg
+	org	100h
+begin:	jmp	init_vectors		;initialize vectors and attach to dos
+rom_keyboard_int	dd
+rom_keyboard_io 	dd
+buffer_head		dw	offset keyboard_buffer
+buffer_tail		dw	offset keyboard_buffer
+keyboard_buffer 	dw	160d dup(0)	;159 character input buffer
+keyboard_buffer_end	label	word
+
+;--------------------------------------------------------;
+; this procedure sends a short beep when the buffer fills
+;--------------------------------------------------------;
+
+kb_control	equ	61h		;control bits for keyboard & speaker
+error_beep	proc	near
+	push	ax
+	push	bx
+	push	cx
+	pushf				;save old interupt enable flag
+	cli				;turn off beep during interupt
+	mov	bx,30d			;number of cycles for 1/8 second tone
+	in	al,kb_control		;get information from speaker port
+	push	ax			;save control information
+start_of_one_cycle:
+	and	al,0fch 		;turn off speaker
+	out	kb_control,al
+	mov	cx,60d			;delay for one half cycle
+off_loop:
+	loop	off_loop
+	or	al,2			;turn off speaker
+	out	kb_control,al
+	mov	cx,60d			;delay for second half cycle
+on_loop:
+	loop	on_loop
+	dec	bx			;200 cycles yet?
+	jnz	start_of_one_cycle
+	pop	ax			;recover old keyboard information
+	out	kb_control,al
+	popf				;restore interupt flag
+	pop	cx
+	pop	bx
+	pop	ax
+	ret
+error_beep	endp
+
+;------------------------------------------------------------------------------
+
+;this procedure checks the rom keyboard buffer to see if some program
+;tried to clear this buffer. we know it's been cleared when the rom
+;tail and header overlap. normally, the new procedures below keep the
+;dummy character, word 0,in the buffer.
+;
+;uses: bx,ds
+;writes:	buffer_head,buffer_tail,rom_buffer_head,
+;		rom_buffer_tail
+;reads: 	keyboard_buffer,kb_buffer
+
+check_clear_buffer	proc near
+	assume	ds:rom_bios_data
+	mov	bx,rom_bios_data	;establish pointer to bios data
+	mov	ds,bx
+	cli				;turn off interupts during this check
+	mov	bx,rom_buffer_head	;check tn see if buffer cleared
+	cmp	bx,rom_buffer_tail	;is the buffer empty?
+	jne	buffer_ok		;no, then everything is alright
+					;yes, then clear the internal buffer
+	mov	bx,offset kb_buffer	;reset buffer with word 0 in buffer
+	mov	rom_buffer_head,bx
+	add	bx,2
+	mov	rom_buffer_tail,bx
+	assume	ds:code_seg
+	mov	bx,cs
+	mov	ds,bx
+	mov	bx,offset keyboard_buffer ;reset internal buffer
+	mov	buffer_head,bx
+	mov	buffer_tail,bx
+buffer_ok:
+	assume	ds:code_seg
+	sti				;interupts back on
+	ret
+check_clear_buffer	endp
+
+;------------------------------------------------------------------------------
+
+;this procedure intercepts the keyboard interrupt and moves any new
+;characters to the internal, 80 character buffer.
+
+intercept_keyboard_int	proc	near
+	assume	ds:nothing
+	push	ds
+	push	si
+	push	bx
+	push	ax
+	call	check_clear_buffer	;check for buffer cleared
+	pushf
+	call	rom_keyboard_int	;read scan code with bios routines
+;-----	transfer any characters to internal buffer
+	assume	ds:rom_bios_data
+	mov	bx,rom_bios_data	;establish pointer to bios data
+	mov	ds,bx
+	mov	si,buffer_tail
+	mov	bx,rom_buffer_head	;check if real characters in buffer
+	inc	bx			;skip over dummy character
+	inc	bx
+	cmp	bx,offset kb_buffer_end
+	jb	dont_wrap		;no need to wrap the pointer
+	mov	bx,offset kb_buffer	;wrap the pointer
+dont_wrap:
+	cmp	bx,rom_buffer_tail	;is there a real character?
+	je	no_new_characers	;no then return to caller
+	mov	ax,[bx] 		;yes,move character to internal buffer
+	mov	cs:[si],ax
+	inc	si
+	inc	si			;move to next position
+	cmp	si,offset keyboard_buffer_end
+	jb	not_at_end
+	mov	si,offset keyboard_buffer
+not_at_end:
+	cmp	si,buffer_head		;buffer overrun?
+	jne	write_to_buffer 	;yes beep and throw out character
+	call	error_beep
+	jmp	short not_at_kb_end
+write_to_buffer:
+	mov	buffer_tail,si
+not_at_kb_end:
+	mov	rom_buffer_head,bx
+
+no_new_characters:
+;----	see if ctrl + alt pushed, and clear buffer if so
+
+	mov	al,kbd_flag		;get status of shift keys into al
+	and	al,0ch			;isolate alt and crtl shift flags
+	cmp	al,0ch			;are both the alt and crtl keys down?
+	jne	dont_clear_buffer	;no, then dont clear the buffer
+	mov	ax,buffer_tail		;yes, then clear the buffer
+	mov	buffer_head,ax
+
+dont_clear_buffer:
+	pop	ax
+	pop	bx
+	pop	si
+	pop	ds
+	iret
+intercept_keyboard_int endp
+
+;-----------------------------------------------------------------------;
+;this procedure replaces the rom bios routines for reading a character	;
+;-----------------------------------------------------------------------;
+	assume	ds:code_seg
+
+;------------------------------------------------------------------------------
+
+intercept_keyboard_io proc	far
+	sti				;interrupts back on
+	push	ds			;save current ds
+	push	bx			;save bx temporarily
+	call	check_clear_buffer	;check for buffer cleared
+	mov	bx,cs			;establish pointer to data area
+	mov	ds,bx
+	or	ah,ah			;ah=0?
+	jz	read_character		;yes, read a character
+	cmp	ah,1			;ah=1?
+	jz	read_status		;yes, return the status
+	pop	bx			;let rom bios handle other functhons
+	pop	ds
+	assume	ds:nothing
+	jmp	rom_keyboard_io 	;call rom bios for other functions
+	assume	ds:code_seg		;ascii read
+
+;--=-	read the key
+
+read_character: 			;ascii read
+	sti				;interrupts back on during loop
+	nop				;allow an interrupt to occur
+	cli				;interrupts back off
+	mov	bx,buffer_head		;get pointer to head of buffer
+	cmp	bx,buffer_tail		;test end of buffer
+	je	read_character		;loop until something in buffer
+	mov	ax,[bx] 		;get scan code and ascii code
+	add	bx,2			;move to next word in buffer
+	cmp	bx,offset keyboard_buffer_end	;at end of buffer?
+	jne	save_pointer		;no, continue
+	mov	bx,offset keyboard_buffer	;yes, reset to buffer start
+save_pointer:
+	mov	buffer_head,bx		;store value in variable
+	pop	bx
+	pop	ds
+	iret				;return to caller
+
+;----	ascii status
+
+read_status:
+	cli				;interrupts off
+	mov	bx,buffer_head		;get head pointer
+	cmp	bx,buffer_tail		;if equal (zf=1) then nothing there
+	mov	ax,[bx]
+	sti				;interrupts back on
+	pop	bx			;recover registers
+	pop	ds
+	ret	2			;throw away flags
+
+intercept_keyboard_io	endp
+
+;-----------------------------------------------------------------;
+;this procedure initializes the interrupt vectors.		  ;
+;-----------------------------------------------------------------;
+
+;------------------------------------------------------------------------------
+
+init_vectors	proc	near
+	assume	ds:vectors
+	push	ds			;save old data segment
+	mov	ax,vectors		;set up the data segment for vectors
+	mov	ds,ax
+	cli				;dont allow interrupts
+
+	mov	ax,keyboard_int_vector	;save addresses of bios routines
+	mov	rom_keyboard_int,ax
+	mov	ax,keyboard_int_vector[2]
+	mov	rom_keyboard_int[2],ax
+					;set up new keyboard_int vector
+	mov	keyboard_int_vector,offset intercept_keyboard_int
+	mov	keyboard_int_vector[2],cs
+	sti				;allow interrupts again
+					;set up keyboard_io vector
+	mov	ax,keyboard_io_vector
+	mov	rom_keyboard_io,ax
+	mov	ax,keyboard_io_vector[2]
+	mov	rom_keyboard_io[2],ax
+	mov	keyboard_io_vector,offset intercept_keyboard_io
+	mov	keyboard_io_vector[2],cs
+					;now set up the the kbd buffer, etc.
+
+	assume	ds:rom_bios_data
+	mov	ax,rom_bios_data
+	mov	ds,ax
+	cli				;dont allow interrupts now
+	mov	bx,offset kb_buffer
+	mov	rom_buffer_head,bx
+	mov	word ptr [bx],0
+	add	bx,2
+	mov	rom_buffer_tail,bx
+	sti				;allow interrupts again
+
+	mov	dx,offset init_vectors	;end of resident portions
+	int	27h			;terminate but stay resident
+init_vectors	endp
+
+;------------------------------------------------------------------------------
+
+code_seg	ends
+
+;==============================================================================
+
+	end	begin
+
+

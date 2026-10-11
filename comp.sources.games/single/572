@@ -1,0 +1,2192 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,d6c6943e71d2574f,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1989-04-27 12:20:47 PST
+Path: utzoo!attcan!uunet!tektronix!tekgen!tekred!games
+From: games@tekred.CNA.TEK.COM
+Newsgroups: comp.sources.games
+Subject: v06i060:  cubes2 - a networked dice game (version 5.1), Part02/08
+Message-ID: <3901@tekred.CNA.TEK.COM>
+Date: 27 Apr 89 19:20:47 GMT
+Sender: billr@tekred.CNA.TEK.COM
+Lines: 2176
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: gmp@rayssdb.RAY.COM (Gregory M. Paris)
+Posting-number: Volume 6, Issue 60
+Archive-name: cubes2/Part02
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 2 (of 8)."
+# Contents:  cubeserv1.c cubestat.6 tactics.c
+# Wrapped by billr@saab on Thu Apr 27 12:13:35 1989
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'cubeserv1.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'cubeserv1.c'\"
+else
+echo shar: Extracting \"'cubeserv1.c'\" \(44192 characters\)
+sed "s/^X//" >'cubeserv1.c' <<'END_OF_FILE'
+X/*	vi:set sw=4 ts=4: */
+X#ifndef	lint
+Xstatic char	sccsid[] = "@(#)cubeserv1.c 5.1 (G.M. Paris) 89/04/25";
+X#endif	lint
+X
+X/*
+X**
+X**	cubes 5.1  Copyright 1989 Gregory M. Paris
+X**		Permission granted to redistribute on a no charge basis.
+X**		All other rights are reserved.
+X**
+X*/
+X
+X/*
+X**	Some #defines to make linting easier.
+X*/
+X#ifdef	lint
+X#ifndef	PATHNAME
+X#define	PATHNAME	"dummy-pathname"
+X#endif	PATHNAME
+X#ifndef	HISTFILE
+X#define	HISTFILE	"dummy-histfile"
+X#endif	HISTFILE
+X#ifndef	UNIXSOCK
+X#define	UNIXSOCK	"dummy-unixsock"
+X#endif	UNIXSOCK
+X#ifndef	INETSOCK
+X#define	INETSOCK	/* dummy-inetsock */
+X#endif	INETSOCK
+X#endif	lint
+X
+X#include	<stdio.h>
+X#include	<ctype.h>
+X#include	<strings.h>
+X#include	<errno.h>
+X#include	<syslog.h>
+X#include	<signal.h>
+X#include	<setjmp.h>
+X#include	<sys/types.h>
+X#include	<sys/time.h>
+X#include	<sys/file.h>
+X#include	<sys/ioctl.h>
+X#include	<sys/socket.h>
+X#include	<netinet/in.h>
+X#include	<netdb.h>
+X#ifdef	UNIXSOCK
+X#include	<sys/un.h>
+X#endif	UNIXSOCK
+X#include	"cubes.h"
+X
+Xextern int		errno;
+Xextern int		optind;
+Xextern int		opterr;
+Xextern long		gamenum;
+Xextern char	   *optarg;
+Xextern char	   *histfmtplr();
+Xextern history *histbyname();
+Xextern char	   *ctime();
+Xextern time_t	time();
+Xextern boolean	wantin();
+Xextern boolean	prescreen();
+Xextern boolean	iscomp();
+Xextern boolean	isproxy();
+Xextern boolean	iskamelion();
+Xextern boolean	newplayers();
+Xextern boolean	pendshutdown();
+Xextern winpref	workhourstype();
+Xstatic int		srvshutdown();
+Xstatic int		sysshutdown();
+Xstatic int		delshutdown();
+X
+Xstatic int		usock	= -1;			/* UNIX server socket */
+Xstatic int		isock	= -1;			/* INET server socket */
+Xstatic int		qsock	= -1;			/* INET query socket */
+Xint				active	= 0;			/* number of Active humans */
+Xint				waiting	= 0;			/* number of Waiting humans */
+Xint				watching= 0;			/* number of Watching humans */
+Xint				spiders	= 0;			/* number of Spiders */
+Xint				turnnum	= 0;			/* current turn number */
+Xint				currup	= -1;			/* player currently up */
+Xunsigned		neq		= 0;			/* number of equivalent hosts */
+Xchar		  **equiv;					/* equivalent hosts */
+Xboolean			enajokers	= False;	/* enable jokers */
+Xboolean			jokermode	= False;	/* dice do not have joker faces */
+Xboolean			inprogress	= False;	/* True when game in progress */
+Xboolean			firstgame	= True;		/* first game with set of players */
+Xboolean			saygoodbye	= False;	/* True if delayed shutdown requested */
+Xboolean			adjroster	= False;	/* Adjust roster */
+Xboolean			clearobs	= False;	/* Observers are showing in roster */
+Xblitzmode		blitzwhen	= Enforced;	/* Blitz mode enforced during work */
+Xwinpref			gametype	= Standard;	/* specifies winscore */
+Xint				winscore	= WINSCORE;	/* points needed to win */
+X#define	CLOSED	(3 * winscore / 4)		/* no more new players */
+Xextern player	plr[];					/* player/connection list */
+Xstruct timeval	poll	= { 0L, 0L };	/* for select polling */
+Xstruct timeval	onesec	= { 1L, 0L };	/* for select polling */
+X
+X#define	PSLEN	55						/* length of "ps" status line */
+Xchar		   *statusline;				/* really av[0] */
+X
+Xmain(ac, av)
+Xchar   *av[];
+X{
+X	int			c;
+X
+X	/*
+X	**	Make sure we have enough room to display our status.
+X	*/
+X	if(strlen(av[0]) < PSLEN) {
+X		char   *newav0;
+X		char   *malloc();
+X
+X		if((newav0 = malloc(PSLEN+1)) == 0) {
+X			syslog(LOG_ERR, "cubeserver: no memory for new argv zero");
+X			exit(1);
+X		}
+X		sprintf(newav0, "cubes %-*s.", PSLEN-7, "startup");
+X		av[0] = newav0;
+X		execv(PATHNAME, av);
+X		perror(PATHNAME);	/* OK */
+X		exit(1);
+X	}
+X
+X	(void) setuid(geteuid());
+X	statusline = av[0];
+X	updstat(-1);		/* server startup */
+X
+X	initcomptbl();
+X
+X	opterr = 0;
+X	while((c = getopt(ac, av, "jb:")) >= 0) {
+X		switch(c) {
+X		case 'j':
+X			enajokers = (enajokers == True) ? False : True;
+X			break;
+X		case 'b':
+X			switch(*optarg) {
+X			case 'n': case 'N': blitzwhen = Noblitz;   continue;
+X			case 'r': case 'R': blitzwhen = Onrequest; continue;
+X			case 'w': case 'W': blitzwhen = Workhours; continue;
+X			case 'e': case 'E': blitzwhen = Enforced;  continue;
+X			}
+X			/* fall to usage error */
+X		default:
+X			fprintf(stderr, "usage -- cubeserver [-j] [-b{nrwe}]\n");	/*OK*/
+X			exit(1);
+X		}
+X	}
+X
+X	/*
+X	**	Blank arguments one through ac.
+X	*/
+X	for(c = 1;c < ac;++c) {
+X		char   *s;
+X		for(s = av[c];*s != '\0';++s)
+X			*s = ' ';
+X	}
+X
+X	/*
+X	**	Fork.
+X	*/
+X	switch(c = fork()) {
+X	case -1:	/* error */
+X		perror("cubeserver: fork");	/* OK */
+X		exit(1);
+X	case 0:		/* child */
+X		break;
+X	default:	/* parent */
+X		printf("%d\n", c);
+X		exit(0);
+X	}
+X
+X	/*
+X	**	Disconnect from controlling tty.
+X	*/
+X	if((c = open("/dev/tty", O_RDWR)) >= 0) {
+X		(void) ioctl(c, TIOCNOTTY, (char *)0);
+X		(void) close(c);
+X	}
+X
+X	/*
+X	**	Ignore keybord signals.  Catch TERM for controlled shutdown.
+X	**	We catch HUP and take it to mean delayed shutdown.
+X	*/
+X	(void) signal(SIGINT,  SIG_IGN);
+X	(void) signal(SIGQUIT, SIG_IGN);
+X	(void) signal(SIGTSTP, SIG_IGN);
+X	(void) signal(SIGTTIN, SIG_IGN);
+X	(void) signal(SIGTTOU, SIG_IGN);
+X	(void) signal(SIGPIPE, SIG_IGN);
+X	(void) signal(SIGHUP,  delshutdown);
+X	(void) signal(SIGTERM, srvshutdown);
+X
+X	/*
+X	**	Close std out and std err.  Initialize syslog.
+X	**	Provide a startup message.
+X	*/
+X	(void) fclose(stdout);
+X	(void) fclose(stderr);
+X#ifdef	LOG_DAEMON
+X	openlog("cubeserver", LOG_PID, LOG_DAEMON);
+X	(void) setlogmask(LOG_UPTO(LOG_ERR));
+X#else	LOG_DAEMON
+X	openlog("cubeserver", LOG_PID);
+X#endif	LOG_DAEMON
+X
+X	{
+X		char   *bname;
+X
+X		switch(blitzwhen) {
+X		case Noblitz:	bname = "never"; break;
+X		case Onrequest: bname = "on request"; break;
+X		case Workhours:	bname = "optional during peak"; break;
+X		case Enforced:	bname = "enforced during peak"; break;
+X		default:		bname = "unknown"; break;
+X		}
+X		syslog(LOG_INFO, "startup: jokers %s, blitz %s",
+X			enajokers == True ? "enabled" : "disabled", bname);
+X	}
+X	
+X	/*
+X	**	Close stdin and open server socket.
+X	**	Initialize random number generator.
+X	**	Read history file.
+X	*/
+X	(void) fclose(stdin);
+X	if(openservsock() < 0)
+X		exit(1);
+X	irandom();
+X	if(histread(HISTFILE) < 0)
+X		exit(1);
+X
+X	/*
+X	**	Initialize player/connection list.
+X	*/
+X	active = waiting = watching = spiders = 0;
+X	for(c = 0;c < PLAYERS;++c)
+X		zeroplayer(c);
+X	addcomp(COMP);	/* add COMP computer */
+X
+X	for(firstgame = True;saygoodbye == False;) {
+X		inprogress = False;
+X		do {
+X			(void) newplayers(True);
+X		} while(active == 0 && waiting == 0 && watching == 0);
+X		if(pendshutdown() == True) {
+X			sysshutdown();
+X			continue;
+X		}
+X		begingame();
+X		while(active > 0 && winner() < 0)
+X			gameturn();
+X		endgame();
+X	}
+X
+X	srvshutdown();
+X	exit(0);
+X}
+X
+X/*
+X**	pendshutdown: return True if system shutdown is pending
+X*/
+Xboolean
+Xpendshutdown()
+X{
+X	/*
+X	**	Check for the existence of the nologin file.  This gives
+X	**	a warning of five minutes or less.  Not really good enough.
+X	*/
+X	return access("/etc/nologin", F_OK) < 0 ? False : True;
+X}
+X	
+X/*
+X**	sysshutdown: hang up on all players saying that the system is going down
+X**		We don't shut down the server because of "shutdown -k".
+X*/
+Xstatic int
+Xsysshutdown()
+X{
+X	register int	c;
+X
+X	/*
+X	**	Send the shutdown message to all humans.
+X	XXX	Could use contents of /etc/nologin here.
+X	*/
+X	if(active > 0 || waiting > 0 || watching > 0 || spiders > 0) {
+X		for(c = 0;c < PLAYERS;++c)
+X			if(plr[c].p_stat != Inactive && plr[c].p_stat != Computer)
+X				(void) simp(c, M_DOWN, "System shutdown in progress -- bye.");
+X	}
+X
+X	/*
+X	**	Hang up on everybody, then reinstall the COMP computer.
+X	*/
+X	for(c = 0;c < PLAYERS;++c)
+X		if(plr[c].p_stat != Inactive)
+X			oldplayer(c);
+X	addcomp(COMP);
+X
+X	updstat(-1);
+X}
+X
+X/*
+X**	openservsock: open, bind, and begin listening on server socket(s)
+X**		also opens the status query socket
+X*/
+Xopenservsock()
+X{
+X	/*
+X	**	We shouldn't be called more than once, but make sure anyway.
+X	*/
+X	if(isock >= 0) {
+X		(void) close(isock);
+X		isock = -1;
+X	}
+X	if(usock >= 0) {
+X		(void) close(usock);
+X		usock = -1;
+X	}
+X	if(qsock >= 0) {
+X		(void) close(qsock);
+X		qsock = -1;
+X	}
+X
+X#ifdef	UNIXSOCK
+X	/*
+X	**	If UNIXSOCK is defined, we open a server socket in the UNIX domain.
+X	**	This socket is used for transactions with players on the local system.
+X	*/
+X	{
+X		struct sockaddr_un	userver;
+X		int					len;
+X
+X		(void) unlink(UNIXSOCK);
+X		if((usock = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+X			syslog(LOG_ERR, "server unix socket: %m");
+X			goto nounix;
+X		}
+X		bzero((char *)&userver, sizeof userver);
+X		userver.sun_family = AF_UNIX;
+X		strcpy(userver.sun_path, UNIXSOCK);
+X		len = sizeof userver.sun_family + strlen(userver.sun_path);
+X		if(bind(usock, &userver, len) < 0) {
+X			syslog(LOG_ERR, "server unix socket bind: %m");
+X			(void) close(usock);
+X			usock = -1;
+X			goto nounix;
+X		}
+X		if(listen(usock, 5) < 0) {
+X			syslog(LOG_ERR, "server unix socket listen: %m");
+X			(void) close(usock);
+X			usock = -1;
+X			goto nounix;
+X		}
+X
+Xnounix:	;
+X	}
+X#endif	UNIXSOCK
+X
+X#ifdef	INETSOCK
+X	/*
+X	**	If INETSOCK is defined, we open a server socket in the INET domain.
+X	**	This socket is used for transactions with players on remote systems,
+X	**	and if UNIXSOCK is not defined, for players on the local system.
+X	*/
+X	{
+X		struct servent	   *ps;
+X		struct sockaddr_in	server;
+X
+X		if((ps = getservbyname("cube", "tcp")) == 0) {
+X			syslog(LOG_ERR, "no cube/tcp service listed");
+X			goto noinet;
+X		}
+X		if((isock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+X			syslog(LOG_ERR, "server inet socket: %m");
+X			goto noinet;
+X		}
+X		bzero((char *)&server, sizeof server);
+X		server.sin_family = AF_INET;
+X		server.sin_port = ps->s_port;
+X		server.sin_addr.s_addr = INADDR_ANY;
+X		if(bind(isock, &server, sizeof server) < 0) {
+X			syslog(LOG_ERR, "server inet socket bind: %m");
+X			(void) close(isock);
+X			isock = -1;
+X			goto noinet;
+X		}
+X		if(listen(isock, 5) < 0) {
+X			syslog(LOG_ERR, "server inet socket listen: %m");
+X			(void) close(isock);
+X			isock = -1;
+X			goto noinet;
+X		}
+Xnoinet:	;
+X	}
+X#endif	INETSOCK
+X
+X	/*
+X	**	Neither socket was opened.  Report this situation
+X	**	and return with failure status.
+X	*/
+X	if(usock < 0 && isock < 0) {
+X		syslog(LOG_ERR, "no server sockets opened");
+X		return -1;
+X	}
+X
+X	/*
+X	**	Now open the status query socket.  This socket is used to respond to
+X	**	queries about the server's status.  Since it is not critical to the
+X	**	operation of the game, we'll make any failure here a non-fatal error.
+X	*/
+X	{
+X		struct sockaddr_in	server;
+X		struct servent	   *ps;
+X
+X		if((ps = getservbyname("cubestat", "udp")) == 0) {
+X			syslog(LOG_WARNING, "no cubestat/udp service listed");
+X			goto noquery;
+X		}
+X		if((qsock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+X			syslog(LOG_WARNING, "query socket: %m");
+X			goto noquery;
+X		}
+X		/*
+X		XXX	If INETSOCK is not defined, this is pretty silly, since queries
+X		XXX	from remote systems can be responded to, but the game cannot be
+X		XXX	played from remote systems.  Maybe we could fix this for many
+X		XXX	configurations by fiddling with server.sin_addr.  Another way
+X		XXX	would be to open a UNIX domain query socket.  Both approaches
+X		XXX	seem like more trouble than they're worth.
+X		*/
+X		bzero((char *)&server, sizeof server);
+X		server.sin_family = AF_INET;
+X		server.sin_port = ps->s_port;
+X		server.sin_addr.s_addr = INADDR_ANY;
+X		if(bind(qsock, &server, sizeof server) < 0) {
+X			syslog(LOG_WARNING, "query socket bind: %m");
+X			(void) close(qsock);
+X			qsock = -1;
+X			goto noquery;
+X		}
+Xnoquery:;
+X	}
+X
+X	return 0;
+X}
+X
+X/*
+X**	asynchelp: long help message for asynchronous requests
+X*/
+Xstatic char	   *asynchelp[]	= {
+X  "g       Go         begin playing (voyeurs and spiders only)",
+X  "x       Autopilot  enter autopilot mode (active players only)",
+X  "m       Myrank     display your ranking info",
+X  "a       Above      display ranking info for player ranked just above you",
+X  "b       Below      display ranking info for player ranked just below you",
+X  "p{num}  Player     display ranking info for player {num} in roster",
+X  (char *)0	/* end marker */
+X};
+X
+X/*
+X**	async: check for and deal with asynchronous requests during game
+X**		Ignore the current player.
+X*/
+Xasync(cur)
+Xint		cur;
+X{
+X	register int	c, n;
+X	char			msgbuf[MESGLEN];
+X	fd_set			rdy;
+X	int				num;
+X
+X	if(inprogress == False)
+X		return;
+X
+X	/*
+X	**	Select on all human connected sockets except for the
+X	**	one connected to the current player.  If the current
+X	**	player is temporarily proxied, select on that socket too.
+X	*/
+X	FD_ZERO(&rdy);
+X	n = -1;
+X	for(c = 0;c < PLAYERS;++c) {
+X		if(c == cur && isproxy(c) == False)
+X			continue;
+X		switch(plr[c].p_stat) {
+X		case Inactive:
+X		case Computer:
+X			continue;
+X		default:
+X			if(plr[c].p_fd >= 0) {
+X				FD_SET(plr[c].p_fd, &rdy);
+X				if(plr[c].p_fd > n)
+X					n = plr[c].p_fd;
+X			}
+X			break;
+X		}
+X	}
+X	if(n == -1 || select(n+1, &rdy, NOSEL, NOSEL, &poll) <= 0)
+X		return;
+X
+X	/*
+X	**	Check the sockets and handle any requests.
+X	*/
+X	for(c = 0;c < PLAYERS;++c) {
+X		if(c == cur && isproxy(c) == False)
+X			continue;
+X		if(plr[c].p_fd < 0 || !FD_ISSET(plr[c].p_fd, &rdy))
+X			continue;
+X		if(reply(c, msgbuf, sizeof msgbuf) <= 0)
+X			continue;
+X		if(msgbuf[0] != ASYNCMARK)	/* asynchronous marker */
+X			continue;				/* XXX: ignore silently */
+X		switch(msgbuf[1]) {
+X		case 'g': case 'G':		/* Go! */
+X			if(plr[c].p_stat == Active && isproxy(c) == True) {
+X				plr[c].p_computer = 0;	/* become human again */
+X				(void) tellstatus(c);
+X				break;
+X			}
+X			if(plr[c].p_stat != Watching) {
+X				(void) simp(c, M_ARGE, "The go command makes no sense now.");
+X				break;
+X			}
+X			if(highscore(-1, (int *)0) >= CLOSED) {
+X				(void) simp(c, M_ARGE, "It's too late to enter this game.");
+X				break;
+X			}
+X			plr[c].p_stat = Waiting, ++waiting, --watching;
+X			(void) tellstatus(c);
+X			adjroster = True;
+X			break;
+X		case 'x': case 'X':		/* toggle autopilot mode */
+X			if(plr[c].p_stat != Active) {
+X				(void) simp(c, M_ARGE, "Autopilot is for active players only.");
+X				break;
+X			}
+X			if(isproxy(c) == False)
+X				pickproxy(c);			/* temporary proxy */
+X			else
+X				plr[c].p_computer = 0;	/* become human again */
+X			(void) tellstatus(c);
+X			break;
+X		case 'm': case 'M': (void) myrank(c,  True); break;
+X		case 'a': case 'A': (void) aboveme(c, True); break;
+X		case 'b': case 'B': (void) belowme(c, True); break;
+X		case 'p': case 'P':
+X			if(sscanf(msgbuf, "%*[^0123456789]%d", &num) != 1) {
+X				(void) simp(c, M_ARGE, "Usage: player <number>");
+X				break;
+X			}
+X			(void) plrrank(c, num - 1, True);
+X			break;
+X		case 'q':	/* quit (decision already made) */
+X			/*
+X			**	If we send this message, we're more than likely to
+X			**	get a dead pipe entry in syslog.  By commenting it
+X			**	out, we assume that the client will exit on its own.
+X			*/
+X/*			(void) simp(c, M_DOWN, "So long, quitter...");	/* make sure */
+X			oldplayer(c);
+X			break;
+X		case '?':	/* help */
+X			(void) multimesg(c, M_HELP, asynchelp);
+X			break;
+X		default:
+X			(void) invalid(c);
+X			break;
+X		}
+X	}
+X}
+X
+X/*
+X**	wantinjmp, wantintimo: wantin timeout handler
+X*/
+Xstatic jmp_buf	wantinjmp;
+Xstatic int
+Xwantintimo()
+X{
+X	longjmp(wantinjmp, 1);
+X}
+X
+X/*
+X**	wantin: return True if ready to do accept on server socket
+X**		If hang equals HANG, hang answering queries and providing heartbeat
+X*/
+Xboolean
+Xwantin(hang)
+Xstruct timeval *hang;
+X{
+X	fd_set		rdy;
+X	int			n, c;
+X	int		  (*oldalrm)();
+X	unsigned	alarmv, hold;
+X	char		msgbuf[MESGLEN];
+X	boolean		ready;
+X
+X	/*
+X	**	If we're not supposed to hang, just do a poll of
+X	**	the server socket(s) using the requested hang time.
+X	*/
+X	if(hang != HANG) {
+X		FD_ZERO(&rdy);
+X		n = -1;
+X		if(usock >= 0) {
+X			FD_SET(usock, &rdy);
+X			if(usock > n)
+X				n = usock;
+X		}
+X		if(isock >= 0) {
+X			FD_SET(isock, &rdy);
+X			if(isock > n)
+X				n = isock;
+X		}
+X
+X		if(select(n+1, &rdy, NOSEL, NOSEL, hang) > 0) {
+X			if(usock >= 0 && FD_ISSET(usock, &rdy))
+X				return True;	/* server unix socket ready */
+X			if(isock >= 0 && FD_ISSET(isock, &rdy))
+X				return True;	/* server inet socket ready */
+X		}
+X
+X		return False;			/* server socket(s) not ready */
+X	}
+X
+X	/*
+X	**	If there are spiders, set up a regular heartbeat.  We can't
+X	**	call heartbeat as an alarm signal handler because it calls
+X	**	message which uses alarms to timeout socket writes.  We check
+X	**	for pending shutdowns and get rid of spiders if True.
+X	*/
+X	alarmv = alarm(0);
+X	oldalrm = signal(SIGALRM, SIG_IGN);
+X	if(spiders > 0) {
+X		(void) signal(SIGALRM, wantintimo);
+X		if(setjmp(wantinjmp) != 0) {
+X			if(saygoodbye == True || pendshutdown() == True)
+X				sysshutdown();
+X			else
+X				heartbeat();
+X		}
+X		(void) alarm(READTIMO);
+X	}
+X
+X	/*
+X	**	Hang answering queries.  Leave loop upon connection request.
+X	**	If there are Spiders, monitor the corresponding sockets
+X	**	in case they want to quit being Spiders and begin play.
+X	**	When any data is sent from a Spider client, we change that
+X	**	player's status to Waiting and return True.
+X	*/
+X	ready = False;
+X	for(;;) {
+X		FD_ZERO(&rdy);
+X		n = -1;
+X		if(usock >= 0) {
+X			FD_SET(usock, &rdy);
+X			if(usock > n)
+X				n = usock;
+X		}
+X		if(isock >= 0) {
+X			FD_SET(isock, &rdy);
+X			if(isock > n)
+X				n = isock;
+X		}
+X		if(qsock >= 0) {
+X			FD_SET(qsock, &rdy);
+X			if(qsock > n)
+X				n = qsock;
+X		}
+X		if(spiders > 0) {
+X			for(c = 0;c < PLAYERS;++c) {
+X				if(plr[c].p_stat == Spider && plr[c].p_fd >= 0) {
+X					FD_SET(plr[c].p_fd, &rdy);
+X					if(plr[c].p_fd > n)
+X						n = plr[c].p_fd;
+X				}
+X			}
+X		}
+X
+X		if(n < 0 || select(n+1, &rdy, NOSEL, NOSEL, HANG) <= 0)
+X			continue;
+X
+X		if(qsock >= 0 && FD_ISSET(qsock, &rdy))	/* query */
+X			answer();
+X		if(usock >= 0 && FD_ISSET(usock, &rdy)) { /* local conn. req. */
+X			ready = True;						/* server socket ready */
+X			break;
+X		}
+X		if(isock >= 0 && FD_ISSET(isock, &rdy)) { /* net conn. req. */
+X			ready = True;						/* server socket ready */
+X			break;
+X		}
+X		if(spiders > 0) {						/* anxious spiders? */
+X			hold = alarm(0);					/* suspend heartbeat */
+X			for(c = 0;c < PLAYERS;++c) if(plr[c].p_stat == Spider) {
+X				if(!FD_ISSET(plr[c].p_fd, &rdy))
+X					continue;
+X				if(reply(c, msgbuf, sizeof msgbuf) <= 0)
+X					continue;
+X				if(msgbuf[0] != ASYNCMARK)		/* asynchronous marker */
+X					continue;					/* XXX: ignore silently */
+X				switch(msgbuf[1]) {
+X				case 'g': case 'G':		/* Go! */
+X					plr[c].p_stat = Waiting, ++waiting, --spiders;
+X					(void) tellstatus(c);
+X					break;
+X				case 'x': case 'X':		/* not appropriate */
+X					(void) simp(c, M_ARGE,
+X						"Using the autopilot now would be silly.");
+X					break;
+X				case 'm': case 'M': (void) myrank(c,  True); break;
+X				case 'a': case 'A': (void) aboveme(c, True); break;
+X				case 'b': case 'B': (void) belowme(c, True); break;
+X				case 'p': case 'P':
+X					(void) simp(c, M_ARGE, "There aren't any players!");
+X					break;
+X				case 'q':	/* quit (decision already made) */
+X					(void) simp(c, M_DOWN, "So long, quitter...");
+X					oldplayer(c);
+X					break;
+X				case '?':	/* help */
+X					(void) multimesg(c, M_HELP, asynchelp);
+X					break;
+X				default:
+X					(void) invalid(c);
+X					break;
+X				}
+X			}
+X			if(waiting > 0)						/* converted spiders */
+X				break;							/* keep ready false */
+X			(void) alarm(hold);					/* resume heartbeat */
+X		}
+X	}
+X
+X	/*
+X	**	Turn off heartbeat.
+X	*/
+X	(void) alarm(0);
+X	(void) signal(SIGALRM, oldalrm);
+X	(void) alarm(alarmv);
+X
+X	return ready;
+X}
+X
+X/*
+X**	answer: check for and answer any pending status queries
+X**		For now, we support only the query Q_ROSTER
+X**		and return only S_IDLE and S_ROSTER.
+X*/
+Xanswer()
+X{
+X	register int		c, n, h;
+X	fd_set				rdy;
+X	char				status[STATLEN];
+X	char				query;
+X	int					flen;
+X	struct sockaddr		from;
+X	static char			unrecog[]	= { S_UNRECOG, '\0' };
+X
+X	/*
+X	**	If no query socket, there's nothing to do.
+X	*/
+X	if(qsock < 0)
+X		return;
+X
+X	/*
+X	**	Check for any pending requests.  If none, we're done.
+X	*/
+X	FD_ZERO(&rdy);
+X	FD_SET(qsock, &rdy);
+X	if(select(qsock+1, &rdy, NOSEL, NOSEL, &poll) <= 0)
+X		return;
+X	
+X	/*
+X	**	We've got at least one request, so let's format a response
+X	**	and send it to any and all that have asked for it.  (This,
+X	**	of course, assumes that we're going to get a Q_ROSTER query.)
+X	*/
+X	if(active == 0 && waiting == 0) {
+X		if(saygoodbye == True) {
+X			static char		down[]	= "XThe cubeserver is shutting down.\r\n";
+X
+X			strcpy(status, down);
+X			n = sizeof down - 1;
+X			status[0] = S_IDLE;
+X		} else {
+X			char		   *type;
+X			time_t			last;
+X			extern char	   *ctime();
+X
+X			switch(workhourstype()) {
+X			case Blitz:
+X				type = blitzwhen == Enforced ?
+X					"Blitz only" : "Blitz by default";
+X				break;
+X			case Standard:
+X				type = blitzwhen == Noblitz ?
+X					"Standard only" : "Standard by default";
+X				break;
+X			default:
+X				type = "unknown";
+X				break;
+X			}
+X			last = 0;
+X			(void) histtime(HISTFILE, &last);
+X			sprintf(status,
+X"%cThe cubeserver is idle since %12.12s.\r\nPrevailing game type is %s.\r\n",
+X				S_IDLE, ctime(&last) + 4, type);
+X			n = strlen(status);
+X		}
+X	} else if(active == 0 && waiting > 0) {
+X		static char	about[]	= "XA game is about to begin.\r\n";
+X		strcpy(status, about);
+X		status[0] = S_ROSTER;	/* to provide success indication */
+X		n = sizeof about - 1;
+X	} else {
+X		status[0] = S_ROSTER;
+X		n = 1;
+X		strcpy(&status[n], "Up  Player ");
+X		n += 11;
+X
+X		if((c = watching + waiting) == 0)
+X			strcpy(&status[n], "    ");
+X		else
+X			sprintf(&status[n], "%2dw ", c);
+X		n += 4;
+X
+X		if(currup < 0)
+X			strcpy(&status[n], "        Sqndr Score\r\n");
+X		else if(turnnum <= 1)
+X			sprintf(&status[n], "%2d    * Sqndr Score\r\n", turnnum);
+X		else
+X			sprintf(&status[n], "%2d %4d Sqndr Score\r\n",
+X				turnnum, plr[currup].p_score / (turnnum-1));
+X		n += 21;
+X
+X		strcpy(&status[n], "--- ------------------ ----- -----\r\n");
+X		n += 36;
+X
+X		for(h = 0, c = 0;c < PLAYERS;++c) {
+X			switch(plr[c].p_stat) {
+X			case Active:
+X			case Computer:
+X				if(plr[c].p_score > h)
+X					h = plr[c].p_score;
+X				break;
+X			}
+X		}
+X
+X		for(c = 0;c < PLAYERS && n < STATLEN-37;++c) {
+X			switch(plr[c].p_stat) {
+X			case Active:
+X			case Computer:
+X				sprintf(&status[n], "%3s %-18.18s %5d %5d%c\r\n",
+X					(c == currup) ? "=->" : "",
+X					plr[c].p_name, plr[c].p_squander, plr[c].p_score,
+X					(h == 0 || plr[c].p_score < h) ? ' ' : '*'
+X				);
+X				n += 37;
+X				break;
+X			}
+X		}
+X
+X		/*
+X		**	Some additional explanation.
+X		*/
+X		if(inprogress == True) {
+X			if(n <= STATLEN - 36) {
+X				sprintf(&status[n], "(%s%s game %s.)\r\n",
+X					gametype == Standard ? "Standard" : "Blitz",
+X					jokermode == True ? " joker" : "",
+X					turnnum == 0 ? "has begun" : "in progress");
+X				n = n + strlen(&status[n]);
+X			}
+X		} else if(turnnum == 0) {
+X			static char	waitfor[] = "(Preparing for the next game.)\r\n";
+X			if(n <= STATLEN - sizeof waitfor) {
+X				strcpy(&status[n], waitfor);
+X				n += sizeof waitfor - 1;
+X			}
+X		} else {
+X			static char	gameover[] = "(The game has ended.)\r\n";
+X			if(n <= STATLEN - sizeof gameover) {
+X				strcpy(&status[n], gameover);
+X				n += sizeof gameover - 1;
+X			}
+X		}
+X	}
+X
+X	/*
+X	**	Loop, reading each request and responding to it.  For now,
+X	**	there's only one type of request, so just read a single byte
+X	**	and ignore it.  When we run out of requests, we're done.
+X	*/
+X	for(;;) {
+X		FD_ZERO(&rdy);
+X		FD_SET(qsock, &rdy);
+X		if(select(qsock+1, &rdy, NOSEL, NOSEL, &poll) <= 0)
+X			return;		/* no more requests */
+X
+X		flen = sizeof from;
+X		if(recvfrom(qsock, &query, sizeof query, 0, &from, &flen) <= 0) {
+X			syslog(LOG_DEBUG, "answer: recvfrom: %m");
+X			continue;
+X		}
+X
+X		switch(query) {
+X		case Q_ROSTER:
+X			if(sendto(qsock, status, n+1, 0, &from, flen) < 0)
+X				syslog(LOG_DEBUG, "answer: sendto: %m");
+X			break;
+X		default:
+X			syslog(LOG_NOTICE, "answer: got unrecognized query");
+X			if(sendto(qsock, unrecog, sizeof unrecog, 0, &from, flen) < 0)
+X				syslog(LOG_DEBUG, "answer: sendto: %m");
+X			break;
+X		}
+X	}
+X}
+X
+X/*
+X**	newplayers: check for and add new players
+X*/
+Xboolean
+Xnewplayers(hang)
+Xboolean					hang;
+X{
+X	register int		c;
+X	int					csock;
+X	int					tries;
+X	int					len, n;
+X	char				msgbuf[BUFSIZ];
+X	int					off	= 0;
+X	int					added;
+X	fd_set				rdy;
+X
+X	/*
+X	**	Is this a new batch of players?
+X	*/
+X	if(hang == True && active == 0)
+X		firstgame = True;
+X
+X	/*
+X	**	If there are no humans that want to play, we can hang waiting for some.
+X	**	If wantin returns False, we have converted Spiders.
+X	*/
+X	if(hang == True && active == 0 && waiting == 0 && watching == 0)
+X		if(wantin(HANG) == False)
+X			return waiting > 0 ? True : False;	/* False? */
+X
+X	/*
+X	**	Keep looping until we run out of connection requests.
+X	*/
+X	added = 0;
+X	for(;;) {
+X		/*
+X		**	If we are supposed to hang, then wait a while for
+X		**	another connection request, elsewise, just return.
+X		*/
+X#define	MAXTRIES	5
+X		for(tries = 0;wantin(&onesec) == False;++tries) {
+X			if(hang == False || tries > MAXTRIES)
+X				return added > 0 ? True : False;
+X			updstat(-1);	/* about to begin notification */
+X/*			sleep(1);		/* wantin hangs for one second */
+X		}
+X
+X		/*
+X		**	Check server socket(s).
+X		*/
+X		FD_ZERO(&rdy);
+X		n = -1;
+X		if(usock >= 0) {
+X			FD_SET(usock, &rdy);
+X			if(usock > n)
+X				n = usock;
+X		}
+X		if(isock >= 0) {
+X			FD_SET(isock, &rdy);
+X			if(isock > n)
+X				n = isock;
+X		}
+X		if(n < 0 || select(n+1, &rdy, NOSEL, NOSEL, &poll) <= 0)
+X			continue;
+X
+X		/*
+X		**	No client socket open yet.
+X		*/
+X		csock = -1;
+X
+X#ifdef	UNIXSOCK
+X		/*
+X		**	If we don't have an open client socket yet, accept a connection
+X		**	from a potential player via the UNIX domain socket.
+X		*/
+X		if(csock < 0 && usock >= 0 && FD_ISSET(usock, &rdy)) {
+X			struct sockaddr_un	uclient;
+X
+X			len = sizeof uclient;
+X			if((csock = accept(usock, &uclient, &len)) < 0)
+X				syslog(LOG_DEBUG, "unix accept: %m");
+X		}
+X#endif	UNIXSOCK
+X
+X#ifdef	INETSOCK
+X		/*
+X		**	If we don't have an open client socket yet, accept a connection
+X		**	from a potential player via the INET domain socket.
+X		*/
+X		if(csock < 0 && isock >= 0 && FD_ISSET(isock, &rdy)) {
+X			struct sockaddr_in	client;
+X
+X			len = sizeof client;
+X			if((csock = accept(isock, &client, &len)) < 0)
+X				syslog(LOG_DEBUG, "inet accept: %m");
+X		}
+X#endif	INETSOCK
+X
+X		/*
+X		**	If we reach here, it means that select returned indicating
+X		**	activity, but neither server socket had anything to accept.
+X		**	We log this and continue.
+X		*/
+X		if(csock < 0) {
+X			syslog(LOG_DEBUG, "newplayers: nothing to accept");
+X			continue;
+X		}
+X
+X		/*
+X		**	Make sure non-blocking I/O is turned off.
+X		*/
+X		(void) ioctl(csock, FIONBIO, (char *)&off);
+X
+X		/*
+X		**	If the system is about to go down, don't allow new players.
+X		*/
+X		if(pendshutdown() == True) {
+X			sprintf(msgbuf,
+X				"%d Sorry, the system is about to shut down.\r\n", M_ARGE);
+X			(void) write(csock, msgbuf, strlen(msgbuf));
+X			sprintf(msgbuf, "%d Server closing connection.\r\n", M_DOWN);
+X			(void) write(csock, msgbuf, strlen(msgbuf));
+X			(void) close(csock);
+X			continue;
+X		}
+X
+X		/*
+X		**	Find an open slot.
+X		*/
+X		for(c = 0;c < PLAYERS;++c)
+X			if(plr[c].p_stat == Inactive)
+X				break;
+X		if(c == PLAYERS) {
+X			sprintf(msgbuf, "%d Sorry, full house.\r\n", M_ARGE);
+X			(void) write(csock, msgbuf, strlen(msgbuf));
+X			sprintf(msgbuf, "%d Server closing connection.\r\n", M_DOWN);
+X			(void) write(csock, msgbuf, strlen(msgbuf));
+X			(void) close(csock);
+X			continue;
+X		}
+X
+X		/*
+X		**	Fill in player parameters.  We must initially give the player
+X		**	a status of Waiting or Watching so that we can send messages.
+X		**	We initially choose Watching and adjust later.
+X		*/
+X		zeroplayer(c);
+X		plr[c].p_fd = csock;
+X		plr[c].p_stat = Watching, ++watching;
+X		if(getplayername(c) < 0 || getplayerid(c) < 0)
+X			continue;
+X
+X		/*
+X		**	If we're not inprogress, check to see if the system's about
+X		**	to go down.  If so, hang up on this player (and all others).
+X		*/
+X		if(inprogress == False && pendshutdown() == True) {
+X			sysshutdown();
+X			continue;
+X		}
+X
+X		/*
+X		**	Give the welcome message.  If a game is in progress, display the
+X		**	roster and, if it matters, ask if the human wants to play or watch.
+X		**	If no game is in progress and there's no other Active, Waiting,
+X		**	or Watching humans, we ask if the human would prefer to be a
+X		**	Spider.  If so, we change status from Watching to Spider.
+X		**	Otherwise just change Watching to Waiting.
+X		*/
+X		sprintf(msgbuf, "%d %s, welcome to Cubes.\r\n", M_INFO, plr[c].p_name);
+X		if(message(c, msgbuf) < 0)
+X			continue;
+X		if(inprogress == True) {
+X			tellwinscore(c);	/* tell winscore to this player */
+X			roster(c, False);	/* roster for this player only */
+X			if(highscore(-1, (int *)0) < CLOSED)
+X				if(getplayerintent(c) < 0)	/* watch or play? */
+X					continue;
+X			if(plr[c].p_stat != Watching)	/* not watching */
+X				if(prescreen(c) == False)	/* doesn't like game type */
+X					continue;
+X			adjroster = True;
+X		} else if(active == 0 && waiting == 0 && watching == 1) {
+X			if(getplayerintent(c) < 0)		/* wait or play? */
+X				continue;
+X			if(plr[c].p_stat != Spider)		/* not waiting */
+X				if(prescreen(c) == False)	/* doesn't like prevailing mode */
+X					continue;
+X/*			adjroster = True;				/* no game in progress */
+X		} else {
+X			if(prescreen(c) == False)		/* doesn't like prevailing mode */
+X				continue;
+X			plr[c].p_stat = Waiting, ++waiting, --watching;
+X/*			adjroster = True;				/* no game in progress */
+X		}
+X
+X		if(tellstatus(c) < 0)
+X			continue;
+X
+X		++added;
+X		(void) observers(-1);
+X/*		updstat(-1);	/* new (temporary?) observer; don't report here */
+X	}
+X}
+X
+X/*
+X**	begingame: setup prior to a game
+X*/
+Xbegingame()
+X{
+X	register int	c;
+X	int				nplr, ncomp;
+X
+X	inprogress = False;
+X	turnnum = 0;
+X	setgamenum();
+X	updstat(-1);		/* pregame setup */
+X
+X	/*
+X	**	Fill the roster, pick the game type, throw out those that can't
+X	**	live with the choice.  Repeat until we have enough players.
+X	**	Only complication is that Computers are added with Waiting 
+X	**	status, so we have to blow them away with special code.
+X	*/
+X	do {
+X		fillroster(&nplr, &ncomp);
+X		pickgametype();
+X		for(c = 0;c < PLAYERS;++c) if(plr[c].p_stat != Inactive) {
+X			switch(plr[c].p_pref) {
+X			case Fstand: if(gametype == Standard) continue; break;
+X			case Fblitz: if(gametype == Blitz) continue; break;
+X			default: continue;
+X			}
+X			if( plr[c].p_stat == Computer
+X			|| (plr[c].p_stat == Waiting && plr[c].p_computer != 0)) {
+X				oldplayer(c);
+X				--nplr, --ncomp;
+X				continue;
+X			}
+X			(void) simp(c, M_DOWN, "This isn't your kind of game.");
+X			oldplayer(c);
+X			--nplr;
+X		}
+X	} while(nplr < MINPLR || ncomp < MINCOMP);
+X
+X	/*
+X	**	Add Waiting and Watching here, though there shouldn't be any Watching.
+X	**	We do Spiders in the next loop in case all the humans got bumped out.
+X	**	We have to be careful of Waiting Computers.
+X	*/
+X	for(c = 0;c < PLAYERS;++c) {
+X		switch(plr[c].p_stat) {
+X		case Waiting:
+X			if(plr[c].p_computer == 0) {
+X				plr[c].p_stat = Active, ++active, --waiting;
+X				(void) tellstatus(c);
+X			} else	/* waiting computer */
+X				plr[c].p_stat = Computer, --waiting;
+X			plr[c].p_score = plr[c].p_squander = 0, plr[c].p_onboard = False;
+X			break;
+X		case Watching:
+X			plr[c].p_stat = Active, ++active, --watching;
+X			(void) tellstatus(c);
+X			plr[c].p_score = plr[c].p_squander = 0, plr[c].p_onboard = False;
+X			break;
+X		}
+X	}
+X	if(waiting != 0) {
+X		syslog(LOG_DEBUG, "begingame: waiting=%d (should be zero)", waiting);
+X		waiting = 0;
+X	}
+X	if(watching != 0) {
+X		syslog(LOG_DEBUG, "begingame: watching=%d (should be zero)", watching);
+X		watching = 0;
+X	}
+X
+X	/*
+X	**	If no Active at this point, all the non-Spiders must have disagreed
+X	**	with the game type selection and were bumped out.  Give up.
+X	*/
+X	if(active == 0) {
+X		updstat(-1);
+X		return;
+X	}
+X
+X	/*
+X	**	We're committed to a game, so awaken the Spiders.
+X	**	If the Spider's forced preference doesn't match, say goodbye.
+X	*/
+X	if(spiders > 0) {
+X		for(c = 0;c < PLAYERS;++c) if(plr[c].p_stat == Spider) {
+X			if((plr[c].p_pref == Fstand && gametype != Standard)
+X			|| (plr[c].p_pref == Fblitz && gametype != Blitz)) {
+X				(void) simp(c,M_DOWN,"They aren't playing your kind of game.");
+X				oldplayer(c);
+X				continue;
+X			}
+X			plr[c].p_stat = Active, ++active, --spiders;
+X			(void) tellstatus(c);
+X			plr[c].p_score = plr[c].p_squander = 0, plr[c].p_onboard = False;
+X		}
+X		if(spiders != 0) {
+X			syslog(LOG_DEBUG,
+X				"begingame: spiders=%d (should be zero)", spiders);
+X			spiders = 0;
+X		}
+X	}
+X
+X	/*
+X	**	Initialize and sort the history data.
+X	**	Reorder the player roster based on history and/or previous score.
+X	*/
+X	histsort();
+X	historder(firstgame);
+X
+X	/*
+X	**	Zero scores and distribute new roster.
+X	*/
+X	tellwinscore(-1);
+X	for(c = 0;c < PLAYERS;++c)
+X		plr[c].p_score = plr[c].p_squander = 0, plr[c].p_onboard = False;
+X	roster(-1, False);
+X
+X	inprogress = True;
+X	updstat(-1);			/* ready to begin game */
+X	hesitate(2000L, 3000L);	/* give players a chance to assess */
+X}
+X
+X/*
+X**	latejoincomp: add a computer player if it looks not-too-unfavorable
+X**		returns True if a player was added
+X*/
+Xboolean
+Xlatejoincomp(high)
+Xint		high;
+X{
+X	register int	c, low;
+X	int				nplr;
+X
+X#define	SPREAD	(winscore / 30)
+X
+X	/*
+X	**	Don't add a computer if the game is no longer open.
+X	**	Don't add a computer while the low score is less than ONBOARD.
+X	**	Don't add a computer if the point spread is too large.
+X	*/
+X	if(high >= CLOSED
+X	|| (low = lowscore((int *)0)) < ONBOARD
+X	|| high - low > SPREAD)
+X		return False;
+X	
+X	/*
+X	**	Count the number of players and find the first empty slot.
+X	*/
+X	low = -1, nplr = 0;
+X	for(c = 0;c < PLAYERS;++c) {
+X		switch(plr[c].p_stat) {
+X		case Active:
+X		case Computer:
+X		case Waiting:
+X		case Spider:	/* shouldn't happen */
+X			++nplr;
+X			break;
+X		case Inactive:
+X			if(low == -1)
+X				low = c;
+X			break;
+X		}
+X	}
+X
+X	/*
+X	**	If there's an empty slot and not too many players, add a computer.
+X	*/
+X	if((c = low) != -1 && nplr < 6) {
+X		pickcomputer(c);						/* sets status to Computer */
+X		plr[c].p_stat = Waiting, ++waiting;		/* no Waiting Computer status */
+X		plr[c].p_score = plr[c].p_squander = 0, plr[c].p_onboard = False;
+X		plr[c].p_fd = -1, plr[c].p_timeouts = 0;
+X		adjroster = True;
+X		return True;
+X	}
+X
+X	return False;
+X
+X#undef	SPREAD
+X}
+X
+X/*
+X**	gameturn: do a single turn for each Active player
+X*/
+Xgameturn()
+X{
+X	register int	c;
+X	int				about, wasabout;
+X	int				high;
+X	char			msgbuf[MESGLEN];
+X
+X	++turnnum;
+X
+X	wasabout = -1;
+X	for(c = 0;active > 0 && c < PLAYERS;++c) {
+X		switch(plr[c].p_stat) {
+X		case Computer:
+X		case Active:
+X			updstat(c);
+X			/*
+X			**	The turn function returns -d_pts_max when no points
+X			**	are gained on the turn, or d_pts_turn when points
+X			**	are gained on the turn.  We have no use for this
+X			**	return value (anymore), since turn (now) updates
+X			**	p_score, p_squander, and p_onboard.
+X			*/
+X			(void) turn(c);
+X			annscore(c);
+X
+X			/*
+X			**	Tell about players about to win and players no longer
+X			**	about to win.
+X			*/
+X			if((about = winner()) == c) {
+X				sprintf(msgbuf, "%d %s is about to win...\r\n",
+X					M_INFO, plr[c].p_name);
+X				announce(c, msgbuf);
+X				if(plr[c].p_stat == Active)
+X					(void) simp(c, M_INFO, "You are about to win...");
+X				hesitate(1500L, 2000L);
+X			} else if(wasabout != about && wasabout >= 0) {
+X				sprintf(msgbuf, "%d %s is no longer about to win.\r\n",
+X					M_INFO, plr[wasabout].p_name);
+X				announce(wasabout, msgbuf);
+X				if(plr[wasabout].p_stat == Active)
+X					(void) simp(c, M_INFO, "You are no longer about to win.");
+X				hesitate(1500L, 2000L);
+X			}
+X			wasabout = about;
+X
+X			/*
+X			**	Accept new players to Waiting or Watching status.
+X			**	Check for asyncrhronous requests.
+X			*/
+X			if(inprogress == True && wantin(&poll) == True)
+X				(void) newplayers(False);
+X			async(-1);	/* nobody's turn at the moment */
+X			hesitate(1500L, 1800L);
+X			break;
+X		}
+X	}
+X
+X	/*
+X	**	If a game is inprogress, we may wish to adjust the roster.
+X	*/
+X	if(active > 0 && inprogress == True) {
+X		high = highscore(-1, (int *)0);
+X
+X		/*
+X		**	Possibly add a computer player.  (More probable early in game.)
+X		*/
+X		if(randint(CLOSED) > high)
+X			(void) latejoincomp(high);
+X
+X		/*
+X		**	Call fixroster when necessary to collapse out blank slots
+X		**	and to add new players to the proper place in the turn order.
+X		*/
+X		if(adjroster == True)
+X			fixroster(high < CLOSED ? True : False);
+X	}
+X}
+X
+X/*
+X**	anoghelp: long help message at M_ANOG prompt
+X*/
+Xstatic char	   *anoghelp[] = {
+X	"y       Yes:    play in next game (synonyms=[,])",
+X	"n       No:     don't play in next game (synonyms=[.eqx])",
+X	"m       Myrank: display your ranking info",
+X	"a       Above:  display ranking info for player ranked just above you",
+X	"b       Below:  display ranking info for player ranked just below you",
+X	"p<num>  Player: display ranking info for player <num> in roster",
+X	(char *)0	/* end marker */
+X};
+X
+X/*
+X**	endgame: cleanup after game finish
+X*/
+Xendgame()
+X{
+X	register int	c, highc;
+X	boolean			again;
+X	int				num, rankq, errs;
+X	time_t			now;
+X	char		   *date;
+X	history		   *ph;
+X	char			msgbuf[BUFSIZ];
+X
+X	inprogress = False;
+X	firstgame = False;
+X/*	turnnum = 0;		/* don't zero; needed in histpoints */
+X	updstat(-1);		/* game over */
+X
+X	/*
+X	**	If there's a winner, update player score histories.
+X	*/
+X	if((highc = winner()) >= 0) {
+X		for(c = 0;c < PLAYERS;++c) {
+X			switch(plr[c].p_stat) {
+X			case Computer:
+X			case Active:
+X				(void) histpoints(c);
+X				break;
+X			}
+X		}
+X		(void) histwins(highc);
+X	}
+X
+X	/*
+X	**	Write history whether or not there was a winner.
+X	*/
+X	(void) histwrite(HISTFILE);
+X
+X	/*
+X	**	If there's a winner, send each active player a copy
+X	**	of their (new) ranking info, for recordkeeping purposes.
+X	*/
+X	if(highc >= 0) {
+X		(void) time(&now);
+X		date = ctime(&now) + 4;
+X		for(c = 0;c < PLAYERS;++c) {
+X			if(plr[c].p_stat == Active) {
+X				if((ph = histbyname(plr[c].p_id)) == 0)
+X					continue;
+X				sprintf(msgbuf, "%d %.16s %ld %.12s %s\r\n", M_RANK,
+X					equiv[0], ph->h_lastgame, date, histfmtplr(c, 0, True));
+X				(void) message(c, msgbuf);
+X			}
+X		}
+X	}
+X
+X	/*
+X	**	Tell everybody who won.
+X	*/
+X	if(highc < 0)
+X		sprintf(msgbuf, "%d The game has concluded with no winner.\r\n",
+X			M_NWIN);
+X	else
+X		sprintf(msgbuf, "%d Player %d %s has won the game!\r\n",
+X			M_OVER, highc+1, plr[highc].p_name);
+X	announce(-1, msgbuf);
+X	hesitate(2000L, 3000L);
+X
+X	/*
+X	**	If the system's about to shut down, don't waste any more time.
+X	**	We delay checking saygoodbye until play again query.
+X	*/
+X	if(pendshutdown() == True) {
+X		sysshutdown();
+X		return;
+X	}
+X
+X	/*
+X	**	Distribute a new roster that shows those Watching and Waiting.
+X	*/
+X	if(watching > 0 || waiting > 0)
+X		roster(-1, True);
+X	
+X	/*
+X	**	Get rid of all proxies.  Computers quit on occasion.  Kamelion
+X	**	quits more often.  Ask humans if they'd like to play.
+X	**	If they say no, dump them out of the game.
+X	*/
+X	for(c = 0;c < PLAYERS;++c) {
+X		switch(plr[c].p_stat) {
+X		case Active:
+X			if(isproxy(c) == True) {
+X				if(annturn(c) < 0)
+X					continue;
+X				(void) simp(c, M_DOWN, "You've chosen not to play...");
+X				hesitate(1500L, 3000L);
+X				oldplayer(c);
+X				continue;
+X			}
+X			/* fall */
+X		case Watching:
+X		case Waiting:
+X		case Spider:	/* shouldn't happen */
+X			if(annturn(c) < 0)
+X				continue;
+X			if(saygoodbye == True) {
+X				(void) simp(c, M_DOWN,
+X					"The cubeserver is shutting down -- bye.");
+X				oldplayer(c);
+X				continue;
+X			}
+X			if(pendshutdown() == True) {
+X				(void) simp(c, M_DOWN,
+X					"System shutdown in progress -- goodbye.");
+X				oldplayer(c);
+X				continue;
+X			}
+X			break;
+X		case Computer:
+X			(void) annturn(c);
+X			if(saygoodbye == True || pendshutdown() == True) {
+X				hesitate(500L, 1000L);
+X				oldplayer(c);
+X				continue;
+X			}
+X			if(iscomp(c) == True) {
+X				hesitate(750L, 1250L);
+X				continue;
+X			}
+X			hesitate(1000L, 3000L);
+X			if(isproxy(c) == True) {
+X				oldplayer(c);
+X				continue;
+X			}
+X			if(iskamelion(c) == True) {
+X				hesitate(100L, 1000L);
+X				if(randint(3) == 3)
+X					oldplayer(c);
+X				continue;
+X			}
+X			if(randint(9) == 9)
+X				oldplayer(c);
+X			continue;
+X		default:
+X			continue;
+X		}
+X
+X#define	MAXRANKQ	3				/* limit rank query abuse */
+X#define	MAXERRS		(2*MAXRANKQ)	/* limit error recovery abuse */
+X		rankq = errs = 0;
+X		do {
+X			again = False;
+X
+X			if(errs < MAXERRS) {
+X				sprintf(msgbuf, "%d Play %s game? [yn%s?]\r\n", M_ANOG,
+X					plr[c].p_stat == Active ? "another" : "in next",
+X					rankq < MAXRANKQ ? "mabp" : "");
+X				if(dialogue(c, msgbuf, sizeof msgbuf) < 0) {
+X					if(plr[c].p_stat != Inactive) {	/* in case of timeout */
+X						(void) simp(c, M_DOWN, "Server closing connection.");
+X						oldplayer(c);
+X					}
+X					break;
+X				}
+X			} else {
+X				if(simp(c, M_ARGE, "Too many errors, assuming No.") < 0)
+X					break;
+X				msgbuf[0] = 'n', msgbuf[1] = '\0';
+X			}
+X
+X			switch(msgbuf[0]) {
+X/*			case '\0':				/* default -- too dangerous */
+X			case 'y': case 'Y':		/* Yes */
+X			case ',':				/* yes for numeric keypads */
+X				switch(plr[c].p_stat) {
+X				case Waiting:
+X					plr[c].p_stat = Active, ++active, --waiting;
+X					(void) tellstatus(c);
+X					break;
+X				case Watching:
+X					plr[c].p_stat = Active, ++active, --watching;
+X					(void) tellstatus(c);
+X					break;
+X				case Spider:
+X					plr[c].p_stat = Active, ++active, --spiders;
+X					(void) tellstatus(c);
+X					break;
+X				}
+X				break;
+X			case 'n': case 'N':		/* No */
+X			case 'q': case 'Q':		/* Quit */
+X			case 'e': case 'E':		/* Exit */
+X/*			case 'x': case 'X':		/* eXit -- now means autopilot */
+X			case '.':				/* hold (numeric keypad) */
+X				if(plr[c].p_stat == Active) {
+X					sprintf(msgbuf, c == highc
+X						?	"%d Good game %s.  Bye...\r\n"
+X						:	"%d Better luck next time, %s.\r\n",
+X						M_DOWN, plr[c].p_name);
+X					(void) message(c, msgbuf);
+X				} else
+X					(void) simp(c, M_DOWN, "See ya, wallflower...");
+X				oldplayer(c);
+X				break;
+X			case 'm': case 'M':		/* Myrank */
+X				if(rankq++ >= MAXRANKQ)
+X					goto toomany;
+X				if(myrank(c, False) < 0)
+X					break;
+X				again = True;
+X				break;
+X			case 'a': case 'A':		/* Aboveme */
+X				if(rankq++ >= MAXRANKQ)
+X					goto toomany;
+X				if(aboveme(c, False) < 0)
+X					break;
+X				again = True;
+X				break;
+X			case 'b': case 'B':		/* Belowme */
+X				if(rankq++ >= MAXRANKQ)
+X					goto toomany;
+X				if(belowme(c, False) < 0)
+X					break;
+X				again = True;
+X				break;
+X			case 'p': case 'P':		/* Player <num> */
+X				if(rankq++ >= MAXRANKQ)
+X					goto toomany;
+X				if(sscanf(msgbuf, "%*[^0123456789]%d", &num) != 1) {
+X					(void) simp(c, M_ARGE, "Usage: player <number>");
+X					again = True;
+X					break;
+X				}
+X				if(plrrank(c, num - 1, False) < 0)
+X					break;
+X				again = True;
+X				break;
+X			case '?':	/* help */
+X				if(multimesg(c, M_HELP, anoghelp) < 0)
+X					break;
+X				again = True;
+X				break;
+Xtoomany:
+X			default:
+X				if(invalid(c) < 0)
+X					break;
+X				again = True;
+X				break;
+X			}
+X			++errs;
+X		} while(again == True && plr[c].p_stat != Inactive);
+X	}
+X
+X	/*
+X	**	Sanity checks.
+X	*/
+X	if(active < 0) {
+X		syslog(LOG_DEBUG, "endgame: active=%d (should non-negative)", active);
+X		waiting = 0;
+X	}
+X	if(waiting != 0) {
+X		syslog(LOG_DEBUG, "endgame: waiting=%d (should be zero)", waiting);
+X		waiting = 0;
+X	}
+X	if(watching != 0) {
+X		syslog(LOG_DEBUG, "endgame: watching=%d (should be zero)", watching);
+X		watching = 0;
+X	}
+X	if(spiders != 0) {
+X		syslog(LOG_DEBUG, "endgame: spiders=%d (should be zero)", spiders);
+X		spiders = 0;
+X	}
+X
+X	/*
+X	**	If there are no Active players left, get rid of all Computer players.
+X	**	Reinstall the COMP computer.
+X	*/
+X	if(active == 0) {
+X		for(c = 0;c < PLAYERS;++c)
+X			if(plr[c].p_stat == Computer)
+X				oldplayer(c);
+X		addcomp(COMP);
+X	}
+X
+X	clearroster();
+X	turnnum = 0;
+X	updstat(-1);		/* idle or pregame again */
+X
+X#undef	MAXRANKQ
+X#undef	MAXERRS
+X}
+X
+X/*
+X**	updstat: update status line
+X*/
+Xupdstat(cup)
+Xint		cup;
+X{
+X	register int	c, n, h, nobs;
+X	char			buf[2*PSLEN+NAMELEN];
+X
+X	currup = cup;	/* update global variable */
+X
+X	nobs = waiting + watching;
+X	if(saygoodbye == True)
+X		strcpy(buf, "shutting down");
+X	else if(active == 0 && nobs == 0)
+X		strcpy(buf, "idle");
+X	else if(active == 0 && nobs != 0)
+X		sprintf(buf, "idle wt%d", nobs);
+X	else {
+X		for(h = n = c = 0;c < PLAYERS;++c) {
+X			if(plr[c].p_stat == Computer || plr[c].p_stat == Active) {
+X				if(plr[c].p_score > h)
+X					h = plr[c].p_score;
+X				++n;
+X			}
+X		}
+X		if(inprogress == False)
+X			sprintf(buf, "waiting pl%d", n);
+X		else if(cup < 0)
+X			sprintf(buf, "active pl%d hs%d tn%d", n, h, turnnum);
+X		else if(nobs == 0)
+X			sprintf(buf, "active pl%d hs%d tn%d %s",
+X				n, h, turnnum, plr[cup].p_name);
+X		else
+X			sprintf(buf, "active pl%d wt%d hs%d tn%d %s",
+X				n, nobs, h, turnnum, plr[cup].p_name);
+X	}
+X
+X	sprintf(statusline, "cubes %-*s.", PSLEN-7, buf);
+X
+X	/*
+X	**	Check for and answer any pending status queries.
+X	*/
+X	answer();
+X}
+X
+X/*
+X**	srvshutdown: controlled shutdown on SIGTERM
+X*/
+Xstatic int
+Xsrvshutdown()
+X{
+X	register int	c;
+X
+X	for(c = 0;c < PLAYERS;++c) {
+X		switch(plr[c].p_stat) {
+X		case Active:
+X		case Waiting:
+X		case Watching:
+X		case Spider:
+X			(void) simp(c, M_DOWN, "The cubeserver is shutting down -- goodbye.");
+X			/* fall */
+X		case Computer:
+X			oldplayer(c);
+X			break;
+X		}
+X	}
+X
+X#ifdef	UNIXSOCK
+X	(void) unlink(UNIXSOCK);
+X#endif	UNIXSOCK
+X
+X	syslog(LOG_INFO, "shutdown");
+X
+X	saygoodbye = True;
+X	updstat(-1);
+X
+X	exit(0);
+X}
+X
+X/*
+X**	delshutdown: delayed shutdown
+X**		if game is inprogress, just set saygoodbye
+X**		elsewise shutdown immediately
+X*/
+Xstatic int
+Xdelshutdown()
+X{
+X	if(inprogress == True)
+X		saygoodbye = True;
+X	else
+X		srvshutdown();
+X}
+END_OF_FILE
+if test 44192 -ne `wc -c <'cubeserv1.c'`; then
+    echo shar: \"'cubeserv1.c'\" unpacked with wrong size!
+fi
+# end of 'cubeserv1.c'
+fi
+if test -f 'cubestat.6' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'cubestat.6'\"
+else
+echo shar: Extracting \"'cubestat.6'\" \(1342 characters\)
+sed "s/^X//" >'cubestat.6' <<'END_OF_FILE'
+X.TH CUBESTAT 6 "cubes 5.1" GMP "UNIX Gaming Manual"
+X.SH NAME
+Xcubestat \- check status of the cube server
+X.\"
+X.\" sccsid: @(#)cubestat.6 5.1 (G.M. Paris) 89/01/22
+X.\"
+X.\"
+X.\"
+X.\"	cubes 5.1  Copyright 1988 Gregory M. Paris
+X.\"		Permission granted to redistribute on a no charge basis.
+X.\"		All other rights are reserved.
+X.\"
+X.\"
+X.SH SYNOPSIS
+X.B cubestat
+X[
+X.BR \- { be }
+X] [
+X.B \-h host
+X]
+X.SH OVERVIEW
+XThe
+X.I cubestat
+Xprogram allows users to query the status of the
+X.IR cubes (6)
+Xserver.
+XIf the server to be queried is on a remote system,
+Xthe
+X.B \-h host
+Xoption can be used to specify which system's server to query.
+X.PP
+XCurrently, the behavior of
+X.I cubestat
+Xis defined as follows.
+XIf there is a game in progress,
+X.I cubestat
+Xwill output a player roster similar to the one displayed by the
+X.I cubes
+Xprogram.
+XOtherwise,
+X.I cubestat
+Xwill output an informative message relating to the current status
+Xof the server.
+XIf the
+X.B \-b
+Xoption is specified,
+X.I cubestat
+Xwill loop until a game is about to begin.
+XIf the
+X.B \-e
+Xoption is specified,
+X.I cubestat
+Xwill loop until any game that's in progress ends.
+X.SH "EXIT STATUS"
+XAn exit status of zero is returned if a game is in progress.
+XA non-zero exit status is returned if no game is in progress
+Xor if there was an error of some type.
+X.SH AUTHOR
+XGreg Paris <gmp@rayssd.ray.com>
+X.SH "SEE ALSO"
+Xcubes(6)
+END_OF_FILE
+if test 1342 -ne `wc -c <'cubestat.6'`; then
+    echo shar: \"'cubestat.6'\" unpacked with wrong size!
+fi
+# end of 'cubestat.6'
+fi
+if test -f 'tactics.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'tactics.c'\"
+else
+echo shar: Extracting \"'tactics.c'\" \(5405 characters\)
+sed "s/^X//" >'tactics.c' <<'END_OF_FILE'
+X/*	vi:set sw=4 ts=4: */
+X#ifndef	lint
+Xstatic char	sccsid[] = "@(#)tactics.c 5.1 (G.M. Paris) 89/01/22";
+X#endif	lint
+X
+X/*
+X**
+X**	cubes 5.1  Copyright 1989 Gregory M. Paris
+X**		Permission granted to redistribute on a no charge basis.
+X**		All other rights are reserved.
+X**
+X*/
+X
+X#include	"cubes.h"
+X
+X/*
+X**	nosingle: discard excess singles of a certain variety
+X*/
+Xnosingles(pd, comb)
+Xregister diceset   *pd;
+Xcombination			comb;
+X{
+X	register int	d;
+X	register int	singles;
+X	register int	aces	= 0;
+X	register int	fives	= 0;
+X	register int	jokers	= 0;
+X
+X	if(pd->d_best == Nothing)
+X		return;
+X
+X	for(d = 0;d < NDICE;++d) {
+X		switch(pd->d_comb[d]) {
+X		case Ace:	++aces; break;
+X		case Five:	++fives; break;
+X		case Joker:	++jokers; break;
+X		default:	break;
+X		}
+X	}
+X
+X	switch(comb) {
+X	case Ace:	if((singles = aces) == 0) return; break;
+X	case Five:	if((singles = fives) == 0) return; break;
+X	case Joker:	if((singles = jokers) == 0) return; break;
+X	default:	return;
+X	}
+X
+X	if(pd->d_best == comb) {
+X		switch(comb) {
+X		case Ace:	if(fives > 0) { pd->d_best = Five; break; }		/* fall */
+X		case Five:	if(jokers > 0) { pd->d_best = Joker; break; }	/* fall */
+X		case Joker:	if(--singles == 0) return; break;
+X		}
+X	}
+X
+X	/*
+X	**	Alternate zapping LtoR and RtoL.
+X	*/
+X	if(randint(2) == 1) {
+X		for(d = 0;singles > 0 && d < NDICE;++d) {
+X			if(pd->d_comb[d] == comb) {
+X				pd->d_comb[d] = Nothing;
+X				pd->d_stat[d] = Free;
+X				++pd->d_rolling;
+X				--singles;
+X			}
+X		}
+X	} else {
+X		for(d = NDICE-1;singles > 0 && d >= 0;--d) {
+X			if(pd->d_comb[d] == comb) {
+X				pd->d_comb[d] = Nothing;
+X				pd->d_stat[d] = Free;
+X				++pd->d_rolling;
+X				--singles;
+X			}
+X		}
+X	}
+X}
+X
+X/*
+X**	noaces, nofives, nojokers: calls to nosingles routine
+X*/
+Xnoaces(pd)		diceset *pd; { nosingles(pd, Ace); }
+Xnofives(pd)		diceset *pd; { nosingles(pd, Five); }
+Xnojokers(pd)	diceset *pd; { nosingles(pd, Joker); }
+X
+X/*
+X**	no3okind: zap 3o'kind in specified denomination
+X**		If face is BADFACE, zaps any denomination 3o'kind found.
+X**		Assumes only Aces, Fives, and Jokers will fit in
+X**		the same hand as a Three_of_a_kind.
+X*/
+Xno3okind(pd, face)
+Xregister diceset   *pd;
+Xint					face;
+X{
+X	register int	d;
+X	boolean			present;
+X	combination		nextbest;
+X
+X	if(pd->d_best != Three_of_a_kind)
+X		return;
+X
+X	/*
+X	**	Look for the 3o'kind and the highest single.
+X	*/
+X	present = False;
+X	nextbest = Nothing;
+X	for(d = 0;d < NDICE;++d) {
+X		switch(pd->d_comb[d]) {
+X		case Three_of_a_kind:
+X			if(face != BADFACE && pd->d_face[d] != face)
+X				return;
+X			present = True;
+X			switch(pd->d_face[d]) {
+X			case ACE:
+X				nextbest = Ace;
+X				break;
+X			case FIVE:
+X				if(nextbest == Nothing || nextbest == Joker)
+X					nextbest = Five;
+X				break;
+X			case JOKER:
+X				if(nextbest == Nothing)
+X					nextbest = Joker;
+X				break;
+X			default:
+X				break;
+X			}
+X			break;
+X		case Ace:
+X			nextbest = Ace;
+X			break;
+X		case Five:
+X			if(nextbest == Nothing || nextbest == Joker)
+X				nextbest = Five;
+X			break;
+X		case Joker:
+X			if(nextbest == Nothing)
+X				nextbest = Joker;
+X			break;
+X		default:
+X			break;
+X		}
+X	}
+X
+X	/*
+X	**	If we didn't find an appropriate 3o'kind or if there
+X	**	would be no scoring dice left if we zapped it, we're done.
+X	*/
+X	if(present == False || nextbest == Nothing)
+X		return;
+X	
+X	/*
+X	**	Obliterate 3o'kind.  If it's in a scoring denomination,
+X	**	do the appropriate conversion and count on a later call
+X	**	to noaces, nofives, or nojokers to finish the job.
+X	*/
+X	for(d = 0;d < NDICE;++d) {
+X		if(pd->d_comb[d] != Three_of_a_kind)
+X			continue;
+X		switch(pd->d_face[d]) {
+X		case ACE:	pd->d_comb[d] = Ace; break;
+X		case FIVE:	pd->d_comb[d] = Five; break;
+X		case JOKER:	pd->d_comb[d] = Joker; break;
+X		default:
+X			pd->d_comb[d] = Nothing;
+X			pd->d_stat[d] = Free;
+X			++pd->d_rolling;
+X			break;
+X		}
+X	}
+X	pd->d_best = nextbest;
+X}
+X
+X/*
+X**	no3deuce, no3three, no3any: calls to no3okind routine
+X*/
+Xno3deuce(pd)	diceset *pd; { no3okind(pd, DEUCE); }
+Xno3three(pd)	diceset *pd; { no3okind(pd, THREE); }
+Xno3any(pd)		diceset *pd; { no3okind(pd, BADFACE); }
+X
+X/*
+X**	nosmall: discard Small_straight, retaining imbeded ace or five
+X**		Assumes only singles fit in a hand with a Small_straight.
+X*/
+Xnosmall(pd)
+Xregister diceset   *pd;
+X{
+X	register int	d;
+X	boolean			present;
+X	combination		nextbest;
+X
+X	if(pd->d_best != Small_straight)
+X		return;
+X
+X	present = False;
+X	nextbest = Nothing;
+X	for(d = 0;d < NDICE;++d) {
+X		switch(pd->d_comb[d]) {
+X		case Small_straight:
+X			present = True;
+X			switch(pd->d_face[d]) {
+X			case ACE:
+X				pd->d_comb[d] = Ace;
+X				nextbest = Ace;
+X				break;
+X			case FIVE:
+X				pd->d_comb[d] = Five;
+X				if(nextbest == Nothing || nextbest == Joker)
+X					nextbest = Five;
+X				break;
+X			default:
+X				pd->d_comb[d] = Nothing;
+X				pd->d_stat[d] = Free;
+X				++pd->d_rolling;
+X				break;
+X			}
+X			break;
+X		case Ace:
+X			nextbest = Ace;
+X			break;
+X		case Five:
+X			if(nextbest == Nothing || nextbest == Joker)
+X				nextbest = Five;
+X			break;
+X		case Joker:
+X			if(nextbest == Nothing)
+X				nextbest = Joker;
+X			break;
+X		default:
+X			break;
+X		}
+X	}
+X	if(present == True)
+X		pd->d_best = nextbest;
+X}
+X
+X/*
+X**	noacesmall: discard only Small_straights that contain an imbedded ace
+X*/
+Xnoacesmall(pd)
+Xregister diceset   *pd;
+X{
+X	register int	d;
+X
+X	if(pd->d_best != Small_straight)
+X		return;
+X	
+X	for(d = 0;d < NDICE;++d) {
+X		if(pd->d_comb[d] == Small_straight) {
+X			switch(pd->d_face[d]) {
+X			case ACE:			/* imbedded ace */
+X				nosmall(pd);	/* dump it */
+X				return;			/* all done */
+X			case FIVE:			/* imbedded five */
+X				return;			/* keep it */
+X			}
+X		}
+X	}
+X}
+END_OF_FILE
+if test 5405 -ne `wc -c <'tactics.c'`; then
+    echo shar: \"'tactics.c'\" unpacked with wrong size!
+fi
+# end of 'tactics.c'
+fi
+echo shar: End of archive 2 \(of 8\).
+cp /dev/null ark2isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 8 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

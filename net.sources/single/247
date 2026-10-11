@@ -1,0 +1,379 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,784dfcfc8f849808,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-03-09 00:32:34 PST
+Message-ID: <bnews.linus.14397>
+Newsgroups: net.sources
+Path: utzoo!decvax!genradbo!linus!sch
+X-Path: utzoo!decvax!genradbo!linus!sch
+From: linus!sch
+Date: Wed Mar  9 03:32:32 1983
+Subject: Reposting of Buchholz Benchmark
+X-Google-Info: Converted from the original B-News header
+Posted: Tue Mar  8 08:07:37 1983
+Received: Wed Mar  9 03:32:32 1983
+
+echo x - Readme
+cat >Readme <<'!E!O!F!'
+The program buchholz is a performance measuring tool from "A synthetic
+job for measuring system performance" by W. Buchholz, IBM Syst.
+Journal, No. 4 1969 page 309.  It is a useful tool since it combines
+both I/O and computational speed tests.
+
+Two bencmarks are combined together here, the first is a compute
+bound matrix problem and the second is a file update problem.
+
+The input stream consists of lines with three numbers.  First the
+number of master file records, second the number of transaction file
+records, and third the number of computational cycles.  If the first
+two are zero then the test does no I/O, if the number of computational
+steps is zero then it does no computation.  See the file 'Sample' for a
+typical set of input values.
+
+The output stream contains the results of these tests, formatted for
+readablity.  
+Results are included for:
+	Filename	Machine		Running Unix Version
+      --------------------------------------------------------
+	Vax750		Vax 11/750 	4.1bsd
+	Vax780		Vax 11/780	4.1bsd
+	PWB11-70	Pdp 11/70	PWB Unix
+
+See the source if you want to change either,
+1) the type of I/O used (now stdio),
+2) or the type of numbers used in the computation test.
+!E!O!F!
+echo x - buchholz.c
+cat >buchholz.c <<'!E!O!F!'
+/*  Buchholz performance test.
+ *  from "A synthetic job for measuring system performance"
+ *  by W. Buchholz, IBM Syst. Journal, No. 4 1969 page 309.
+ *
+ * The following parameters determine size and arithmetic type of test
+ */
+#include <stdio.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/times.h>
+#define TICKS_SEC 60	/* clock ticks/second */
+
+/* The following determine size of table and data type to use
+ * for the compute bound test portion.
+ */
+#define N	10
+#define START	100
+typedef long TESTYPE;	/* want 32 bit integers */
+
+/* the following determine type I/O to be done. */
+#define GETREC(x,f) fread((char *) &x, sizeof(x), 1, f)
+#define PUTREC(x,f) fwrite((char *) &x, sizeof(x), 1, f)
+ 
+#define TRUE 1
+#define FALSE 0
+#define BIGNUM 32766
+
+char mas_name[] = "/tmp/Bm\0XXXXXX";
+char det_name[] = "/tmp/Bd\0XXXXXX";
+char nmas_name[] = "/tmp/Bn\0XXXXXX";
+char ndet_name[] = "/tmp/Bo\0XXXXXX";
+FILE *master, *detin, *newmas, *detout;
+FILE *openfile();
+
+main() {
+	static TESTYPE table[N*N*N+1], sum;
+	register int j;
+	int ratio,nmas,nmas1,ndet,ndet1,nrep;
+	long checksum, count, rstime, retime;
+	char card[80];
+	float el_stime, el_utime;
+	extern int clean();
+
+	struct tms st_time, end_time;
+
+	struct record {
+		int key;
+		TESTYPE sum;
+		long check;
+		char data[16];
+	} m_rec,d_rec;
+
+	nmas = 0; 
+	ndet = 0;
+
+	mktemp(mas_name);	mktemp(det_name);
+	mktemp(nmas_name);	mktemp(ndet_name);
+	if( signal(SIGHUP, clean) == SIG_IGN)
+		signal(SIGHUP,SIG_IGN);
+	if(signal(SIGINT, clean) == SIG_IGN)
+		signal(SIGINT,SIG_IGN);
+
+	for(j=1; j<= N*N*N; j++)  /* initialize the table */
+		table[j] = START + j - 1;
+
+	printf("Input: #master #detail #steps\n");
+
+	while(fgets(card, 80, stdin) != NULL) {
+		printf("%s",card);
+		j=sscanf(card,"%d %d %d", &nmas1, &ndet1, &nrep);
+
+		if(j!=3||nmas1<0||ndet1<0||nrep<0||ndet1>nmas1) {
+			fprintf(stderr,"ERROR:invalid input parameters\n");
+			continue;
+		}
+		count = 0; checksum = 0;
+
+		if (nmas1 != nmas && nmas1 > 0) {     /* Master generation */
+			nmas = nmas1;
+			master = openfile(mas_name,"w");
+			for(j=1; j<=nmas; j++) {
+				m_rec.sum = 0;
+				m_rec.key = j;
+				checksum += j;
+				m_rec.check = checksum;
+				sprintf(m_rec.data,"MASTER %7d",j);
+				PUTREC(m_rec, master);
+			}
+			fclose(master);
+			checksum = 0;
+		}
+		if (ndet1 != ndet && ndet1 > 0) {    /* Detail generation */
+			ndet = ndet1;
+			ratio = nmas / ndet;
+			detout = openfile(det_name,"w");
+			for(j=ratio; j<=nmas; j += ratio) {
+				d_rec.sum = 0;
+				d_rec.key = j;
+				checksum += j;
+				d_rec.check = checksum;
+				sprintf(d_rec.data, "DETAIL %7d", j);
+				PUTREC(d_rec, detout);
+			}
+			fclose(detout);
+			checksum = 0;
+		}
+		if (nrep==0) continue;  /* Disk I/O pass */
+		if (nmas1 > 0 && ndet1 > 0) {
+			master = openfile(mas_name,"r");
+			newmas = openfile(nmas_name,"w");
+			detin = openfile(det_name,"r");
+			detout = openfile(ndet_name,"w");
+			GETREC(m_rec, master);
+			GETREC(d_rec, detin);
+			times(&st_time);
+			time(&rstime);
+
+			while(!feof(master)) {
+				if(m_rec.key < d_rec.key) { /* Key test */
+					PUTREC(m_rec, newmas);
+					GETREC(m_rec, master);
+				}
+				else if(m_rec.key > d_rec.key) {
+					fprintf(stderr,"ERROR:records out of sequence\n");
+					goto end_disk;
+				}
+				else {
+					if(!kernel(table,nrep,&sum)) goto end_disk;
+
+					m_rec.sum = sum; /* Write detail */
+					d_rec.sum = sum;
+					checksum = d_rec.check;
+					count++;
+					PUTREC(d_rec, detout);
+					GETREC(d_rec, detin);
+					PUTREC(m_rec, newmas);
+					GETREC(m_rec, master);
+				}
+
+				if(feof(detin))
+					d_rec.key = BIGNUM;
+			}
+			times(&end_time);
+			time(&retime);
+			if(checksum != (count * (count+1)*ratio)/ 2)
+				fprintf(stderr,"ERROR: Checksum error\n");
+end_disk:
+			fclose(master); 
+			fclose(newmas);
+			fclose(detin); 
+			fclose(detout);
+		}
+		else {                  /* Compute pass */
+			time(&rstime);
+			times(&st_time);
+			kernel(table,nrep,&sum);
+			times(&end_time);
+			time(&retime);
+		}
+
+		el_stime = (end_time.tms_stime - st_time.tms_stime)/TICKS_SEC;
+		el_utime = (end_time.tms_utime - st_time.tms_utime)/TICKS_SEC;
+
+		printf("Cpu time:%5.1f (sys) + %5.1f (usr) = %5.1f secs.\n",
+		   el_stime, el_utime, el_stime+el_utime);
+		printf("Elapsed time:%ld  secs.\n",retime-rstime);
+		printf("loops: %d\t",nrep);
+		printf("sum: %ld\t", sum);
+		printf("#active: %ld\t",count);
+		printf("checksum: %ld\n\n", checksum);
+
+	}
+	unlink(mas_name);         unlink(det_name);
+	unlink(nmas_name);        unlink(ndet_name);
+}
+
+/*
+ * The compute kernel sums N integers from a table of N^3 consectutive integers
+ * beginning with START. k-th integer summed is START - 1 + K^3.
+ * sum is checked algebraically.  Kernel is repeated nrep times.
+ */
+kernel(table,nrep,sum)
+TESTYPE table[];
+TESTYPE *sum;
+int nrep;
+{
+	register int i,j,k;
+	TESTYPE u, lsum;
+
+	for(i=0; i<nrep; i++) {
+		*sum = u = 0;
+		j = 0;
+		for(k=1; k<=N; k++) {
+			j += 6*u + 1;
+			*sum += table[j];
+			u += k;
+		}
+		lsum = (N * (N + 1))/ 2;
+		if(START != (*sum - lsum * lsum) / N + 1) {
+			fprintf(stderr,"ERROR: Compute pass arithmetic error\n");
+			return(FALSE);
+		}
+	}
+	return(TRUE);
+}
+
+
+/* An open function with error checking */
+FILE *openfile(name,acc)
+char *name, *acc;
+{
+	register FILE *result;
+
+	result = fopen(name, acc);
+	if(result == NULL) {
+		fprintf(stderr, "Couldn't open file: %s\n", name);
+		exit(1);
+	}
+	return(result);
+}
+
+/* quit and remove the temporary files if we get interrupted */
+clean() {
+	fclose(master);	fclose (newmas);
+	fclose(detin);	fclose (detout);
+	unlink(mas_name); unlink(det_name);
+	unlink(nmas_name); unlink(ndet_name);
+	exit(2);
+}
+!E!O!F!
+echo x - PWB11-70
+cat >PWB11-70 <<'!E!O!F!'
+Input: #master #detail #steps
+0 0 1000     short compute test
+Cpu time:  0.0 (sys) +   0.0 (usr) =   0.0 secs.
+Elapsed time:2  secs.
+loops: 1000	sum: 4015	#active: 0	checksum: 0
+
+0 0 10000    med compute bound test
+Cpu time:  1.0 (sys) +   6.0 (usr) =   7.0 secs.
+Elapsed time:25  secs.
+loops: 10000	sum: 4015	#active: 0	checksum: 0
+
+0 0 50000    long compute bound test
+ERROR:invalid input parameters
+1000 100 1   short I/O test
+Cpu time:  0.0 (sys) +   0.0 (usr) =   0.0 secs.
+Elapsed time:9  secs.
+loops: 1	sum: 4015	#active: 100	checksum: 50500
+
+3000 500 1   I/O bound test
+Cpu time:  2.0 (sys) +   2.0 (usr) =   4.0 secs.
+Elapsed time:41  secs.
+loops: 1	sum: 4015	#active: 500	checksum: 751500
+
+4000 700 200 long mixed test
+Cpu time: 15.0 (sys) + 108.0 (usr) = 123.0 secs.
+Elapsed time:307  secs.
+loops: 200	sum: 4015	#active: 800	checksum: 1602000
+!E!O!F!
+echo x - Vax750
+cat >Vax750 <<'!E!O!F!'
+Input: #master #detail #steps
+0 0 1000     short compute test
+Cpu time:  0.0 (sys) +   0.0 (usr) =   0.0 secs.
+Elapsed time:0  secs.
+loops: 1000	sum: 4015	#active: 0	checksum: 0
+
+0 0 10000    med compute bound test
+Cpu time:  0.0 (sys) +   2.0 (usr) =   2.0 secs.
+Elapsed time:6  secs.
+loops: 10000	sum: 4015	#active: 0	checksum: 0
+
+0 0 50000    long compute bound test
+Cpu time:  1.0 (sys) +  12.0 (usr) =  13.0 secs.
+Elapsed time:25  secs.
+loops: 50000	sum: 4015	#active: 0	checksum: 0
+
+1000 100 1   short I/O test
+Cpu time:  0.0 (sys) +   1.0 (usr) =   1.0 secs.
+Elapsed time:5  secs.
+loops: 1	sum: 4015	#active: 100	checksum: 50500
+
+3000 500 1   I/O bound test
+Cpu time:  1.0 (sys) +   3.0 (usr) =   4.0 secs.
+Elapsed time:9  secs.
+loops: 1	sum: 4015	#active: 500	checksum: 751500
+
+4000 700 200 long mixed test
+Cpu time:  6.0 (sys) +  48.0 (usr) =  54.0 secs.
+Elapsed time:104  secs.
+loops: 200	sum: 4015	#active: 800	checksum: 1602000
+
+
+
+!E!O!F!
+echo x - Vax780
+cat >Vax780 <<'!E!O!F!'
+Input: #master #detail #steps
+0 0 1000     short compute test
+Cpu time:  0.0 (sys) +   0.0 (usr) =   0.0 secs.
+Elapsed time:1  secs.
+loops: 1000	sum: 4015	#active: 0	checksum: 0
+
+0 0 10000    med compute bound test
+Cpu time:  0.0 (sys) +   1.0 (usr) =   1.0 secs.
+Elapsed time:1  secs.
+loops: 10000	sum: 4015	#active: 0	checksum: 0
+
+0 0 50000    long compute bound test
+Cpu time:  0.0 (sys) +   6.0 (usr) =   6.0 secs.
+Elapsed time:9  secs.
+loops: 50000	sum: 4015	#active: 0	checksum: 0
+
+1000 100 1   short I/O test
+Cpu time:  0.0 (sys) +   0.0 (usr) =   0.0 secs.
+Elapsed time:1  secs.
+loops: 1	sum: 4015	#active: 100	checksum: 50500
+
+3000 500 1   I/O bound test
+Cpu time:  0.0 (sys) +   2.0 (usr) =   2.0 secs.
+Elapsed time:5  secs.
+loops: 1	sum: 4015	#active: 500	checksum: 751500
+
+4000 700 200 long mixed test
+Cpu time:  3.0 (sys) +  24.0 (usr) =  27.0 secs.
+Elapsed time:51  secs.
+loops: 200	sum: 4015	#active: 800	checksum: 1602000
+
+!E!O!F!
+
+

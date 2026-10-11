@@ -1,0 +1,581 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,d1624a0b492a0187,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-08-12 17:49:52 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 exptools 1/6/84; site ihuxx.UUCP
+Path: utzoo!watmath!clyde!burl!mgnetp!ihnp4!ihuxx!ignatz
+From: ignatz@ihuxx.UUCP (Dave Ihnat, Chicago, IL)
+Newsgroups: net.sources
+Subject: re-write of the Unix 'cut' command
+Message-ID: <811@ihuxx.UUCP>
+Date: Sun, 12-Aug-84 20:49:52 EDT
+Article-I.D.: ihuxx.811
+Posted: Sun Aug 12 20:49:52 1984
+Date-Received: Mon, 13-Aug-84 03:32:09 EDT
+Organization: AT&T Bell Labs, Naperville, IL
+Lines: 561
+
+
+echo x - cut.c
+cat >cut.c <<'!E!O!F!'
+/*
+ * cut - a recreation of the Unix(Tm) cut(1) command.
+ *
+ * syntax:  cut -cLIST[ file1 file2 ...]
+ *		cut -fLIST [-d char][ -s][ file1 file2 ...]
+ *
+ *	Copyright (C) 1984 by David M. Ihnat
+ *
+ * This program is a total rewrite of the Bell Laboratories Unix(Tm)
+ * command of the same name, as of System V.  It contains no proprietary
+ * code, and therefore may be used without violation of any proprietary
+ * agreements whatsoever.  However, you will notice that the program is
+ * copyrighted by me.  This is to assure the program does *not* fall
+ * into the public domain.  Thus, I may specify just what I am now:
+ * This program may be freely copied and distributed, provided this notice
+ * remains; it may not be sold for profit without express written consent of
+ * the author.
+ * Please note that I recreated the behavior of the Unix(Tm) 'cut' command
+ * as faithfully as possible; however, I haven't run a full set of regression
+ * tests.  Thus, the user of this program accepts full responsibility for any
+ * effects or loss; in particular, the author is not responsible for any losses, * explicit or incidental, that may be incurred through use of this program.
+ *
+ * I ask that any bugs (and, if possible, fixes) be reported to me when
+ * possible.  -David Ihnat (312) 784-4544 ihuxx!ignatz
+ */
+
+#include <stdio.h>
+
+extern int errno;
+
+#define CPM
+
+/* I'd love to use enums, but not everyone has them.  Portability, y'know. */
+#define BADLIST		1
+#define NODELIM		2
+#define NOFIELDS	3
+#define USAGE		4
+#define BADFILE		5
+#define BACKERR		6
+#define TOOLONG		7
+
+#define	TAB	'\t';
+#define BACKSP	0x8
+#define	_MAXSZ	512
+#define COMMAND "cut"
+
+#define	IGNOREIT	0
+#define CUTIT		1
+
+char outbuf[_MAXSZ];			/* Processed output buffer */
+char rawbuf[_MAXSZ];			/* Raw holding buffer for field mode */
+#define	FLDFLAG	fields[0]		/* Used for EOL processing */
+short int fields[_MAXSZ];		/* Max number of fields or line length */
+
+char *cmdnam;
+
+short int cflag,fflag,sflag;
+char delim = TAB;
+
+main(argc,argv)
+int argc;
+char **argv;
+{
+	FILE *fileptr;
+	FILE *fopen();
+	int filecnt;
+
+	cflag = fflag = sflag = 0;
+
+#ifdef CPM
+	cmdnam = COMMAND;
+#else
+	cmdnam = *argv;
+#endif
+
+	/* Skip invocation name */
+	argv++;
+	argc--;
+
+	/* Most compilers initialize storage to zero; but don't count on it. */
+
+	for(filecnt = 0;filecnt < _MAXSZ;filecnt++)
+		fields[filecnt] = IGNOREIT;
+
+	/* First, parse input options */
+
+	while(argv[0][0] == '-')
+	{
+		switch(argv[0][1])
+		{
+			case 'c':
+				/* Build the character position list */
+				if(fflag || cflag)
+					prerr(USAGE,NULL);
+				else
+				{
+					cflag++;
+					setflds(&argv[0][2]);
+				}
+				break;
+
+			case 'f':
+				/* Build the field position list */
+				if(fflag || cflag)
+					prerr(USAGE,NULL);
+				else
+				{
+					fflag++;
+					setflds(&argv[0][2]);
+				}
+				break;
+
+			case 'd':
+				/* New delimiter */
+				delim = argv[0][2];
+				if(delim == '\0')
+					prerr(NODELIM,NULL);
+
+				break;
+
+			case 's':
+				sflag++;
+				break;
+
+			default:
+				prerr(USAGE,NULL);
+		}
+		argv++;
+		argc--;
+	}
+
+	/* Finished all setup.  If no fields selected, tell them and exit. */
+	if(!(cflag | fflag))
+		prerr(BADLIST,NULL);
+
+	if(!FLDFLAG)
+		prerr(NOFIELDS,NULL);
+
+	/*
+	 * If no files specified, process stdin.  Otherwise,
+	 * process on a file-by-file basis.
+	 */
+	 if(argc == 0)
+		dofile(stdin);
+	else
+		for(filecnt = 0;filecnt < argc;filecnt++,argv++)
+			if((fileptr = fopen(argv[0],"r")) == (FILE *)NULL)
+				prerr(BADFILE,argv);
+			else
+			{
+				dofile(fileptr);
+				fclose(fileptr);
+			}
+}
+
+setflds(fldstr)
+char *fldstr;
+{
+	/*
+	 * The string, character or field, must have one of the 
+	 * following formats:
+	 *
+	 *	n
+	 *	n,m[,...]	where n<m
+	 *	a-b		where a<b
+	 *	-n,m		where n<m; implies 1-n
+	 *	n-		where - implies to end of line or last field
+	 */
+	int index,minflag,value,fldset;
+
+	minflag = 0;
+	value = 0;
+	index = 1;
+	FLDFLAG = 0;
+
+	for(;;)
+	{
+		switch(*fldstr)
+		{
+			case '-':
+				/* Starting a range */
+				if(minflag)
+					prerr(BADLIST,NULL);
+				minflag++;
+				fldstr++;
+
+				if(value)
+				{
+					if(value >= _MAXSZ)
+						prerr(BADLIST,NULL);
+
+					index = value;
+				}else
+					index = 1;
+
+				value = 0;
+				break;
+			
+			case ',':
+			case '\0':
+				/* Ending the string, or this field/column sublist */
+				if(minflag) /* Some damnable range */
+				{	/* Ranges are nasty.  Possibles:
+					 * -n,a-n,n-.  In any case, index
+					 * contains the start of the range.
+					 */
+					if(!value)
+					{	/* From index to EOL */
+
+						FLDFLAG = index;
+						fldset++;
+						value = 0;
+					}else
+					{
+						if(value >= _MAXSZ)
+							prerr(BADLIST,NULL);
+
+						if(value < index)
+							prerr(BADLIST,NULL);
+
+						/* Already a TOEOL sequence? */
+						if(FLDFLAG)
+						{
+							/*
+							 * Yes.  Now...is the new sequence already
+							 * contained by the old one? If so, no processing
+							 * is necessary.
+							 */
+							if(FLDFLAG > index)
+							{
+								/*
+								 * No, the new sequence starts before the old.
+								 * Does the range extend into the current
+								 * EOL range? If so, simply move the EOL marker.
+								 */
+								if(FLDFLAG < value)
+								{
+									FLDFLAG = index;
+								}else
+									/* Simple range. Fill it. */
+									for(; index <= value ;index++)
+										fields[index] = CUTIT;
+
+								/* In any case, some fields were selected. */
+								fldset++;
+							}
+						}else	/* Ok, no TOEOL sequence */
+						{
+							for(;index <= value;index++)
+							{
+								fields[index] = CUTIT;
+							}
+							fldset++;
+						}
+						value = 0;
+					}
+					minflag = 0;	/* Reset the field-in-progress flag. */
+				}else
+					if(value)
+					{
+						if(value >= _MAXSZ)
+							prerr(BADLIST,NULL);
+
+						fields[value] = CUTIT;
+						value = 0;
+						fldset++;
+					}
+
+
+				if(*fldstr == '\0')
+				{
+					/*
+					 * Last bit of processing.  If there was an EOL,
+					 * fill the array from the EOL point.  In any case,
+					 * if there were any fields selected, leave the FLDFLAG
+					 * value non-zero on return.
+					 */
+					if(FLDFLAG)
+						for(index = FLDFLAG; index < _MAXSZ; index++)
+							fields[index] = CUTIT;
+
+					if(fldset)
+						FLDFLAG = 1;
+
+					return(0);
+				}
+
+				fldstr++;
+				break;
+
+			default:
+				if((*fldstr < '0' ) || (*fldstr > '9' ))
+					prerr(BADLIST,NULL);
+
+				else
+				{
+					value = 10 * value + *fldstr - '0';
+					fldstr++;
+				}
+		}
+	}
+}
+
+dofile(fno)
+FILE *fno;
+{
+	/*
+	 * This will process the input files according to the rules specified
+	 * in the fields array.
+	 */
+
+	 int charcnt,poscnt,bflag,doneflag,fldfound;
+	 register int c;
+
+	 char *inbufptr, *rawbufptr;
+
+	 do
+	 {
+		inbufptr =  outbuf;
+		rawbufptr = rawbuf;
+		charcnt =  bflag = doneflag = fldfound = 0;
+		poscnt = 1;
+
+		do
+		{
+			c = fgetc(fno);
+			if(c == EOF)
+			{
+				/* That's it for this file or stream */
+				doneflag++;
+				break;
+			}
+
+			if(cflag)
+			{
+				/*
+				 * In character scan mode.  Look to see if
+				 * it's an NROFF-type underlined character;
+				 * if so, then don't count the backspace.
+				 * Notice that this could cause a buffer
+				 * overflow in the worst case situation...
+				 * but that's MOST unlikely.
+				 */
+
+				if(c == BACKSP)
+				{
+					if(bflag)
+						prerr(BACKERR);
+					else
+					{
+						bflag++;
+						*inbufptr++ = c;
+					}
+				}else
+				{
+					/*
+					 * Valid character.  If it's to be sent,
+					 * stow it in the outbuffer.
+					 */
+					 bflag = 0;
+
+					 if(++charcnt == (_MAXSZ - 1))
+						prerr(TOOLONG);
+
+					 if(fields[charcnt] && (c != '\n'))
+						*inbufptr++ = c;
+				}
+			}else
+			{
+				/*
+				 * Field processing.  In this case, charcnt
+				 * does indicate processed characters on the
+				 * current line, but that is all.  Notice that
+				 * ALL characters are initially stowed in the
+				 * raw  buffer, until at least one field has
+				 * been found.
+				 */
+				 if(fields[poscnt])
+				 {
+					/* Ok, working on a field.  It,
+					 * and its terminating delimiter,
+					 * go only into the processed buffer.
+					 */
+					 fldfound = 1;
+					 if(c != '\n')
+					 	*inbufptr++ = c;
+				}else
+					if(!fldfound)
+					{
+						charcnt++;
+						if(c != '\n')
+							*rawbufptr++ = c;
+					}
+				/*
+				 * In any case, if a delimiter, bump the field
+				 * indicator.
+				 */
+				 if(c == delim)
+					poscnt++;
+			}
+		}while(c != '\n');
+
+		if((cflag && charcnt) || (fflag && fldfound))
+		{
+			/*
+			 * No matter what mode, something was found. Print it.
+			 */
+
+			if(fflag && (*(inbufptr-1) == delim))
+				--inbufptr; /* Supress trailing delimiter */
+
+			*inbufptr = '\0'; /* But null-terminate the line. */
+			puts(outbuf);
+		}else
+			if((fflag && (!sflag)) && charcnt)
+			{
+				/*
+				 * In this case, a line with some characters,
+				 * no delimiters, and no supression.  Print it.
+				 */
+
+				 *rawbufptr = '\0';
+				 puts(rawbuf);
+			}
+
+	 }while(!doneflag);
+}
+
+prerr(etype, estring)
+int etype;
+char *estring;
+{
+	switch(etype)
+	{
+		case BADLIST:
+			fprintf(stderr,"%s : bad list for c/f option\n",cmdnam);
+			break;
+
+		case USAGE:
+			fprintf(stderr,"Usage: %s [-s] [-d<char>] {-c<list> | -f<list>} file ...\n",cmdnam);
+			break;
+
+		case NOFIELDS:
+			fprintf(stderr,"%s : no fields\n",cmdnam);
+			break;
+
+		case NODELIM:
+			fprintf(stderr,"%s : no delimiter\n",cmdnam);
+			break;
+
+		case BADFILE:
+			fprintf(stderr,"Cannot open: %s : %s\n",cmdnam,estring);
+			break;
+		
+		case BACKERR:
+			fprintf(stderr,"%s : cannot handle multiple adjacent backspaces\n",cmdnam);
+			break;
+
+		case TOOLONG:
+			fprintf(stderr,"%s : line too long\n",cmdnam);
+	}
+	exit(2);
+}
+!E!O!F!
+echo x - cut.mp
+cat >cut.mp <<'!E!O!F!'
+.TH CUT 1 ""
+.SH NAME
+cut \- cut out selected fields of each line of a file
+.SH SYNOPSIS
+\fBcut -c\fPlist [file1 file2 ...]
+.br
+\fBcut -f\fPlist [\fB-d\fP char] [\fB-s\fP] [file1 file2 ...]
+.SH DESCRIPTION
+Use \fIcut\fP to cut out columns from a table or fields from each line of a
+file; in data base parlance, it implements the projection of a
+relation.  The fields as specified by \fIlist\fP can be fixed length,
+i.e., character positions as on a punched card (\fB\-c\fP option), or
+the length can vary from line to line and be marked with a field
+delimiter character like \fItab\fP (\fB\-f\fP option).  \fICut\fP can
+be used as a filter; if no files are given, the standard input is
+used.
+.PP
+The meanings of the options are:
+.TP .75
+\fIlist\fP
+A comma-separated list of integer field numbers (in increasing order),
+with optional \- to indicate ranges as in the \fB\-o\fP option of
+\fInroff/troff\fP for page ranges; e.g., \fB1,4,5\fP\;
+\fB1\-3,8\fP\; \fB\-5,10\fP (short for \fB1\-5,10\P); or \fB3\-\fP
+(short for third through last field).
+.TP
+\fB\-c\fIlist\fR
+The \fIlist\fP following \fB\-c\fP (no space) specifies character
+positions (e.g., \fB\-c1\-72\fP would pass the first 72 characters of
+each line).
+.TP
+\fB\-f\fIlist\fR
+The \fIlist\fP following \fB\-f\fP is a list of fields assumed to be
+separated in the file by a delimiter character (see \fB\-d\fP); e.g.,
+\fB\-f1,7\fP copies the first and seventh field only.  Lines with no
+field delimiters will be passed through intact (useful for table
+subheadings), unless \fB\-s\fP is specified.
+.TP
+\fB\-d\fIchar\fR
+The character following \fB\-d\fP is the field delimiter (\fB\-f\fP
+option only).  Default is \fItab\fP.  Space or other characters with
+special meaning to the shell must be quoted.
+.TP
+\fB\-s\fP
+Supresses lines with no delimiter characters in case of \fB\-f\fP
+option.  Unless specified, lines with no delimiters will be passed
+through untouched.
+.PP
+Either the \fB\-c\fP or \fB\-f\fP option must be specified.
+.SH HINTS
+Use \fIgrep\fP(1) to make horizontal "cuts" (by context) through a
+file or \fIpaste\fP(1) to put files together column\-wise (i.e.,
+horizontally).  To reorder columns in a table, use \fIcut\fP and
+\fIpaste\fP.
+.SH EXAMPLES
+.TP 2.25
+cut -d: -f1,5 /etc/passwd
+mapping of user IDs to names
+.TP
+name\=\`who am i\|cut \-f1 \-d\"\ \"\`
+to set \fBname\fP to current login name
+.SH DIAGNOSTICS
+.TP 2.0
+\fIline too long\fP
+A line can have no more than 511 characters or fields.
+.TP
+\fIbad list for c/f option\fP
+Missing \fB\-c\fP or \fB\-f\fP option or incorrectly specified
+\fIlist\fP.  No error occurs if a line has fewer fields than the
+\fIlist\fP calls for.
+.TP
+\fIno fields\fP
+The \fIlist\fP is empty.
+.SH SEE ALSO
+grep(1),paste(1).
+.SH CAVEATS
+This program is a complete rewrite of the Bell Laboratories command of
+the same name; no part of the original source or manual is included.
+Therefore, you may feel free to use it, and its source, without violation
+of \fPany\fP contract agreements.  However, I retain the copyright in order to
+specify it remain available for use by all and sundry, without
+cost.  Feel free to modify as necessary, although I went to great
+pains to recreate the behavior of the original command; I would suggest
+this congruence be maintained.
+.PP
+Along the same lines, although I've made a reasonable effort to test
+the more arcane behavior of the original \fIcut\fP and reproduce it,
+there are no guarantees.  I remain in no way liable for any loss,
+either explicit or incidental, that may be incurred through use of this
+command.  I do ask that any bugs (and, hopefully, fixes) be reported
+back to me as encountered. \- David M. Ihnat, ihuxx!ignatz
+!E!O!F!
+
+

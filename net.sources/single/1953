@@ -1,0 +1,224 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,e728f224f5775a06,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-11-19 10:54:23 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site asgb.UUCP
+Path: utzoo!linus!decvax!ittvax!dcdwest!sdcsvax!bmcg!asgb!devine
+From: devine@asgb.UUCP
+Newsgroups: net.sources
+Subject: checkmail program
+Message-ID: <582@asgb.UUCP>
+Date: Mon, 19-Nov-84 13:54:23 EST
+Article-I.D.: asgb.582
+Posted: Mon Nov 19 13:54:23 1984
+Date-Received: Tue, 20-Nov-84 07:17:47 EST
+Reply-To: devine@asgb.UUCP (Bob Devine)
+Organization: Burroughs Corporation, Boulder Colo.
+Lines: 203
+
+
+  Here is a little program that I have used for a while and thought
+other folks may want to use.  The idea came from Brian Kernighan and
+Rob Pike's book "The Unix Programming Environment".  They gave a
+little program that checked for a growing mailbox.  The assumption
+is that a larger mailbox means that one (or more) message have been
+appended to it since the last time its size was checked.
+
+  It was fine for the simple case.  However, if you are reading mail
+when a new message comes in and you delete an existing message, there
+is no way to determine if a new message arrived by size checking alone.
+I've also added all sorts of bells and whistles to the original.
+In the latest incarnation of 'checkail' it will asynchronously tell
+you when mail has arrived, giving the sender's name and the 'Subject:'
+line, if any.  BUT, if you don't like it breaking through when you are editing,
+you'll have to modify it to wait with a message (some suggestions are setting
+the eXecute bit for your TTY line or using a LCK.TERM file to mean
+"don't bother me with mail now!").
+
+  Environment stuff:  I use it for System V.2 Unix, it MAY still work
+for BSD Unixes -- it has been modified greatly since it last ran on 4.1.
+There are #ifdef BSD sections included.  Run 'checkmail' in the background.
+Use the command sh -c "checkmail &" if you don't like the process number to
+be displayed.  For BSD, you will have to kill the process when you logout,
+so keep that PID or just make sure that it is the first job and kill it
+using %1.  If you are worried about everyone running their own copy or
+checkmail and gobbling up needed process slots, change it to run like 'biff'
+to check everyone's mailbox who wants it done (exercise left to the reader...).
+
+  One more thing, change the NOISE string to whatever you want to be
+bothered by.  Postnews will probably chew up the current string "escape#>".
+
+Bob Devine  Burroughs-ASG   {sdcsvax || sdcrdcf}!bmcg!asgb!moloch!devine
+
+---------------- cut ------ here ------------------------
+
+/*  checkmail :  program to watch a user's mailbox */
+/*  		 Oct. 84 Bob Devine                */
+
+#include <stdio.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <time.h>
+#ifdef BSD
+#include <sys/timeb.h>
+#endif
+#include <sys/stat.h>
+
+#define  WHO_LENGTH  15		/* assume max user_name is 15 chars (safe)*/
+#ifdef BSD
+#define  POST_OFFICE "/usr/spool/mail"
+#else
+#define  POST_OFFICE "/usr/mail"
+#endif
+
+/**** GLOBAL VARIABLES ****/
+unsigned char	line[512];	/* working space throughout program */
+char	*prog_name;		/* what this program is called */
+struct tm   * prev_tm;
+FILE	*outfile, *mailfp;
+char    *NOISE = "#>";	/* vt100 style keyclick --
+				-- should use BEL from terminfo/cap */
+
+main (argc, argv)
+    char   **argv;
+{
+	struct stat mail_box;		/* the user's mailbox */
+	struct tm   temp_tm;		/* used at program start up */
+	char  *user_name;
+	char  *getlogin();		/* used for finding correct mailbox */
+	long   last_time_checked;
+	long   time();
+	int    last_size, snooze_amount;
+
+	prog_name = argv[0];
+
+	if ((outfile = fopen("/dev/tty", "w")) == NULL)
+		die("error opening /dev/tty for output", (char *) 0);
+	if ((user_name = getlogin()) == NULL) /* find out who is running this */
+		die("can't get your login name", (char *) 0);
+	if (chdir(POST_OFFICE) == -1)
+		die("can't cd to %s", POST_OFFICE);
+	prev_tm = &temp_tm;		/* start with it zeroed out */
+#ifdef BSD
+	/* ignore the TOSTOP signal for running in background */
+	signal(SIGTTOU, SIG_IGN);
+#endif
+
+
+	while (1)	/* run until gets [kill, intr, hup, ETC] sig) */
+	{
+		while (stat(user_name, &mail_box) == -1) /* no mailbox found */
+		    if (errno == ENOENT)
+			sleep(300);	/* wait 5 min & try again */
+		    else
+			die("error with the mail file", (char *) 0);
+		if ((mailfp = fopen(user_name, "r")) == NULL)
+			die("error opening mail file for read\n", (char *) 0);
+
+		/* Any new mail? */
+		if (mail_box.st_size != last_size)
+		  {
+			/* examine EVERY message to see if it is new */
+			lseek(fileno(mailfp), 0L, 0);
+			check_for_new_msgs();
+		  }
+		fclose(mailfp);
+		last_size = mail_box.st_size;
+		time(&last_time_checked);
+		prev_tm = localtime(&last_time_checked);
+		/* sleep until the 'top-of-the-minute' */
+		snooze_amount = 59 - prev_tm->tm_sec;
+		if (snooze_amount < 20)		/* for efficiency sake && */
+		   snooze_amount += 60;		/* avoiding sleeps of zero */
+		sleep(snooze_amount);
+	}
+}
+
+
+/* has_a : tells if the 'string' has 'word' at beginning */
+has_a(word, string)
+    register char *word, *string;
+{
+	while(*word)
+		if (*word++ != *string++) return(0);
+	return(1);
+}
+
+
+/* is_a_new_msg : check the From line for the date (kludge, kludge) */
+is_a_new_msg(from_line)
+    char   *from_line;
+{
+	register char *p;
+	int	 day, hour, min;
+
+	/* the date has format "Mon Oct  8 10:48 1984" */
+	for (p = from_line+12; *p!=':' && *p!='\0'; p++) ;
+	if (! *p) return(0);	/* if colon not found, assume old mesg */
+	p = p - 5;		/* back into the DAY field */
+	day=0;
+	if (*p >= '\060')	/* ignore if blank */
+	   day = ((int) *p - 060);
+	p++;
+	day  = day * 10 + ((int) *p - 060); p = p + 2;
+	hour = ((int) *p++ - 060) * 10 + ((int) *p - 060); p = p + 2;
+	min  = ((int) *p++ - 060) * 10 + ((int) *p - 060);
+      /* check to see if this message is older than the last time checked */
+      /* NOTE: best resolution is 1 min */
+	if ((min >= prev_tm->tm_min) && (hour == prev_tm->tm_hour))
+		return(1);
+	if ((hour > prev_tm->tm_hour) && (day == prev_tm->tm_mday))
+		return(1);
+	if (day > prev_tm->tm_mday)	/* if program is run after midnight */
+		return(1);		/*-- or program has just started */
+	return(0);
+}
+
+check_for_new_msgs()
+{
+	int	i;			/* loop variable */
+	char	who_sent[WHO_LENGTH];
+
+	while (fgets(line, sizeof(line), mailfp) != NULL)
+	    if (has_a("From ", line))
+		if (is_a_new_msg(line))
+		{
+			int count = 0;
+
+			for (i=0; i < WHO_LENGTH; i++)
+				if ((who_sent[i] = line[i+5]) == ' ') break;
+			who_sent[i] = '\0';
+			fprintf(outfile, "\n New mail from %s - ", who_sent);
+			fgets(line, sizeof(line), mailfp);  /* eat 'To' line */
+			fgets(line, sizeof(line), mailfp);  /* subject line? */
+			while ((count < 4) && (! has_a("Subject: ", line)))
+			  {
+			    fgets(line, sizeof(line), mailfp);
+			    count++;
+			  }
+			if (has_a("Subject: ", line))
+				fprintf(outfile, "%s%s", line, NOISE);
+			else
+				fprintf(outfile, "(no subject)%s\n", NOISE);
+			fflush(outfile);
+		}
+}
+
+/* die : print error message and die */
+die(s1, s2)
+    char *s1, *s2;
+{
+	extern int errno, sys_nerr;
+	extern char *sys_errlist[], *prog_name;
+
+	if (prog_name) fprintf(stderr, "%s: ", prog_name);
+	(void)fprintf(stderr, s1, s2);
+	if (errno > 0 && errno < sys_nerr)
+		fprintf(stderr, " (%s)", sys_errlist[errno]);
+	(void)fprintf(stderr, "\n");
+	exit(1);
+}
+
+

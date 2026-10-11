@@ -1,0 +1,2207 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,86ac0a27f35622fd,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1992-06-19 01:31:26 PST
+Path: sparky!uunet!zephyr.ens.tek.com!master!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v13i092:  gnuchess4 - GNU Chess 4.0, Part04/12
+Message-ID: <3059@master.CNA.TEK.COM>
+Date: 19 Jun 92 15:54:02 GMT
+Sender: news@master.CNA.TEK.COM
+Lines: 2191
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: cracraft@rice-chex.ai.mit.edu (Stuart Cracraft)
+Posting-number: Volume 13, Issue 92
+Archive-name: gnuchess4/Part04
+Supersedes: gnuchess2: Volume 4, Issue 37-40
+Environment: 
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 4 (of 12)."
+# Contents:  src/checkgame.c src/search.c
+# Wrapped by billr@saab on Fri Jun 19 08:36:00 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'src/checkgame.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'src/checkgame.c'\"
+else
+echo shar: Extracting \"'src/checkgame.c'\" \(18324 characters\)
+sed "s/^X//" >'src/checkgame.c' <<'END_OF_FILE'
+X/*
+X * checkgame.c - check a chess.lst file for illegal moves
+X *
+X * Usage: checkgame filename
+X *
+X * Copyright (c) 1992 Free Software Foundation
+X *
+X * This file is part of GNU CHESS.
+X *
+X * GNU Chess is free software; you can redistribute it and/or modify
+X * it under the terms of the GNU General Public License as published by
+X * the Free Software Foundation; either version 2, or (at your option)
+X * any later version.
+X *
+X * GNU Chess is distributed in the hope that it will be useful,
+X * but WITHOUT ANY WARRANTY; without even the implied warranty of
+X * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X * GNU General Public License for more details.
+X *
+X * You should have received a copy of the GNU General Public License
+X * along with GNU Chess; see the file COPYING.  If not, write to
+X * the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
+X */
+X#include <stdio.h>
+X#include "gnuchess.h"
+X#ifdef MSDOS
+X#include <stdlib.h>
+X#include <string.h>
+X#include <time.h>
+X#define RWA_ACC "r+b"
+X#define WA_ACC "w+b"
+X#else
+X#define RWA_ACC "r+"
+X#define WA_ACC "w+"
+X#include <sys/param.h>
+X#include <sys/types.h>
+X#include <sys/times.h>
+X#endif /* MSDOS */
+XFILE *fd;
+X
+X#define truescore 0x0001
+X#define lowerbound 0x0002
+X#define upperbound 0x0004
+X#define kingcastle 0x0008
+X#define queencastle 0x0010
+Xconst short otherside[3] =
+X{black, white, neutral};
+X
+Xstruct GameRec GameList[512];
+Xchar mvstr[4][6];
+Xlong i, j;
+Xshort int ep;
+Xint r, c;
+Xchar line[128];
+Xchar *l;
+Xshort int board[64];
+Xshort int color[64];
+Xshort int GameCnt;
+Xint from, to;
+Xchar *InPtr;
+Xint ckcastld[2];
+Xshort int epsquare = -1;
+Xint ok;
+Xint mvptr = 0;
+Xstruct leaf Tree[256];
+X
+X/* .... MOVE GENERATION VARIABLES AND INITIALIZATIONS .... */
+X
+Xconst short kingP[3] =
+X{4, 60, 0};
+Xconst short Stboard[64] =
+X{rook, knight, bishop, queen, king, bishop, knight, rook,
+X pawn, pawn, pawn, pawn, pawn, pawn, pawn, pawn,
+X 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+X 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+X pawn, pawn, pawn, pawn, pawn, pawn, pawn, pawn,
+X rook, knight, bishop, queen, king, bishop, knight, rook};
+Xconst short Stcolor[64] =
+X{white, white, white, white, white, white, white, white,
+X white, white, white, white, white, white, white, white,
+X neutral, neutral, neutral, neutral, neutral, neutral, neutral, neutral,
+X neutral, neutral, neutral, neutral, neutral, neutral, neutral, neutral,
+X neutral, neutral, neutral, neutral, neutral, neutral, neutral, neutral,
+X neutral, neutral, neutral, neutral, neutral, neutral, neutral, neutral,
+X black, black, black, black, black, black, black, black,
+X black, black, black, black, black, black, black, black};
+Xshort board[64], color[64];
+X
+X/*
+X * nextpos[piece][from-square] , nextdir[piece][from-square] gives vector of
+X * positions reachable from from-square in ppos with piece such that the
+X * sequence	ppos = nextpos[piece][from-square]; pdir =
+X * nextdir[piece][from-square]; u = ppos[sq]; do { u = ppos[u]; if(color[u]
+X * != neutral) u = pdir[u]; } while (sq != u); will generate the sequence of
+X * all squares reachable from sq.
+X *
+X * If the path is blocked u = pdir[sq] will generate the continuation of the
+X * sequence in other directions.
+X */
+X
+Xunsigned char nextpos[8][64][64];
+Xunsigned char nextdir[8][64][64];
+X
+X/*
+X * ptype is used to separate white and black pawns, like this; ptyp =
+X * ptype[side][piece] piece can be used directly in nextpos/nextdir when
+X * generating moves for pieces that are not black pawns.
+X */
+Xconst short ptype[2][8] =
+X{
+X  no_piece, pawn, knight, bishop, rook, queen, king, no_piece,
+X  no_piece, bpawn, knight, bishop, rook, queen, king, no_piece};
+X
+X/* data used to generate nextpos/nextdir */
+Xstatic const short direc[8][8] =
+X{
+X  0, 0, 0, 0, 0, 0, 0, 0,
+X  10, 9, 11, 0, 0, 0, 0, 0,
+X  8, -8, 12, -12, 19, -19, 21, -21,
+X  9, 11, -9, -11, 0, 0, 0, 0,
+X  1, 10, -1, -10, 0, 0, 0, 0,
+X  1, 10, -1, -10, 9, 11, -9, -11,
+X  1, 10, -1, -10, 9, 11, -9, -11,
+X  -10, -9, -11, 0, 0, 0, 0, 0};
+Xstatic const short max_steps[8] =
+X{0, 2, 1, 7, 7, 7, 1, 2};
+Xstatic const short nunmap[120] =
+X{
+X  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+X  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+X  -1, 0, 1, 2, 3, 4, 5, 6, 7, -1,
+X  -1, 8, 9, 10, 11, 12, 13, 14, 15, -1,
+X  -1, 16, 17, 18, 19, 20, 21, 22, 23, -1,
+X  -1, 24, 25, 26, 27, 28, 29, 30, 31, -1,
+X  -1, 32, 33, 34, 35, 36, 37, 38, 39, -1,
+X  -1, 40, 41, 42, 43, 44, 45, 46, 47, -1,
+X  -1, 48, 49, 50, 51, 52, 53, 54, 55, -1,
+X  -1, 56, 57, 58, 59, 60, 61, 62, 63, -1,
+X  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+X  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+X
+Xint InitFlag = false;
+X
+X
+Xvoid
+XDISP (void)
+X{
+X
+X  short r, c, l;
+X
+X  if (true)
+X    {
+X      printf ("\n");
+X      for (r = 7; r >= 0; r--)
+X	{
+X	  for (c = 0; c <= 7; c++)
+X	    {
+X	      l = locn (r, c);
+X	      if (color[l] == neutral)
+X		printf (" -");
+X	      else if (color[l] == white)
+X		printf (" %c", Qxx[board[l]]);
+X	      else
+X		printf (" %c", Pxx[board[l]]);
+X	    }
+X	  printf ("\n");
+X	}
+X      printf ("\n");
+X    }
+X}
+X
+Xint
+Xcastle (short int side, short int kf, short int kt, short int iop)
+X
+X/* Make or Unmake a castling move. */
+X
+X{
+X  register short rf, rt, xside;
+X
+X  xside = otherside[side];
+X  if (kt > kf)
+X    {
+X      rf = kf + 3;
+X      rt = kt - 1;
+X    }
+X  else
+X    {
+X      rf = kf - 4;
+X      rt = kt + 1;
+X    }
+X  if (kf != kingP[side] ||
+X      board[kf] != king ||
+X      board[rf] != rook ||
+X      color[kt] != neutral ||
+X      color[rt] != neutral ||
+X      color[kt - 1] != neutral)
+X    return (false);
+X  else
+X    return (true);
+X}
+X
+Xvoid
+XInitialize_moves (void)
+X
+X/*
+X * This procedure pre-calculates all moves for every piece from every square.
+X * This data is stored in nextpos/nextdir and used later in the move
+X * generation routines.
+X */
+X
+X{
+X  short ptyp, po, p0, d, di, s, delta;
+X  unsigned char *ppos, *pdir;
+X  short dest[8][8];
+X  short steps[8];
+X  short sorted[8];
+X
+X  for (ptyp = 0; ptyp < 8; ptyp++)
+X    for (po = 0; po < 64; po++)
+X      for (p0 = 0; p0 < 64; p0++)
+X	{
+X	  nextpos[ptyp][po][p0] = (unsigned char) po;
+X	  nextdir[ptyp][po][p0] = (unsigned char) po;
+X	}
+X  for (ptyp = 1; ptyp < 8; ptyp++)
+X    for (po = 21; po < 99; po++)
+X      if (nunmap[po] >= 0)
+X	{
+X	  ppos = nextpos[ptyp][nunmap[po]];
+X	  pdir = nextdir[ptyp][nunmap[po]];
+X	  /* dest is a function of direction and steps */
+X	  for (d = 0; d < 8; d++)
+X	    {
+X	      dest[d][0] = nunmap[po];
+X	      delta = direc[ptyp][d];
+X	      if (delta != 0)
+X		{
+X		  p0 = po;
+X		  for (s = 0; s < max_steps[ptyp]; s++)
+X		    {
+X		      p0 = p0 + delta;
+X
+X		      /*
+X		       * break if (off
+X		       * board) or (pawns
+X		       * only move two
+X		       * steps from home
+X		       * square)
+X		       */
+X		      if ((nunmap[p0] < 0) || (((ptyp == pawn) || (ptyp == bpawn))
+X					       && ((s > 0) && ((d > 0) || (Stboard[nunmap[po]] != pawn)))))
+X			break;
+X		      else
+X			dest[d][s] = nunmap[p0];
+X		    }
+X		}
+X	      else
+X		s = 0;
+X
+X	      /*
+X	       * sort dest in number of steps order
+X	       * currently no sort is done due to
+X	       * compability with the move
+X	       * generation order in old gnu chess
+X	       */
+X	      steps[d] = s;
+X	      for (di = d; s > 0 && di > 0; di--)
+X		if (steps[sorted[di - 1]] == 0)	/* should be: < s */
+X		  sorted[di] = sorted[di - 1];
+X		else
+X		  break;
+X	      sorted[di] = d;
+X	    }
+X
+X	  /*
+X	   * update nextpos/nextdir, pawns have two
+X	   * threads (capture and no capture)
+X	   */
+X	  p0 = nunmap[po];
+X	  if (ptyp == pawn || ptyp == bpawn)
+X	    {
+X	      for (s = 0; s < steps[0]; s++)
+X		{
+X		  ppos[p0] = (unsigned char) dest[0][s];
+X		  p0 = dest[0][s];
+X		}
+X	      p0 = nunmap[po];
+X	      for (d = 1; d < 3; d++)
+X		{
+X		  pdir[p0] = (unsigned char) dest[d][0];
+X		  p0 = dest[d][0];
+X		}
+X	    }
+X	  else
+X	    {
+X	      pdir[p0] = (unsigned char) dest[sorted[0]][0];
+X	      for (d = 0; d < 8; d++)
+X		for (s = 0; s < steps[sorted[d]]; s++)
+X		  {
+X		    ppos[p0] = (unsigned char) dest[sorted[d]][s];
+X		    p0 = dest[sorted[d]][s];
+X		    if (d < 7)
+X		      pdir[p0] = (unsigned char) dest[sorted[d + 1]][0];
+X
+X		    /*
+X		     * else is already
+X		     * initialized
+X		     */
+X		  }
+X	    }
+X	}
+X}
+X
+X#define Link(from,to,flag,s) \
+X{\
+X   node->f = from; node->t = to;\
+X     node->reply = 0;\
+X       node->flags = flag;\
+X	 node->score = s;\
+X	   ++node;\
+X	     ++mvptr;\
+X	     }
+X
+Xinline void
+XLinkMove (short int ply,
+X	  short int f,
+X	  short int t,
+X	  short int flag,
+X	  short int xside)
+X
+X/*
+X * Add a move to the tree.  Assign a bonus to order the moves as follows: 1.
+X * Principle variation 2. Capture of last moved piece 3. Other captures
+X * (major pieces first) 4. Killer moves 5.
+X */
+X
+X{
+X  register short s;
+X  register unsigned short mv;
+X  register struct leaf *node;
+X
+X  s = 0;
+X  node = &Tree[mvptr];
+X  mv = (f << 8) | t;
+X  if (row (t) == 0 || row (t) == 7)
+X    {
+X      flag |= promote;
+X      Link (f, t, flag | queen, s - 20000);
+X      Link (f, t, flag | knight, s - 20000);
+X      Link (f, t, flag | rook, s - 20000);
+X      flag |= bishop;
+X    }
+X  else if (row (t) == 1 || row (t) == 6)
+X    {
+X      flag |= pwnthrt;
+X    }
+X  Link (f, t, flag, s - 20000);
+X}
+X
+X
+Xvoid
+XGenMoves (register short int ply, register short int sq, short int side, short int xside)
+X
+X/*
+X * Generate moves for a piece. The moves are taken from the precalulated
+X * array nextpos/nextdir. If the board is free, next move is choosen from
+X * nextpos else from nextdir.
+X */
+X
+X{
+X  register short u, piece;
+X  register unsigned char *ppos, *pdir;
+X
+X  mvptr = 0;
+X  piece = board[sq];
+X  ppos = nextpos[ptype[side][piece]][sq];
+X  pdir = nextdir[ptype[side][piece]][sq];
+X  if (piece == pawn)
+X    {
+X      u = ppos[sq];		/* follow no captures thread */
+X      if (color[u] == neutral)
+X	{
+X	  LinkMove (ply, sq, u, 0, xside);
+X	  u = ppos[u];
+X	  if (color[u] == neutral)
+X	    LinkMove (ply, sq, u, 0, xside);
+X	}
+X      u = pdir[sq];		/* follow captures thread */
+X      if (color[u] == xside)
+X	LinkMove (ply, sq, u, capture, xside);
+X      else if (u == epsquare)
+X	LinkMove (ply, sq, u, capture | epmask, xside);
+X      u = pdir[u];
+X      if (color[u] == xside)
+X	LinkMove (ply, sq, u, capture, xside);
+X      else if (u == epsquare)
+X	LinkMove (ply, sq, u, capture | epmask, xside);
+X
+X    }
+X  else
+X    {
+X      u = ppos[sq];
+X      do
+X	{
+X	  if (color[u] == neutral)
+X	    {
+X	      LinkMove (ply, sq, u, 0, xside);
+X	      u = ppos[u];
+X	    }
+X	  else
+X	    {
+X	      if (color[u] == xside)
+X		LinkMove (ply, sq, u, capture, xside);
+X	      u = pdir[u];
+X	    }
+X      } while (u != sq);
+X    }
+X}
+Xvoid
+Xskip ()
+X{
+X  while (*InPtr != ' ')
+X    InPtr++;
+X  while (*InPtr == ' ')
+X    InPtr++;
+X}
+Xvoid
+Xskipb ()
+X{
+X  while (*InPtr == ' ')
+X    InPtr++;
+X}
+Xint
+Xparser (char *f, int side, unsigned short *flags)
+X{
+X  int c1, r1, c2, r2;
+X
+X  *flags = 0;
+X
+X  if (f[4] == 'o')
+X    if (side == black)
+X      return 0x3C3A;
+X    else
+X      return 0x0402;
+X  else if (f[0] == 'o')
+X    if (side == black)
+X      return 0x3C3E;
+X    else
+X      return 0x0406;
+X  else
+X    {
+X      c1 = f[0] - 'a';
+X      r1 = f[1] - '1';
+X      c2 = f[2] - 'a';
+X      r2 = f[3] - '1';
+X      if (f[4] != ' ')
+X	{
+X	  /* promotion */
+X	  for (i = 0; i < 7; i++)
+X	    if (f[4] == Qxx[i])
+X	      {
+X		*flags = i | promote;
+X		break;
+X	      }
+X	}
+X      return (locn (r1, c1) << 8) | locn (r2, c2);
+X    }
+X  return (0);
+X}
+X
+Xvoid
+Xalgbr (short int f, short int t, short int flag)
+X
+X
+X/*
+X * Generate move strings in different formats.
+X */
+X
+X{
+X  int m3p;
+X
+X  if (f != t)
+X    {
+X      /* algebraic notation */
+X      mvstr[0][0] = Cxx[column (f)];
+X      mvstr[0][1] = Rxx[row (f)];
+X      mvstr[0][2] = Cxx[column (t)];
+X      mvstr[0][3] = Rxx[row (t)];
+X      mvstr[0][4] = mvstr[3][0] = '\0';
+X      if (((mvstr[1][0] = Pxx[board[f]]) == 'P') || (flag & promote))
+X	{
+X	  if (mvstr[0][0] == mvstr[0][2])	/* pawn did not eat */
+X	    {
+X	      mvstr[2][0] = mvstr[1][0] = mvstr[0][2];	/* to column */
+X	      mvstr[2][1] = mvstr[1][1] = mvstr[0][3];	/* to row */
+X	      m3p = 2;
+X	    }
+X	  else
+X	    /* pawn ate */
+X	    {
+X	      mvstr[2][0] = mvstr[1][0] = mvstr[0][0];	/* column */
+X	      mvstr[2][1] = mvstr[1][1] = mvstr[0][2];	/* to column */
+X	      mvstr[2][2] = mvstr[0][3];
+X	      m3p = 3;		/* to row */
+X	    }
+X	  if (flag & promote)
+X	    {
+X	      mvstr[0][4] = mvstr[1][2] = mvstr[2][m3p] = Qxx[flag & pmask];
+X	      mvstr[1][3] = mvstr[2][m3p + 1] = mvstr[0][5] = '\0';
+X#ifdef CHESSTOOL
+X	      mvstr[3][0] = mvstr[0][0];	/* Allow e7e8 for
+X						 * chesstool */
+X	      mvstr[3][1] = mvstr[0][1];
+X	      mvstr[3][2] = mvstr[0][2];
+X	      mvstr[3][3] = mvstr[0][3];
+X	      mvstr[3][4] = '\0';
+X#endif
+X	    }
+X	  mvstr[2][m3p] = mvstr[1][2] = '\0';
+X	}
+X      else
+X	/* not a pawn */
+X	{
+X	  mvstr[2][0] = mvstr[1][0];
+X	  mvstr[2][1] = mvstr[0][1];
+X	  mvstr[2][2] = mvstr[1][1] = mvstr[0][2];	/* to column */
+X	  mvstr[2][3] = mvstr[1][2] = mvstr[0][3];	/* to row */
+X	  mvstr[2][4] = mvstr[1][3] = '\0';
+X	  strcpy (mvstr[3], mvstr[2]);
+X	  mvstr[3][1] = mvstr[0][0];
+X	  if (flag & cstlmask)
+X	    {
+X	      if (t > f)
+X		{
+X		  strcpy (mvstr[1], "o-o");
+X		  strcpy (mvstr[2], "O-O");
+X		}
+X	      else
+X		{
+X		  strcpy (mvstr[1], "o-o-o");
+X		  strcpy (mvstr[2], "O-O-O");
+X		}
+X	    }
+X	}
+X    }
+X  else
+X    mvstr[0][0] = mvstr[1][0] = mvstr[2][0] = mvstr[3][0] = '\0';
+X}
+X
+XGetGame ()
+X{
+X  char fb[256];
+X  unsigned short flags;
+X
+X  fgets (fb, 256, fd);
+X  fgets (fb, 256, fd);
+X  while (fgets (fb, 256, fd))
+X    {
+X      struct GameRec *g;
+X      int side = white;
+X
+X      side = otherside[side];
+X      if (fb[0] == '\n')
+X	return;
+X      ++GameCnt;
+X      InPtr = fb;
+X      skipb ();
+X      g = &GameList[GameCnt];
+X      g->gmove = parser (InPtr, side, &flags);
+X      skip ();
+X      g->score = atoi (InPtr);
+X      skip ();
+X      g->depth = atoi (InPtr);
+X      skip ();
+X      g->nodes = atoi (InPtr);
+X      skip ();
+X      g->time = atoi (InPtr);
+X      g->flags = flags;
+X      skip ();
+X      ++GameCnt;
+X      g = &GameList[GameCnt];
+X      g->gmove = parser (InPtr, side, &flags);
+X      skip ();
+X      g->score = atoi (InPtr);
+X      skip ();
+X      g->depth = atoi (InPtr);
+X      skip ();
+X      g->nodes = atoi (InPtr);
+X      skip ();
+X      g->time = atoi (InPtr);
+X      g->flags = flags;
+X
+X    }
+X}
+Xshort int xside, side;
+Xint
+Xgetboard (int mvno)
+X
+X{
+X  register short int f, t;
+X  short int rf, rt;
+X  unsigned short mv;
+X
+X
+X  /* now update the board and hash values */
+X
+X  /*
+X   * should really check the moves as we do this, but???
+X   */
+X  mv = GameList[mvno].gmove;
+X  f = mv >> 8 & 0x7F;
+X  t = mv & 0xFF;
+X  /* can only capture other side */
+X  if (board[t] != no_piece)
+X    {
+X      if (color[t] != xside)
+X	{
+X	  algbr (f, t, 0);
+X	  printf ("Illegal move - %d %s \n", mvno, mvstr);
+X	}
+X    }
+X  /* there must be a piece to move */
+X  if (board[f] == no_piece || color[f] != side)
+X    {
+X      algbr (f, t, 0);
+X      printf ("Illegal move + %d %s \n", mvno, mvstr);
+X    }
+X  /* is it EnPassant */
+X
+X
+X  if (board[f] == pawn && board[t] == no_piece)
+X    {
+X      if ((row (f) == 3 &&
+X	   row (t) == 2) || (row (f) == 4 && row (t) == 5))
+X	{
+X	  if (column (t) != column (f))
+X	    {
+X	      ep = t + ((t > f) ? -8 : 8);
+X	      if (board[ep] == pawn && color[ep] == xside)
+X		{
+X		  board[ep] = no_piece;
+X		  color[ep] = neutral;
+X		}
+X	    }
+X	}
+X    }
+X  board[t] = board[f];
+X  color[t] = color[f];
+X  color[f] = neutral;
+X  board[f] = no_piece;
+X  /* castle moves */
+X  if ((mv == BLACKCASTLE) || (mv == WHITECASTLE) || (mv == LONGBLACKCASTLE) || (mv == LONGWHITECASTLE))
+X    {
+X
+X      if (t > f)
+X	{
+X	  rf = f + 3;
+X	  rt = t - 1;
+X	}
+X      else
+X	{
+X	  rf = f - 4;
+X	  rt = t + 1;
+X	}
+X      if ((board[t] == king && color[t] == side) && (board[rf] == rook) && (color[rf] == side))
+X	{
+X	  board[rt] = rook;
+X	  color[rt] = side;
+X	  board[rf] = no_piece;
+X	  color[rf] = neutral;
+X	  ckcastld[side] = true;
+X	}
+X    }
+X  else if (GameList[i].flags & promote)
+X
+X    board[t] = GameList[i].flags & pmask;
+X}
+X
+Xint
+Xmain (int argc, char **argv)
+X{
+X  int from, to;
+X  unsigned short int mv;
+X  int start, end;
+X  int ii, kf, jj;
+X
+X  Initialize_moves ();
+X  ckcastld[0] = ckcastld[1] = false;
+X
+X  if (argc > 4 || argc < 2)
+X    {
+X      printf ("Usage: game file [start [end] ] \n");
+X      exit ();
+X    }
+X  start = end = 0;
+X
+X  if (argc > 2)
+X    start = (atoi (argv[2]) * 2) - 1;
+X  if (argc == 4)
+X    end = (atoi (argv[3]) * 2) - 1;
+X  side = white;
+X  xside = black;
+X  for (i = 0; i < 64; i++)
+X    {
+X      board[i] = Stboard[i];
+X      color[i] = Stcolor[i];
+X    }
+X  i = 1;
+X  if ((fd = fopen (argv[1], RWA_ACC)) == NULL)
+X    exit (1);
+X  GetGame ();
+X  if (!start || start < 1 || start > GameCnt)
+X    start = 1;
+X  if (!end || end > GameCnt || end < 1)
+X    end = GameCnt;
+X  side = white;
+X  xside = black;
+X  for (i = 1; i < end; i++)
+X    {
+X      mv = GameList[i].gmove;
+X      from = mv >> 8 & 0x7F;
+X      to = mv & 0x7F;
+X      algbr (from, to, 0);
+X      if (side)
+X	printf ("%s\n", mvstr);
+X      else
+X	{
+X	  printf ("%d. ", 1 + ((i - 1) / 2));
+X	  printf ("%s  ", mvstr);
+X	}
+X
+X      GenMoves (0, from, side, xside);
+X      if (!ckcastld[side] && board[from] == king && color[from] == side)
+X	{
+X	  if (castle (side, from, from + 2, 0))
+X	    {
+X	      LinkMove (0, from, from + 2, cstlmask, xside);
+X	    }
+X	  if (castle (side, from, from - 2, 0))
+X	    {
+X	      LinkMove (0, from, from - 2, cstlmask, xside);
+X	    }
+X	}
+X      ok = false;
+X      for (ii = 0; ii < mvptr; ii++)
+X	{
+X	  if (from == Tree[ii].f && to == Tree[ii].t)
+X	    {
+X	      ok = true;
+X	      break;
+X	    }
+X	}
+X      if (!ok)
+X	{
+X	  algbr (from, to, 0);
+X	  printf ("Illegal move %s\n", mvstr);
+X	  for (ii = 0; ii < mvptr; ii++)
+X	    {
+X	      algbr (Tree[ii].f, Tree[ii].t, 0);
+X	      printf (" %s\n", mvstr);
+X	    }
+X	  DISP ();
+X	  exit ();
+X	}
+X      getboard (i);
+X      if (board[to] == pawn)
+X	if (to - from == 16)
+X	  epsquare = from + 8;
+X	else if (from - to == 16)
+X	  epsquare = from - 8;
+X	else
+X	  epsquare = -1;
+X      kf = -1;
+X      for (ii = 0; ii < 64; ii++)
+X	{
+X	  if ((board[ii] == king) && (color[ii] == side))
+X	    {
+X	      kf = ii;
+X	      break;
+X	    }
+X	}
+X      if (kf < 0)
+X	{
+X	  printf ("Badnews: you have no king\n");
+X	  DISP ();
+X	  exit ();
+X	}
+X      for (ii = 0; ii < 64; ii++)
+X	{
+X	  if (color[ii] == xside)
+X	    {
+X	      mvptr = 0;
+X	      GenMoves (0, ii, xside, side);
+X	      for (jj = 0; jj < mvptr; jj++)
+X		{
+X		  if (Tree[jj].t == kf)
+X		    {
+X
+X		      printf ("Badnews: you are in check\n");
+X		      printf ("king is at %d %d\n", row (kf), column (kf));
+X		      algbr (Tree[jj].f, Tree[jj].t, 0);
+X		      printf ("move is %s\n", mvstr);
+X		      DISP ();
+X		      exit ();
+X		    }
+X		}
+X	    }
+X	}
+X      xside = side;
+X      side = otherside[side];
+X    }
+X  printf ("\n\n");
+X  printf ("Final board:\n\n");
+X  DISP ();
+X  exit ();
+X}
+END_OF_FILE
+if test 18324 -ne `wc -c <'src/checkgame.c'`; then
+    echo shar: \"'src/checkgame.c'\" unpacked with wrong size!
+fi
+# end of 'src/checkgame.c'
+fi
+if test -f 'src/search.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'src/search.c'\"
+else
+echo shar: Extracting \"'src/search.c'\" \(32814 characters\)
+sed "s/^X//" >'src/search.c' <<'END_OF_FILE'
+X/*
+X * search.c - C source for GNU CHESS
+X *
+X * Copyright (c) 1988,1989,1990 John Stanback
+X * Copyright (c) 1992 Free Software Foundation
+X *
+X * This file is part of GNU CHESS.
+X *
+X * GNU Chess is free software; you can redistribute it and/or modify
+X * it under the terms of the GNU General Public License as published by
+X * the Free Software Foundation; either version 2, or (at your option)
+X * any later version.
+X *
+X * GNU Chess is distributed in the hope that it will be useful,
+X * but WITHOUT ANY WARRANTY; without even the implied warranty of
+X * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X * GNU General Public License for more details.
+X *
+X * You should have received a copy of the GNU General Public License
+X * along with GNU Chess; see the file COPYING.  If not, write to
+X * the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
+X */
+X#include "gnuchess.h"
+X#ifdef QUIETBACKGROUND
+Xshort background = 0;
+X#endif /* QUIETBACKGROUND */
+Xstatic short int DepthBeyond;
+Xunsigned short int PrVar[MAXDEPTH];
+Xextern char mvstr[4][6];
+X#ifdef DEBUG
+Xunsigned short DBLINE[MAXDEPTH];
+Xstruct leaf *dbptr;
+X#endif
+Xstruct leaf rootnode;
+Xshort int restype;
+X#include "ataks.h"
+X
+X/* ............    MOVE GENERATION & SEARCH ROUTINES    .............. */
+Xinline
+Xvoid
+Xrepetition (short int *cnt)
+X
+X/*
+X * Check for draw by threefold repetition.
+X */
+X
+X{
+X  register short i, c;
+X  register unsigned short m;
+X  short b[64];
+X
+X  *cnt = c = 0;
+X  /* try to avoid work */
+X  if (GameCnt > Game50 + 2)
+X    {
+X#ifdef NOMEMSET
+X      for (i = 0; i < 64; b[i++] = 0) ;
+X#else
+X      memset ((char *) b, 0, sizeof (b));
+X#endif /* NOMEMSET */
+X      for (i = GameCnt; i >= Game50; i--)
+X	{
+X	  m = GameList[i].gmove;
+X	  /* does piece exist on diff board? */
+X	  if (b[m & 0xff])
+X	    {
+X	      /* does diffs cancel out, piece back? */
+X	      if ((b[m >> 8] += b[m & 0xff]) == 0)
+X		--c;
+X	      b[m & 0xff] = 0;
+X	    }
+X	  else
+X	    {
+X	      /* create diff */
+X	      ++c;
+X	      /* does diff cancel out another diff? */
+X	      if (!(b[m >> 8] -= (b[m & 0xff] = board[m & 0xff] +
+X				  (color[m & 0xff] << 8))))
+X		--c;;
+X	    }
+X	  /* if diff count is 0 we have a repetition */
+X	  if (c == 0)
+X	    if ((i ^ GameCnt) & 1)
+X	      (*cnt)++;
+X	}
+X    }
+X}
+X
+Xint plyscore, globalscore, globalpnt;
+Xvoid
+Xpick (short int p1, short int p2)
+X
+X/*
+X * Find the best move in the tree between indexes p1 and p2. Swap the best
+X * move into the p1 element.
+X *
+X*/
+X{
+X  register struct leaf *p, *q, *r, *k;
+X  register s0;
+X  struct leaf temp;
+X
+X  k = p = &Tree[p1];
+X  q = &Tree[p2];
+X  s0 = p->score;
+X  for (r = p + 1; r <= q; r++)
+X    if ((r->score) > s0)
+X      {
+X	s0 = (r->score);
+X	p = r;
+X      }
+X  if (p != k)
+X    {
+X      temp = *p;
+X      *p = *k;
+X      *k = temp;
+X    }
+X}
+X
+Xstatic int TCcount, TCleft;
+Xvoid
+XSelectMove (short int side, short int iop)
+X
+X
+X/*
+X * Select a move by calling function search() at progressively deeper ply
+X * until time is up or a mate or draw is reached. An alpha-beta window of
+X * -Awindow to +Bwindow points is set around the score returned from the
+X * previous iteration. If Sdepth != 0 then the program has correctly
+X * predicted the opponents move and the search will start at a depth of
+X * Sdepth+1 rather than a depth of 1.
+X */
+X
+X{
+X  static short int i, tempb, tempc, tempsf, tempst, xside, rpt;
+X  static short int alpha, beta, score;
+X  static struct GameRec *g;
+X  int bookflag = false;
+X  int Jscore;
+X  unsigned short tmp[MAXDEPTH];
+X  flag.timeout = false;
+X  xside = side ^ 1;
+X  /* if background mode set to infinite */
+X  if (iop == 2)
+X    {
+X      ResponseTime = 9999999;
+X#ifdef QUIETBACKGROUND
+X      background = true;
+X#endif /* QUIETBACKGROUND */
+X    }
+X  else
+X    {
+X      player = side;
+X      if (TCflag)
+X	{
+X	  TCcount = 0;
+X#ifdef QUIETBACKGROUND
+X	  background = false;
+X#endif /* QUIETBACKGROUND */
+X	  if (TimeControl.moves[side] < 1)
+X	    TimeControl.moves[side] = 1;
+X	  /* special case time per move specified */
+X	  if (TimeControl.moves[side] == 1)
+X	    {
+X	      ResponseTime = TimeControl.clock[side] - 100;
+X	      TCleft = 0;
+X	    }
+X	  else
+X	    {
+X	      /* calculate avg time per move remaining */
+X	      ResponseTime = (TimeControl.clock[side]) / (((TimeControl.moves[side]) << 1));
+X              TCleft = ResponseTime>>1;
+X	       if (TimeControl.moves[side] < 5) TCcount = MAXTCCOUNT - 1;
+X	    }
+X	  if (ResponseTime < 100)
+X	    {
+X	      ResponseTime = 100;
+X	      TCcount = MAXTCCOUNT;
+X	    }
+X	  else if (ResponseTime < 200)
+X	    {
+X	      TCcount = MAXTCCOUNT - 1;
+X	    }
+X	}
+X    }
+X
+X  ExtraTime = 0;
+X  ExaminePosition ();
+X  score = ScorePosition (side);
+X#ifdef QUIETBACKGROUND
+X  if (!background)
+X#endif /* QUIETBACKGROUND */
+X    ShowSidetoMove ();
+X  if (TCflag)
+X    if (score < SCORETIME)
+X      {
+X	ExtraTime += TCleft;
+X	TCcount++;
+X      }
+X
+X#ifdef QUIETBACKGROUND
+X  if (!background)
+X#endif /* QUIETBACKGROUND */
+X    SearchStartStuff (side);
+X#if !defined NOHISTORY
+X#ifdef NOMEMSET
+X  for (i = 0; i < 8192; i++)
+X    history[i] = 0;
+X#else
+X  memset ((char *) history, 0, sizeof (history));
+X#endif /* NOMEMSET */
+X#endif
+X  FROMsquare = TOsquare = -1;
+X  PV = 0;
+X  if (iop == 1)
+X    hint = 0;
+X  for (i = 0; i < MAXDEPTH; i++)
+X    PrVar[i] = killr0[i] = killr1[i] = killr2[i] = killr3[i] = 0;
+X  /* set initial window for search */
+X  alpha = score - ((computer == black) ? BAwindow : WAwindow);
+X  beta = score + ((computer == black) ? BBwindow : WBwindow);
+X  rpt = 0;
+X  TrPnt[1] = 0;
+X  root = &Tree[0];
+X  MoveList (side, 1);
+X  for (i = TrPnt[1]; i < TrPnt[2]; i++) pick (i, TrPnt[2] - 1);
+X  /* can I get a book move? */
+X  if (flag.regularstart && Book){	
+X    flag.timeout = bookflag = OpeningBook (&hint, side);
+X    ResponseTime += ResponseTime;
+X  }
+X  rootnode = Tree[0];
+X  /* zero stats for hash table */
+X  reminus = replus = 0;
+X  NodeCnt = ETnodes = EvalNodes = HashCnt = FHashAdd = HashAdd = FHashCnt = THashCol = HashCol = 0;
+X  globalscore = plyscore = score;
+X#ifdef DEBUG4
+X  if (debuglevel & 8)
+X    {
+X      int j;
+X      for (j = 1; j < 2; j++)
+X	{
+X	  int idb;
+X	  for (idb = TrPnt[j]; idb < TrPnt[j + 1]; idb++)
+X	    {
+X	      algbr (Tree[idb].f, Tree[idb].t, Tree[idb].flags);
+X	      printf ("level 8 %d-->%d %s %d %d\n", j, idb, mvstr[0], Tree[idb].score, Tree[idb].width);
+X	    }
+X	}
+X    }
+X#endif
+X
+X/********************* main loop ********************************/
+X  while (!flag.timeout)
+X    {
+X      /* go down a level at a time */
+X      Sdepth++;
+X      DepthBeyond = Sdepth + ((Sdepth == 1) ? (DEPTHBEYOND >> 1) : DEPTHBEYOND);
+X
+X#if !defined CHESSTOOL && !defined XBOARD
+X#ifdef QUIETBACKGROUND
+X      if (!background)
+X#endif /* QUIETBACKGROUND */
+X	ShowDepth (' ');
+X#endif
+X      /* search at this level returns score of PV */
+X      score = search (side, 1, Sdepth, alpha, beta, PrVar, &rpt);
+X      /* save PV as killer */
+X      for (i = 1; i <= Sdepth; i++)
+X	killr0[i] = PrVar[i];
+X
+X      /* low search failure re-search with (-inf,score) limits  */
+X      if (score < alpha)
+X	{
+X	  reminus++;
+X#ifdef QUIETBACKGROUND
+X	  if (!background)
+X#endif /* QUIETBACKGROUND */
+X	    ShowDepth ('-');
+X	  if (TCflag && TCcount < MAXTCCOUNT)
+X	    {
+X	      TCcount += 1;
+X	      ExtraTime += (TCleft);
+X	    }
+X	  score = search (side, 1, Sdepth, -9999, score, PrVar, &rpt);
+X	}
+X
+X      /* high search failure re-search with (score, +inf) limits */
+X      if (score > beta && !(root->flags & exact))
+X	{
+X	  replus++;
+X#ifdef QUIETBACKGROUND
+X	  if (!background)
+X#endif /* QUIETBACKGROUND */
+X	    ShowDepth ('+');
+X	  if (TCflag && TCcount < MAXTCCOUNT)
+X	    {
+X	      TCcount += 1;
+X	      ExtraTime += (TCleft);
+X	    }
+X	  score = search (side, 1, Sdepth, score, 9999, PrVar, &rpt);
+X	}
+X/**************** out of search ********************************************/
+X      if (Sdepth == MaxSearchDepth)
+X	flag.timeout = true;
+X
+X      else if (TCflag && (Sdepth > (MINDEPTH - 1)) && (TCcount < MAXTCCOUNT))
+X	{
+X	  if (tmp[1] != PrVar[1] || tmp[2] != PrVar[2])
+X	    {
+X	      TCcount++;
+X	      ExtraTime += TCleft;
+X	    }
+X
+X	  if ((abs (score - globalscore) / Sdepth) > ZDELTA)
+X	    {
+X	      TCcount++;
+X	      ExtraTime += TCleft;
+X	    }
+X	}
+X/************************ time control ***********************************/
+X
+X      /* save PV as killer */
+X      for (i = 1; i <= Sdepth + 1; i++)
+X	killr0[i] = PrVar[i];
+X      if (((rootnode.f << 8) | rootnode.t) != PrVar[1])
+X	{
+X	  for (i = TrPnt[1]; i < TrPnt[2]; i++)
+X	    if (((Tree[i].f << 8) | Tree[i].t) == PrVar[1])
+X	      {
+X		rootnode = Tree[i];
+X		break;
+X	      }
+X	}
+X      for (i = 1; i <= Sdepth + 1; i++)
+X	tmp[i] = PrVar[i];
+X      Tscore[0] = score;
+X      /*if (!flag.timeout)*/
+X      for (i = TrPnt[1]; i < TrPnt[2]; i++)
+X	pick (i, TrPnt[2] - 1);
+X      /* if done or nothing good to look at quit */
+X      if ((rootnode.flags & exact) || (score < -9000))
+X	flag.timeout = true;
+X#ifdef DEBUG13
+X      if (flag.timeout && !background)
+X	{
+X	  FILE *D;
+X	  int r, c, l;
+X	  struct leaf *xnode;
+X	  D = fopen ("/tmp/DEBUG", "a+");
+X	  fprintf (D, " %d ply %d sco %d TC %d rs %d gl %d cnt %d\n",
+X		   Sdepth, plyscore, score, TCcount, restype,
+X		   globalpnt, TrPnt[2] - TrPnt[1]);
+X	  for (i = 1; tmp[i]; i++)
+X	    {
+X	      algbr (tmp[i] >> 8, tmp[i] & 0xff, 0);
+X	      fprintf (D, "%s ", mvstr[0]);
+X	    }
+X	  fprintf (D, "\n");
+X	  for (i = 1; PrVar[i]; i++)
+X	    {
+X	      algbr (PrVar[i] >> 8, PrVar[i] & 0xff, 0);
+X	      fprintf (D, "%s ", mvstr[0]);
+X	    }
+X	  fprintf (D, "\n");
+X	  algbr (rootnode.f, rootnode.t, rootnode.flags);
+X	  fprintf (D, "%s ", mvstr[0]);
+X	  fprintf (D, "\n");
+X	  fclose (D);
+X	}
+X#endif
+X      /* find the next best move put below root */
+X      if (!flag.timeout)
+X	{
+X	  /* */
+X#if !defined NODYNALPHA
+X	  Jscore = (plyscore + score) >> 1;
+X#endif
+X	  plyscore = score;
+X	  /* recompute search window */
+X	  beta = score + ((computer == black) ? BBwindow : WBwindow);
+X#if !defined NODYNALPHA
+X	  alpha = ((Jscore < score) ? Jscore : score) - ((computer == black) ? BAwindow : WAwindow) + abs (Jscore / 12);
+X#else
+X	  alpha = score - ((computer == black) ? BAwindow : WAwindow);
+X#endif
+X	}
+X      else
+X	for (i = 1; i <= Sdepth + 1; i++)
+X	  PrVar[i] = tmp[i];
+X#if !defined CHESSTOOL
+X#ifdef QUIETBACKGROUND
+X      if (!background)
+X#endif /* QUIETBACKGROUND */
+X	ShowResults (score, PrVar, '.');
+X#endif
+X#ifdef DEBUG4
+X      if (debuglevel & 16)
+X	{
+X	  int j;
+X	  printf ("Sdepth %d alpha %d beta %d stage %d\n", Sdepth, alpha, beta, stage);
+X	  for (j = 1; j < 2; j++)
+X	    {
+X	      int idb;
+X	      for (idb = TrPnt[j]; idb < TrPnt[j + 1]; idb++)
+X		{
+X		  algbr (Tree[idb].f, Tree[idb].t, Tree[idb].flags);
+X		  printf ("level 16 %d-->%d %s %d %d %x\n", Sdepth, idb, mvstr[0], Tree[idb].score, Tree[idb].width, Tree[idb].flags);
+X		}
+X	    }
+X	}
+X#endif
+X
+X    }
+X/******************************* end of main loop ***********************************/
+X  /* background mode */
+X  if (iop == 2)
+X    return;
+X#ifdef DEBUG4
+X  if (debuglevel & 4)
+X    {
+X      int j;
+X      printf ("Sdepth %d alpha %d beta %d stage %d\n", Sdepth, alpha, beta, stage);
+X      for (j = 1; j < 2; j++)
+X	{
+X	  int idb;
+X	  for (idb = TrPnt[j]; idb < TrPnt[j + 1]; idb++)
+X	    {
+X	      algbr (Tree[idb].f, Tree[idb].t, Tree[idb].flags);
+X	      printf ("level 4 %d-->%d %s %d %d\n", j, idb, mvstr[0], Tree[idb].score, Tree[idb].width);
+X	    }
+X	}
+X    }
+X#endif
+X
+X  if (rpt >= 2)
+X    {
+X      rootnode.flags |= draw;
+X      DRAW = CP[101];		/*Repetition*/
+X    }
+X  else
+X    /* if no moves and not in check then draw */
+X  if ((rootnode.score == -9999) && !(SqAtakd (PieceList[side][0], xside)))
+X    {
+X      rootnode.flags |= draw;
+X      DRAW = CP[87];		/*No moves*/
+X    }
+X  else if (GameCnt == MAXMOVES)
+X    {
+X      rootnode.flags |= draw;
+X      DRAW = CP[80];		/*Max Moves*/
+X    }
+X
+X  /* not in book so set hint to guessed move for other side */
+X  if (!bookflag)
+X    hint = ((tmp[1]) ? tmp[2] : 0);
+X
+X  /* if not mate or draw make move and output it */
+X  if (((score > -9999) && (rpt <= 2)) || (rootnode.flags & draw))
+X    {
+X      MakeMove (side, &rootnode, &tempb, &tempc, &tempsf, &tempst, &INCscore);
+X#if !defined NOMATERIAL
+X      if (flag.material && !pmtl[black] && !pmtl[white] && (mtl[white] < (valueR + valueK)) && (mtl[black] < (valueR + valueK)))
+X	{
+X	  rootnode.flags |= draw;
+X	  DRAW = CP[224];	/*No pieces*/
+X	}
+X      else
+X#endif
+X      if (!PieceCnt[black] && !PieceCnt[white])
+X	{
+X	  rootnode.flags |= draw;
+X	  DRAW = CP[88];	/*No pieces*/
+X	}
+X      algbr (rootnode.f, rootnode.t, (short) rootnode.flags);
+X    }
+X  else {
+X    algbr (0, 0, 0);		/* Zero move string when mate. */
+X    rootnode.score = score;	/* When mate, ignore distinctions! --SMC */
+X  }
+X  /* If Time Control get the elapsed time */
+X  if (TCflag)
+X    ElapsedTime (1);
+X  OutputMove ();
+X  /* if mate set flag */
+X  if ((score == -9999 || score == 9998))
+X    flag.mate = true;
+X  /* if mate clear hint */
+X  if (flag.mate)
+X    hint = 0;
+X  /* if pawn move or capture or castle or promote zero repitition array */
+X  if ((board[rootnode.t] == pawn) || (rootnode.flags & (capture | cstlmask | promote)))
+X    {
+X      Game50 = GameCnt;
+X      ZeroRPT ();
+X    }
+X  /* add move to game list */
+X  g = &GameList[GameCnt];
+X  g->score = score;
+X  g->nodes = NodeCnt;
+X  g->time = (short) et;
+X  g->depth = Sdepth;
+X  g->flags = root->flags;
+X#ifdef DEBUG40
+X  g->d1 = TCcount;
+X  g->d2 = ResponseTime ;
+X  g->d4 = TCleft;
+X  g->d3 = ExtraTime;
+X#endif
+X  /* update time comtrol info */
+X  if (TCflag)
+X    {
+X#if defined CHESSTOOL || defined XBOARD
+X      TimeControl.clock[side] -= (et + OperatorTime + 45);
+X#else
+X      TimeControl.clock[side] -= (et + OperatorTime);
+X#endif
+X      /* finished our required moves - setup the next set */
+X      if (--TimeControl.moves[side] == 0)
+X	{
+X	  if (XC)
+X	    if (XCmore < XC)
+X	      {
+X		TCmoves = XCmoves[XCmore];
+X		TCminutes = XCminutes[XCmore];
+X		TCseconds = XCseconds[XCmore];
+X		XCmore++;
+X	      }
+X	  SetTimeControl ();
+X	}
+X    }
+X  /* check for end conditions */
+X  if ((rootnode.flags & draw) /*&& flag.bothsides*/ )
+X    flag.quit = flag.mate = true;
+X  else if (GameCnt == MAXMOVES)
+X    {
+X      flag.quit = flag.mate = true;
+X    }
+X  /* out of move store, you loose */
+X  else
+X    /* switch to other side */
+X    player = xside;
+X  Sdepth = 0;
+X}
+X
+Xint
+Xsearch (short int side,
+X	register short int ply,
+X	register short int depth,
+X	short int alpha,
+X	short int beta,
+X	short unsigned int *bstline,
+X	short int *rpt)
+X
+X/*
+X * Perform an alpha-beta search to determine the score for the current board
+X * position. If depth <= 0 only capturing moves, pawn promotions and
+X * responses to check are generated and searched, otherwise all moves are
+X * processed. The search depth is modified for check evasions, certain
+X * re-captures and threats. Extensions may continue for up to 11 ply beyond
+X * the nominal search depth.
+X */
+X
+X
+X{
+X  register short j, pnt;
+X  short tempb, tempc, tempsf, tempst, cf;
+X  short xside, pbst, score, rcnt, slk, InChk;
+X  unsigned short mv, nxtline[MAXDEPTH];
+X  struct leaf *node, tmp;
+X  short best;
+X  short bestwidth = 0;
+X
+X  NodeCnt++;
+X  /* look every ZNODE nodes for a timeout */
+X  if (TCflag)
+X    {
+X      if (NodeCnt > ETnodes)
+X	{
+X	  ElapsedTime (2);
+X	  if (Sdepth > MINDEPTH && flag.musttimeout)
+X	    {
+X	      flag.timeout = true;
+X	      flag.musttimeout = false;
+X	    }
+X	  else if ((et >= (ResponseTime + ExtraTime)) && Sdepth > MINDEPTH)
+X	    flag.timeout = true;
+X	}
+X
+X    }
+X  else if (flag.musttimeout && Sdepth > MINDEPTH)
+X    {
+X      flag.timeout = true;
+X      flag.musttimeout = false;
+X    }
+X
+X  xside = side ^ 1;
+X
+X  /*
+X   * check for possible repitition if so call repitition - rpt is repeat
+X   * count
+X   */
+X  if ((ply <= Sdepth + 3) && rpthash[side][hashkey & 0xFF] > 0)
+X    {
+X      repetition (rpt);
+X
+X      /*
+X       * repeat position >2 don't need to return score it's taken care of
+X       * above
+X       */
+X      if (*rpt == 1 && ply > 1)
+X	return 0;
+X    }
+X  else
+X    *rpt = 0;
+X
+X  /* slk is lone king indicator for either side */
+X  score = evaluate (side, ply, alpha, beta, INCscore, &slk, &InChk);
+X  /* score > 9000 its a draw or mate */
+X  if (score > 9000)
+X    {
+X      bstline[ply] = 0;
+X      return (score);
+X    }
+X  /* Do we need to add depth because of special conditions */
+X  /* if in check or pawn threat or in capture sequence search deeper */
+X/*************************************** depth extensions ***********************************/
+X  if (depth > 0)
+X    {
+X      /* Allow opponent a chance to check again */
+X      if (InChk)
+X	depth = (depth < 2) ? 2 : depth;
+X      else if (PawnThreat[ply - 1] ||
+X	       (flag.rcptr && (score > alpha) &&
+X      (score < beta) && (ply > 2) && CptrFlag[ply - 1] && CptrFlag[ply - 2]))
+X	++depth;
+X    }
+X  else
+X    {
+X      if (score >= alpha &&
+X	  (InChk || PawnThreat[ply - 1] || (hung[side] > 1 && ply == Sdepth + 1)))
+X	depth = 1;
+X      else if (score <= beta &&
+X	       ((ply < Sdepth + 4) && (ply > 4) &&
+X		ChkFlag[ply - 2] && ChkFlag[ply - 4] &&
+X		ChkFlag[ply - 2] != ChkFlag[ply - 4]))
+X	depth = 1;
+X    }
+X/*******************************************************************************************/
+X  /* try the local transition table if it's there */
+X#if ttblsz
+X  if (flag.hash && ply > 1)
+X    {
+X      if (ProbeTTable (side, depth, ply, &alpha, &beta, &score) == true)
+X	{
+X	  bstline[ply] = PV;
+X	  bstline[ply + 1] = 0;
+X#ifdef DEBUG4
+X	  if (debuglevel & 64)
+X	    {
+X	      algbr (PV >> 8, PV & 0xff, 0);
+X	      printf ("-get-> d=%d s=%d p=%d a=%d b=%d %s\n", depth, score, ply, alpha, beta, mvstr[0]);
+X	    }
+X#endif
+X	  if (beta == -20000)
+X	    return (score);
+X	  if (alpha > beta)
+X	    return (alpha);
+X	}
+X#ifdef HASHFILE
+X      /* ok try the transition file if its there */
+X      else if (hashfile && (depth > HashDepth) && (GameCnt < HashMoveLimit)
+X	 && (ProbeFTable (side, depth, ply, &alpha, &beta, &score) == true))
+X	{
+X	  int hgood = false;
+X	  int f = PV >> 8;
+X	  int t = PV & 0x3f;
+X	  register int i;
+X	  /*
+X           * if you find something put it in the local table for future
+X           * reference
+X           */
+X	  hgood = false;
+X	  for (i = TrPnt[ply]; i < TrPnt[ply + 1]; i++)
+X	    {
+X	      if (Tree[i].f == f && Tree[i].t == t)
+X		{
+X		  hgood = true;
+X		  break;
+X		}
+X	    }
+X	  if (hgood)
+X	    {
+X	      PutInTTable (side, score, depth, ply, alpha, beta, PV);
+X	      bstline[ply] = PV;
+X	      bstline[ply + 1] = 0;
+X	      if (beta == -20000)
+X		return (score);
+X	      if (alpha > beta)
+X		return (alpha);
+X	    }
+X#ifdef DEBUG10
+X	  else
+X	    {
+X	      FILE *D;
+X	      int r, c, l;
+X	      struct leaf *xnode;
+X	      D = fopen ("/tmp/DEBUG", "w");
+X	      pnt = TrPnt[2];
+X	      fprintf (D, "hashfile failure\n");
+X	      algbr (PV >> 8, PV & 0x3f, 0);
+X	      fprintf (D, "inout move is %s\n", mvstr);
+X	      fprintf (D, "legal move are \n");
+X	      for (r = TrPnt[ply]; r < TrPnt[ply + 1]; r++)
+X		{
+X		  xnode = &Tree[r];
+X		  algbr (xnode->f, xnode->t, (short) xnode->flags);
+X		  fprintf (D, "%s %s %s %s\n", mvstr[0], mvstr[1], mvstr[2], mvstr[3]);
+X		}
+X	      fprintf (D, "\n current board is\n");
+X	      for (r = 7; r >= 0; r--)
+X		{
+X		  for (c = 0; c <= 7; c++)
+X		    {
+X		      l = locn (r, c);
+X		      if (color[l] == neutral)
+X			fprintf (D, " -");
+X		      else if (color[l] == white)
+X			fprintf (D, " %c", qxx[board[l]]);
+X		      else
+X			fprintf (D, " %c", pxx[board[l]]);
+X		    }
+X		  fprintf (D, "\n");
+X		}
+X	      fprintf (D, "\n");
+X	      fclose (D);
+X	    }
+X#endif
+X	}
+X#endif /* HASHFILE */
+X    }
+X
+X#endif /* ttblsz */
+X
+X  /*
+X   * if more then DepthBeyond ply past goal depth or at goal depth and
+X   * score > beta quit - means we are out of the window
+X   */
+X  if (ply > DepthBeyond || (depth < 1 && score > beta))
+X    {
+X      return (score);
+X    }
+X
+X  /*
+X   * if below first ply and not at goal depth generate all moves else only
+X   * capture moves
+X   */
+X  if (ply > 1)
+X    if (depth > 0)
+X      {
+X	MoveList (side, ply);
+X      }
+X    else
+X      CaptureList (side, ply);
+X
+X  /* no moves return what we have */
+X
+X  /*
+X   * normally a search will continue til past goal and no more capture
+X   * moves exist
+X   */
+X  /* unless it hits DepthBeyond */
+X  if (TrPnt[ply] == TrPnt[ply + 1])
+X    {
+X      return (score);
+X    }
+X  cf = (depth < 1 && ply > Sdepth + 1 && !ChkFlag[ply - 2] && !slk);
+X
+X  /* if not at goal set best = -inf else current score */
+X  best = ((depth > 0) ? -12000 : score);
+X  /* if best so far is better than alpha set alpha to best */
+X  if (best > alpha)
+X    alpha = best;
+X  /********************** main loop ************************************************************************/
+X  /* look at each move until no more or beta cutoff */
+X  for (pnt = pbst = TrPnt[ply]; pnt < TrPnt[ply + 1] && best <= beta; pnt++)
+X    {
+X      /* find the most interesting looking of the remaining moves */
+X      pick (pnt, TrPnt[ply + 1] - 1);
+X
+X      node = &Tree[pnt];
+X      /* is this a forbidden move */
+X      if (ply == 1 && node->score == -32768)
+X	continue;
+X      nxtline[ply + 1] = 0;
+X      if (cf && score + node->score < alpha)
+X	break;
+X#if !defined CHESSTOOL && !defined XBOARD
+X      /* if at top level */
+X      if (ply == 1)
+X	{			/* at the top update search status */
+X	  if (flag.post)
+X#ifdef QUIETBACKGROUND
+X	    if (!background)
+X#endif /* QUIETBACKGROUND */
+X	      ShowCurrentMove (pnt, node->f, node->t);
+X	}
+X#endif
+X      if (!(node->flags & exact))
+X	{
+X	  /* make the move and go deeper */
+X	  MakeMove (side, node, &tempb, &tempc, &tempsf, &tempst, &INCscore);
+X	  CptrFlag[ply] = (node->flags & capture);
+X	  PawnThreat[ply] = (node->flags & pwnthrt);
+X	  Tscore[ply] = node->score;
+X	  PV = node->reply;
+X	  node->score = -search (xside, ply + 1,
+X				 ((depth > 0) ? depth - 1 : 0),
+X				 -beta, -alpha,
+X				 nxtline, &rcnt);
+X	  node->width = (ply % 2 == 1) ? (TrPnt[ply + 2] - TrPnt[ply + 1]) : 0;
+X	  if (abs (node->score) > 9000)
+X	    node->flags |= exact;
+X	  else if (rcnt == 1)
+X	    node->score /= 2;
+X	  if ((rcnt >= 2 || GameCnt - Game50 > 99 || (node->score == 9999 - ply && !ChkFlag[ply])))
+X	    {
+X	      node->flags |= (draw | exact);
+X	      DRAW = CP[58];	/* Draw */
+X	      node->score = ((side == computer) ? contempt : -contempt);
+X	    }
+X	  node->reply = nxtline[ply + 1];
+X	  /* reset to try next move */
+X	  UnmakeMove (side, node, &tempb, &tempc, &tempsf, &tempst);
+X	}
+X      /* if best move so far */
+X
+X      if (!flag.timeout && ((node->score > best) || ((node->score == best) && (node->width > bestwidth))))
+X	{
+X	  /* all things being equal pick the denser part of the tree */
+X	  bestwidth = node->width;
+X
+X	  /*
+X           * if not at goal depth and better than alpha and not an exact
+X           * score increment by depth
+X           */
+X	  if (depth > 0 && node->score > alpha && !(node->flags & exact))
+X	    node->score += depth;
+X	  best = node->score;
+X	  pbst = pnt;
+X	  if (best > alpha)
+X	    {
+X	      alpha = best;
+X	    }
+X	  /* update best line */
+X	  for (j = ply + 1; nxtline[j] > 0; j++)
+X	    bstline[j] = nxtline[j];
+X	  bstline[j] = 0;
+X	  bstline[ply] = (node->f << 8) | node->t;
+X	  /* if at the top */
+X	  if (ply == 1)
+X	    {
+X
+X	      /*
+X               * if its better than the root score make it the root
+X               */
+X	      if ((best > root->score) || ((best == root->score) && (bestwidth > root->width)))
+X		{
+X		  tmp = Tree[pnt];
+X		  for (j = pnt - 1; j >= 0; j--)
+X		    Tree[j + 1] = Tree[j];
+X		  Tree[0] = tmp;
+X		  pbst = 0;
+X		}
+X#if !defined CHESSTOOL && !defined XBOARD
+X#ifdef QUIETBACKGROUND
+X	      if (!background)
+X#endif /* QUIETBACKGROUND */
+X		if (Sdepth > 2)
+X		  if (best > beta)
+X		    {
+X		      ShowResults (best, bstline, '+');
+X		    }
+X		  else if (best < alpha)
+X		    {
+X		      ShowResults (best, bstline, '-');
+X		    }
+X		  else
+X		    ShowResults (best, bstline, '&');
+X#endif
+X	      restype = (best < alpha) ? false : true;
+X	    }
+X	}
+X      if (Sdepth > MINDEPTH && flag.timeout)
+X	{
+X	  if (ply == 1)
+X	    globalpnt = (pnt);
+X	  return (Tscore[ply]);
+X	}
+X    }
+X
+X  /******************************************************************************************/
+X  globalpnt = (pnt);
+X  node = &Tree[pbst];
+X  mv = (node->f << 8) | node->t;
+X
+X  /*
+X   * we have a move so put it in local table - if it's already there done
+X   * else if not there or needs to be updated also put it in hashfile
+X   */
+X#if ttblsz
+X  if (flag.hash && ply <= Sdepth && *rpt == 0 && best == alpha)
+X    {
+X      if (PutInTTable (side, best, depth, ply, alpha, beta, mv)
+X#ifdef HASHFILE
+X	  && hashfile && (depth > HashDepth) && (GameCnt < HashMoveLimit))
+X	{
+X	  PutInFTable (side, best, depth, ply, alpha, beta, node->f, node->t);
+X	}
+X#else
+X	);
+X#endif /* HASHFILE */
+X    }
+X
+X#endif /* ttblsz */
+X  if (depth > 0)
+X    {
+X#if !defined NOHISTORY
+X      j = (node->f << 6) | node->t;
+X      if (side == black)
+X	j |= 0x1000;
+X      if (history[j] < 150)
+X	history[j] += (unsigned char) depth << 1;
+X#endif
+X      if (node->t != (GameList[GameCnt].gmove & 0xFF))
+X	if (best <= beta)
+X	  killr3[ply] = mv;
+X	else if (mv != killr1[ply])
+X	  {
+X	    killr2[ply] = killr1[ply];
+X	    killr1[ply] = mv;
+X	  }
+X      killr0[ply] = ((best > 9000) ? mv : 0);
+X    }
+X
+X  return (best);
+X}
+X
+X
+X
+X
+Xint
+Xcastle (short int side, short int kf, short int kt, short int iop)
+X
+X/* Make or Unmake a castling move. */
+X
+X{
+X  register short rf, rt, t0, xside;
+X
+X  xside = side ^ 1;
+X  if (kt > kf)
+X    {
+X      rf = kf + 3;
+X      rt = kt - 1;
+X    }
+X  else
+X    {
+X      rf = kf - 4;
+X      rt = kt + 1;
+X    }
+X  if (iop == 0)
+X    {
+X      if (kf != kingP[side] ||
+X	  board[kf] != king ||
+X	  board[rf] != rook ||
+X	  color[kf] != side ||
+X	  color[rf] != side ||
+X	  Mvboard[kf] != 0 ||
+X	  Mvboard[rf] != 0 ||
+X	  color[kt] != neutral ||
+X	  color[rt] != neutral ||
+X	  color[kt - 1] != neutral ||
+X	  SqAtakd (kf, xside) ||
+X	  SqAtakd (kt, xside) ||
+X	  SqAtakd (rt, xside))
+X	return (false);
+X    }
+X  else
+X    {
+X      if (iop == 1)
+X	{
+X	  castld[side] = true;
+X	  Mvboard[kf]++;
+X	  Mvboard[rf]++;
+X	}
+X      else
+X	{
+X	  castld[side] = false;
+X	  Mvboard[kf]--;
+X	  Mvboard[rf]--;
+X	  t0 = kt;
+X	  kt = kf;
+X	  kf = t0;
+X	  t0 = rt;
+X	  rt = rf;
+X	  rf = t0;
+X	}
+X      board[kt] = king;
+X      color[rt] = color[kt] = side;
+X      Pindex[kt] = 0;
+X      board[kf] = no_piece;
+X      color[rf] = color[kf] = neutral;
+X      board[rt] = rook;
+X      Pindex[rt] = Pindex[rf];
+X      board[rf] = no_piece;
+X      PieceList[side][Pindex[kt]] = kt;
+X      PieceList[side][Pindex[rt]] = rt;
+X      UpdateHashbd (side, king, kf, kt);
+X      UpdateHashbd (side, rook, rf, rt);
+X    }
+X  return (true);
+X}
+X
+X
+Xvoid
+XEnPassant (short int xside, short int f, short int t, short int iop)
+X
+X/*
+X * Make or unmake an en passant move.
+X */
+X
+X{
+X  register short l;
+X
+X  l = t + ((t > f) ? -8 : 8);
+X  if (iop == 1)
+X    {
+X      board[l] = no_piece;
+X      color[l] = neutral;
+X    }
+X  else
+X    {
+X      board[l] = pawn;
+X      color[l] = xside;
+X    }
+X  InitializeStats ();
+X  if (iop != 1)
+X    epsquare = t;
+X}
+X
+X
+Xvoid
+XUpdatePieceList (short int side, short int sq, short int iop)
+X
+X/*
+X * Update the PieceList and Pindex arrays when a piece is captured or when a
+X * capture is unmade.
+X */
+X
+X{
+X  register short i;
+X
+X  if (iop == 1)
+X    {
+X      PieceCnt[side]--;
+X      for (i = Pindex[sq]; i <= PieceCnt[side]; i++)
+X	{
+X	  PieceList[side][i] = PieceList[side][i + 1];
+X	  Pindex[PieceList[side][i]] = i;
+X	}
+X    }
+X  else
+X    {
+X      PieceCnt[side]++;
+X      PieceList[side][PieceCnt[side]] = sq;
+X      Pindex[sq] = PieceCnt[side];
+X    }
+X}
+X
+Xvoid
+XMakeMove (short int side,
+X	  struct leaf * node,
+X	  short int *tempb,	/* color of to square */
+X	  short int *tempc,	/* piece at to square */
+X	  short int *tempsf,	/* static value of piece on from */
+X	  short int *tempst,	/* static value of piece on to */
+X	  short int *INCscore)	/* score increment for pawn structure change */
+X
+X/*
+X * Update Arrays board[], color[], and Pindex[] to reflect the new board
+X * position obtained after making the move pointed to by node. Also update
+X * miscellaneous stuff that changes when a move is made.
+X */
+X
+X{
+X  register short f, t, xside, ct, cf;
+X  register struct GameRec *g;
+X
+X  xside = side ^ 1;
+X  g = &GameList[++GameCnt];
+X  g->hashkey = hashkey;
+X  g->hashbd = hashbd;
+X  f = node->f;
+X  t = node->t;
+X  epsquare = -1;
+X  FROMsquare = f;
+X  TOsquare = t;
+X  *INCscore = 0;
+X  g->Game50 = Game50;
+X  g->gmove = (f << 8) | t;
+X  g->flags = node->flags;
+X  if (node->flags & cstlmask)
+X    {
+X      g->piece = no_piece;
+X      g->color = side;
+X      (void) castle (side, f, t, 1);
+X      Game50 = GameCnt;
+X    }
+X  else
+X    {
+X      if (!(node->flags & capture) && (board[f] != pawn))
+X	rpthash[side][hashkey & 0xFF]++;
+X      else
+X	Game50 = GameCnt;
+X      *tempsf = svalue[f];
+X      *tempst = svalue[t];
+X      g->piece = *tempb = board[t];
+X      g->color = *tempc = color[t];
+X      if (*tempc != neutral)
+X	{
+X	  UpdatePieceList (*tempc, t, 1);
+X	  /* if capture decrement pawn count */
+X	  if (*tempb == pawn)
+X	    {
+X	      --PawnCnt[*tempc][column (t)];
+X	    }
+X	  if (board[f] == pawn)
+X	    {
+X	      cf = column (f);
+X	      ct = column (t);
+X	      /* move count from from to to */
+X	      --PawnCnt[side][cf];
+X	      ++PawnCnt[side][ct];
+X
+X	      /*
+X               * calculate increment for pawn structure changes
+X               */
+X	      /* doubled or more - */
+X	      if (PawnCnt[side][ct] > (1 + PawnCnt[side][cf]))
+X		*INCscore -= 15;
+X	      /* went to empty column + */
+X	      else if (PawnCnt[side][ct] < 1 + PawnCnt[side][cf])
+X		*INCscore += 15;
+X
+X	      /*
+X               * went to outside col or empty col on one side ????????
+X               */
+X	      else if (ct == 0 || ct == 7 || PawnCnt[side][ct + ct - cf] == 0)
+X		*INCscore -= 15;
+X	    }
+X	  mtl[xside] -= value[*tempb];
+X	  if (*tempb == pawn)
+X	    pmtl[xside] -= valueP;
+X	  UpdateHashbd (xside, *tempb, -1, t);
+X	  *INCscore += *tempst;
+X	  Mvboard[t]++;
+X	}
+X      color[t] = color[f];
+X      board[t] = board[f];
+X      svalue[t] = svalue[f];
+X      Pindex[t] = Pindex[f];
+X      PieceList[side][Pindex[t]] = t;
+X      color[f] = neutral;
+X      board[f] = no_piece;
+X      if (board[t] == pawn)
+X	if (t - f == 16)
+X	  epsquare = f + 8;
+X	else if (f - t == 16)
+X	  epsquare = f - 8;
+X      if (node->flags & promote)
+X	{
+X	  board[t] = node->flags & pmask;
+X	  if (board[t] == queen)
+X	    HasQueen[side]++;
+X	  else if (board[t] == rook)
+X	    HasRook[side]++;
+X	  else if (board[t] == bishop)
+X	    HasBishop[side]++;
+X	  else if (board[t] == knight)
+X	    HasKnight[side]++;
+X	  --PawnCnt[side][column (t)];
+X	  mtl[side] += value[board[t]] - valueP;
+X	  pmtl[side] -= valueP;
+X	  UpdateHashbd (side, pawn, f, -1);
+X	  UpdateHashbd (side, board[t], f, -1);
+X	  *INCscore -= *tempsf;
+X	}
+X      if (node->flags & epmask)
+X	EnPassant (xside, f, t, 1);
+X      else
+X	UpdateHashbd (side, board[t], f, t);
+X      Mvboard[f]++;
+X    }
+X}
+X
+Xvoid
+XUnmakeMove (short int side,
+X	    struct leaf * node,
+X	    short int *tempb,
+X	    short int *tempc,
+X	    short int *tempsf,
+X	    short int *tempst)
+X
+X/*
+X * Take back a move.
+X */
+X
+X{
+X  register short f, t, xside;
+X
+X  xside = side ^ 1;
+X  f = node->f;
+X  t = node->t;
+X  epsquare = -1;
+X  Game50 = GameList[GameCnt--].Game50;
+X  if (node->flags & cstlmask)
+X    (void) castle (side, f, t, 2);
+X  else
+X    {
+X      color[f] = color[t];
+X      board[f] = board[t];
+X      svalue[f] = *tempsf;
+X      Pindex[f] = Pindex[t];
+X      PieceList[side][Pindex[f]] = f;
+X      color[t] = *tempc;
+X      board[t] = *tempb;
+X      svalue[t] = *tempst;
+X      if (node->flags & promote)
+X	{
+X	  board[f] = pawn;
+X	  ++PawnCnt[side][column (t)];
+X	  mtl[side] += valueP - value[node->flags & pmask];
+X	  pmtl[side] += valueP;
+X	  UpdateHashbd (side, (short) node->flags & pmask, -1, t);
+X	  UpdateHashbd (side, pawn, -1, t);
+X	}
+X      if (*tempc != neutral)
+X	{
+X	  UpdatePieceList (*tempc, t, 2);
+X	  if (*tempb == pawn)
+X	    {
+X	      ++PawnCnt[*tempc][column (t)];
+X	    }
+X	  if (board[f] == pawn)
+X	    {
+X	      --PawnCnt[side][column (t)];
+X	      ++PawnCnt[side][column (f)];
+X	    }
+X	  mtl[xside] += value[*tempb];
+X	  if (*tempb == pawn)
+X	    pmtl[xside] += valueP;
+X	  UpdateHashbd (xside, *tempb, -1, t);
+X	  Mvboard[t]--;
+X	}
+X      if (node->flags & epmask)
+X	EnPassant (xside, f, t, 2);
+X      else
+X	UpdateHashbd (side, board[f], f, t);
+X      Mvboard[f]--;
+X      if (!(node->flags & capture) && (board[f] != pawn))
+X	rpthash[side][hashkey & 0xFF]--;
+X    }
+X}
+X
+X
+Xvoid
+XInitializeStats (void)
+X
+X/*
+X * Scan thru the board seeing what's on each square. If a piece is found,
+X * update the variables PieceCnt, PawnCnt, Pindex and PieceList. Also
+X * determine the material for each side and set the hashkey and hashbd
+X * variables to represent the current board position. Array
+X * PieceList[side][indx] contains the location of all the pieces of either
+X * side. Array Pindex[sq] contains the indx into PieceList for a given
+X * square.
+X */
+X
+X{
+X  register short i, sq;
+X
+X  epsquare = -1;
+X  for (i = 0; i < 8; i++)
+X    {
+X      PawnCnt[white][i] = PawnCnt[black][i] = 0;
+X    }
+X  mtl[white] = mtl[black] = pmtl[white] = pmtl[black] = 0;
+X  PieceCnt[white] = PieceCnt[black] = 0;
+X  hashbd = hashkey = 0;
+X  for (sq = 0; sq < 64; sq++)
+X    if (color[sq] != neutral)
+X      {
+X	mtl[color[sq]] += value[board[sq]];
+X	if (board[sq] == pawn)
+X	  {
+X	    pmtl[color[sq]] += valueP;
+X	    ++PawnCnt[color[sq]][column (sq)];
+X	  }
+X	Pindex[sq] = ((board[sq] == king) ? 0 : ++PieceCnt[color[sq]]);
+X
+X	PieceList[color[sq]][Pindex[sq]] = sq;
+X	hashbd ^= hashcode[color[sq]][board[sq]][sq].bd;
+X	hashkey ^= hashcode[color[sq]][board[sq]][sq].key;
+X      }
+X}
+END_OF_FILE
+if test 32814 -ne `wc -c <'src/search.c'`; then
+    echo shar: \"'src/search.c'\" unpacked with wrong size!
+fi
+# end of 'src/search.c'
+fi
+echo shar: End of archive 4 \(of 12\).
+cp /dev/null ark4isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 12 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+	echo Building book file.
+	cat misc/book.xaa misc/book.xab > misc/gnuchess.nunn.book
+	rm misc/book.xaa misc/book.xab
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

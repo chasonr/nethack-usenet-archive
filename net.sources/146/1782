@@ -1,0 +1,545 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,931aaebed4260d49,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-10-05 04:45:20 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site stcvax.UUCP
+Path: utzoo!linus!decvax!ittvax!dcdwest!sdcsvax!sdcrdcf!hplabs!hao!stcvax!lat
+From: lat@stcvax.UUCP (Larry Tepper)
+Newsgroups: net.sources
+Subject: makefile dependency list generator
+Message-ID: <309@stcvax.UUCP>
+Date: Fri, 5-Oct-84 07:45:20 EDT
+Article-I.D.: stcvax.309
+Posted: Fri Oct  5 07:45:20 1984
+Date-Received: Sun, 7-Oct-84 21:59:47 EDT
+Organization: Storage Technology Corp.  Louisville, CO
+Lines: 525
+
+I am posting the following program which has been in use for
+sometime here at STC.  No doubt bugs will start cropping up
+now that I've made it public.  Anyway, this program runs the
+C preprocessor and examines its output for the REAL list of
+included files.  This means that it not only gets files
+included by other include files, but it also doesn't erroneously
+refer to files not really included because of an #ifndef, i. e.
+
+	#ifndef BSD4_2
+	#include "ndir.h"
+	#endif
+
+It also is slower than those awk and grep programs previously
+submitted, but who said doing the entire job would be faster?
+-------------------------------------------------------------
+echo You better be running this through /bin/sh ...
+echo We will be extracting 2 files
+echo ''
+echo extracting includes.1 ...
+cat > includes.1 << 'End_Of_includes.1'
+.TH INCLUDES 1
+.SH NAME
+includes \- include file dependency list generator for C
+.SH SYNOPSIS
+.B includes [-I...] [-D...] [-ssuffix] files...
+.SH DESCRIPTION
+.I includes
+is a tool for the generation of dependency lists used in makefiles.
+By running the C preprocessor on its input files, and examining the
+output for the names of included files,
+.I includes
+will find even those file included by other include files.
+In the absence of any input files,
+.I includes
+processes its standard input.
+As a typical example, the following section might be placed at the
+end of a makefile prior to generating the dependencies for it.
+.sp
+.nf
+	depend:
+		mv makefile makefile.prev
+		sed '/^# Dependencies follow/,$$d' makefile.prev > makefile
+		echo '# Dependencies follow' >> makefile
+		includes -I../h -DUSG -so -p:../src $(SOURCES) >> makefile
+		echo '# IF YOU PUT STUFF HERE IT WILL GET BLASTED' >> makefile
+		echo '# see depend: above' >> Makefile
+	
+	# DO NOT DELETE THE FOLLOWING LINE
+	# Dependencies follow
+.fi
+.sp
+.PP
+The options to
+.I includes
+are:
+.TP
+\-i
+ignores header files from /usr/include
+.TP
+\-o
+outputs only the list of included header files.
+.TP
+\-v
+verbose mode.
+.I includes
+prints the name of each file as it is processed.
+.TP
+\-ssuffix
+The suffices of input files are replaced with
+.I suffix.
+As in the example,
+.I suffix
+is almost always "o", and is used to convert names like
+.I main.c
+into
+.I main.o.
+.TP
+\-psearchpath
+.I searchpath
+takes the same format as does the PATH variable of the Bourne
+shell, i. e. a list of directory names separated by colons.
+.I includes
+looks in each directory for its input files, and runs the C
+preprocessor on the first such file encountered.  This option is
+used to accomodate the VPATH local modification to
+.I make.
+.br
+.ne 3
+.TP
+\-Idirectory
+This option is passed to the C preprocessor, and is not
+otherwise used by
+.I includes.
+.ne 3
+.TP
+\-Ddefinition
+This option is passed to the C preprocessor, and is not
+otherwise used by
+.I includes.
+.SH SEE ALSO
+cc(1), make(1)
+End_Of_includes.1
+echo extracting includes.c ...
+cat > includes.c << 'End_Of_includes.c'
+#include <stdio.h>
+#include <ctype.h>
+#include <errno.h>
+
+/* Dependency list generator to aid in generating makefiles.
+ *
+ * Larry Tepper
+ * Storage Technology Corp.
+ * Louisville, Colorado
+ *
+ * This file was created with tabstops set at 5.
+ */
+
+/* Array of string address for running the C pre-processor. */
+#define NCPP 30
+
+static char *cppcmd[NCPP] = {
+#if V7RUN
+	"v7run",
+#endif
+	"cpp",
+};
+
+static char **cppfp;		/* Points to file name entry in cppcmd */
+static int cppid;			/* PID for running cpp */
+
+/* Directories where we look for source files. */
+#define NDIR 30
+static char *path[NDIR] = { "", };
+
+/* Option: replace file suffices with this string. */
+static char *suff;
+
+/* Option: output only include file names. */
+static char onlyincl;
+
+/* Option: don't output file included from /usr/include */
+static char nosysincl;
+
+main(argc, argv)
+int argc;
+register char **argv;
+{
+	register char *s;
+	register char **cpp, **sp;
+	int rv, verbose;
+
+	verbose = 0;
+
+	/* Find first NULL in cpp command array */
+	for (cpp = &cppcmd[1]; *cpp != NULL; cpp++)
+		;
+
+	for (argv++; (s = *argv) != NULL  &&  *s++ == '-'; argv++)  {
+		switch (*s++)  {
+		case 'i':
+			nosysincl++;
+			break;
+		case 'o':
+			onlyincl++;
+			break;
+		case 'D':
+		case 'I':
+			/* Check vs. NCPP-1 since array must be null terminated */
+			if (cpp >= &cppcmd[NCPP-1])  {
+				fprintf(stderr, "Too many preprocessor args\n");
+				exit(1);
+			}
+			*cpp++ = *argv;
+			break;
+		case 'v':
+			verbose++;
+			break;
+		case 'p':
+			/* The remainder of the string has the form of a shell
+			 * path, i. e. :dir1:dir2....  Overwrite the colons
+			 * with zeroes and fill path[] with pointers to the
+			 * directory names.
+			 */
+			sp = &path[0];
+			for ( ;; )  {
+				if (sp >= &path[NDIR])  {
+					fprintf(stderr, "Too many path directories\n");
+					exit(1);
+				}
+				*sp++ = s;
+				while (*s != 0  &&  *s != ':')  {
+					s++;
+				}
+				if (*s == 0)
+					break;
+				*s++ = 0;
+			}
+			break;
+		case 's':
+			suff = s;
+			break;
+		default:
+			goto usage;
+		}
+	}
+	if (*argv == NULL)
+		goto usage;
+
+	cppfp = cpp;				/* Put address of file string here */
+	while ((s = *argv++) != NULL) {
+		if (verbose)  {
+			fprintf(stderr, "%s:\n", s);
+		}
+		if ((rv = includes(s)) != 0)  {
+			exit(rv);
+		}
+	}
+	princls();
+	exit(0);
+
+usage:
+	fprintf(stderr,
+	"Usage: includes [-ssuff] [-Idirectory] [-ppath] [-v] files\n");
+	exit(1);
+}
+
+/* Allocate memory for string s and copy it into the new place. */
+char *
+scopy(s)
+register char *s;
+{
+	register char *t, *u;
+	char *malloc();
+
+	if ((t = malloc(strlen(s) + 1)) == NULL)  {
+		nomem();
+	}
+	u = t;
+	while ((*t++ = *s++) != 0)  {
+		;
+	}
+	return u;
+}
+
+FILE *
+runcpp()
+{
+	int p[2];
+	register char *cpp;
+
+	if (pipe(p) < 0)  {
+		perror("Can't pipe");
+		return NULL;
+	}
+
+	if ((cppid = fork()) == 0) {
+		register char **ap;
+
+		close(p[0]);			/* Close read side in child */
+		dup2(p[1], 1);			/* Connect write side to stdout */
+		close(p[1]);
+#if V7RUN
+		cpp = "v7run";
+#else
+		cpp = "/lib/cpp";
+#endif
+		execvp(cpp, cppcmd);
+		perror(cpp);
+		_exit(1);
+	}
+	close(p[1]);
+	if (cppid < 0)  {
+		perror("Can't fork");
+		close(p[0]);
+		return NULL;
+	}
+	return fdopen(p[0], "r");
+}
+
+static char line[500];			/* Holds input lines from the file. */
+static char sufname[100];		/* Input file name with suffix replaced. */
+
+/* Generate the list of it's include files. */
+includes(f)
+char *f;
+{
+	register char *s;
+	register int c;
+	char *ifn;				/* Name of file to include */
+	char *rindex();
+	char *sufp;				/* Pointer to malloc'ed copy of sufname */
+	FILE *pipein;
+	int once, wstatus;
+	extern int errno;
+
+	/* If the file name has slashes in it, just use
+	 * the name as is.  Otherwise, work through the
+	 * path list trying to find file `f'.
+	 */
+	if (rindex(f, '/') != NULL)  {
+		strcpy(line, f);
+	} else {
+		register char **sp;
+		register found;
+
+		found = 0;
+		for (sp = &path[0]; sp < &path[NDIR]  &&  (s = *sp++) != NULL; )  {
+			namecat(line, s, f);
+			if (access(line, 4) == 0)  {		/* Check readability */
+				found++;
+				break;
+			}
+		}
+		if (!found)  {
+			perror(f);
+			return 1;
+		}
+	}
+	*cppfp = line;
+
+	/* get right hand part of name and replace it's suffix. */
+	if ((s = rindex(f, '/')) == NULL)  {
+		s = f;
+	} else {
+		s++;
+	}
+	strcpy(sufname, s);
+	if (suff != NULL  &&  (s = rindex(sufname, '.')) != NULL)  {
+		strcpy(++s, suff);
+	}
+	sufp = scopy(sufname);
+
+	/* Run the C pre-processor & read its output from a pipe. */
+	if ((pipein = runcpp()) == NULL)  {
+		return 1;
+	}
+
+	/* "once" lets us ignore the first file name from cpp,
+	 * since it's just the name of the input file.
+	 */
+	once = 1;
+	for ( ;; )  {
+		s = &line[0];
+		if (fgets(s, 500, pipein) == NULL)
+			break;
+		if (*s++ != '#')
+			continue;
+
+		/* Skip initial white space */
+		while ((c = *s++) != 0  &&  (c == ' '  ||  c == '\t'))
+			;
+
+		/* See if it's the 1st include line for a file.
+		 * Such lines look like:
+		 *	# 1 "filename.h"
+		 */
+		if (c != '1'  ||  isdigit(*s))  {
+			continue;
+		}
+		if (once)  {
+			once = 0;
+			continue;
+		}
+
+		/* Skip to start of include file name */
+		while ((c = *s++) != 0  &&  c != '"')
+			;
+
+		if (c == 0)  {
+			continue;		/* Weird line: no file */
+		}
+		ifn = s;			/* Start of the include file name */
+
+		/* Find the end of the include file name.  */
+		while (*s != 0  &&  *s != c)
+			s++;
+		if (*s == 0)  {
+			/* #include not correctly ended by " */
+			continue;
+		}
+		*s = 0;
+
+		/* Add it to our list */
+		addchain(ifn, sufp);
+	}
+	fclose(pipein);
+	while ((c = wait(&wstatus)) > 0  &&  c != cppid)
+		;
+	return wstatus;
+}
+
+namecat(d, s, t)
+register char *d;			/* Destination string */
+register char *s;			/* Left part of path (possibly empty) */
+char *t;					/* Right part of path */
+{
+	*d = 0;
+	if (*s != 0)  {
+		while ((*d++ = *s++) != 0)
+			;
+		d[-1] =  '/';
+	}
+	for (s = t; (*d++ = *s++) != 0; )
+		;
+}
+
+/* For each source file s including file incl, sstr points to s
+ * and snxt points to the next file including incl.
+ */
+struct schain {
+	char *sstr;
+	struct schain *snxt;
+};
+
+/* For each included file incl, istr points to incl, iincl points
+ * to the list of source files including incl, and inxt points
+ * to the structure for some other included file.  
+ */
+struct ichain {
+	char *istr;
+	struct schain *iincl;
+	struct ichain *inxt;
+};
+
+/* There is a linked list of all of the include files found
+ * in this run.  For each include filed, there is a linked
+ * list of names of files that depend upon it.  
+ */
+struct ichain *head;
+
+/* Add file name s to the chain of files depending on included file
+ * f. Allocate space for f if needed. S must already be allocated.
+ */
+addchain(f, s)
+char *f, *s;
+{
+	register struct ichain *ip;
+	register struct schain *sp;
+
+	/* See if this include file has been previously encountered. */
+	for (ip = head; ip != NULL  &&  strcmp(ip->istr, f) != 0; ip = ip->inxt)
+		;
+
+	if (ip == NULL)  {				/* Not yet encountered. */
+		/* Allocate a structure for this include file
+		 * and link it into the list.
+		 */
+		if ((ip = (struct ichain*)malloc(sizeof(struct ichain))) == NULL)  {
+			nomem();
+		}
+		ip->inxt = head;
+		head = ip;
+		ip->istr = scopy(f);
+		ip->iincl = NULL;
+	}
+	if ((sp = (struct schain*)malloc(sizeof(struct schain))) == NULL)  {
+		nomem();
+	}
+	sp->snxt = ip->iincl;
+	ip->iincl = sp;
+	sp->sstr = s;			/* s must be unique or malloc'ed */
+}
+
+#if V7RUN
+static char sysincl[] = "/usr/libv7/include/";
+#else
+static char sysincl[] = "/usr/include/";
+#endif
+
+/* Print the included file dependency list at the end of the run. */
+princls()
+{
+	register struct ichain *ip;
+	register struct schain *sp;
+	register col, n, sl;
+
+	for (ip = head; ip != NULL; ip = ip->inxt)  {
+		if (nosysincl)  {
+			/* Skip this file if it's a system include file */
+			if (strncmp(sysincl, ip->istr, sizeof(sysincl)-1) == 0)  {
+				continue;
+			}
+		}
+		if (onlyincl)  {
+			printf("%s\n", ip->istr);
+			continue;
+		}
+		col = 78;			/* # of columns remaining. */
+		n = 0;
+		printf("\n");
+		for (sp = ip->iincl; sp != NULL; sp = sp->snxt)  {
+			sl = strlen(sp->sstr);
+			if (col - (sl + 1) <= 0)  {
+				printf(" \\\n", ip->istr);
+				col = 78;
+				n = 0;
+			}
+			if (n != 0)  {
+				printf(" ");
+				col--;
+			}
+			printf("%s", sp->sstr);
+			col -= sl;
+			n++;
+		}
+		if (col - (strlen(ip->istr) + 2) <= 0)  {
+			printf(": \\\n%s\n", ip->istr);
+		} else {
+			printf(": %s\n", ip->istr);
+		}
+	}
+}
+
+nomem()
+{
+	fprintf(stderr, "Out of memory\n");
+	exit(1);
+}
+End_Of_includes.c
+exit 0
+-- 
+Violence is the last refuge of the incompetent.
+
+{ihnp4 hao philabs sdcrdcf ucbvax!nbires}!stcvax!lat	Larry Tepper
+Storage Technology, MD-3T, Louisville, CO 80028		303-673-5435
+
+

@@ -1,0 +1,1064 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,13f03c8735c7552b,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-12-29 13:00:18 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site entropy.UUCP
+Path: utzoo!decvax!bellcore!allegra!ulysses!mhuxr!mhuxj!houxm!vax135!cornell!uw-beaver!uw-june!entropy!hubert
+From: hubert@entropy.UUCP (Steve Hubert)
+Newsgroups: net.sources
+Subject: nicedaemon reposting
+Message-ID: <111@entropy.UUCP>
+Date: Sat, 29-Dec-84 16:00:18 EST
+Article-I.D.: entropy.111
+Posted: Sat Dec 29 16:00:18 1984
+Date-Received: Sun, 30-Dec-84 08:02:34 EST
+Distribution: net
+Organization: UW MathStat, Seattle
+Lines: 1043
+
+My posting seems to have gotten severely garbled.  Sorry if you
+already received this.
+: This is a process which runs as a user process, no kernel changes,
+: which renices hog processes.  Compile with
+:   cc -O -o nicedaemon -DLOG nicedaemon.c    or
+:   cc -O -o nicedaemon nicedaemon.c
+:
+: It has only been tested on a 4.2 system and seems to work for me there.
+:
+: Steve Hubert
+:  Dept. of Stat., U. of Wash, Seattle
+:  {allegra,decvax,ihnp4,ucbvax!lbl-csam}!uw-beaver!entropy!hubert
+:  hubert%entropy@uw-beaver
+:
+:
+:
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting nicedaemon.l'
+sed 's/^X//' <<'//go.sysin dd *' >nicedaemon.l
+X.TH NICEDAEMON 8 local
+X.SH NAME
+nicedaemon \- automatic renice for long running jobs
+X.SH SYNOPSIS
+X.B nicedaemon
+[
+sleeptime [
+X.B \-
+] ]
+X.SH DESCRIPTION
+X.I Nicedaemon
+is intended to increase the amount of interaction for jobs which take less
+than one minute of cpu time.
+The method to achieve this is to renice long
+running jobs.
+Every 
+X.I sleeptime
+minutes 
+X.I nicedaemon 
+will look at the load average.
+If the load average is over 4.5 then
+X.I nicedaemon 
+will look
+for processes which are using a lot of cpu time.
+The default 
+X.I sleeptime
+interval is ten minutes.
+The
+X.IR nice (1) 
+value for running processes is altered to conform to the
+following table and a messages is sent to the user if s/he is still logged
+onto the terminal where s/he started the process being reniced.
+X.sp
+X.ta .5i +\w'CPU MINUTES    'u +\w'MINIMUM NICE VALUE'u
+	CPU MINUTES	MINIMUM NICE VALUE
+X.br
+	1 minute	4
+X.br
+	5 minutes	8
+X.br
+	15 minutes	11
+X.br
+	30 minutes	14
+X.br
+	45 minutes	17
+X.PP
+There are several reasons why certain jobs will not be reniced.
+Jobs
+running at a negative priority, jobs initiated from the console terminal,
+jobs deemed to be highly interactive (shells and editors),
+and
+jobs initiated as the system goes from single to multi-user are
+exempt from the effects of 
+X.IR nicedaemon .
+If 
+X.I sleeptime
+is specified and the
+X.B \-
+option used, then the warning sent to the user's terminal will
+not be done.
+X.SH FILES
+X.ta \w'/etc/rc.local   'u
+X/etc/rc	Multi-user startup commands
+X.br
+X/etc/rc.local	Local startup commands
+X.SH "SEE ALSO"
+renice(1), nice(1), setpriority(2)
+X.SH AUTHORS
+Jim Reeds, Robert Gross, Steve Hubert, others.
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 664 nicedaemon.l
+	/bin/echo -n '	'; /bin/ls -ld nicedaemon.l
+fi
+/bin/echo 'Extracting nicedaemon.c'
+sed 's/^X//' <<'//go.sysin dd *' >nicedaemon.c
+X/* "@(#)nicedaemon.c	1.4	12/2/83	Berkeley Ucbbach"; */
+X/* Some small entropy changes, 6/84, 12/84, Steve Hubert */
+
+X/*
+ *	Usage:	nicedaemon [ sleeptime [ - ] ]
+ *		where sleeptime is the time in minutes between wakeups
+ *		and a second argument (if present) inhibits warnings.
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+#include <nlist.h>
+#include <pwd.h>
+#include <sys/param.h>
+#include <sys/tty.h>
+#include <sys/dir.h>
+#include <sys/user.h>
+#include <sys/proc.h>
+#include <machine/pte.h>
+#include <sys/vm.h>
+#include <sys/text.h>
+#include <sys/stat.h>
+#include <sys/mbuf.h>
+#include <math.h>
+#include <signal.h>
+#include <strings.h>
+
+#define	RDR		0
+#define	WTR		1
+
+#ifndef MYNICE
+#define MYNICE		4	/* daemon runs at this nice */
+#endif
+
+#ifndef	LA
+#define	LA		((double) 4.5)	/* load average low water mark	*/
+#endif
+
+#define	MINUTE		*60
+#define	MINUTES		MINUTE
+#define	DEF_SLEEPTIME	(10 MINUTES)	/* default time between wakeups	*/
+#define	TABSIZ		((sizeof tab) / (sizeof (struct nicetab)))
+
+#ifdef LOG		/* keep a log */
+	FILE *llog;
+#ifndef LOGFILE
+#define LOGFILE "/usr/local/lib/nice_log"
+#endif
+#endif
+
+#define	max(a, b)	((a) > (b) ?  (a) : (b))
+#define	max3(a, b, c)	(max ((a), max ((b), (c))))
+#define	min(a, b)	((a) < (b) ?  (a) : (b))
+
+X/*
+ * nice table, if have used between cpumin and cpumax time renice to
+ * niceval
+ */
+struct	nicetab	{
+
+	time_t	cpumin;
+	time_t	cpumax;
+	short	niceval;
+
+}	tab [ ]	=	{
+	(time_t) (1	MINUTE),	(time_t) (5	MINUTES),	4,
+	(time_t) (5	MINUTES),	(time_t) (15	MINUTES),	8,
+	(time_t) (15	MINUTES),	(time_t) (30	MINUTES),	11,
+	(time_t) (30	MINUTES),	(time_t) (45	MINUTES),	14,
+	(time_t) (45	MINUTES),	(time_t) (32767	MINUTES),	17
+	};
+
+
+
+X/* From ps.c */
+struct nlist nl[] = {
+	{ "_proc" },
+#define	X_PROC		0
+	{ "_Usrptmap" },
+#define	X_USRPTMA	1
+	{ "_usrpt" },
+#define	X_USRPT		2
+	{ "_nswap" },
+#define	X_NSWAP		3
+	{ "_maxslp" },
+#define	X_MAXSLP	4
+	{ "_ccpu" },
+#define	X_CCPU		5
+	{ "_ecmx" },
+#define	X_ECMX		6
+	{ "_nproc" },
+#define	X_NPROC		7
+	{ "_dmmin" },
+#define	X_DMMIN		8
+	{ "_dmmax" },
+#define	X_DMMAX		9
+	{ "_avenrun" },
+#define	X_AVENRUN	10
+	{ 0 },
+};
+
+struct	savcom {
+	union {
+		struct	lsav *lp;
+		float	u_pctcpu;
+		struct	vsav *vp;
+		int	s_ssiz;
+	} s_un;
+	struct	asav *ap;
+} *savcom;
+
+struct	asav {
+	char	*a_cmdp;
+	int	a_flag;
+	short	a_stat, a_uid, a_pid, a_nice, a_pri, a_slptime, a_time;
+	size_t	a_size, a_rss, a_tsiz, a_txtrss;
+	short	a_xccount;
+	char	a_tty[MAXNAMLEN+1];
+	dev_t	a_ttyd;
+	time_t	a_cpu;
+	size_t	a_maxrss;
+};
+
+struct	proc proc[8];		/* 8 = a few, for less syscalls */
+struct	proc *mproc;
+struct	text *text;
+
+union {
+	struct	user user;
+	char	upages[UPAGES][NBPG];
+} user;
+#define u	user.user
+
+#define clear(x) 	((int)x & 0x7fffffff)
+
+char	*tptr;
+char	*gettty(), *getcmd(), *getname(), *savestr(), *malloc(), *state();
+char	*calloc(); 
+char	*ttyname(); 
+int	lseek();
+int	nswap, maxslp;
+struct	text *atext;
+double	ccpu;
+int	ecmx;
+struct	pte *Usrptma, *usrpt;
+int	nproc;
+int	dmmin, dmmax;
+
+struct	ttys {
+	char	name[MAXNAMLEN+1];
+	dev_t	ttyd;
+	struct	ttys *next;
+	struct	ttys *cand;
+} *allttys, *cand[16];
+
+int	npr;
+
+char	*kmemf, *memf, *swapf, *nlistf;
+int	kmem, mem, swap = -1;
+int	sumcpu;
+
+int	pcbpf;
+int	argaddr;
+extern	char _sobuf[];
+
+#define	pgtok(a)	((a)*CLBYTES/1024)
+
+main(ac, av)
+int ac;
+char **av;
+{
+	double vec[3];
+	FILE *psopen();
+	register mypid;
+	unsigned sleeptime;
+	short telluser = 0;
+	int place;
+
+	if (ac == 1)
+		sleeptime = (unsigned) (DEF_SLEEPTIME);
+	else
+		sleeptime = (unsigned) ((atoi (av [1])) MINUTES);
+
+	if (ac < 3)
+		telluser++;
+
+	/*
+	 *	If, eventually, we write to someone, we'll be permanently
+	 *	attached to a tty, so instead we immediately attach ourselves
+	 *	to the console.
+	 */
+	if (telluser)
+		(void)close(open("/dev/console", 0));
+
+	/*
+	 *	To avoid renicing ourselves after we've used lots of time.
+	 */
+	mypid	= getpid();
+
+	(void)setpriority(PRIO_PROCESS, mypid, MYNICE); 
+
+	if (chdir("/dev") < 0) {
+		perror("/dev");
+		exit(1);
+	}
+
+	getdev(); 
+	openfiles();
+
+#ifdef LOG
+	logit("Sleeptime %d  Mynice %d  Lowwater %.2f  %s\n", sleeptime,
+				MYNICE, LA, (telluser?"":"No Warnings"));
+#endif
+
+	for (;;) {
+		register int job;
+
+		sleep(sleeptime);
+
+		/*
+	 	 * If it's either not busy enough to bother, or so busy
+	 	 * that we can't even fork and exec ps, try again later.
+	 	 */
+		getkvars();
+		(void)lseek(kmem, (long)nl[X_AVENRUN].n_value, 0);
+		if (read(kmem, (char *)vec, sizeof(double) * 3) != (sizeof(double) * 3)) {
+			cantread("load ave", kmemf);
+			vec[0] = vec[1] = vec[2] = 0.0;
+		}
+		if (max3(vec[0], vec[1], vec[2]) > LA) {
+#ifdef LOG
+			logit("LA %.2f %.2f %.2f   donice()\n",
+					vec[0], vec[1], vec[2]);
+#endif
+			donice();
+		}else {
+#ifdef LOG
+			logit("LA %.2f %.2f %.2f   Sleep...\n",
+					vec[0], vec[1], vec[2]);
+#endif
+			continue;
+		}
+		
+		for (place = 0; place < npr; place++) {
+			register struct savcom *sp = &savcom[place];
+			register struct asav *a;
+
+			a = sp->ap;
+			/* Conditions that allow process to be immune */
+
+			if (*(a->a_tty) == '?' || !strncmp(a->a_tty,"co",2))
+				goto junkit;
+			if (a->a_pid == mypid || a->a_nice-NZERO < 0)
+				goto junkit;
+			if (checkperm(a->a_cmdp))
+				goto junkit;
+
+			for (job = 0; job < TABSIZ; job++) {
+			 if (a->a_cpu >= tab[job].cpumin && a->a_cpu < tab[job].cpumax)
+				if (a->a_nice-NZERO < tab[job].niceval) {
+
+#ifdef LOG
+				 logit("%s: %s (%d) %d -> %d  %d:%02d\n",
+					(getpwuid(a->a_uid))->pw_name,
+					a->a_cmdp, a->a_pid, a->a_nice-NZERO,
+					tab[job].niceval, a->a_cpu/60,
+					a->a_cpu%60);
+#endif
+
+				 (void)setpriority(PRIO_PROCESS,a->a_pid,tab[job].niceval);
+				 if (telluser)
+					 advise(a);
+				 break;
+				}
+			}
+junkit:			free((char *) a->a_cmdp);
+			free((char *) a);
+		}
+		free((char *) savcom);
+	}
+}
+
+donice()
+{
+	register int i, j;
+	off_t procp;
+	long getword();
+
+	procp = getword(nl[X_PROC].n_value);
+	nproc = getword(nl[X_NPROC].n_value);
+	savcom = (struct savcom *)calloc((unsigned)nproc, sizeof (*savcom));
+
+	npr = 0;
+	for (i=0; i<nproc; i += 8) {
+		(void)lseek(kmem, (long)procp, 0);
+		j = nproc - i;
+		if (j > 8)
+			j = 8;
+		j *= sizeof (struct proc);
+		if (read(kmem, (char *)proc, j) != j) {
+			cantread("proc table", kmemf);
+			exit(1);
+		}
+		procp += j;
+		for (j = j / sizeof (struct proc) - 1; j >= 0; j--) {
+			mproc = &proc[j];
+			if (mproc->p_stat == 0)
+				continue;
+			if (mproc->p_stat == SZOMB ||
+			    mproc->p_flag&SWEXIT)
+				continue;
+			if (mproc->p_slptime > MAXSLP &&
+			    (mproc->p_stat == SSLEEP ||
+			     mproc->p_stat == SSTOP))
+				continue;
+			save();
+		}
+	}
+}
+
+long
+getword(loc)
+unsigned long loc;
+{
+	long word;
+
+	(void)lseek(kmem, (long)loc, 0);
+	if (read(kmem, (char *)&word, sizeof (word)) != sizeof (word))
+		printf("error reading kmem at %x\n", loc);
+	return (word);
+}
+
+openfiles()
+{
+
+	kmemf = "/dev/kmem";
+	kmem = open(kmemf, 0);
+	if (kmem < 0) {
+		perror(kmemf);
+		exit(1);
+	}
+	memf = "/dev/mem";
+	mem = open(memf, 0);
+	if (mem < 0) {
+		perror(memf);
+		exit(1);
+	}
+	swapf = "/dev/drum";
+	swap = open(swapf, 0);
+	if (swap < 0) {
+		perror(swapf);
+		exit(1);
+	}
+#ifdef LOG
+	if ((llog = fopen(LOGFILE, "w")) == NULL) {
+		perror(LOGFILE);
+	}
+#endif
+}
+
+getkvars()
+{
+	long getword();
+
+	nlistf = "/vmunix";
+	nlist(nlistf, nl);
+	if (nl[0].n_type == 0) {
+		fprintf(stderr, "%s: No namelist\n", nlistf);
+		exit(1);
+	}
+	usrpt = (struct pte *)nl[X_USRPT].n_value;	/* don't clear!! */
+	Usrptma = (struct pte *)nl[X_USRPTMA].n_value;
+	(void)lseek(kmem, (long)nl[X_NSWAP].n_value, 0);
+	if (read(kmem, (char *)&nswap, sizeof (nswap)) != sizeof (nswap)) {
+		cantread("nswap", kmemf);
+		exit(1);
+	}
+	(void)lseek(kmem, (long)nl[X_MAXSLP].n_value, 0);
+	if (read(kmem, (char *)&maxslp, sizeof (maxslp)) != sizeof (maxslp)) {
+		cantread("maxslp", kmemf);
+		exit(1);
+	}
+	(void)lseek(kmem, (long)nl[X_CCPU].n_value, 0);
+	if (read(kmem, (char *)&ccpu, sizeof (ccpu)) != sizeof (ccpu)) {
+		cantread("ccpu", kmemf);
+		exit(1);
+	}
+	(void)lseek(kmem, (long)nl[X_ECMX].n_value, 0);
+	if (read(kmem, (char *)&ecmx, sizeof (ecmx)) != sizeof (ecmx)) {
+		cantread("ecmx", kmemf);
+		exit(1);
+	}
+	dmmin = getword(nl[X_DMMIN].n_value);
+	dmmax = getword(nl[X_DMMAX].n_value);
+}
+
+cantread(what, fromwhat)
+char *what, *fromwhat;
+{
+
+	fprintf(stderr, "ps: error reading %s from %s\n", what, fromwhat);
+}
+
+struct	direct *dbuf;
+int	dialbase;
+
+getdev()
+{
+	register DIR *df;
+
+	dialbase = -1;
+	if ((df = opendir(".")) == NULL) {
+		fprintf(stderr, "Can't open . in /dev\n");
+		exit(1);
+	}
+	while ((dbuf = readdir(df)) != NULL) 
+		maybetty();
+	closedir(df);
+}
+
+X/*
+ * Attempt to avoid stats by guessing minor device
+ * numbers from tty names.  Console is known,
+ * know that r(hp|up|mt) are unlikely as are different mem's,
+ * floppy, null, tty, etc.
+ */
+maybetty()
+{
+	register char *cp = dbuf->d_name;
+	register struct ttys *dp;
+	int x;
+	struct stat stb;
+
+	switch (cp[0]) {
+
+	  case 'c':
+		if (!strcmp(cp, "console")) {
+			x = 0;
+			goto donecand;
+		}
+		if (!strcmp(cp, "core"))
+			return;
+		break;
+
+	  case 'd':
+		if (!strcmp(cp, "drum") || !strncmp(cp, "dial", 4))
+			return;
+		break;
+
+	  case 'f':
+		if (!strcmp(cp, "floppy"))
+			return;
+		break;
+
+	  case 'k':
+		cp++;
+		if (*cp == 'U')
+			cp++;
+		goto trymem;
+
+	  case 'r':
+		if (cp[1] == 'r' || cp[1] == 'm')
+			cp++;
+#define is(a,b) cp[0] == 'a' && cp[1] == 'b'
+		if (is(r,a) || is(m,t)) {
+			cp += 2;
+			if (isdigit(*cp) && cp[2] == 0)
+				return;
+		}
+		break;
+
+	  case 'm':
+trymem:
+		if (cp[0] == 'm' && cp[1] == 'e' && cp[2] == 'm' && cp[3] == 0)
+			return;
+		if (cp[0] == 'm' && cp[1] == 't')
+			return;
+		break;
+
+	  case 'n':
+		if (!strcmp(cp, "null"))
+			return;
+		break;
+
+	  case 'v':
+		if ((cp[1] == 'a' || cp[1] == 'p') && isdigit(cp[2]) &&
+		    cp[3] == 0)
+			return;
+		break;
+
+	  case '.':
+		return;
+		break;
+	
+	  case 'M':
+		if (!strncmp(cp, "MAKE", 4));
+			return;
+		break;
+	
+	  case 'R':
+		if (!strcmp(cp, "ReadMe") || !strcmp(cp, "README") ||
+			!strcmp(cp, "Readme"));
+			return;
+		break;
+
+	}
+	cp = dbuf->d_name + dbuf->d_namlen - 1;
+	x = 0;
+	if (cp[-1] == 'd') {
+		if (dialbase == -1) {
+			if (stat("ttyd0", &stb) == 0)
+				dialbase = stb.st_rdev & 017;
+			else
+				dialbase = -2;
+		}
+		if (dialbase == -2)
+			x = 0;
+		else
+			x = 11;
+	}
+	if (cp > dbuf->d_name && isdigit(cp[-1]) && isdigit(*cp))
+		x += 10 * (cp[-1] - ' ') + cp[0] - '0';
+	else if (*cp >= 'a' && *cp <= 'f')
+		x += 10 + *cp - 'a';
+	else if (isdigit(*cp))
+		x += *cp - '0';
+	else
+		x = -1;
+donecand:
+	dp = (struct ttys *)malloc(sizeof (struct ttys));
+	(void)strcpy(dp->name, dbuf->d_name);
+	dp->next = allttys;
+	dp->ttyd = -1;
+	allttys = dp;
+	if (x == -1)
+		return;
+	x &= 017;
+	dp->cand = cand[x];
+	cand[x] = dp;
+}
+
+char *
+gettty()
+{
+	register char *p;
+	register struct ttys *dp;
+	struct stat stb;
+	int x;
+
+	if (u.u_ttyp == 0)
+		return("?");
+	x = u.u_ttyd & 017;
+	for (dp = cand[x]; dp; dp = dp->cand) {
+		if (dp->ttyd == -1) {
+			if (stat(dp->name, &stb) == 0 &&
+			   (stb.st_mode&S_IFMT)==S_IFCHR)
+				dp->ttyd = stb.st_rdev;
+			else
+				dp->ttyd = -2;
+		}
+		if (dp->ttyd == u.u_ttyd)
+			goto found;
+	}
+	/* ick */
+	for (dp = allttys; dp; dp = dp->next) {
+		if (dp->ttyd == -1) {
+			if (stat(dp->name, &stb) == 0 &&
+			   (stb.st_mode&S_IFMT)==S_IFCHR)
+				dp->ttyd = stb.st_rdev;
+			else
+				dp->ttyd = -2;
+		}
+		if (dp->ttyd == u.u_ttyd)
+			goto found;
+	}
+	return ("?");
+found:
+	p = dp->name;
+	if (p[0]=='t' && p[1]=='t' && p[2]=='y')
+		p += 3;
+	return (p);
+}
+
+save()
+{
+	register struct savcom *sp;
+	register struct asav *ap;
+	register struct text *xp;
+	char *ttyp, *cmdp;
+
+	if (mproc->p_stat != SZOMB && getu() == 0)
+		return;
+	ttyp = gettty();
+	if (tptr && strncmp(tptr, ttyp, 2))
+		return;
+	sp = &savcom[npr];
+	cmdp = getcmd();
+	if (cmdp == 0)
+		return;
+	sp->ap = ap = (struct asav *)malloc(sizeof (struct asav));
+	sp->ap->a_cmdp = cmdp;
+#define e(a,b) ap->a = mproc->b
+	e(a_flag, p_flag); e(a_stat, p_stat); e(a_nice, p_nice);
+	e(a_uid, p_uid); e(a_pid, p_pid); e(a_pri, p_pri);
+	e(a_slptime, p_slptime); e(a_time, p_time);
+	ap->a_tty[0] = ttyp[0];
+	ap->a_tty[1] = ttyp[1] ? ttyp[1] : ' ';
+	if (ap->a_stat == SZOMB) {
+		ap->a_cpu = 0;
+	} else {
+		ap->a_size = mproc->p_dsize + mproc->p_ssize;
+		e(a_rss, p_rssize); 
+		ap->a_ttyd = u.u_ttyd;
+		ap->a_cpu = u.u_ru.ru_utime.tv_sec + u.u_ru.ru_stime.tv_sec;
+		if (sumcpu)
+			ap->a_cpu += u.u_cru.ru_utime.tv_sec + u.u_cru.ru_stime.tv_sec;
+		if (mproc->p_textp && text) {
+			xp = &text[mproc->p_textp - atext];
+			ap->a_tsiz = xp->x_size;
+			ap->a_txtrss = xp->x_rssize;
+			ap->a_xccount = xp->x_ccount;
+		}
+	}
+#undef e
+	ap->a_maxrss = mproc->p_maxrss;
+	npr++;
+}
+
+getu()
+{
+	struct pte *pteaddr, apte;
+	struct pte arguutl[UPAGES+CLSIZE];
+	register int i;
+	int ncl, size;
+
+	size = sizeof (struct user);
+	if ((mproc->p_flag & SLOAD) == 0) {
+		if (swap < 0)
+			return (0);
+		(void)lseek(swap, (long)dtob(mproc->p_swaddr), 0);
+		if (read(swap, (char *)&user.user, size) != size) {
+			fprintf(stderr, "ps: cant read u for pid %d from %s\n",
+			    mproc->p_pid, swapf);
+			return (0);
+		}
+		pcbpf = 0;
+		argaddr = 0;
+		return (1);
+	}
+	pteaddr = &Usrptma[btokmx(mproc->p_p0br) + mproc->p_szpt - 1];
+	(void)lseek(kmem, (long)pteaddr, 0);
+	if (read(kmem, (char *)&apte, sizeof(apte)) != sizeof(apte)) {
+		printf("ps: cant read indir pte to get u for pid %d from %s\n",
+		    mproc->p_pid, swapf);
+		return (0);
+	}
+	(void)lseek(mem,
+	    (long)ctob(apte.pg_pfnum+1) - (UPAGES+CLSIZE) * sizeof (struct pte),
+		0);
+	if (read(mem, (char *)arguutl, sizeof(arguutl)) != sizeof(arguutl)) {
+		printf("ps: cant read page table for u of pid %d from %s\n",
+		    mproc->p_pid, kmemf);
+		return (0);
+	}
+	if (arguutl[0].pg_fod == 0 && arguutl[0].pg_pfnum)
+		argaddr = ctob(arguutl[0].pg_pfnum);
+	else
+		argaddr = 0;
+	pcbpf = arguutl[CLSIZE].pg_pfnum;
+	ncl = (size + NBPG*CLSIZE - 1) / (NBPG*CLSIZE);
+	while (--ncl >= 0) {
+		i = ncl * CLSIZE;
+		(void)lseek(mem, (long)ctob(arguutl[CLSIZE+i].pg_pfnum), 0);
+		if (read(mem, user.upages[i], CLSIZE*NBPG) != CLSIZE*NBPG) {
+			printf("ps: cant read page %d of u of pid %d from %s\n",
+			    arguutl[CLSIZE+i].pg_pfnum, mproc->p_pid, memf);
+			return (0);
+		}
+	}
+	return (1);
+}
+
+char *BAD = "BAD";
+
+char *
+getcmd()
+{
+	char cmdbuf[CLSIZE*NBPG];
+	union {
+		char	argc[CLSIZE*NBPG];
+		int	argi[CLSIZE*NBPG/sizeof (int)];
+	} argspac;
+	register char *cp;
+	register int *ip;
+	char c;
+	int nbad;
+	struct dblock db;
+	char *file;
+
+	if (mproc->p_stat == SZOMB || mproc->p_flag&(SSYS|SWEXIT))
+		return ("");
+	if ((mproc->p_flag & SLOAD) == 0 || argaddr == 0) {
+		if (swap < 0)
+			goto retucomm;
+		vstodb(0, CLSIZE, &u.u_smap, &db, 1);
+		(void)lseek(swap, (long)dtob(db.db_base), 0);
+		if (read(swap, (char *)&argspac, sizeof(argspac))
+		    != sizeof(argspac))
+			goto bad;
+		file = swapf;
+	} else {
+		(void)lseek(mem, (long)argaddr, 0);
+		if (read(mem, (char *)&argspac, sizeof (argspac))
+		    != sizeof (argspac))
+			goto bad;
+		file = memf;
+	}
+	ip = &argspac.argi[CLSIZE*NBPG/sizeof (int)];
+	ip -= 2;		/* last arg word and .long 0 */
+	while (*--ip)
+		if (ip == argspac.argi)
+			goto retucomm;
+	*(char *)ip = ' ';
+	ip++;
+	nbad = 0;
+	for (cp = (char *)ip; cp < &argspac.argc[CLSIZE*NBPG]; cp++) {
+		c = *cp & 0177;
+		if (c == 0)
+			*cp = ' ';
+		else if (c < ' ' || c > 0176) {
+			if (++nbad >= 5) {
+				*cp++ = ' ';
+				break;
+			}
+			*cp = '?';
+		} else if (c == '=') {
+			while (*--cp != ' ')
+				if (cp <= (char *)ip)
+					break;
+			break;
+		}
+	}
+	*cp = 0;
+	while (*--cp == ' ')
+		*cp = 0;
+	cp = (char *)ip;
+	(void)strncpy(cmdbuf, cp, &argspac.argc[CLSIZE*NBPG] - cp);
+	if (cp[0] == '-' || cp[0] == '?' || cp[0] <= ' ') {
+		(void)strcat(cmdbuf, " (");
+		(void)strncat(cmdbuf, u.u_comm, sizeof(u.u_comm));
+		(void)strcat(cmdbuf, ")");
+	}
+	return (savestr(cmdbuf));
+
+bad:
+	/* Make it exempt if we can't read it. */
+	fprintf(stderr, "ps: error locating command name for pid %d from %s\n",
+	    mproc->p_pid, file);
+	return (BAD);
+retucomm:
+	(void)strcpy(cmdbuf, " (");
+	(void)strncat(cmdbuf, u.u_comm, sizeof (u.u_comm));
+	(void)strcat(cmdbuf, ")");
+	return (savestr(cmdbuf));
+}
+
+
+X/*
+ * Given a base/size pair in virtual swap area,
+ * return a physical base/size pair which is the
+ * (largest) initial, physically contiguous block.
+ */
+vstodb(vsbase, vssize, dmp, dbp, rev)
+register int vsbase;
+int vssize;
+struct dmap *dmp;
+register struct dblock *dbp;
+{
+	register int blk = dmmin;
+	register swblk_t *ip = dmp->dm_map;
+
+	vsbase = ctod(vsbase);
+	vssize = ctod(vssize);
+	if (vsbase < 0 || vsbase + vssize > dmp->dm_size)
+		panic("vstodb");
+	while (vsbase >= blk) {
+		vsbase -= blk;
+		if (blk < dmmax)
+			blk *= 2;
+		ip++;
+	}
+	if (*ip <= 0 || *ip + blk > nswap)
+		panic("vstodb *ip");
+	dbp->db_size = min(vssize, blk - vsbase);
+	dbp->db_base = *ip + (rev ? blk - (vsbase + dbp->db_size) : vsbase);
+}
+
+X/*ARGSUSED*/
+panic(cp)
+	char *cp;
+{
+#ifdef DEBUG
+	printf("%s\n", cp);
+#endif
+}
+
+char *
+savestr(cp)
+char *cp;
+{
+	register int len;
+	register char *dp;
+
+	len = strlen(cp);
+	dp = (char *)malloc((unsigned)(len+1));
+	(void)strcpy(dp, cp);
+	return (dp);
+}
+
+
+X/*
+ *	Tell the user that his (her) process has been zapped
+ */
+advise(a)
+register struct asav *a;
+{
+	struct stat statbuf;
+	char thistty[16];
+	register FILE *fp;
+
+	/*
+	 *	Don't send messages if
+	 *		1)	the tty name is garbled or
+	 *		2)	the tty and process owners aren't the same
+	 *		3)	the cmd is troff
+	 */
+
+	(void)sprintf(thistty,"/dev/tty%2.2s",a->a_tty);
+	if (stat (thistty, & statbuf) == -1)
+		return;
+	if (statbuf.st_uid != a->a_uid)
+			return;
+
+	if (!strcmp("/usr/bin/troff", a->a_cmdp))
+			return;
+
+	if ((fp = fopen(thistty, "a")) == NULL)
+		return;
+		
+	fprintf(fp, "\r\n%s\r\n", "Message from nicedaemon:  your process");
+	fprintf(fp, "%s\t(PID = %d)\r\n", a->a_cmdp, a->a_pid);
+	fprintf(fp, "%s\n", "has been \"reniced\" in accordance with the");
+	fprintf(fp, "%s\n", "guidelines in the help files \"background\"");
+	fprintf(fp, "%s\n", "and \"bigjobs.\"  Please read these to find");
+	fprintf(fp, "%s\r\n", "out how to do this yourself.");
+	(void)fclose(fp);
+}
+
+X/* commands exempt from the nicedaemon */
+char *exempt[] = {
+	"csh",
+	"-csh",
+	"vi",
+	"ex",
+	"-u",
+	"ispsh",
+X/*	"rsh",
+	"rlogind",	*/
+	"sh",
+	"edit",
+	"ed",
+	"funplot",
+	"glim",
+	"emacs",
+	"tip",
+	"cu",
+	"readnews",
+	"BAD",	/* If we couldn't read mem properly, don't nail him. */
+	0
+	};
+
+X/* Return 1 if a privileged command, and 0 if not */
+
+checkperm(cmd)
+char *cmd;
+{
+	register char *cp = cmd, **progs;
+	register char *cp2;
+	char schar;
+
+	/* Use only first word */
+
+	for (cp2 = cp; *cp2 && !isspace(*cp2); cp2++); 
+
+	schar = *cp2;
+	*cp2 = NULL;  /* Temporary end of string */
+
+	if ((cp = rindex(cmd,'/')) != NULL)
+		cp++;
+	else	
+		cp = cmd;
+
+	for (progs = exempt; *progs; progs++)
+		if (!strncmp(*progs,cp,strlen(*progs))) {
+			*cp2 = schar;
+			return (1);
+		}
+	*cp2 = schar;
+	return (0);
+}
+
+
+#ifdef LOG
+
+struct timeval t;
+struct timezone tz;
+
+logit(fmt, args)
+char *fmt;
+{
+	static long timekeeper=0;
+	char *date, *ctime();
+
+	gettimeofday(&t, &tz);
+	if (t.tv_sec - timekeeper > 3600) {
+		timekeeper = t.tv_sec;
+		date = ctime(&(t.tv_sec));
+		date[16] = '\0';
+		fprintf(llog, "%s\n", date);
+	}
+
+	_doprnt(fmt, &args, llog);
+	fflush(llog);
+}
+#endif
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 664 nicedaemon.c
+	/bin/echo -n '	'; /bin/ls -ld nicedaemon.c
+fi
+
+

@@ -1,0 +1,354 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,ff976389af07c713,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-09-20 20:19:55 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site sbcs.UUCP
+Path: utzoo!linus!philabs!sbcs!perry
+From: perry@sbcs.UUCP (Perry Kivolowitz)
+Newsgroups: net.sources
+Subject: BOOT STRAP FOR DEVICE FOR WHICH YOU HAVE A BOOT PROM (4.1BSD)
+Message-ID: <481@sbcs.UUCP>
+Date: Tue, 20-Sep-83 23:19:55 EDT
+Article-I.D.: sbcs.481
+Posted: Tue Sep 20 23:19:55 1983
+Date-Received: Thu, 22-Sep-83 00:29:49 EDT
+Organization: SUNY at Stony Brook
+Lines: 335
+
+This boot strap will work with any device you have a boot prom for.
+We use for both the ra80/81's and RL02s.
+Goes in /sys/mdec/raboot.s
+
+-------------------------------------------------------------------------
+
+/*
+ * VAX 11-750 disk boot program to load "/boot" from
+ * a UNIX filesystem into low core and to execute that file.
+ *
+ * This program can only read regular small 10k byte files
+ * from the root of a UNIX filesystem. That is to say, it cannot
+ * (does not care to) look at indirect blocks. It just loads 
+ * the (up to) first 10 blocks addressed by the direct map
+ * pointers, and goes from there.
+ *
+ * If anything goes wrong during the boot, an error code is left in R7.
+ * The codes are defined below.
+ *
+ * written by Scott Comer at the urging of Mike Caplinger.
+ * copyright (c) LCSE, Rice University, Houston TX
+ */
+	.set	DATA, 	  0x3000	/* start of impure data area */
+	.set	STACK, 	  0xfa00	/* good place for the stack */
+	.set	BOOTBASE, 0xfe00	/* relocated home of boot block */
+
+
+	.set	STEP1, 1
+	.set	STEP2, 2
+	.set	STEP3, 3
+	.set	STEP4, 4
+	.set	STEP5, 5
+	.set	STEP6, 6
+	.set	STEP7, 7
+
+	/* these three hold the register contents needed by the */
+	/* rom driver subroutine to access the boot device      */
+	.set	driver_r1, DATA		
+	.set	driver_r2, driver_r1+4	
+	.set	driver_r3, driver_r2+4	
+	.set	driver, driver_r3+4		/* addr of driver routine */
+
+	.set	inode_start, driver+4
+
+	.set	di_mode, inode_start		/* disk resident inode */
+	.set	di_nlink, di_mode+2
+	.set	di_uid, di_nlink+2
+	.set	di_gid, di_uid+2
+	.set	di_size, di_gid+2
+	.set	di_addr, di_size+4
+	.set	di_atime, di_addr+40	/* 13 map ptrs: 3 bytes each */
+	.set	di_mtime, di_atime+4
+	.set	di_ctime, di_mtime+4
+	.set	inode_end, di_ctime+4
+
+	.set	inode_size, inode_end-inode_start
+
+	.set	BLOCK_SIZE, 1024	/* file system block size */
+	.set	inodes_per_block, BLOCK_SIZE/inode_size
+	.set	blocks_before_ilist, 2	/* boot and super blocks */
+
+
+	.set	dir_size, 16		/* size of directory entry */
+	.set	name_size, 14		/* size of name string */
+
+	.set	ENTADR,024  		/* offset to entry addr in a.out */
+
+	.set	root_inode, 2 		/* root dir inode no. */
+
+	.set	NOT_FIRST_64K, 		0x1001
+	.set	UNSUPPORTED_DEVICE, 	0x1002
+	.set	RETURN_FROM_BOOT, 	0x1003
+	.set	COULD_NOT_FIND_BOOT, 	0x1004
+	.set	FILE_TOO_LARGE, 	0x1005
+	.set	FILE_READ_ERROR, 	0x1006
+
+init:
+	.long	0			/* boot block parameters */
+	.long	0			/* (all unused, hence 0) */
+	.long	0
+
+/*
+The registers are set by the console subsystem as follows. Those marked with
+stars are saved by the driver subroutine. Those marked with a "d" are used
+by the driver subroutine, and must contain the indicated values before
+calling the driver.
+
+   r0  = type of boot device (see 750 hardware reference, console)
+ds r1  = address of the unibus i/o page
+ds r2  = boot device CSR address
+ds r3  = boot device unit number
+ s r4  = 
+ds r5  = software boot flags (driver: offset to buffer for read)
+ s r6  = driver subroutine address
+   r7  = 
+d  r8  = LBN of block to read from disk
+   r9  = 
+ s r10 = 
+ s r11 = 
+ s ap  = 
+   fp  = 
+ s sp  = 
+
+Memory is mapped as follows:
+
+0000 to 01ff	Boot block program
+0200 to f9ff	Available
+fa00 to fdff	Drivers and control routines
+fe00 to ffff	Available
+
+The /boot programs are small (size <= 10240 bytes), and are ultimatly loaded
+starting at 0000. The UNIX boot block programs all assume this; hence I
+shall too. Because of this, the boot block program will have to relocate
+itself. Addresses above 27ff are available as scratch. Thus, the final layout
+of memory will be:
+
+0000 to 27ff	/boot program
+2800 to f8ff	Available for scratch
+f900 to f9ff	Stack
+fa00 to fdff	Drivers and control routines
+fe00 to ffff	Boot block program (relocated)
+
+Upon calling the loaded program (/boot), the registers are expected to
+contain the following:
+
+r10 = boot device code (this is different from DEC codes; see table, later)
+r11 = software boot flags (from console boot command)
+*/
+
+start:
+	clrl	r7
+	movl	r0, r10			/* save the device type */
+	moval	init, r11		/* base address of good memory */
+	movl	r5, ap			/* save the boot flags */
+
+	tstl	r11			/* see if it is zero */
+	beql	1f
+
+	movzwl	$NOT_FIRST_64K, r7
+	halt				/* not in first 64k of memory */
+
+1:	moval	STACK(r11), sp		/* put the stack somewhere good */
+
+	/* save the register contents needed by the boot driver */
+	movl	$STEP1,r7		/* debug info */
+	movl	r1, driver_r1(r11)
+	movl	r2, driver_r2(r11)
+	movl	r3, driver_r3(r11)
+	movl	r6, driver(r11)
+
+	/* relocate the boot program */
+	movc3	$end, (r11), BOOTBASE(r11)
+
+	jmp	BOOTBASE+start2(r11)
+
+start2:
+	/* running relocated */
+
+	movl	$STEP2,r7		/* debug info */
+	pushl	$root_inode			/* go read the / directory */
+	calls	$1, BOOTBASE+get_inode(r11)
+	movl	$STEP3,r7		/* debug info */
+	calls	$0, BOOTBASE+read_file(r11)
+	movl	$STEP4,r7		/* debug info */
+ 
+	calls	$0, BOOTBASE+search_boot(r11)	/* look for 'boot' */
+	movl	$STEP5,r7		/* debug info */
+
+	/* the inode number of 'boot' is now in r0 */
+
+restart:
+	pushl	r0				/* read in 'boot' */
+	calls	$1, BOOTBASE+get_inode(r11)
+	movl	$STEP6,r7		/* debug info */
+	calls	$0, BOOTBASE+read_file(r11)
+	movl	$STEP7,r7		/* debug info */
+
+	/* if we make it thus far, boot has been loaded into */
+	/* memory starting at location 0.                    */
+
+	/* we still have to set up the registers as /boot will */
+	/* want them. After that, the program is called        */
+
+	movl	r11, r9				/* save the base pointer */
+
+	/* boot strap device codes from microcode routines */
+	.set	AnyMassBus, 0
+	.set	RK07, 1
+	.set	RL02, 2
+	.set	UDA50, 17
+	.set	TU58, 64
+
+	cmpb	r10, $AnyMassBus
+	bneq	1f
+	movzbl	$0, r10				/* massbus disk */
+	brb	2f
+
+1:	cmpb	r10, $RK07
+	bneq	1f
+	movzbl	$3, r10				/* rk07 disk */
+	brb	2f
+
+1:	cmpb	r10, $UDA50
+	bneq	1f
+	movzbl	$9, r10				/* uda50 */
+	brb	2f
+
+1:	movzwl	$UNSUPPORTED_DEVICE, r7
+	halt					/* unsupported device */
+
+2:	movl	ap, r11				/* software boot flags */
+
+	addl3	di_size(r9), r9, r2		/* address to start clear */
+
+	moval	BOOTBASE(r9), r1		/* address to stop clearing */
+
+1:	cmpl	r2, r1
+	bgeq	2f
+
+	clrb	(r2)+
+	brb	1b
+
+2:	calls	$0, (r9)
+
+	movzwl	$RETURN_FROM_BOOT, r7
+	halt					/* end of program */
+
+boot_file:
+	.byte	'b, 'o, 'o, 't, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
+search_boot:
+	.word	0xffc			/* r11-r2 */
+
+	/* search the root directory for 'boot' */
+	/* returns the inode number in r0, or halts */
+
+	movl	r11, r10		/* pointer to first directory entry */
+	addl3	di_size(r11), r11, r9	/* first byte past directory */
+
+1:	tstw	(r10)			/* check the inode number */
+	beql	2f			/* this entry is unused */
+
+	cmpc3	$name_size, BOOTBASE+boot_file(r11), 2(r10)	/* check the name */
+	bneq	2f
+
+	movzwl	(r10), r0		/* found it, return the inumber */
+	ret
+
+2:	addl2	$dir_size, r10		/* continue the search with the */
+	cmpl	r10, r9			/* gone past the end...         */
+	blss	1b
+
+	movzwl	$COULD_NOT_FIND_BOOT, r7
+	halt				/* could not find 'boot' */
+	
+read_file:
+	.word	0xffc			/* r11-r2 */
+
+	cmpl	di_size(r11), $10240	/* no large files here */
+	bleq	1f
+
+	movzwl	$FILE_TOO_LARGE, r7
+	halt				/* file too large */
+
+1:	moval	di_addr(r11), r2
+	clrl	r3
+
+2:	extzv	$0, $24, (r2), r4
+	beql	3f			/* end of the list */
+
+	pushl	r3
+	pushl	r4
+	calls	$2, BOOTBASE+read_block(r11)
+
+	addl2	$3, r2
+	addl2	$BLOCK_SIZE, r3
+	brb	2b
+
+3:	ret
+
+read_block:
+	.word	0xffc			/* r11-r2 */
+
+	clrq	-(sp)			/* make room for the buf addr */
+
+	movl	driver_r1(r11), r1
+	movl	driver_r2(r11), r2
+	movl	driver_r3(r11), r3
+	
+	mull3	$2, 4(ap), r4		/* mult by 2 to get lbn */
+
+	movl	r4, r8
+	movl	8(ap), r5
+
+	addl3	r5, r11, (sp)		/* for massbus babies */
+
+	jsb	*driver(r11)		/* read the first block */
+	blbs	r0, 1f
+
+	movzwl	$FILE_READ_ERROR, r7
+	halt				/* error reading file */
+
+1:	addl3	$1, r4, r8
+	addl2	$512, r5
+
+	addl3	r5, r11, (sp)		/* for massbus babies */
+
+	jsb	*driver(r11)		/* read the second block */
+	blbs	r0, 1f
+
+	movzwl	$FILE_READ_ERROR, r7
+	halt				/* error reading file */
+
+1:	ret
+
+get_inode:
+	.word	0xffc			/* r11-r2 */
+
+	/* turn into offset from beginning of disk */
+	/* (remember that inodes are numbered from 1?) */
+
+	addl3	$(inodes_per_block * blocks_before_ilist - 1), 4(ap), r0
+	clrl	r1
+	ediv	$inodes_per_block, r0, r0, r2
+
+	pushl	$0				/* read into 0 */
+	pushl	r0
+	calls	$2, BOOTBASE+read_block(r11)	/* read a block */
+
+	mull2	$inode_size, r2
+	addl2	r11, r2
+	movc3	$inode_size, (r2), inode_start(r11)
+	ret
+end:
+
+

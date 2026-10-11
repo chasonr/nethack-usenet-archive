@@ -1,0 +1,1309 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,44cd52dfc282eeda,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-02-03 21:27:37 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site neurad.UUCP
+Path: utzoo!watmath!clyde!cbosgd!ihnp4!mhuxn!mhuxm!mhuxi!mhuxh!mhuxv!mhuxt!mhuxr!ulysses!allegra!mit-eddie!genrad!panda!talcott!harvard!seismo!umcp-cs!nbs-amrf!neurad!fnf@unisoft.UUCP
+From: fnf@unisoft.UUCP
+Newsgroups: net.sources
+Subject: new dbug.c (security fix)
+Message-ID: <141@neurad.UUCP>
+Date: Mon, 4-Feb-85 00:27:37 EST
+Article-I.D.: neurad.141
+Posted: Mon Feb  4 00:27:37 1985
+Date-Received: Wed, 6-Feb-85 01:24:47 EST
+Sender: news@neurad.UUCP
+Organization: National Institutes of Health, Bethesda, MD
+Lines: 1288
+
+#  The previously distributed version of dbug.c had a serious
+#  security hole.  When linked with a setuid program, it allowed
+#  any user to redirect the debugger output stream to any file
+#  that the setuid program was capable of writing to.
+
+#  Since there are quite a few changes and additions I decided to
+#  simply repost dbug.c rather than the diffs.
+
+#--------CUT---------CUT---------CUT---------CUT--------#
+#########################################################
+#                                                       #
+# This is a shell archive file.  To extract files:      #
+#                                                       #
+#    1)	Make a directory for the files.                 #
+#    2) Write a file, such as "file.shar", containing   #
+#       this archive file into the directory.           #
+#    3) Type "sh file.shar".  Do not use csh.           #
+#                                                       #
+#########################################################
+#
+#
+echo Extracting dbug.c:
+sed 's/^Z//' >dbug.c <<\STUNKYFLUFF
+Z/************************************************************************
+Z *									*
+Z *			Copyright (c) 1984, Fred Fish			*
+Z *			    All Rights Reserved				*
+Z *									*
+Z *	This software and/or documentation is released into the		*
+Z *	public domain for personal, non-commercial use only.		*
+Z *	Limited rights to use, modify, and redistribute are hereby	*
+Z *	granted for non-commercial purposes, provided that all		*
+Z *	copyright notices remain intact and all changes are clearly	*
+Z *	documented.  The author makes no warranty of any kind with	*
+Z *	respect to this product and explicitly disclaims any implied	*
+Z *	warranties of merchantability or fitness for any particular	*
+Z *	purpose.							*
+Z *									*
+Z ************************************************************************
+Z */
+Z
+Z
+Z/*
+Z *  FILE
+Z *
+Z *	dbug.c   runtime support routines for dbug package
+Z *
+Z *  SCCS
+Z *
+Z *	@(#)dbug.c	1.5 1/18/85
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	These are the runtime support routines for the dbug package.
+Z *	The dbug package has two main components; the user include
+Z *	file containing various macro definitions, and the runtime
+Z *	support routines which are called from the macro expansions.
+Z *
+Z *	Externally visible functions in the runtime support module
+Z *	use the naming convention pattern "_db_xx...xx_", thus
+Z *	they are unlikely to collide with user defined function names.
+Z *
+Z *  AUTHOR
+Z *
+Z *	Fred Fish
+Z *	(Currently at UniSoft Systems, Berkeley Ca.)
+Z *
+Z */
+Z
+Z
+Z#include <stdio.h>
+Z
+Z/*
+Z *	Manifest constants that should not require any changes.
+Z */
+Z
+Z#define FALSE		0	/* Boolean FALSE */
+Z#define TRUE		1	/* Boolean TRUE */
+Z#define EOS		'\000'	/* End Of String marker */
+Z
+Z/*
+Z *	Manifest constants which may be "tuned" if desired.
+Z */
+Z
+Z#define PRINTBUF	1024	/* Print buffer size */
+Z#define INDENT		4	/* Indentation per trace level */
+Z#define MAXDEPTH	200	/* Maximum trace depth default */
+Z
+Z/*
+Z *	The following flags are used to determine which
+Z *	capabilities the user has enabled with the state
+Z *	push macro.
+Z */
+Z
+Z#define TRACE_ON	000001	/* Trace enabled */
+Z#define DEBUG_ON	000002	/* Debug enabled */
+Z#define FILE_ON 	000004	/* File name print enabled */
+Z#define LINE_ON		000010	/* Line number print enabled */
+Z#define DEPTH_ON	000020	/* Function nest level print enabled */
+Z#define PROCESS_ON	000040	/* Process name print enabled */
+Z
+Z#define TRACING (stack -> flags & TRACE_ON)
+Z#define DEBUGGING (stack -> flags & DEBUG_ON)
+Z#define STREQ(a,b) (strcmp(a,b) == 0)
+Z
+Z/*
+Z *	Typedefs to make things more obvious.
+Z */
+Z
+Z#define VOID void		/* Can't use typedef for most compilers */
+Ztypedef int BOOLEAN;
+Z
+Z/*
+Z *	Make it easy to change storage classes if necessary.
+Z */
+Z
+Z#define LOCAL static		/* Names not needed by outside world */
+Z#define IMPORT extern		/* Names defined externally */
+Z#define EXPORT			/* Allocated here, available globally */
+Z#define AUTO auto		/* Names to be allocated on stack */
+Z#define REGISTER register	/* Names to be placed in registers */
+Z
+Z/*
+Z *	Variables which are available externally but should only
+Z *	be accessed via the macro package facilities.
+Z */
+Z
+ZEXPORT FILE *_db_fp_ = stderr;		/* Output stream, default stderr */
+ZEXPORT char *_db_process_ = "dbug";	/* Pointer to process name; argv[0] */
+ZEXPORT BOOLEAN _db_on_ = FALSE;		/* TRUE if debugging currently on */
+Z
+Z/*
+Z *	Externally supplied functions.
+Z */
+Z
+Z#ifdef unix			/* Only needed for unix */
+ZIMPORT int chown ();		/* Change owner of a file */
+ZIMPORT int getgid ();		/* Get real group id */
+ZIMPORT int getuid ();		/* Get real user id */
+ZIMPORT int access ();		/* Test file for access */
+Z#endif
+Z
+ZIMPORT int fprintf ();		/* Formatted print on file */
+ZIMPORT int fflush ();		/* Flush output for stream */
+ZIMPORT char *strcpy ();		/* Copy strings around */
+ZIMPORT int strlen ();		/* Find length of string */
+ZIMPORT char *malloc ();		/* Allocate memory */
+ZIMPORT int atoi ();		/* Convert ascii to integer */
+Z
+Z
+Z/*
+Z *	The user may specify a list of functions to trace or 
+Z *	debug.  These lists are kept in a linear linked list,
+Z *	a very simple implementation.
+Z */
+Z
+Zstruct link {
+Z    char *string;		/* Pointer to link's contents */
+Z    struct link *next_link;	/* Pointer to the next link */
+Z};
+Z
+Z
+Z/*
+Z *	Debugging states can be pushed or popped off of a
+Z *	stack which is implemented as a linked list.  Note
+Z *	that the head of the list is the current state and the
+Z *	stack is pushed by adding a new state to the head of the
+Z *	list or popped by removing the first link.
+Z */
+Z
+Zstruct state {
+Z    int flags;				/* Current state flags */
+Z    int maxdepth;			/* Current maximum trace depth */
+Z    int level;				/* Current function nesting level */
+Z    FILE *out_file;			/* Current output stream */
+Z    struct link *functions;		/* List of functions */
+Z    struct link *keywords;		/* List of debug keywords */
+Z    struct link *processes;		/* List of process names */
+Z    struct state *next_state;		/* Next state in the list */
+Z};
+Z
+ZLOCAL struct state *stack = NULL;	/* Linked list of stacked states */
+Z
+Z/*
+Z *	Local variables not seen by user.
+Z */
+Z
+ZLOCAL char *func = "?func";	/* Name of current user function */
+ZLOCAL char *file = "?file";	/* Name of current user file */
+ZLOCAL BOOLEAN init_done = FALSE;/* Set to TRUE when initialization done */
+Z
+ZLOCAL struct link *ListParse ();/* Parse a debug command string */
+ZLOCAL char *StrDup ();		/* Make a fresh copy of a string */
+ZLOCAL VOID OpenFile ();		/* Open debug output stream */
+ZLOCAL VOID CloseFile ();	/* Close debug output stream */
+ZLOCAL VOID PushState ();	/* Push current debug state */
+ZLOCAL VOID ChangeOwner ();	/* Change file owner and group */
+ZLOCAL BOOLEAN DoTrace ();	/* Test for tracing enabled */
+ZLOCAL BOOLEAN Writable ();	/* Test to see if file is writable */
+ZLOCAL char *DbugMalloc ();	/* Allocate memory for runtime support */
+ZLOCAL char *BaseName ();	/* Remove leading pathname components */
+Z
+Z				/* Supplied in Sys V runtime environ */
+ZLOCAL char *strtok ();		/* Break string into tokens */
+ZLOCAL char *strrchr ();		/* Find last occurance of char */
+Z
+Z/*
+Z *	Miscellaneous printf format strings.
+Z */
+Z 
+Z#define MSG1 "%s: missing DBUG_RETURN or DBUG_VOID_RETURN macro in function \"%s\"\n"
+Z#define MSG2 "%s: can't open debug output stream \"%s\": "
+Z#define MSG3 "%s: can't close debug file: "
+Z#define MSG4 "%s: debugger aborting because %s\n"
+Z#define MSG5 "%s: can't change owner/group of \"%s\": "
+Z
+Z/*
+Z *	Macros and defines for testing file accessibility under UNIX.
+Z */
+Z
+Z#ifdef unix
+Z#  define A_EXISTS	00		/* Test for file existance */
+Z#  define A_EXECUTE	01		/* Test for execute permission */
+Z#  define A_WRITE	02		/* Test for write access */
+Z#  define A_READ	03		/* Test for read access */
+Z#  define EXISTS(pathname) (access (pathname, A_EXISTS) == 0)
+Z#  define WRITABLE(pathname) (access (pathname, A_WRITE) == 0)
+Z#else
+Z#  define EXISTS(pathname) (FALSE)	/* Assume no existance */
+Z#endif
+Z
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	_db_push_    push current debugger state and set up new one
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	VOID _db_push_ (control)
+Z *	char *control;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Given pointer to a debug control string in "control", pushes
+Z *	the current debug state, parses the control string, and sets
+Z *	up a new debug state.
+Z *
+Z *	The only attribute of the new state inherited from the previous
+Z *	state is the current function nesting level.  This can be
+Z *	overridden by using the "r" flag in the control string.
+Z *
+Z *	The debug control string is a sequence of colon separated fields
+Z *	as follows:
+Z *
+Z *		<field_1>:<field_2>:...:<field_N>
+Z *
+Z *	Each field consists of a mandatory flag character followed by
+Z *	an optional "," and comma separated list of modifiers:
+Z *
+Z *		flag[,modifier,modifier,...,modifier]
+Z *
+Z *	The currently recognized flag characters are:
+Z *
+Z *		d	Enable output from DBUG_<N> macros for
+Z *			for the current state.  May be followed
+Z *			by a list of keywords which selects output
+Z *			only for the DBUG macros with that keyword.
+Z *			A null list of keywords implies output for
+Z *			all macros.
+Z *
+Z *		f	Limit debugging and/or tracing to the
+Z *			list of named functions.  Note that a null
+Z *			list will disable all functions.  The
+Z *			appropriate "d" or "t" flags must still
+Z *			be given, this flag only limits their
+Z *			actions if they are enabled.
+Z *
+Z *		F	Identify the source file name for each
+Z *			line of debug or trace output.
+Z *
+Z *		L	Identify the source file line number for
+Z *			each line of debug or trace output.
+Z *
+Z *		n	Print the current function nesting depth for
+Z *			each line of debug or trace output.
+Z *	
+Z *		p	Limit debugger actions to specified processes.
+Z *			A process must be identified with the
+Z *			DBUG_PROCESS macro and match one in the list
+Z *			for debugger actions to occur.
+Z *
+Z *		P	Print the current process name for each
+Z *			line of debug or trace output.
+Z *
+Z *		r	When pushing a new state, do not inherit
+Z *			the previous state's function nesting level.
+Z *			Useful when the output is to start at the
+Z *			left margin.
+Z *
+Z *		t	Enable function call/exit trace lines.
+Z *			May be followed by a list (containing only
+Z *			one modifier) giving a numeric maximum
+Z *			trace level, beyond which no output will
+Z *			occur for either debugging or tracing
+Z *			macros.  The default is a compile time
+Z *			option.
+Z *
+Z *	Some examples of debug control strings which might appear
+Z *	on a shell command line (the "-#" is typically used to
+Z *	introduce a control string to an application program) are:
+Z *
+Z *		-#d:t
+Z *		-#d:f,main,subr1:F:L:t,20
+Z *		-#d,input,output,files:n
+Z *
+Z */
+Z
+Z
+ZVOID _db_push_ (control)
+Zchar *control;
+Z{
+Z    REGISTER char *scan;
+Z    REGISTER struct link *temp;
+Z
+Z    control = StrDup (control);
+Z    PushState ();
+Z    scan = strtok (control, ":");
+Z    for (; scan != NULL; scan = strtok ((char *)NULL, ":")) {
+Z	switch (*scan++) {
+Z	    case 'd': 
+Z		_db_on_ = TRUE;
+Z		stack -> flags |= DEBUG_ON;
+Z		if (*scan++ == ',') {
+Z		    stack -> keywords = ListParse (scan);
+Z		}
+Z		break;
+Z	    case 'f': 
+Z		if (*scan++ == ',') {
+Z		    stack -> functions = ListParse (scan);
+Z		}
+Z		break;
+Z	    case 'F': 
+Z		stack -> flags |= FILE_ON;
+Z		break;
+Z	    case 'L': 
+Z		stack -> flags |= LINE_ON;
+Z		break;
+Z	    case 'n': 
+Z		stack -> flags |= DEPTH_ON;
+Z		break;
+Z	    case 'o': 
+Z		if (*scan++ == ',') {
+Z		    temp = ListParse (scan);
+Z		    OpenFile (temp -> string);
+Z		    FreeList (temp);
+Z		} else {
+Z		    OpenFile ("-");
+Z		}
+Z		break;
+Z	    case 'p':
+Z		if (*scan++ == ',') {
+Z		    stack -> processes = ListParse (scan);
+Z		}
+Z		break;
+Z	    case 'P': 
+Z		stack -> flags |= PROCESS_ON;
+Z		break;
+Z	    case 'r': 
+Z		stack -> level = 0;
+Z		break;
+Z	    case 't': 
+Z		stack -> flags |= TRACE_ON;
+Z		if (*scan++ == ',') {
+Z		    temp = ListParse (scan);
+Z		    stack -> maxdepth = atoi (temp -> string);
+Z		    FreeList (temp);
+Z		}
+Z		break;
+Z	}
+Z    }
+Z    free (control);
+Z}
+Z
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	_db_pop_    pop the debug stack
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Pops the debug stack, returning the debug state to its
+Z *	condition prior to the most recent _db_push_ invocation.
+Z *	Note that the pop will fail if it would remove the last
+Z *	valid state from the stack.  This prevents user errors
+Z *	in the push/pop sequence from screwing up the debugger.
+Z *	Maybe there should be some kind of warning printed if the
+Z *	user tries to pop too many states.
+Z *
+Z */
+Z
+ZVOID _db_pop_ ()
+Z{
+Z    REGISTER struct state *discard;
+Z
+Z    discard = stack;
+Z    if (discard != NULL && discard -> next_state != NULL) {
+Z	stack = discard -> next_state;
+Z	_db_fp_ = stack -> out_file;
+Z	if (discard -> keywords != NULL) {
+Z	    FreeList (discard -> keywords);
+Z	}
+Z	if (discard -> functions != NULL) {
+Z	    FreeList (discard -> functions);
+Z	}
+Z	if (discard -> processes != NULL) {
+Z	    FreeList (discard -> processes);
+Z	}
+Z	CloseFile (discard -> out_file);
+Z	free ((char *) discard);
+Z    }
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	_db_enter_    process entry point to user function
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	VOID _db_enter_ (_func_, _file_, _line_, _sfunc_, _sfile_, _slevel_)
+Z *	char *_func_;		points to current function name
+Z *	char *_file_;		points to current file name
+Z *	int _line_;		called from source line number
+Z *	char **_sfunc_;		save previous _func_
+Z *	char **_sfile_;		save previous _file_
+Z *	int *_slevel_;		save previous nesting level
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Called at the beginning of each user function to tell
+Z *	the debugger that a new function has been entered.
+Z *	Note that the pointers to the previous user function
+Z *	name and previous user file name are stored on the
+Z *	caller's stack (this is why the ENTER macro must be
+Z *	the first "executable" code in a function, since it
+Z *	allocates these storage locations).  The previous nesting
+Z *	level is also stored on the callers stack for internal
+Z *	self consistency checks.
+Z *
+Z *	Also prints a trace line if tracing is enabled and
+Z *	increments the current function nesting depth.
+Z *
+Z *	Note that this mechanism allows the debugger to know
+Z *	what the current user function is at all times, without
+Z *	maintaining an internal stack for the function names.
+Z *
+Z */
+Z
+ZVOID _db_enter_ (_func_, _file_, _line_, _sfunc_, _sfile_, _slevel_)
+Zchar *_func_;
+Zchar *_file_;
+Zint _line_;
+Zchar **_sfunc_;
+Zchar **_sfile_;
+Zint *_slevel_;
+Z{
+Z    if (!init_done) {
+Z	_db_push_ ("");
+Z    }
+Z    *_sfunc_ = func;
+Z    *_sfile_ = file;
+Z    func = _func_;
+Z    file = BaseName (_file_);
+Z    stack -> level += INDENT;
+Z    *_slevel_ = stack -> level;
+Z    if (DoTrace ()) {
+Z	DoPrefix (_line_);
+Z	Indent (stack -> level);
+Z	(VOID) fprintf (_db_fp_, ">%s\n", func);
+Z	(VOID) fflush (_db_fp_);
+Z    }
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	_db_return_    process exit from user function
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	VOID _db_return_ (_line_, _sfunc_, _sfile_, _slevel_)
+Z *	int _line_;		current source line number
+Z *	char **_sfunc_;		where previous _func_ is to be retrieved
+Z *	char **_sfile_;		where previous _file_ is to be retrieved
+Z *	int *_slevel_;		where previous level was stashed
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Called just before user function executes an explicit or implicit
+Z *	return.  Prints a trace line if trace is enabled, decrements
+Z *	the current nesting level, and restores the current function and
+Z *	file names from the defunct function's stack.
+Z *
+Z */
+Z
+ZVOID _db_return_ (_line_, _sfunc_, _sfile_, _slevel_)
+Zint _line_;
+Zchar **_sfunc_;
+Zchar **_sfile_;
+Zint *_slevel_;
+Z{
+Z    if (!init_done) {
+Z	_db_push_ ("");
+Z    }
+Z    if (stack -> level != *_slevel_ && (TRACING || DEBUGGING)) {
+Z	(VOID) fprintf (_db_fp_, MSG1, _db_process_, func);
+Z	(VOID) fflush (_db_fp_);
+Z    } else if (DoTrace ()) {
+Z	DoPrefix (_line_);
+Z	Indent (stack -> level);
+Z	(VOID) fprintf (_db_fp_, "<%s\n", func);
+Z	(VOID) fflush (_db_fp_);
+Z    }
+Z    stack -> level = *_slevel_ - INDENT;
+Z    func = *_sfunc_;
+Z    file = *_sfile_;
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	_db_printf_    handle print of debug lines
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	VOID _db_printf_ (_line_, keyword, format,
+Z *		a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
+Z *	int _line_;
+Z *	char *keyword,  *format;
+Z *	int a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	When invoked via one of the DBUG macros, tests the keyword
+Z *	to see if that macro has been selected for processing via
+Z *	the debugger control string, and if so, handles printing
+Z *	of the arguments via the format string.  The line number
+Z *	of the DBUG macro in the source is found in _line_.
+Z *
+Z *	Note that the format string SHOULD NOT include a terminating
+Z *	newline, this is supplied automatically.
+Z *
+Z *  NOTE
+Z *
+Z *	The rather ugly argument declaration is to handle some
+Z *	magic with respect to the number of arguments passed
+Z *	via the DBUG macros.  The current maximum is 3 arguments
+Z *	(not including the keyword and format strings).
+Z *
+Z *	If the args being passed by the DBUG macro are actually
+Z *	doubles (worst case) then there will be a total of 12
+Z *	ints on the stack for a PDP-11 or 6 ints on a 68000.
+Z *
+Z */
+Z
+Z/*VARARGS3*/
+ZVOID _db_printf_ (_line_, keyword, format, 
+Z	a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
+Zint _line_;
+Zchar *keyword,  *format;
+Zint a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11;
+Z{
+Z    if (_db_keyword_ (keyword)) {
+Z	DoPrefix (_line_);
+Z	if (TRACING) {
+Z	    Indent (stack -> level + INDENT);
+Z	} else {
+Z	    (VOID) fprintf (_db_fp_, "%s: ", func);
+Z	}
+Z	(VOID) fprintf (_db_fp_, "%s: ", keyword);
+Z	(VOID) fprintf (_db_fp_, format, a0, a1, a2, a3, a4, a5, a6,a7, a8,
+Z		a9, a10, a11);
+Z	(VOID) fprintf (_db_fp_, "\n");
+Z	(VOID) fflush (_db_fp_);
+Z    }
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	ListParse    parse list of modifiers in debug control string
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL struct link *ListParse (ctlp)
+Z *	char *ctlp;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Given pointer to a comma separated list of strings in "cltp",
+Z *	parses the list, building a list and returning a pointer to it.
+Z *	The original comma separated list is destroyed in the process of
+Z *	building the linked list, thus it had better be a duplicate
+Z *	if it is important.
+Z *
+Z *	Note that since each link is added at the head of the list,
+Z *	the final list will be in "reverse order", which is not
+Z *	significant for our usage here.
+Z *
+Z */
+Z
+ZLOCAL struct link *ListParse (ctlp)
+Zchar *ctlp;
+Z{
+Z    REGISTER char *start;
+Z    REGISTER struct link *new;
+Z    REGISTER struct link *head;
+Z
+Z    head = NULL;
+Z    while (*ctlp != EOS) {
+Z	start = ctlp;
+Z	while (*ctlp != EOS && *ctlp != ',') {
+Z	    ctlp++;
+Z	}
+Z	if (*ctlp == ',') {
+Z	    *ctlp++ = EOS;
+Z	}
+Z	new = (struct link *) DbugMalloc (sizeof (struct link));
+Z	new -> string = StrDup (start);
+Z	new -> next_link = head;
+Z	head = new;
+Z    }
+Z    return (head);
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	InList    test a given string for member of a given list
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL BOOLEAN InList (linkp, cp)
+Z *	struct link *linkp;
+Z *	char *cp;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Tests the string pointed to by "cp" to determine if it is in
+Z *	the list pointed to by "linkp".  Linkp points to the first
+Z *	link in the list.  If linkp is NULL then the string is treated
+Z *	as if it is in the list (I.E all strings are in the null list).
+Z *	This may seem rather strange at first but leads to the desired
+Z *	operation if no list is given.  The net effect is that all
+Z *	strings will be accepted when there is no list, and when there
+Z *	is a list, only those strings in the list will be accepted.
+Z *
+Z */
+Z
+ZLOCAL BOOLEAN InList (linkp, cp)
+Zstruct link *linkp;
+Zchar *cp;
+Z{
+Z    REGISTER struct link *scan;
+Z    REGISTER BOOLEAN accept;
+Z
+Z    if (linkp == NULL) {
+Z	accept = TRUE;
+Z    } else {
+Z	accept = FALSE;
+Z	for (scan = linkp; scan != NULL; scan = scan -> next_link) {
+Z	    if (STREQ (scan -> string, cp)) {
+Z		accept = TRUE;
+Z		break;
+Z	    }
+Z	}
+Z    }
+Z    return (accept);
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	PushState    push current state onto stack and set up new one
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL VOID PushState ()
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Pushes the current state on the state stack, and initializes
+Z *	a new state.  The only parameter inherited from the previous
+Z *	state is the function nesting level.  This action can be
+Z *	inhibited if desired, via the "r" flag.
+Z *
+Z *	The state stack is a linked list of states, with the new
+Z *	state added at the head.  This allows the stack to grow
+Z *	to the limits of memory if necessary.
+Z *
+Z */
+Z
+ZLOCAL VOID PushState ()
+Z{
+Z    REGISTER struct state *new;
+Z
+Z    new = (struct state *) DbugMalloc (sizeof (struct state));
+Z    new -> flags = 0;
+Z    new -> maxdepth = MAXDEPTH;
+Z    if (stack != NULL) {
+Z	new -> level = stack -> level;
+Z    } else {
+Z	new -> level = 0;
+Z    }
+Z    new -> out_file = stderr;
+Z    new -> functions = NULL;
+Z    new -> keywords = NULL;
+Z    new -> processes = NULL;
+Z    new -> next_state = stack;
+Z    stack = new;
+Z    init_done = TRUE;
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	DoTrace    check to see if tracing is current enabled
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL BOOLEAN DoTrace ()
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Checks to see if tracing is enabled based on whether the
+Z *	user has specified tracing, the maximum trace depth has
+Z *	not yet been reached, the current function is selected,
+Z *	and the current process is selected.  Returns TRUE if
+Z *	tracing is enabled, FALSE otherwise.
+Z *
+Z */
+Z
+ZLOCAL BOOLEAN DoTrace ()
+Z{
+Z    REGISTER BOOLEAN trace;
+Z
+Z    trace = FALSE;
+Z    if (TRACING) {
+Z	if (stack -> level / INDENT <= stack -> maxdepth) {
+Z	    if (InList (stack -> functions, func)) {
+Z		if (InList (stack -> processes, _db_process_)) {
+Z		    trace = TRUE;
+Z		}
+Z	    }
+Z	}
+Z    }
+Z    return (trace);
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	_db_keyword_    test keyword for member of keyword list
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	BOOLEAN _db_keyword_ (keyword)
+Z *	char *keyword;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Test a keyword to determine if it is in the currently active
+Z *	keyword list.  As with the function list, a keyword is accepted
+Z *	if the list is null, otherwise it must match one of the list
+Z *	members.  When debugging is not on, no keywords are accepted.
+Z *	After the maximum trace level is exceeded, no keywords are
+Z *	accepted (this behavior subject to change).  Additionally,
+Z *	the current function and process must be accepted based on
+Z *	their respective lists.
+Z *
+Z *	Returns TRUE if keyword accepted, FALSE otherwise.
+Z *
+Z */
+Z
+ZBOOLEAN _db_keyword_ (keyword)
+Zchar *keyword;
+Z{
+Z    REGISTER BOOLEAN accept;
+Z
+Z    if (!init_done) {
+Z	_db_push_ ("");
+Z    }
+Z    accept = FALSE;
+Z    if (DEBUGGING) {
+Z	if (stack -> level / INDENT <= stack -> maxdepth) {
+Z	    if (InList (stack -> functions, func)) {
+Z		if (InList (stack -> keywords, keyword)) {
+Z		    if (InList (stack -> processes, _db_process_)) {
+Z			accept = TRUE;
+Z		    }
+Z		}
+Z	    }
+Z	}
+Z    }
+Z    return (accept);
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	Indent    indent a line to the given indentation level
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL Indent (indent)
+Z *	int indent;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Indent a line to the given level.  Note that this is
+Z *	a simple minded but portable implementation.
+Z *	There are better ways.
+Z *
+Z */
+Z
+ZLOCAL Indent (indent)
+Zint indent;
+Z{
+Z    REGISTER int count;
+Z    AUTO char buffer[PRINTBUF];
+Z
+Z    for (count = 0; (count < (indent - INDENT)) && (count < (PRINTBUF - 1)); count++) {
+Z	if ((count % INDENT) == 0) {
+Z	    buffer[count] = '|';
+Z	} else {
+Z	    buffer[count] = ' ';
+Z	}
+Z    }
+Z    buffer[count] = EOS;
+Z    (VOID) fprintf (_db_fp_, buffer);
+Z    (VOID) fflush (_db_fp_);
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	FreeList    free all memory associated with a linked list
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL FreeList (linkp)
+Z *	struct link *linkp;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Given pointer to the head of a linked list, frees all
+Z *	memory held by the list and the members of the list.
+Z *
+Z */
+Z
+ZLOCAL FreeList (linkp)
+Zstruct link *linkp;
+Z{
+Z    REGISTER struct link *old;
+Z
+Z    while (linkp != NULL) {
+Z	old = linkp;
+Z	linkp = linkp -> next_link;
+Z	if (old -> string != NULL) {
+Z	    free (old -> string);
+Z	}
+Z	free ((char *) old);
+Z    }
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	StrDup   make a duplicate of a string in new memory
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL char *StrDup (string)
+Z *	char *string;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Given pointer to a string, allocates sufficient memory to make
+Z *	a duplicate copy, and copies the string to the newly allocated
+Z *	memory.  Failure to allocated sufficient memory is immediately
+Z *	fatal.
+Z *
+Z */
+Z
+Z
+ZLOCAL char *StrDup (string)
+Zchar *string;
+Z{
+Z    REGISTER char *new;
+Z
+Z    new = DbugMalloc (strlen (string) + 1);
+Z    (VOID) strcpy (new, string);
+Z    return (new);
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	DoPrefix    print debugger line prefix prior to indentation
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL DoPrefix (_line_)
+Z *	int _line_;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Print prefix common to all debugger output lines, prior to
+Z *	doing indentation if necessary.  Print such information as
+Z *	current process name, current source file name and line number,
+Z *	and current function nesting depth.
+Z *
+Z */
+Z  
+Z 
+ZLOCAL DoPrefix (_line_)
+Zint _line_;
+Z{
+Z    if (stack -> flags & PROCESS_ON) {
+Z	(VOID) fprintf (_db_fp_, "%s: ", _db_process_);
+Z    }
+Z    if (stack -> flags & FILE_ON) {
+Z	(VOID) fprintf (_db_fp_, "%14s: ", file);
+Z    }
+Z    if (stack -> flags & LINE_ON) {
+Z	(VOID) fprintf (_db_fp_, "%5d: ", _line_);
+Z    }
+Z    if (stack -> flags & DEPTH_ON) {
+Z	(VOID) fprintf (_db_fp_, "%4d: ", stack -> level / INDENT);
+Z    }
+Z    (VOID) fflush (_db_fp_);
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	OpenFile    open new output stream for debugger output
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL VOID OpenFile (name)
+Z *	char *name;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Given name of a new file (or "-" for stdout) opens the file
+Z *	and sets the output stream to the new file.
+Z *
+Z */
+Z
+ZLOCAL VOID OpenFile (name)
+Zchar *name;
+Z{
+Z    REGISTER FILE *fp;
+Z    REGISTER BOOLEAN newfile;
+Z
+Z    if (name != NULL) {
+Z	if (strcmp (name, "-") == 0) {
+Z	    _db_fp_ = stdout;
+Z	    stack -> out_file = _db_fp_;
+Z	} else {
+Z	    if (!Writable (name)) {
+Z		(VOID) fprintf (_db_fp_, MSG2, _db_process_, name);
+Z		perror ("");
+Z		(VOID) fflush (_db_fp_);
+Z	    } else {
+Z		if (EXISTS (name)) {
+Z		    newfile = FALSE;
+Z		} else {
+Z		    newfile = TRUE;
+Z		}
+Z		fp = fopen (name, "a");
+Z		if (fp == NULL) {
+Z 		    (VOID) fprintf (_db_fp_, MSG2, _db_process_, name);
+Z		    perror ("");
+Z		    (VOID) fflush (_db_fp_);
+Z		} else {
+Z		    _db_fp_ = fp;
+Z		    stack -> out_file = fp;
+Z		    if (newfile) {
+Z			ChangeOwner (name);
+Z		    }
+Z		}
+Z	    }
+Z	}
+Z    }
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	CloseFile    close the debug output stream
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL VOID CloseFile (fp)
+Z *	FILE *fp;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Closes the debug output stream unless it is standard output
+Z *	or standard error.
+Z *
+Z */
+Z
+ZLOCAL VOID CloseFile (fp)
+ZFILE *fp;
+Z{
+Z    if (fp != stderr && fp != stdout) {
+Z	if (fclose (fp) == 0) {
+Z	    (VOID) fprintf (stderr, MSG3, _db_process_);
+Z	    perror ("");
+Z	    (VOID) fflush (_db_fp_);
+Z	}
+Z    }
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	DbugExit    print error message and exit
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL VOID DbugExit (why)
+Z *	char *why;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Prints error message using current process name, the reason for
+Z *	aborting (typically out of memory), and exits with status 1.
+Z *	This should probably be changed to use a status code
+Z *	defined in the user's debugger include file.
+Z *
+Z */
+Z 
+ZLOCAL VOID DbugExit (why)
+Zchar *why;
+Z{
+Z    (VOID) fprintf (stderr, MSG4, _db_process_, why);
+Z    (VOID) fflush (stderr);
+Z    exit (1);
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	DbugMalloc    allocate memory for debugger runtime support
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL char *DbugMalloc (size)
+Z *	int size;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Allocate more memory for debugger runtime support functions.
+Z *	Failure to to allocate the requested number of bytes is
+Z *	immediately fatal to the current process.  This may be
+Z *	rather unfriendly behavior.  It might be better to simply
+Z *	print a warning message, freeze the current debugger state,
+Z *	and continue execution.
+Z *
+Z */
+Z 
+ZLOCAL char *DbugMalloc (size)
+Zint size;
+Z{
+Z    register char *new;
+Z
+Z    new = malloc ((unsigned int) size);
+Z    if (new == NULL) {
+Z	DbugExit ("out of memory");
+Z    }
+Z    return (new);
+Z}
+Z
+Z
+Z/*
+Z *	This function may be eliminated when strtok is available
+Z *	in the runtime environment (missing from BSD4.1).
+Z */
+Z
+ZLOCAL char *strtok (s1, s2)
+Zchar *s1, *s2;
+Z{
+Z    static char *end = NULL;
+Z    REGISTER char *rtnval;
+Z
+Z    rtnval = NULL;
+Z    if (s2 != NULL) {
+Z	if (s1 != NULL) {
+Z	    end = s1;
+Z	    rtnval = strtok ((char *) NULL, s2);
+Z	} else if (end != NULL) {
+Z	    if (*end != EOS) {
+Z		rtnval = end;
+Z		while (*end != *s2 && *end != EOS) {end++;}
+Z		if (*end != EOS) {
+Z		    *end++ = EOS;
+Z		}
+Z	    }
+Z	}
+Z    }
+Z    return (rtnval);
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	BaseName    strip leading pathname components from name
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL char *BaseName (pathname)
+Z *	char *pathname;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Given pointer to a complete pathname, locates the base file
+Z *	name at the end of the pathname and returns a pointer to
+Z *	it.
+Z *
+Z */
+Z
+ZLOCAL char *BaseName (pathname)
+Zchar *pathname;
+Z{
+Z    register char *base;
+Z
+Z    base = strrchr (pathname, '/');
+Z    if (base++ == NULL) {
+Z	base = pathname;
+Z    }
+Z    return (base);
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	Writable    test to see if a pathname is writable/creatable
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL BOOLEAN Writable (pathname)
+Z *	char *pathname;
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	Because the debugger might be linked in with a program that
+Z *	runs with the set-uid-bit (suid) set, we have to be careful
+Z *	about opening a user named file for debug output.  This consists
+Z *	of checking the file for write access with the real user id,
+Z *	or checking the directory where the file will be created.
+Z *
+Z *	Returns TRUE if the user would normally be allowed write or
+Z *	create access to the named file.  Returns FALSE otherwise.
+Z *
+Z */
+Z
+ZLOCAL BOOLEAN Writable (pathname)
+Zchar *pathname;
+Z{
+Z    REGISTER BOOLEAN granted;
+Z    REGISTER char *lastslash;
+Z
+Z#ifndef unix
+Z    return (TRUE);
+Z#else
+Z    granted = FALSE;
+Z    if (EXISTS (pathname)) {
+Z	if (WRITABLE (pathname)) {
+Z	    granted = TRUE;
+Z	}
+Z    } else {
+Z	lastslash = strrchr (pathname, '/');
+Z	if (lastslash != NULL) {
+Z	    *lastslash = EOS;
+Z	} else {
+Z	    pathname = ".";
+Z	}
+Z	if (WRITABLE (pathname)) {
+Z	    granted = TRUE;
+Z	}
+Z	if (lastslash != NULL) {
+Z	    *lastslash = '/';
+Z	}
+Z    }
+Z    return (granted);
+Z#endif
+Z}
+Z
+Z
+Z/*
+Z *	This function may be eliminated when strrchr is available
+Z *	in the runtime environment (missing from BSD4.1).
+Z *	Alternately, you can use rindex() on BSD systems.
+Z */
+Z
+ZLOCAL char *strrchr (s, c)
+Zchar *s;
+Zchar c;
+Z{
+Z    REGISTER char *scan;
+Z
+Z    for (scan = s; *scan != EOS; scan++) {;}
+Z    while (scan > s && *--scan != c) {;}
+Z    if (*scan != c) {
+Z	scan = NULL;
+Z    }
+Z    return (scan);
+Z}
+Z
+Z
+Z/*
+Z *  FUNCTION
+Z *
+Z *	ChangeOwner    change owner to real user for suid programs
+Z *
+Z *  SYNOPSIS
+Z *
+Z *	LOCAL VOID ChangeOwner (pathname)
+Z *
+Z *  DESCRIPTION
+Z *
+Z *	For unix systems, change the owner of the newly created debug
+Z *	file to the real owner.  This is strictly for the benefit of
+Z *	programs that are running with the set-user-id bit set.
+Z *
+Z *	Note that at this point, the fact that pathname represents
+Z *	a newly created file has already been established.  If the
+Z *	program that the debugger is linked to is not running with
+Z *	the suid bit set, then this operation is redundant (but
+Z *	harmless).
+Z *
+Z */
+Z
+ZLOCAL VOID ChangeOwner (pathname)
+Zchar *pathname;
+Z{
+Z#ifdef unix
+Z    if (chown (pathname, getuid (), getgid ()) == -1) {
+Z	(VOID) fprintf (stderr, MSG5, _db_process_, pathname);
+Z	perror ("");
+Z	(VOID) fflush (_db_fp_);
+Z    }
+Z#endif
+Z}
+STUNKYFLUFF
+set `sum dbug.c`
+if test 14117 != $1
+then
+echo dbug.c: Checksum error. Is: $1, should be: 14117.
+fi
+echo ALL DONE BUNKY!
+exit 0
+
+

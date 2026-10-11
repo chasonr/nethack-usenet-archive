@@ -1,0 +1,132 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 162299,5bc7194bc7f96f01
+X-Google-Attributes: gid162299,public
+X-Google-ArrivalTime: 1985-09-19 00:01:20 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84 SMI; site sun.uucp
+Path: utzoo!watmath!clyde!bonnie!akgua!whuxlm!harpo!decvax!decwrl!sun!guy
+From: guy@sun.uucp (Guy Harris)
+Newsgroups: net.sources.games
+Subject: Re: Visual Trek: Help on libs for SVR2?
+Message-ID: <2808@sun.uucp>
+Date: Thu, 19-Sep-85 03:01:20 EDT
+Article-I.D.: sun.2808
+Posted: Thu Sep 19 03:01:20 1985
+Date-Received: Sat, 21-Sep-85 05:14:43 EDT
+References: <666@ihu1m.UUCP> <85120@cpsc53.UUCP>
+Distribution: net
+Organization: Sun Microsystems, Inc.
+Lines: 110
+
+> > Does anyone know what library to use as a replacement
+> > for the -ltermlib option on the cc that loads
+> > this game? SVR2 has no such library. Replacing
+> > it with curses loads the modules, but the
+> > program does not function properly.
+
+The problem is that Visual Trek uses the "termcap" library incorrectly (or,
+at least, not in the way it's supposed to be used).  The "curses"/"terminfo"
+library has routines which emulate the behavior of the "tget..." routines
+but only if you use them correctly.
+
+The code in question (in excerpted form):
+
+	static char cm[20];
+
+		p = cm;
+		tgetstr("cm", &p);
+		p = cl;
+		tgetstr("cl", &p);
+		...
+
+A more "correct" version would be
+
+	static char string[1024];	/* or however big it has to be */
+	static char *stringp = &string[0];
+	static char *cm;
+
+		cm = tgetstr("cm", &stringp);
+		cl = tgetstr("cl", &stringp);
+
+The intent was that "tget<whatever>" would return the gotten
+boolean/number/string.  The pointer for "tgetstr" is merely to a buffer into
+which the strings are to be dumped.  The reason it works differently in
+"curses"/"terminfo" is that "terminfo" reads the entire "terminfo" entry as
+one big lump, and you then reference the capability strings directly from
+that lump.  The "tgetstr" routines merely return pointers into that lump;
+they do not use the second argument in any way whatsoever.
+
+Speaking of suspicious code:
+
+	gtty(0, &tty);
+	saveflags = tty.sg_flags;
+	tty.sg_flags |= RAW;
+	tty.sg_flags &= ~(ECHO | XTABS);
+	stty(0, &tty);
+
+Programs should not use RAW mode unless they need an 8-bit data path to/from
+the terminal (no parity, just 8 data bits) and no flow control.  If the
+program just wants to capture each character as it is typed, CBREAK mode is
+just fine.  You probably want to turn off CRMOD also (RAW mode disables all
+output translations).  The RAW should be CBREAK and the ECHO | XTABS should
+probably include CRMOD (and maybe LCASE).
+
+	ioctl(0, TIOCGETP, &tty);
+		/* I consider "gtty" and "stty" to be deprecated */
+	saveflags = tty.sg_flags;
+	tty.sg_flags |= CBREAK;
+	tty.sg_flags &= ~(ECHO | XTABS | CRMOD | LCASE);
+	ioctl(0, TIOCSETP, &tty);
+
+None of that will work right in System III or System V.  Declare "tty" as a
+"struct termio", declare "savetty" as "struct termio" also and throw out
+"saveflags", and replace the code with
+
+	ioctl(0, TCGETA, &tty);
+	savetty = tty;
+	/*
+	 * This assumes you want to turn off all output translations,
+	 * which is very likely to be the case in any full-screen program.
+	 */
+	tty.c_oflag &= ~OPOST;
+	tty.c_lflag &= ~(ICANON | ECHO);
+		/* turning ICANON off is like turning CBREAK on */
+	ioctl(0, TCSETAW, &tty);
+
+Note that in both these cases, the user's interrupt character will work
+normally.  This means that unless you want to disable the interrupt and quit
+characters (for information on that, see below), you'll have to catch SIGINT
+(and maybe SIGQUIT) and, if you get those signals, restore the modes, clear
+the screen, and exit.
+
+To disable the interrupt characters in V7 (and, hence, 4.xBSD):
+
+	struct tchars tc, savetc;
+
+	ioctl(0, TIOCGETC, &tc);
+	savetc = tc;
+	tc.t_intrc = '\377';
+	tc.t_quitc = '\377';
+	ioctl(0, TIOCSETC, &tc);
+
+For S3/S5, just turn off the ISIG bit as well as the ICANON bit in
+"c_lflags".
+
+If you're running under 4.xBSD, you should also either
+
+	1) catch SIGTSTP and, when it is caught, reset the TTY modes, clear
+	   the screen, reset the SIGTSTP handler if you're running under
+	   4.2BSD, and send yourself a SIGTSTP with "kill"
+
+or
+
+	2) disable the suspend and delayed-suspend characters as well.
+	   To do this, look up the TIOCGLTC and TIOCSLTC "ioctl" calls in
+	   TTY(4).
+
+Moral - writing full-screen programs is more complicated than you probably
+thought.
+
+	Guy Harris
+
+

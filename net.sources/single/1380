@@ -1,0 +1,519 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,a31bca735186e042,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-07-11 00:09:59 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 UW 5/3/83; site uw-beaver
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxl!ihnp4!zehntel!dual!amd!decwrl!decvax!ittvax!dcdwest!sdcsvax!sdcrdcf!hplabs!tektronix!uw-beaver!furuta
+From: furuta@uw-beaver.UUCP
+Newsgroups: net.sources
+Subject: macget.c
+Message-ID: <1192@uw-beaver>
+Date: Wed, 11-Jul-84 03:09:59 EDT
+Article-I.D.: uw-beave.1192
+Posted: Wed Jul 11 03:09:59 1984
+Date-Received: Tue, 17-Jul-84 01:30:27 EDT
+Organization: U of Washington Computer Science
+Lines: 499
+
+By request, here's macget.c:
+
+#include <stdio.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <sys/ioctl.h>
+
+#define RECORDBYTES 132
+#define DATABYTES 128
+#define NAMEBYTES 63
+
+#define RETRIES 10
+#define SOHTIMO 10
+#define LINTIMO 20
+#define CHRTIMO 1
+
+#define MAXRECNO 0xff
+#define BYTEMASK 0xff
+
+#define TMO -1
+#define DUP '\000'
+#define SOH '\001'
+#define EOT '\004'
+#define ACK '\006'
+#define NAK '\025'
+#define CAN '\030'
+#define EEF '\032'
+#define ESC '\033'
+
+#define H_NLENOFF 1
+#define H_NAMEOFF 2
+#define H_TYPEOFF 65
+#define H_AUTHOFF 69
+#define H_DLENOFF 81
+#define H_RLENOFF 85
+
+#define TEXT 0
+#define DATA 1
+#define RSRC 2
+#define FULL 3
+
+int mode, txtmode;
+
+struct macheader {
+	char m_name[NAMEBYTES+1];
+	char m_type[4];
+	char m_author[4];
+	int m_datalen;
+	int m_rsrclen;
+} mh;
+
+struct filenames {
+	char f_info[256];
+	char f_data[256];
+	char f_rsrc[256];
+} files;
+
+int lastack;
+char buf[DATABYTES];
+
+/*
+ * macget -- receive file from macintosh using xmodem protocol
+ *
+ * (c) 1984 Brown University Computer Science 
+ * may be used but not sold without permission
+ * written by Dave Johnson 5/22/84
+ * revised ddj 6/29/84
+ */
+char usage[] = "usage: \"macget [-rdu] [filename]\"\n";
+
+main(ac, av)
+char **av;
+{
+	char *name;
+
+	mode = FULL;
+	name = "";
+	ac--; av++;
+	while (ac) {
+		if (av[0][0] == '-') {
+			switch (av[0][1]) {
+			case 'r':
+				mode = RSRC;
+				break;
+			case 'd':
+				mode = DATA;
+				break;
+			case 'u':
+				mode = TEXT;
+				break;
+			default:
+				fprintf(stderr, usage);
+				exit(1);
+			}
+		}
+		else {
+			name = av[0];
+		}
+		ac--; av++;
+	}
+
+	setup_tty();
+	if (send_sync() == ACK) {
+		txtmode = 0;
+		recv_hdr(name);
+		if (mode == TEXT) txtmode++;
+		recv_file(files.f_data, mh.m_datalen, 1);
+		txtmode = 0;
+		recv_file(files.f_rsrc, mh.m_rsrclen, 0);
+	}
+	reset_tty();
+}
+
+recv_hdr(name)
+char *name;
+{
+	int n;
+	FILE *fp;
+	char tmpname[16];
+	char *np;
+
+	strcpy(tmpname, "#machdrXXXXXX");
+	mktemp(tmpname);
+	recv_file(tmpname, DATABYTES, 1);
+
+	fp = fopen(tmpname, "r");
+	if (fp == NULL) {
+		perror("temp file");
+		cleanup(-1);
+	}
+	fread(buf, 1, DATABYTES, fp);
+	fclose(fp);
+
+	if (name && *name) {
+		n = strlen(name);
+		if (n > NAMEBYTES) n = NAMEBYTES;
+		strncpy(mh.m_name, name, n);
+		mh.m_name[n] = '\0';
+	}
+	else {
+		n = buf[H_NLENOFF] & BYTEMASK;
+		if (n > NAMEBYTES) n = NAMEBYTES;
+		strncpy(mh.m_name, buf + H_NAMEOFF, n);
+		mh.m_name[n] = '\0';
+	}
+	for (np = mh.m_name; *np; np++)
+		if (*np == ' ') *np = '_';
+
+	if (mode == FULL) {
+		sprintf(files.f_info, "%s.info", mh.m_name);
+		rename(tmpname, files.f_info);
+		sprintf(files.f_data, "%s.data", mh.m_name);
+		sprintf(files.f_rsrc, "%s.rsrc", mh.m_name);
+	}
+	else {
+		unlink(tmpname);
+		switch (mode) {
+		case RSRC:
+			sprintf(files.f_data, "/dev/null");
+			sprintf(files.f_rsrc, "%s.rsrc", mh.m_name);
+			break;
+
+		case DATA:
+			sprintf(files.f_data, "%s.data", mh.m_name);
+			sprintf(files.f_rsrc, "/dev/null");
+			break;
+
+		case TEXT:
+			sprintf(files.f_data, "%s.text", mh.m_name);
+			sprintf(files.f_rsrc, "/dev/null");
+			break;
+		}
+	}
+
+	strncpy(mh.m_type, buf + H_TYPEOFF, 4);
+	strncpy(mh.m_author, buf + H_AUTHOFF, 4);
+	mh.m_datalen = get4(buf + H_DLENOFF);
+	mh.m_rsrclen = get4(buf + H_RLENOFF);
+}
+
+recv_file(fname, bytes, more)
+char *fname;
+int bytes, more;
+{
+	register int status, n;
+	FILE *outf;
+	int naks = 0;
+
+	lastack = 0;
+	outf = fopen(fname, "w");
+	if (outf == NULL) {
+		perror(fname);
+		cleanup(-1);
+	}
+	for (;;) {
+		status = rec_read(buf, DATABYTES);
+		switch (status) {
+		case EOT:
+			if (more)
+				tputc(NAK);
+			fclose(outf);
+			return;
+		case ACK:
+			tputc(ACK);
+			naks = 0;
+			n = (bytes > DATABYTES) ? DATABYTES : bytes;
+			bytes -= n;
+			fwrite(buf, n, 1, outf);
+			break;
+		case DUP:
+			tputc(ACK);
+			naks = 0;
+			break;
+		case NAK:
+			purge(CHRTIMO);
+			if (naks++ < RETRIES) {
+				tputc(NAK);
+				break;
+			}
+			/* fall through */
+		case CAN:
+			tputc(CAN);
+			fclose(outf);
+			/* unlink fname? */
+			cleanup(-1);
+			/* NOTREACHED */
+		}
+	}
+}
+
+send_sync()
+{
+	int c;
+
+	for (;;) {
+		c = tgetc(60);
+		switch (c) {
+		case ESC:
+			break;
+		case CAN:
+		case EOT:
+		case TMO:
+			return c;
+		default:
+			continue;
+		}
+		c = tgetc(1);
+		if (c != 'a')
+			continue;
+		tputc(ACK);
+		return ACK;
+	}
+}
+
+rec_read(buf, recsize)
+char buf[];
+int recsize;
+{
+	int c, rec, rec_bar, cksum;
+
+	c = tgetc(SOHTIMO);
+	switch (c) {
+	case TMO:
+		return NAK;
+	case EOT:
+		return EOT;
+	case CAN:
+		return CAN;
+	case SOH:
+		/* read header */
+		rec = tgetc(CHRTIMO);
+		if (rec == TMO)
+			return NAK;
+		rec_bar = tgetc(CHRTIMO);
+		if (rec_bar == TMO)
+			return NAK;
+
+		/* check header */
+		if (rec != MAXRECNO - rec_bar) return NAK;
+
+		/* fill buffer */
+		cksum = tgetrec(buf, recsize, LINTIMO);
+		if (cksum == TMO)
+			return NAK;
+
+		/* get checksum */
+		c = tgetc(CHRTIMO);
+		if (c == TMO)
+			return NAK;
+		if (c != (cksum & BYTEMASK))
+			return NAK;
+
+		/* check record number */
+		if (rec == lastack)
+			return DUP;
+		if (rec != ((lastack + 1) & MAXRECNO))
+			return CAN;
+		else {
+			lastack = rec;
+			return ACK;
+		}
+	}
+	/* NOTREACHED */
+}
+
+purge(timeout)
+int timeout;
+{
+	int c;
+
+	do {
+		c = tgetc(timeout);
+	} while (c != TMO);
+}
+
+static int ttyfd;
+static FILE *ttyf;
+jmp_buf timobuf;
+
+tgetrec(buf, count, timeout)
+char *buf;
+int count, timeout;
+{
+	char *bp;
+	int i, cksum;
+
+	if (setjmp(timobuf))
+		return TMO;
+	
+	alarm(timeout);
+	i = fread(buf, 1, count, ttyf);
+	alarm(0);
+	if (i != count)
+		return TMO;
+	
+	cksum = 0;
+	bp = buf;
+	for (i = 0; i < count; bp++, i++) {
+		cksum += *bp;
+		if (txtmode && *bp == '\r')
+			*bp = '\n';
+	}
+	return cksum;
+}
+
+tgetc(timeout)
+int timeout;
+{
+	int c;
+
+	if (setjmp(timobuf))
+		return TMO;
+
+	alarm(timeout);
+	c = getc(ttyf);
+	alarm(0);
+
+	if (c == -1)	/* probably hung up or logged off */
+		return EOT;
+	else
+		return c & BYTEMASK;
+}
+
+tputc(c)
+char c;
+{
+	write(ttyfd, &c, 1);
+}
+
+timedout()
+{
+	longjmp(timobuf, 1);
+}
+
+static struct sgttyb otty, ntty;
+/* should turn messages off */
+
+setup_tty()
+{
+	int cleanup();
+	int timedout();
+
+	ttyf = stdin;
+	ttyfd = fileno(stdin);
+	ioctl(ttyfd, TIOCGETP, &otty);
+	signal(SIGHUP, cleanup);
+	signal(SIGINT, cleanup);
+	signal(SIGQUIT, cleanup);
+	signal(SIGTERM, cleanup);
+	signal(SIGALRM, timedout);
+	ntty = otty;
+	ntty.sg_flags = RAW|ANYP;
+	ioctl(ttyfd, TIOCSETP, &ntty);
+}
+
+reset_tty()
+{
+	sleep(2);	/* should wait for output to drain */
+	ioctl(ttyfd, TIOCSETP, &otty);
+}
+
+cleanup(sig)
+int sig;
+{
+	reset_tty();
+	exit(sig);
+}
+
+get4(bp)
+char *bp;
+{
+	register int i;
+	int value = 0;
+
+	for (i = 0; i < 4; i++) {
+		value <<= 8;
+		value |= (*bp & BYTEMASK);
+		bp++;
+	}
+	return value;
+}
+===========macget.l
+.TH MACGET local "29 June 1984"
+.UC 4
+.SH NAME
+macget \- receive file from macintosh via modem7 / macterminal
+.SH SYNOPSIS
+.B macget
+[
+.B \-rdu
+] [file]
+.SH DESCRIPTION
+.I Macget
+receives a file from a Macintosh running MacTerminal.
+MacTerminal should be set to use the modem7 protocol,
+and should have flow control disabled.
+.PP
+The optional 
+.I file
+parameter specifies the name to use when creating the unix files,
+otherwise the Mac file name is used (with spaces converted to underscores).
+.PP
+If none of the
+.B \-rdu
+flags are specified, 
+.I macget 
+receives three files from the Mac:
+.IB file .info ,
+.IB file .data ,
+and
+.IB file .rsrc .
+This option is useful for storing Mac files so they can
+be restored later using
+.IR macput .
+.PP
+The
+.B \-r
+flag specifies 
+.I resource
+mode.
+Only 
+.IB file .rsrc
+will be created, from the Mac file's resource fork.
+.PP
+The
+.B \-d
+flag specifies 
+.I data
+mode.
+Only
+.IB file .data
+will be created, containing the data fork of the Mac file.
+.PP
+The 
+.B \-u
+flag requests 
+.I unix
+mode, in which carriage returns are converted into
+unix newline characters, and the unix file
+.IB file .text
+is created.
+.SH SEE ALSO
+macput(local)
+.SH BUGS
+Doesn't work over flow controlled communication lines,
+or when using rlogin.
+.PP
+The current version of MacTerminal (-0.15X) has trouble sending
+a handful of specific files, with no recourse but to reboot the Mac.
+This problem occurs even when two Mac's are connected directly
+to each other, so maybe this will be fixed in the next version
+of MacTerminal.
+.PP
+MacTerminal does not provide a valid creation time in the header
+it sends out, nor does it check the validity of the time in the 
+header it receives, if indeed the time is encoded in the header.
+Therefore creation times of files returned to the Mac will be bogus.
+.SH AUTHOR
+Dave Johnson, Brown 6/29/84
+
+

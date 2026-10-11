@@ -1,0 +1,582 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 162299,624fe70ced2bae85,start
+X-Google-Attributes: gid162299,public
+X-Google-ArrivalTime: 1986-02-03 14:37:28 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxr!mhuxt!houxm!whuxl!whuxlm!akgua!gatech!seismo!mcvax!ukc!mg
+From: mg@ukc.UUCP
+Newsgroups: net.sources.games
+Subject: program to find anagrams of a phrase
+Message-ID: <683@eagle.ukc.ac.uk>
+Date: Mon, 3-Feb-86 17:37:28 EST
+Article-I.D.: eagle.683
+Posted: Mon Feb  3 17:37:28 1986
+Date-Received: Thu, 6-Feb-86 20:45:09 EST
+Reply-To: mg@ukc.UUCP (M.W.Guy)
+Organization: U of Kent at Canterbury, Canterbury, UK
+Lines: 562
+
+Herewith a program to find all the anagrams of a word or phrase.
+
+It takes the phrase (your name, for example) as its arguments, then
+searches through the dictionary to find all possible anagrams.
+An anagram is defined as a phrase with the same number of letters as the
+original with the same number of each letter.
+
+It works (in principle) by filtering out from the dictionary all words which
+are sub-words of the key, that is, words which can be made from the key
+without necessarily using all the letters, and trying all combinations of
+these words together and printing only those combinations which exactly use up
+all of the key's letters.
+
+It works in such a manner as not to print out each group of words in all its
+permutations, and filters out all one-letter words from the dictionary except
+for a, i and o. This is because the time taken is dependent upon the depth to
+which it has to recurse, which is greatly increased if there are many
+one-letter words. To find all anagrams of "martin guy" it takes 18 seconds on
+one of our Vaxen, but note that a key of 30 letters might well take many years
+because of the vastly increased number of subwords and increased recursion
+depth.
+
+Use it sensibly; it is very expensive to run.
+
+Thanks are due to Stu Plant for the original idea and to Mark Wheadon for
+porting it to the Perq.
+
+If anyone has ideas for further speedups to it, or any portability
+considerations which I have overlooked, I would be most interested.
+
+	Martin Guy
+
+---8<------8<------8<------8<------8<------8<------8<------8<------8<------8<---
+static char *sccsid = "@(#)anagram.c	1.11 (UKC) 9/1/86";
+
+/*
+ *	Find all anagrams of a word or phrase which an be made from the words
+ *	of the dictionary which should come in on stdin, unless stdin points to
+ *	a tty in which case we go and get /usr/dict/words for ourselves.
+ *
+ *	Eliminates all one-letter "words" except a, i, o.
+ *
+ *	Martin Guy, University of Kent at Canterbury, December 1985
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+
+/*
+ *	Structure of each word read from the dictionary and stored as part
+ *	of a possible anagram.
+ */
+
+typedef struct cell {
+	struct cell *link;	/* To bind the linked list together */
+	char *word;		/* At last! The word itself */
+	char *realword;		/* exactly as it came out of the dictionary */
+	int wordlen;		/* length of the word */
+				/* Sub-wordlist reduces problem for children */
+				/* These pointers are the heads of a stack of
+				 * doubly linked lists (!) */
+	struct cell **flink;	/* Forward links for doubly linked list */
+	struct cell **rlink;	/* Reverse links for doubly linked list */
+} cell_t;
+
+int freq[256];		/* number of time each character occurs in the key.
+			 * Must be initialised to 0s.
+			 * Set by buildwordlist, Used by findanags. */
+int nletters;		/* Number of letters in key, == sum(freq[*]) */
+char *anagword[64];	/* pointers to the words making up the anagram under construction */
+static int nwords;	/* number of words in current list */
+
+cell_t *buildwordlist();
+cell_t *sort();
+cell_t *forgelinks();
+char *malloc();
+char *strcpy();
+
+char *progname;		/* program name for error reporting */
+int vflag = 0;		/* verbose mode: give a running commentary */
+int iflag = 0;		/* Ignore case of words' first letters */
+int iiflag = 0;		/* lowercasise all characters from dict */
+int pflag = 0;		/* Ignore punctuation in words from dict */
+int purify = 0;		/* Some munging has to be done on the dict's words */
+			/* purify == (iflag || pflag || iiflag) */
+int maxgen = 0;		/* Highest number of generations of findanag possible */
+
+main(argc, argv)
+char **argv;
+{
+	register int i, j;
+	cell_t *wordlist;
+
+	progname = argv[0];
+	
+	/*
+	 *	Check calling syntax
+	 */
+	while (argc >= 2 && argv[1][0] == '-') {
+		switch (argv[1][1]) {
+		case 'I':	/* Ignore case completely */
+			iiflag = 1;
+			purify = 1;
+			break;
+		case 'i':	/* Initial letter case independence */
+			iflag = 1;
+			purify = 1;
+			break;
+		case 'p':	/* punctuation-ignoring mode */
+			pflag = 1;
+			purify = 1;
+			break;
+		case 'v':	/* verbose mode */
+			vflag = 1;
+			break;
+		case 'm':	/* Set maximum number of words in anagram */
+			maxgen = atoi(&argv[1][2]);
+			if (maxgen <= 0) goto usage;
+			break;
+		default:
+			goto usage;
+		}
+		/* Pretend the argument wasn't there */
+		argv++; argc--;
+	}
+	if (argc<2) {
+usage:		fprintf(stderr, "Usage: %s -v -m# word [word] ...\n", progname);
+		fprintf(stderr, "-v\tVerbose: give running commentary.\n");
+		fprintf(stderr, "-m#\tMaximum number of words in anagrams.\n");
+		fprintf(stderr, "-i\tIgnore case of initial character of words from dictionary.\n");
+		fprintf(stderr, "-I\tIgnore case of words from dictionary entirely.\n");
+		fprintf(stderr, "-p\tIgnore punctuation in words from dictionary.\n");
+		exit(1);
+	}
+
+	if (isatty(0)) {
+		if (freopen("/usr/dict/words", "r", stdin) == NULL) {
+			fprintf(stderr, "%s: cannot open dictionary.\n", progname);
+			exit(1);
+		}
+	}
+
+	/*
+	 *	Fill in frequency of letters in argument.
+	 *	freq[*] must have been initialised to 0.
+	 */
+	nletters = 0;
+	for (i=1; i<argc; i++) {
+		for (j=0; argv[i][j] != '\0'; j++) {
+			freq[argv[i][j]]++;
+			nletters++;
+		}
+	}
+
+	if (vflag) fprintf(stderr, "%d letters in key.\n", nletters);
+
+	/*
+	 *	If no -m option, set the maximum possible recursion depth
+	 */
+	if (maxgen == 0) maxgen = nletters;
+
+	if (vflag) fputs("Building wordlist...\n", stderr);
+	wordlist = buildwordlist();
+
+	if (vflag) fputs("Sorting wordlist...\n", stderr);
+	wordlist = sort(wordlist);
+
+	if (vflag) {
+		fputs("After sorting:\n", stderr);
+		printwordlist(wordlist);
+	}
+
+	if (vflag) fputs("Searching for anagrams...\n", stderr);
+	initfind(wordlist);
+	findanags(0, forgelinks(wordlist), nletters);
+	exit(0);
+}
+
+/*
+ *	Read words in from stdin and put candidates into a linked list.
+ *	Return the head of the list.
+ */
+cell_t *
+buildwordlist()
+{
+	register char *cp;		/* Temporary for word-grubbing */
+	char *word;			/* Candidate word from dictionary */
+	char realword[32];		/* Exactly as read from dictionary */
+	cell_t *head = NULL;		/* Head of the linked list */
+	cell_t **lastptr = &head;	/* Points to the last link field in the chain */
+	cell_t *newcell;		/* Pointer to cell under construction */
+
+	nwords = 0;			/* number of words in wordlist */
+	while (gets(realword) != NULL) {
+
+		/*
+		 * if iflag or pflag, filter the word before processing it.
+		 */
+		if (!purify) {
+			word = realword;
+		} else {
+			static char buf[32];
+			register char *rp, *wp;
+			register int differ = 0;
+
+			for (rp = realword, wp = buf; *rp != '\0'; rp++) {
+				switch (*rp) {
+				case 'a': case 'b': case 'c': case 'd':
+				case 'e': case 'f': case 'g': case 'h':
+				case 'i': case 'j': case 'k': case 'l':
+				case 'm': case 'n': case 'o': case 'p':
+				case 'q': case 'r': case 's': case 't':
+				case 'u': case 'v': case 'w': case 'x':
+				case 'y': case 'z':
+				case '0': case '1': case '2': case '3':
+				case '4': case '5': case '6': case '7':
+				case '8': case '9':
+					*wp++ = *rp;
+					break;
+
+				case 'A': case 'B': case 'C': case 'D':
+				case 'E': case 'F': case 'G': case 'H':
+				case 'I': case 'J': case 'K': case 'L':
+				case 'M': case 'N': case 'O': case 'P':
+				case 'Q': case 'R': case 'S': case 'T':
+				case 'U': case 'V': case 'W': case 'X':
+				case 'Y': case 'Z':
+					if (iiflag || (iflag && rp == realword) ) {
+						*wp++ = tolower(*rp);
+						differ = 1;
+					} else {
+						*wp++ = *rp;
+					}
+					break;
+				
+				default:
+					if (pflag) {
+						differ = 1;
+					} else {
+						*wp++ = *rp;
+					}
+				}
+			}
+			*wp = '\0';
+			word = differ ? buf : realword;
+		}
+
+		/*
+		 *	Throw out all one-letter words except for a, i, o
+		 *	otherwise most of the output consists of one-letter
+		 *	words.
+		 */
+		if (word[1] == '\0') {
+			switch (word[0]) {
+			case 'a':
+			case 'i':
+			case 'o':
+				break;
+			default:
+				goto nextword;
+			}
+		}
+
+		/*
+		 *	Reject the word if it contains any character which
+		 *	wasn't in the key.
+		 */
+		for (cp = word; *cp != '\0'; cp++) {
+			if (freq[*cp] == 0) {
+				/* The word contains an illegal char */
+				goto nextword;
+				/* shame about the break statement */
+			}
+		}
+		/*
+		 *	This word merits further inspection. See if it contains
+		 *	no more of any letter than the original.
+		 */
+		for (cp=word; *cp != '\0'; cp++) {
+			if (freq[*cp] <= 0) {
+				/* We have run out of this letter.
+				 * try next word */
+				goto restore;
+			} /* else */
+			freq[*cp]--;
+		}
+		/*
+		 *	the word passed all the tests
+		 *	Construct a new cell and attach it to the list.
+		 */
+		/* Get a new cell */
+		newcell = (cell_t *) malloc(sizeof(cell_t));
+		if (newcell == NULL) oom("buildwordlist");
+
+		/* And somewhere to store the string */
+		newcell->word = (char *) malloc((unsigned) (strlen(word) + 1));
+		if (newcell->word == NULL) oom("buildwordlist");
+
+		/* Copy the string into the new space */
+		(void) strcpy(newcell->word, word);
+
+		/* remember the length for optimising findanag and sorting */
+		newcell->wordlen = cp - word;
+
+		/* If realword differs from pure word, store it separately */
+		if (realword == word) {
+			newcell->realword = newcell->word;
+		} else {
+			/* somewhere to store the string */
+			newcell->realword = (char *) malloc((unsigned) (strlen(realword) + 1));
+			if (newcell->realword == NULL) oom("buildwordlist");
+
+			/* Copy the string into the new space */
+			(void) strcpy(newcell->realword, realword);
+		}
+			
+		/* Mark it as the end of the list */
+		newcell->link = NULL;
+
+		/* Point the old tail-cell at it */
+		*lastptr = newcell;
+
+		/* And remember the new one as the tail cell */
+		lastptr = &(newcell->link);
+		
+		nwords++;
+restore:	
+		/*
+		 * Restore freq[] to its original state; this is quicker than
+		 * doing a block copy into a temporary array and munging that.
+		 * At this point, cp is either pointing to the terminating null
+		 * or to the first letter in the word for which freq == 0.
+		 * So all the freq[] entries for [word..(cp-1)] have been
+		 * decremented. Put them back.
+		 */
+		for ( --cp; cp >= word; --cp ) {
+			freq[*cp]++;
+		}
+nextword:	;
+	}
+	if (vflag) fprintf(stderr, "%d suitable words found\n", nwords);
+
+	return(head);
+}
+
+/*
+ *	Comparison function for sort so that longest words come first
+ */
+static int
+islonger(first, second)
+char *first, *second;
+{
+	return((*(cell_t **)second)->wordlen - (*(cell_t **)first)->wordlen);
+}
+
+/*
+ *	Sort the wordlist by word length so that the longest is at the head.
+ *	Return the new head of the list.
+ */
+cell_t *
+sort(head)
+cell_t *head;
+{
+	register cell_t **sortbase;	/* Array of pointers to cells */
+	register int i;			/* Loop index */
+	register cell_t *cp;		/* Loop index */
+	cell_t *newhead;		/* hold return value so we can free */
+
+	sortbase = (cell_t **) malloc((unsigned)nwords * sizeof(cell_t *));
+	if (sortbase == NULL) oom("buildwordlist while sorting");
+
+	/*
+	 *	Reference all strings from the array
+	 */
+	for (cp=head,i=0; cp!=NULL; cp=cp->link,i++) {
+		sortbase[i] = cp;
+	}
+
+	/* Check just in case */
+	if (i != nwords) {
+		/* nwords disagrees with the length of the linked list */
+		fprintf(stderr, "%s: Aagh! Despair! %d %d\n",
+			progname, i, nwords);
+		abort();
+	}
+
+	qsort((char *) sortbase, nwords, sizeof(cell_t *), islonger);
+
+	/*
+	 * Re-forge the linked list according to the sorted array of pointers
+	 */
+	for (i=0; i<nwords-1; i++) {
+		sortbase[i]->link = sortbase[i+1];
+	}
+	sortbase[nwords-1]->link = NULL;
+
+	newhead = sortbase[0];
+	free((char *)sortbase);
+	return(newhead);
+}
+
+/* Out Of Memory */
+oom(where)
+char *where;
+{
+	fprintf(stderr, "%s: Out of memory in %s.\n", progname, where);
+	exit(1);
+}
+
+initfind(head)
+cell_t *head;
+{
+	cell_t *cp;
+
+	/*
+	 *	Get some memory for the sub-wordlists
+	 */
+	for (cp = head; cp != NULL; cp = cp->link) {
+		cp->flink = (cell_t **) malloc((unsigned)maxgen * sizeof(cell_t *));
+		if (cp->flink == NULL) oom("initfind");
+		cp->rlink = (cell_t **) malloc((unsigned)maxgen * sizeof(cell_t *));
+		if (cp->rlink == NULL) oom("initfind");
+	}
+}
+
+/*
+ *	Print out all anagrams which can be made from the wordlist wordl
+ *	out of the letters left in freq[].
+ *	(cell)->[fr]link[generation] is the word list we are to scan.
+ *	Scan from the tail back to the head; (head->rlink[gen]==NULL)
+ */
+findanags(generation, wordlt, nleft)
+int generation;		/* depth of recursion */
+cell_t *wordlt;		/* the tail of the wordlist we are to use */
+int nleft;		/* number of unclaimed chars from key */
+{
+	register cell_t *cellp;		/* for tracing down the wordlist */
+	register char *cp;		/* for inspecting each word */
+	register int nl;		/* copy of nleft for munging */
+	register char *cp2;		/* temp for speed */
+	register cell_t *myhead = NULL;	/* list of words we found suitable */
+	register cell_t *mytail;	/* tail of our list of words */
+
+	/*
+	 *	Loop from the tail cell back up to and including the
+	 *	head of the wordlist
+	 */
+	for (cellp = wordlt; cellp != NULL; cellp = cellp->rlink[generation]) {
+		/*
+		 *	This looks remarkably like bits of buildwordlist.
+		 *
+		 *	First a quick rudimentary check whether we have already
+		 *	run out of any of the letters required.
+		 */
+		for (cp = cellp->word; *cp != '\0'; cp++) {
+			if (freq[*cp] == 0) goto nextword;
+		}
+
+		/*
+		 *	Now do a more careful counting check.
+		 */
+		nl = nleft;
+		for (cp = cellp->word; *cp != '\0'; cp++) {
+			if (freq[*cp] == 0) goto failure;
+			freq[*cp]--; nl--;
+		}
+
+		/*
+		 *	Yep, there were the letters left to make the word.
+		 *	Are we done yet?
+		 */
+		switch (nl) {
+		case 0:	/* Bingo */
+			print(generation, cellp->realword);
+			break;
+		default:
+			if (generation < maxgen-1) {
+				/* Record the word and find something to follow it */
+				/*
+				 * Add it to the list of words that were ok for
+				 * us; those words which we rejected are
+				 * certainly not worth our children's attention.
+				 * Constructed like a lifo stack.
+				 */
+				cellp->flink[generation+1] = myhead;
+				if (myhead != NULL)
+					myhead->rlink[generation+1] = cellp;
+				else /* this is the first item on the list */
+					mytail = cellp;
+				myhead = cellp;
+				myhead->rlink[generation+1] = NULL;
+
+				anagword[generation] = cellp->realword;
+				findanags(generation+1, mytail, nl);
+			}
+		}
+
+failure:	/*
+		 *	Restore freq to its former state
+		 */
+		cp2 = cellp->word;
+		for (--cp; cp>=cp2; cp--) {
+			freq[*cp]++;
+		}
+nextword:	;
+	}
+}
+		
+print(gen, word)
+char *word;
+{
+	register int i;
+
+	for (i = 0; i < gen; i++) {
+		fputs(anagword[i], stdout);
+		putchar(' ');
+	}
+	puts(word);
+	(void) fflush(stdout);
+}
+
+/*
+ *	Forge the reverse links to form a doubly-linked list
+ *	Return the address of the tail of the list.
+ */
+cell_t *
+forgelinks(head)
+cell_t *head;
+{
+	cell_t *prev = NULL;	/* address of previous cell */
+	cell_t *cp;		/* list follower */
+
+	for (cp = head; cp != NULL; cp = cp->link) {
+		cp -> flink[0] = cp -> link;
+		cp -> rlink[0] = prev;
+		prev = cp;
+	}
+	return(prev);
+}
+
+printwordlist(head)
+cell_t *head;
+{
+	cell_t *cp;	/* list tracer */
+	int col = 0;	/* print column for word wrapping */
+	int wordlen;	/* length of realword */
+
+	for (cp = head; cp != NULL; cp = cp -> link) {
+		wordlen = strlen(cp->realword);
+		if (col + wordlen + 1 > 79) {
+			putc('\n', stderr);
+			col = 0;
+		}
+		if (col != 0) {
+			putc(' ', stderr);
+			col++;
+		}
+		fputs(cp->word, stderr);
+		col += wordlen;
+	}
+	putc('\n', stderr);
+}
+
+

@@ -1,0 +1,2398 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,704f59092fef7ef9,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1987-01-14 09:13:45 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!mnetor!seismo!rochester!kodak!keily
+From: keily@kodak.UUCP (dick keily)
+Newsgroups: net.sources
+Subject: MSDOS less source 3 of 3
+Message-ID: <669@kodak.UUCP>
+Date: Wed, 14-Jan-87 12:13:45 EST
+Article-I.D.: kodak.669
+Posted: Wed Jan 14 12:13:45 1987
+Date-Received: Thu, 15-Jan-87 01:03:07 EST
+Reply-To: keily@kodak.UUCP (dick keily)
+Followup-To: ...!seismo!rochester!kodak!keily
+Distribution: world
+Organization: Eastman Kodak Co, Rochester, NY
+Lines: 2376
+
+==============Edit thru here and run thru sh=====================
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#	regexp.c
+#	scrn.c
+#	signal.c
+#	ttyin.c
+#	version.c
+#	less.man
+# This archive created: Wed Jan 14 11:28:34 1987
+export PATH; PATH=/bin:$PATH
+if test -f 'regexp.c'
+then
+	echo shar: will not over-write existing file "'regexp.c'"
+else
+cat << \SHAR_EOF > 'regexp.c'
+/*
+ * regcomp and regexec -- regsub and regerror are elsewhere
+ *
+ *	Copyright (c) 1986 by University of Toronto.
+ *	Written by Henry Spencer.  Not derived from licensed software.
+ *
+ *	Permission is granted to anyone to use this software for any
+ *	purpose on any computer system, and to redistribute it freely,
+ *	subject to the following restrictions:
+ *
+ *	1. The author is not responsible for the consequences of use of
+ *		this software, no matter how awful, even if they arise
+ *		from defects in it.
+ *
+ *	2. The origin of this software must not be misrepresented, either
+ *		by explicit claim or by omission.
+ *
+ *	3. Altered versions must be plainly marked as such, and must not
+ *		be misrepresented as being the original software.
+ *
+ * Beware that some of this code is subtly aware of the way operator
+ * precedence is structured in regular expressions.  Serious changes in
+ * regular-expression syntax might require a total rethink.
+ */
+#include <stdio.h>
+#include "regexp.h"
+#include "regmagic.h"
+
+/*
+ * The "internal use only" fields in regexp.h are present to pass info from
+ * compile to execute that permits the execute phase to run lots faster on
+ * simple cases.  They are:
+ *
+ * regstart	char that must begin a match; '\0' if none obvious
+ * reganch	is the match anchored (at beginning-of-line only)?
+ * regmust	string (pointer into program) that match must include, or NULL
+ * regmlen	length of regmust string
+ *
+ * Regstart and reganch permit very fast decisions on suitable starting points
+ * for a match, cutting down the work a lot.  Regmust permits fast rejection
+ * of lines that cannot possibly match.  The regmust tests are costly enough
+ * that regcomp() supplies a regmust only if the r.e. contains something
+ * potentially expensive (at present, the only such thing detected is * or +
+ * at the start of the r.e., which can involve a lot of backup).  Regmlen is
+ * supplied because the test in regexec() needs it and regcomp() is computing
+ * it anyway.
+ */
+
+/*
+ * Structure for regexp "program".  This is essentially a linear encoding
+ * of a nondeterministic finite-state machine (aka syntax charts or
+ * "railroad normal form" in parsing technology).  Each node is an opcode
+ * plus a "next" pointer, possibly plus an operand.  "Next" pointers of
+ * all nodes except BRANCH implement concatenation; a "next" pointer with
+ * a BRANCH on both ends of it is connecting two alternatives.  (Here we
+ * have one of the subtle syntax dependencies:  an individual BRANCH (as
+ * opposed to a collection of them) is never concatenated with anything
+ * because of operator precedence.)  The operand of some types of node is
+ * a literal string; for others, it is a node leading into a sub-FSM.  In
+ * particular, the operand of a BRANCH node is the first node of the branch.
+ * (NB this is *not* a tree structure:  the tail of the branch connects
+ * to the thing following the set of BRANCHes.)  The opcodes are:
+ */
+
+/* definition	number	opnd?	meaning */
+#define	END	0	/* no	End of program. */
+#define	BOL	1	/* no	Match "" at beginning of line. */
+#define	EOL	2	/* no	Match "" at end of line. */
+#define	ANY	3	/* no	Match any one character. */
+#define	ANYOF	4	/* str	Match any character in this string. */
+#define	ANYBUT	5	/* str	Match any character not in this string. */
+#define	BRANCH	6	/* node	Match this alternative, or the next... */
+#define	BACK	7	/* no	Match "", "next" ptr points backward. */
+#define	EXACTLY	8	/* str	Match this string. */
+#define	NOTHING	9	/* no	Match empty string. */
+#define	STAR	10	/* node	Match this (simple) thing 0 or more times. */
+#define	PLUS	11	/* node	Match this (simple) thing 1 or more times. */
+#define	OPEN	20	/* no	Mark this point in input as start of #n. */
+			/*	OPEN+1 is number 1, etc. */
+#define	CLOSE	30	/* no	Analogous to OPEN. */
+
+/*
+ * Opcode notes:
+ *
+ * BRANCH	The set of branches constituting a single choice are hooked
+ *		together with their "next" pointers, since precedence prevents
+ *		anything being concatenated to any individual branch.  The
+ *		"next" pointer of the last BRANCH in a choice points to the
+ *		thing following the whole choice.  This is also where the
+ *		final "next" pointer of each individual branch points; each
+ *		branch starts with the operand node of a BRANCH node.
+ *
+ * BACK		Normal "next" pointers all implicitly point forward; BACK
+ *		exists to make loop structures possible.
+ *
+ * STAR,PLUS	'?', and complex '*' and '+', are implemented as circular
+ *		BRANCH structures using BACK.  Simple cases (one character
+ *		per match) are implemented with STAR and PLUS for speed
+ *		and to minimize recursive plunges.
+ *
+ * OPEN,CLOSE	...are numbered at compile time.
+ */
+
+/*
+ * A node is one char of opcode followed by two chars of "next" pointer.
+ * "Next" pointers are stored as two 8-bit pieces, high order first.  The
+ * value is a positive offset from the opcode of the node containing it.
+ * An operand, if any, simply follows the node.  (Note that much of the
+ * code generation knows about this implicit relationship.)
+ *
+ * Using two bytes for the "next" pointer is vast overkill for most things,
+ * but allows patterns to get big without disasters.
+ */
+#define	OP(p)	(*(p))
+#define	NEXT(p)	(((*((p)+1)&0377)<<8) + *((p)+2)&0377)
+#define	OPERAND(p)	((p) + 3)
+
+/*
+ * See regmagic.h for one further detail of program structure.
+ */
+
+
+/*
+ * Utility definitions.
+ */
+#ifndef CHARBITS
+#define	UCHARAT(p)	((int)*(unsigned char *)(p))
+#else
+#define	UCHARAT(p)	((int)*(p)&CHARBITS)
+#endif
+
+#define	FAIL(m)	{ regerror(m); return(NULL); }
+#define	ISMULT(c)	((c) == '*' || (c) == '+' || (c) == '?')
+#define	META	"^$.[()|?+*\\"
+
+/*
+ * Flags to be passed up and down.
+ */
+#define	HASWIDTH	01	/* Known never to match null string. */
+#define	SIMPLE		02	/* Simple enough to be STAR/PLUS operand. */
+#define	SPSTART		04	/* Starts with * or +. */
+#define	WORST		0	/* Worst case. */
+
+/*
+ * Global work variables for regcomp().
+ */
+static char *regparse;		/* Input-scan pointer. */
+static int regnpar;		/* () count. */
+static char regdummy;
+static char *regcode;		/* Code-emit pointer; &regdummy = don't. */
+static long regsize;		/* Code size. */
+
+/*
+ * Forward declarations for regcomp()'s friends.
+ */
+#ifndef STATIC
+#define	STATIC	static
+#endif
+STATIC char *reg();
+STATIC char *regbranch();
+STATIC char *regpiece();
+STATIC char *regatom();
+STATIC char *regnode();
+STATIC char *regnext();
+STATIC void regc();
+STATIC void reginsert();
+STATIC void regtail();
+STATIC void regoptail();
+#ifdef STRCSPN
+STATIC int strcspn();
+#endif
+
+/*
+ - regcomp - compile a regular expression into internal code
+ *
+ * We can't allocate space until we know how big the compiled form will be,
+ * but we can't compile it (and thus know how big it is) until we've got a
+ * place to put the code.  So we cheat:  we compile it twice, once with code
+ * generation turned off and size counting turned on, and once "for real".
+ * This also means that we don't allocate space until we are sure that the
+ * thing really will compile successfully, and we never have to move the
+ * code and thus invalidate pointers into it.  (Note that it has to be in
+ * one piece because free() must be able to free it all.)
+ *
+ * Beware that the optimization-preparation code in here knows about some
+ * of the structure of the compiled regexp.
+ */
+regexp *
+regcomp(exp)
+char *exp;
+{
+	register regexp *r;
+	register char *scan;
+	register char *longest;
+	register int len;
+	int flags;
+	extern char *malloc();
+
+	if (exp == NULL)
+		FAIL("NULL argument");
+
+	/* First pass: determine size, legality. */
+	regparse = exp;
+	regnpar = 1;
+	regsize = 0L;
+	regcode = &regdummy;
+	regc(MAGIC);
+	if (reg(0, &flags) == NULL)
+		return(NULL);
+
+	/* Small enough for pointer-storage convention? */
+	if (regsize >= 32767L)		/* Probably could be 65535L. */
+		FAIL("regexp too big");
+
+	/* Allocate space. */
+	r = (regexp *)malloc(sizeof(regexp) + (unsigned)regsize);
+	if (r == NULL)
+		FAIL("out of space");
+
+	/* Second pass: emit code. */
+	regparse = exp;
+	regnpar = 1;
+	regcode = r->program;
+	regc(MAGIC);
+	if (reg(0, &flags) == NULL)
+		return(NULL);
+
+	/* Dig out information for optimizations. */
+	r->regstart = '\0';	/* Worst-case defaults. */
+	r->reganch = 0;
+	r->regmust = NULL;
+	r->regmlen = 0;
+	scan = r->program+1;			/* First BRANCH. */
+	if (OP(regnext(scan)) == END) {		/* Only one top-level choice. */
+		scan = OPERAND(scan);
+
+		/* Starting-point info. */
+		if (OP(scan) == EXACTLY)
+			r->regstart = *OPERAND(scan);
+		else if (OP(scan) == BOL)
+			r->reganch++;
+
+		/*
+		 * If there's something expensive in the r.e., find the
+		 * longest literal string that must appear and make it the
+		 * regmust.  Resolve ties in favor of later strings, since
+		 * the regstart check works with the beginning of the r.e.
+		 * and avoiding duplication strengthens checking.  Not a
+		 * strong reason, but sufficient in the absence of others.
+		 */
+		if (flags&SPSTART) {
+			longest = NULL;
+			len = 0;
+			for (; scan != NULL; scan = regnext(scan))
+				if (OP(scan) == EXACTLY && strlen(OPERAND(scan)) >= len) {
+					longest = OPERAND(scan);
+					len = strlen(OPERAND(scan));
+				}
+			r->regmust = longest;
+			r->regmlen = len;
+		}
+	}
+
+	return(r);
+}
+
+/*
+ - reg - regular expression, i.e. main body or parenthesized thing
+ *
+ * Caller must absorb opening parenthesis.
+ *
+ * Combining parenthesis handling with the base level of regular expression
+ * is a trifle forced, but the need to tie the tails of the branches to what
+ * follows makes it hard to avoid.
+ */
+static char *
+reg(paren, flagp)
+int paren;			/* Parenthesized? */
+int *flagp;
+{
+	register char *ret;
+	register char *br;
+	register char *ender;
+	register int parno;
+	int flags;
+
+	*flagp = HASWIDTH;	/* Tentatively. */
+
+	/* Make an OPEN node, if parenthesized. */
+	if (paren) {
+		if (regnpar >= NSUBEXP)
+			FAIL("too many ()");
+		parno = regnpar;
+		regnpar++;
+		ret = regnode(OPEN+parno);
+	} else
+		ret = NULL;
+
+	/* Pick up the branches, linking them together. */
+	br = regbranch(&flags);
+	if (br == NULL)
+		return(NULL);
+	if (ret != NULL)
+		regtail(ret, br);	/* OPEN -> first. */
+	else
+		ret = br;
+	if (!(flags&HASWIDTH))
+		*flagp &= ~HASWIDTH;
+	*flagp |= flags&SPSTART;
+	while (*regparse == '|') {
+		regparse++;
+		br = regbranch(&flags);
+		if (br == NULL)
+			return(NULL);
+		regtail(ret, br);	/* BRANCH -> BRANCH. */
+		if (!(flags&HASWIDTH))
+			*flagp &= ~HASWIDTH;
+		*flagp |= flags&SPSTART;
+	}
+
+	/* Make a closing node, and hook it on the end. */
+	ender = regnode((paren) ? CLOSE+parno : END);	
+	regtail(ret, ender);
+
+	/* Hook the tails of the branches to the closing node. */
+	for (br = ret; br != NULL; br = regnext(br))
+		regoptail(br, ender);
+
+	/* Check for proper termination. */
+	if (paren && *regparse++ != ')') {
+		FAIL("unmatched ()");
+	} else if (!paren && *regparse != '\0') {
+		if (*regparse == ')') {
+			FAIL("unmatched ()");
+		} else
+			FAIL("junk on end");	/* "Can't happen". */
+		/* NOTREACHED */
+	}
+
+	return(ret);
+}
+
+/*
+ - regbranch - one alternative of an | operator
+ *
+ * Implements the concatenation operator.
+ */
+static char *
+regbranch(flagp)
+int *flagp;
+{
+	register char *ret;
+	register char *chain;
+	register char *latest;
+	int flags;
+
+	*flagp = WORST;		/* Tentatively. */
+
+	ret = regnode(BRANCH);
+	chain = NULL;
+	while (*regparse != '\0' && *regparse != '|' && *regparse != ')') {
+		latest = regpiece(&flags);
+		if (latest == NULL)
+			return(NULL);
+		*flagp |= flags&HASWIDTH;
+		if (chain == NULL)	/* First piece. */
+			*flagp |= flags&SPSTART;
+		else
+			regtail(chain, latest);
+		chain = latest;
+	}
+	if (chain == NULL)	/* Loop ran zero times. */
+		(void) regnode(NOTHING);
+
+	return(ret);
+}
+
+/*
+ - regpiece - something followed by possible [*+?]
+ *
+ * Note that the branching code sequences used for ? and the general cases
+ * of * and + are somewhat optimized:  they use the same NOTHING node as
+ * both the endmarker for their branch list and the body of the last branch.
+ * It might seem that this node could be dispensed with entirely, but the
+ * endmarker role is not redundant.
+ */
+static char *
+regpiece(flagp)
+int *flagp;
+{
+	register char *ret;
+	register char op;
+	register char *next;
+	int flags;
+
+	ret = regatom(&flags);
+	if (ret == NULL)
+		return(NULL);
+
+	op = *regparse;
+	if (!ISMULT(op)) {
+		*flagp = flags;
+		return(ret);
+	}
+
+	if (!(flags&HASWIDTH) && op != '?')
+		FAIL("*+ operand could be empty");
+	*flagp = (op != '+') ? (WORST|SPSTART) : (WORST|HASWIDTH);
+
+	if (op == '*' && (flags&SIMPLE))
+		reginsert(STAR, ret);
+	else if (op == '*') {
+		/* Emit x* as (x&|), where & means "self". */
+		reginsert(BRANCH, ret);			/* Either x */
+		regoptail(ret, regnode(BACK));		/* and loop */
+		regoptail(ret, ret);			/* back */
+		regtail(ret, regnode(BRANCH));		/* or */
+		regtail(ret, regnode(NOTHING));		/* null. */
+	} else if (op == '+' && (flags&SIMPLE))
+		reginsert(PLUS, ret);
+	else if (op == '+') {
+		/* Emit x+ as x(&|), where & means "self". */
+		next = regnode(BRANCH);			/* Either */
+		regtail(ret, next);
+		regtail(regnode(BACK), ret);		/* loop back */
+		regtail(next, regnode(BRANCH));		/* or */
+		regtail(ret, regnode(NOTHING));		/* null. */
+	} else if (op == '?') {
+		/* Emit x? as (x|) */
+		reginsert(BRANCH, ret);			/* Either x */
+		regtail(ret, regnode(BRANCH));		/* or */
+		next = regnode(NOTHING);		/* null. */
+		regtail(ret, next);
+		regoptail(ret, next);
+	}
+	regparse++;
+	if (ISMULT(*regparse))
+		FAIL("nested *?+");
+
+	return(ret);
+}
+
+/*
+ - regatom - the lowest level
+ *
+ * Optimization:  gobbles an entire sequence of ordinary characters so that
+ * it can turn them into a single node, which is smaller to store and
+ * faster to run.  Backslashed characters are exceptions, each becoming a
+ * separate node; the code is simpler that way and it's not worth fixing.
+ */
+static char *
+regatom(flagp)
+int *flagp;
+{
+	register char *ret;
+	int flags;
+
+	*flagp = WORST;		/* Tentatively. */
+
+	switch (*regparse++) {
+	case '^':
+		ret = regnode(BOL);
+		break;
+	case '$':
+		ret = regnode(EOL);
+		break;
+	case '.':
+		ret = regnode(ANY);
+		*flagp |= HASWIDTH|SIMPLE;
+		break;
+	case '[': {
+			register int class;
+			register int classend;
+
+			if (*regparse == '^') {	/* Complement of range. */
+				ret = regnode(ANYBUT);
+				regparse++;
+			} else
+				ret = regnode(ANYOF);
+			if (*regparse == ']' || *regparse == '-')
+				regc(*regparse++);
+			while (*regparse != '\0' && *regparse != ']') {
+				if (*regparse == '-') {
+					regparse++;
+					if (*regparse == ']' || *regparse == '\0')
+						regc('-');
+					else {
+						class = UCHARAT(regparse-2)+1;
+						classend = UCHARAT(regparse);
+						if (class > classend+1)
+							FAIL("invalid [] range");
+						for (; class <= classend; class++)
+							regc(class);
+						regparse++;
+					}
+				} else
+					regc(*regparse++);
+			}
+			regc('\0');
+			if (*regparse != ']')
+				FAIL("unmatched []");
+			regparse++;
+			*flagp |= HASWIDTH|SIMPLE;
+		}
+		break;
+	case '(':
+		ret = reg(1, &flags);
+		if (ret == NULL)
+			return(NULL);
+		*flagp |= flags&(HASWIDTH|SPSTART);
+		break;
+	case '\0':
+	case '|':
+	case ')':
+		FAIL("internal urp");	/* Supposed to be caught earlier. */
+		break;
+	case '?':
+	case '+':
+	case '*':
+		FAIL("?+* follows nothing");
+		break;
+	case '\\':
+		if (*regparse == '\0')
+			FAIL("trailing \\");
+		ret = regnode(EXACTLY);
+		regc(*regparse++);
+		regc('\0');
+		*flagp |= HASWIDTH|SIMPLE;
+		break;
+	default: {
+			register int len;
+			register char ender;
+
+			regparse--;
+			len = strcspn(regparse, META);
+			if (len <= 0)
+				FAIL("internal disaster");
+			ender = *(regparse+len);
+			if (len > 1 && ISMULT(ender))
+				len--;		/* Back off clear of ?+* operand. */
+			*flagp |= HASWIDTH;
+			if (len == 1)
+				*flagp |= SIMPLE;
+			ret = regnode(EXACTLY);
+			while (len > 0) {
+				regc(*regparse++);
+				len--;
+			}
+			regc('\0');
+		}
+		break;
+	}
+
+	return(ret);
+}
+
+/*
+ - regnode - emit a node
+ */
+static char *			/* Location. */
+regnode(op)
+char op;
+{
+	register char *ret;
+	register char *ptr;
+
+	ret = regcode;
+	if (ret == &regdummy) {
+		regsize += 3;
+		return(ret);
+	}
+
+	ptr = ret;
+	*ptr++ = op;
+	*ptr++ = '\0';		/* Null "next" pointer. */
+	*ptr++ = '\0';
+	regcode = ptr;
+
+	return(ret);
+}
+
+/*
+ - regc - emit (if appropriate) a byte of code
+ */
+static void
+regc(b)
+char b;
+{
+	if (regcode != &regdummy)
+		*regcode++ = b;
+	else
+		regsize++;
+}
+
+/*
+ - reginsert - insert an operator in front of already-emitted operand
+ *
+ * Means relocating the operand.
+ */
+static void
+reginsert(op, opnd)
+char op;
+char *opnd;
+{
+	register char *src;
+	register char *dst;
+	register char *place;
+
+	if (regcode == &regdummy) {
+		regsize += 3;
+		return;
+	}
+
+	src = regcode;
+	regcode += 3;
+	dst = regcode;
+	while (src > opnd)
+		*--dst = *--src;
+
+	place = opnd;		/* Op node, where operand used to be. */
+	*place++ = op;
+	*place++ = '\0';
+	*place++ = '\0';
+}
+
+/*
+ - regtail - set the next-pointer at the end of a node chain
+ */
+static void
+regtail(p, val)
+char *p;
+char *val;
+{
+	register char *scan;
+	register char *temp;
+	register int offset;
+
+	if (p == &regdummy)
+		return;
+
+	/* Find last node. */
+	scan = p;
+	for (;;) {
+		temp = regnext(scan);
+		if (temp == NULL)
+			break;
+		scan = temp;
+	}
+
+	if (OP(scan) == BACK)
+		offset = scan - val;
+	else
+		offset = val - scan;
+	*(scan+1) = (offset>>8)&0377;
+	*(scan+2) = offset&0377;
+}
+
+/*
+ - regoptail - regtail on operand of first argument; nop if operandless
+ */
+static void
+regoptail(p, val)
+char *p;
+char *val;
+{
+	/* "Operandless" and "op != BRANCH" are synonymous in practice. */
+	if (p == NULL || p == &regdummy || OP(p) != BRANCH)
+		return;
+	regtail(OPERAND(p), val);
+}
+
+/*
+ * regexec and friends
+ */
+
+/*
+ * Global work variables for regexec().
+ */
+static char *reginput;		/* String-input pointer. */
+static char *regbol;		/* Beginning of input, for ^ check. */
+static char **regstartp;	/* Pointer to startp array. */
+static char **regendp;		/* Ditto for endp. */
+
+/*
+ * Forwards.
+ */
+STATIC int regtry();
+STATIC int regmatch();
+STATIC int regrepeat();
+
+#ifdef DEBUG
+int regnarrate = 0;
+void regdump();
+STATIC char *regprop();
+#endif
+
+/*
+ - regexec - match a regexp against a string
+ */
+int
+regexec(prog, string)
+register regexp *prog;
+register char *string;
+{
+	register char *s;
+	extern char *strchr();
+
+	/* Be paranoid... */
+	if (prog == NULL || string == NULL) {
+		regerror("NULL parameter");
+		return(0);
+	}
+
+	/* Check validity of program. */
+	if (UCHARAT(prog->program) != MAGIC) {
+		regerror("corrupted program");
+		return(0);
+	}
+
+	/* If there is a "must appear" string, look for it. */
+	if (prog->regmust != NULL) {
+		s = string;
+		while ((s = strchr(s, prog->regmust[0])) != NULL) {
+			if (strncmp(s, prog->regmust, prog->regmlen) == 0)
+				break;	/* Found it. */
+			s++;
+		}
+		if (s == NULL)	/* Not present. */
+			return(0);
+	}
+
+	/* Mark beginning of line for ^ . */
+	regbol = string;
+
+	/* Simplest case:  anchored match need be tried only once. */
+	if (prog->reganch)
+		return(regtry(prog, string));
+
+	/* Messy cases:  unanchored match. */
+	s = string;
+	if (prog->regstart != '\0')
+		/* We know what char it must start with. */
+		while ((s = strchr(s, prog->regstart)) != NULL) {
+			if (regtry(prog, s))
+				return(1);
+			s++;
+		}
+	else
+		/* We don't -- general case. */
+		do {
+			if (regtry(prog, s))
+				return(1);
+		} while (*s++ != '\0');
+
+	/* Failure. */
+	return(0);
+}
+
+/*
+ - regtry - try match at specific point
+ */
+static int			/* 0 failure, 1 success */
+regtry(prog, string)
+regexp *prog;
+char *string;
+{
+	register int i;
+	register char **sp;
+	register char **ep;
+
+	reginput = string;
+	regstartp = prog->startp;
+	regendp = prog->endp;
+
+	sp = prog->startp;
+	ep = prog->endp;
+	for (i = NSUBEXP; i > 0; i--) {
+		*sp++ = NULL;
+		*ep++ = NULL;
+	}
+	if (regmatch(prog->program + 1)) {
+		prog->startp[0] = string;
+		prog->endp[0] = reginput;
+		return(1);
+	} else
+		return(0);
+}
+
+/*
+ - regmatch - main matching routine
+ *
+ * Conceptually the strategy is simple:  check to see whether the current
+ * node matches, call self recursively to see whether the rest matches,
+ * and then act accordingly.  In practice we make some effort to avoid
+ * recursion, in particular by going through "ordinary" nodes (that don't
+ * need to know whether the rest of the match failed) by a loop instead of
+ * by recursion.
+ */
+static int			/* 0 failure, 1 success */
+regmatch(prog)
+char *prog;
+{
+	register char *scan;	/* Current node. */
+	char *next;		/* Next node. */
+	extern char *strchr();
+
+	scan = prog;
+#ifdef DEBUG
+	if (scan != NULL && regnarrate)
+		fprintf(stderr, "%s(\n", regprop(scan));
+#endif
+	while (scan != NULL) {
+#ifdef DEBUG
+		if (regnarrate)
+			fprintf(stderr, "%s...\n", regprop(scan));
+#endif
+		next = regnext(scan);
+
+		switch (OP(scan)) {
+		case BOL:
+			if (reginput != regbol)
+				return(0);
+			break;
+		case EOL:
+			if (*reginput != '\0')
+				return(0);
+			break;
+		case ANY:
+			if (*reginput == '\0')
+				return(0);
+			reginput++;
+			break;
+		case EXACTLY: {
+				register int len;
+				register char *opnd;
+
+				opnd = OPERAND(scan);
+				/* Inline the first character, for speed. */
+				if (*opnd != *reginput)
+					return(0);
+				len = strlen(opnd);
+				if (len > 1 && strncmp(opnd, reginput, len) != 0)
+					return(0);
+				reginput += len;
+			}
+			break;
+		case ANYOF:
+			if (*reginput == '\0' || strchr(OPERAND(scan), *reginput) == NULL)
+				return(0);
+			reginput++;
+			break;
+		case ANYBUT:
+			if (*reginput == '\0' || strchr(OPERAND(scan), *reginput) != NULL)
+				return(0);
+			reginput++;
+			break;
+		case NOTHING:
+			break;
+		case BACK:
+			break;
+		case OPEN+1:
+		case OPEN+2:
+		case OPEN+3:
+		case OPEN+4:
+		case OPEN+5:
+		case OPEN+6:
+		case OPEN+7:
+		case OPEN+8:
+		case OPEN+9: {
+				register int no;
+				register char *save;
+
+				no = OP(scan) - OPEN;
+				save = reginput;
+
+				if (regmatch(next)) {
+					/*
+					 * Don't set startp if some later
+					 * invocation of the same parentheses
+					 * already has.
+					 */
+					if (regstartp[no] == NULL)
+						regstartp[no] = save;
+					return(1);
+				} else
+					return(0);
+			}
+			break;
+		case CLOSE+1:
+		case CLOSE+2:
+		case CLOSE+3:
+		case CLOSE+4:
+		case CLOSE+5:
+		case CLOSE+6:
+		case CLOSE+7:
+		case CLOSE+8:
+		case CLOSE+9: {
+				register int no;
+				register char *save;
+
+				no = OP(scan) - CLOSE;
+				save = reginput;
+
+				if (regmatch(next)) {
+					/*
+					 * Don't set endp if some later
+					 * invocation of the same parentheses
+					 * already has.
+					 */
+					if (regendp[no] == NULL)
+						regendp[no] = save;
+					return(1);
+				} else
+					return(0);
+			}
+			break;
+		case BRANCH: {
+				register char *save;
+
+				if (OP(next) != BRANCH)		/* No choice. */
+					next = OPERAND(scan);	/* Avoid recursion. */
+				else {
+					do {
+						save = reginput;
+						if (regmatch(OPERAND(scan)))
+							return(1);
+						reginput = save;
+						scan = regnext(scan);
+					} while (scan != NULL && OP(scan) == BRANCH);
+					return(0);
+					/* NOTREACHED */
+				}
+			}
+			break;
+		case STAR:
+		case PLUS: {
+				register char nextch;
+				register int no;
+				register char *save;
+				register int min;
+
+				/*
+				 * Lookahead to avoid useless match attempts
+				 * when we know what character comes next.
+				 */
+				nextch = '\0';
+				if (OP(next) == EXACTLY)
+					nextch = *OPERAND(next);
+				min = (OP(scan) == STAR) ? 0 : 1;
+				save = reginput;
+				no = regrepeat(OPERAND(scan));
+				while (no >= min) {
+					/* If it could work, try it. */
+					if (nextch == '\0' || *reginput == nextch)
+						if (regmatch(next))
+							return(1);
+					/* Couldn't or didn't -- back up. */
+					no--;
+					reginput = save + no;
+				}
+				return(0);
+			}
+			break;
+		case END:
+			return(1);	/* Success! */
+			break;
+		default:
+			regerror("memory corruption");
+			return(0);
+			break;
+		}
+
+		scan = next;
+	}
+
+	/*
+	 * We get here only if there's trouble -- normally "case END" is
+	 * the terminating point.
+	 */
+	regerror("corrupted pointers");
+	return(0);
+}
+
+/*
+ - regrepeat - repeatedly match something simple, report how many
+ */
+static int
+regrepeat(p)
+char *p;
+{
+	register int count = 0;
+	register char *scan;
+	register char *opnd;
+
+	scan = reginput;
+	opnd = OPERAND(p);
+	switch (OP(p)) {
+	case ANY:
+		count = strlen(scan);
+		scan += count;
+		break;
+	case EXACTLY:
+		while (*opnd == *scan) {
+			count++;
+			scan++;
+		}
+		break;
+	case ANYOF:
+		while (*scan != '\0' && strchr(opnd, *scan) != NULL) {
+			count++;
+			scan++;
+		}
+		break;
+	case ANYBUT:
+		while (*scan != '\0' && strchr(opnd, *scan) == NULL) {
+			count++;
+			scan++;
+		}
+		break;
+	default:		/* Oh dear.  Called inappropriately. */
+		regerror("internal foulup");
+		count = 0;	/* Best compromise. */
+		break;
+	}
+	reginput = scan;
+
+	return(count);
+}
+
+/*
+ - regnext - dig the "next" pointer out of a node
+ */
+static char *
+regnext(p)
+register char *p;
+{
+	register int offset;
+
+	if (p == &regdummy)
+		return(NULL);
+
+	offset = NEXT(p);
+	if (offset == 0)
+		return(NULL);
+
+	if (OP(p) == BACK)
+		return(p-offset);
+	else
+		return(p+offset);
+}
+
+#ifdef DEBUG
+
+STATIC char *regprop();
+
+/*
+ - regdump - dump a regexp onto stdout in vaguely comprehensible form
+ */
+void
+regdump(r)
+regexp *r;
+{
+	register char *s;
+	register char op = EXACTLY;	/* Arbitrary non-END op. */
+	register char *next;
+	extern char *strchr();
+
+
+	s = r->program + 1;
+	while (op != END) {	/* While that wasn't END last time... */
+		op = OP(s);
+		printf("%2d%s", s-r->program, regprop(s));	/* Where, what. */
+		next = regnext(s);
+		if (next == NULL)		/* Next ptr. */
+			printf("(0)");
+		else 
+			printf("(%d)", (s-r->program)+(next-s));
+		s += 3;
+		if (op == ANYOF || op == ANYBUT || op == EXACTLY) {
+			/* Literal string, where present. */
+			while (*s != '\0') {
+				putchar(*s);
+				s++;
+			}
+			s++;
+		}
+		putchar('\n');
+	}
+
+	/* Header fields of interest. */
+	if (r->regstart != '\0')
+		printf("start `%c' ", r->regstart);
+	if (r->reganch)
+		printf("anchored ");
+	if (r->regmust != NULL)
+		printf("must have \"%s\"", r->regmust);
+	printf("\n");
+}
+
+/*
+ - regprop - printable representation of opcode
+ */
+static char *
+regprop(op)
+char *op;
+{
+	register char *p;
+	static char buf[50];
+
+	(void) strcpy(buf, ":");
+
+	switch (OP(op)) {
+	case BOL:
+		p = "BOL";
+		break;
+	case EOL:
+		p = "EOL";
+		break;
+	case ANY:
+		p = "ANY";
+		break;
+	case ANYOF:
+		p = "ANYOF";
+		break;
+	case ANYBUT:
+		p = "ANYBUT";
+		break;
+	case BRANCH:
+		p = "BRANCH";
+		break;
+	case EXACTLY:
+		p = "EXACTLY";
+		break;
+	case NOTHING:
+		p = "NOTHING";
+		break;
+	case BACK:
+		p = "BACK";
+		break;
+	case END:
+		p = "END";
+		break;
+	case OPEN+1:
+	case OPEN+2:
+	case OPEN+3:
+	case OPEN+4:
+	case OPEN+5:
+	case OPEN+6:
+	case OPEN+7:
+	case OPEN+8:
+	case OPEN+9:
+		sprintf(buf+strlen(buf), "OPEN%d", OP(op)-OPEN);
+		p = NULL;
+		break;
+	case CLOSE+1:
+	case CLOSE+2:
+	case CLOSE+3:
+	case CLOSE+4:
+	case CLOSE+5:
+	case CLOSE+6:
+	case CLOSE+7:
+	case CLOSE+8:
+	case CLOSE+9:
+		sprintf(buf+strlen(buf), "CLOSE%d", OP(op)-CLOSE);
+		p = NULL;
+		break;
+	case STAR:
+		p = "STAR";
+		break;
+	case PLUS:
+		p = "PLUS";
+		break;
+	default:
+		regerror("corrupted opcode");
+		break;
+	}
+	if (p != NULL)
+		(void) strcat(buf, p);
+	return(buf);
+}
+#endif
+
+/*
+ * The following is provided for those people who do not have strcspn() in
+ * their C libraries.  They should get off their butts and do something
+ * about it; at least one public-domain implementation of those (highly
+ * useful) string routines has been published on Usenet.
+ */
+#ifdef STRCSPN
+/*
+ * strcspn - find length of initial segment of s1 consisting entirely
+ * of characters not from s2
+ */
+
+static int
+strcspn(s1, s2)
+char *s1;
+char *s2;
+{
+	register char *scan1;
+	register char *scan2;
+	register int count;
+
+	count = 0;
+	for (scan1 = s1; *scan1 != '\0'; scan1++) {
+		for (scan2 = s2; *scan2 != '\0';)	/* ++ moved down. */
+			if (*scan1 == *scan2++)
+				return(count);
+		count++;
+	}
+	return(count);
+}
+#endif
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'scrn.c'
+then
+	echo shar: will not over-write existing file "'scrn.c'"
+else
+cat << \SHAR_EOF > 'scrn.c'
+/* Scrn.c replaces screen.c that was in the net distribution. Module contains
+ * PC screen routines plus whatever was in screen.c that had to be kept for
+ * linking with the other modules at link time.
+ */
+ 
+#include <dos.h>
+#include <stdlib.h>
+#include <string.h>
+#include "scrn.h"
+
+#define CNTL_H		0x08
+#define CNTL_U		0x15
+#define NL		0x0a
+#define CR		0x0d
+#define TAB		0x09
+#define BELL		0x07
+#define ROWS		25
+#define COLUMS		80
+
+#define	NOT_QUIET	0	/* Ring bell at eof and for errors */
+#define	LITTLE_QUIET	1	/* Ring bell only for errors */
+#define	VERY_QUIET	2	/* Never ring bell */
+
+extern int quiet;		/* If VERY_QUIET, use visual bell for bell */
+extern int scrn_in_color;	/* When using color monitor */
+int erase_char, kill_char;	/* The user's erase and line-kill chars */
+int sc_height, sc_width, se_width, ue_width, ul_width, so_width;
+int auto_wrap, ignaw;
+void init(), dinit(), get_term(), home(), bell(), vbell(), add_line();
+void lower_left(), clear(), clear_eol(), so_enter(), so_exit(), ul_enter();
+void ul_exit(), backspace(), putbs(), raw_mode();
+
+cls()         /* move cursor home and clear the screen  */
+{
+	union REGS REG;
+	int mode;
+    
+	gotoxy(0, 0);
+	REG.x.ax = 0x0600;
+	if (scrn_in_color == 1)
+		REG.h.bh = WHITE_ON_BLUE;
+	else
+		REG.h.bh = BW;
+	REG.x.cx = 0x0000;
+	REG.x.dx = 0x184f;
+	int86(0x10, &REG, &REG);
+}
+
+era_eol()
+{
+	union REGS REG;
+	int hold[4];
+	int column;
+
+	getxy(hold);
+	column = hold[1];
+	if (scrn_in_color == 1)
+		REG.x.bx = WHITE_ON_BLUE;
+	else
+		REG.x.bx = BW;
+	REG.x.ax = 0x0900;	/* ah = 10; al = null char to write */
+	REG.x.cx = 80 - column;	/* cx = no. of nulls to write */
+	int86(0x10, &REG, &REG);
+	restorxy(hold);		/* retore cursor to original position */
+	return;
+}
+
+gotoxy(row, col)  /* Position cursor at x,y on screen */
+int	row, col;
+{
+	union REGS REG;
+
+	REG.h.ah = 02;
+	REG.h.bh = 00;
+	REG.h.dh = row;
+	REG.h.dl = col;
+	int86(0x10, &REG, &REG);
+}
+
+getxy(hold) /* Get cursor coordinates */
+int *hold;
+{
+	union REGS REG;
+
+	REG.h.ah = 03;
+	REG.h.bh = 00;
+	int86(0x10, &REG, &REG);
+	hold[0] = REG.h.dh;
+	hold[1] = REG.h.dl;
+	hold[2] = REG.h.ch;
+	hold[3] = REG.h.cl;
+}
+
+
+restorxy(hold)  /* Restore cursor gotten above */
+int *hold;
+{
+	union REGS REG;
+
+	gotoxy(hold[0], hold[1]);
+	REG.h.ah = 01;
+	REG.h.bh = 00;
+	REG.h.ch = hold[2];
+	REG.h.cl = hold[3];
+	int86(0x10, &REG, &REG);
+}
+
+curs_r(n)	/* move cursor right n places */
+int n;
+{
+	int hold[4];
+	int row, column;
+		
+	getxy(hold);
+	row = hold[0];
+	column = hold[1];
+	if (column < 0)
+		if (n < 0)
+			return(0);
+	if (column > 79)
+		if (n > 0)
+			return(0);
+	column = column + n;
+	gotoxy(row, column);
+}						
+
+curs_l(n)	/* move cursor left n places */
+int n;
+{
+	curs_r(-n);
+}
+
+scroll_up(n)
+int n;
+{
+	union REGS REG;
+
+	REG.h.ah = 0x06;
+	if (scrn_in_color == 1)
+			REG.h.bh = WHITE_ON_BLUE;
+	else
+		REG.h.bh = BW;
+	REG.h.al = n;
+	REG.x.cx = 0x0000;
+	REG.x.dx = 256 * 24 + 79;
+	int86(0x10, &REG, &REG);
+	return(1);
+}
+
+get_mode()   /* Check for Monochrome mode 7 */
+{
+	union REGS REG;
+
+	REG.h.ah = 15;
+	int86(0x10, &REG, &REG);
+	return(REG.h.al);
+}
+
+
+/*
+ * Set cursor checking for current cursor size parameters.
+ */
+
+set_cur()
+{
+	union REGS INREG, OUTREG;
+
+	if (get_mode() == 7)
+	{
+		INREG.h.ah = 1;
+		INREG.h.bh = 0x00;
+		INREG.h.ch = 12;
+		INREG.h.cl = 13;
+		int86(0x10, &INREG, &OUTREG);
+	}
+	else
+	{
+		INREG.h.ah = 0x03;
+		INREG.h.bh = 0x00;
+		int86(0x10, &INREG, &OUTREG);
+		INREG.h.ah = 0x01;
+		INREG.h.bh = 0x00;
+		INREG.h.ch = OUTREG.h.ch;
+		INREG.h.cl = OUTREG.h.cl;
+		int86(0x10, &INREG, &OUTREG);
+	}
+}
+
+chr_put(c, attribute)
+int c;
+int attribute;
+{
+    union REGS REG;
+    int hold[4];
+    int i, row, column;
+            
+    if (c == CR)
+    {
+    	getxy(hold);
+    	row = hold[0];
+    	column = 0;
+    	gotoxy(row, column);
+        return(1);
+    }
+    if (c == TAB)
+    {
+    	for (i = 0;i <= 7;++i)
+    		chr_put(' ', attribute);
+        return(1);
+    }
+    if (c == BELL)
+    {
+    	putch(7);
+    	return(1);
+    }
+    if (c == NL)
+    {
+	getxy(hold);
+	row = hold[0];
+        if (row >= 24)
+        	scroll_up(1);
+	else
+		++row;
+	column = 0;
+	gotoxy(row, column);
+        return(1);
+    }    	
+    REG.h.ah = 0x9;
+    REG.h.al = c;
+    REG.h.bl = attribute;
+    REG.h.bh = 00;
+    REG.x.cx = 1;
+    int86(0x10, &REG, &REG);
+    curs_r(1);
+    return(REG.x.ax);
+}
+
+str_put(str, attribute)
+char *str;
+int attribute;
+{
+	int i;
+
+	if (scrn_in_color == 1)
+		attribute = WHITE_ON_RED;
+	else
+		attribute = REV_VID;
+	for (i = 0;i < strlen(str);++i)
+		chr_put(*(str + i), attribute);
+}
+
+
+/*
+ * Add a blank line (called with cursor at home).
+ * Should scroll the display down.
+ */
+
+void
+add_line()
+{
+	union REGS REG;
+	int hold[4];	
+	int row, column;
+
+	REG.h.ah = 0x07;
+	if (scrn_in_color == 1)
+		REG.h.bh = WHITE_ON_BLUE;
+	else
+		REG.h.bh = BW;
+	REG.h.al = 1;
+	getxy(hold);
+	row = hold[0];
+	column = hold[1];
+	REG.h.ch = row;
+	REG.h.cl = 0;
+	REG.h.dh = 24;
+	REG.h.dl = 79;
+	int86(0x10, &REG, &REG);
+}	
+
+/*
+ * Below are the functions which perform all the "less terminal-specific"
+ * screen manipulation functions. They are taken from screen.c that was
+ * in the distribution of less on the news.
+ */
+
+/*
+ * Initialize terminal
+ */
+void
+init()
+{
+	set_cur();
+}
+
+/*
+ * Deinitialize terminal
+ */
+void
+deinit()
+{
+}
+
+void
+get_term()
+{
+	sc_height = ROWS;
+	sc_width = COLUMS;
+	se_width = 0;
+	ue_width = 0;
+	ul_width = 0;
+	so_width = 0;
+	auto_wrap = 0;			/* chr_put doesn't autowrap */
+	ignaw = 0;
+	/* sneak in kill and erase characters for command line editing */
+	kill_char = CNTL_U;		/* use ctrl-u as kill chararcter */
+	erase_char = CNTL_H;		/* use ctrl-h as erase character */
+}
+
+void
+raw_mode(on)
+int on;
+{
+	/* left here in case there is a desire */
+	/* to put terminal in raw_mode vs cooked */
+}
+
+/*
+ * Home cursor (move to upper left corner of screen).
+ */
+
+void
+home()
+{
+	gotoxy(0, 0);
+}
+
+/*
+ * Move cursor to lower left corner of screen.
+ */
+void
+lower_left()
+{
+	gotoxy(24, 0);
+}
+
+/*
+ * Ring the terminal bell.
+ */
+void
+bell()
+{
+	if (quiet == VERY_QUIET)
+		vbell();
+	else
+		putch(BELL);
+}
+
+/*
+ * Output the "visual bell", if there is one.
+ */
+void
+vbell()
+{
+	/* there is no visual bell at this time */
+	return;
+}
+
+/*
+ * Clear the screen.
+ */
+void
+clear()
+{
+	cls();
+}
+
+/*
+ * Clear from the cursor to the end of the cursor's line.
+ * {{ This must not move the cursor. }}
+ */
+void
+clear_eol()
+{
+	era_eol();
+}
+
+/*
+ * Begin "standout" (bold, underline, or whatever).
+ */
+void
+so_enter()
+{
+}
+
+/*
+ * End "standout".
+ */
+void
+so_exit()
+{
+}
+
+/*
+ * Begin "underline" (hopefully real underlining, 
+ * otherwise whatever the terminal provides).
+ */
+void
+ul_enter()
+{
+}
+
+/*
+ * End "underline".
+ */
+void
+ul_exit()
+{
+}
+
+/*
+ * Erase the character to the left of the cursor 
+ * and move the cursor left.
+ */
+void
+backspace()
+{
+	/* 
+	 * Try to erase the previous character by overstriking with a space.
+	 */
+	curs_l(1);
+	putc(' ');
+	curs_l(1);
+}
+
+/*
+ * Output a plain backspace, without erasing the previous char.
+ */
+void
+putbs()
+{
+	curs_l(1);
+}
+
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'signal.c'
+then
+	echo shar: will not over-write existing file "'signal.c'"
+else
+cat << \SHAR_EOF > 'signal.c'
+/*
+ * Routines dealing with signals.
+ *
+ * A signal usually merely causes a bit to be set in the "signals" word.
+ * At some convenient time, the mainline code checks to see if any
+ * signals need processing by calling psignal().
+ * An exception is made if we are reading from the keyboard when the
+ * signal is received.  Some operating systems will simply call the
+ * signal handler and NOT return from the read (with EINTR).
+ * To handle this case, we service the interrupt directly from
+ * the handler if we are reading from the keyboard.
+ */
+
+#include "less.h"
+#include <signal.h>
+#include <setjmp.h>
+#ifdef MSDOS
+char get_swchar();
+void swchar_to_dos();
+void swchar_to_unix();
+#include <process.h>
+#include <dos.h>
+#endif
+
+/*
+ * The type of signal handler functions.
+ * Usually int, although it should be void.
+ */
+typedef	int		HANDLER;
+
+/*
+ * "sigs" contains bits indicating signals which need to be processed.
+ */
+public int sigs;
+#define	S_INTERRUPT	01
+#ifdef SIGTSTP
+#define	S_STOP		02
+#endif
+
+extern int reading;
+extern char *first_cmd;
+extern jmp_buf main_loop;
+
+/*
+ * Interrupt signal handler.
+ */
+	static HANDLER
+interrupt()
+{
+	SIGNAL(SIGINT, interrupt);
+	sigs |= S_INTERRUPT;
+	if (reading)
+		psignals();
+}
+
+#ifdef SIGTSTP
+/*
+ * "Stop" (^Z) signal handler.
+ */
+	static HANDLER
+stop()
+{
+	SIGNAL(SIGTSTP, stop);
+	sigs |= S_STOP;
+	if (reading)
+		psignals();
+}
+#endif
+
+/*
+ * Set up the signal handlers.
+ */
+	public void
+init_signals()
+{
+	(void) SIGNAL(SIGINT, interrupt);
+#ifdef SIGTSTP
+	(void) SIGNAL(SIGTSTP, stop);
+#endif
+}
+
+/*
+ * Process any signals we have recieved.
+ * A received signal cause a bit to be set in "sigs".
+ */
+	public void 
+psignals()
+{
+	register int tsignals;
+
+	tsignals = sigs;
+	sigs = 0;
+	if (tsignals == 0)
+		return;
+
+	dropout();		/* Discard any buffered output */
+
+#ifdef SIGTSTP
+	if (tsignals & S_STOP)
+	{
+		/*
+		 * Clean up the terminal.
+		 */
+#ifdef SIGTTOU
+		SIGNAL(SIGTTOU, SIG_IGN);
+#endif
+		lower_left();
+		clear_eol();
+		flush();
+		raw_mode(0);
+#ifdef SIGTTOU
+		SIGNAL(SIGTTOU, SIG_DFL);
+#endif
+		SIGNAL(SIGTSTP, SIG_DFL);
+#if SIGSETMASK
+		/*
+		 * This system will not allow us to send a 
+		 * stop signal (SIGTSTP) to ourself
+		 * while we are in the signal handler, like maybe now.
+		 * (This can be the case if we are reading; see comment above.)
+		 * So we ask the silly system for permission to do so.
+		 */
+		sigsetmask(0);
+#endif
+		kill(getpid(), SIGTSTP);
+		/*
+		 * ... Bye bye. ...
+		 * Hopefully we'll be back later and resume here...
+		 * Reset the terminal and arrange to repaint the
+		 * screen when we get back to the main command loop.
+		 */
+		SIGNAL(SIGTSTP, stop);
+		raw_mode(1);
+		first_cmd = "r";
+		longjmp(main_loop, 1);
+	}
+#endif
+	if (tsignals & S_INTERRUPT)
+	{
+		bell();
+		/*
+		 * {{ You may wish to replace the bell() with 
+		 *    error("Interrupt"); }}
+		 */
+	}
+
+	longjmp(main_loop, 1);
+}
+
+/*
+ * Pass the specified command to a shell to be executed.
+ * Like plain "system()", but handles resetting terminal modes, etc.
+ */
+	public void
+lsystem(cmd)
+	char *cmd;
+{
+#ifdef MSDOS
+	int result;
+	char sw_char;
+#endif
+	int inp;
+
+	/*
+	 * Print the command which is to be executed.
+	 */
+	lower_left();
+	clear_eol();
+	puts("!");
+	puts(cmd);
+	puts("\n");
+
+	/*
+	 * De-initialize the terminal and take out of raw mode.
+	 */
+#ifndef MSDOS
+	deinit();
+	flush();
+	raw_mode(0);
+#endif
+	/*
+	 * Restore signals to their defaults.
+	 */
+	SIGNAL(SIGINT, SIG_DFL);
+#ifdef SIGTSTP
+	SIGNAL(SIGTSTP, SIG_DFL);
+#endif
+	/*
+	 * Pass the command to the system to be executed.
+	 */
+#ifndef MSDOS
+	inp = dup(0);
+	close(0);
+	open("/dev/tty", 0);
+#endif
+#ifdef MSDOS
+	sw_char = get_swchar();
+	swchar_to_dos();
+	result = system(cmd);
+	if (result != 0)
+		perror("Less");
+	if (sw_char == '-')
+		swchar_to_unix();
+#else
+	system(cmd);
+#endif
+#ifndef MSDOS
+	close(0);
+	dup(inp);
+	close(inp);
+#endif
+	/*
+	 * Reset signals, raw mode, etc.
+	 */
+#ifndef MSDOS
+	init_signals();
+	raw_mode(1);
+	init();
+#endif
+}
+
+#ifdef MSDOS
+char
+get_swchar()
+{
+	union REGS inregs;
+	union REGS outregs;
+	
+	inregs.h.ah = 0x37;
+	inregs.h.al = 0;
+	intdos(&inregs, &outregs);
+	return(outregs.h.dl);
+}
+
+
+void
+swchar_to_dos()
+{
+	union REGS inregs;
+	union REGS outregs;
+	
+	inregs.h.ah = 0x37;
+	inregs.h.al = 0x01;
+	inregs.h.dl = '/';
+	intdos(&inregs, &outregs);
+	return;
+}	
+
+void
+swchar_to_unix()
+{
+	union REGS inregs;
+	union REGS outregs;
+	
+	inregs.h.ah = 0x37;
+	inregs.h.al = 0x01;
+	inregs.h.dl = '-';
+	intdos(&inregs, &outregs);
+	return;
+}
+
+#endif
+
+
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'ttyin.c'
+then
+	echo shar: will not over-write existing file "'ttyin.c'"
+else
+cat << \SHAR_EOF > 'ttyin.c'
+/*
+ * Routines dealing with getting input from the keyboard (i.e. from the user).
+ */
+
+#include "less.h"
+
+/*
+ * The boolean "reading" is set true or false according to whether
+ * we are currently reading from the keyboard.
+ * This information is used by the signal handling stuff in signal.c.
+ * {{ There are probably some race conditions here
+ *    involving the variable "reading". }}
+ */
+public int reading;
+
+static int tty;
+
+/*
+ * Open keyboard for input.
+ * (Just use file descriptor 2.)
+ */
+	public void
+open_getc()
+{
+	tty = 2;
+}
+
+/*
+ * Get a character from the keyboard.
+ */
+	public int
+getc()
+{
+#if MSDOS
+#if MSC
+	int c;
+	struct regs {
+		int ax, bx, cx, dx, si, di, ds, es;
+	} cregs, rregs;
+	int intno = 0x016;
+#else
+	char c;
+#endif
+#endif
+	int result;
+
+	reading = 1;
+#if MSDOS
+#if MSC
+	cregs.ax = 0x0000;			/* set registers */
+	int86(0x16, &cregs, &cregs);		/* call BIOS - INT 16h */
+	c = (cregs.ax & 0x00ff);
+	reading = 0;
+	return(c & 0177);
+#else
+	do
+	{
+		flush();
+		result = read(tty, &c, 1);
+	} while (result != 1);
+	reading = 0;
+	return (c & 0177);
+#endif
+#endif
+}
+
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'version.c'
+then
+	echo shar: will not over-write existing file "'version.c'"
+else
+cat << \SHAR_EOF > 'version.c'
+/*
+ *		less
+ *	Copyright (c) 1984,1985  Mark Nudelman
+ *
+ *	This program may be freely used and/or modified, 
+ *	with the following provisions:
+ *	1. This notice and the above copyright notice must remain intact.
+ *	2. Neither this program, nor any modification of it,
+ *	   may not be sold for profit without written consent of the author.
+ *
+ *	-----------------------------------------------------------------
+ *
+ *	This program is a paginator similar to "more", 
+ *	but allows you to move both forward and backward in the file.  
+ *	Commands are based on "more" and "vi".
+ *
+ *	----------------------- CHANGES ---------------------------------
+ *
+ *	    Allowed use on standard input		1/29/84   markn
+ *	    Added E, N, P commands			2/1/84    markn
+ *	    Added '=' command, 'stop' signal handling	4/17/84   markn
+ *	    Added line folding				4/20/84   markn
+ *	v2: Fixed '=' command to use BOTTOM_PLUS_ONE, 
+ *	    instead of TOP, added 'p' & 'v' commands	4/27/84   markn
+ *	v3: Added -m and -t options, '-' command	5/3/84    markn
+ *	v4: Added LESS environment variable		5/3/84    markn
+ *	v5: New comments, fixed '-' command slightly	5/3/84    markn
+ *	v6: Added -Q, visual bell			5/15/84   markn
+ *	v7: Fixed jump_back(n) bug: n should count real
+ *	    lines, not folded lines.  Also allow number
+ *	    on G command.				5/24/84   markn
+ *	v8: Re-do -q and -Q commands			5/30/84   markn
+ *	v9: Added "+<cmd>" argument			9/25/84   markn
+ *	v10: Fixed bug in -b<n> argument processing	10/10/84  markn
+ *	v11: Made error() ring bell if \n not entered.	10/18/84  markn
+ *	-----------------------------------------------------------------
+ *	v12: Reorganized signal handling and made
+ *	     portable to 4.2bsd.			2/13/85   mark
+ *	v13: Reword error message for '-' command.	2/16/85   mark
+ *	v14: Added -bf and -bp variants of -b.		2/22/85   mark
+ *	v15: Miscellaneous changes.			2/25/85   mark
+ *	v16: Added -u flag for backspace processing.	3/13/85   mark
+ *	v17: Added j and k commands, 
+ *		changed -t default.			4/13/85   mark
+ *	v18: Rewrote signal handling code.		4/20/85   mark
+ *	v19: Got rid of "verbose" eq_message().		5/2/85    mark
+ *	     Made search() scroll in some cases.
+ *	v20: Fixed screen.c ioctls for System V.	5/21/85   mark
+ *	v21: Fixed some first_cmd bugs.			5/23/85   mark
+ *	v22: Added support for no RECOMP nor REGCMP.	5/24/85   mark
+ *	v23: Miscellanous changes and prettying up.	5/25/85   mark
+ *      v24: Added ti,te terminal init & de-init       6/3/85 Mike Kersenbrock
+ *	v25: Added -U flag, standout mode underlining.	6/8/85    mark
+ *	v26: Added -M flag.				6/9/85    mark
+ *	     Use underline termcap (us) if it exists.
+ *	v27: Renamed some variables to make unique in	6/15/85   mark
+ *	     6 chars.  Minor fix to -m.
+ *	v28: Fixed right margin bug.			6/28/85   mark
+ *	v29: Incorporated M.Rose's changes to signal.c	6/28/85   mark
+ *	v30: Fixed stupid bug in argument processing.	6/29/85   mark
+ *	v31: Added -p flag, changed repaint algorithm.  7/15/85   mark
+ *	     Added kludge for magic cookie terminals.
+ *	v32: Added cat_file if output not a tty.	7/16/85   mark
+ *	v33: Added -e flag and EDITOR.			7/23/85   mark
+ *	v34: Added -s flag.				7/26/85   mark
+ *	v35: Rewrote option handling; added option.c.	7/27/85   mark
+ *	v36: Fixed -e flag to work if not last file.	7/29/85   mark
+ *	v37: Added -x flag.				8/10/85   mark
+ *	v38: Changed prompting; created prompt.c.	8/19/85   mark
+ *	v39: (Not -p) does not initially clear screen.	8/24/85   mark
+ *	v40: Added "skipping" indicator in forw().	8/26/85   mark
+ *	v41: ONLY_RETURN, control char commands,	9/17/85   mark
+ *	     faster search, other minor fixes.
+ *	v42: Added ++ command line syntax;		9/25/85   mark
+ *	     ch_fsize for pipes.
+ *	v43: Added -h flag, changed prim.c algorithms.	10/15/85  mark
+ *	v44: Made END print in all cases of eof;	10/16/85  mark
+ *	     ignore SIGTTOU after receiving SIGTSTP.
+ *	v45: Never print backspaces unless -u.		10/16/85  mark
+ *	v46: Backwards scroll in jump_loc.		10/24/85  mark
+ *	v47: Fixed bug in edit(): *first_cmd==0		10/30/85  mark
+ *	v48: Use TIOCSETN instead of TIOCSETP.		11/16/85  mark
+ *	     Added marks (m and ' commands).
+ *	-----------------------------------------------------------------
+ */
+
+char version[] = "@(#) less  version 48";
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'less.man'
+then
+	echo shar: will not over-write existing file "'less.man'"
+else
+cat << \SHAR_EOF > 'less.man'
+LESS(l)
+
+NAME
+     less - opposite of more
+
+SYNOPSIS
+     less [-cdepstwmMqQuU] [-h_n] [-b[fp]_n] [-x_n] [+_c_m_d] [_n_a_m_e] ...
+
+DESCRIPTION
+     _L_e_s_s is a program similar to _m_o_r_e (1), but which allows backwards
+     movement in the file as well as forward movement.  Also, _l_e_s_s does not
+     have to read the entire input file before starting, so with large
+     input files it starts up faster than text editors like _v_i (1).  _L_e_s_s
+     uses termcap, so it can run on a variety of terminals.  There is even
+     limited support for hardcopy terminals.  (On a hardcopy terminal,
+     lines which should be printed at the top of the screen are prefixed
+     with an up-arrow.)
+
+     Commands are based on both _m_o_r_e and _v_i. Commands may be preceeded by a
+     decimal number, called N in the descriptions below.  The number is
+     used by some commands, as indicated.
+
+
+COMMANDS
+     h    Help: display a summary of these commands.  If you forget all the
+          other commands, remember this one.
+
+     SPACE
+          Scroll forward N lines, default one screen.  If N is more than
+          the screen size, only one screenful is displayed.
+
+     f    Same as SPACE.
+
+     b    Scroll backward N lines, default one screen.  If N is more than
+          the screen size, only one screenful is displayed.
+
+     RETURN
+          Scroll forward N lines, default 1.  If N is more than the screen
+          size, the entire N lines are displayed.
+
+     e    Same as RETURN.
+
+     j    Also the same as RETURN.
+
+     y    Scroll backward N lines, default 1.  If N is more than the screen
+          size, the entire N lines are displayed.
+
+     k    Same as y.
+
+     d    Scroll forward N lines, default 10.  If N is specified, it
+          becomes the new default for all d and u commands.
+
+     u    Scroll backward N lines, default 10.  If N is specified, it
+          becomes the new default for all d and u commands.
+
+     r    Repaint the screen.
+
+     R    Repaint the screen, discarding any buffered input.  Useful if the
+          file is changing while it is being viewed.
+
+     g    Go to line N in the file, default 1 (beginning of file).
+          (Warning: this may be slow if N is large.)
+
+     G    Go to line N in the file, default the end of the file.  (Warning:
+          this may be slow if standard input, rather than a file, is being
+          read.)
+     p    Go to a position N percent into the file.  N should be between 0
+          and 100.  (This is possible if standard input is being read, but
+          only if _l_e_s_s has already read to the end of the file.  It is
+          always fast, but not always useful.)
+
+     %    Same as p.
+
+     m    Followed by any lowercase letter, marks the current position with
+          that letter.
+
+     '    Followed by any lowercase letter, returns to the position which
+          was previously marked with that letter.  All marks are lost when
+          a new file is examined.
+
+     /pattern
+          Search forward in the file for the N-th occurence of the pattern.
+          N defaults to 1.  The pattern is a regular expression, as
+          recognized by _e_d. The search starts at the second line displayed
+          (but see the -t option, which changes this).
+
+     ?pattern
+          Search backward in the file for the N-th occurence of the
+          pattern.  The search starts at the line immediately before the
+          top line displayed.
+
+     n    Repeat previous search, for N-th occurence of the last pattern.
+
+     E    Examine a new file.  If the filename is missing, the "current"
+          file (see the N and P commands below) from the list of files in
+          the command line is re-examined.
+
+     N    Examine the next file (from the list of files given in the
+          command line).  If a number N is specified (not to be confused
+          with the command N), the N-th next file is examined.
+
+     P    Examine the previous file.  If a number N is specified, the N-th
+          previous file is examined.
+
+     =    Prints the name of the file being viewed and the byte offset of
+          the bottom line being displayed.  If possible, it also prints the
+          length of the file and the percent of the file above the last
+          displayed line.
+
+     -    Followed by one of the command line option letters (see below),
+          this will toggle the setting of that option and print a message
+          describing the new setting.
+
+     V    Prints the version number of _l_e_s_s being run.
+
+     q    Exits _l_e_s_s.
+
+     The following two commands may or may not be valid, depending on your
+     particular installation.
+
+     v    Invokes an editor to edit the current file being viewed.  The
+          editor is taken from the environment variable EDITOR, or defaults
+          to "vi".
+
+     ! shell-command
+          Invokes a shell to run the shell-command given.
+
+OPTIONS
+     Command line options are described below.  Options are also taken from
+     the environment variable "LESS".  (The environment variable is parsed
+     before the command line, so command line options override the LESS
+     environment variable.  Options may be changed while _l_e_s_s is running
+     via the "-" command.) For example, if you like more-style prompting,
+     to avoid typing "less -m ..." each time _l_e_s_s is invoked, you might
+     tell _c_s_h:
+
+     setenv LESS m
+
+     or if you use _s_h:
+
+     LESS=m; export LESS
+
+     -s   The -s flag causes consecutive blank lines to be squeezed into a
+          single blank line.  This is useful when viewing _n_r_o_f_f output.
+
+     -t   Normally, forward searches start just after the top displayed
+          line (that is, at the second displayed line).  Thus forward
+          searches include the currently displayed screen.  The -t command
+          line option causes forward searches to start just after the
+          bottom line displayed, thus skipping the currently displayed
+          screen.
+
+     -m   Normally, _l_e_s_s prompts with a colon.  The -m command line option
+          causes _l_e_s_s to prompt verbosely like _m_o_r_e, printing the file name
+          and percent into the file.
+
+     -M   The -M command line option causes _l_e_s_s to prompt even more
+          verbosely than _m_o_r_e.
+
+     -q   Normally, if an attempt is made to scroll past the end of the
+          file or before the beginning of the file, the terminal bell is
+          rung to indicate this fact.  The -q command line option tells
+          _l_e_s_s not to ring the bell at such times.  If the terminal has a
+          "visual bell", it is used instead.
+
+     -Q   Even if -q is given, _l_e_s_s will ring the bell on certain other
+          errors, such as typing an invalid character.  The -Q command line
+          option tells _l_e_s_s to be quiet all the time; that is, never ring
+          the terminal bell.  If the terminal has a "visual bell", it is
+          used instead.
+
+     -e   Normally the only way to exit less is via the "q" command.  The
+          -e command line option tells less to automatically exit the
+          second time it reaches end-of-file.
+
+     -u   If the -u command line option is given, backspaces are treated as
+          printable characters; that is, they are sent to the terminal when
+          they appear in the input.
+
+     -U   If the -U command line option is given, backspaces are printed as
+          the two character sequence "^H".  If neither -u nor -U is given,
+          backspaces which appear adjacent to an underscore character are
+          treated specially: the underlined text is displayed using the
+          terminal's hardware underlining capability.
+
+     -w   Normally, _l_e_s_s uses a tilde character to represent lines past the
+          end of the file.  The -w option causes blank lines to be used
+          instead.
+
+     -d   Normally, _l_e_s_s will complain if the terminal is dumb; that is,
+          lacks some important capability, such as the ability to clear the
+          screen or scroll backwards.  The -d flag suppresses this
+          complaint (but does not otherwise change the behavior of the
+          program on a dumb terminal).
+
+     -p   Normally, _l_e_s_s will repaint the screen by scrolling from the
+          bottom of the screen.  If the -p flag is set, when _l_e_s_s needs to
+          change the entire display, it will clear the screen and paint
+          from the top line down.
+
+     -h   Normally, _l_e_s_s will scroll backwards when backwards movement is
+          necessary.  The -h option specifies a maximum number of lines to
+          scroll backwards.  If it is necessary to move backwards more than
+          this many lines, the screen is repainted in a forward direction.
+          (If the terminal does not have the ability to scroll backwards,
+          -h0 is implied.)
+
+     -x   The -x_n command line option sets tab stops every _n positions.
+          The default for _n is 8.
+
+     -b   The -b_n command line option tells _l_e_s_s to use a non-standard
+          buffer size.  There are two standard (default) buffer sizes, one
+          is used when a file is being read and the other when a pipe
+          (standard input) is being read.  The current defaults are 5
+          buffers for files and 12 for pipes.  (Buffers are 1024 bytes.)
+          The number _n specifies a different number of buffers to use.  The
+          -b may be followed by "f", in which case only the file default is
+          changed, or by "p" in which case only the pipe default is
+          changed.  Otherwise, both are changed.
+
+     -c   Normally, when data is read by _l_e_s_s, it is scanned to ensure that
+          bit 7 (the high order bit) is turned off in each byte read, and
+          to ensure that there are no null (zero) bytes in the data (null
+          bytes are turned into "@" characters).  If the data is known to
+          be "clean", the -c command line option will tell _l_e_s_s to skip
+          this checking, causing an imperceptible speed improvement.
+          (However, if the data is not "clean", unpredicatable results may
+          occur.)
+
+     +    If a command line option begins with +, the remainder of that
+          option is taken to be an initial command to _l_e_s_s. For example, +G
+          tells _l_e_s_s to start at the end of the file rather than the
+          beginning, and +/xyz tells it to start at the first occurence of
+          "xyz" in the file.  As a special case, +<number> acts like
+          +<number>g; that is, it starts the display at the specified line
+          number (however, see the caveat under the "g" command above).  If
+          the option starts with ++, the initial command applies to every
+          file being viewed, not just the first one.
+
+
+BUGS
+     When used on standard input (rather than a file), you can move
+     backwards only a finite amount, corresponding to that portion of the
+     file which is still buffered.
+SHAR_EOF
+fi # end of overwriting check
+#	End of shell archive
+exit 0
+
+

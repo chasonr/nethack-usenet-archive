@@ -1,0 +1,272 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,efd257bcd4cbd7ad,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-11-18 17:40:16 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site ncoast.UUCP
+Path: utzoo!linus!decvax!cwruecmp!atvax!ncoast!bsa
+From: bsa@ncoast.UUCP (Brandon Allbery)
+Newsgroups: net.sources
+Subject: SYSTAT - Visual system status display program (V7/Xenix and up)
+Message-ID: <423@ncoast.UUCP>
+Date: Sun, 18-Nov-84 20:40:16 EST
+Article-I.D.: ncoast.423
+Posted: Sun Nov 18 20:40:16 1984
+Date-Received: Wed, 21-Nov-84 05:17:58 EST
+Organization: North Coast XENIX, Cleveland
+Lines: 252
+
+The following C program is a visual system status display program.  It
+shows who's on the system and what processes are running.  It was designed
+for a small Xenix system, so it probably will (at the least) need to
+have the screen display reformatted to work with Vaxen and other monstrosities;
+at present it has room for 9 logins and 28 processes (with ps ax).  I
+have #defined the commands used for finding out who's on and what processes
+are running; you can change them for v7 systems without ``finger'' or
+for systems requiring more options to ``ps''.  For more logins, you can
+duplicate the code for splitting the process listing over two columns
+into the who's on code and use ``who'' as the program (or do a direct
+lookup into the utmp file).
+
+This program, as formatted, will not run on a screen smaller than 64x16;
+80x24 is preferred, and 132x24 or larger is even better.  The larger
+the screen, the more information can be shown.
+
+Change S_USRWIN to reflect the number of lines to use to display the
+list of current users; change WHO and PROC to the programs used to show
+who's on and what's running; the #defines should be in the form of arguments
+to execl(), but not null-terminated (the progreham does that for you).
+For example:  in the program as posted, the #defines are:
+
+#define WHO		"/usr/bin/finger"
+#define PROC		"/bin/ps", "ax"
+
+With the exception of the use of ``finger'' for the users listing, this
+program should be compilable on any system from V7 on; /vmunix users
+will probably want to change the call to fork() in xopen() to a call
+to vfork() (I think... what do *I* know of /vmunix ?).
+
+Please send any improvements or bug reports/fixes to ncoast!bsa (full
+path in the .signature, if the system crash didn't munge postnews).
+
+---------------------- CUT HERE --------------------------------------
+#include <curses.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <pwd.h>
+
+/*
+ * systat - show system status visually
+ *
+ * This program provides a window on the system.  There are three windows
+ * involved: the top 8 lines are reserved for ``finger'', the bottom line for
+ * time and program status, and the rest for ``ps ax''.  ps is split into
+ * two columns.  If you need more space for logins, redesign it; I suggest
+ * using ``who'' as a first step.  This was designed under Xenix, the only
+ * non-V7 feature used is ``finger'' (unless you count curses itself).  This
+ * also shows why I left so little space for logins (6 users max. on Model
+ * 16 at present).
+ */
+
+WINDOW *usrwin, *procwin, *pswin;
+unsigned rtime;
+int redraw(), cleanup(), pfd[2];
+struct passwd *getpwuid();
+FILE *xopen();
+char *index();
+
+#define WHO		"/usr/bin/finger"
+#define PROC		"/bin/ps", "ax"
+
+#define S_USRWIN	8
+#define MAILDIR		"/usr/spool/mail/"
+
+main()
+    {
+    struct sgttyb tty;
+    FILE *fp;
+    char line[39], ch, lmailbox[256], mailbox[256];
+    struct stat mbox, lmbox;
+    struct passwd *pwd;
+    long clock;
+    int pcnt;
+
+    if (gtty(1, &tty) < 0)
+	{
+	fprintf(stderr, "Output not to /dev/tty\n");
+	exit(-1);
+	}
+    strcpy(mailbox, MAILDIR);
+    strcpy(lmailbox, MAILDIR);
+    strcat(lmailbox, getlogin());
+    setpwent();
+    pwd = getpwuid(getuid());
+    strcat(mailbox, pwd->pw_name);
+    switch (tty.sg_ospeed)
+	{
+	case B110:	/* pity the poor user of this! */
+	    rtime = 120;
+	    break;
+	
+	case B300:
+	    rtime = 60;
+	    break;
+	
+	case B1200:
+	    rtime = 15;
+	    break;
+	
+	case B1800:
+	    rtime = 10;
+	    break;
+	case B2400:
+	    rtime = 5;
+	    break;
+	
+	default:
+	    if (tty.sg_ospeed < B2400)
+		rtime = 60;
+	    else
+		rtime = 1;
+	}
+    initscr();
+    if (LINES < 16 || COLS < 64)
+	{
+	fprintf(stderr, "Must have at least an 64x16 screen.\n");
+	endwin();
+	}
+    usrwin = newwin(S_USRWIN, COLS, 0, 0);
+    procwin = newwin(LINES - S_USRWIN - 1, COLS, S_USRWIN, 0);
+    signal(SIGINT, cleanup);
+    signal(SIGQUIT, redraw);
+
+    for(;;)
+	{
+	werase(usrwin);
+	if ((fp = xopen(WHO, 0)) == NULL)
+	    {
+	    perror(WHO);
+	    endwin();
+	    exit(-1);
+	    }
+	while ((ch = getc(fp)) != EOF)
+	    waddch(usrwin, ch);
+	xclose(fp);
+	werase(procwin);
+	if ((fp = xopen(PROC, 0)) == NULL)
+	    {
+	    perror(PROC);
+	    endwin();
+	    exit(-1);
+	    }
+	fgets(line, COLS / 2 - 1, fp);
+	waddstr(procwin, line);
+	wmove(procwin, 0, COLS / 2);
+	waddstr(procwin, line);
+	wmove(procwin, 1, 0);
+	pcnt = 2;
+	while (fgets(line, COLS / 2 - 1, fp) != NULL && pcnt < (LINES - S_USRWIN - 1) * 2)
+	    {
+	    wmove(procwin, pcnt / 2, (pcnt % 2 == 0? 0 : COLS / 2));
+	    waddstr(procwin, line);
+	    if (index(line, '\n') == 0)
+		while ((ch = getc(fp)) != '\n')
+		    ;
+	    pcnt ++;
+	    }
+	xclose(fp);
+	erase();
+	move(LINES - 1, 0);
+	time(&clock);
+	if (stat(mailbox, &mbox) < 0)
+	    mbox.st_size = 0;
+	if (stat(lmailbox, &lmbox) < 0)
+	    lmbox.st_size = 0;
+	printw("%s ", pwd->pw_name);
+	if (mbox.st_size > 0)
+	    {
+	    standout();
+	    printw(" You have mail. ");
+	    standend();
+	    }
+	printw(" Login: %s ", getlogin());
+	if (lmbox.st_size > 0)
+	    {
+	    standout();
+	    printw(" has mail ");
+	    standend();
+	    }
+	printw(" %s ", ctime(&clock));
+	move(LINES - 1, 0);
+	overwrite(usrwin, stdscr);
+	overwrite(procwin, stdscr);
+	refresh();
+	sleep(rtime);
+	}
+    }
+
+redraw()
+    {
+    touchwin(stdscr);
+    refresh();
+    signal(SIGQUIT, redraw);
+    }
+
+cleanup()
+    {
+    clear();
+    refresh();
+    endwin();
+    exit(0);
+    }
+
+FILE *xopen(cmd, arg1, arg2, arg3, arg4)
+    char *cmd, *arg1, *arg2, *arg3, *arg4;
+    {
+    FILE *rfp;
+
+    pipe(pfd);
+    switch(fork())
+	{
+	case -1:
+	    endwin();
+	    perror("fork()");
+	    exit(-1);
+	
+	case 0:
+	    break;
+	
+	default:
+	    close(pfd[1]);
+	    if ((rfp = fdopen(pfd[0], "r")) == NULL)
+		{
+		endwin();
+		perror("fdopen()");
+		exit(-1);
+		}
+	    return rfp;
+	}
+    close(pfd[0]);
+    close(1);
+    dup2(pfd[1], 1);
+    execl(cmd, cmd, arg1, arg2, arg3, arg4, 0);
+    endwin();
+    perror(cmd);
+    exit(-1);
+    }
+
+xclose(fd)
+    FILE *fd;
+    {
+    fclose(fd);
+    wait(0);
+    }
+-- 
+  Brandon Allbery @ North Coast Xenix  |   the.world!ucbvax!decvax!cwruecmp!
+6504 Chestnut Road, Independence, Ohio |       {atvax!}ncoast!{tdi1!}bsa
+   (216) 524-1416             \ 44131  | E1439@CSUOHIO.BITNET (friend's acct.)
+---------------------------------------+---------------------------------------
+Forgive; we just had a system crash & lost a month's worth of work and patches.
+
+

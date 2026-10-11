@@ -1,0 +1,345 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,95119e33946a8b02,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-11-27 09:52:49 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/17/84; site dspo.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!godot!harvard!seismo!cmcl2!lanl!dspo!tomlin
+From: tomlin@dspo.UUCP
+Newsgroups: net.sources
+Subject: An internet name server and time server for 4.2bsd
+Message-ID: <186@dspo.UUCP>
+Date: Tue, 27-Nov-84 12:52:49 EST
+Article-I.D.: dspo.186
+Posted: Tue Nov 27 12:52:49 1984
+Date-Received: Thu, 29-Nov-84 03:11:14 EST
+Distribution: net
+Organization: Los Alamos National Laboratory
+Lines: 324
+
+The following two servers are handy, at least, if you are running the
+MIT PC/IP code on IBM PCs and have a 4.2bsd machine on a connected
+network.
+
+I don't have a real time clock card and hate typing in the date and
+time every time I boot the PC.  Also, I hate typing internet addresses
+everytime I want to telnet to a machine or tftp a file.
+
+			-- Bob Tomlinson (dspo!tomlin@LANL)
+
+	To install:
+	Add the following two lines to your /etc/services file:
+time		37/udp		timserver	# PC/IP needed a UDP time server
+name		42/udp		nameserver	# PC/IP needed a UDP name server
+
+	Add the following to your /etc/rc.local file (NOTE: we put local
+	things in /usr/local/bin):
+if [ -f /usr/local/bin/timed ]; then
+	/usr/local/bin/timed & echo -n ' timed'			>/dev/console
+fi
+if [ -f /usr/local/bin/named ]; then
+	/usr/local/bin/named & echo -n ' named'			>/dev/console
+fi
+
+------------------  time server
+/*
+ * Copyright, 1984 The Regents of the University of California.  This software
+ * was produced under a U.S. Government contract, W-7405-ENG-36, by the 
+ * Los Alamos National Laboratory, which is operated by the University of
+ * California for the U.S. Department of Energy.   The U.S. Government is 
+ * licensed to use, reproduce, and distribute this software.  Permission
+ * is granted to the public to copy and use this software without charge, 
+ * provided that this notice and any statement of authorship are reproduced
+ * on all copies.  Neither the Government nor the University makes any warranty
+ * expressed or implied, or assumes any liability or responsibility for
+ * the use of this software.
+ *
+ * Written by Bob Tomlinson, Los Alamos National Laboratory, E-10/Data Systems
+ *
+ * $Header: timed.c,v 1.1 84/11/21 09:58:27 tomlin Exp $
+ *
+ * $State: Exp $
+ *
+ * $Log:	timed.c,v $
+ * Revision 1.1  84/11/21  09:58:27  tomlin
+ * Initial revision
+ * 
+ */
+
+#ifndef lint
+static char	rcsid[] = "$Header: timed.c,v 1.1 84/11/21 09:58:27 tomlin Exp $";
+#endif lint
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/file.h>
+#include <sys/time.h>
+
+#include <net/if.h>
+#include <netinet/in.h>
+
+#include <stdio.h>
+#include <errno.h>
+#include <ctype.h>
+#include <netdb.h>
+
+struct	sockaddr_in sin = { AF_INET };
+
+extern	errno;
+
+char	myname[32];
+struct	servent *sp;
+int	s = -1;
+
+main()
+{
+	struct sockaddr_in from;
+	struct hostent *hp;
+
+	sp = getservbyname("time", "udp");
+	if (sp == 0) {
+		fprintf(stderr, "timed: udp/time: unknown service\n");
+		exit(1);
+	}
+#ifndef DEBUG
+	if (fork())
+		exit(0);
+	{ int s;
+	  for (s = 0; s < 10; s++)
+		(void) close(s);
+	  (void) open("/", 0);
+	  (void) dup2(0, 1);
+	  (void) dup2(0, 2);
+	  s = open("/dev/tty", 2);
+	  if (s >= 0) {
+		ioctl(s, TIOCNOTTY, 0);
+		(void) close(s);
+	  }
+	}
+#endif
+	if (getuid()) {
+		fprintf(stderr, "timed: not super user\n");
+		exit(1);
+	}
+
+	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+		perror("timed: socket");
+		exit(1);
+	}
+	/*
+	 * Establish host name as returned by system.
+	 */
+	if (gethostname(myname, sizeof (myname) - 1) < 0) {
+		perror("gethostname");
+		exit(1);
+	}
+	hp = gethostbyname(myname);
+	if (hp == NULL) {
+		fprintf(stderr, "%s: don't know my own name\n", myname);
+		exit(1);
+	}
+	sin.sin_family = hp->h_addrtype;
+	sin.sin_port = sp->s_port;
+	if (bind(s, &sin, sizeof (sin)) < 0) {
+		perror("timed: bind");
+		exit(1);
+	}
+	for (;;) {
+		char		foo[10];
+		int		cc, len = sizeof (from);
+		struct timeval	tp;
+		struct timezone	tzp;
+		unsigned long	atime;
+
+		cc = recvfrom(s, (char *)foo, sizeof (foo), 0,
+			&from, &len);
+		if (cc < 0 && errno != EINTR) {
+			perror("timed: recv");
+			continue;
+		}
+		if (from.sin_port != sp->s_port) {
+			fprintf(stderr, "timed: %d: bad from port, continuing...\n",
+				ntohs(from.sin_port));
+			/* continue; */
+		}
+		gettimeofday(&tp, &tzp);
+#define SECS_PER_DAY	(24*60*60)
+		/*  70 years between ARPA base and UNIX base 1900-1969 */
+		/* 365 days per year */
+		/*  17 leap years (extra days) */
+		atime = tp.tv_sec + ((70*365+17) * SECS_PER_DAY);
+#if vax || pdp11
+		atime = htonl(atime);
+#endif
+		(void) sendto(s, (char *)&atime, sizeof (atime), 0,
+			&from, len);
+	}
+}
+
+------------------  name server
+/*
+ * Copyright, 1984 The Regents of the University of California.  This software
+ * was produced under a U.S. Government contract, W-7405-ENG-36, by the 
+ * Los Alamos National Laboratory, which is operated by the University of
+ * California for the U.S. Department of Energy.   The U.S. Government is 
+ * licensed to use, reproduce, and distribute this software.  Permission
+ * is granted to the public to copy and use this software without charge, 
+ * provided that this notice and any statement of authorship are reproduced
+ * on all copies.  Neither the Government nor the University makes any warranty
+ * expressed or implied, or assumes any liability or responsibility for
+ * the use of this software.
+ *
+ * $Header: named.c,v 1.1 84/11/21 17:29:59 tomlin Exp $
+ *
+ * $State: Exp $
+ *
+ * $Log:	named.c,v $
+ * Revision 1.1  84/11/21  17:29:59  tomlin
+ * Initial revision
+ * 
+ */
+
+#ifndef lint
+static char	rcsid[] = "$Header: named.c,v 1.1 84/11/21 17:29:59 root Exp $";
+#endif lint
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/file.h>
+
+#include <net/if.h>
+#include <netinet/in.h>
+
+#include <stdio.h>
+#include <errno.h>
+#include <ctype.h>
+#include <netdb.h>
+#include <strings.h>
+
+struct	sockaddr_in sin = { AF_INET };
+
+typedef struct	namerequest {
+	char nr_nameoctet;
+	char nr_namelen;
+	char nr_namestr[1024];	/* 1024 is arbitrary */
+};
+
+unsigned char	*replybuf;
+unsigned char	*malloc();
+
+#define ERRORMESSAGE	"Unknown machine"
+
+extern	errno;
+
+char	myname[32];
+struct	servent *sp;
+int	s = -1;
+
+main()
+{
+	struct sockaddr_in from;
+	struct hostent *hp;
+
+	sp = getservbyname("name", "udp");
+	if (sp == 0) {
+		fprintf(stderr, "named: udp/name: unknown service\n");
+		exit(1);
+	}
+#ifndef DEBUG
+	if (fork())
+		exit(0);
+	{ int s;
+	  for (s = 0; s < 10; s++)
+		(void) close(s);
+	  (void) open("/", 0);
+	  (void) dup2(0, 1);
+	  (void) dup2(0, 2);
+	  s = open("/dev/tty", 2);
+	  if (s >= 0) {
+		ioctl(s, TIOCNOTTY, 0);
+		(void) close(s);
+	  }
+	}
+#endif
+	if (getuid()) {
+		fprintf(stderr, "named: not super user\n");
+		exit(1);
+	}
+
+	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+		perror("named: socket");
+		exit(1);
+	}
+	/*
+	 * Establish host name as returned by system.
+	 */
+	if (gethostname(myname, sizeof (myname) - 1) < 0) {
+		perror("gethostname");
+		exit(1);
+	}
+	hp = gethostbyname(myname);
+	if (hp == NULL) {
+		fprintf(stderr, "%s: don't know my own name\n", myname);
+		exit(1);
+	}
+	sin.sin_family = hp->h_addrtype;
+	sin.sin_port = sp->s_port;
+	if (bind(s, &sin, sizeof (sin)) < 0) {
+		perror("named: bind");
+		exit(1);
+	}
+	for (;;) {
+		int			cc, i, len = sizeof (from);
+		struct namerequest	request;
+		struct hostent		*rh;
+
+		cc = recvfrom(s, (char *)&request, sizeof (request), 0,
+			&from, &len);
+		if (cc <= 0) {
+			if (cc < 0 && errno != EINTR)
+				perror("named: recv");
+			continue;
+		}
+		if (from.sin_port != sp->s_port) {
+			fprintf(stderr, "named: %d: bad from port, continuing...\n",
+				ntohs(from.sin_port));
+			/* continue; */
+		}
+		request.nr_namestr[request.nr_namelen] = '\0';
+		rh = gethostbyname(request.nr_namestr);
+		if (rh == NULL) {
+			fprintf(stderr, "%s: unknown machine\n", request.nr_namestr);
+			/* 3 = error type + length + error code */
+			replybuf=malloc(cc+3+sizeof (ERRORMESSAGE));
+			bcopy(&request, replybuf, cc);
+			i=cc;
+			replybuf[i++]=(unsigned char)3;	/* 3 denotes an error */
+			replybuf[i++]=(unsigned char)strlen(ERRORMESSAGE);
+			bcopy(ERRORMESSAGE, &replybuf[i], strlen(ERRORMESSAGE));
+			i+=strlen(ERRORMESSAGE);
+			(void) sendto(s, (char *)replybuf, i, 0, &from, len);
+			free(replybuf);
+			continue;
+		}
+		/* 6 = addr type + len + internet addr */
+		replybuf=malloc(cc+6);
+		bcopy(&request, replybuf, cc);
+		i=cc;
+		replybuf[i++]=(unsigned char)2;	/* 2 denotes an addr */
+		replybuf[i++]=(unsigned char)rh->h_length;
+		bcopy(rh->h_addr, &replybuf[i], rh->h_length);
+		i+=(rh->h_length);
+		(void) sendto(s, (char *)replybuf, i, 0, &from, len);
+		free(replybuf);
+	}
+}
+-- 
+Bob Tomlinson - dspo!tomlin@LANL  or  ucbvax!unmvax!lanl!dspo!tomlin
+Los Alamos National Laboratory - E-10/Data Systems
+Los Alamos, New Mexico  -  (505) 667-8495
+
+

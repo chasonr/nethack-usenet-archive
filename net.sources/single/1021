@@ -1,0 +1,801 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,d45739f759335247,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-02-27 21:26:07 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site umcp-cs.UUCP
+Path: utzoo!watmath!clyde!floyd!harpo!seismo!rlgvax!cvl!umcp-cs!petec
+From: petec@umcp-cs.UUCP
+Newsgroups: net.sources
+Subject: dump/file-restore code (3 of 4)
+Message-ID: <5490@umcp-cs.UUCP>
+Date: Tue, 28-Feb-84 00:26:07 EST
+Article-I.D.: umcp-cs.5490
+Posted: Tue Feb 28 00:26:07 1984
+Date-Received: Wed, 29-Feb-84 14:10:29 EST
+Organization: Univ. of Maryland, Computer Science Dept.
+Lines: 781
+
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting whichtape.c'
+sed 's/^X//' <<'//go.sysin dd *' >whichtape.c
+
+static char *sccsid = "@(#) whichtape(V2)	PJS (University of Maryland)";
+X/*
+ *	whichtape:  This program is used to determine on which tape
+ * a file or list of files have been dumped.  It uses the information
+ * in /g/etc/filesontapes (defined in filtap.h), which is maintained 
+ * by the program filtapmgr (file tape manager).
+ * (See the manual entry for a more user oriented description.)
+ *
+ * written by:  Patrick Steranka -- Jan. 1983 <patrick@umcp-cs>
+ * maintained by Pete Cottrell <petec@umcp-cs>
+ *
+ * Patrick has graduated, so please send comments, bug reports, etc. to
+ * petec@umcp-cs
+ *
+ */
+
+
+#include <stdio.h>
+#include <ctype.h>
+#include <sys/param.h>
+#include <sys/ino.h>
+#include <sys/inode.h>
+#include <sys/dir.h>
+#include <dumprestor.h>
+#include <fstab.h>
+#include "filtap.h"
+#define MAXLIST 2000
+
+long	int	savpos;
+PTRNODE	base_sys,marker,ptr;
+
+struct	bufent{
+	char	fname[120];	/* Full path name */
+	char	*eoname;	/* Pointer to end of path name */
+	NODE	e;
+} buf;
+
+short	int	cklist[MAXLIST];
+struct	bufent	file_list[MAXLIST];
+int	fl_idx=0, none_found=1,i;
+
+X/* This array corresponds to each file in the argv list of files. It has
+   indexes into the file_list */
+int	argv_list[MAXLIST];
+int	af_idx=0;
+
+X/* options */
+int	aopt,	/* print out all back-up information option */
+	ropt,	/* recursive option */
+	eopt,	/* don't expand file option */
+	iopt;	/* print out inode information also */
+	fopt;	/* choose different file database */
+
+int	getrecord(),getent();
+FILE	*fp,*fp_child,*popen(),*fopen();
+char	*findrdev(),*timdmptap(),*rawname(),*get_dmptime();
+char	**gblargv;
+
+main(argc,argv)
+int	argc;
+char	**argv;
+{
+	char	*opts,dirname[100];
+	long	int	savepos;
+	int	foundall;
+
+	/* handle both ways for describing options, ie.
+	   -opts or -o -p -t -s */
+	while (--argc && **++argv == '-'){
+		opts = *argv;
+		while (*++opts)
+			switch(*opts){
+			case 'r': /* recurse option */
+				ropt++;
+				break;
+			case 'a': /* print all back-up information option */
+				aopt++;
+				break;
+			case 'i': /* print inode information option */
+				iopt++;
+				break;
+			case 'e': /* no-expand option */
+				eopt++;
+				break;
+			case 'f': /* different file database option */
+				fopt++;
+				filsys_file = *++argv;
+				argc--;
+				break;
+			default: /* huh???, option */
+				fprintf(stderr,"Bad option `%c'.\n",*opts);
+				goto usage;
+			} /* end case */
+	} /* end while */
+
+	if (argc < 1){
+usage:	 fprintf(stderr,"usage: whichtape [-f filsys_file] -aire filelist\n");
+		exit(1);
+	}
+	if ((fp=fopen(filsys_file,"r")) == NULL){
+		fprintf(stderr,"Missing file %s.\n",filsys_file);
+		exit(1);
+	}
+	/* Each entry in this array corresponds to an argv file, if the
+	   entry is still -1 after looking for it, then the file was not
+	   found, else the entry has an index into the file_list array. */
+	for(i=0;i<MAXLIST;i++){
+		cklist[i] = 0;
+		argv_list[i] = -1;
+	}
+	strcpy(buf.fname,"/");
+	buf.eoname = &(buf.fname[1]);
+	/* Set gblargv to list of files to query */
+	gblargv = argv;
+	foundall = 0;
+	while (getent(&buf) != EOF && foundall == 0){
+		/* Look at each entry in "filsys_file" and see if any
+		   arguments match any of the entries */
+		if (buf.e.dir && (strcmp(buf.e.name,".") != 0)
+			&& (strcmp(buf.e.name,"..") != 0)) {
+			/* Add another name to this path */
+			addrmdir(&buf);
+			continue;
+		}
+		else if (strcmp(buf.e.name,"/") == 0){
+			/* Reached the end of a directory so remove the
+			   parents name */
+			addrmdir(&buf);
+			continue;
+		}
+		else {
+			/* Add the file name to the path name => full name */
+			strcpy(buf.eoname,buf.e.name);
+		}
+		for(foundall=1,i=0; i < argc; i++){
+			if (cklist[i] == 0){
+				lookforentry(argc,argv);
+				foundall=0;
+				break;
+			}
+		}		
+	}/* End while */
+	
+	for(i=0; i < argc; i++){
+		if (cklist[i] == 0){
+			printf("File %s not backed-up on daily tape, sorry!\n",argv[i]);
+			printf("You may find it on a bi-weekly tape, though.\n");
+		}
+	}
+	fclose(fp);
+	exit(0);
+
+}
+
+lookforentry(argc,argv)
+int	argc;
+char	**argv;
+{
+	register	int	i, savepos;
+	/* Compare each file in the arg. list against this entry */
+	for (i=0; i < argc; i++){
+		/* Make af_idx point to the argv file being processed */
+		af_idx = i; if (strcmp(buf.fname,argv[i]) == 0){
+			/* found a match -- print out info for this 
+			   entry */
+			/* Check this entry off of the list */
+			cklist[i] = 1;
+			savpos = ftell(fp);
+				printentry(&buf);
+			fseek(fp,savpos,0);/* Restor file to saved
+					      position */
+		}
+		else{
+			/* maybe this is a directory entry */
+			if (eopt == 0 && strcmp(buf.e.name,".") == 0){
+				/* Expand file name into a directory,
+				   because a directory can be entered
+				   "with or without it's" "/." name */
+				/* Note:  Actually take off /. and then
+				   do the comparison */
+				buf.eoname[-1] = '\0';
+				if (strcmp(buf.fname,argv[i]) == 0){
+					/* A directory entry has been 
+					   found, so print the directry
+					   "and it's contents" */
+					buf.eoname[-1] = '/';
+					/*  Check this directory off list */
+					cklist[i] = 1;
+					savpos = ftell(fp);
+					printentry(&buf);
+					/* Restor file to saved 
+					   position */
+					fseek(fp,savpos,0);
+				}
+				else
+					buf.eoname[-1] = '/';
+			}
+		}
+	}/* For */
+}
+
+printentry(b)
+struct	bufent *b;
+{
+	register	int skiplevel,notdone=1,eoflag;
+	struct	bufent	savbent;
+
+	prtent(b);	/* Print this entry */
+	if (b->e.dir == 0)
+		return;
+	/* Prepare for directory searching */
+	cpybent(&savbent,b);
+	skiplevel=1;
+	/* This entry is a directory, so print it's contents (if ropt == 0),
+	   or print it's contents and sub-directories contents (if ropt > 0)
+	*/
+	while ((eoflag = getent(b)) != EOF && (skiplevel > 0)){
+		if (ropt){
+			/* Print sub-directories - do not skip them */
+			if (strcmp(b->e.name,"..") == 0)
+				continue;
+			if (b->e.dir && strcmp(b->e.name,".") != 0){
+				/* Add this directory name to the path */
+				skiplevel++;
+				addrmdir(b);
+				continue;
+			}
+			if (strcmp(b->e.name,"/") == 0){
+				/* Reached end of a directory -- so remove
+				   the dir. name from the path */
+				skiplevel--;
+				addrmdir(b);
+				continue;
+			}
+		}
+		else{
+			/* When directories are reached - skip over them */
+			if (strcmp(b->e.name,"..") == 0)
+				continue;
+			if (b->e.dir && strcmp(b->e.name,".") != 0){
+				/* Skip until the end of this sub-directory */
+				addrmdir(b);
+				if(skiplevel++ == 1){
+					/* print this directory */
+					/* but don't recurse it */
+					prtent(b); 
+				}
+				continue;
+			}
+			if (strcmp(b->e.name,"/") == 0){
+				/* continue with previous directory */
+				skiplevel--;
+				addrmdir(b);
+				continue;
+			}
+			if (skiplevel > 1)
+				continue;
+		}
+		/* form a full path & file name & print it out */
+		strcpy(b->eoname,b->e.name);
+		prtent(b); 
+	} /* End while */
+	cpybent(b,&savbent);
+	return;
+}
+
+prtent(b)
+struct	bufent	*b;
+{
+	int i,j,idx;
+	char *ptime;
+
+	if (aopt){
+		/* print all back-up information for this entry */
+		printf("file: %s\n",b->fname);
+		if (iopt){
+			/* print out inode information for this entry */
+			/* print out inodes for this entry */
+			for (i=0; i < (MAXBACKUPS-1)/3 + 1; i++){ /* for each row */
+				for (j=0; j<3; j++){ /* for each column */
+					if ((idx=j+i*3) < MAXBACKUPS){ 
+						/* only print as many columns as are needed */
+						if (j == 0)
+							printf("%s",(i==0)?"inodes:\t":"\t");
+						printf("(%d) = %5d\t",idx+1,b->e.inodes[idx]);
+					}
+				}
+				printf("\n");
+			} /* print out inodes */
+		}
+		/* print out tape names for this entry */
+		for (i=0; i < MAXBACKUPS; i++){ /* for each row */
+			if (i == 0)
+				printf("tapes:");
+			ptime = get_dmptime(b->e.tapes[i],b->fname);
+			if (*ptime == '\0') ptime = "--Time of Dump Unknown--";
+			printf("\t(%d) = %5s\t%s\n",i+1,b->e.tapes[i],ptime);
+		}
+		printf("\n");
+	}
+	else{
+		/* normal print */
+		ptime = get_dmptime(b->e.tapes[0],b->fname);
+		if (*ptime == '\0') ptime = "--Time of Dump Unknown--";
+		printf("%s\t%s",b->e.tapes[0],ptime);
+		if (iopt)
+			printf("\t%d",b->e.inodes[0]);
+		printf("\t%s\n",b->fname);
+	}
+}
+
+getent(b)
+struct	bufent *b;
+{
+	int	nmread,i;
+	char 	c,*name;
+
+	clearnode(&(b->e));
+	/* read inodes */
+	nmread = 1;		/* to get loop started */
+	for (i=0; i < MAXBACKUPS && nmread > 0; i++){
+		nmread = fread((char*)&(b->e.inodes[i]),
+					sizeof(ino_t),1,fp);
+	}
+	/* Check for end of file */
+	/* Actually, if an incomplete record occured here it would go
+	   undetected. *sigh* */
+	if (nmread == 0) /* Reached EOF - normal case */
+		return(EOF);
+	/* read tape names */
+	for (i=0; i < MAXBACKUPS; i++){
+		fread(b->e.tapes[i],MAXTAPNAM,1,fp);
+		/* Add null byte to end of tape name */
+		b->e.tapes[i][MAXTAPNAM] = '\0'; 
+	}
+	/* read directory flag */
+	fread(&c,1,1,fp);
+	switch (c){
+	case '0': /* This entry is a normal file */
+		b->e.dir = 0;
+		break;
+	case '1': /* This entry is a directory */
+		b->e.dir = 1;
+		break;
+	default: /* Error in file */
+		fprintf(stderr,"\nERROR in %s: file position is %d (decimal)\n",filsys_file,ftell(fp));
+		printf("\nEntry in error is\n");
+		prtbent(b);
+		return(ERROR);
+		break;
+	}
+	/* Read in file name */
+	for (name=b->e.name; (nmread = fread(&c,1,1,fp)) > 0 && c != '\0'; )
+		*name++ = c; /* Read until null byte */
+	*name = '\0'; /* Add null byte at end of name */
+	/* Just double check to see if unexpected end of file occured */
+	if (nmread = 0){
+		fprintf(stderr,"INCOMPLETE Record - at EOF\n");
+		return(ERROR);
+	}
+	return(0);
+}
+
+clearnode(e)
+NODE	 e;
+{
+	int	i,j;
+
+	e.next = NULL;
+	e.down = NULL;
+	e.dir = 0;
+	/* Initialize all tape back-up names to nulls */
+	for(i=0; i < MAXBACKUPS; i++){
+		for(j=0; j < MAXTAPNAM; j++)
+			e.tapes[i][j] = ' ';
+		e.tapes[i][MAXTAPNAM] = '\0'; /* Stick null at end of tape name */
+	}
+	for(i=0; i < MAXBACKUPS; i++)
+		e.inodes[i] = 0;
+	return;
+}
+
+prtbent(b)
+struct	bufent	*b;
+{
+	int i,j,idx;
+
+	printf("file: %s\n",b->fname);
+	printf("entry name: %s\n",b->e.name);
+	/* print out inodes for this entry */
+	for (i=0; i < (MAXBACKUPS-1)/3 + 1; i++){ /* for each row */
+		for (j=0; j<3; j++){ /* for each column */
+			if ((idx=j+i*3) < MAXBACKUPS){ 
+				/* only print as many columns as are needed */
+				if (j == 0)
+					printf("%s",(i==0)?"inodes:\t":"\t");
+				printf("(%d) = %5d\t",idx+1,b->e.inodes[idx]);
+			}
+		}
+		printf("\n");
+	} /* print out inodes */
+	/* print out tape names for this entry */
+	for (i=0; i < (MAXBACKUPS-1)/3 + 1; i++){ /* for each row */
+		for (j=0; j<3; j++){ /* for each column */
+			if ((idx=j+i*3) < MAXBACKUPS){ 
+				/* only print as many columns as are needed */
+				if (j == 0)
+					printf("%s",(i==0)?"tapes:\t":"\t");
+				printf("(%d) = %5s\t",idx+1,b->e.tapes[idx]);
+			}
+		}
+		printf("\n");
+	} /* print out tape names */
+}
+
+X/* get_dmptime:  Returns in ctime format the date & time when the tape
+   name given was dumped.   This time is gotten from /etc/dumpdates.
+   The TAPNAMOPT must be enabled for this information to be extracted.
+   The NULL string is returned, if for any reason the time could not
+   be determined. */
+
+char *
+get_dmptime(tape,filename)
+char		*tape,*filename;
+
+{
+	char *dev;
+	
+	dev = findrdev(filename);
+	return(timdmptap(tape,dev));
+}
+
+X/* findrdev:  Returns the raw device upon which a file was dumped.
+   This is the first field in /etc/dumpdates. */
+
+char *
+findrdev(filename)
+char *filename;
+{
+	char *dev,*edev,*index();
+	register	 struct fstab *fs_ent;
+	struct		fstab	*getfsfile();
+	
+	dev = filename++;
+	edev = index(filename,'/');
+	if (edev != NULL)
+		*edev = '\0';
+	setfsent();
+	if ((fs_ent = getfsfile(dev)) == NULL){
+		if (edev != NULL)
+			*edev = '/'; /* Let's put back the slash we took out */
+		endfsent();
+		setfsent();
+		/* device could not be found so assume file belongs on root */
+		if ((fs_ent=getfsfile("/")) == NULL){
+			fprintf(stderr,"File %s, can't find device (in");
+			fprintf(stderr," /etc/fstab) that file belongs on.\n",dev);
+			/* What??? -- This really shouldn't happen */
+			endfsent();
+			return("");
+		}
+		/* Close fstab file */
+		endfsent();
+		return(rawname(fs_ent->fs_spec));
+	}
+	if (edev != NULL)
+		*edev = '/'; /* Let's put back the slash we took out */
+	/* Close fstab file */
+	endfsent();
+	/* Got device file belongs on */
+	return(rawname(fs_ent->fs_spec));
+}
+
+char *rawname(cp)
+	char *cp;
+{
+	static char rawbuf[32];
+	char *rindex();
+	char *dp = rindex(cp, '/');
+
+	if (dp == 0)
+		return (0);
+	*dp = 0;
+	strcpy(rawbuf, cp);
+	*dp = '/';
+	strcat(rawbuf, "/r");
+	strcat(rawbuf, dp+1);
+	return (rawbuf);
+}
+
+addrmdir(b)
+struct bufent *b;
+{
+	if (b->e.dir && strcmp(b->e.name,".") != 0
+		    && strcmp(b->e.name,"..") != 0){
+		/* "This is a directory entry, so add it to the path's name" */
+		strcpy(b->eoname,b->e.name);
+		strcat(b->eoname,"/.");
+		b->eoname = b->fname + strlen(b->fname) - 1;
+	}
+	if (strcmp(b->e.name,"/") == 0){
+		/* Back up over previous slash, ie. given /foo/bar/file
+				where b->eoname points to  ------- ^
+		   then back up before / to here  ---------------^
+		 */
+		b->eoname -= 2;
+		/* Get rid of last path name added */
+		while (*b->eoname != '/' && b->eoname != b->fname)
+			b->eoname--;
+		/* chop off directory name, ie   given   /foo/bar/file
+		   this goes to                          /foo/
+		   where b->eoname points to  ----------------^
+		 */
+		*++(b->eoname) = '\0';
+	}
+	return;
+}
+
+file_found(b)
+struct	bufent	*b;
+{
+
+	/* Just like an assignment statment */
+	cpybent(&(file_list[fl_idx++]),b);
+	
+	/* If this file is in the argv list, then leave a pointer
+	   to it in argv_list */
+	if (strcmp(b->fname,gblargv[af_idx])){
+		/* This file or directory appears in the argument list
+		   so remember where it is in the file_list */
+		argv_list[af_idx] = fl_idx-1;
+	}
+}
+
+cpybent(dest,source)
+struct	bufent	*dest,*source;
+{
+	strcpy(dest->fname,source->fname);
+	dest->eoname = source->eoname;
+	cpyent(&(dest->e),&(source->e));
+}
+
+
+cpyent(dest,source)
+NODE	*dest,*source;
+{
+	register int	i;
+	
+	/* Note:  The limit values in the FOR loops where obtained from
+		the file "filtap.h" */
+	/* Copy inodes information */
+	for(i=0;i<MAXBACKUPS;i++)
+		dest->inodes[i] = source->inodes[i];
+	/* Copy directory flag information */
+	dest->dir = source->dir;
+	/* Copy pointer information (although it is not being
+	   used in this program) */
+	dest->next = source->next;
+	dest->down = source->down;
+	/* Copy entries name information */
+	for(i=0;i<15;i++)
+		dest->name[i] = source->name[i];
+	return;
+}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 whichtape.c
+	/bin/echo -n '	'; /bin/ls -ld whichtape.c
+fi
+/bin/echo 'Extracting getrecord.c'
+sed 's/^X//' <<'//go.sysin dd *' >getrecord.c
+#define	TAPNAMOPT 1
+#define	OINCREM	"/etc/ddate"		/*old format incremental info*/
+#define	NINCREM	"/etc/dumpdates"	/*new format incremental info*/
+#include <stdio.h>
+#include <ctype.h>
+#include <sys/param.h>
+#include <sys/stat.h>
+#include <sys/filsys.h>
+#include <sys/ino.h>
+#include <sys/inode.h>
+#include <sys/fblk.h>
+#include <sys/dir.h>
+#include <utmp.h>
+#include <time.h>
+#include <signal.h>
+#include <dumprestor.h>
+#include <fstab.h>
+
+
+int	recno = 0;
+int getrecord(df, ip)
+	FILE	*df;
+	struct	idates	*ip;
+{
+#ifdef	TAPNAMOPT
+	char	buf[BUFSIZ],tap_buf[100],ino_buf[100];
+	int	nocnv;
+
+	if ( (fgets(buf, BUFSIZ, df)) != buf)
+		return(-1);
+	recno++;
+
+	nocnv = sscanf(buf,TNDUMPINFMT,ip->id_name,&(ip->id_incno),ip->id_pdate);
+	nocnv = sscanf(&(buf[ENDOLDLINE]),"%s %s",tap_buf,ino_buf);
+	if (nocnv < 2){
+		ip->id_notapes = 0;
+	}
+	else{
+		ip->id_notapes = unpk_tapes(tap_buf,ip->id_tapes);	
+		if (unpk_inos(ino_buf,ip->id_inos) != ip->id_notapes){
+			msg("Mismatched tape names & starting inode numbers, line %d\n",
+				recno);
+		}
+	}
+
+X/* There is no need to convert the dump time into the integer
+   equivalent representation.  So skip this extra work. */
+X/* 
+	if (makeidate(ip, ip->id_pdate) < 0)
+		msg("Unknown intermediate format in %s, line %d\n",
+			NINCREM, recno);
+ */
+	return(0);
+
+
+#else not TAPNAMOPT
+
+	if ( (fgets(buf, BUFSIZ, df)) != buf)
+		return(-1);
+	recno++;
+	if (makeidate(idatep, buf) < 0)
+		msg("Unknown intermediate format in %s, line %d\n",
+			NINCREM, recno);
+	return(0);
+#endif	TAPNAMOPT
+}
+
+unpk_tapes(buf,ar)
+char	*buf,ar[MAXTAPDMP][MAXTAPNAM+1];
+{
+	int i=0;
+	char *ptr=buf,*ent,c,c2;
+	
+	while(*ptr){
+		ent = (ptr == buf)? ptr: ++ptr;/* skip over comma, if ness */
+		/* find end of entry */
+		while (*ptr != ',' && *ptr != '\0')
+			ptr++;
+		c = *ptr;
+		c2 = '\0';
+		*ptr = '\0';/* temp mark end of string */
+		/* Watch for tape names that are too long */
+		if(strlen(ent) > MAXTAPNAM){
+			msg("Tape name too long %s in %s\n",ent,NINCREM);
+			/* prevent subscript error */
+			c2 = ent[MAXTAPNAM];
+			ent[MAXTAPNAM] = '\0';
+			msg("Truncated to '%s'\n",ent);
+		}
+		/* Assign tape name to i(th) position */
+		strcpy(ar[i],ent);
+		/* prevent subscript error */
+		if (c2)
+			ent[MAXTAPNAM] = c2;
+		i++;
+		/* replace char saved */
+		*ptr = c;
+	}
+	return(i);
+}
+
+unpk_inos(buf,inos)
+char	*buf;
+ino_t	inos[MAXTAPDMP];
+{
+	int i=0;	/* count # of entries */
+	char *ptr=buf,*ent,c;
+	
+	while(*ptr){
+		ent = (ptr == buf)? ptr: ++ptr;/* skip over comma, if ness */
+		/* find end of entry */
+		while (*ptr != ',' && *ptr != '\0')
+			ptr++;
+		c = *ptr;
+		*ptr = '\0';/* temp mark end of string */
+		inos[i++] = (ino_t)(atoi(ent));
+		/* replace char saved */
+		*ptr = c;
+	}
+	return(i);
+}
+
+msg(fmt, a1, a2, a3, a4, a5)
+	char	*fmt;
+{
+	fprintf(stderr,"  DUMP: ");
+	fprintf(stderr, fmt, a1, a2, a3, a4, a5);
+	fflush(stdout);
+	fflush(stderr);
+}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 getrecord.c
+	/bin/echo -n '	'; /bin/ls -ld getrecord.c
+fi
+/bin/echo 'Extracting timdmptap.c'
+sed 's/^X//' <<'//go.sysin dd *' >timdmptap.c
+
+#define TAPNAMOPT 1
+#include <stdio.h>
+#include <ctype.h>
+#include <sys/param.h>
+#include <sys/stat.h>
+#include <sys/filsys.h>
+#include <sys/ino.h>
+#include <sys/inode.h>
+#include <sys/fblk.h>
+#include <sys/dir.h>
+#include <utmp.h>
+#include <time.h>
+#include <signal.h>
+#include <dumprestor.h>
+#include <fstab.h>
+
+#define	OINCREM	"/etc/ddate"		/*old format incremental info*/
+#define	NINCREM	"/etc/dumpdates"	/*new format incremental info*/
+
+char *
+timdmptap(tape,dev)
+char	*tape,*dev;
+{
+	FILE *fp;
+	int i,recno=0;
+	static struct idates dd_ent;
+	
+	if ((fp = fopen(NINCREM,"r")) == NULL){
+		/* Can't open dumpdates file */
+		return("");
+	}
+	while (getrecord(fp,&dd_ent) >= 0){
+		/* Only look at records for a particular device */
+		recno++;
+		if (strcmp(dd_ent.id_name,dev) != 0)
+			continue;
+		/* Is tape we're looking for in this record */
+		for (i=0; i < dd_ent.id_notapes; i++){
+			if (strcmp(dd_ent.id_tapes[i],tape) == 0){
+				/* Return time when this tape was dumped */
+				fclose(fp);
+				return(dd_ent.id_pdate);
+			}
+		}
+	}			/* End while */
+	/* didn't find tape in fie, so don't know when it was dumped */
+	fclose(fp);
+	return("");
+}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 timdmptap.c
+	/bin/echo -n '	'; /bin/ls -ld timdmptap.c
+fi
+-- 
+Call-Me:   Pete Cottrell, Univ. of Md. Comp. Sci. Dept.
+UUCP:	   {seismo,allegra,brl-bmd}!umcp-cs!petec
+CSNet:	   petec@umcp-cs
+ARPA:	   petec.umcp-cs@CSNet-Relay
+
+

@@ -1,0 +1,273 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,8b1120b585e5cf20,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-09-17 18:59:00 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: Notesfiles; site uiucuxc.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxl!ihnp4!inuxc!pur-ee!uiucdcs!uiucuxc!root
+From: root@uiucuxc.UUCP
+Newsgroups: net.sources
+Subject: Hayes 1200 driver for tip
+Message-ID: <12500013@uiucuxc.UUCP>
+Date: Mon, 17-Sep-84 21:59:00 EDT
+Article-I.D.: uiucuxc.12500013
+Posted: Mon Sep 17 21:59:00 1984
+Date-Received: Tue, 25-Sep-84 03:08:05 EDT
+Lines: 253
+Nf-ID: #N:uiucuxc:12500013:000:5027
+Nf-From: uiucuxc!root    Sep 17 20:59:00 1984
+
+Here's a Hayes driver that was whipped together and works reliably
+(for us).  I'd be interested in any changes that make it reliable for
+someone else.
+
+         Paul Pomes
+
+UUCP:	 {ihnp4,pur-ee}!uiucdcs!uiucuxc!paul   harpo!uiucuxc!paul
+ARPA:	 paul%uiucuxc%uiuc.csnet@csnet-relay.arpa
+CSNET:	 paul%uiucuxc@uiuc
+US Mail: Univ of Illinois, CSO,  1304 W Springfield Ave, Urbana, IL  61801
+
+----Cut Here-----
+#define DEBUG
+
+#include "tip.h"
+
+/*
+** Hayes 1200 modem driver
+**
+** It's assumed the modem is set up with the following dip switch settings:
+**
+** SW 1: Up - Normal DTR action
+** SW 2: Dn - Terse responses (numeric codes 0 to 5)
+** SW 3: Dn - Enable modem response
+** SW 4: Dn - Disable echo of command characters
+** SW 5: Dn - Auto-answer disabled
+** SW 6: Dn - Force CD and DSR ready
+** SW 7: Up - Single line RJ11C/W jacks
+** SW 8: Dn - Enable command mode
+**
+** Written 27 June 1984 by Paul Pomes, University of Illinois, CSO
+**
+** Copyright University of Illinois, 1984.  Permission is granted for
+** unlimited modification, use, and distribution, except that this
+** software may not be sold for profit directly nor as part of any
+** software package.  This software is made available with no warranty
+** of any kind, express or implied.
+*/
+
+/* modem commands
+**
+** INIT sets the escape code to meta-U, theoretically denying users the
+** use of the escape code.  However BREAK puts the modem into command mode
+** anyway. *sigh*  To cover up as much as possible, the guard time is set
+** to five seconds on either side of the BREAK.
+*/
+#define INIT1		"ATS2=149\r"
+#define	INIT2		"ATS12=255\r"
+#define	SYNC		"AT\r"		/* sync the modem serial port to the
+					** tty speed
+					*/
+/* result codes returned by modem in form "n\r" */
+#define	OK		0
+#define CONNECT		1
+#define RING		2
+#define	NO_CARRIER	3
+#define	ERROR		4
+#define CONNECT_1200	5
+
+static	int sigALRM();
+static	int timeout = 0;
+static	jmp_buf timeoutbuf;
+#ifdef DEBUG
+static char	response[40], *r_pnt;
+#endif
+
+hayes_dialer(num)
+char	*num;
+{
+	register int connected = 0;
+	char cbuf[40];
+
+	if (boolean(value(VERBOSE)))
+		printf("\nstarting call...");
+#ifdef DEBUG
+	for (r_pnt = response; r_pnt < response+40; r_pnt++)
+		*r_pnt = 0;
+#endif
+	ioctl(FD, TIOCCDTR, 0);
+	sleep(2);
+	ioctl(FD, TIOCSDTR, 0);
+	ioctl(FD, TIOCFLUSH, 0);
+	sleep(1);
+	/*
+	** Sync the modem to the tty port speed
+	*/
+	if (write(FD, SYNC, strlen(SYNC) != strlen(SYNC)))
+	{
+		printf("can't write first sync to hayes...");
+		exit(0);
+	}
+	if (write(FD, SYNC, strlen(SYNC) != strlen(SYNC)))
+	{
+		printf("can't write second sync to hayes...");
+		exit(0);
+	}
+	sleep(1);
+	ioctl(FD, TIOCFLUSH, 0);
+	if (cmd(SYNC) != '0')
+	{
+		printf("can't sync hayes to tty port speed...");
+#ifdef DEBUG
+		printf("Responses: ");
+		for (r_pnt = response; *r_pnt; r_pnt++)
+			printf("%d ", *r_pnt);
+		putchar('\n');
+#endif
+		return (0);
+	}
+	/*
+	 * Configure; then dial.
+	 */
+	if (cmd(INIT1) != '0')
+	{
+		printf("can't INIT1 hayes...");
+#ifdef DEBUG
+		printf("Responses: ");
+		for (r_pnt = response; *r_pnt; r_pnt++)
+			printf("%d ", *r_pnt);
+		putchar('\n');
+#endif
+		return (0);
+	}
+	sleep(1);
+	if (cmd(INIT2) != '0')
+	{
+		printf("can't INIT2 hayes...");
+#ifdef DEBUG
+		printf("Responses: ");
+		for (r_pnt = response; *r_pnt; r_pnt++)
+			printf("%d ", *r_pnt);
+		putchar('\n');
+#endif
+		return (0);
+	}
+
+	(void) sprintf(cbuf, "ATDT %s\r", num);
+	if (write(FD, cbuf, strlen(cbuf)) != strlen(cbuf))
+	{
+		printf("dial command write error to hayes...");
+		return(0);
+	}
+	connected = detect("1\r");
+#ifdef ACULOG
+	if (timeout) {
+		char line[80];
+
+		sprintf(line, "%d second dial timeout",
+			number(value(DIALTIMEOUT)));
+		logent(value(HOST), num, "hayes", line);
+	}
+#endif
+	if (timeout)
+		hayes_disconnect();	/* insurance */
+	return (connected);
+}
+
+hayes_disconnect()
+{
+	if (FD > 0)
+		ioctl(FD, TIOCCDTR, 0);
+	close(FD);
+}
+
+hayes_abort()
+{
+	char c = '\r';
+	if (FD > 0)
+	{
+		write(FD, &c, 1);
+		ioctl(FD, TIOCCDTR, 0);
+	}
+	close(FD);
+}
+
+static int
+sigALRM()
+{
+
+	timeout = 1;
+#ifdef DEBUG
+	printf("Timeout: Responses: ");
+	for (r_pnt = response; *r_pnt; r_pnt++)
+		printf("%d ", *r_pnt);
+	putchar('\n');
+#endif
+	longjmp(timeoutbuf, 1);
+}
+
+static int
+cmd(s)
+	register char *s;
+{
+	char c, cr;
+	int (*f)();
+
+	write(FD, s, strlen(s));
+	f = signal(SIGALRM, sigALRM);
+	if (setjmp(timeoutbuf)) {
+		hayes_abort();
+		signal(SIGALRM, f);
+		return (1);
+	}
+	alarm(number(value(DIALTIMEOUT)));
+	read(FD, &c, 1);
+	read(FD, &cr, 1);
+#ifdef DEBUG
+	*r_pnt++ = c;
+	*r_pnt++ = cr;
+#endif
+	while (cr != '\r')
+	{
+		c = cr;
+		read(FD, &cr, 1);
+		cr &= 0177;
+#ifdef DEBUG
+		*r_pnt++ = cr;
+#endif
+	}
+	alarm(0);
+	signal(SIGALRM, f);
+	c &= 0177;
+	return ((int) c);
+}
+
+static int
+detect(s)
+	register char *s;
+{
+	char c;
+	int (*f)();
+
+	f = signal(SIGALRM, sigALRM);
+	timeout = 0;
+	while (*s) {
+		if (setjmp(timeoutbuf)) {
+			hayes_abort();
+			break;
+		}
+		alarm(number(value(DIALTIMEOUT)));
+		read(FD, &c, 1);
+#ifdef DEBUG
+		*r_pnt++ = c;
+#endif
+		alarm(0);
+		c &= 0177;
+		if (c != *s++)
+			return (0);
+	}
+	signal(SIGALRM, f);
+	return (timeout == 0);
+}
+
+

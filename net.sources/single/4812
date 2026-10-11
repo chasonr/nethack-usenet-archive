@@ -1,0 +1,660 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,65d051fac6305135,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-09-02 10:30:34 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!mnetor!seismo!lll-crg!lll-lcc!styx!twg-ap!amdahl!hplabs!pesnta!amd!amdcad!amdimage!prls!philabs!micomvax!musocs!mcgill-vision!leei
+From: leei@mcgill-vision.UUCP (Lee Iverson)
+Newsgroups: net.sources
+Subject: 4.3 INET server code.
+Message-ID: <485@mcgill-vision.UUCP>
+Date: Tue, 2-Sep-86 13:30:34 EDT
+Article-I.D.: mcgill-v.485
+Posted: Tue Sep  2 13:30:34 1986
+Date-Received: Sun, 14-Sep-86 03:35:59 EDT
+Reply-To: leei@larry.ee.mcgill.edu.UUCP (Lee Iverson)
+Organization: McGill University, Montreal
+Lines: 639
+Keywords: 4.3BSD network client server.
+
+Well, we just go 4.3 and the expanded networking facilities really got my
+mind going, so I hacked this little tool together and figured I'd let you
+all have a gander.
+
+This is intended to be the initial setup code for both the client and server
+end of some service available anywhere on the local network.  The client end
+broadcasts a request for the service and if the service exists anywhere on
+the local net, the server will respond.  Clearly this has a number of uses,
+the most immediate being distributed games.  It would be very easy to wrap
+these routines in a framework that broadcasts a request for a server and if
+no reply is received, forks a referee process which establishes itself as a
+server, and tries again.
+
+At this point, the code is really simple, and, as far as I know, runs under
+4.3 with no problems.  If you have any ideas for improvement, please feel
+free to implement them and let me know about you changes.  There are plenty
+of "problems" with the code as it stands now that anyone could fix:
+
+	- Depends on 4.3 (I think) because of broadcasting.
+	- Depends on INET type network.
+	- Only deals with SOCK_DGRAM sockets.
+	- Assumes (sort of) that only one server exists.  It might be useful
+	  to accept all responses to the initial request and then choose one
+	  of them to deal with.
+	- etc. (I'm sure you can come up with more).
+
+So, I hope to hear from some of you out there son and hope that this
+inspires and helps as many of you as possible.
+
+				Enjoy,
+				Lee Iverson
+				utcsri!mcgill-vision!leei
+				McGill University, Montreal, Canada
+
+--------------------  cut at dotted line -----------------------
+echo x - server.c
+sed 's/^X//' >server.c <<'*-*-END-of-server.c-*-*'
+Xset noglob
+Xecho Extracting client.c
+Xcat > client.c <<'##EOF##'
+X#include <stdio.h>
+X#include <netdb.h>
+X
+X#include <sys/types.h>
+X#include <sys/time.h>
+X#include <sys/ioctl.h>
+X#include <sys/socket.h>
+X
+X#include <netinet/in.h>
+X#include <net/if.h>
+X
+Xextern void request_service();
+X
+X/*
+X *	These variables may be accessed externally in order to verify that
+X *	further messages received on the socket are actually being sent by
+X *	the same server.  This may easily be done using the command:
+X *
+X *	    bcmp( (char *) &server_addr, (char *) &addr, server_addr_size )
+X */
+X
+Xstruct sockaddr_in server_addr;
+Xint server_addr_size = sizeof(server_addr);
+X
+X/*
+X *	int obtain_service( char *name, int port, int timeout_sec,
+X *			    char *request, int request_size )
+X *
+X *	    Sends a broadcast message over the net asking for the existence
+X *	of a server socket on the given port associated with the named
+X *	service.  The port argument is a default port number if the service
+X *	is not found in the local net DB.  If there is no response after
+X *	timeout_sec seconds, then we return with -1.  If a response is
+X *	received, then the socket is connected to that address and the socket
+X *	number is returned.  The socket type used is SOCK_DGRAM.
+X */
+X
+Xint
+Xobtain_service( serv_name, serv_port, timeout_sec, request, request_size )
+Xchar *serv_name;
+Xint serv_port;
+Xint timeout_sec;
+Xchar *request;
+Xint request_size;
+X{
+X    int sock;
+X    fd_set mask;
+X    struct timeval timeout;
+X    struct servent  *serv,  *getservbyname();
+X    struct protoent *proto, *getprotobyname();
+X    int serv_proto = 0;
+X    static char tbuf[64];
+X
+X    /* Initialize the timeout structure */
+X    timeout.tv_sec = timeout_sec;
+X    timeout.tv_usec = 0;
+X
+X    /* Get service information */
+X    serv_port = htons(serv_port);
+X    if ( (serv = getservbyname( serv_name, (char *) 0 )) != NULL ) {
+X	serv_port = serv->s_port;
+X#ifdef PROTO_SUPPORTED
+X	if ( (proto = getprotobyname(serv->s_proto)) != NULL )
+X	    serv_proto = proto->p_proto;
+X#endif PROTO_SUPPORTED
+X    }
+X
+X#ifdef DEBUG
+X    printf( "Access port %d and proto %d\n", ntohs(serv_port), serv_proto );
+X    fflush(stdout);
+X#endif DEBUG
+X    /* Initialize the socket */
+X    if ( (sock = socket( AF_INET, SOCK_DGRAM, serv_proto )) < 0 ) {
+X	perror( "creating socket to server" );
+X	exit(1);
+X    }
+X
+X    /* Make the request */
+X    printf( "[Request service ..." ); fflush(stdout);
+X    request_service( sock, serv_port, request, request_size );
+X
+X    /* Now, wait for some response */
+X    FD_ZERO(&mask);
+X    FD_SET(sock,&mask);
+X    if ( select(FD_SETSIZE,&mask,(fd_set *)0,(fd_set *)0,&timeout) <= 0 ||
+X	 !FD_ISSET( sock, &mask ) ) {
+X	printf( " timed out]\n" ); fflush(stdout);
+X	return -1;
+X    }
+X
+X    /* We got a response (YAY!) */
+X    printf( " answered..." ); fflush(stdout);
+X
+X    /* So, peek at the response (to get address) */
+X    if ( recvfrom( sock, tbuf, sizeof(tbuf), MSG_PEEK,
+X		   &server_addr, &server_addr_size ) < 0 ) {
+X	perror( "receive initial response" );
+X	exit(1);
+X    }
+X
+X#ifdef DEBUG
+X    printf( "[by %s %d]...",
+X	    inet_ntoa(server_addr.sin_addr), ntohs(server_addr.sin_port) );
+X    fflush(stdout);
+X#endif DEBUG
+X
+X    /* Connect socket to the address */
+X    if ( connect( sock, &server_addr, server_addr_size ) < 0 ) {
+X	perror( "connect to server" );
+X	exit(1);
+X    }
+X
+X    /* Return with a happy (:-) response */
+X    printf( " connected]\n" ); fflush(stdout);
+X    return sock;
+X}
+X
+X/*
+X *	int get_ifc( int sock )
+X *
+X *	    Put the IFCONF data structure into the ifc structure and return
+X *	the number of ifreq structures it contains.
+X */
+X
+Xstatic struct ifconf ifc;
+X
+Xint
+Xget_ifc( sock )
+Xint sock;
+X{
+X    static char ifc_buffer[BUFSIZ];
+X
+X    ifc.ifc_len = sizeof(ifc_buffer);
+X    ifc.ifc_buf = ifc_buffer;
+X    if ( (ioctl( sock, SIOCGIFCONF, (char *) &ifc )) < 0 ) {
+X	perror( "get ifconf" );
+X	exit(1);
+X    }
+X    return ifc.ifc_len / sizeof(struct ifreq);
+X}
+X
+X/*
+X *	request_service( int sock, int port, char *data, int data_len )
+X *
+X *	    This function broadcasts a request for the given service using
+X *	the socket sock.  The request is directed at servers on the named
+X *	port on all machines in the local INET network.
+X */
+X
+Xvoid
+Xrequest_service( sock, port, data, data_len )
+Xint sock;
+Xint port;
+Xchar *data;
+Xint data_len;
+X{
+X    struct sockaddr_in sin;
+X    struct sockaddr dst;
+X    int off = 0, on = 1;
+X    int n;
+X    struct ifreq *ifr;
+X
+X    /* Set socket for broadcast mode */
+X    if ( (setsockopt( sock,SOL_SOCKET,SO_BROADCAST,&on,sizeof(on) )) < 0 ) {
+X	perror( "set socket option for broadcast" );
+X	exit(1);
+X    }
+X
+X    /* Initialize broadcast address and bind socket to it */
+X    sin.sin_family = AF_INET;
+X    sin.sin_port = port;
+X    sin.sin_addr.s_addr = htonl(INADDR_ANY);
+X    bind( sock, (struct sockaddr *) &sin, sizeof(sin) );
+X
+X    for ( n = get_ifc(sock), ifr = ifc.ifc_req; n > 0; --n, ++ifr ) {
+X
+X	/* Only deal with AF_INET networks */
+X	if ( ifr->ifr_addr.sa_family != AF_INET ) continue;
+X
+X	/* Use the current address by default */
+X	bzero( (char *) &dst, sizeof(dst) );
+X	bcopy( (char *)&ifr->ifr_addr, (char *)&dst, sizeof(ifr->ifr_addr) );
+X
+X	/* Get the flags */
+X	if ( ioctl( sock, SIOCGIFFLAGS, (char *) ifr ) < 0 ) {
+X	    perror( "get ifr flags" );
+X	    exit(1);
+X	}
+X
+X	/* Skip unusable cases */
+X	if ( !(ifr->ifr_flags & IFF_UP) ||	    /* If not up, OR */
+X	     (ifr->ifr_flags & IFF_LOOPBACK ) ||    /* if loopback, OR */
+X	     !(ifr->ifr_flags & (IFF_BROADCAST | IFF_POINTOPOINT)) )
+X	    continue;
+X
+X	/* Now, determine the address to send to */
+X	if ( ifr->ifr_flags & IFF_POINTOPOINT ) {
+X	    if ( ioctl( sock, SIOCGIFDSTADDR, (char *) ifr ) < 0 ) {
+X		perror( "get ifr destination address" );
+X		exit(1);
+X	    }
+X	    bcopy( (char *) &ifr->ifr_dstaddr,
+X		   (char *) &dst,
+X		   sizeof(ifr->ifr_dstaddr) );
+X	}
+X	if ( ifr->ifr_flags & IFF_BROADCAST ) {
+X	    if ( ioctl( sock, SIOCGIFBRDADDR, (char *) ifr ) < 0 ) {
+X		perror( "get ifr broadcast address" );
+X		exit(1);
+X	    }
+X	    bcopy( (char *) &ifr->ifr_broadaddr,
+X		   (char *) &dst,
+X		   sizeof(ifr->ifr_broadaddr) );
+X	}
+X
+X	/* ... make sure that the port number is OK */
+X	if ( dst.sa_family == AF_INET ) {
+X	    struct sockaddr_in *sa_in = (struct sockaddr_in *) &dst;
+X	    sa_in->sin_port = port;
+X#ifdef DEBUG
+X	    printf( "Request address = %s (%d)\n",
+X		    inet_ntoa(sa_in->sin_addr), ntohs(port) );
+X	    fflush(stdout);
+X#endif DEBUG
+X	}
+X
+X	/* ... and send the request */
+X	if ( sendto( sock, data, data_len, 0,
+X		     (struct sockaddr *) &dst, sizeof(dst) ) < 0 ) {
+X	    perror( "sendto" );
+X	    exit(1);
+X	}
+X    }
+X
+X    /* Reset socket option to normal operation */
+X    if ( (setsockopt( sock,SOL_SOCKET,SO_BROADCAST,&off,sizeof(off) )) < 0 ) {
+X	perror( "reset socket option for no broadcast" );
+X	exit(1);
+X    }
+X}
+X##EOF##
+Xecho Extracting service.h
+Xcat > service.h <<'##EOF##'
+*-*-END-of-server.c-*-*
+echo x - client.c
+sed 's/^X//' >client.c <<'*-*-END-of-client.c-*-*'
+X#include <stdio.h>
+X#include <netdb.h>
+X
+X#include <sys/types.h>
+X#include <sys/time.h>
+X#include <sys/ioctl.h>
+X#include <sys/socket.h>
+X
+X#include <netinet/in.h>
+X#include <net/if.h>
+X
+Xextern void request_service();
+X
+X/*
+X *	These variables may be accessed externally in order to verify that
+X *	further messages received on the socket are actually being sent by
+X *	the same server.  This may easily be done using the command:
+X *
+X *	    bcmp( (char *) &server_addr, (char *) &addr, server_addr_size )
+X */
+X
+Xstruct sockaddr_in server_addr;
+Xint server_addr_size = sizeof(server_addr);
+X
+X/*
+X *	int obtain_service( char *name, int port, int timeout_sec,
+X *			    char *request, int request_size )
+X *
+X *	    Sends a broadcast message over the net asking for the existence
+X *	of a server socket on the given port associated with the named
+X *	service.  The port argument is a default port number if the service
+X *	is not found in the local net DB.  If there is no response after
+X *	timeout_sec seconds, then we return with -1.  If a response is
+X *	received, then the socket is connected to that address and the socket
+X *	number is returned.  The socket type used is SOCK_DGRAM.
+X */
+X
+Xint
+Xobtain_service( serv_name, serv_port, timeout_sec, request, request_size )
+Xchar *serv_name;
+Xint serv_port;
+Xint timeout_sec;
+Xchar *request;
+Xint request_size;
+X{
+X    int sock;
+X    fd_set mask;
+X    struct timeval timeout;
+X    struct servent  *serv,  *getservbyname();
+X    struct protoent *proto, *getprotobyname();
+X    int serv_proto = 0;
+X    static char tbuf[64];
+X
+X    /* Initialize the timeout structure */
+X    timeout.tv_sec = timeout_sec;
+X    timeout.tv_usec = 0;
+X
+X    /* Get service information */
+X    serv_port = htons(serv_port);
+X    if ( (serv = getservbyname( serv_name, (char *) 0 )) != NULL ) {
+X	serv_port = serv->s_port;
+X#ifdef PROTO_SUPPORTED
+X	if ( (proto = getprotobyname(serv->s_proto)) != NULL )
+X	    serv_proto = proto->p_proto;
+X#endif PROTO_SUPPORTED
+X    }
+X
+X#ifdef DEBUG
+X    printf( "Access port %d and proto %d\n", ntohs(serv_port), serv_proto );
+X    fflush(stdout);
+X#endif DEBUG
+X    /* Initialize the socket */
+X    if ( (sock = socket( AF_INET, SOCK_DGRAM, serv_proto )) < 0 ) {
+X	perror( "creating socket to server" );
+X	exit(1);
+X    }
+X
+X    /* Make the request */
+X    printf( "[Request service ..." ); fflush(stdout);
+X    request_service( sock, serv_port, request, request_size );
+X
+X    /* Now, wait for some response */
+X    FD_ZERO(&mask);
+X    FD_SET(sock,&mask);
+X    if ( select(FD_SETSIZE,&mask,(fd_set *)0,(fd_set *)0,&timeout) <= 0 ||
+X	 !FD_ISSET( sock, &mask ) ) {
+X	printf( " timed out]\n" ); fflush(stdout);
+X	return -1;
+X    }
+X
+X    /* We got a response (YAY!) */
+X    printf( " answered..." ); fflush(stdout);
+X
+X    /* So, peek at the response (to get address) */
+X    if ( recvfrom( sock, tbuf, sizeof(tbuf), MSG_PEEK,
+X		   &server_addr, &server_addr_size ) < 0 ) {
+X	perror( "receive initial response" );
+X	exit(1);
+X    }
+X
+X#ifdef DEBUG
+X    printf( "[by %s %d]...",
+X	    inet_ntoa(server_addr.sin_addr), ntohs(server_addr.sin_port) );
+X    fflush(stdout);
+X#endif DEBUG
+X
+X    /* Connect socket to the address */
+X    if ( connect( sock, &server_addr, server_addr_size ) < 0 ) {
+X	perror( "connect to server" );
+X	exit(1);
+X    }
+X
+X    /* Return with a happy (:-) response */
+X    printf( " connected]\n" ); fflush(stdout);
+X    return sock;
+X}
+X
+X/*
+X *	int get_ifc( int sock )
+X *
+X *	    Put the IFCONF data structure into the ifc structure and return
+X *	the number of ifreq structures it contains.
+X */
+X
+Xstatic struct ifconf ifc;
+X
+Xint
+Xget_ifc( sock )
+Xint sock;
+X{
+X    static char ifc_buffer[BUFSIZ];
+X
+X    ifc.ifc_len = sizeof(ifc_buffer);
+X    ifc.ifc_buf = ifc_buffer;
+X    if ( (ioctl( sock, SIOCGIFCONF, (char *) &ifc )) < 0 ) {
+X	perror( "get ifconf" );
+X	exit(1);
+X    }
+X    return ifc.ifc_len / sizeof(struct ifreq);
+X}
+X
+X/*
+X *	request_service( int sock, int port, char *data, int data_len )
+X *
+X *	    This function broadcasts a request for the given service using
+X *	the socket sock.  The request is directed at servers on the named
+X *	port on all machines in the local INET network.
+X */
+X
+Xvoid
+Xrequest_service( sock, port, data, data_len )
+Xint sock;
+Xint port;
+Xchar *data;
+Xint data_len;
+X{
+X    struct sockaddr_in sin;
+X    struct sockaddr dst;
+X    int off = 0, on = 1;
+X    int n;
+X    struct ifreq *ifr;
+X
+X    /* Set socket for broadcast mode */
+X    if ( (setsockopt( sock,SOL_SOCKET,SO_BROADCAST,&on,sizeof(on) )) < 0 ) {
+X	perror( "set socket option for broadcast" );
+X	exit(1);
+X    }
+X
+X    /* Initialize broadcast address and bind socket to it */
+X    sin.sin_family = AF_INET;
+X    sin.sin_port = port;
+X    sin.sin_addr.s_addr = htonl(INADDR_ANY);
+X    bind( sock, (struct sockaddr *) &sin, sizeof(sin) );
+X
+X    for ( n = get_ifc(sock), ifr = ifc.ifc_req; n > 0; --n, ++ifr ) {
+X
+X	/* Only deal with AF_INET networks */
+X	if ( ifr->ifr_addr.sa_family != AF_INET ) continue;
+X
+X	/* Use the current address by default */
+X	bzero( (char *) &dst, sizeof(dst) );
+X	bcopy( (char *)&ifr->ifr_addr, (char *)&dst, sizeof(ifr->ifr_addr) );
+X
+X	/* Get the flags */
+X	if ( ioctl( sock, SIOCGIFFLAGS, (char *) ifr ) < 0 ) {
+X	    perror( "get ifr flags" );
+X	    exit(1);
+X	}
+X
+X	/* Skip unusable cases */
+X	if ( !(ifr->ifr_flags & IFF_UP) ||	    /* If not up, OR */
+X	     (ifr->ifr_flags & IFF_LOOPBACK ) ||    /* if loopback, OR */
+X	     !(ifr->ifr_flags & (IFF_BROADCAST | IFF_POINTOPOINT)) )
+X	    continue;
+X
+X	/* Now, determine the address to send to */
+X	if ( ifr->ifr_flags & IFF_POINTOPOINT ) {
+X	    if ( ioctl( sock, SIOCGIFDSTADDR, (char *) ifr ) < 0 ) {
+X		perror( "get ifr destination address" );
+X		exit(1);
+X	    }
+X	    bcopy( (char *) &ifr->ifr_dstaddr,
+X		   (char *) &dst,
+X		   sizeof(ifr->ifr_dstaddr) );
+X	}
+X	if ( ifr->ifr_flags & IFF_BROADCAST ) {
+X	    if ( ioctl( sock, SIOCGIFBRDADDR, (char *) ifr ) < 0 ) {
+X		perror( "get ifr broadcast address" );
+X		exit(1);
+X	    }
+X	    bcopy( (char *) &ifr->ifr_broadaddr,
+X		   (char *) &dst,
+X		   sizeof(ifr->ifr_broadaddr) );
+X	}
+X
+X	/* ... make sure that the port number is OK */
+X	if ( dst.sa_family == AF_INET ) {
+X	    struct sockaddr_in *sa_in = (struct sockaddr_in *) &dst;
+X	    sa_in->sin_port = port;
+X#ifdef DEBUG
+X	    printf( "Request address = %s (%d)\n",
+X		    inet_ntoa(sa_in->sin_addr), ntohs(port) );
+X	    fflush(stdout);
+X#endif DEBUG
+X	}
+X
+X	/* ... and send the request */
+X	if ( sendto( sock, data, data_len, 0,
+X		     (struct sockaddr *) &dst, sizeof(dst) ) < 0 ) {
+X	    perror( "sendto" );
+X	    exit(1);
+X	}
+X    }
+X
+X    /* Reset socket option to normal operation */
+X    if ( (setsockopt( sock,SOL_SOCKET,SO_BROADCAST,&off,sizeof(off) )) < 0 ) {
+X	perror( "reset socket option for no broadcast" );
+X	exit(1);
+X    }
+X}
+*-*-END-of-client.c-*-*
+echo x - service.h
+sed 's/^X//' >service.h <<'*-*-END-of-service.h-*-*'
+X#define SERV_PORT   (1046)
+X#define SERV_NAME   "brd-test"
+*-*-END-of-service.h-*-*
+echo x - serv.c
+sed 's/^X//' >serv.c <<'*-*-END-of-serv.c-*-*'
+X#include <stdio.h>
+X
+X#include <sys/types.h>
+X#include <netinet/in.h>
+X
+X#include "service.h"
+X
+Xint comm_chan;
+Xchar in_buf[BUFSIZ];
+X
+Xmain()
+X{
+X    if ( (comm_chan = setup_server( SERV_NAME, SERV_PORT )) < 0 ) {
+X	perror( "setup_server" );
+X	exit(1);
+X    }
+X
+X    for ( ;; ) {
+X	struct sockaddr_in from;
+X	int fromlen = sizeof(from);
+X	int r;
+X
+X	if ( (r = recvfrom( comm_chan, in_buf, sizeof(in_buf), 0,
+X			    (struct sockaddr *) &from, &fromlen )) < 0 ) {
+X	    perror( "receive" );
+X	    continue;
+X	}
+X
+X	/* Data received, display it. */
+X	printf( "From " );
+X	print_bytes( (char *) &from, sizeof(from) );
+X	printf( ": %.*s\n", r, in_buf );
+X	fflush(stdout);
+X
+X	/* Reply to the bugger. */
+X#define MSG "Hello."
+X	sendto(comm_chan,MSG,sizeof(MSG),0,(struct sockaddr *)&from,fromlen);
+X    }
+X}
+X
+Xprint_bytes( p, n )
+Xunsigned char *p;
+Xint n;
+X{
+X    printf( "[" );
+X    for ( ; n; --n, ++p ) {
+X	printf( "%d", *p );
+X	if ( n != 1 ) printf( "," );
+X    }
+X    printf( "]" );
+X}
+*-*-END-of-serv.c-*-*
+echo x - findserv.c
+sed 's/^X//' >findserv.c <<'*-*-END-of-findserv.c-*-*'
+X#include <stdio.h>
+X
+X#include "service.h"
+X
+X#define TIMEOUT 10
+X
+X#define SIGN_ON	    "sign on."
+X#define NUM_MSGS 5
+X
+Xint sock_to_serv;
+Xchar in_buf[BUFSIZ];
+X
+Xmain( argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X    int i;
+X    char *msg = "They're here!";
+X
+X    if ( argc > 1 ) msg = argv[1];
+X
+X    if ( (sock_to_serv =
+X	  obtain_service( SERV_NAME, SERV_PORT, TIMEOUT,
+X			  SIGN_ON, sizeof(SIGN_ON) )) < 0 ) {
+X	fprintf( stderr, "Service request timed out\n" );
+X	exit(1);
+X    }
+X    printf( "Client side started\n" );
+X
+X    for ( i = 0; i < NUM_MSGS; ++i ) {
+X	datagram_string( sock_to_serv, msg );
+X	sleep(5);
+X    }
+X
+X    close(sock_to_serv);
+X}
+X
+Xint
+Xdatagram_string( sock, string )
+Xint sock;
+Xchar *string;
+X{
+X    write( sock, string, strlen(string) );
+X}
+*-*-END-of-findserv.c-*-*
+exit
+-- 
+				Lee Iverson
+				utcsri!mcgill-vision!leei
+				Mcgill University, Montreal
+				Computer Vision and Robotics Lab
+
+

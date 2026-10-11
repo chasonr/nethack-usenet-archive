@@ -1,0 +1,264 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 169ae0,46222ed533844b26,start
+X-Google-Attributes: gid169ae0,public
+X-Google-Thread: 159752,46222ed533844b26,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-12-21 15:18:27 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site umcp-cs.UUCP
+Path: utzoo!linus!decvax!genrad!mit-eddie!godot!harvard!seismo!umcp-cs!chris
+From: chris@umcp-cs.UUCP (Chris Torek)
+Newsgroups: net.sources,net.unix-wizards
+Subject: ``fd'' device driver
+Message-ID: <2065@umcp-cs.UUCP>
+Date: Fri, 21-Dec-84 18:18:27 EST
+Article-I.D.: umcp-cs.2065
+Posted: Fri Dec 21 18:18:27 1984
+Date-Received: Sun, 23-Dec-84 08:23:25 EST
+Distribution: net
+Organization: U of Maryland, Computer Science Dept., College Park, MD
+Lines: 240
+
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting Info'
+cat <<'Foo' >Info
+As promised, here is the fd driver for 4.2BSD.  Beware: I just ripped
+out the 4.1 manual, so it's wrong.  The code now doesn't just dup() the
+file, if it's an inode; it makes a whole new file pointer.  (For sockets
+and any other descriptor types you may happen to have lying around, it
+still dup()s.)
+
+This isn't Fred's original code either; I reformatted it and removed
+a few "u.u_" assignments.  Any bugs can probably be attributed to me.
+
+To install, put dev_fd.c in sys/sys, update conf/files, configure, make
+depend, and make.  (I think.)  dev_fd.c is a lot like tty_pty.c.
+
+By the way, we've found /dev/fd0 especially useful with soelim.
+Foo
+/bin/echo 'Extracting dev_fd.c'
+sed 's/^X//' <<'//go.sysin dd *' >dev_fd.c
+#ifndef lint
+static char rcsid[] = "@(#)$Header: /usr/sys/sys/RCS/dev_fd.c,v 1.1 84/12/01 21:38:17 chris Exp $";
+#endif lint
+
+X/*
+ * fd.c		Fred Blonder - U of Maryland	11-Sep-1984
+ *
+ * ``File Descriptor'' pseudo-device driver, rewritten for Berkeley 4.2.
+ *
+ * Opening minor device N opens the file (if any) connected to file-descriptor
+ * N belonging to the calling process. Note that this driver consists of only
+ * the ``open()'' routine, because all subsequent references to this file will
+ * be direct to the other driver.
+ */
+
+#include "fd.h"
+#if NFD > 0
+
+#include "../h/param.h"
+#include "../h/inode.h"
+#include "../h/file.h"
+#include "../h/dir.h"
+#include "../h/user.h"
+#include "../h/errno.h"
+
+X/*
+ * THIS CODE NEEDS CLEANING AS SOON AS ASSIGNMENTS TO u.u_* GO AWAY
+ */
+
+fdopen(dev, mode)
+dev_t dev;
+int mode;
+{
+	struct file *fp, *wfp;
+	struct inode *ip, *wip;
+	int rwmode, error;
+
+	/*
+	 * Note the horrid kludge here: u.u_r.r_val1 contains the value
+	 * of the new file descriptor, which has not been disturbed since
+	 * it was allocated.
+	 */
+	if ((fp = getf(u.u_r.r_val1)) == NULL)
+		return (u.u_error);
+
+	if ((wfp = getf(minor(dev))) == NULL)
+		return (u.u_error);
+
+	/*
+	 * We must explicitly test for this case because ufalloc() may
+	 * have allocated us the same file desriptor we are referring
+	 * to, if the proccess referred to an invalid (closed) descriptor.
+	 * Ordinarily this would be caught by getf(), but by the time we
+	 * reach this routine u_pofile[minor(dev)] could already be set
+	 * to point to our file struct.
+	 */
+	if (fp == wfp)
+		return (EBADF);
+
+	ip = (struct inode *)fp->f_data;
+
+	/*
+	 * Fake a ``dup()'' sys call if it isn't an inode.
+	 */
+	if (wfp->f_type != DTYPE_INODE) {
+		/*
+		 * Check that the mode the file is being opened
+		 * for is consistent with the mode of the existing
+		 * descriptor. This isn't as clean as it should be,
+		 * but this entire driver is a real kludge anyway.
+		 */
+		rwmode = mode & (FREAD|FWRITE);
+		if ((fp->f_flag & rwmode) != rwmode)
+			return (EACCES);
+
+		/* Delete references to this pseudo-device. */
+		irele(ip);		/* Chuck the inode. */
+		fp->f_count = 0;	/* Chuck the file structure. */
+		/* Dup the file descriptor. */
+		dupit(u.u_r.r_val1, wfp, u.u_pofile[minor(dev)]);
+		return (0);
+	}
+
+	error = 0;
+	wip = (struct inode *)wfp->f_data;
+
+	/*
+	 * I'm not sure that we really need to lock the inode here,
+	 * but why not be paranoid?
+	 */
+	ilock(wip);
+
+	/*
+	 * Since we're opening a file again, we run through all the
+	 * permission checks so this can't be used as a loophole to
+	 * get access to a file we shouldn't have.  (GROT)
+	 */
+	if (mode & FREAD && access(wip, IREAD))
+		goto bad;
+	if (mode & (FWRITE|FTRUNC)) {
+		if ((ip->i_mode&IFMT) == IFDIR) {
+			error = EISDIR;
+			goto bad;
+		}
+		if (access(wip, IWRITE))
+			goto bad;
+	}
+
+	/*
+	 * The file must always exist, so we don't even bother testing
+	 * for its presence.
+	 */
+	if ((mode & (FCREAT|FEXCL)) == (FCREAT|FEXCL)) {
+		error = EEXIST;
+		goto bad;
+	}
+
+	/*
+	 * This may not make any sense, but I'm paranoid and figure that
+	 * it's probably an error.
+	 */
+	if (mode & FTRUNC) {
+		error = EBUSY;
+		goto bad;
+	}
+
+	/* Call the device-specific open routine, if any. */
+	if ((error = openi(wip, mode)) != 0)
+		goto bad;
+
+	/*
+	 * Made it this far, now switch the inode pointers in the
+	 * file descriptors around, to make this file open refer
+	 * to the other file.
+	 */
+	irele(ip);		/* We don't need this anymore. */
+	fp->f_data = (caddr_t)wip;
+	wip->i_count++;
+	iunlock(wip);
+	return (0);
+
+bad:
+	iunlock(wip);
+	return (error);
+}
+
+#endif NFD > 0
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 dev_fd.c
+	/bin/echo -n '	'; /bin/ls -ld dev_fd.c
+fi
+/bin/echo 'Extracting fd.4'
+sed 's/^X//' <<'//go.sysin dd *' >fd.4
+X.TH FD 4l "11-Jan-83 (U of Maryland)"
+X.UC 4
+X.SH NAME
+fd \- ``file descriptor'' driver
+X.SH DESCRIPTION
+X.lg
+X.I Fd0
+-
+X.I fd19
+are special files that are symbolic names for a process's file descriptors.
+That is, opening the file: /dev/fd\fIN\fP is equivalent to doing the system
+call: dup(\fIN\fP).
+This can be used to force a program which opens files by name, to connect
+itself to open file descriptors (which you have thoughtfully provided) in
+weird and wonderful ways. A simple use would be to force a program which
+only accepts input from files, to read from its standard input.
+For instance:
+X.sp
+X.ti +10
+cat /dev/fd0
+X.sp
+produces the same result as:
+X.sp
+X.ti +10
+cat -
+X.sp
+which would be useful if \fIcat\fP didn't use the ``-'' convention.
+X.sp
+The driver checks to see that the read/write mode you are attempting to open
+the file with, is compatible with the mode of the existing file descriptor.
+That is: if descriptor 5 is open for writing, you cannot open ``/dev/fd5''
+for reading.
+X.SH AUTHOR
+Fred Blonder <fred@umcp-cs>
+X.SH FILES
+X/dev/fd*
+X.SH BUGS
+Since the driver fakes a ``dup'' system call rather than actually re-opening
+the file, the new descriptor is a copy of the dup-ed descriptor, and shares
+its properties. Specifically: it will have the same read/write mode as the
+dup-ed descriptor. If descriptor 0 is open for reading and writing, opening
+``/dev/fd0'' for reading will return a writeable, as well as readable, file
+descriptor.
+Also: the descriptors share the same read/write pointer, so seeks, reads &
+writes on one will affect the other.
+X.sp
+While not a bug in the driver, use of these files can produce odd
+interactions with programs which don't expect to have their file
+descriptors surreptitiously aliased.
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 fd.4
+	/bin/echo -n '	'; /bin/ls -ld fd.4
+fi
+-- 
+(This line accidently left nonblank.)
+
+In-Real-Life: Chris Torek, Univ of MD Comp Sci Dept (301) 454-7690
+UUCP:	{seismo,allegra,brl-bmd}!umcp-cs!chris
+CSNet:	chris@umcp-cs		ARPA:	chris@maryland
+
+

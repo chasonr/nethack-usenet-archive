@@ -1,0 +1,830 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,a833ea64fc1cd900,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-02-05 01:17:50 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83 (MC830919); site kaist.UUCP
+Path: utzoo!utcs!lsuc!pesnta!hplabs!kaist!hjpark
+From: hjpark@kaist.UUCP (HyeonJe Park)
+Newsgroups: net.sources
+Subject: uucp on TCP/IP connection
+Message-ID: <1299@kaist.UUCP>
+Date: Tue, 5-Feb-85 04:17:50 EST
+Article-I.D.: kaist.1299
+Posted: Tue Feb  5 04:17:50 1985
+Date-Received: Thu, 7-Feb-85 06:42:47 EST
+Distribution: net.bugs.4bsd
+Organization: KAIST, Seoul, Republic of Korea
+Lines: 809
+
+This is the uucp implemenation on 4.2 BSD TCP/IP.
+
+			Park, Hyunje
+			KAIST, Seoul Korea
+			(UUCP: ...!hplabs!kaist!hjpark)
+			(CSNET: hjpark%kaist@csnet-relay.csnet)
+# This is a shell archive.  Remove anything before this line, then
+# unpack it by saving it in a file and typing "sh file".  (Files
+# unpacked will be owned by you and have default permissions.)
+#
+# This archive contains:
+# README.TCP uucpd.c cicod.c cico.diff condevs.diff
+
+echo x - README.TCP
+cat > "README.TCP" << '//E*O*F README.TCP//'
+INSTALLATION GUIDE FOR UUCP ON TCP/IP
+README	5.2	85/01/31
+
+Hyunje Park, kaist!hjpark, hjpark%kaist@csnet-relay.csnet
+			Korea Advanced Institute of Science and Technology
+
+This is the guide for installation of the uucp that can used on 
+4.2BSD TCP/IP connection as well as normal connection. The modification 
+is based on 5.2 version from Tom Truscott and Bob Gray. The routines may
+be rough because it is done without much modification of existing system.
+(Only change of "uucico" routine and installation of the "uucpd" daemon
+are needed.)
+
+newly generated routines
+
+	uucpd.c: main program of uucp daemon
+
+	cicod.c: sub-program of uucp daemon
+		 It is modified from cico.c so that it might run
+		 as only SLAVE mode
+
+modified routines
+
+	cico.c
+
+	condevs.c
+
+**** INSTALLATION *******
+
+1. In /etc/services, add the following line. 
+	( I am assuming that service number 33 is unused in your system.)
+	( If you have already used the number, you may use the other number.)
+
+	uucp		33/tcp				# uucp on TCP/IP
+
+2. In Makefile, add the following line.
+
+	uucpd:	uucpd.o cicod.o cntrl.o gnsys.o ${IOCTL} ${PKON} \
+			uulib.a
+		${CC} -o uucpd ${LDFLAGS} uucpd.o cicod.o cntrl.o \
+			gnsys.o ${IOCTL} ${PKON} uulib.a ${LIBS}
+
+3. Define INET in uucp.h
+
+	#define INET
+
+4. Copy uucpd.c and cicod.c in the uucp directory.
+
+5. Change cico.c and condevs.c.
+
+6. Excute the make command
+
+7. Adjust the entry of /usr/lib/uucp/L.sys.
+
+	site_name time INET site_name 0
+		(The value of the last field has no meaning.)
+
+8. In rc.local, add the following entry and copy uucpd into /etc.
+
+	if [ -f /etc/uucpd ]; then
+		/etc/uucpd & echo -n ' uucpd'			>/dev/console
+	fi
+
+9. Install uucico into the proper location
+
+10. Run the uucpd or reboot.
+
+#####################################################################
+The files of uucpd.c, cicod.c and the diff files of cico.c
+and condevs.c follows.
+
+	If you have more elegant version, inform me.
+
+	Park, Hyunje
+	Dept of CS
+	KAIST
+	Seoul, Korea
+//E*O*F README.TCP//
+
+echo x - uucpd.c
+cat > "uucpd.c" << '//E*O*F uucpd.c//'
+/* 
+ * uucp daemon
+ * uucp on TCP/IP
+ * made by hjpark@kaist
+ */
+
+#ifndef lint
+static char sccsid[] = "@(#)uucpd.c	1.0 (KAIST) 85/01/29";
+#endif
+
+/*
+ * Stripped-down uucp server.
+ */
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+
+#include <netinet/in.h>
+
+#include <stdio.h>
+#include <signal.h>
+#include <errno.h>
+#include <sgtty.h>
+#include <netdb.h>
+
+int	reapchild();
+int errno;
+
+struct	sockaddr_in sin = { AF_INET };
+
+main(argc, argv)
+	char *argv[];
+{
+	int s, pid, options;
+	struct servent *sp;
+
+	sp = getservbyname("uucp", "tcp");
+	if (sp == 0) {
+		fprintf(stderr, "uucpd: tcp/uucp: unknown service\n");
+		exit(1);
+	}
+	sin.sin_port = sp->s_port;
+	argc--, argv++;
+	if (argc >0 && !strcmp(*argv, "-d")) {
+		options |= SO_DEBUG;
+		argc--; argv++;
+	}
+	if (argc > 0) {
+		sin.sin_port = atoi(*argv);
+		if (sin.sin_port <= 0) {
+			fprintf(stderr, "uucpd:%s: bad port #\n", *argv);
+			exit(1);
+		}
+		sin.sin_port = htons((u_short)sin.sin_port);
+	}
+#ifndef DEB
+	if (fork())
+		exit(0);
+	for (s = 0; s < 10; s++)
+		(void) close(s);
+	(void) open("/", 0);
+	(void) dup2(0, 1);
+	(void) dup2(0, 2);
+	{ int tt = open("/dev/tty", 2);
+	  if (tt > 0) {
+		ioctl(tt, TIOCNOTTY, 0);
+		close(tt);
+	  }
+	}
+#endif
+again:
+	s = socket(AF_INET, SOCK_STREAM, 0, 0);
+	if (s < 0) {
+		perror("uucpd: socket");
+		sleep(5);
+		goto again;
+	}
+	if (options & SO_DEBUG)
+		if (setsockopt(s, SOL_SOCKET, SO_DEBUG, 0, 0) < 0)
+			perror("uucpd: setsockopt (SO_DEBUG)");
+	if (setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, 0, 0) < 0)
+		perror("uucpd: setsockopt (SO_KEEPALIVE)");
+	while (bind(s, (caddr_t)&sin, sizeof (sin), 0) < 0) {
+		perror("uucpd: bind");
+		sleep(5);
+	}
+	signal(SIGCHLD, reapchild);
+	listen(s, 10);
+	for (;;) {
+		struct sockaddr_in from;
+		int s2, fromlen = sizeof (from);
+
+		s2 = accept(s, (caddr_t)&from, &fromlen);
+		if (s2 < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("uucpd: accept");
+			sleep(1);
+			continue;
+		}
+		if ((pid = fork()) < 0)
+			printf("Out of processes\n");
+		else if (pid == 0) {
+			signal(SIGCHLD, SIG_IGN);
+			close(s);
+			cico(s2);
+			perror("uucico server: execl");
+			exit(1);
+		}
+		close(s2);
+	}
+	/*NOTREACHED*/
+}
+
+reapchild()
+{
+	union wait status;
+
+	while (wait3(&status, WNOHANG, 0) > 0)
+		;
+}
+//E*O*F uucpd.c//
+
+echo x - cicod.c
+cat > "cicod.c" << '//E*O*F cicod.c//'
+#ifndef lint
+static char sccsid[] = "@(#)cicod.c	5.3 (Kaist) 1/29/85";
+#endif
+/* 
+ * uucp on TCP/IP
+ */
+
+
+#include "uucp.h"
+#include <signal.h>
+#include <setjmp.h>
+#include <sys/types.h>
+#include <sgtty.h>
+
+
+#include <sys/socket.h>
+#include <netdb.h>
+struct	protoent *prtent;
+
+jmp_buf Sjbuf;
+/*  call fail text  */
+char *Stattext[] = {
+	"",
+	"BAD SYSTEM",
+	"WRONG TIME",
+	"SYSTEM LOCKED",
+	"NO DEVICE",
+	"DIAL FAILED",
+	"LOGIN FAILED",
+	"BAD SEQUENCE"
+};
+
+int Role = 0;
+/*  call fail codes  */
+int Stattype[] = {
+	0, 0, 0, 0,
+	SS_NODEVICE, SS_FAIL, SS_FAIL, SS_BADSEQ
+};
+
+
+int Errorrate = 0;
+struct sgttyb Savettyb;
+
+/*******
+ *	cico - this program is operated as only SLAVE mode
+ *	of uucico
+ */
+
+cico(sock)
+register int sock;
+{
+	register int ret;
+	int seq;
+	int onesys = 0;
+	char wkpre[NAMESIZE], file[NAMESIZE];
+	char msg[BUFSIZ], *q;
+	register char *p;
+	extern onintr(), timeout(), setdebug();
+	extern intrEXIT();
+	extern char *pskip();
+	char rflags[30];
+	char *ttyn;
+	int orig_uid = getuid();
+
+	strcpy(Progname, "uucico");
+	uucpname(Myname);
+
+	/* Try to run as uucp -- rti!trt */
+	setgid(getegid());
+	setuid(geteuid());
+
+	signal(SIGILL, intrEXIT);
+	signal(SIGTRAP, intrEXIT);
+	signal(SIGIOT, intrEXIT);
+	signal(SIGEMT, intrEXIT);
+	signal(SIGFPE, intrEXIT);
+	signal(SIGBUS, intrEXIT);
+	signal(SIGSEGV, intrEXIT);
+	signal(SIGSYS, intrEXIT);
+	signal(SIGINT, onintr);
+	signal(SIGHUP, onintr);
+	signal(SIGQUIT, onintr);
+	signal(SIGTERM, onintr);
+	signal(SIGPIPE, onintr);	/* 4.1a tcp-ip stupidity */
+	signal(SIGFPE, setdebug);
+	ret = guinfo(getuid(), User, msg);
+	strcpy(Loginuser, User);
+	ASSERT(ret == 0, "BAD UID ", "", ret);
+
+	rflags[0] = '\0';
+	umask(WFMASK);
+	strcpy(Rmtname, Myname);
+	Ifn = Ofn = sock;
+#ifdef	DEB
+	Debug = 9;
+	logent("ENABLED", "DEBUG");
+#endif
+	subchdir(Spool);
+	strcpy(Wrkdir, Spool);
+
+	Unet = 1;
+	DEBUG(4, "TCP/IP connection\n", "");
+	/* initial handshake */
+	onesys = 1;
+	fclose(stderr);
+	fopen(RMTDEBUG, "w");
+	omsg('S', "here", Ofn);
+	signal(SIGALRM, timeout);
+	alarm(MAXMSGTIME);
+	if (setjmp(Sjbuf)) {
+		/* timed out */
+		exit(0);
+	}
+	for (;;) {
+		ret = imsg(msg, Ifn);
+		if (ret != 0) {
+			alarm(0);
+			exit(0);
+		}
+		if (msg[0] == 'S')
+			break;
+	}
+	alarm(0);
+	q = &msg[1];
+	p = pskip(q);
+	sprintf(Rmtname, "%.7s", q);
+	DEBUG(4, "sys-%s\n", Rmtname);
+	if (mlock(Rmtname)) {
+		omsg('R', "LCK", Ofn);
+		cleanup(0);
+	}
+	else if (callback(Loginuser)) {
+		signal(SIGINT, SIG_IGN);
+		signal(SIGHUP, SIG_IGN);
+		omsg('R', "CB", Ofn);
+		logent("CALLBACK", "REQUIRED");
+		/*  set up for call back  */
+		systat(Rmtname, SS_CALLBACK, "CALL BACK");
+		gename(CMDPRE, Rmtname, 'C', file);
+		close(creat(subfile(file), 0666));
+		xuucico(Rmtname);
+		cleanup(0);
+	}
+	seq = 0;
+	while (*p == '-') {
+		q = pskip(p);
+		switch(*(++p)) {
+		case 'g':
+			Pkdrvon = 1;
+			break;
+		case 'x':
+			Debug = atoi(++p);
+			if (Debug <= 0)
+				Debug = 1;
+			break;
+		case 'Q':
+			seq = atoi(++p);
+			break;
+		default:
+			break;
+		}
+		p = q;
+	}
+	if (callok(Rmtname) == SS_BADSEQ) {
+		logent("BADSEQ", "PREVIOUS");
+		omsg('R', "BADSEQ", Ofn);
+		cleanup(0);
+	}
+	if ((ret = gnxseq(Rmtname)) == seq) {
+		omsg('R', "OK", Ofn);
+		cmtseq();
+	}
+	else {
+		systat(Rmtname, Stattype[7], Stattext[7]);
+		logent("BAD SEQ", "HANDSHAKE FAILED");
+		ulkseq();
+		omsg('R', "BADSEQ", Ofn);
+		cleanup(0);
+	}
+	ttyn = ttyname(Ifn);
+	if (ttyn != NULL)
+		chmod(ttyn, 0600);
+loop:
+	if (!onesys) {
+		ret = gnsys(Rmtname, Spool, CMDPRE);
+		if (ret == FAIL)
+			cleanup(100);
+		if (ret == 0)
+			cleanup(0);
+	}
+
+	sprintf(wkpre, "%c.%.7s", CMDPRE, Rmtname);
+
+	DEBUG(1, " Rmtname %s, ", Rmtname);
+	DEBUG(1, "Role %s,  ", "SLAVE");
+	DEBUG(1, "Ifn - %d, ", Ifn);
+	DEBUG(1, "Loginuser - %s\n", Loginuser);
+
+	alarm(MAXMSGTIME);
+	if (setjmp(Sjbuf))
+		goto Failure;
+	ret = startup(Role);
+	alarm(0);
+	if (ret != SUCCESS) {
+Failure:
+		logent("startup", "FAILED");
+		systat(Rmtname, SS_FAIL, "STARTUP");
+		goto next;
+	}
+	else {
+		logent("startup", "OK");
+		systat(Rmtname, SS_INPROGRESS, "TALKING");
+		ret = cntrl(Role, wkpre);
+		DEBUG(1, "cntrl - %d\n", ret);
+		signal(SIGINT, SIG_IGN);
+		signal(SIGHUP, SIG_IGN);
+		signal(SIGALRM, timeout);
+		if (ret == 0) {
+			logent("conversation complete", "OK");
+			rmstat(Rmtname);
+
+		}
+		else {
+			logent("conversation complete", "FAILED");
+			systat(Rmtname, SS_FAIL, "CONVERSATION");
+		}
+		alarm(MAXMSGTIME);
+		omsg('O', "OOOOO", Ofn);
+		DEBUG(4, "send OO %d,", ret);
+		if (!setjmp(Sjbuf)) {
+			for (;;) {
+				omsg('O', "OOOOO", Ofn);
+				ret = imsg(msg, Ifn);
+				if (ret != 0)
+					break;
+				if (msg[0] == 'O')
+					break;
+			}
+		}
+		alarm(0);
+		clsacu();	/* rti!trt: is this needed? */
+	}
+next:
+	if (!onesys) {
+		goto loop;
+	}
+	cleanup(0);
+}
+
+struct sgttyb Hupvec;
+
+/***
+ *	cleanup(code)	cleanup and exit with "code" status
+ *	int code;
+ */
+
+cleanup(code)
+register int code;
+{
+	register int ret;
+	register char *ttyn;
+
+	signal(SIGINT, SIG_IGN);
+	signal(SIGHUP, SIG_IGN);
+	rmlock(CNULL);
+	clsacu();
+	logcls();
+	ttyn = ttyname(Ifn);
+	if (ttyn != NULL)
+		chmod(ttyn, 0600);
+	if (Ofn != -1) {
+		close(Ifn);
+		close(Ofn);
+	}
+	DEBUG(1, "exit code %d\n", code);
+	if (code == 0)
+		xuuxqt();
+	exit(code);
+}
+
+/***
+ *	onintr(inter)	interrupt - remove locks and exit
+ */
+
+onintr(inter)
+register int inter;
+{
+	char str[30];
+	signal(inter, SIG_IGN);
+	sprintf(str, "SIGNAL %d", inter);
+	logent(str, "CAUGHT");
+	systat(Rmtname, SS_FAIL, str);
+	cleanup(inter);
+}
+
+/* changed to single version of intrEXIT.  Is this okay? rti!trt */
+intrEXIT(signo)
+int signo;
+{
+	signal(signo, SIG_DFL);
+	setgid(getgid());
+	setuid(getuid());
+	abort();
+}
+/*
+ * Catch a special signal
+ * (SIGFPE, ugh), and toggle debugging between 0 and 30.
+ * Handy for looking in on long running uucicos.
+ */
+setdebug()
+{
+	if (Debug < 30)
+		Debug = 30;
+	else
+		Debug = 0;
+}
+
+/***
+ *	timeout()	catch SIGALRM routine
+ */
+
+timeout()
+{
+	logent(Rmtname, "TIMEOUT");
+	systat(Rmtname, SS_FAIL, "TIMEOUT");
+	longjmp(Sjbuf, 1);
+}
+
+static char *
+pskip(p)
+register char *p;
+{
+	while( *p && *p != ' ' )
+		++p;
+	if( *p ) *p++ = 0;
+	return(p);
+}
+
+int Dcf = -1;
+/***
+ *	clsacu()	close call unit
+ *
+ *	return codes:  none
+ */
+
+clsacu()
+{
+
+	if (close(Dcf) == 0) {
+		DEBUG(4, "fd %d NOT CLOSED by CU_clos\n", Dcf);
+		logent("clsacu", "NOT CLOSED by CU_clos");
+	}
+	Dcf = -1;
+}
+//E*O*F cicod.c//
+
+echo x - cico.diff
+cat > "cico.diff" << '//E*O*F cico.diff//'
+*** cico.c.org	Thu Jan 31 01:19:23 1985
+--- cico.c	Fri Feb  1 13:40:07 1985
+***************
+*** 14,19
+  #endif
+  
+  
+  #ifdef UNET
+  #include <UNET/unetio.h>
+  #include <UNET/tcp.h>
+
+--- 14,26 -----
+  #endif
+  
+  
++ #ifdef INET
++ #include <sys/socket.h>
++ #include <netdb.h>
++ #define MAXC 1000
++ #endif INET
++ 
++ 
+  #ifdef UNET
+  #include <UNET/unetio.h>
+  #include <UNET/tcp.h>
+***************
+*** 68,73
+  	char rflags[30];
+  	char *ttyn;
+  	int orig_uid = getuid();
+  
+  	strcpy(Progname, "uucico");
+  	uucpname(Myname);
+
+--- 75,85 -----
+  	char rflags[30];
+  	char *ttyn;
+  	int orig_uid = getuid();
++ #ifdef	INET
++ 	register FILE *fsys;
++ 	char 	info[MAXC], *flds[MAXC/10];
++ 	int	nf;
++ #endif
+  
+  	strcpy(Progname, "uucico");
+  	uucpname(Myname);
+***************
+*** 281,286
+  	}
+  
+  	sprintf(wkpre, "%c.%.7s", CMDPRE, Rmtname);
+  
+  	if (Role == MASTER) {
+  		/*  master part */
+
+--- 293,314 -----
+  	}
+  
+  	sprintf(wkpre, "%c.%.7s", CMDPRE, Rmtname);
++ 
++ #ifdef	INET
++ /*
++  * Determine if we are on INET
++  */
++ 
++ 	fsys = fopen(SYSFILE, "r");
++ 	nf = 0;
++ 	Unet = 0;
++ 	if (( nf = finds(fsys, Rmtname, info, flds)) > 0)
++ 		if (strcmp("INET", flds[F_LINE]) == 0) {
++ 			Unet = 1;
++ 			DEBUG(4, "TCP/IP connection\n", "");
++ 		}
++ 	fclose(fsys);
++ #endif
+  
+  	if (Role == MASTER) {
+  		/*  master part */
+//E*O*F cico.diff//
+
+echo x - condevs.diff
+cat > "condevs.diff" << '//E*O*F condevs.diff//'
+*** condevs.c.org	Thu Jan 31 01:17:02 1985
+--- condevs.c	Thu Jan 31 21:57:21 1985
+***************
+*** 70,75
+  #ifdef VENTEL
+  int ventopn(), ventcls();
+  #endif
+  #ifdef	UNET
+  #include <UNET/unetio.h>
+  #include <UNET/tcp.h>
+
+--- 70,81 -----
+  #ifdef VENTEL
+  int ventopn(), ventcls();
+  #endif
++ #ifdef	INET
++ #include <sys/socket.h>
++ #include <netinet/in.h>
++ #include <netdb.h>
++ int inetopn(), inetcls();
++ #endif	INET
+  #ifdef	UNET
+  #include <UNET/unetio.h>
+  #include <UNET/tcp.h>
+***************
+*** 96,101
+  #ifdef	UNET
+  { "UNET", "UNET", unetopn, nulldev, unetcls },
+  #endif UNET
+  #ifdef MICOM
+  { "MICOM", "micom", micopn, nulldev, miccls },
+  #endif MICOM
+
+--- 102,110 -----
+  #ifdef	UNET
+  { "UNET", "UNET", unetopn, nulldev, unetcls },
+  #endif UNET
++ #ifdef	INET
++ { "INET", "INET", inetopn, nulldev, inetcls },
++ #endif INET
+  #ifdef MICOM
+  { "MICOM", "micom", micopn, nulldev, miccls },
+  #endif MICOM
+***************
+*** 297,302
+  	return(fd);
+  }
+  #endif	PNET
+  
+  #ifdef UNET
+  /***
+
+--- 306,393 -----
+  	return(fd);
+  }
+  #endif	PNET
++ 
++ #ifdef INET
++ /***
++  *	inetopn -- make INET (tcp-ip) connection
++  *
++  *	return codes:
++  *		>0 - file number - ok
++  *		FAIL - failed
++  */
++ 
++ inetopn(flds)
++ 	char *flds[];
++ {
++ 	register int s;
++ 	struct	servent *sp;
++ 	struct	hostent *host;
++ 	struct	sockaddr_in sin;
++ 	char	*hostname;
++ 	char	hnamebuf[32];
++ 	int inetcls();
++ 
++ 	sp = getservbyname("uucp", "tcp");
++ 	if (sp == 0) {
++ 		fprintf(stderr, "uucp: tcp/uucp: unknown service\n");
++ 		exit(1);
++ 	}
++ 	if (setjmp(Sjbuf)) {
++ 		logent("tcpopen", "TIMEOUT");
++ 		endhostent();	/* see below */
++ 		return(CF_DIAL);
++ 	}
++ 	host = gethostbyname(flds[F_NAME]);
++ 	if (host) {
++ 		sin.sin_family = host->h_addrtype;
++ 		bcopy(host->h_addr, (caddr_t)&sin.sin_addr, host->h_length);
++ 		hostname = host->h_name;
++ 	}
++ 	else {
++ 		sin.sin_family = AF_INET;
++ 		sin.sin_addr.s_addr = inet_addr(flds[F_NAME]);
++ 		if (sin.sin_addr.s_addr == -1) {
++ 			DEBUG(4, "%s: unknown host\n", flds[F_NAME]);
++ 			return(CF_DIAL);
++ 		}
++ 		strcpy(hnamebuf, flds[F_NAME]);
++ 		hostname = hnamebuf;
++ 	}
++ 	sin.sin_port = sp->s_port;
++ 	DEBUG(4, "inetopn host %s, ", flds[F_NAME]);
++ 	DEBUG(4, "port %d\n", sp->s_port);
++ 	signal(SIGALRM, alarmtr);
++ 	alarm(30);
++ 	s = socket(AF_INET, SOCK_STREAM, 0, 0);
++ 	if (s < 0) {
++ 		DEBUG(4, "socket failed\n", 0);
++ 		logent("socket", "FAILED");
++ 		return(CF_DIAL);
++ 	}
++ 	if (connect(s, (caddr_t)&sin, sizeof (sin), 0) <0) {
++ 		DEBUG(5, "connection failed\n", 0);
++ 		logent("connect", "FAILED");
++ 		return(CF_DIAL);
++ 	}
++ 	alarm(0);
++ 	endhostent(); /* wave magic wand at 4.2BSD and incant "eat it, bruce" */
++ 	CU_end = inetcls;
++ 	return(s);
++ }
++ 
++ /*
++  * inetcls -- close INET connection.
++  */
++ inetcls(s)
++ register int s;
++ {
++ 	DEBUG(4, "INET CLOSE called\n", 0);
++ 	if (s > 0) {
++ 		close(s);
++ 		DEBUG(4, "closed s %d\n", s);
++ 	}
++ }
++ #endif INET
+  
+  #ifdef UNET
+  /***
+//E*O*F condevs.diff//
+
+exit 0
+-- 
+			Park, Hyunje
+			KAIST, Seoul Korea
+			(UUCP: ...!hplabs!kaist!hjpark)
+
+

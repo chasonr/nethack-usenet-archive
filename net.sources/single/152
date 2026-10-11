@@ -1,0 +1,869 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,6607da98a678f5de,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1982-12-26 22:55:12 PST
+Message-ID: <bnews.sdcsla.183>
+Newsgroups: net.sources
+Path: utzoo!decvax!harpo!floyd!cmcl2!philabs!sdcsvax!phonlab!sdcsla!draper
+X-Path: utzoo!decvax!harpo!floyd!cmcl2!philabs!sdcsvax!phonlab!sdcsla!draper
+From: sdcsla!draper
+Date: Mon Dec 27 01:55:08 1982
+Subject: cchk:  a new program to help weed out C syntax errors
+X-Google-Info: Converted from the original B-News header
+Posted: Fri Dec 24 13:29:27 1982
+Received: Mon Dec 27 01:55:08 1982
+
+
+This is a follow-up to Tom Anderson's cnest that checked for nested comments.
+First comes the C source, then the manual entry -- separated by a line of ---
+------------------------------------------------------------------------------
+/*
+	Copyright:	The Regents of the University of California
+
+	Title:		cchk
+
+	Purpose:	To find and report all badly matched openers and
+			closers plus assignment/equality confusions
+			in a c source file.
+
+	Author:		Steve Draper, expanding cnest by Tom Anderson
+
+	Usage:		cchk [-q] [-v] <filename1> <filename2> ...
+
+	History:	December 3, 1982	creation date --
+						Tom Anderson at microsof!fluke
+			December 9, 1982	Jeffrey Mogul at Stanford
+				- checks for unclosed comment at end of file.
+			December 20, 1982	Converted to cchk --
+							Steve Draper at UCSD
+*/
+
+#include <stdio.h>
+#include <ctype.h>
+
+#define TRUE 1
+#define FALSE 0
+#define SP 32
+#define TAB 9
+#define LF 10
+
+#define BRACE	1
+#define SQBRAK 	2
+#define PAREN	3
+#define IF	4
+#define IFCOND	5
+#define WHLCOND	6
+#define THEN	7
+#define ELSE	8
+
+#define STACKSIZ 20
+
+struct brak { int type, b_indent, b_ln; }  stack[STACKSIZ];
+
+
+#define rmbrak(N) (top -= N, stackc -= N)
+#define myungetc(C)  ungetc(((C) == LF ? SP : (C)), infile)
+
+int mygetchar(), pr();
+void checkelse(), newbrak(), checkcloser(), prtype();
+
+FILE *infile;
+int ln, indent, commindent, stackc, commln;
+int singlequoterr, oddsinglequote, bracecnt, parencnt, sqbrakcnt;
+int errstatus = 0, wstatus = 0;
+int errnmb, wnmb;
+int verbose = 0;
+char *filename;
+struct brak *top;
+
+main(argc,argv)
+	unsigned int argc ;
+	char *argv[] ;
+{
+    register int c ;
+    int i;
+    int doubleqflag = 0;
+    unsigned int file_index;
+    struct brak *ptr;
+
+    file_index = 1;
+
+	while (argc > 1  &&  argv[file_index][0] == '-')
+	  {
+		if (strcmp(argv[file_index], "-v") == 0)   verbose++;
+		if (strcmp(argv[file_index], "-q") == 0)   wnmb = -2;
+		if (strcmp(argv[file_index], "-s") == 0)   wnmb = -2;
+		file_index++; argc--;
+	  }
+
+    do {
+	/* INIT for each file */
+	ln = 1;  indent = 0;  commindent = 0;
+	singlequoterr = oddsinglequote = parencnt = sqbrakcnt = bracecnt = 0;
+	errnmb = 0;
+	if (wnmb > -2) wnmb = 0;
+	newbrak(0);
+
+	if (argc == 1)
+	  {
+	    	infile = stdin;
+		filename = NULL;
+	  }
+	else
+	{
+	    if ((infile = fopen(argv[file_index],"r")) == (FILE *) NULL)
+	    {
+		fprintf (stdout,"%s: Can't access %s\n",argv[0], argv[file_index]);
+		continue;
+	    }
+	    filename = argv[file_index];
+	}
+
+	while ( ( c = mygetchar()) !=  EOF )
+	{
+ 	    if (verbose == 2)
+	      {
+		int i;
+		for (i = stackc; i>0; i--) 
+		  {
+			printf("%c %d: type ", c, i);
+			prtype(stack[i].type);
+			printf(", indent %d, line %d.\n", stack[i].b_indent, stack[i].b_ln);
+	          }
+	      }
+
+	    switch (c)
+	    {
+		case ';':
+			myungetc(SP);
+			while (top->type == ELSE)   rmbrak(1);
+			if (top->type == THEN)  { rmbrak(1);  checkelse(); }
+			break;
+
+		case '!': case '>': case '<':   /* swallow legit. '=' chars */
+		    	c = mygetchar();
+			if (c != '=') myungetc(c);
+			break;
+
+		case '=':
+			if ((top-1)->type == IFCOND  ||  (top-1)->type == WHLCOND)
+			  {
+				c = mygetchar();
+				if (c != '=')
+				  {
+					myungetc(c);
+					if (pr(1))
+						printf("Assignment instead of equals in conditional, line %d.\n", ln);
+				  }
+			  }
+			break;
+
+		case LF: case SP:
+			c = mygetchar();
+			switch (c)
+			  {
+				case 'i':	/* if */
+					c = mygetchar();
+					if (c == 'f'
+					&&  !isalpha(c = fgetc(infile))  &&  !isdigit(c))
+					  {
+						ungetc(c, infile);
+						newbrak(IF);
+						while ((c = mygetchar()) == SP ||  c == LF);
+						if (c != '(')
+						  {
+							if (pr(1))
+								printf("Bad if (no condition) line %d.\n", ln);
+							rmbrak(1);
+						  }
+						else newbrak(IFCOND);
+						myungetc(c);
+					  }
+					else myungetc(c);
+					break;
+				case 'w':		/* while */
+					if ((c = mygetchar()) == 'h'
+					&&  (c = mygetchar()) == 'i'
+					&&  (c = mygetchar()) == 'l'
+					&&  (c = mygetchar()) == 'e'
+					&&  !isalpha(c = fgetc(infile))  &&  !isdigit(c))
+					  {
+						ungetc(c, infile);
+						while ((c = mygetchar()) == SP ||  c == LF);
+						if (c != '(')
+						  {
+							if (pr(1))
+								printf("Bad while (no condition) line %d.\n", ln);
+						  }
+						else newbrak(WHLCOND);
+						myungetc(c);
+					  }
+					else myungetc(c);
+					break;
+				case 'e':		/* else */
+					myungetc(c);
+					checkelse();
+					break;
+
+				default:
+					myungetc(c);
+					break;
+			  }
+			break;
+
+		case '*':		 /* close comment ? */
+		    c = mygetchar();
+		    if (c != '/')  { myungetc(c);  break; }
+
+		   if (pr(1))
+			printf
+			("Line %d: Comment close without open, indent %d\n",
+			ln, indent);
+
+		    break;
+
+
+		case '\'':
+			if ((c = fgetc(infile)) != '\\')
+			  {
+				if (c == '\''  ||  (c = fgetc(infile)) != '\'')
+				  {
+					if (pr(1))  printf("Bad character constant line %d\n", ln);
+					singlequoterr = 1;
+				  }
+			  }
+			else if (!isdigit(c = fgetc(infile)))
+			  {
+				if ((c = fgetc(infile)) != '\'')
+				  {
+					if (pr(1))  printf("Bad character constant with \\ line %d\n", ln);
+				  }
+			  }
+			else
+			  {
+				if (isdigit(c = fgetc(infile)))
+					if (isdigit(c = fgetc(infile)))
+						c = fgetc(infile);
+				if (c != '\'')
+					if (pr(1))  printf("Bad character constant with \\0 line %d\n", ln);
+			  }
+
+			if (c != '\'')
+			  {
+				ungetc(c, infile);
+				oddsinglequote = !oddsinglequote;
+				singlequoterr = 1;
+			  }
+			break;
+
+		case '\"':
+			do {
+				c = fgetc(infile);
+				if (c == EOF)
+				  {
+					if (pr(2))  printf("Error: '\"' quoted string not ended by end of file .\n");
+					break;
+				  }
+				else if (c == LF)
+				  {
+				    if (doubleqflag == 0)
+					if (pr(0))  printf("Warning: '\"' quoted string not ended by end of line %d.\n", ln);
+					doubleqflag = 1;
+					ln++;
+				  }
+				else if (c == '\\')  { c = SP; fgetc(infile); }
+			} while (c != '\"' ) ;
+			doubleqflag = 0;
+		    break;
+
+		case '{':
+			if (stackc  &&  indent < top->b_indent)
+				if (pr(0)) printf("Indent jumps backwards line %d.\n", ln);
+			newbrak(BRACE);
+		    break;
+
+		case '}':
+			checkcloser(BRACE);
+			while (top->type == ELSE)   rmbrak(1);
+			if (top->type == THEN)  { rmbrak(1);  checkelse(); }
+			    break;
+
+		case '(':
+			if (stackc  &&  indent < top->b_indent)
+				if (pr(0)) printf("Indent jumps backwards line %d.\n", ln);
+			newbrak(PAREN);
+		    break;
+
+		case ')':
+			checkcloser(PAREN);
+			if (top->type == IFCOND)
+			  {
+				rmbrak(1);
+				newbrak(THEN);
+			  }
+			else if (top->type == WHLCOND)  rmbrak(1);
+		    break;
+
+		case '[':
+			if (stackc  &&   indent < top->b_indent)
+				if (pr(0)) printf("Indent jumps backwards line %d.\n", ln);
+			newbrak(SQBRAK);
+		    break;
+
+		case ']':
+			checkcloser(SQBRAK);
+		    break;
+
+		default:
+		    break;
+
+	    }
+	}
+
+eof:
+	fclose(infile);
+
+	while (stackc > 0)
+	  {
+		pr(2);
+		fputs("Unclosed brak at EOF: ", stdout);
+		prtype(top->type);
+		printf(" opened on line %d.\n", top->b_ln);
+		switch (top->type)
+		{
+		case BRACE:  { bracecnt++;  break; }
+		case SQBRAK:  { sqbrakcnt++;  break; }
+		case PAREN:  { parencnt++;  break; }
+		default: break;
+		}
+		rmbrak(1);
+	  }
+
+	if (errstatus  ||  (oddsinglequote || bracecnt || sqbrakcnt || parencnt))
+		{ pr(2);   puts("Summary: "); }
+	else
+	  {
+		if (filename != NULL)
+			{  fputs(filename, stdout); fputs(": ", stdout);  }
+		puts("   O.K.");
+	  }
+	if (oddsinglequote) 
+		puts("\tOdd number of single quotes. ");
+	if (bracecnt)
+	{
+		printf("\t%d too few %s braces.\n", abs(bracecnt), (bracecnt>0 ? "closing" : "opening"));
+	}
+	if (sqbrakcnt)
+	{
+		printf("\t%d too few %s square brackets.\n", abs(sqbrakcnt), (sqbrakcnt>0 ? "closing" : "opening"));
+	}
+	if (parencnt)
+	{
+		printf("\t%d too few %s parentheses.\n", abs(parencnt), (parencnt>0 ? "closing" : "opening"));
+	}
+	putchar(LF);
+
+    } while (++file_index < argc);
+    exit(errstatus ? 2 : wstatus);
+}
+
+
+int mygetchar()
+  {
+	register int c;
+	static int firsttime = 1;
+
+	c = fgetc(infile);
+
+	/*
+	if (c == ';')
+		{ ungetc(SP, infile);  return(';'); }
+	*/
+
+	if (c == '/')			 /* open comment ? */
+	  {
+		c = fgetc(infile);
+		if (c != '*')  { ungetc(c, infile);  return('/'); }
+		commln = ln;
+		commindent = indent;
+
+		while (1)
+		  {
+			c = fgetc(infile);
+
+			if (c == EOF)		 /* last comment never ended */
+			  {
+				if (pr(2))
+					printf
+					("Comment opened line %d unclosed by end of file.\n",
+					commln);
+			  }
+
+			else if (c == '/')		/* nested comment ? */
+			  {
+				if ((c = fgetc(infile)) == '*')
+				  {
+					if (pr(0))  fprintf(stdout,
+	"Nested comment: line %d, indent %d.  First open: line %d, indent %d\n",
+					ln, indent, commln, commindent);
+				  }
+				else ungetc(c, infile);
+			  }
+			else if (c == '*')		/* end comment ? */
+			  {
+				if ((c = fgetc(infile)) == '/')
+				  {
+		   if (indent != commindent  &&  indent-1 != commindent)
+					if (pr(0))  printf(
+"Indent of comment close doesn't match open: lines %d, %d, indents %d, %d\n",
+					commln, ln, commindent, indent);
+
+					break;	   /* only exit from loop */
+				  }
+				else ungetc(c, infile);
+			  }
+			else if (c == LF)
+			  {
+			    do  {
+				if (c == SP) indent++;
+				else if (c == TAB)  indent = ((indent+8)/8)*8;
+				else if (c == LF)
+				  { 
+					ln++;
+					indent = 0;
+				  } 
+		 	    } while (isspace(c = fgetc(infile)));
+			    ungetc(c, infile);
+			  }
+		  }
+		return(SP);
+
+	  }
+
+	if (c == LF  ||  firsttime == 1)
+	      {
+		firsttime = 0;
+lf:		while (1)
+		  {
+			if (c == SP) indent++;
+			else if (c == TAB)  indent = ((indent+8)/8)*8;
+			else if (c == LF)
+			  { 
+				ln++;
+				indent = 0;
+				singlequoterr = 0;
+			  } 
+			else
+			  {
+				ungetc(c, infile);
+				return(LF);
+				break;
+			  }
+			c = fgetc(infile);
+		  }
+	      }
+
+	if (c == SP  ||  c == TAB)
+	  {
+		do  c = fgetc(infile); while (c == SP  ||  c == TAB);
+		if (c != LF)
+		  {
+			ungetc(c, infile);
+			return(SP);
+		  }
+		else goto lf;
+	  }
+
+	return(c);
+  }
+
+
+/*
+	administer count of error msgs. and suppress if too many
+	administer the status var.s
+	prepend file name to msg.
+	flag error msg.s (not warnings) with '*'
+*/
+
+int pr(error)
+	int error;
+  {
+	if (singlequoterr)   return(0);
+
+	if (verbose)
+	  {
+		int i;
+		for (i = stackc; i>0; i--) 
+		  {
+			printf("%d: type ", i);
+			prtype(stack[i].type);
+			printf(", indent %d, line %d.\n", stack[i].b_indent, stack[i].b_ln);
+		  }
+	  }
+
+	if (error == 2)  { errnmb = 0;  errstatus = 1; }
+	else if (error)
+	  {
+		errstatus = 1;
+		if (errnmb < 0) return(0);
+		else if (errnmb >= 9)
+		  {
+			errnmb = -1;
+			puts("Other error messages being suppressed.\n");
+			return(0);
+		  }
+	  }
+	else
+	  {
+		wstatus = 1;
+		if (wnmb < 0) return(0);
+		else if (errnmb + wnmb >= 9)
+		  {
+			wnmb = -1;
+			puts("Further warning messages being suppressed.\n");
+			return(0);
+		  }
+	  }
+
+	if (filename != NULL)
+		{  fputs(filename, stdout); fputs(": ", stdout);  }
+	if (error) putchar('*');
+	if (error) errnmb++; else wnmb++;
+	return(1);
+  }
+
+
+void newbrak(newtype)
+	int newtype;
+  {
+	if (newtype == 0)  { top = stack; stackc = 0; }
+	else  { top++; stackc++; }
+	if (stackc >= STACKSIZ)
+	  {
+		if (pr(2)) printf("***stack overflow, line %d.\n", ln);
+		exit();
+	  }
+
+	top->type = newtype;
+	top->b_indent = indent;
+	top->b_ln = ln;
+
+  }
+
+
+void prtype(type)
+	int type;
+  {
+	switch(type)
+	  {
+	  case BRACE:  	putchar('}'); break;
+	  case PAREN:  	putchar(')'); break;
+	  case SQBRAK:  putchar(']'); break;
+	  case IF:  	fputs("if", stdout); break;
+	  case IFCOND:  fputs("if-condition", stdout); break;
+	  case THEN:  	fputs("then", stdout); break;
+	  case ELSE:  	fputs("else", stdout); break;
+	  case WHLCOND:  fputs("while-condition", stdout); break;
+	  default: 	fputs("'NULL'", stdout); break;
+	  }
+  }
+
+
+void checkcloser(type)
+	int (type);
+  {
+	int i = 0, found = 0;
+
+	if (type == top->type  &&  top->b_indent == indent)
+		{ rmbrak(1); return; }
+
+	while(!found  &&  ++i < stackc  &&  indent <= (top-i)->b_indent)
+		if (type == (top-i)->type  &&  (top-i)->b_indent == indent)
+			found = 1;
+
+	if (found)
+	  {
+		if (pr(1))  printf("Missing closer%c detected line %d:\n", (i>1?'s':'\0'), ln);
+		while(i--)
+		  {
+			if (pr(1))
+			  {
+				fputs("\tMissing closing ", stdout);
+				prtype(top->type);
+				printf(" opened line %d.\n", top->b_ln);
+			  }
+			switch (top->type)
+			{
+			case BRACE:  { bracecnt++;  break; }
+			case SQBRAK:  { sqbrakcnt++;  break; }
+			case PAREN:  { parencnt++;  break; }
+			default: break;
+			}
+			rmbrak(1);
+		  }
+		rmbrak(1);	/* the matching brak */
+	  }
+	else if (type == top->type)
+	  {
+		if (indent != top->b_indent)
+		  {
+			if (pr(0)) 
+			  {
+				fputs("Mismatched indent on closing ", stdout);
+				prtype(type);
+				printf
+					(" lines %d, %d; indents %d, %d.\n",
+					top->b_ln, ln, top->b_indent, indent);
+			  }
+		  }
+		rmbrak(1);
+	  }
+
+	else
+	  {
+		switch (type)
+		{
+		case BRACE:  { bracecnt--;  break; }
+		case SQBRAK:  { sqbrakcnt--;  break; }
+		case PAREN:  { parencnt--;  break; }
+		default: break;
+		}
+
+		if (pr(1))
+		  {
+			fputs("Muddle detected at unmatched closing ", stdout);
+			prtype(type);
+			printf(" line %d.\n", ln);
+		  }
+	  }
+  }
+
+
+/*
+	removes IF from stack
+	checks else's indent
+*/
+
+
+void checkelse()
+  {
+	int c;
+
+	while ((c = mygetchar()) == SP  || c == LF);
+	if (c == 'e'
+	&&  (c = mygetchar()) == 'l'
+	&&  (c = mygetchar()) == 's'
+	&&  (c = mygetchar()) == 'e'
+	&&  !isalpha(c = fgetc(infile))  &&  !isdigit(c))
+	  {
+		ungetc(c, infile);
+		if (top->type == THEN)  rmbrak(1);
+		if (top->type != IF)
+			{ if (pr(1)) printf("Else with no if line %d.\n", ln); }
+
+		else if (indent+2 < top->b_indent)
+		  { if (pr(1))
+			printf("Dangling else -- bound to wrong if?  \"if\" line %d, \"else\" line %d.\n", top->b_ln, ln);
+		  }
+
+		else if (indent != top->b_indent)
+		 { if (pr(0))
+		  {
+			fputs("Wrong indent for else", stdout);
+			if (indent-2 >  top->b_indent)
+				fputs(" (missing if?)", stdout);
+			printf(".  \"if\" line %d, \"else\" line %d.\n", top->b_ln, ln);
+		  }
+		 }
+
+		if (top->type == IF)  rmbrak(1);
+		newbrak(ELSE);
+	  }
+
+	else
+	  {
+		myungetc(c); myungetc(SP);
+
+			/* no else so terminate the IF */
+		if (top->type == IF)
+		  {
+			rmbrak(1);
+			while (top->type == ELSE)   rmbrak(1);
+			if (top->type == THEN)  { rmbrak(1);  checkelse(); }
+		  }
+	  }
+
+  }
+----------------------------------------------------------------------------
+.TH cchk 1CSL "Dec 19, 1982"
+.SH NAME
+cchk \- C program checker
+.SH SYNOPSIS
+.I cchk
+[-q] [-v] [files ...]
+.SH EXAMPLES
+.nf
+	cchk foo.c
+.br
+This is the basic useage.
+.sp 2
+	cchk $1.c
+	if ($status == 0)  cc -O $1.c -o $1
+.fi
+.br
+These lines might appear in a shell script.  They run cchk on the source of
+the program named as argument, and then run the compiler on it only if cchk
+detected no errors.
+.SH DESCRIPTION
+.I cchk
+checks C programs for correctly matching brackets of all kinds, including
+quotes and comment brackets, checks that the indentation of matching
+brackets also matches, and checks for symptoms of 3 kinds of errors that
+the C compiler allows without warning: "dangling else" errors where an else is
+bound to the wrong preceding if, nested comments, where the first
+close-comment bracket prematurely ends the outer comment, and the use of
+assignment ('=') where equality-test ('==') was meant.
+It is meant to be run as a pre-check on C programs before calling the compiler,
+just as you might run lint as a post-check.
+It's virtues are that it is about 5 times as fast as the compiler, so that it
+allows you to weed out some trivial syntactic errors faster; for the errors it
+detects it produces better error messages than the compiler;
+and it detects the errors mentioned above that the compiler ignores.
+.PP
+The indentation rules it applies are that the indentation of the first
+non-white character on the line holding an opener should match that on the
+line holding the matching closer.  These rules are fairly weak (e.g. they are
+compatible with but do not enforce the Ingres format standard), though they
+may still conflict with your own habits.
+The
+.I -q
+(quiet) option suppresses messages classed as warnings, which includes
+those about mismatched indentations.
+The
+.I -v
+(verbose) option prints more information -- it shows what is on its internal
+stack at the time an error is detected.  It is probably only of real use for
+debugging
+.I cchk
+itself.  The program returns status 1 if warnings were issued, status 2 if
+errors were detected, and 0 if neither.
+.PP
+The distinction between warnings and
+errors is somewhat arbitrary.  Because C allows certain errors it would be
+inappropriate here to make the distinction between compilable and
+non-compiliable programs.  Basically only indentation mismatches are warnings,
+and the symptoms of dangling elses or using assignment ('=') instead of
+equality ('==') are treated as errors.  The program will always print some
+message if you have an error involving mismatched brackets of some kind, and
+will pass any legal program if its indentation is also correct, unless '=' is
+used in the top level of a condition expression.  For cases in between it tries hard but
+may make mistakes, though if you are aiming for a properly indented program
+you can be sure that an error means that something is wrong.
+.PP
+When it detects signs of a bracket mismatch it makes a decision on the spot
+about the most likely underlying cause.  It does not wait for more evidence to
+disambiguate this, so on the occasions it is wrong, not only are the messages
+inappropriate to some degree, but several messages may be produced concerning
+what is really a single (unrecognized) error.  The most common example of
+this is if you have the wrong indent on a closing brace such that it matches an
+earlier opening brace, cchk assumes first that there is a missing closing
+brace, and then when it finds the second closing brace that this has no matching
+opening brace (this having been already wrongly accounted for).
+The summary it gives at the end tells you whether there was really a net
+imbalance of brackets, which may help sort out these cases.
+.PP
+.I cchk
+was written as a result of the following observations.
+ 1)  In Unix, modularity suggests that it is appropriate to have different
+programs with different special expertise where other systems would cram them
+all into one program.  Thus lint incoporates special knowledge about
+type-checking and portability considerations that would be inappropriate in a
+compiler.
+.I cchk
+like lint takes advantage of the fact that since it is not the compiler it can
+be wrong some of the time without preventing anyone from doing anything.
+ 2)  C has, in my opinion, some bad choices in its syntax that cause frequent
+errors by users.  It turns out, though, that these can largely be checked
+for cheaply, which alleviates the original poor design choice.
+These are:
+ 	a) Not supporting nested comments (nor warning about them in the
+compiler).
+ 	b) Not having an "endif" (or "fi") closer to terminate if statements,
+thus leaving users open to the dangling else problem.  (This is the problem
+that if you have nested if statements the following else will get bound to
+the nearest preceding one, which is not always the intuitively reasonable
+one.)  This is especially troublesome, as it means among other things
+that if you modify a
+program by adding an else clause to an existing if statement, you may have to
+modify (by adding braces) not the if statement to which you are attaching the
+else, but a nested if statement acting as its "then" clause.
+ 	c) The use of '=' for assignment, following Fortran's bad usage.
+It seems to be the case that both '=' and '==' get seen and mentally read as
+"equals" so that it is hard to spot if you write '=' for '==' in conditionals,
+an error that may happen either because of the language-promoted confusion
+itself, or because of a typing slip (which is then hard to spot).
+ 3) The C compiler produces outstandingly unhelpful error messages as a rule,
+from the point of view of a user who wants to make corrections as fast as
+possible.  Once past the beginner stage however, a user can usually do all
+right by ignoring the text of the error message, which almost never tells
+her/him what to correct, and attending to the line-number:  generally when
+your attention is directed to
+only a line or two you can tell what is wrong.  This
+breaks down when the compiler fails to generate anything like the
+helpful line number.  This is usually however in cases of failure to match
+brackets of some sort -- something which is easy for another program to check.
+Furthermore attending to the user's indentation usually allows accurate
+diagnoses and helpful messages to be generated in just these cases.
+.PP
+.I cchk,
+then, attempts to address these points largely by checking bracket matches and using
+indentation to guess what the real problem was -- whether a missing opener, a
+missing closer, wrong indentation, or some other mistake such as a spurious
+character.
+Like the compiler, it has only a fair chance of recovering after an error
+and commenting intelligently on the remaining code.
+However its relatively fast running time means that correcting only the first
+error in each cycle is not too time consuming.
+.SH SEE\ ALSO
+lint(1), cc(1)
+.SH AUTHOR
+Steve Draper
+.SH BUGS
+It inflicts its own idea of good indentation, which neither matches a
+recognized standard exactly nor your own practices.
+It can generate several error descriptions where there is only one error --
+one that it does not describe.
+.PP
+It does not deal with the preprocessor intelligently.
+There are two kinds of case to note:
+ 1) defines may themselves not be good C e.g.
+ 	#define ctrl(letter) ('letter' & 077)
+.br
+will work ok in the program but will draw "bad character constant" from
+.I cchk.
+Similarly, though more questionable, you might define your own opener and closer e.g.
+ 	#define then {
+ 	#define endif }
+ 2)  Some uses of #ifdef will confuse
+.I cchk,
+for instance if alternative
+if-condition lines are given, controlled by #ifdef ... #else
+.I cchk
+will see them
+both.  Similarly using "#ifdef\ comment" to comment out parts of the text in
+order to overcome the lack of nested comments in C will draw fire if the
+commented out section is not legal C.
+.PP
+This could be overcome by piping the program through the preprocessor before
+.I cchk
+sees it i.e. by
+ 	cc -E foo.c | cchk
+.br
+but then the line numbers
+.I cchk
+generates will be wrong.
+.SH DIAGNOSTICS
+The program returns status 1 if warnings were issued, status 2 if
+errors were detected, and 0 if neither.
+
+

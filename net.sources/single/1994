@@ -1,0 +1,1781 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,de8ccfd4b00c3119,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-12-01 19:42:08 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site mddc.UUCP
+Path: utzoo!watmath!clyde!cbosgd!mddc!chris
+From: chris@mddc.UUCP (Chris Maloney)
+Newsgroups: net.sources
+Subject: My new DMF32 Driver (Faster & More dmfs)
+Message-ID: <357@mddc.UUCP>
+Date: Sat, 1-Dec-84 22:42:08 EST
+Article-I.D.: mddc.357
+Posted: Sat Dec  1 22:42:08 1984
+Date-Received: Tue, 4-Dec-84 08:09:53 EST
+Organization: MDDC, Cincinnati, Ohio
+Lines: 1761
+
+Last summer I released a driver for the DMF32 which used the DMF mode
+dynamically (whenever there is a lot to output at one time).  I have
+since found that increasing the size of the 'clist's can make a
+significate difference and made other some changes to the driver and so
+I am reposting it, along with the changes to increase the size of the
+'clist'.  The following is the latest DMF32 Driver and changes made to
+support it.  By cutting down on the interrupt vectors allocated to DMF
+emulations which only have the async or lp parts, this driver allows
+the installation of more than 16 of these on a single unibus.  (I use
+the configuration register of the dmf, and re-arrange the vector table
+in the probe routine to accomplish this.)  This was done to accomadate
+two Bridge HSM's on the same system, but can be useful any time you
+want a lot of DMFs on one VAX.  There is also one bug fix for the
+'select' system call.
+
+This driver works with emulations of the DMF, including Emulex,
+Bridge/ABLE HAC, Able...  This driver also includes support for the lp
+port.
+
+Here you go. Please Let me know of any problems.
+
+Chris Maloney
+Management Decisions Development Corp.
+7209 Dixie Highway
+Fairfield, Ohio   45014
+(513)874-6464
+
+...{ucbvax,decvax,ihnp4,mhuxi}!cbosgd!mddc!chris		(uucp)
+cbosgd!mddc!chris@BERKELEY					(arpa)
+
+----- CUT HERE -----
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting dmf.c'
+sed 's/^X//' <<'//go.sysin dd *' >dmf.c
+X/* MDDC (CWM)  Version 1.01  Oct. 11, 1984 */
+
+X/* -----
+    Name: dmf.c
+    Driver for DMF32, CS11/F1, Able VMZ32 and similar other emulations.
+
+    Chris Maloney
+    Management Decisions Development Corp.
+    7209 Dixie Highway
+    Fairfield, Ohio   45014
+    (513)874-6464
+
+    Line printer driver by:
+    Dwight Melcher
+    Univ. of Colorado, Boulder
+    (303) 492-7919
+
+
+    Rev. Date		Description
+    ---- ----		-----------
+    1.01 Oct. 11, 1984	Wakeup process selecting on output
+
+    TO DO:
+	test reset code
+
+    -----
+    DMF32 line printer driver
+    The line printer on dmfx is indicated by a minor device
+    code of 128+x.
+
+    -----
+    The flags field of the config file is interpreted as:
+      bits	meaning
+      ----	-------
+      0-7		soft carrier bits for ttys part of dmf32
+      8-15	number of cols/line on the line printer
+		       if 0, 132 will be used.
+      16-23	number of lines/page on the line printer
+		       if 0, 66 will be used.
+----- */
+
+
+#include "dmf.h"
+#if NDMF > 0
+
+X/* -----
+	This entire source module is conditional depending on value of NDMF.
+	NDMF is the number of dmf32's configured in the system.
+----- */
+
+#include "../machine/pte.h"
+
+#include "bk.h"
+#include "../h/param.h"
+#include "../h/conf.h"
+#include "../h/dir.h"
+#include "../h/user.h"
+#include "../h/ioctl.h"
+#include "../h/tty.h"
+#include "../h/map.h"
+#include "../h/buf.h"
+#include "../h/vm.h"
+#include "../h/bk.h"
+#include "../h/clist.h"
+#include "../h/file.h"
+#include "../h/uio.h"
+#include "../h/kernel.h"
+
+#include "../vaxuba/ubareg.h"
+#include "../vaxuba/ubavar.h"
+#include "../vaxuba/dmfreg.h"
+
+
+X/* -----
+	SILO TIME OUT Constant....
+	If you get data overruns, or have problems with
+	xon/xoff not responing quick enough,
+	set this lower, but keep it at least 1.
+	If you make this 0, you are in trouble.
+------ */
+
+#define SILO_TIME_OUT	(3)
+
+X/* -----
+	DO DMA COUNT Constant...
+	Number of characters at which driver uses DMA mode.
+	DEC uses 32, but this is two high for unix.
+	(I think VMS has to remap UBA memory to do the DMA.)
+	Setting this to 0 disables the SILO mode which may be OK.
+----- */
+
+#define DO_DMA_COUNT	(10)
+#define TRUE	(1)
+#define FALSE	(0)
+
+#define ASLP                1           /* waiting for interrupt from dmf */
+#define OPEN                2	        /* line printer is open */
+#define ERROR               4           /* error while printing, driver       */
+                                        /* refuses to do anything till closed */
+
+
+X/* -----
+	GLOBAL DATA   AREA
+----- */
+
+X/* -----
+	Definition of the driver for the auto-configuration program.
+----- */
+
+int     dmfprobe(), dmfattach(), dmfrint(), dmfxint();
+int     dmflint();
+struct  uba_device *dmfinfo[NDMF];
+u_short dmfstd[] = { 0 };
+struct  uba_driver dmfdriver =
+    {
+    dmfprobe, 0, dmfattach, 0, dmfstd, "dmf", dmfinfo 
+    };
+
+X/* -----
+	Local variables for the driver
+----- */
+
+int     dmfact;                        /* mask of active dmf's */
+struct dmfl_softc
+    {
+    unsigned dmfl_state;               /* soft state bits */
+    unsigned dmfl_info;                /* uba info */
+    unsigned short dmfl_lines;         /* lines per page (66 def.) */
+    unsigned short dmfl_cols;          /* cols per line (132 def.) */
+    char     dmfl_buf[DMFL_SIZ];
+    } dmfl_softc[NDMF];
+
+
+char    dmf_speeds[] =
+    {
+    0, 0, 1, 2, 3, 4, 0, 5, 6, 7, 010, 012, 014, 016, 017, 0 
+    };
+int     dmfstart();
+
+#ifndef lint
+int     ndmf = NDMF*8;                 /* used by iostat */
+#endif
+
+int     ttrstrt();
+struct  tty     dmf_tty[NDMF*8];
+
+char    dmfsoftCAR[NDMF];
+struct
+    {
+    char dmfa_state;			/* dmf state */
+    int dmfa_count;			/* dmf dma count */
+    } dmfa_softc[NDMF*8];
+
+#define ST_TXOFF	(0x01)		/* tx turned off */
+#define ST_DMA		(0x02)		/* dma operation inprogress */
+#define ST_INBUSY	(0x04)		/* stop tx in busy */
+
+X/* -----
+	The clist space is mapped by the driver onto each UNIBUS.
+----- */
+
+static  int     cbase[MAXNUBA];        /* base address in unibus map */
+int     dmf_ubinfo[MAXNUBA];           /* info about allocated unibus map */
+X/* -----
+	The UBACVT macro converts a clist space address for unibus uban
+	into an i/o space address for the DMA routine.
+----- */
+#define	UBACVT(x, uban)	    (cbase[uban] + ((x) - (char *)cfree))
+
+
+X/* -----
+	Routine for configuration to set dmf interrupt.
+----- */
+
+extern struct uba_device *auto_ui;	/* this is from unifind */
+
+dmfprobe(reg)
+caddr_t reg;
+{
+register int     br, cvec;         /* these are ``value-result'' */
+				    /* these two values will be r10 and r11 */
+register struct  dmfdevice *dmf_addr;
+register int     i;
+register unsigned int a;
+
+static   char    *dmfdevs[] =
+    {
+    "parallel (not supported)",
+    "line printer",
+    "synchronous (not supported)",
+    "asynchronous"
+    };
+
+    dmf_addr = (struct dmfdevice *)reg;
+
+#ifdef lint
+     br = 0; cvec = br; br = cvec; dmfxint(0); dmfrint(0); dmfsrint();
+     dmfsxint(); dmfdaint(); dmfdbint(); dmflint();
+#endif
+
+X/* -----
+	Interupt level is 15.
+----- */
+
+    br = 0x15;
+
+X/* -----
+	See which parts of the controller are there.
+----- */
+
+    a = (dmf_addr->dmfc_config >> 12) & 0xf;
+    printf("dmf%d:", auto_ui->ui_unit);
+    for (i = 0; a != 0; ++i, a >>= 1)
+	if (a & 1)
+	    printf(" %s", dmfdevs[i]);
+    printf(".\n");
+
+X/* -----
+	Tell the controller which vector to use.
+	we get to chose our own vector.
+----- */
+
+    a = dmf_addr->dmfc_config;
+    switch (a & DMFC_CONFGMASK)
+	{
+	case DMFC_ASYNC:
+	    cvec = (uba_hd[numuba].uh_lastiv -= 8);
+	    dmf_addr->dmfc_config = ((cvec - 2*8)>> 2);
+#ifdef DEBUG
+printf("Recovering unsed DMF32 ivecs (async) auto_ui=%d\n", auto_ui);
+for (i=0; auto_ui->ui_intr[i] != 0; i++)
+    printf("auto_ui->ui_intr[%d] = %x\n", i, auto_ui->ui_intr[i]);
+#endif DEBUG
+	    auto_ui->ui_intr[0] = auto_ui->ui_intr[4];
+	    auto_ui->ui_intr[1] = auto_ui->ui_intr[5];
+	    auto_ui->ui_intr[2] = 0;
+	    printf("dmf%d: Recovered unused DMF32 ivecs (async).\n",
+		    auto_ui->ui_unit);
+#ifdef DEBUG
+for (i=0; auto_ui->ui_intr[i] != 0; i++)
+    printf("auto_ui->ui_intr[%d] = %x\n", i, auto_ui->ui_intr[i]);
+#endif DEBUG
+	    break;
+
+	/* ---
+	    the "-= 8" can be "-= 4" i think, but the 8 just wastes
+	    4 bytes and if i change it I have no way to test it.
+	--- */
+	case DMFC_LP:
+	    cvec = (uba_hd[numuba].uh_lastiv -= 8);
+	    dmf_addr->dmfc_config = ((cvec - 3*8)>> 2);
+	    auto_ui->ui_intr[0] = auto_ui->ui_intr[6];
+	    auto_ui->ui_intr[1] = 0;
+	    printf("dmf%d: Recovered unused DMF32 ivecs (lp).\n",
+						    auto_ui->ui_unit);
+	    break;
+
+	default:
+	    cvec = (uba_hd[numuba].uh_lastiv -= 4 * 8);
+	    dmf_addr->dmfc_config = (cvec >> 2);
+	    break;
+	}
+    dmf_addr->dmfl_ctrl = DMFL_RST;
+
+X/* -----
+	???? NEED TO SAVE IT SOMEWHERE FOR OTHER DEVICES ????
+----- */
+
+    return(sizeof(struct dmfdevice));
+}
+
+
+
+X/* -----
+	Routine to "attach" a dmf.
+	Get columns, lines and other device dependant information
+	for the specific device.
+----- */
+
+dmfattach(ui)
+struct  uba_device *ui;
+{
+register int    cols;
+register int    lines;
+
+    cols = (ui->ui_flags >> 8) & 0xff;
+    lines = (ui->ui_flags >> 16) & 0xff;
+    dmfsoftCAR[ui->ui_unit] = ui->ui_flags & 0xff;
+    dmfl_softc[ui->ui_unit].dmfl_cols = (cols == 0 ? DMFL_DCL : cols);
+    dmfl_softc[ui->ui_unit].dmfl_lines = (lines == 0 ? DMFL_DLN : lines);
+    return;
+}
+
+
+X/* -----
+	Open a DMF32 line, mapping the clist onto the uba if this
+	is the first dmf on this uba.
+	Turn on this dmf if this is the first use of it.
+----- */
+
+X/* ARGSUSED */
+
+dmfopen(device, flag)
+dev_t   device;
+int flag;
+{
+register struct   tty      *tp;
+register int      unit, controller;
+register struct   dmfdevice *dmf_addr;
+register struct   uba_device *ui;
+int priority;
+int xstatus;
+
+    unit = minor(device);
+    controller = unit >> 3;
+
+X/* -----
+	Test for and process a printer open request.
+----- */
+
+    if (unit & 0200)
+	return(dmflopen(device, flag));
+
+X/* -----
+	Test for invalid unit.
+----- */
+
+    if (unit >= NDMF*8 || (ui = dmfinfo[controller]) == 0 || ui->ui_alive == 0)
+        return (ENXIO);
+
+    tp = &dmf_tty[unit];
+
+X/* -----
+	Test for exclusive use flag.
+----- */
+
+    if (tp->t_state & TS_XCLUDE && u.u_uid != 0)
+	return (EBUSY);
+
+    dmf_addr = (struct dmfdevice *)ui->ui_addr;
+    tp->t_addr = (caddr_t)dmf_addr;
+    tp->t_oproc = dmfstart;
+    tp->t_state |= TS_WOPEN;
+
+X/* -----
+	Set up Unibus map registers.
+	block uba resets which can clear the state.
+----- */
+
+    priority = spl5();
+    if (dmf_ubinfo[ui->ui_ubanum] == 0) 
+        {
+        dmf_ubinfo[ui->ui_ubanum] =
+	     uballoc(ui->ui_ubanum, (caddr_t)cfree,
+		     nclist * sizeof(struct cblock), 0);
+        cbase[ui->ui_ubanum] = dmf_ubinfo[ui->ui_ubanum] & 0x3ffff;
+        }
+
+X/* -----
+	If the dmf is inactive, activate it.
+----- */
+
+    if ((dmfact & (1 << controller)) == 0) 
+        {
+        dmf_addr->dmfa_csr |= DMFA_IE;
+        dmfact |= (1 << controller);
+        dmf_addr->dmfa_sato = SILO_TIME_OUT;
+        }
+    splx(priority);
+
+X/* -----
+	If this is first open, initialze tty state to default.
+----- */
+
+    if ((tp->t_state & TS_ISOPEN) == 0) 
+        {
+        ttychars(tp);
+        if (tp->t_ispeed == 0) 
+            {
+            tp->t_ispeed = B300;
+            tp->t_ospeed = B300;
+            tp->t_flags = ODDP | EVENP | ECHO;
+            }
+        dmfparam(unit);
+	dmfa_softc[unit].dmfa_state = 0;
+        }
+
+X/* -----
+	Wait for carrier, then process line discipline specific open.
+----- */
+
+    if ((dmfmctl(device, DMFA_ON, DMSET) & (DMFA_CAR << 8)) ||
+        (dmfsoftCAR[controller] & (1 << (unit & 07))))
+        tp->t_state |= TS_CARR_ON;
+    priority = spl5();
+    while ((tp->t_state & TS_CARR_ON) == 0) 
+        {
+        tp->t_state |= TS_WOPEN;
+        sleep((caddr_t) & tp->t_rawq, TTIPRI);
+        }
+    splx(priority);
+
+    xstatus = (*linesw[tp->t_line].l_open)(device, tp);
+    return(xstatus);
+}
+
+
+X/* -----
+	Set parameters from open or stty into the DMF hardware registers.
+	Block interrupts so parameters will be set before the line interrupts.
+	If terminal speed is set to 0, hang up on last close, turm modem off
+	and return to caller.
+----- */
+
+dmfparam(unit)
+register int     unit;
+{
+register struct  tty *tp;
+register struct  dmfdevice *dmf_addr;
+register int     line_parameters, line_control;
+int     priority;
+
+    tp = &dmf_tty[unit];
+    dmf_addr = (struct dmfdevice *)tp->t_addr;
+
+    priority = spl5();
+    if ((tp->t_ispeed) == 0) 
+        {
+        tp->t_state |= TS_HUPCLS;
+        (void) dmfmctl(unit, DMFA_OFF, DMSET);
+        return;
+        }
+
+X/* -----
+	Set up line parameters and control info.
+----- */
+
+    line_parameters =
+	 (dmf_speeds[tp->t_ospeed] << 12) | (dmf_speeds[tp->t_ispeed] << 8);
+    line_control = DMFA_LCE;
+    if ((tp->t_ispeed) == B134)
+	{
+	line_parameters |= DMFA_6BT | DMFA_PEN;
+	}
+    else if (tp->t_flags & (RAW | LITOUT))
+	{
+	line_parameters |= DMFA_8BT;
+	}
+     else
+	{
+	line_parameters |= DMFA_7BT | DMFA_PEN;
+	}
+    if (tp->t_flags & EVENP)
+	line_parameters |= DMFA_EPR;
+    if ((tp->t_ospeed) == B110)
+	line_parameters |= DMFA_SCD;
+    line_parameters |= (unit & 07);
+
+    dmf_addr->dmfa_lparm = line_parameters;
+    dmf_addr->dmfa_csr = DMFA_IE | IR_LCTMR | (unit & 07);
+    dmf_addr->dmfa_lctmr = (dmf_addr->dmfa_lctmr | (line_control & 0xff));
+    splx(priority);
+    return;
+}
+
+
+X/* -----
+	Routine to close a DMF32 line.
+----- */
+
+X/*  ARGSUSED */
+
+dmfclose(device, flag)
+dev_t   device;
+int     flag;
+{
+register struct  tty     *tp;
+register unit;
+
+    unit = minor(device);
+    tp = &dmf_tty[unit];
+
+    if (unit & 0200)
+	return(dmflclose(device, flag));
+    (*linesw[tp->t_line].l_close)(tp);
+
+X/* -----
+	Break, hang-up and close the modem. Return to caller.
+----- */
+
+    (void) dmfmctl(unit, DMFA_BRK, DMBIC);
+    if (tp->t_state & TS_HUPCLS || (tp->t_state & TS_ISOPEN) == 0)
+        (void) dmfmctl(unit, DMFA_OFF, DMSET);
+    ttyclose(tp);
+    return;
+}
+
+
+X/* -----
+	Reset state of driver if UBA reset was necessary.
+	Reset the csr, lpr, and lctmr registers on open lines,
+	    and restart transmitters.
+----- */
+
+dmfreset(uban)
+int     uban;
+{
+register int     controller, unit;
+register struct  tty *tp;
+register struct  uba_device *ui;
+register struct  dmfdevice *dmf_addr;
+int     i;
+
+X/* -----
+	Set up Unibus map registers.
+----- */
+
+    if (dmf_ubinfo[uban] == 0)
+	return;
+    dmf_ubinfo[uban] = uballoc(uban, (caddr_t)cfree,
+                               nclist * sizeof (struct cblock), 0);
+    cbase[uban] = dmf_ubinfo[uban] & 0x3ffff;
+
+X/* -----
+	For each dmf controller in the system.
+----- */
+
+    for (controller = 0; controller < NDMF; controller++) 
+        {
+        ui = dmfinfo[controller];
+        if (ui == 0 || ui->ui_alive == 0 || ui->ui_ubanum != uban) continue;
+        printf(" dmf%d", controller);
+        dmf_addr = (struct dmfdevice *)ui->ui_addr;
+        dmf_addr->dmfa_csr |= DMFA_IE;
+        dmf_addr->dmfa_sato = SILO_TIME_OUT;
+        unit = controller * 8;
+X/* -----
+	For each unit on a dmf controller.
+	If the unit is open or waiting for open to complete, reset it.
+----- */
+        for (i = 0; i < 8; i++) 
+            {
+	    dmfa_softc[unit].dmfa_state = 0;
+
+            tp = &dmf_tty[unit];
+
+            if (tp->t_state & (TS_ISOPEN | TS_WOPEN)) 
+                {
+                dmfparam(unit);
+                (void) dmfmctl(unit, DMFA_ON, DMSET);
+                tp->t_state &= ~TS_BUSY;
+                dmfstart(tp);
+                }
+            unit++;
+            }
+        }
+    return;
+}
+
+
+X/* -----
+	Routine to read a dmf32 line.
+----- */
+
+dmfread(device, uio)
+dev_t   device;
+struct  uio     *uio;
+{
+register struct  tty     *tp;
+int xstatus;
+
+    if (minor(device) & 0200)
+	return(ENXIO);
+    tp = &dmf_tty[minor(device)];
+    xstatus = (*linesw[tp->t_line].l_read)(tp, uio);
+    return(xstatus);
+}
+
+
+X/* -----
+	Routine to write to a dmf32 line.
+----- */
+
+dmfwrite(device, uio)
+dev_t   device;
+struct  uio     *uio;
+{
+register struct  tty     *tp;
+int xstatus;
+
+    if (minor(device) & 0200)
+	return(dmflwrite(device, uio));
+    tp = &dmf_tty[minor(device)];
+    xstatus = (*linesw[tp->t_line].l_write)(tp, uio);
+    return(xstatus);
+}
+
+
+X/* -----
+	 Routine to process a DMF32 receiver interrupt.
+----- */
+
+dmfrint(controller)
+int     controller;
+{
+register struct  tty     *tp;
+register int character;
+register struct  dmfdevice *dmf_addr;
+register struct  tty     *tp0;
+register struct  uba_device *ui;
+int     overrun, priority;
+int     unit;
+
+    overrun = 0;
+    ui = dmfinfo[controller];
+    if (ui == 0 || ui->ui_alive == 0) return;
+    dmf_addr = (struct dmfdevice *)ui->ui_addr;
+    tp0 = &dmf_tty[controller << 3];
+
+X/* -----
+	Loop fetching characters from the silo for this
+	dmf until there are no more in the silo.
+----- */
+
+    while ((character = dmf_addr->dmfa_rbuf) < 0) 
+        {
+	unit = (character >> 8) & 07;
+        tp = tp0 + (unit & 07);
+        if (character & DMFA_DSC) 
+            {
+	    if (!(dmfsoftCAR[controller] & (1 << (unit & 07))))
+		{
+		priority = spl5();
+		dmf_addr->dmfa_csr = DMFA_IE | IR_RMS | (unit & 07);
+		if (dmf_addr->dmfa_rms & DMFA_CAR) 
+		    {
+		    if ((tp->t_state & TS_CARR_ON) == 0) 
+			{
+			wakeup((caddr_t) &tp->t_rawq);
+			tp->t_state |= TS_CARR_ON;
+			}
+		    }
+		else 
+		    {
+		    if (tp->t_state & TS_CARR_ON) 
+			{
+			gsignal(tp->t_pgrp, SIGHUP);
+			gsignal(tp->t_pgrp, SIGCONT);
+			dmf_addr->dmfa_csr = DMFA_IE | IR_LCTMR | (unit & 07);
+			dmf_addr->dmfa_lctmr =
+				dmf_addr->dmfa_lctmr & ((DMFA_OFF<<8) | 0xff);
+			ttyflush(tp, FREAD | FWRITE);
+			}
+		    tp->t_state &= ~TS_CARR_ON;
+		    }
+		splx(priority);
+		}
+            continue;
+            }
+
+X/* -----
+	If unit is not open, wake it up and continue with next character.
+----- */
+
+        if ((tp->t_state & TS_ISOPEN) == 0) 
+            {
+            wakeup((caddr_t)tp);
+            continue;
+            }
+
+X/* -----
+	When using parity (even or odd) continue with next character.
+----- */
+
+        if (character & DMFA_PE)
+	    {
+            if ((tp->t_flags & (EVENP | ODDP)) == EVENP ||
+               (tp->t_flags & (EVENP | ODDP)) == ODDP )
+                continue;
+	    }
+
+X/* -----
+	At data over-run (silo overflow), print error message.
+----- */
+
+        if ((character & DMFA_DO) && overrun == 0) 
+            {
+            printf("dmf%d: silo overflow\n", controller);
+            overrun = 1;
+            }
+
+X/* -----
+	At framing error (break) generate a null (in raw mode,
+	for getty), or a interrupt (in cooked/cbreak mode).
+----- */
+
+        if (character & DMFA_FE)
+	    {
+            if (tp->t_flags & RAW)
+                character = 0;
+	    else
+		character = tp->t_intrc;
+	    }
+
+X/* -----
+	Perform the line specific receiver interrupt with special
+	consideration for the Berkeley line discipline.
+----- */
+
+#if NBK > 0
+        if (tp->t_line == NETLDISC) 
+            {
+            character &= 0177;
+            BKINPUT(character, tp);
+            }
+	else
+#endif
+	    (*linesw[tp->t_line].l_rint)(character, tp);
+        }
+    return;
+}
+
+
+X/* -----
+	Start (restart) transmission on the given DMF32 line.
+----- */
+
+dmfstart(tp)
+register struct  tty *tp;
+{
+register struct  dmfdevice *dmf_addr;
+register int     unit, nch, room;
+int     controller;
+int priority, car, use_dma;
+register int i;
+register char *cp;
+
+    unit = minor(tp->t_dev);
+    controller = unit >> 3;
+    dmf_addr = (struct dmfdevice *)tp->t_addr;
+
+X/* -----
+	Disable interupts.
+	If it's currently active, or delaying, no need to do anything.
+----- */
+
+    priority = spl5();
+
+    if (tp->t_state & (TS_TIMEOUT | TS_BUSY | TS_TTSTOP))
+	goto out;
+
+X/* -----
+	If the transmitter has been disabled reenable it.
+	If the transmitter was disabled before the xint,
+	(the TS_BUSY was still on) then reset the BUSY state and
+	we will wait for the interrupt.  IF !TS_BUSY we already
+	saw the interrupt so we can start another transmission.
+----- */
+
+    if ( (dmfa_softc[unit].dmfa_state & ST_TXOFF) ) 
+        {
+        dmf_addr->dmfa_csr = DMFA_IE | IR_LCTMR | (unit & 07);
+	dmf_addr->dmfa_lctmr = (dmf_addr->dmfa_lctmr | DMFA_TE);
+	dmfa_softc[unit].dmfa_state &= ~ST_TXOFF;
+	if (dmfa_softc[unit].dmfa_state & ST_INBUSY)
+	    {
+	    dmfa_softc[unit].dmfa_state &= ~ST_INBUSY;
+	    tp->t_state |= TS_BUSY;
+	    goto out;
+	    }
+        }
+
+X/* -----
+	If there are sleepers, and output has drained below low
+	water mark, wake up the sleepers.
+----- */
+
+    if (tp->t_outq.c_cc <= TTLOWAT(tp)) 
+        {
+	if (tp->t_state & TS_ASLEEP) 
+	    {
+	    tp->t_state &= ~TS_ASLEEP;
+	    wakeup((caddr_t)&tp->t_outq);
+	    }
+	if (tp->t_wsel)
+	    {
+	    selwakeup(tp->t_wsel, tp->t_state & TS_WCOLL);
+	    tp->t_wsel = 0;
+	    tp->t_state &= ~TS_WCOLL;
+	    }
+        }
+
+X/* -----
+	Now restart transmission unless the output queue is empty.
+----- */
+
+    if (tp->t_outq.c_cc == 0)
+	goto out;
+    if (tp->t_flags & (RAW | LITOUT))
+	{
+        nch = ndqb(&tp->t_outq, 0);
+	}
+    else 
+        {
+		/* If first thing on queue is a delay process it. */
+        nch = ndqb(&tp->t_outq, 0200);
+        if (nch == 0) 
+            {
+            nch = getc(&tp->t_outq);
+            timeout(ttrstrt, (caddr_t)tp, (nch & 0x7f) + 6);
+            tp->t_state |= TS_TIMEOUT;
+            goto out;
+            }
+        }
+
+X/* -----
+	If characters to transmit, (re)start transmission.
+	Enalble transmitter and interrupts and set the mode to busy.
+	Should we use DMA or SILO mode?
+	    If "nch" is greater than DO_DMA_COUNT then do the
+	    transmission with DMA.
+	    Or if all the characters won't fit in the silo, then
+	    use DMA so we don't have to restart later.
+	For DMA:
+	    Calculate the DMA dmf_addr.
+	    Load DMA dmf_addr and character count appropriately.
+	    We will wait for the xint before we flush them.
+	    If you don't wait for the xint before flushing, the
+	    higher levels will start reusing the buffers.
+	For non DMA:
+	    Move nch characters into the silo and flush them from the queue.
+----- */
+
+    if (nch) 
+        {
+        dmf_addr->dmfa_csr = DMFA_IE | IR_LCTMR | (unit & 07);
+	dmf_addr->dmfa_lctmr = (dmf_addr->dmfa_lctmr | DMFA_TE);
+        tp->t_state |= TS_BUSY;
+
+	use_dma = FALSE;
+	room = DMFA_SIZ;
+	if (nch > DO_DMA_COUNT)
+	    {
+	    use_dma = TRUE;
+	    }
+X/* -----
+	else
+	    {
+	    dmf_addr->dmfa_csr = DMFA_IE | IR_TSC | (unit & 07);
+	    room = DMFA_SIZ - dmf_addr->dmfa_tsc;
+	    if (room <= nch)
+		{
+		use_dma = TRUE;
+		}
+	    }
+----- */
+	
+	if(use_dma)
+	    {
+	    car = UBACVT(tp->t_outq.c_cf, dmfinfo[controller]->ui_ubanum);
+	    dmfa_softc[unit].dmfa_count = nch;
+	    dmfa_softc[unit].dmfa_state |= ST_DMA;
+	    dmf_addr->dmfa_csr = DMFA_IE | IR_TBA | (unit & 07);
+	    dmf_addr->dmfa_tba = car;
+	    dmf_addr->dmfa_tcc = ((car >> 2) & 0xc000) | nch;
+	    }
+	else
+	    {
+	    dmfa_softc[unit].dmfa_state &= ~ST_DMA;
+	    cp = tp->t_outq.c_cf;
+	    nch = MIN(nch, room);
+	    dmf_addr->dmfa_csr = DMFA_IE | IR_TBUF | (unit & 07);
+	    for (i = 0; i < nch; i++)
+		dmf_addr->dmfa_tbf = *cp++;
+	    ndflush(&tp->t_outq, nch);
+	    }
+        }
+
+out:
+    splx(priority);
+    return;
+}
+
+
+X/* -----
+	Stop output on a line, e.g. for ^S/^Q or output flush.
+	Block input/output interrupts by setting priority.
+	Disable the transmitter
+	We must disable the transmitter even if the 'tp' says the
+	terminal is not busy, because in DMA mode, there are characters left in
+	the silo after the controller interrupts with transmit complete.
+	if flush request (i.e. a non stopped-by-^S request.)
+	    Flush the silo by setting the appropriate bit.
+	    This will cause a xint when the flush is complete so make it busy.
+	else if busy, mark as stopped while busy.
+----- */
+
+X/* ARGSUSED */
+
+dmfstop(tp, flag)
+register struct  tty *tp;
+{
+register struct  dmfdevice *dmf_addr;
+register int     unit, priority;
+
+
+    priority = spl5();
+    dmf_addr = (struct dmfdevice *)tp->t_addr;
+    unit = minor(tp->t_dev);
+
+    dmf_addr->dmfa_csr = IR_LCTMR | (unit & 07) | DMFA_IE;
+    dmf_addr->dmfa_lctmr = (dmf_addr->dmfa_lctmr & ~DMFA_TE);
+    dmfa_softc[unit].dmfa_state |= ST_TXOFF;
+    if ((tp->t_state & TS_TTSTOP) == 0) 
+	{
+	tp->t_state |= TS_FLUSH | TS_BUSY;
+	dmf_addr->dmfa_lctmr = (dmf_addr->dmfa_lctmr | DMFA_FLS);
+	}
+    else
+	{
+	if (tp->t_state & TS_BUSY)
+	    {
+	    dmfa_softc[unit].dmfa_state |= ST_INBUSY;
+	    tp->t_state &= ~TS_BUSY;
+	    }
+	}
+    splx(priority);
+    return;
+}
+
+
+X/* -----
+	Routine to handel a DMF32 transmitter interrupt.
+	Restart the idle line.
+	Loop while transmit is ready.
+	Get the unit number and clear the busy bit.
+	    Test for DMA error and print error message.
+		SHOULD RESTART OR SOMETHING...
+	    Test for DMA flush bit set and clear it.
+	 Clear the flush flag if it is set.
+	     Reable the transmitter.
+----- */
+
+dmfxint(controller)
+int     controller;
+{
+register struct  tty *tp;
+register struct  dmfdevice *dmf_addr;
+register struct  uba_device *ui;
+register int     unit, t;
+
+int     count;
+int     priority;
+
+    ui = dmfinfo[controller];
+    dmf_addr = (struct dmfdevice *)ui->ui_addr;
+
+    priority = spl5();
+    while ((t = dmf_addr->dmfa_csr) & DMFA_TRDY) 
+        {
+        unit = controller * 8 + ((t >> 8) & 07);
+        tp = &dmf_tty[unit];
+        tp->t_state &= ~TS_BUSY;
+
+        if (t & DMFA_NXM)
+	    printf("dmf%d: NXM line %d\n", controller, unit & 7);
+
+	if (tp->t_state & TS_FLUSH)
+	    {
+            tp->t_state &= ~TS_FLUSH;
+	    dmf_addr->dmfa_csr = DMFA_IE | IR_LCTMR | (unit & 07);
+	    dmf_addr->dmfa_lctmr = (dmf_addr->dmfa_lctmr | DMFA_TE);
+	    }
+	else if (dmfa_softc[unit].dmfa_state & ST_DMA)
+	    {
+	    ndflush(&tp->t_outq, dmfa_softc[unit].dmfa_count);
+	    }
+	dmfa_softc[unit].dmfa_state = 0;
+
+X/* ------
+	Start (restart) the transmission.
+----- */
+
+        if (tp->t_line)
+	    {
+            (*linesw[tp->t_line].l_start)(tp);
+	    }
+	 else
+	    {
+	    dmfstart(tp);
+	    }
+        }
+
+    splx(priority);
+    return;
+}
+
+
+X/* -----
+	Routine for Ioctl for DMF32.
+	    Perform line specific ioctl for Berkeley line discipline,
+	    and tty ioctl then process any errors.
+----- */
+
+X/* ARGSUSED */
+
+dmfioctl(device, command, data, flag)
+dev_t   device;
+caddr_t data;
+{
+register struct  tty *tp;
+register int     unit;
+int     error;
+
+    unit = minor(device);
+    tp = &dmf_tty[unit];
+    if (unit & 0200) return(ENOTTY);
+
+    error = (*linesw[tp->t_line].l_ioctl)(tp, command, data, flag);
+    if (error >= 0) return(error);
+    error = ttioctl(tp, command, data, flag);
+    if (error >= 0) 
+        {
+        if (command == TIOCSETP || command == TIOCSETN)
+	    dmfparam(unit);
+        return(error);
+        }
+
+X/* ------
+	Process specific ioctl command.
+----- */
+
+    switch(command) 
+        {
+	case TIOCSBRK:
+	    (void) dmfmctl(device, DMFA_BRK, DMBIS);
+	    break;
+	case TIOCCBRK:
+	    (void) dmfmctl(device, DMFA_BRK, DMBIC);
+	    break;
+	case TIOCSDTR:
+	    (void) dmfmctl(device, DMFA_DTR | DMFA_RTS, DMBIS);
+	    break;
+	case TIOCCDTR:
+	    (void) dmfmctl(device, DMFA_DTR | DMFA_RTS, DMBIC);
+	    break;
+	case TIOCMSET:
+	    (void) dmfmctl(device, dmtodmf(*(int *)data), DMSET);
+	    break;
+	case TIOCMBIS:
+	    (void) dmfmctl(device, dmtodmf(*(int *)data), DMBIS);
+	    break;
+	case TIOCMBIC:
+	    (void) dmfmctl(device, dmtodmf(*(int *)data), DMBIC);
+	    break;
+	case TIOCMGET:
+	    *(int *)data = dmftodm(dmfmctl(device, 0, DMGET));
+	    break;
+	default:
+	    return(ENOTTY);
+        }
+    return(0);
+}
+
+
+X/* -----
+	Routine for DMF32 modem control
+----- */
+
+dmfmctl(device, bits, how)
+dev_t   device;
+int     bits, how;
+{
+register struct dmfdevice *dmf_addr;
+register int unit, modem_status, line_control;
+register int temp;
+int     priority;
+
+    unit = minor(device);
+    dmf_addr = (struct dmfdevice *)(dmf_tty[unit].t_addr);
+
+X/* -----
+	Block I/O interrupts.
+	Get receive modem status, transmit modem status & line control info.
+----- */
+
+    priority = spl5();
+    dmf_addr->dmfa_csr = DMFA_IE | IR_RMS | (unit & 07);
+    modem_status = dmf_addr->dmfa_rms << 8;
+
+    dmf_addr->dmfa_csr = DMFA_IE | IR_LCTMR | (unit & 07);
+    temp = dmf_addr->dmfa_lctmr;
+    modem_status |= ((temp>>8) & (0x1f));
+    line_control = (temp & (0x3f));
+    if (line_control & DMFA_RBK)
+	{
+	modem_status |= DMFA_BRK;
+	}
+
+X/* -----
+	Process modem control commands.
+----- */
+
+    switch(how) 
+        {
+	case DMSET:
+	    modem_status = (modem_status & 0xff00) | bits;
+	    break;
+	case DMBIS:
+	    modem_status |= bits;
+	    break;
+	case DMBIC:
+	    modem_status &= ~bits;
+	    break;
+	case DMGET:
+	    (void) splx(priority);
+	    return(modem_status);
+        }
+
+X/* -----
+	Process the break bit and set up the modem status and line control
+	information to be replaced  in the transmit modem register for the
+	selected line.
+----- */
+
+    if (modem_status & DMFA_BRK)
+	{
+        line_control |= DMFA_RBK;
+	}
+    else
+	{
+	line_control &= ~DMFA_RBK;
+	}
+    dmf_addr->dmfa_csr = DMFA_IE | IR_LCTMR | (unit & 07);
+    dmf_addr->dmfa_lctmr = ((modem_status & 0x1f) << 8) | (line_control & 0x3f);
+
+    (void) splx(priority);
+    return(modem_status);
+}
+
+
+X/* -----
+    Routine to convert modem status from dm to dmf format.
+	Pull bits 1 & 3 through unchanged. If dm secondary transmit bit is set,
+	and/or dm request to send bit is set, and/or dm user modem signal bit
+	is set, set the corresponding dmf bits. Return to caller.
+----- */
+
+dmtodmf(bits)
+register int     bits;
+{
+register int     b;
+
+    b = bits & 012;
+    if (bits & DM_ST) b |= DMFA_RAT;
+    if (bits & DM_RTS) b |= DMFA_RTS;
+    if (bits & DM_USR) b |= DMFA_USW;
+    return(b);
+}
+
+X/* -----
+	Routine to convert modem status from dmf to dm format.
+	    Pull bits 1 & 3 through unchanged. Pull bits 11 - 15 through as bits
+	    4 - 8 and set bit 0 to dm line enable.
+	If dmf user modem signal bit set, and/or  dmf request to send bit set,
+	then set the corresponding dm bit also. Return to caller.
+----- */
+
+dmftodm(bits)
+register int     bits;
+{
+
+    register int     b;
+
+    b = (bits & 012) | ((bits >> 7) & 0760) | DM_LE;
+
+    if (bits & DMFA_USR) b |= DM_USR;
+    if (bits & DMFA_RTS) b |= DM_RTS;
+    return(b);
+}
+
+
+X/* -----
+	L I N E   P R I N T E R   D R I V E R
+----- */
+
+X/* -----
+	Routine to open the line printer port on a dmf32
+----- */
+
+dmflopen(device, flag)
+dev_t   device;
+int     flag;
+{
+register int     controller;
+register struct  dmfl_softc *sc;
+register struct  uba_device *ui;
+register struct  dmfdevice *dmf_addr;
+
+    controller = minor(device) & 07 ;
+    if (((sc = &dmfl_softc[controller])->dmfl_state & OPEN) ||
+       ((ui = dmfinfo[controller]) == 0) || ui->ui_alive == 0)
+       return(ENXIO);
+    dmf_addr = (struct dmfdevice *)ui->ui_addr;
+    if ((dmf_addr->dmfl_ctrl & DMFL_OFL))
+        {
+        /*printf("dmf: line printer offline/jammed\n");*/
+        return(EIO);
+        }
+    if ((dmf_addr->dmfl_ctrl & DMFL_CNV))
+        {
+        printf("dmf:line printer disconnected\n");
+        return(EIO);
+        }
+    dmf_addr->dmfl_ctrl = 0;
+    sc->dmfl_state |= OPEN;
+    return(0);
+}
+
+
+X/* -----
+	Routine to close the line printer part of a dmf32.
+----- */
+
+dmflclose(device, flag)
+dev_t   device;
+int     flag;
+{
+register int     controller;
+register struct  dmfl_softc *sc;
+
+    controller = minor(device) & 07;
+    sc = &dmfl_softc[controller];
+    dmflout(device, "\f", 1);
+    sc->dmfl_state = 0;
+    if (sc->dmfl_info != 0)
+        ubarelse((struct dmfdevice *)(dmfinfo[controller])->ui_ubanum,
+		  &(sc->dmfl_info));
+    ((struct dmfdevice *)(dmfinfo[controller]->ui_addr))->dmfl_ctrl = 0;
+    return(0);
+}
+
+
+X/* -----
+	Routine to write to the line printer part of a dmf32.
+----- */
+
+dmflwrite(device, uio)
+dev_t   device;
+struct  uio *uio;
+{
+register unsigned int n;
+register int     error;
+register struct  dmfl_softc *sc;
+
+    sc = &dmfl_softc[minor(device) & 07];
+    if (sc->dmfl_state & ERROR) return(EIO);
+    while (n = min(DMFL_SIZ, (unsigned)uio->uio_resid))
+        {
+        if (error = uiomove(&sc->dmfl_buf[0], (int)n, UIO_WRITE, uio))
+            {
+            printf("uio move error\n");
+            return(error);
+            }
+        if (error = dmflout(device, &sc->dmfl_buf[0], n)) return(error);
+        }
+    return(0);
+}
+
+
+X/* -----
+	Routine to start io operation to dmf line printer.
+	cp is address of buf of n chars to be sent.
+	dmf will be put in formatted output mode, this will
+	be selectable from an ioctl if the need ever arises.
+----- */
+
+dmflout(device, cp, n)
+dev_t   device;
+char    *cp;
+int     n;
+{
+register struct  dmfl_softc *sc;
+register int     controller;
+register struct  uba_device *ui;
+register struct  dmfdevice *d;
+register unsigned info;
+int priority;
+
+    controller = minor(device) & 07;
+    sc = &dmfl_softc[controller];
+    if (sc->dmfl_state & ERROR) return(EIO);
+    ui = dmfinfo[controller];
+
+X/* -----
+	allocate unibus resources, will be released when io operation is done
+----- */
+
+    sc->dmfl_info = info = uballoc(ui->ui_ubanum, cp, n, 0);
+    d = (struct dmfdevice *)ui->ui_addr;
+    d->dmfl_ctrl = (2 << 8) | DMFL_FMT; /* indir reg 2 */
+
+X/* -----
+	indir reg auto increments on r/w.
+	SO DON'T CHANGE THE ORDER OF THIS CODE
+----- */
+    d->dmfl_indrct = 0;    /* prefix chars & num */
+    d->dmfl_indrct = 0;    /* suffix chars & num */
+    d->dmfl_indrct = info; /* dma lo 16 bits address */
+
+X/* -----
+	the minus "number of chars" used below is NOT DOCUMENTED !!
+----- */
+    d->dmfl_indrct = -n;  /* number of chars */
+
+    d->dmfl_indrct = ((info >> 16) & 3) /* dma hi 2 bits address */
+                 | (1 << 8)             /* auto cr insert */
+                 | (1 << 9)             /* use real ff */
+                 | (1 << 15);           /* no u/l conversion */
+    d->dmfl_indrct = sc->dmfl_lines     /* lines per page */
+                 | (sc->dmfl_cols << 8);/* carriage width */
+    sc->dmfl_state |= ASLP;
+    priority = spl5();
+    d->dmfl_ctrl |= DMFL_PEN | DMFL_IE;
+    while (sc->dmfl_state & ASLP)
+        {
+        sleep(&sc->dmfl_buf[0], (PZERO + 8));
+        while (sc->dmfl_state & ERROR)
+            {
+            timeout(dmflint, controller, 10 * hz);
+            sleep(&sc->dmfl_state, (PZERO + 8));
+            }
+
+        /*if (sc->dmfl_state & ERROR) return (EIO);*/
+        }
+    splx(priority);
+    return(0);
+}
+
+
+X/* -----
+	Routine to handle an interrupt from the line printer part of the dmf32
+----- */
+
+dmflint(controller)
+int     controller;
+{
+register struct  uba_device *ui;
+register struct  dmfl_softc *sc;
+register struct  dmfdevice *d;
+
+    ui = dmfinfo[controller];
+    sc = &dmfl_softc[controller];
+    d = (struct dmfdevice *)ui->ui_addr;
+    d->dmfl_ctrl &= ~DMFL_IE;
+    if (sc->dmfl_state & ERROR)
+        {
+        printf("dmfl: intr while in error state \n");
+        if ((d->dmfl_ctrl & DMFL_OFL) == 0) sc->dmfl_state &= ~ERROR;
+        wakeup(&sc->dmfl_state);
+        return;
+        }
+    if (d->dmfl_ctrl & DMFL_DER) printf("dmf:NXM\n");
+    if (d->dmfl_ctrl & DMFL_OFL)
+        {
+        printf("dmf:printer error\n");
+        sc->dmfl_state |= ERROR;
+        }
+    if (d->dmfl_ctrl & DMFL_PDN)
+        {
+#ifdef notdef
+        printf("bytes= %d\n", d->dmfl_indrct);
+        printf("lines= %d\n", d->dmfl_indrct);
+#endif
+        }
+    sc->dmfl_state &= ~ASLP;
+    wakeup(&sc->dmfl_buf[0]);
+    if (sc->dmfl_info != 0) ubarelse(ui->ui_ubanum, &sc->dmfl_info);
+    sc->dmfl_info = 0;
+    return;
+}
+
+
+X/* ----
+	NON-SUPPORTED INTERFACES...Parallel and synchronous
+----- */
+
+X/* -----
+	interrupt routine for parallel interface, not yet supported
+----- */
+
+dmfdaint() 
+{
+    printf("dmfdaint\n"); 
+    return;
+}
+
+X/* -----
+	interrupt routine for parallel interface, not yet supported
+----- */
+
+dmfdbint() 
+{
+    printf("dmfdbint\n"); 
+    return;
+}
+
+X/* -----
+	interrupt routine for synchronous interface, not yet supported
+----- */
+
+dmfsrint() 
+{
+    printf("dmfsrint\n"); 
+    return;
+}
+
+X/* -----
+	interrupt routine for synchronous interface, not yet supported
+----- */
+
+dmfsxint() 
+{
+    printf("dmfsxint\n"); 
+    return;
+}
+#endif
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 660 dmf.c
+	/bin/echo -n '	'; /bin/ls -ld dmf.c
+fi
+/bin/echo 'Extracting dmfreg.h'
+sed 's/^X//' <<'//go.sysin dd *' >dmfreg.h
+X/* -----
+
+ dmfreg.h
+ 
+DMF32 register definitions.
+
+    "dmfc" refers to the dmf32 as a whole,
+    "dmfa" refers to the async portion of the dmf32,
+    "dmfs" refers to the sync portion of the dmf32,
+    "dmfd" refers to the dr11 portion of the dmf32, and
+    "dmfl" to the lp portion of the dmf32.
+
+(ro) - read only
+(wo) - write only
+----- */
+
+X/* -----
+	dmf32 control register definitions
+----- */
+
+ struct dmfdevice
+     {
+     short	 dmfc_config;		/* configuration control status reg. */
+     short	 dmfc_maint;		/* diagnostic control status register */
+     short	 dmfs_receive;		/* synchronous receive register */
+     short	 dmfs_xmit;		/* synchronous transmit register */
+     short	 dmfs_misc;		/* synchronous miscellaneous register */
+     short	 dmfs_indrct;		/* synchronous indirect register */
+     short	 dmfa_csr;		/* asynch. control status register */
+     short	 dmfa_lparm;		/* asynch. line parameter register */
+     short	 dmfa_rbuf;		/* asynch. receive buffer register */
+     union				/* indirect register */
+	 {
+	 u_short word;			/* word */
+	 u_char	 bytes[2];		/* bytes */
+	 }	 dmfa_ir;
+     short	 dmfl_ctrl;		/* line printer control register */
+     short	 dmfl_indrct;		/* line printer indirect register */
+     short	 dmfd_ctrl;		/* dr11 control register */
+     short	 dmfd_outbuf;		/* dr11 output buffer register */
+     short	 dmfd_inbuf;		/* dr11 input buffer register */
+     short	 dmfd_indrct;		/* dr11 indirect register */
+     };
+
+#define dmfa_sato dmfa_rbuf		/* receive silo alarm timeout (wo) */
+
+X/* -----
+	aliases for asynchronous indirect control registers
+----- */
+
+#define IR_TBUF	 000			/* transmit buffer register (wo)*/
+#define	IR_RMS	 000			/* recieve modem status register (ro)*/
+#define	IR_TSC	 000			/* transmit silo count register (ro)*/
+#define IR_LCTMR 010			/* line control and transmit modem */
+#define IR_TBA	 020			/* trans. buf. addr register */
+#define IR_TCC	 030			/* transmit char. count */
+
+#define dmfa_tbf dmfa_ir.bytes[0]	/* transmit buffer (wo) */
+#define dmfa_tbf2 dmfa_ir.word		/* transmit buffer for 2 chars. (wo) */
+
+#define dmfa_rms dmfa_ir.bytes[1]	/* receive modem status (ro) */
+#define dmfa_tsc dmfa_ir.bytes[0]	/* transmit silo count (ro) */
+
+#define dmfa_lctmr dmfa_ir.word		/* line control and transmit modem */
+
+#define dmfa_tba dmfa_ir.word		/* transmit buffer address */
+
+#define dmfa_tcc dmfa_ir.word		/* transmit character count */
+
+X/* -----
+	bits in dmfc_config register
+----- */
+
+#define DMFC_CONFGMASK	0xf000		/* dmf32 configuration mask */
+#define DMFC_ASYNC	0x8000		/* asynch interface */
+#define DMFC_SYNC	0x4000		/* synchronous interface */
+#define DMFC_LP		0x2000		/* line printer */
+#define DMFC_PARALLEL	0x1000		/* parallel interface */
+
+X/* -----
+	bits in dmfa_csr register
+----- */
+
+#define DMFA_TRDY  0100000		/* transmit ready */
+#define DMFA_TIE   0040000		/* transmit interrupt enable */
+#define DMFA_NXM   0030000		/* non-existant memory */
+#define DMFA_LIN   0003400		/* transmit line number */
+#define DMFA_RRDY  0000200		/* receiver data available */
+#define DMFA_RIE   0000100		/* receiver interrupt enable */
+#define DMFA_RESET 0000040		/* master reset */
+#define DMFA_IAD   0000037		/* indirect address register */
+
+#define DMFA_IE	 (DMFA_TIE|DMFA_RIE)	/* enable transmit and receive */
+#define DMFA_SIZ 32			/* size of DMF output silo (per line) */
+
+X/* -----
+	bits in dmfa_lparm register
+----- */
+
+#define DMFA_6BT 0010			 /* 6 bits per character */
+#define DMFA_7BT 0020			 /* 7 bits per character */
+#define DMFA_8BT 0030			 /* 8 bits per character */
+#define DMFA_PEN 0040			 /* parity enable */
+#define DMFA_EPR 0100			 /* even parity */
+#define DMFA_SCD 0200			 /* stop code */
+#define DMFA_XTE 0170000		 /* transmit rate */
+#define DMFA_RRT 0007400		 /* receive rate */
+#define DMFA_LSL 0000007		 /* line select */
+
+#define BR_50	 000			 /* baud rate 50    bps */
+#define BR_75	 001			 /*	"     75     "	*/
+#define BR_110	 002			 /*	"     110    "	*/
+#define BR_134_5 003			 /*	"     134.5  "	*/
+#define BR_150	 004			 /*	"     150    "	*/
+#define BR_300	 005			 /*	"     300    "	*/
+#define BR_600	 006			 /*	"     600    "	*/
+#define BR_1200	 007			 /*	"     1200   "	*/
+#define BR_1800	 010			 /*	"     1800   "	*/
+#define BR_2000	 011			 /*	"     2000   "	*/
+#define BR_2400	 012			 /*	"     2400   "	*/
+#define BR_3600	 013			 /*	"     3600   "	*/
+#define BR_4800	 014			 /*	"     4800   "	*/
+#define BR_7200	 015			 /*	"     7200   "	*/
+#define BR_9600	 016			 /*	"     9600   "	*/
+#define BR_19200 017			 /*	"     19200  "	*/
+
+X/* -----
+	bits in dmfa_rbuf register
+----- */
+#define DMFA_DSC 0004000		/* data set change */
+#define DMFA_PE	 0010000		/* parity error */
+#define DMFA_FE	 0020000		/* framing error */
+#define DMFA_DO	 0040000		/* data overrun */
+#define DMFA_DV	 0100000		/* data valid */
+#define DMFA_RL	 0003400		/* line */
+#define DMFA_RD	 0000377		/* data */
+#define DMFA_AT	 0000377		/* alarm timeout */
+
+X/* -----
+	bits in dmfa_rms register
+----- */
+#define DMFA_USR 0004			/* user modem signal (pin 25) */
+#define DMFA_SR	 0010			/* secondary receive */
+#define DMFA_CTS 0020			/* clear to send */
+#define DMFA_CAR 0040			/* carrier detect */
+#define DMFA_RNG 0100			/* ring */
+#define DMFA_DSR 0200			/* data set ready */
+
+X/*
+ * bits in dmfa_tms register
+ */
+#define DMFA_USW 0001			/* user modem signal (pin 18) */
+#define DMFA_DTR 0002			/* data terminal ready */
+#define DMFA_RAT 0004			/* data signal rate select */
+#define DMFA_ST	 0010			/* secondary transmit */
+#define DMFA_RTS 0020			/* request to send */
+#define DMFA_BRK 0040			/* pseudo break bit */
+#define DMFA_PMT 0200			/* preempt output */
+
+#define DMFA_ON	 (DMFA_DTR|DMFA_RTS)
+#define DMFA_OFF 0
+
+X/*
+ * bits in dmfa_lcr register
+ */
+#define DMFA_MIE 0040			/* modem interrupt enable */
+#define DMFA_FLS 0020			/* flush transmit silo */
+#define DMFA_RBK 0010			/* real break bit */
+#define DMFA_RE	 0004			/* receive enable */
+#define DMFA_AUT 0002			/* auto XON/XOFF */
+#define DMFA_TE	 0001			/* transmit enable */
+#define DMFA_CF	 0300			/* control function */
+
+#define DMFA_LCE (DMFA_MIE|DMFA_RE|DMFA_TE)
+
+X/*
+ * bits in dmfa_tcc register
+ */
+#define DMFA_HA	 0140000		/* high address bits */
+
+X/*
+ * bits in dm lsr, copied from dh.c
+ */
+#define DM_USR	 0001000		/* usr modem sig, not a real DM bit */
+#define DM_DSR	 0000400		/* data set ready, not a real DM bit */
+#define DM_RNG	 0000200		/* ring */
+#define DM_CAR	 0000100		/* carrier detect */
+#define DM_CTS	 0000040		/* clear to send */
+#define DM_SR	 0000020		/* secondary receive */
+#define DM_ST	 0000010		/* secondary transmit */
+#define DM_RTS	 0000004		/* request to send */
+#define DM_DTR	 0000002		/* data terminal ready */
+#define DM_LE	 0000001		/* line enable */
+
+X/*
+ * bits in the line printer control registers
+ */
+#define DMFL_PEN 0000001		/* print enable */
+#define DMFL_RST 0000002		/* master reset */
+#define DMFL_FMT 0000004		/* format control */
+#define DMFL_xx1 0000030		/* unused */
+#define DMFL_MNT 0000040		/* mainenance mode on */
+#define DMFL_IE	 0000100		/* intr enable */
+#define DMFL_PDN 0000200		/* print done bit */
+#define DMFL_IDR 0003400		/* indirect reg */
+#define DMFL_xx2 0004000		/* unused */
+#define DMFL_CNV 0010000		/* connect verify */
+#define DMFL_DVR 0020000		/* davfu ready */
+#define DMFL_OFL 0040000		/* printer offline */
+#define DMFL_DER 0100000		/* dma error bit */
+#define DMFL_SIZ 512			/* max chars per dma */
+#define DMFL_DCL 132			/* default # of cols/line <=255 */
+#define DMFL_DLN 66			/* default # of lines/page <=255 */
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 660 dmfreg.h
+	/bin/echo -n '	'; /bin/ls -ld dmfreg.h
+fi
+/bin/echo 'Extracting changes1'
+sed 's/^X//' <<'//go.sysin dd *' >changes1
+Changes to /sys/vax/autoconf.c
+1c1
+< /*	autoconf.c	6.3	83/08/11	*/
+---
+> /*	autoconf.c	6.4	(MDDC/cwm) Nov. 27, 1984	*/
+159c159
+< 		case NEX_UBA3:
+---
+> 		case NEX_UBA3:    /* Fix from ~chris/4.2/uba */
+161,162c161,162
+< 			if (numuba >= 4) {
+< 				printf("5 uba's");
+---
+> 			if (numuba >= MAXNUBA) {
+> 				printf("%d uba's", numuba);
+164a165,168
+> 			if (numuba >= NUBA) {
+> 				printf("uba%d", numuba);
+> 				goto unconfig;
+> 			}
+368a373,375
+> 
+> struct uba_device *auto_ui;	/* place to save for probe routines (MDDC) */
+> 
+575a583
+> 		auto_ui = ui; /* MDDC */
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 660 changes1
+	/bin/echo -n '	'; /bin/ls -ld changes1
+fi
+/bin/echo 'Extracting changes2'
+sed 's/^X//' <<'//go.sysin dd *' >changes2
+Changes to /sys/h/param.h
+97a98,102
+> /* ----- MDDC change ----- */
+> #ifdef MDDC
+> #define	CBSIZE	60		/* number of chars in a clist block */
+> #define	CROUND	0x3F		/* clist rounding; sizeof(int *) + CBSIZE -1*/
+> #else /* !MDDC */
+99a105
+> #endif MDDC
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 660 changes2
+	/bin/echo -n '	'; /bin/ls -ld changes2
+fi
+/bin/echo 'Extracting changes3'
+sed 's/^X//' <<'//go.sysin dd *' >changes3
+Changes to /sys/conf/param.c
+47a48,51
+> /* ----- MDDC ----- */
+> #ifdef MDDC
+> int	nclist = 100 + 10 * MAXUSERS;
+> #else /* !MDDC */
+48a53
+> #endif MDDC
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 660 changes3
+	/bin/echo -n '	'; /bin/ls -ld changes3
+fi
+
+

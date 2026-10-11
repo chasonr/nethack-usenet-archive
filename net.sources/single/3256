@@ -1,0 +1,804 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,67c5b0124a9d9604,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-09-03 08:04:20 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 11/03/84 (WLS Mods); site astrovax.UUCP
+Path: utzoo!watmath!clyde!cbosgd!ihnp4!astrovax!richmon
+From: richmon@astrovax.UUCP (Michael Richmond)
+Newsgroups: net.sources
+Subject: reposting of at(1) command
+Message-ID: <644@astrovax.UUCP>
+Date: Tue, 3-Sep-85 11:04:20 EDT
+Article-I.D.: astrovax.644
+Posted: Tue Sep  3 11:04:20 1985
+Date-Received: Wed, 4-Sep-85 07:19:17 EDT
+Distribution: net
+Organization: Princeton Univ. Astrophysics
+Lines: 783
+
+Several weeks ago, I posted source for the at(1) command. There were
+several problems with it, especially on Sys V machines (such as the
+AT&T 7300 I write it on): by 'chown'ing an at file to 'root', the file
+would be run by 'at' with super-user permissions. I have fixed this
+problem, and several others, in the new version below. Moreover, rather
+than supplying a 'makefile' that automatically installs the command,
+I have merely included written instructions on what to do (in the
+original, the 'make install' option clobbered /usr/lib/crontab); if
+something goes wrong in the installation, at least it won't be my
+fault.
+
+Michael Richmond			Princeton University, Astrophysics
+
+{allegra,akgua,burl,cbosgd,decvax,ihnp4,noao,princeton,vax135}!astrovax!richmon
+
+
+# This is a shell archive.  Remove anything before this line,
+# then unpack it by saving it in a file and typing "sh file".
+#
+# Wrapped by richmon on Mon Sep  2 22:50:01 EDT 1985
+# Contents:  README makefile at.c atrun.c at.h at.doc
+ 
+echo x - README
+sed 's/^@//' > "README" <<'@//E*O*F README//'
+#	NEW FEATURES!!!!!
+#
+#	1. no longer will the error file ATRUN.ERR get filled up with
+#	   messages saying 'there aren't any files to run'.
+#
+#	2. a file in the AT directory will not be run if its owner has
+#		been changed since its creation; thus, users can no longer
+#		'chown' their at files to root. however, they may make changes
+#		to their own at files without endangering the jobs.
+#
+#	3. files in the AT directory are in the form YYDDD.HHMMC, where C
+#		is a letter which distinguishes between files with the same
+#		time. 
+#	
+##########################################################################
+#  to set up 'at' on your AT&T Unix PC, do the following:
+#
+#	0. make sure that the files 'at.c', 'atrun.c', 'at.h' and 'at'
+#		are all in the current directory.
+#
+#	1. make both 'at.exe' and 'atrun' by typing 			
+#		make at
+#
+#	2. put 'at.exe' and 'at' in /usr/bin, changing the owner and group
+#		of 'at' to bin and making it executable by all. change the
+#		owner of 'at.exe' to root, and set the mode to 4755, so that
+#		it sets effective user-id to root upon execution by anyone.
+#
+#	3. put 'atrun' in /usr/lib, changing the owner and group to root
+#		and mode to 700.
+#
+#	4. insert the following line in /usr/lib/crontab: (without the '#')
+#	 	change the first group of digits to taste. remember that the more
+#		often 'atrun' runs, the more likely that it will be running
+#		when the power goes out - and then you get a head crash.
+#
+#		0,15,30,45 * * * * /bin/su root -c "/usr/lib/atrun > /dev/null"
+#
+#	5. save the sources, the documentation and this file in a safe
+#		place, perhaps /usr/src/at.
+#
+@//E*O*F README//
+chmod u=rw,g=r,o=r README
+ 
+echo x - makefile
+sed 's/^@//' > "makefile" <<'@//E*O*F makefile//'
+all: at.exe atrun
+
+at.exe:  at.c
+	cc at.c -o at.exe
+
+atrun: atrun.c
+	cc atrun.c -o atrun
+@//E*O*F makefile//
+chmod u=rw,g=r,o=r makefile
+ 
+echo x - at.c
+sed 's/^@//' > "at.c" <<'@//E*O*F at.c//'
+#include <errno.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include "at.h"
+
+	/* number of days in the months of the year */
+
+int mon_days[12] = { 0, 31, 59, 90, 120, 150, 181, 212, 242, 273, 303, 334 };
+
+
+	/* names of things */
+
+char *mon_name[] = {
+	"january",
+	"february",
+	"march",
+	"april",
+	"may",
+	"june",
+	"july",
+	"august",
+	"september",
+	"october",
+	"november",
+	"decmeber"
+};
+
+char *day_name[] = {
+	"sunday",
+	"monday",
+	"tuesday",
+	"wednesday",
+	"thursday",
+	"friday",
+	"saturday"
+};
+
+
+#define MONTH  1
+#define WEEK   2
+
+	/* index into the array of either months or days of the given 
+	   second argument */
+
+int index = 0;
+int fouryr, year, day, hour, minute;
+int pres_day, pres_wkday;
+int at_days, at_wkday;
+long now_time, at_time, till_tomorrow, leftover;
+char t_char, error[100];
+
+
+
+main(argc, argv)
+int argc;
+char *argv[];
+{
+	long to_seconds();
+	char temp[10];
+	char filename[20];
+	int type;
+	
+	
+	if (argc < 2)
+	  err_msg("usage: at time [ month [ day ] || weekday [ week ] ] [ file ]");
+
+	now();
+	at_time = to_seconds(argv[1]);
+
+	/* the possible cases are:
+
+		1.	at 340  [ file ]
+		2.	at 340 jan 23  [ file ]
+		3.  at 340 sat  [ week ] [ file ]
+
+	   take care of each in turn below: get the number of days in the future
+	   each one is (in 'at_days') and if there is a filename, place
+	   it in 'filename'.  */
+
+	filename[0] = '\0';
+	if (argc == 2) {
+		at_days = 0;
+	}
+	else if (argc == 3) {
+		if (access(argv[2], 0) == 0) {
+			strcpy(filename, argv[2]);	
+			at_days = 0;
+		}
+		else {
+			if (analyze(argv[2]) != WEEK)
+				err_msg("invalid second argument");
+			at_days = then(argv[2], "");
+		}
+	}
+	else {
+		type = analyze(argv[2]);
+		at_days = then(argv[2], argv[3]);
+		if ((type == WEEK) && (strcmp(argv[3], "week") != 0))
+			strcpy(filename, argv[3]);
+		if (argc > 4)
+			strcpy(filename, argv[4]);
+	}
+
+	if ((at_days == 0) && (at_time < S_DAY - till_tomorrow))
+		at_days = 1;
+	if (at_days == 0)
+		at_time += now_time + till_tomorrow + 1 - S_DAY;
+	else {
+		at_time += now_time + till_tomorrow;
+		if (at_days > 1)
+			at_time += S_DAY * (at_days - 1);
+	}
+
+	calstr(at_time, temp);
+	makefile(temp, filename);
+	putid(temp);
+
+}
+
+
+putid(file)
+char *file;
+{
+	FILE *fp, *fopen();
+	char name[30];
+	struct stat sbuf;
+
+	sprintf(name, "/usr/spool/at/%s%c", file, t_char);
+	if (stat(name, &sbuf) < 0)
+		err_msg("cannot get status of file");
+
+	if ((fp = fopen(IDFILE, "a")) == NULL) {
+		sprintf(error, "cannot open file %s\n", IDFILE);
+		err_msg(error);
+	}
+
+	fprintf(fp, "%s %d %ld\n", name, sbuf.st_uid, sbuf.st_ctime);
+	fclose(fp);
+	chown(IDFILE, 0, 0);
+	chmod(IDFILE, 0600);
+}
+
+
+	/* create a file in the directory /usr/spool/at which is owned
+	   by the current at user and contains the commands which he
+	   wishes to execute via /bin/sh. already in the file are a
+	   'cd' command into the current directory, and a bunch of
+	   commands to set up the environment to be identical to the
+	   present one. */
+
+
+makefile(time, filename)
+char *time, *filename;
+{
+	FILE *fp, *fp2;
+	char t_file[20], buf[BUFLEN];
+
+	if ((fp = fopen(TEMPFILE, "a")) == NULL)
+		err_msg("can not create temporary file");
+	if (*filename == '\0')
+		fp2 = stdin;
+	else
+		if ((fp2 = fopen(filename, "r")) == NULL) {
+			sprintf(error, "can't open %s", filename);
+			err_msg(error);
+		}
+
+	while (fgets(buf, BUFLEN, fp2) != NULL)
+		fputs(buf, fp);
+	fclose(fp);
+	fclose(fp2);
+
+	t_char = 'A';
+	sprintf(t_file, "/usr/spool/at/%s%c", time, t_char);
+	while ((access(t_file, 0) == 0) || (errno != ENOENT)) {
+		if (++t_char > 'z')
+			err_msg("too many files");
+		sprintf(t_file, "/usr/spool/at/%s%c", time, t_char);
+	}
+
+	if (link(TEMPFILE, t_file) < 0) {
+		sprintf(error, "cannot create file %s", t_file);
+		err_msg(error);
+	}
+	chown(t_file, getuid(), getgid());
+	chmod(t_file, 0600);
+	if (unlink(TEMPFILE) < 0)
+		fprintf(stderr, "warning: cannot remove temporary file %s", TEMPFILE);
+}
+		
+
+
+	/* turn the given time string, such as '356am', into the number of
+	   seconds from (the previous) midnight. trailing letters can be
+	   'A' for AM, 'P' for PM, 'N' for noon, 'M' for midnight. */
+
+long
+to_seconds(t_str)
+char *t_str;
+{
+	long retval;
+	char last;
+
+	if (sscanf(t_str, "%ld", &retval) < 1)
+		err_msg("invalid time of day");
+	if (strlen(t_str) < 3)
+		retval *= 100;
+	if ((retval < 0) || (retval > 2400))
+		err_msg("invalid time of day");
+
+	last = toupper(t_str[strlen(t_str) - 1]);
+	switch (last) {
+	case 'A':
+		/* do nothing - 24-hour time is default. */
+		break;
+	case 'P':
+		retval += 1200;
+		break;
+	case 'N':
+		/* again, do nothing, since 1200 is by default noon */
+		break;
+	case 'M':
+		if (retval == 1200)
+			retval = 2400;
+		break;
+	default:
+		break;
+	}
+
+	return((retval / 100) * 3600 + (retval % 100) * 60);	
+}
+
+	/* figure out whether the given string is a month name or a day
+	   name. set the global variable 'index' to the index of the
+	   found item in its array, and return either MONTH or S_DAY
+	   to the calling routine. if ambiguous, terminate program. */
+
+analyze(str)
+char *str;
+{
+	int i, j, k, max, max2, m_max;
+
+	max = max2 = 0;
+
+	/* first see how it compares to months */
+	for (i = 0; i < 12; i++) {
+		for (j = 0; mon_name[i][j] == str[j]; j++)
+			;
+		if (j > max) {
+			max = j;
+			index = i;
+		}
+		else if (j == max)
+			max2 = max;
+	}
+
+	m_max = max;
+
+	/* now do days */
+	for (k = 0; k < 7; k++) {
+		for (j = 0; day_name[k][j] == str[j]; j++)
+			;
+		if (j > max) {
+			max = j;
+			index = k;
+		}
+		else if (j == max)
+			max2 = max;
+	}
+
+	if (max2 == max)
+		err_msg("ambiguous date");
+	else 
+		return(m_max == max ? MONTH : WEEK);
+}
+		
+	
+		
+
+	/* print an error message and quit */
+
+err_msg(str)
+char *str;
+{
+	fprintf(stderr, "at: %s\n", str);
+	unlink(TEMPFILE);
+	exit(-1);
+}
+
+
+	/* get the current time in seconds since Jan 1 1970, 
+	   day-of-the-year, weekday and number of seconds until midnight tonight. */
+
+now()
+{
+	char nowstr[10];
+
+	now_time = time((long *) 0) - LOCAL;
+	calstr(now_time, nowstr);
+
+	pres_day = day;
+	pres_wkday = ((366 * fouryr) + (365 * year) + pres_day + 6) % 7; 
+	till_tomorrow = (23 - hour) * S_HOUR + (59 - minute) * S_MINUTE	+ 
+		(60 - leftover);
+}
+
+
+	/* figure out how many S_DAYS into the future the given date is, and
+	   return that number. pass argv[2] in arg2, which sohuld have either
+	   a month name or a weekday name, and argv[3] in arg3, which should
+	   be either a number (in the case of MONTH) or "week" (in the case of
+	   S_DAY) or possibly the name of the file to be run later. */
+
+then(arg2, arg3)
+char *arg2, *arg3;
+{
+	int diff, day, wk_extra, leap_day;
+
+	if (analyze(arg2) == MONTH) {
+		if (sscanf(arg3, "%d", &day) < 1)
+			err_msg("invalid day number following month name");
+		day += mon_days[index];
+		if (((year == 0) && (pres_day < 60) && (day >= 60)) ||
+		    ((year == 3) && (day < pres_day) && (day >= 60)))
+			leap_day = 1;
+		else	
+			leap_day = 0;
+		if ((diff = day - pres_day) < 0)
+			return((365 - diff) + leap_day);
+		else
+			return(diff + leap_day);
+	}
+	else {
+		if (strcmp(arg3, "week") == 0)
+			wk_extra = 7;
+		else
+			wk_extra = 0;
+		if ((diff = index - pres_wkday) < 0)
+			return((7 + diff) + wk_extra);
+		else
+			return(diff + wk_extra);
+	}
+} 
+
+
+	/* given some number of seconds since 0:00 Jan 1, 1970 in the
+	   parameter num, put in the parameter str the date in form
+	   YYDDD.HHMM */
+
+calstr(num, str)
+long num;
+char *str;
+{
+	
+	num -= (fouryr = num / S_FOUR_YEAR) * S_FOUR_YEAR;
+	num -= (year = num / S_YEAR) * S_YEAR;
+	num -= (day = num / S_DAY) * S_DAY;
+	num -= (hour = num / S_HOUR) * S_HOUR;
+	num -= (minute = num / S_MINUTE) * S_MINUTE;
+	leftover = num;
+
+	sprintf(str, "%02d%03d.%02d%02d", 4*fouryr + year + 70, day, hour, minute);
+}
+@//E*O*F at.c//
+chmod u=rw,g=r,o=r at.c
+ 
+echo x - atrun.c
+sed 's/^@//' > "atrun.c" <<'@//E*O*F atrun.c//'
+#include <fcntl.h>
+#include <ctype.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include "at.h"
+
+
+
+long num;
+int fouryr, year, day, hour, minute, par_pid;
+char error[80], fullname[30];
+FILE *err_fp, *id_fp;
+
+
+main()
+{
+	FILE *fp;
+	char buf[BUFLEN];
+
+	chdir("/usr/spool/at");
+	if ((err_fp = fopen(ERRFILE, "a+")) < 0)
+		exit(-1);
+	if ((id_fp = fopen(IDFILE, "r+")) < 0)
+		exit(-1);
+	
+	system("/bin/sh -c 'cd /usr/spool/at; /bin/ls [0-9]* > temp'");
+	now();
+	if ((fp = fopen("temp", "r")) < 0) {
+		fprintf(err_fp, "atrun: cannot open temporary file %s\n", TEMPFILE);
+		exit(-1);
+	}
+
+	/* if the first character picked up is not a number, then it is
+	   the beginning of the error message "[0-9]* not found". in that
+	   case, quit, since there are no files waiting in the AT
+	   directory. */
+
+	while ((fscanf(fp, "%s", buf) != EOF) && (isdigit(*buf))) {
+		process(buf);
+	}
+	unlink(TEMPFILE);
+	rewind(err_fp);
+	if (fscanf(err_fp, "%s", buf) == EOF)
+		unlink(ERRFILE);
+		
+}
+
+	/* 'str' contains the name of a file which we check against the current
+	    time. if it ought to be run, setuid and setgid, then run it by
+	    exec'ing /bin/sh with the filename as its first argument. if it
+	    was run, remove it afterwards. */
+
+process(str)
+char *str;
+{
+	char o_name[30], buf[BUFLEN];
+	time_t o_time;
+	struct stat stat_buf;
+	FILE *fopen();
+	int fd, pid, o_uid, found;
+
+	if (!ripe(str))
+		return;
+
+	/* get the directory entry of the file in order to find the owner
+	   and group ID's. if unable to get the info, just skip it. */
+	if (stat(str, &stat_buf) < 0)
+		return;
+
+	/* make sure that no one has tampered with the file except, possibly,
+	   the owner. if someone else has, remove it and return - but do not
+	   execute! likewise, if there is a file in /usr/spool/at that looks
+	   like an at-file, but has no entry in /usr/spool/at/.ids, refuse
+	   to run it. */
+
+	sprintf(fullname, "/usr/spool/at/%s", str);
+	rewind(id_fp);
+	found = 0;
+	while (fgets(buf, BUFLEN, id_fp) != NULL) {
+		sscanf(buf, "%s %d %ld", o_name, &o_uid, &o_time);
+		if (strcmp(fullname, o_name) == 0) {
+			if (o_uid == stat_buf.st_uid) {
+				found = 1;
+				break;
+			}
+		}
+	}
+	if (found == 0) {
+		cleanup(fullname, &stat_buf);
+		return;
+	}
+	
+	if ((pid = fork()) < 0)
+		die("unable to fork");
+	else if (pid != 0) {
+		wait((int *) 0);
+		cleanup(fullname, &stat_buf);
+	}
+	else {
+
+		/* set uid and gid, then force file descriptors 0, 1 and 2 to point
+		   to /dev/null so that any output from the 'sh' process (NOT
+		   the processes it is running, of course) is sent there. */
+
+		setuid((int) stat_buf.st_uid);
+		setgid((int) stat_buf.st_gid);
+		fd = open("/dev/null", O_RDWR);
+		close(0); close(1); close(2);
+		dup(fd); dup(fd); dup(fd);
+		execl("/bin/sh", "/bin/sh", fullname, 0);
+	}
+}
+
+	/* remove the file from /usr/spool/at, and get rid of its entry in
+	   the file /usr/spool/at/.ids. */
+
+cleanup(str, s_buf)
+char *str;
+struct stat *s_buf;
+{	
+	FILE *fp, *fopen();
+	char o_name[30], *t, *mktemp(), buf[BUFLEN];
+	int o_uid, o_time;
+
+	rewind(id_fp);
+	t = mktemp("atXXXXXX");
+	fp = fopen(t, "w");
+	while (fgets(buf, BUFLEN, id_fp) != NULL) {
+		sscanf(buf, "%s %d %ld", o_name, &o_uid, &o_time);
+		if (strcmp(str, o_name) != 0)
+			fputs(buf, fp);
+	}
+	fclose(id_fp);
+	fclose(fp);
+	unlink(IDFILE);
+	link(t, IDFILE);
+	chown(IDFILE, 0, 0);
+	chmod(IDFILE, 0600);	
+	id_fp = fopen(IDFILE, "r+");
+	unlink(t);
+	unlink(str);
+}
+
+
+	/* return 1 if the filename indicates a time earlier than the present,
+	   0 otherwise. */
+
+#define  DECIDED(x, y) (x < y ? 1 : ((x == y) ? -1 : 0))
+
+ripe(str)
+char *str;
+{
+	int d, f_year, f_day, f_hour, f_minute;
+
+	if (sscanf(str, "%2d%3d.%2d%2d", &f_year, &f_day, &f_hour, &f_minute) < 4) {
+		sprintf(error, "bad file name %s", str);
+		burp(error);
+	}
+	if ((d = DECIDED(f_year, year)) >= 0) 
+		return(d);
+	if ((d = DECIDED(f_day, day)) >= 0)
+		return(d);
+	if ((d = DECIDED(f_hour, hour)) >= 0)
+		return(d);
+	return(f_minute <= minute);	
+}
+
+
+	/* put error message in error file and quit. remove temporay
+	   files if this process is the parent process called in
+	   crontab, but not if it is just a child process called
+	   in a fork() earlier. */
+
+die(str)
+char *str;
+{
+	fprintf(err_fp, "atrun: %s\n", str);
+	if (getpid() == par_pid)
+		unlink(TEMPFILE);
+	exit(-1);
+}
+
+	/* put message in error file but don't quit. */
+
+burp(str)
+char *str;
+{
+	fprintf(err_fp, "atrun: %s\n", str);
+}
+
+now()
+{
+
+	num = time((long *) 0) - LOCAL;
+	num -= (fouryr = num / S_FOUR_YEAR) * S_FOUR_YEAR;
+	num -= (year = num / S_YEAR) * S_YEAR;
+	year += 70 + (4 * fouryr);
+	num -= (day = num / S_DAY) * S_DAY;
+	num -= (hour = num / S_HOUR) * S_HOUR;
+	num -= (minute = num / S_MINUTE) * S_MINUTE;
+
+}
+
+@//E*O*F atrun.c//
+chmod u=rw,g=r,o=r atrun.c
+ 
+echo x - at.h
+sed 's/^@//' > "at.h" <<'@//E*O*F at.h//'
+	/* some file ids */
+#define IDFILE    "/usr/spool/at/.ids"
+#define TEMPFILE  "/usr/spool/at/temp"
+#define ERRFILE   "/usr/spool/at/ATRUN.ERR"
+
+
+	/* number of seconds in a variety of time periods */
+#define S_FOUR_YEAR   126230400
+#define S_YEAR         31536000
+#define S_DAY             86400
+#define S_HOUR             3600
+#define S_MINUTE             60
+
+	/* correction for my time zone */
+#define EST         14400
+#define CST         18000
+#define MST         21600
+#define PST         25200
+
+#define LOCAL       EST
+#define BUFLEN      100
+@//E*O*F at.h//
+chmod u=rw,g=r,o=r at.h
+ 
+echo x - at.doc
+sed 's/^@//' > "at.doc" <<'@//E*O*F at.doc//'
+@.TH at 1
+@.SH NAME
+@.PP
+at - run commands via
+@.IR sh (1)
+at a later time
+@.SH SYNOPSIS
+@.PP
+At has two forms:
+@.IP
+at time weekday [ week ] [ file ]
+@.IP
+at time month day_of_month [ file ]
+@.SH DESCRIPTION
+@.PP
+@.I At
+takes commands from the given file (standard input default) and runs
+them via
+@.IR sh (1)
+at the time specified by its arguments. Input and output are lost
+unless redirected. The 
+@.I time 
+argument consists of up to four digits
+and an optional trailing 'A' (for AM), 'P' (for PM), 'N' (for noon)
+or 'M' for midnight. If one or two digits are present, 
+both are assumed to be hours; if three or four,
+the first one or two are hours,
+the last two minutes. If no 'A' or 'P' is supplied, twenty-four
+hour time is assumed. With no further arguments, the next occurence of
+the given time (later today or tomorrow) is used.
+@.PP
+The
+@.I weekday
+argument specifies one of the seven calendar weekdays by name; either
+upper or lower case may be used, with only enough letters to uniquely
+identify one. If the word
+@.I week
+follows, the date is moved seven days into the future.
+@.PP
+The 
+@.I month
+argument specifies one of the twelve months by name, again in either
+or lower case, with the following argument supplying the day of that
+month during which execution is desired. If 
+@.I month
+is earlier than the current month, or the same and 
+@.I day_of_month
+earlier the current day, a date in the next calendar year is used.
+@.SH OPERATION
+@.PP
+@.I At
+creates a file which switches to the current directory
+and sets up the current environment before executing the user's
+comamnds. Actual execution is carried out by /usr/lib/atrun,
+invoked every so often by an entry in the file /usr/lib/crontab.
+@.SH FILES
+@.PP
+/usr/bin/at
+@.br
+/usr/bin/at.exe
+@.br
+/usr/spool/at/YYDDD.HHMM
+@.br
+/usr/lib/atrun
+@.SH "SEE ALSO"
+@.PP
+@.IR cron (1), sh (1), crontab (4)
+@.SH DIAGNOSTICS
+@.PP
+All error messages produced by 
+@.I at
+appear on the user's terminal, while those produced by 
+@.I atrun
+are place in the file /usr/spool/at/ATRUN.ERR.
+@.SH BUGS
+@.PP
+The granularity of
+@.IR cron (1)
+means that commands will be executed only within some reasonable
+period (usually fifteen minutes) after the exact time given.
+@.PP
+@.I At
+is very stupid about dates and
+times - it does not check them for validity. Thus,
+@.IP
+at 499 jan 88
+@.PP
+will cause no warnings or error messages, just a file that will run
+on the 88th day after January first at 99 minutes past four AM.
+@//E*O*F at.doc//
+chmod u=rw,g=r,o=r at.doc
+ 
+exit 0
+-- 
+Michael Richmond			Princeton University, Astrophysics
+
+{allegra,akgua,burl,cbosgd,decvax,ihnp4,noao,princeton,vax135}!astrovax!richmon
+
+

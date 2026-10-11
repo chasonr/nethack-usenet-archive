@@ -1,0 +1,631 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,cdde7e3c2fbc075a,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-01-06 23:09:29 PST
+Message-ID: <bnews.decvax.373>
+Newsgroups: net.sources
+Path: utzoo!decvax!betz
+X-Path: utzoo!decvax!betz
+From: decvax!betz
+Date: Fri Jan  7 02:09:27 1983
+Subject: xlisp part 3 of 4
+X-Google-Info: Converted from the original B-News header
+Posted: Thu Jan  6 12:11:52 1983
+Received: Fri Jan  7 02:09:27 1983
+
+::::::::::::::
+xlobj.c
+::::::::::::::
+/* xlobj - xlisp object functions */
+
+#include "xlisp.h"
+
+/* external variables */
+extern struct node *xlstack;
+extern struct node *xlenv;
+
+/* external procedures */
+extern struct node *xlevarg();
+extern struct node *xlevmatch();
+
+/* global variables */
+struct node *self;
+
+/* the class object pointer */
+static struct node *class;
+static struct node *messages;
+static struct node *ivars;
+static struct node *new;
+static struct node *isnew;
+static int init;
+
+/* forward declarations (the extern hack is because of decusc) */
+extern struct node *enterivar();
+
+/* xlmfind - find the message binding for a message to an object */
+struct node *xlmfind(obj,msym)
+  struct node *obj,*msym;
+{
+    struct node *lptr,*msg;
+
+    /* lookup the message */
+    for (lptr = enterivar(obj->n_obclass,messages)->n_bndvalue;
+	 lptr != NULL;
+	 lptr = lptr->n_listnext)
+	if ((msg = lptr->n_listvalue) != NULL && msg->n_msg == msym)
+	    return (msg);
+
+    /* message not found */
+    return (NULL);
+}
+
+/* xlxsend - send a message to an object */
+struct node *xlxsend(obj,msg,args)
+  struct node *obj,*msg,*args;
+{
+    struct node *oldstk,method,cptr,val,*isnewmsg,*oldenv;
+
+    /* save the old environment */
+    oldenv = xlenv;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&method,&cptr,&val,NULL);
+
+    /* get the method for this message */
+    method.n_ptr = msg->n_msgcode;
+
+    /* make sure its a function or a subr */
+    if (method.n_ptr->n_type != SUBR && method.n_ptr->n_type != FUN)
+	xlfail("bad method");
+
+    /* bind the symbol self */
+    xlbind(self,obj);
+
+    /* evaluate the function call */
+    if (method.n_ptr->n_type == SUBR) {
+	xlfixbindings(oldenv);
+	val.n_ptr = (*method.n_ptr->n_subr)(args);
+    }
+    else {
+
+	/* bind the formal arguments */
+	xlabind(method.n_ptr->n_funargs,args);
+	xlfixbindings(oldenv);
+
+	/* execute the code */
+	cptr.n_ptr = method.n_ptr->n_funcode;
+	while (cptr.n_ptr != NULL)
+	    val.n_ptr = xlevarg(&cptr.n_ptr);
+    }
+
+    /* restore the environment */
+    xlunbind(oldenv);
+
+    /* after creating an object, send it the "isnew" message */
+    if (msg->n_msg == new && val.n_ptr != NULL) {
+	if ((isnewmsg = xlmfind(val.n_ptr,isnew)) == NULL)
+	    xlfail("no method for the isnew message");
+	val.n_ptr = xlxsend(val.n_ptr,isnewmsg,args);
+    }
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the result value */
+    return (val.n_ptr);
+}
+
+/* xlsend - send a message to an object (message in arg list) */
+struct node *xlsend(obj,args)
+  struct node *obj,*args;
+{
+    struct node *msg;
+
+    /* find the message binding for this message */
+    if ((msg = xlmfind(obj,xlevmatch(SYM,&args))) == NULL)
+	xlfail("no method for this message");
+
+    /* send the message */
+    return (xlxsend(obj,msg,args));
+}
+
+/* new - create a new object instance */
+static struct node *mnew()
+{
+    struct node *oldstk,obj;
+    struct node *cls,*lptr,*lnk,*last;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&obj,NULL);
+
+    /* get the class */
+    cls = self->n_symvalue;
+
+    /* generate a new object */
+    obj.n_ptr = newnode(OBJ);
+    obj.n_ptr->n_obclass = cls;
+
+    /* create a list of instance variables for the new object */
+    for (lptr = enterivar(cls,ivars)->n_bndvalue, last = NULL;
+	 lptr != NULL;
+	 lptr = lptr->n_listnext, last = lnk) {
+	lnk = newnode(LIST);
+	if (last == NULL)
+	    obj.n_ptr->n_obdata = lnk;
+	else
+	    last->n_listnext = lnk;
+	lnk->n_listvalue = newnode(BND);
+	lnk->n_listvalue->n_bndsym = lptr->n_listvalue;
+    }
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the new object */
+    return (obj.n_ptr);
+}
+
+/* misnew - initialize a new class */
+static struct node *misnew(args)
+  struct node *args;
+{
+    /* make sure there aren't any arguments */
+    if (args != NULL)
+	xlfail("too many arguments");
+
+    /* return the new object */
+    return (self->n_symvalue);
+}
+
+/* enterivar - enter an instance variable */
+static struct node *enterivar(obj,sym)
+  struct node *obj,*sym;
+{
+    struct node *lptr,*vbnd;
+
+    /* lookup the instance variable */
+    for (lptr = obj->n_obdata; lptr != NULL; lptr = lptr->n_listnext)
+	if ((vbnd = lptr->n_listvalue) != NULL && vbnd->n_bndsym == sym)
+	    break;
+
+    /* add the instance variable if it wasn't found */
+    if (lptr == NULL) {
+	if (!init)
+	    printf("can't find \"%s\"\n",sym->n_symname);
+	lptr = newnode(LIST);
+	lptr->n_listnext = obj->n_obdata;
+	obj->n_obdata = lptr;
+	lptr->n_listvalue = vbnd = newnode(BND);
+	vbnd->n_bndsym = sym;
+    }
+
+    /* return the binding */
+    return (vbnd);
+}
+
+/* addivar - enter an instance variable */
+static addivar(cls,var)
+  struct node *cls; char *var;
+{
+    struct node *vbnd,*lptr;
+
+    /* enter the "ivars" instance variable */
+    vbnd = enterivar(cls,ivars);
+
+    /* add the instance variable */
+    lptr = newnode(LIST);
+    lptr->n_listnext = vbnd->n_bndvalue;
+    vbnd->n_bndvalue = lptr;
+    lptr->n_listvalue = xlenter(var);
+}
+
+/* entermsg - add a message to a class */
+static struct node *entermsg(cls,msg)
+  struct node *cls,*msg;
+{
+    struct node *lptr,*mbnd,*mptr;
+
+    /* lookup the "messages" instance variable */
+    mbnd = enterivar(cls,messages);
+
+    /* lookup the message */
+    for (lptr = mbnd->n_bndvalue; lptr != NULL; lptr = lptr->n_listnext)
+	if ((mptr = lptr->n_listvalue)->n_msg == msg)
+	    break;
+
+    /* allocate a new message entry if one wasn't found */
+    if (lptr == NULL) {
+	lptr = newnode(LIST);
+	lptr->n_listnext = mbnd->n_bndvalue;
+	mbnd->n_bndvalue = lptr;
+	lptr->n_listvalue = mptr = newnode(MSG);
+	mptr->n_msg = msg;
+    }
+
+    /* return the symbol node */
+    return (mptr);
+}
+
+/* answer - define a method for answering a message */
+static struct node *answer(args)
+  struct node *args;
+{
+    struct node *oldstk,arg,msg,fargs,code;
+    struct node *obj,*mptr,*fptr;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&arg,&msg,&fargs,&code,NULL);
+
+    /* initialize */
+    arg.n_ptr = args;
+
+    /* message symbol */
+    msg.n_ptr = xlevmatch(SYM,&arg.n_ptr);
+
+    /* get the formal argument list */
+    fargs.n_ptr = xlevmatch(LIST,&arg.n_ptr);
+
+    /* get the code */
+    code.n_ptr = xlevmatch(LIST,&arg.n_ptr);
+
+    /* make sure there aren't any more arguments */
+    if (arg.n_ptr != NULL)
+	xlfail("too many arguments");
+
+    /* get the object node */
+    obj = self->n_symvalue;
+
+    /* make a new message list entry */
+    mptr = entermsg(obj,msg.n_ptr);
+
+    /* setup the message node */
+    mptr->n_msgcode = fptr = newnode(FUN);
+    fptr->n_funargs = fargs.n_ptr;
+    fptr->n_funcode = code.n_ptr;
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the object */
+    return (obj);
+}
+
+/* mivars - define a list of instance variables */
+static int mivars(args)
+  struct node *args;
+{
+    struct node *oldstk,vars,*obj,*vbnd;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&vars,NULL);
+
+    /* get ivar list */
+    vars.n_ptr = xlevmatch(LIST,&args);
+
+    /* make sure there aren't any more arguments */
+    if (args != NULL)
+	xlfail("too many arguments");
+
+    /* get the object node */
+    obj = self->n_symvalue;
+
+    /* find the ivars instance variable */
+    vbnd = enterivar(obj,ivars);
+    vbnd->n_bndvalue = vars.n_ptr;
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the object */
+    return (obj);
+}
+
+/* addmsg - add a message to a class */
+static addmsg(cls,msg,code)
+  struct node *cls; char *msg; int (*code)();
+{
+    struct node *mptr;
+
+    /* enter the message symbol */
+    mptr = entermsg(cls,xlenter(msg));
+
+    /* store the code for this message */
+    mptr->n_msgcode = newnode(SUBR);
+    mptr->n_msgcode->n_subr = code;
+}
+
+/* xloinit - object function initialization routine */
+xloinit()
+{
+    struct node *csym;
+
+    /* set the initialization flag */
+    init = TRUE;
+
+    /* enter the object related symbols */
+    messages = xlenter("messages");
+    ivars = xlenter("ivars");
+    new = xlenter("new");
+    isnew = xlenter("isnew");
+    self = xlenter("self");
+
+    /* initialize the class object */
+    csym = xlenter("class");
+    class = csym->n_symvalue = newnode(OBJ);
+    class->n_obclass = class;
+    addivar(class,"messages");
+    addivar(class,"ivars");
+    addmsg(class,"new",mnew);
+    addmsg(class,"answer",answer);
+    addmsg(class,"ivars",mivars);
+    addmsg(class,"isnew",misnew);
+
+    /* clear the initialization flag */
+    init = FALSE;
+}
+
+
+::::::::::::::
+xlkmap.c
+::::::::::::::
+/* xlkmap - xlisp key map functions */
+
+#include <stdio.h>
+#include "xlisp.h"
+
+/* external variables */
+extern struct node *xlstack;
+extern struct node *xlenv;
+
+/* external procedures */
+extern struct node *xlevarg();
+extern struct node *xlevmatch();
+extern struct node *xlmfind();
+extern struct node *xlxsend();
+
+/* local definitions */
+#define KMSIZE	256	/* number of characters in a keymap */
+#define KMAX	20	/* maximum number of characters in a key sequence */
+
+/* local variables */
+static struct node *currentenv;
+
+/* keymap - create a new keymap */
+static struct node *keymap(args)
+  struct node *args;
+{
+    /* make sure there aren't any arguments */
+    if (args != NULL)
+	xlfail("too many arguments");
+
+    /* create a keymap node */
+    return (newnode(KMAP));
+}
+
+/* newkmap - allocate memory for a new key map vector */
+static struct node *(*newkmap())[]
+{
+    struct node *(*map)[];
+
+    /* allocate the vector */
+    if ((map = calloc(1,sizeof(struct node *) * KMSIZE)) == NULL) {
+	printf("insufficient memory");
+	exit();
+    }
+
+    /* return the new vector */
+    return (map);
+}
+
+/* key - define a key */
+static struct node *key(args)
+  struct node *args;
+{
+    struct node *oldstk,arg,kmap,kstr,ksym,*kmptr;
+    struct node *(*map)[];
+    char *sptr;
+    int ch;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&arg,&kmap,&kstr,&ksym,NULL);
+
+    /* initialize */
+    arg.n_ptr = args;
+
+    /* get the keymap pointer */
+    kmap.n_ptr = xlevmatch(KMAP,&arg.n_ptr);
+
+    /* get the key string */
+    kstr.n_ptr = xlevmatch(STR,&arg.n_ptr);
+
+    /* get the key symbol */
+    ksym.n_ptr = xlevmatch(SYM,&arg.n_ptr);
+
+    /* make sure there aren't any more arguments */
+    if (arg.n_ptr != NULL)
+	xlfail("too many arguments");
+
+    /* process each character in the key string */
+    for (kmptr = kmap.n_ptr, sptr = kstr.n_ptr->n_str;
+    	 *sptr != 0;
+    	 kmptr = (*map)[ch]) {
+
+	/* get a character */
+	ch = *sptr++;
+
+	/* allocate a key map vector if non currently exists */
+	if ((map = kmptr->n_kmap) == NULL)
+	    map = kmptr->n_kmap = newkmap();
+
+	/* check for this being the last character in the string */
+	if (*sptr == 0)
+	    (*map)[ch] = ksym.n_ptr;
+	else
+	    if ((*map)[ch] == NULL || (*map)[ch]->n_type != KMAP) {
+		(*map)[ch] = newnode(KMAP);
+		(*map)[ch]->n_kmap = newkmap();
+	    }
+    }
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the key map */
+    return (kmap.n_ptr);
+}
+
+/* kmprocess - process input characters using a key map */
+static struct node *kmprocess(args)
+  struct node *args;
+{
+    struct node *oldstk,arg,kmap,env,margs,*kmptr,*nptr,*oldenv;
+    struct node *(*map)[];
+    char keys[KMAX+1];
+    int ch,kndx;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&arg,&kmap,&env,&margs,NULL);
+
+    /* initialize */
+    arg.n_ptr = args;
+
+    /* get the key map */
+    kmap.n_ptr = xlevmatch(KMAP,&arg.n_ptr);
+
+    /* get the environment */
+    env.n_ptr = xlevmatch(LIST,&arg.n_ptr);
+
+    /* make sure there aren't any more arguments */
+    if (arg.n_ptr != NULL)
+	xlfail("too many arguments");
+
+    /* bind the current environment variable */
+    oldenv = xlenv;
+    xlbind(currentenv,env.n_ptr);
+    xlfixbindings(oldenv);
+
+    /* make sure the key map is defined */
+    if (kmap.n_ptr->n_kmap == NULL)
+	xlfail("empty keymap");
+
+    /* create an argument list to send with key messages */
+    margs.n_ptr = newnode(LIST);
+    margs.n_ptr->n_listvalue = newnode(STR);
+    margs.n_ptr->n_listvalue->n_str = keys;
+    margs.n_ptr->n_listvalue->n_strtype = STATIC;
+
+    /* character processing loop */
+    for (kmptr = kmap.n_ptr, kndx = 0; TRUE; ) {
+
+	/* flush pending output */
+	fflush(stdout);
+
+	/* get a character */
+	if ((ch = kbin()) < 0)
+	    break;
+
+	/* put it in the key sequence */
+	if (kndx < KMAX)
+	    keys[kndx++] = ch;
+	else
+	    xlfail("key sequence too long");
+
+	/* dispatch on character code */
+	if ((map = kmptr->n_kmap) == NULL)
+	    xlfail("bad keymap");
+	else if ((nptr = (*map)[ch]) == NULL) {
+	    kmptr = kmap.n_ptr;
+	    kndx = 0;
+	}
+	else if (nptr->n_type == KMAP)
+	    kmptr = (*map)[ch];
+	else if (nptr->n_type == SYM) {
+	    keys[kndx] = 0;
+	    sendmsg(nptr,currentenv->n_symvalue,margs.n_ptr);
+	    kmptr = kmap.n_ptr;
+	    kndx = 0;
+	}
+	else
+	    xlfail("bad keymap");
+    }
+
+    /* unbind */
+    xlunbind(oldenv);
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the keymap */
+    return (kmap.n_ptr);
+}
+
+/* sendmsg - send a message given an environment list */
+static sendmsg(msym,env,args)
+  struct node *msym,*env,*args;
+{
+    struct node *eptr,*obj,*msg;
+
+    /* look for an object that answers the message */
+    for (eptr = env; eptr != NULL; eptr = eptr->n_listnext)
+	if ((obj = eptr->n_listvalue) != NULL && obj->n_type == OBJ)
+	    if ((msg = xlmfind(obj,msym)) != NULL) {
+		xlxsend(obj,msg,args);
+		break;
+	    }
+}
+
+/* xlkmmark - mark a keymap */
+xlkmmark(km)
+  struct node *km;
+{
+    struct node *(*map)[];
+    int i;
+
+    /* mark the keymap node */
+    km->n_flags |= MARK;
+
+    /* check for a null keymap */
+    if ((map = km->n_kmap) == NULL)
+	return;
+
+    /* loop through each keymap entry */
+    for (i = 0; i < KMSIZE; i++)
+	if (((*map)[i] != NULL) && (*map)[i]->n_type == KMAP)
+	    xlkmmark((*map)[i]);
+}
+
+/* xlkmfree - free a keymap */
+xlkmfree(km)
+  struct node *km;
+{
+    struct node *(*map)[];
+    int i;
+
+    /* check for a null keymap */
+    if ((map = km->n_kmap) == NULL)
+	return;
+
+    /* loop through each keymap entry */
+    for (i = 0; i < KMSIZE; i++)
+	if (((*map)[i] != NULL) && (*map)[i]->n_type == KMAP)
+	    xlkmfree((*map)[i]);
+
+    /* free this keymap */
+    free(km->n_kmap);
+}
+
+/* xlkinit - key map function initialization routine */
+xlkinit()
+{
+    /* define the xlisp variables */
+    currentenv = xlenter("currentenv");
+
+    /* define the xlisp functions */
+    xlsubr("keymap",keymap);
+    xlsubr("key",key);
+    xlsubr("kmprocess",kmprocess);
+}
+
+
+
+

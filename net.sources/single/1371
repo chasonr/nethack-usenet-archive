@@ -1,0 +1,540 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,2cb4693d52bbf0c1,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-07-06 16:34:08 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site rna.UUCP
+Path: utzoo!watmath!clyde!burl!mgnetp!ihnp4!zehntel!hplabs!hao!seismo!cmcl2!rna!dan
+From: dan@rna.UUCP (Dan Ts'o)
+Newsgroups: net.sources
+Subject: mkcmd: command for global command files
+Message-ID: <269@rna.UUCP>
+Date: Fri, 6-Jul-84 19:34:08 EDT
+Article-I.D.: rna.269
+Posted: Fri Jul  6 19:34:08 1984
+Date-Received: Sun, 8-Jul-84 01:23:47 EDT
+Organization: Rockefeller Neurobiology, NYC
+Lines: 520
+
+Hi,
+	Here are the sources for a program to generate a shell command
+file from a global filename expression. A classic usage is when you want
+to rename files which end in, say, ".c", to ".c.old":
+
+	mkcmd "mv *.c #.c.old" | sh -x
+
+	This program was originally written at Harvard back in the V6 UNIX
+days and was called "expand". I have modified it to work with the 4.2BSD
+directory routines as well as the original directory format and have hacked
+it to use malloc() rather than the original stack grabbing memory allocation.
+I also renamed it to "mkcmd" since Berkeley UNIX already has an "expand"
+command.
+	If there is a more elegant way to do similar shell commands, I'd
+appreciate some feedback. I know you can piece together something with a
+"for" loop and either basename or sed.
+
+					Cheers,
+					Dan Ts'o
+					...cmcl2!rna!dan
+
+echo mkcmd.doc
+sed 's/^X//' > mkcmd.doc << 'All work and no play makes Jack a dull boy'
+XNAME
+X        mkcmd - expand complicated global commands
+X
+XSYNOPSIS
+X        mkcmd commandstring > shellfile
+X        mkcmd commandstring | sh
+X
+XDESCRIPTION
+X
+X        There is now a command to do those impossible  wild  card
+Xrequests  like  rename  everything  which ends with ".ftn" to end
+Xwith ".f4p" .  This is done by:
+X
+X        % mkcmd "mv *.ftn #.f4p" > file
+X        % sh file
+X
+Xmkcmd  generates a command file on its std output  which  can  be
+Xexamined  on  your  terminal,  redirected into a command file, or
+Xpiped directly into the shell.
+X
+X '#' is the new special  character  introduced  with  mkcmd.   It
+Xrepresents  the  string  matched by '*' .  If there are more than
+Xone wild card specifications in the file name, they may be refer-
+Xenced by '#1', '#2', ..., '#9'.  e.g.:
+X
+X        % mkcmd "mv *.[cs] #1.#2.old" >file
+X
+Xwill generate a command file which will add the extension  ".old"
+Xto all files which end either ".c" or ".s" .
+X '#1'  represents  the  string  matched  by  the  '*'  and   '#2'
+Xrepresents the character matched by the '[cs]' .
+X '?' is also allowed and matches any single character.
+X '#0' represents the logname of the owner of  the  file  matched.
+Xe.g.:
+X
+X        % mkcmd "/tmp/* is owned by #0"
+X
+Xwill give a listing of all files in /tmp and their owners.
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+All work and no play makes Jack a dull boy
+echo mkcmd.c
+sed 's/^X//' > mkcmd.c << 'All work and no play makes Jack a dull boy'
+X/*
+X * mkcmd - create shell command stream on stdout using global filename
+X *	expressions that might not match existing files.
+X *	Originally from Harvard
+X *	Modified by Dan Ts'o (rna!dan) for 4.2BSD
+X */
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#define boolean int
+X#define true 1
+X#define false 0
+X
+X#define space 0377
+X#define chars 0376
+X#define any 0375
+X#define one 0374
+X#define range 0373
+X#define arg 0372
+X#define chend 0371
+X
+X/* dyt - mods for 4.2BSD */
+X#define	NDIR	1			/* Undefine for non-NDIR directories */
+X#ifdef	NDIR
+X#include <sys/dir.h>
+X#else
+X#define	NAMSIZ	14			/* Directory entry size */
+X#endif
+X
+X#include <stdio.h>
+X#define	MAXARG	10
+Xchar *getlogn(), *getpath(), *ealloc();
+Xint getunum();
+X#define	unsign(chr)	(0377&chr)
+Xstruct entry {
+X	struct entry *e_link;
+X	int	e_namlen;
+X	int	e_level[2*MAXARG];
+X#ifdef	NDIR
+X	char	e_name[1];
+X#else
+X	char	e_name[NAMSIZ+1];
+X#endif
+X} *ehead = 0;
+X
+Xchar *lim,*beg,cmnd[1500],output[1000],*p,*glob,*lastbl,*o,*nomore;
+Xboolean instring,argb;
+Xint globcn,oldi;
+X
+Xput (c)
+Xchar c;
+X{
+X	if (instring) *o++ = c;
+X	else {	
+X		*o++ = chars;
+X		*o++ = c;
+X		instring = true;
+X	}
+X}
+X
+Xchar get ()
+X{
+X	if (*p == 0)
+X		error ("Unexpected end of command string");
+X	return (*p++);
+X}
+X
+Xout (c)
+Xchar c;
+X{
+X	if (instring) { 
+X		*o++ = chend; 
+X		instring = false; 
+X	}
+X	*o++ = c;
+X}
+X
+Xseen (c)
+Xchar c;
+X{
+X	if (nomore)
+X		error ("Only one global allowed");
+X	glob = lastbl; 
+X	++globcn;
+X	if (argb)
+X		error ("Arguments can't mix with globals");
+X	out (c);
+X}
+X
+Xboolean globr(c1,c2,lev)
+Xregister char *c1,*c2;
+Xregister int *lev;
+X{
+X	register char *b1;
+X
+X	while (true) {
+X		b1 = c1;
+X		switch (unsign(*c2++)) {
+X
+X		case any:	
+X			while (c1<lim && !globr(c1,c2,lev+2)) ++c1;
+X			*lev++ = b1-beg; 
+X			*lev++ = c1-b1;
+X			return (c1<lim);
+X		case range:	
+X			do {
+X				if (*c2 == ']')
+X					return(false);
+X				if (*c1 == *c2++)
+X					break;
+X			} while (*c2 != '-' || *c1 < (++c2)[-2] || *c1 > *c2++);
+X			while (*c2++ != ']');
+X		case one:	
+X			*lev++ = b1-beg; 
+X			*lev++ = 1; 
+X			++c1;
+X			continue;
+X		case chars:	
+X			while (unsign(*c2) != chend && *c1++ == *c2) ++c2;
+X			if (unsign(*c2++) != chend)
+X				return (false);
+X			continue;
+X		case space:	
+X			while (*c1==0 && c1<lim) ++c1;
+X			return (c1 == lim);
+X
+X		}
+X	}
+X}
+X
+Xboolean globbr (ep, c2)
+Xregister struct entry *ep;
+Xchar *c2;
+X{
+X	beg = ep->e_name; 
+X	lim = beg + ep->e_namlen + 1;	/* Include ending null */
+X	return (globr(beg, c2, ep->e_level));
+X}
+X
+Xmain (n,car)
+Xchar **car;
+Xint n;
+X{
+X	register char ch,*x,*y;
+X	int i;
+X	struct stat sbuf;
+X	char *gp, *gep;
+X#ifdef	NDIR
+X	DIR *dhan;
+X	struct direct *dp;
+X#else
+X	int han;
+X#endif
+X	struct entry *ep, **ea, **et;
+X	int entcmp();
+X
+X	if (n != 2)
+X		error ("Exactly one argument required");
+X	p = car[1]; 
+X	oldi = 0;
+X	globcn = 0;
+X	nomore = 0; 
+X	argb = instring = false;
+X	o = cmnd; 
+X	out (space); 
+X	lastbl = o;
+X
+X	while (*p) switch (ch = get()) {
+X	case '#':	
+X		i = (*p>='0' && *p<='9') ? *p++-'0' : 1;
+X		out (arg); 
+X		out (i); 
+X		argb = true;
+X		if (i>oldi) oldi = i;
+X		if (glob==lastbl)
+X			error("Globals can't mix with arguments");
+X		continue;
+X	case '~':
+X		*--p = '/';
+X	case '*':	
+X		if (unsign(o[-1]) == space && *p=='/') {
+X			x = ++p; 
+X			while (get()!='/');
+X			*--p = 0; 
+X			x = getpath(getunum(x)); 
+X			*p = '/';
+X			if (*x==0)
+X				error("User does not exist");
+X			while (*x)
+X				put (*x++);
+X		} 
+X		else seen (any);
+X		continue;
+X	case '?':	
+X		seen (one);
+X		continue;
+X	case '[':	
+X		seen (range);
+X		do out(ch = get());
+X		while (ch != ']');
+X		continue;
+X	case '\t':
+X	case ' ':	
+X		if (unsign(o[-1]) != space)
+X			out (space);
+X		nomore = glob; 
+X		lastbl = o; 
+X		argb = false; 
+X		continue;
+X	case '"':	
+X		while ((ch = get()) != '"')
+X			put (ch); 
+X		continue;
+X	case '\'':	
+X		while ((ch = get()) != '\'')
+X			put (ch); 
+X		continue;
+X	default:	
+X		put (ch); 
+X		continue;
+X
+X	}
+X
+X	out (space); 
+X	out (0);
+X
+X	if (oldi>globcn)
+X		error ("Unmatched argument");
+X	y = 0;
+X	if (glob && unsign(*glob) == chars)
+X		for (x = glob; unsign(*x) != chend;)
+X			if (*x++ == '/')
+X				y = x;
+X	if (y) {
+X		ch = *y; 
+X		*y = 0;
+X#ifdef	NDIR
+X		if ((dhan = opendir(glob+1)) == NULL)
+X#else
+X		if ((han = open(glob+1, 0)) < 0)
+X#endif
+X			error("Non-existent directory");
+X		*y = ch; 
+X		*--y = chars;
+X	} 
+X	else {
+X#ifdef	NDIR
+X		dhan = opendir(".");
+X		if (dhan ==NULL)
+X#else
+X		han = open(".", 0);
+X		if (han < 0)
+X#endif
+X			error("Can't open directory");
+X		y = glob;
+X	}
+X
+X	if (glob == 0)
+X		error("No globals");
+X
+X	i = 0; 
+X	ep = 0;
+X#ifdef	NDIR
+X	while (dp = readdir(dhan)) {
+X		if (*dp->d_name == '.' && y[1] != '.')
+X			continue;
+X		if (ep)
+X			free(ep);
+X		ep = (struct entry *)ealloc(dp->d_namlen+sizeof (struct entry));
+X		ep->e_namlen = dp->d_namlen;
+X		strcpy(ep->e_name, dp->d_name);
+X#else
+X	while (read(han, &oldi, 2) == 2) {
+X		if (ep == 0)
+X			ep = (struct entry *)ealloc(sizeof (struct entry));
+X		if (read(han, ep->e_name, NAMSIZ) != NAMSIZ)
+X			break;
+X		if (oldi == 0)
+X			continue;
+X		if (*ep->e_name == '.' && y[1] != '.')
+X			continue;
+X		ep->e_name[NAMSIZ] = 0;
+X		ep->e_namlen = NAMSIZ;
+X#endif
+X		if (globbr(ep,y)) {
+X			++i;
+X			ep->e_link = ehead;
+X			ehead = ep;
+X			ep = 0;
+X		}
+X	}
+X#ifdef	NDIR
+X	closedir(dhan);
+X#else
+X	close(han);
+X#endif
+X	if (ep)
+X		free(ep);
+X	if (i==0)
+X		error ("No matches");
+X
+X	/*
+X	 * Sort the entries - user friendly ?
+X	 */
+X	et = ea = (struct entry **) ealloc(i * sizeof (struct entry *));
+X	for (ep = ehead; ep; ep = ep->e_link)
+X		*ea++ = ep;
+X	qsort(et, i, sizeof (struct entry *), entcmp);
+X
+X	ea = et;
+X	do {
+X		ep = *ea++;
+X		gp = 0;
+X		p = cmnd; 
+X		o = output;
+X		while (ch = *p++) switch (unsign(ch)) {
+X
+X		case space:	
+X			if (o!=output) *o++ = ' ';
+X			if (glob==p) {
+X				gp = o;	/* save ptr for stat */
+X				if (glob!=y) {
+X					for (x = glob+1; unsign(*x) != chars;)
+X						*o++ = *x++;
+X					*o++ = '/';
+X				}
+X				x = ep->e_name;
+X				while (*x)
+X					*o++ = *x++;
+X				while (*--o==' '); 
+X				++o; 
+X				*o++ = ' ';
+X				gep = o-1;	/* save ptr for stat */
+X				while (unsign(*p++) != space);
+X			} 
+X			continue;
+X		case chars:	
+X			while (unsign((ch = *p++)) != chend)
+X				*o++ = ch; 
+X			continue;
+X		case arg:	
+X			ch = *p++ - 1;
+X			if (ch < 0) {
+X				/* #0 requests name of owner */
+X				if (gp == 0)
+X					error("#0 before global");
+X				*gep = 0;
+X				stat(gp,&sbuf);
+X				*gep = ' ';
+X				for (x = getlogn(sbuf.st_uid);*o++ = *x++;);
+X				--o;
+X				continue;
+X			}
+X			ch *= 2;
+X			oldi = ep->e_level[ch+1];
+X			for (x = ep->e_name+ep->e_level[ch]; --oldi>=0;)
+X				*o++ = *x++;
+X			continue;
+X
+X		}
+X		*o++ = '\n';
+X		*o = 0;
+X		printf("%s", output);
+X	} 
+X	while (--i);
+X}
+X
+Xentcmp(e1, e2)
+Xregister struct entry **e1, **e2;
+X{
+X	return strcmp((*e1)->e_name, (*e2)->e_name);
+X}
+X
+X#include <pwd.h>
+X
+Xchar *getpath(uid)
+Xint uid;
+X{
+X	register struct passwd *p;
+X
+X	p = getpwuid(uid);
+X	if (p == NULL)
+X		return "";
+X	return p->pw_dir;
+X}
+X
+Xint getunum(name)
+Xchar *name;
+X{
+X	register struct passwd *p;
+X
+X	p = getpwnam(name);
+X	if (p == NULL)
+X		return -1;
+X	return p->pw_uid;
+X}
+X
+Xchar *getlogn(uid)
+Xint uid;
+X{
+X	register struct passwd *p;
+X
+X	p = getpwuid(uid);
+X	if (p == NULL)
+X		return "";
+X	return p->pw_name;
+X}
+X
+Xchar *ealloc(n)
+Xint n;
+X{
+X	register char *p;
+X
+X	p = (char *)malloc(n);
+X	if (p == NULL)
+X		error("Can't get memory");
+X	return p;
+X}
+X
+Xerror(a, b, c)
+X{
+X	fprintf(stderr, "mkcmd: ");
+X	fprintf(stderr, a, b, c);
+X	fprintf(stderr, "\n");
+X	exit(-1);
+X}
+All work and no play makes Jack a dull boy
+
+

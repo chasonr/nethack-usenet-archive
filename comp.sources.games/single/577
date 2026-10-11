@@ -1,0 +1,2239 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,1864939cc01a4371,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1989-04-27 12:24:01 PST
+Path: utzoo!attcan!uunet!tektronix!tekgen!tekred!games
+From: games@tekred.CNA.TEK.COM
+Newsgroups: comp.sources.games
+Subject: v06i065:  cubes2 - a networked dice game (version 5.1), Part07/08
+Message-ID: <3906@tekred.CNA.TEK.COM>
+Date: 27 Apr 89 19:24:01 GMT
+Sender: billr@tekred.CNA.TEK.COM
+Lines: 2223
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: gmp@rayssdb.RAY.COM (Gregory M. Paris)
+Posting-number: Volume 6, Issue 65
+Archive-name: cubes2/Part07
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 7 (of 8)."
+# Contents:  cubes.c cubestat.c risk.c strategies.c
+# Wrapped by billr@saab on Thu Apr 27 12:13:40 1989
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'cubes.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'cubes.c'\"
+else
+echo shar: Extracting \"'cubes.c'\" \(16290 characters\)
+sed "s/^X//" >'cubes.c' <<'END_OF_FILE'
+X/*	vi:set sw=4 ts=4: */
+X#ifndef	lint
+Xstatic char	sccsid[] = "@(#)cubes.c 5.1 (G.M. Paris) 89/01/22";
+X#endif	lint
+X
+X/*
+X**
+X**	cubes 5.1  Copyright 1989 Gregory M. Paris
+X**		Permission granted to redistribute on a no charge basis.
+X**		All other rights are reserved.
+X**
+X*/
+X
+X#include	<stdio.h>
+X#include	<strings.h>
+X#include	<ctype.h>
+X#include	<signal.h>
+X#include	<setjmp.h>
+X#include	<errno.h>
+X#include	<sys/types.h>
+X#include	<sys/time.h>
+X#include	<sys/wait.h>
+X#include	<sys/file.h>
+X#include	<sys/dir.h>
+X#include	<sys/socket.h>
+X#include	<sys/ioctl.h>
+X#include	<netdb.h>
+X#include	<netinet/in.h>
+X#ifdef	UNIXSOCK
+X#include	<sys/un.h>
+X#endif	UNIXSOCK
+X#include	<pwd.h>
+X#include	"cubes.h"
+X
+Xchar			   *cubename	= 0;		/* player name */
+Xchar			   *cubehist	= 0;		/* personal ranking history */
+Xchar			   *cubehost	= 0;		/* server hostname */
+Xint					ssock		= -1;		/* server socket descriptor */
+XFILE			   *fsock		= 0;		/* server socket stream */
+Xint					child		= 0;		/* child pid */
+Xboolean				active		= True;		/* True while active */
+Xboolean				gotintr		= False;	/* True if interrupt received */
+Xboolean				quiet		= False;	/* True if in background */
+Xenterlate			watch		= Watch;	/* what to do about late entry */
+Xenterlate			spider		= Play;		/* what to do about waiting */
+Xwinpref				preference	= Nopref;	/* gametype/winscore preference */
+Xextern graphtype	graphics;				/* graphics type */
+X
+Xextern int			errno;
+Xextern char		   *sys_errlist[];
+X
+Xextern int			optind;
+Xextern int			opterr;
+Xextern char		   *optarg;
+Xextern char		   *getenv();
+Xextern char		   *malloc();
+Xextern char		   *fgets();
+Xextern char		   *fullname();
+Xstatic char		   *save();
+Xstatic int			slowstop();
+X
+Xmain(ac, av)
+Xchar   *av[];
+X{
+X	int				c;
+X	register int	type;
+X	union wait		chexit;
+X	char		   *s, msgbuf[BUFSIZ];
+X
+X#ifdef	GAMESDSO
+X	/*
+X	**	Specific to author's locale: don't accidentally charge contracts!
+X	*/
+X	if(geteuid() == 0)
+X		(void) setdso(GAMESDSO);
+X#endif	GAMESDSO
+X
+X	/*
+X	**	We always turn off any setuid status.  Except for the GAMESDSO
+X	**	stuff above, there's no need for the client to run setuid.
+X	*/
+X	(void) setuid(getuid());
+X
+X	/*
+X	**	Attempt to ensure the efficiency of output stream.
+X	XXX	This may reduce system load on some systems.
+X	*/
+X	{
+X		static char	outbuf[BUFSIZ];
+X		setbuf(stdout, outbuf);
+X	}
+X
+X	irandom();	/* initialize the random number generator */
+X
+X	opterr = 0;
+X	while((c = getopt(ac, av, "BSF:spwg:f:h:n:")) >= 0) {
+X		switch(c) {
+X		case 'B': preference = Blitz; break;
+X		case 'S': preference = Standard; break;
+X		case 'F':
+X			switch(*optarg) {
+X			case 'B': preference = Fblitz; break;
+X			case 'S': preference = Fstand; break;
+X			default:
+X				fprintf(stderr,
+X					"cubes: forced preference must be Standard or Blitz\n");
+X				exit(1);
+X			}
+X			break;
+X		case 'g':	/* set graphics type */
+X			switch(*optarg) {
+X			case 'n': case 'N':	graphics = Nographics; break;
+X			case 'd': case 'D':	graphics = Digital; break;
+X			case 'z': case 'Z':	graphics = Zenith; break;
+X			case 'r': case 'R':
+X				fprintf(stderr, "cubes: warning: no ReGIS -- using DEC\n");
+X				graphics = Digital;
+X				break;
+X			default:
+X				fprintf(stderr,
+X					"cubes: graphics type must be None, DEC, or Zenith\n");
+X				exit(1);
+X			}
+X			break;
+X		case 'h':	/* daemon on remote host */
+X			cubehost = save(optarg);
+X			break;
+X		case 'n':	/* set player name */
+X			cubename = save(optarg);
+X			break;
+X		case 'f':
+X			cubehist = optarg;
+X			break;
+X		case 'a': watch = Ask; break;
+X		case 'p': watch = Play; break;
+X		case 'w': watch = Watch; break;	/* default */
+X		case 's': spider = Wait; break;
+X/*		case 'i': spider = Play; break;	/* default */
+X		default:
+X			fprintf(stderr,
+X"usage -- cubes [-[F]{BS}] [-s] [-{apw}] [-g{drz}] [-f hist] [-h host] [name]\n"
+X			);
+X			exit(1);
+X		}
+X	}
+X
+X	/*
+X	**	We support -n above, but now recognize non-option arguments
+X	**	as the requested player name.  If both are specified, then
+X	**	it's probably a goof, so complain and die.
+X	*/
+X	if(optind < ac) {
+X		if(cubename != 0) {
+X			fprintf(stderr, "usage -- cubes name -OR- cubes -n name\n");
+X			exit(1);
+X		}
+X		strcpy(msgbuf, av[optind]);
+X		while(++optind < ac) {
+X			strcat(msgbuf, " ");
+X			strcat(msgbuf, av[optind]);
+X		}
+X		cubename = save(msgbuf);
+X	}
+X
+X	/*
+X	**	If the cubename wasn't specified on the command line,
+X	**	supply a prompt which shows how long the name can be.
+X	**	If the answer to this prompt is <CR>, then come up with
+X	**	a name by looking at the user's password entry gecos field.
+X	*/
+X	if(cubename == 0) {
+X		if((cubename = getenv("CUBENAME")) == 0) {
+X			printf("......... 123456789012345678\n");
+X			printf("CUBENAME? ");
+X			(void) fflush(stdout);
+X			if(fgets(msgbuf, sizeof msgbuf, stdin) == 0)
+X				exit(0);	/* must have changed mind */
+X			if((s = index(msgbuf, '\n')) == 0) {
+X				fprintf(stderr,
+X					"cubes: name must be eighteen characters or less\n");
+X				exit(1);
+X			}
+X			*s = '\0';
+X			if(msgbuf[0] != '\0')
+X				cubename = save(msgbuf);
+X			else {
+X				struct passwd  *pw, *getpwuid();
+X
+X				if((pw = getpwuid(getuid())) == 0) {
+X					fprintf(stderr, "cubes: no password entry!\n");
+X					exit(1);
+X				}
+X				cubename = save(fullname(pw));
+X			}
+X		}
+X	}
+X
+X	/*
+X	**	Server host was not specified on the command line, so check
+X	**	the environment for a name.  If none, we'll use this host.
+X	*/
+X	if(cubehost == 0)
+X		cubehost = getenv("CUBEHOST");
+X
+X	/*
+X	**	The personal history file was not set on the command line,
+X	**	so check the environment for a value.  If one is not found,
+X	**	then we'll default to "$HOME/.cubehist".  The only way for
+X	**	the user to turn off this feature is to specify a null name.
+X	*/
+X	if(cubehist == 0 && (cubehist = getenv("CUBEHIST")) == 0) {
+X		if((cubehist = getenv("HOME")) == 0)
+X			cubehist = ".";
+X		sprintf(msgbuf, "%s/.cubehist", cubehist);
+X		cubehist = save(msgbuf);
+X	}
+X	
+X	/*
+X	**	We're done processing arguments, so it's safe to blow them
+X	**	away for the purpose of disguise.
+X	*/
+X	newname(ac, av);
+X
+X	/*
+X	**	If this process isn't the process group leader, then we should be OK.
+X	**	(I'm not sure that this will work correctly in all situations.)
+X	**	Otherwise, we must fork for purposes of useful suspend action.  In
+X	**	that case, the parent just waits here for child to exit.
+X	*/
+X	if(getpid() == getpgrp(0))		/* comment out this line if necessary */
+X		switch(child = fork()) {
+X		case 0:		/* child */
+X			break;
+X		case -1:	/* error */
+X			perror("fork");
+X			exit(1);
+X		default:	/* parent */
+X			(void) signal(SIGINT,  SIG_IGN);
+X			(void) signal(SIGQUIT, SIG_IGN);
+X			(void) signal(SIGTSTP, slowstop);
+X			(void) signal(SIGTTOU, SIG_DFL);	/* sent by child */
+X			(void) signal(SIGTTIN, SIG_IGN);	/* ignored by child */
+X			parentname(av);						/* need a new disguise */
+X			while(wait(&chexit) != child)
+X				;
+X			if(chexit.w_termsig != 0)
+X				exit((int)chexit.w_termsig | 0x80);
+X			exit((int)chexit.w_retcode);
+X		}
+X
+X	/*
+X	**	Initialize terminal and set signal handlers.
+X	*/
+X	startup();
+X
+X	/*
+X	**	Connect to the server.
+X	*/
+X	opensocktoserv();
+X	
+X	/*
+X	**	Process messages from the server.
+X	*/
+X	initactions();
+X	while(active == True) {
+X		if((type = rdmessage(msgbuf, sizeof msgbuf)) < 0)
+X			cleanup(1, "error reading message from server");
+X		if(action(type, msgbuf) < 0)
+X			cleanup(1, "action failed");
+X		if(gotintr == True)
+X			reallyquit();
+X		if(quiet == False)
+X			flushinput();
+X	}
+X	
+X	/*
+X	**	Nothing currently gets us here.
+X	*/
+X	cleanup(2, "left main loop!");
+X}
+X
+X/*
+X**	opensocktoserv: open connection to server
+X*/
+Xopensocktoserv()
+X{
+X	int			off		= 0;
+X	boolean		local	= False;
+X
+X#ifdef	lint
+X	local = local;
+X#endif	lint
+X
+X	/*
+X	**	If a null hostname or no hostname was supplied,
+X	**	then assume the local host.
+X	*/
+X	if(cubehost == 0 || *cubehost == '\0') {
+X		char	thishost[256];
+X
+X		(void) gethostname(thishost, sizeof thishost);
+X		cubehost = save(thishost);
+X		local = True;
+X	}
+X
+X#ifdef	UNIXSOCK
+X	/*
+X	**	If the host the localhost, then try connecting to the
+X	**	UNIX domain server socket.  If this fails, go on to
+X	**	try the INET domain socket.
+X	*/
+X	if(local == True) {
+X		struct sockaddr_un	userver;
+X		int					len;
+X
+X		bzero((char *)&userver, sizeof userver);
+X		userver.sun_family = AF_UNIX;
+X		strcpy(userver.sun_path, UNIXSOCK);
+X		len = sizeof userver.sun_family + strlen(userver.sun_path);
+X
+X		if((ssock = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+X			/* XXX: syslog message here */
+X			goto sorry;
+X		}
+X		if(connect(ssock, &userver, len) < 0) {
+X			/* XXX: syslog message here */
+X			(void) close(ssock);
+X			ssock = -1;
+X			goto sorry;
+X		}
+Xsorry:	;
+X	}
+X#endif	UNIXSOCK
+X
+X	/*
+X	**	Connect to the server's INET socket.
+X	*/
+X	if(ssock < 0) {
+X		struct sockaddr_in	server;
+X		struct hostent	   *ph;
+X		struct servent	   *ps;
+X
+X		if((ph = gethostbyname(cubehost)) == 0)
+X			cleanup(1, "unknown host");
+X		ps = getservbyname("cube", "tcp");	/* let client use default port */
+X
+X		bzero((char *)&server, sizeof server);
+X		server.sin_family = AF_INET;
+X		server.sin_port = (ps != 0) ? ps->s_port : (htons(0xf00));
+X		bcopy(ph->h_addr, (char *)&server.sin_addr, ph->h_length);
+X
+X		if((ssock = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+X			cleanup(1, sys_errlist[errno]);
+X		if(connect(ssock, &server, sizeof server) < 0) {
+X			if(errno == ECONNREFUSED)
+X				cleanup(1, "no cubeserver running");
+X			cleanup(1, sys_errlist[errno]);
+X		}
+X	}
+X
+X	/*
+X	**	Make sure non-blocking I/O is turned off.
+X	*/
+X	(void) ioctl(ssock, FIONBIO, (char *)&off);
+X
+X	/*
+X	**	Allow receiving SIGURG on OOB data.  Ignore SIGALRM too.
+X	*/
+X	(void) signal(SIGALRM, SIG_IGN);
+X	(void) signal(SIGURG,  SIG_IGN);
+X	(void) fcntl(ssock, F_SETOWN, getpid());
+X
+X	/*
+X	**	Open a stream so we can do fgets on the socket.
+X	*/
+X	if((fsock = fdopen(ssock, "r")) == 0)
+X		cleanup(1, sys_errlist[errno]);
+X}
+X
+X/*
+X**	rd_jmp, rd_timo: handle server socket read timeout
+X*/
+Xjmp_buf		rd_jmp;
+Xstatic int
+Xrd_timo()
+X{
+X	longjmp(rd_jmp, 1);
+X}
+X
+X/*
+X**	rdmessage: read a message from the server socket
+X**		return the message type number
+X*/
+Xrdmessage(mesg, size)
+Xchar   *mesg;
+Xint		size;
+X{
+X	register int	ntot, n;
+X	int				type;
+X	int			  (*oldalrm)();
+X	fd_set			rdy;
+X
+X	/*
+X	**	Server could time out on system crash or other unrecoverable problem.
+X	*/
+X	oldalrm = signal(SIGALRM, SIG_IGN);
+X	if(setjmp(rd_jmp) != 0) {
+X		(void) alarm(0);
+X		(void) signal(SIGALRM, oldalrm);
+X		sprintf(mesg, "%d %*s", M_ARGE, size-5, "Server may be hung...");
+X		return (int)M_ARGE;		/* non-fatal, let player quit with interrupt */
+X	}
+X	(void) signal(SIGALRM, rd_timo);
+X	(void) alarm(3*READTIMO);	/* let's hope nobody takes this long! */
+X
+X	/*
+X	**	Loop here waiting for server socket to come ready.  If
+X	**	anything is typed on the terminal, respond by calling flushinput.
+X	**	If we get interrupt, service it immediately.
+X	*/
+X	while(fsock->_cnt <= 0) {	/* XXX: eeek! we peeked in stdio.h */
+X		FD_ZERO(&rdy);
+X		if(quiet == False)
+X			FD_SET(0, &rdy);
+X		FD_SET(ssock, &rdy);
+X		if(select(ssock+1, &rdy, NOSEL, NOSEL, HANG) > 0) {
+X			if(quiet == False && FD_ISSET(0, &rdy))
+X				flushinput();
+X			if(FD_ISSET(ssock, &rdy))
+X				break;
+X		}
+X		if(gotintr == True)
+X			reallyquit();
+X	}
+X
+X	/*
+X	**	Read a single line from the socket.
+X	*/
+X	if(fgets(mesg, size, fsock) == 0) {
+X		(void) alarm(0);
+X		(void) signal(SIGALRM, oldalrm);
+X		sprintf(mesg, "%d %*s", M_DOWN, size-5, "Server closed connection.");
+X		return (int)M_DOWN;
+X	}
+X
+X	/*
+X	**	Done reading, turn off alarm.
+X	*/
+X	(void) alarm(0);
+X	(void) signal(SIGALRM, oldalrm);
+X
+X	/*
+X	**	Strip control and space characters from end of message.
+X	*/
+X	ntot = strlen(mesg);
+X	for(n = ntot - 1;n >= 0;--n) {
+X		if(!iscntrl(mesg[n]) && !isspace(mesg[n]))
+X			break;
+X		mesg[n] = '\0';
+X	}
+X
+X	/*
+X	**	Get the message type from the front of the message.
+X	*/
+X	if(sscanf(mesg, "%3d", &type) != 1)
+X		type = (int)M_BADM;
+X
+X	return type;
+X}
+X
+X/*
+X**	save: save a string in new dynamic memory
+X*/
+Xstatic char *
+Xsave(old)
+Xchar   *old;
+X{
+X	unsigned	len;
+X	char	   *new;
+X
+X	len = strlen(old) + 1;
+X	if((new = malloc(len * sizeof *old)) == 0) {
+X		fprintf(stderr, "cubes: no memory for saving arguments\n");
+X		exit(1);
+X	}
+X	strcpy(new, old);
+X
+X	return new;
+X}
+X
+X/*
+X**	randname: return a pointer to a random name
+X*/
+Xstatic char *
+Xrandname(len)
+Xint		len;
+X{
+X	DIR			   *dirp;
+X	struct direct  *dp;
+X	register int	n;
+X	static char		name[MAXNAMLEN+1];
+X
+X	if(len > MAXNAMLEN)
+X		len = MAXNAMLEN;
+X
+X	/*
+X	**	First look for a filename in /tmp.
+X	*/
+X	name[0] = '\0';
+X	if(len > 3 && (dirp = opendir("/tmp")) != 0) {
+X		while((dp = readdir(dirp)) != 0) {
+X			if(dp->d_namlen < 3 || dp->d_namlen > len)
+X				continue;
+X			(void) strcpy(name, dp->d_name);
+X			if(randint(7) == 3)
+X				break;
+X		}
+X		(void) closedir(dirp);
+X	}
+X	if(name[0] != '\0')
+X		return name;
+X	
+X	/*
+X	**	Generate a name with a random function.
+X	*/
+X	for(n = 0;n < len;++n) {
+X		switch(randint(13)) {
+X		case 2: case 7:		name[n] = ' '; break;
+X		case 3:				name[n] = '/'; break;
+X		case 8:				name[n] = '.'; break;
+X		case 1: case 4:	    name[n] = "-aeiouyweeeaai"[randint(13)]; break;
+X		default:			name[n] = 'a' + randint(26) - 1; break;
+X		}
+X	}
+X	name[n] = '\0';
+X
+X	return name;
+X}
+X
+X/*
+X**	newname: rename this program (apparently, anyway)
+X**		This code assumes we can write over av[n] and
+X**		hopes that av[0] through av[ac-1] are contiguous.
+X*/
+Xnewname(ac, av)
+Xint				ac;
+Xregister char  *av[];
+X{
+X	register int	n;
+X	register char  *name, *fake;
+X
+X	/*
+X	**	Make the argument list into one continuous string.
+X	**	Only does this if the arguments seem contiguous.
+X	*/
+X	for(n = 1;n < ac;++n) {
+X		if(*(name = av[n] - 1) == '\0')		/* end of previous arg */
+X			*name = ' ';					/* un-terminate it */
+X			av[n] = 0;						/* none such, now */
+X	}
+X
+X	/*
+X	**	Come up with a suitable replacement argument list.
+X	*/
+X	name = av[0];
+X	switch(n = strlen(name)) {
+X	case 1: break;
+X	case 2: switch(randint(7)) {
+X			case 1: strcpy(name, "vi"); break;
+X			case 2: strcpy(name, "rn"); break;
+X			case 3: strcpy(name, "ex"); break;
+X			case 4: strcpy(name, "bc"); break;
+X			default:strcpy(name, "sh"); break;
+X			} break;
+X	case 3: switch(randint(7)) {
+X			case 1: strcpy(name, "ftp"); break;
+X			case 2: strcpy(name, "adb"); break;
+X			case 3: strcpy(name, "sdb"); break;
+X			case 4: strcpy(name, "dbx"); break;
+X			default:strcpy(name, "csh"); break;
+X			} break;
+X	case 4: switch(randint(7)) {
+X			case 1: strcpy(name, "mail"); break;
+X			case 2: strcpy(name, "xget"); break;
+X			case 3: strcpy(name, "view"); break;
+X			case 4: strcpy(name, "edit"); break;
+X			default:strcpy(name, "lock"); break;
+X			} break;
+X	case 5: switch(randint(7)) {
+X			case 1: strcpy(name, "learn"); break;
+X			case 2: strcpy(name, "sh -i"); break;
+X			case 3: strcpy(name, "a.out"); break;
+X			case 4: strcpy(name, "qcalc"); break;
+X			default:strcpy(name, "vnews"); break;
+X			} break;
+X	case 6: switch(randint(7)) {
+X			case 1: strcpy(name, "iostat"); break;
+X			case 2: strcpy(name, "vmstat"); break;
+X			case 3: strcpy(name, "kermit"); break;
+X			case 4: strcpy(name, "script"); break;
+X			default:strcpy(name, "telnet"); break;
+X			} break;
+X	default:switch(randint(7)) {
+X			case 1: strncpy(name, "more ", 5); name += 5, n -= 5; break;
+X			case 2: strncpy(name, "less ", 5); name += 5, n -= 5; break;
+X			case 3: strncpy(name, "sdb ", 4);  name += 4, n -= 4; break;
+X			case 4: strncpy(name, "vu ", 3);   name += 3, n -= 3; break;
+X			default:strncpy(name, "vi ", 3);   name += 3, n -= 3; break;
+X			}
+X			fake = randname(n);
+X			while(*name != '\0')
+X				*name++ = (*fake == '\0') ? ' ' : *fake++;
+X			break;
+X	}
+X
+X	/*
+X	**	Change remaining arguments to all spaces.
+X	**	Only necessary if arguments aren't contiguous.
+X	*/
+X	for(n = 1;n < ac;++n)
+X		if(av[n] != 0)
+X			for(name = av[n];*name != '\0';++name)
+X				*name = ' ';
+X	
+X	/*
+X	**	Some shells store our name in $_, so check for it
+X	**	and if found, replace it with our newly chosen name.
+X	*/
+X	if((name = getenv("_")) != 0) {
+X		fake = av[0];
+X		while(*name != '\0')
+X			*name++ = (*fake == '\0') ? ' ' : *fake++;
+X	}
+X}
+X
+X/*
+X**	parentname: change av[0] for the parent to look believable
+X*/
+Xparentname(av)
+Xchar   *av[];
+X{
+X	int		len	= strlen(av[0]);
+X
+X	sprintf(av[0], "%-*.*s", len, len, "-sh");
+X}
+X
+X/*
+X**	slowstop: give child a chance to reset the terminal on suspend signal
+X*/
+Xstatic int
+Xslowstop(sig)
+X{
+X#ifndef	sigmask
+X#define	sigmask(sig)	(1 << ((sig) - 1))
+X#endif	sigmask
+X
+X	int	mask;
+X
+X	/*
+X	**	Delay should probably depend on ospeed, but it isn't set in parent.
+X	*/
+X	sleep(1);
+X
+X	/*
+X	**	Reset and unblock sig and "kill" ourselves with it.
+X	*/
+X	(void) signal(sig, SIG_DFL);
+X	mask = sigblock(0);
+X	mask &= ~(sigmask(sig));
+X	(void) sigsetmask(mask);
+X	(void) kill(getpid(), sig);
+X	/*
+X	**	Suspended here.
+X	*/
+X	(void) signal(sig, slowstop);
+X}
+END_OF_FILE
+if test 16290 -ne `wc -c <'cubes.c'`; then
+    echo shar: \"'cubes.c'\" unpacked with wrong size!
+fi
+# end of 'cubes.c'
+fi
+if test -f 'cubestat.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'cubestat.c'\"
+else
+echo shar: Extracting \"'cubestat.c'\" \(4072 characters\)
+sed "s/^X//" >'cubestat.c' <<'END_OF_FILE'
+X/*	vi:set sw=4 ts=4: */
+X#ifndef	lint
+Xstatic char	sccsid[] = "@(#)cubestat.c 5.1 (G.M. Paris) 89/01/22";
+X#endif	lint
+X
+X/*
+X**
+X**	cubes 5.1  Copyright 1989 Gregory M. Paris
+X**		Permission granted to redistribute on a no charge basis.
+X**		All other rights are reserved.
+X**
+X*/
+X
+X#include	<stdio.h>
+X#include	<sys/types.h>
+X#include	<sys/time.h>
+X#include	<sys/socket.h>
+X#include	<netinet/in.h>
+X#include	<netdb.h>
+X#include	<sysexits.h>
+X#include	"cubes.h"
+X
+X#define	EX_CUBES_INPROGRESS	0	/* success */
+X#define	EX_CUBES_IDLE		1	/* fail, sort of */
+X
+Xextern int			optind;
+Xextern int			opterr;
+Xextern char		   *optarg;
+Xextern char		   *getenv();
+Xstruct hostent	   *gethostbyname();
+Xstruct servent	   *getservbyname();
+X
+Xmain(ac, av)
+Xchar   *av[];
+X{
+X	int						c;
+X	char				   *cubehost	= 0;		/* server hostname */
+X	register int			qsock;
+X	struct sockaddr_in		server;
+X	struct servent		   *ps;
+X	struct hostent		   *ph;
+X	struct timeval			timo;
+X	fd_set					rdy;
+X	char					query;
+X	char					status[STATLEN];
+X	boolean					waitforbeg	= False;
+X	boolean					waitforend	= False;
+X
+X	opterr = 0;
+X	while((c = getopt(ac, av, "beh:")) >= 0) {
+X		switch(c) {
+X		case 'b':
+X			waitforbeg = (waitforbeg == True) ? False : True;
+X			break;
+X		case 'e':
+X			waitforend = (waitforend == True) ? False : True;
+X			break;
+X		case 'h':
+X			cubehost = optarg;
+X			break;
+X		default:
+X			fprintf(stderr, "usage -- cubestat [-{be}] [-h host]\n");
+X			exit(EX_USAGE);
+X		}
+X	}
+X
+X	if(waitforbeg == True && waitforend == True) {
+X		fprintf(stderr, "cubestat: can't wait for both begin and end\n");
+X		exit(EX_USAGE);
+X	}
+X
+X	if(waitforbeg == True || waitforend == True) {
+X		static char	fake[] = "lock -";
+X		int			n;
+X
+X		for(c = 0;c < ac;++c)
+X			for(n = 0;av[c][n] != '\0';++n)
+X				av[c][n] = (c > 0 || n >= sizeof fake - 1) ? ' ' : fake[n];
+X	}
+X
+X	/*
+X	**	If cubehost hasn't been set, check the CUBEHOST environment variable.
+X	**	If cubehost is null or not set, use this host.
+X	*/
+X	if(cubehost == 0)
+X		cubehost = getenv("CUBEHOST");
+X	if(cubehost == 0 || *cubehost == '\0') {
+X		static char		thishost[256];
+X
+X		(void) gethostname(thishost, sizeof thishost);
+X		cubehost = thishost;
+X	}
+X	if((ph = gethostbyname(cubehost)) == 0) {
+X		fprintf(stderr, "cubestat: unknown host `%s'\n", cubehost);
+X		exit(EX_NOHOST);
+X	}
+X
+X	/*
+X	**	Look up the cubestat service.
+X	*/
+X	if((ps = getservbyname("cubestat", "udp")) == 0) {
+X		fprintf(stderr, "cubestat: no cubestat/udp service listed\n");
+X		exit(EX_UNAVAILABLE);
+X	}
+X
+X	/*
+X	**	Get a datagram socket then point it at the server.
+X	*/
+X	if((qsock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+X		perror("cubestat: socket");
+X		exit(EX_OSERR);
+X	}
+X	bzero((char *)&server, sizeof server);
+X	server.sin_family = AF_INET;
+X	server.sin_port = ps->s_port;
+X	bcopy(ph->h_addr, (char *)&server.sin_addr, ph->h_length);
+X	if(connect(qsock, &server, sizeof server) < 0) {
+X		perror("cubestat: connect");
+X		exit(EX_OSERR);
+X	}
+X
+X	/*
+X	**	For now, we only know how to ask for a roster.
+X	**	Set up for a few tries.  We'll wait a reasonable time before retrying.
+X	*/
+X	query = Q_ROSTER;
+X	timo.tv_sec = 2 * READTIMO;
+X	timo.tv_usec = 0;
+X	for(c = 0;c < 3 || waitforbeg == True || waitforend == True;++c) {
+X		if(send(qsock, &query, sizeof query, 0) < 0) {
+X			perror("cubestat: send");
+X			exit(EX_IOERR);
+X		}
+X
+X		FD_ZERO(&rdy);
+X		FD_SET(qsock, &rdy);
+X		if(select(qsock+1, &rdy, NOSEL, NOSEL, &timo) > 0) {
+X			if(recv(qsock, status, STATLEN, 0) > 0) {
+X				switch(status[0]) {
+X				case S_IDLE:
+X					if(waitforbeg == False) {
+X						fputs(&status[1], stdout);
+X						exit(EX_CUBES_IDLE);
+X					}
+X					if(c % 20 == 0)
+X						fputs(&status[1], stdout);
+X					sleep(3);
+X					break;
+X				case S_ROSTER:
+X					fputs(&status[1], stdout);
+X					if(waitforend == False)
+X						exit(EX_CUBES_INPROGRESS);
+X					sleep(1);
+X					break;
+X				case S_UNRECOG:
+X					fprintf(stderr,
+X						"cubestat: unrecognized query \\%o\n", query);
+X					exit(EX_PROTOCOL);
+X				default:
+X					fprintf(stderr,
+X						"cubestat: unrecognized response \\%o\n", status[0]);
+X					exit(EX_PROTOCOL);
+X				}
+X			}
+X		}
+X	}
+X
+X	fprintf(stderr, "cubestat: no response from server on %s\n", cubehost);
+X	exit(EX_UNAVAILABLE);
+X}
+END_OF_FILE
+if test 4072 -ne `wc -c <'cubestat.c'`; then
+    echo shar: \"'cubestat.c'\" unpacked with wrong size!
+fi
+# end of 'cubestat.c'
+fi
+if test -f 'risk.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'risk.c'\"
+else
+echo shar: Extracting \"'risk.c'\" \(16470 characters\)
+sed "s/^X//" >'risk.c' <<'END_OF_FILE'
+X/*	vi:set sw=4 ts=4: */
+X#ifndef	lint
+Xstatic char	sccsid[] = "@(#)risk.c 5.1 (G.M. Paris) 89/01/22";
+X#endif	lint
+X
+X/*
+X**
+X**	cubes 5.1  Copyright 1989 Gregory M. Paris
+X**		Permission granted to redistribute on a no charge basis.
+X**		All other rights are reserved.
+X**
+X*/
+X
+X#include	"cubes.h"
+X
+Xextern boolean		jokermode;
+Xextern int			winscore;
+Xextern player		plr[];
+Xextern boolean		iscomp();
+Xextern boolean		isproxy();
+Xextern boolean		iskamelion();
+Xextern long			histavgplr();
+X
+X/*
+X**	risk: values derived empirically using the avg program
+X**
+X**	Yes, you can calculate all this stuff, but what a pain.
+X**	In any case, this table is by no means a complete listing
+X**	of all possible conditions, probabilities, and expectations.
+X**	You could come up with a much more complicated table, but
+X**	to what end?  Some of computer players using this table
+X**	and quite simple strategies are able to best humans regularly.
+X**
+X**	Notes:
+X**		1. p_aok values for rolling NDICE are nonsense.
+X**		2. p_aok values cannot be used with all aces, fives, or jokers
+X**		   since they already count as scoring dice.
+X**		3. p_any and p_all for rolling 3, 2, and 1 can be averaged.
+X**		4. Values for rolling 4 are special, since avg is able to
+X**		   detect asmstr in that case.  Use only mix values.
+X*/
+Xrisk	joker_risktbl[NDICE+1]	= {
+X/*	       any       all       aok  mix aces fives jokers	*/
+X	{ 0.000000, 0.000000, 0.000000,   0,   0,   0,   0  },	/* roll 0 */
+X	{ 0.384615, 0.384615, 0.153846,  23, 406, 215, 715  },	/* roll 1 */
+X	{ 0.621656, 0.147983, 0.023669,  46, 105,  76,  99  },	/* roll 2 */
+X	{ 0.781163, 0.071125, 0.003641,  79,  86,  83,  83  },	/* roll 3 */
+X	{ 0.885755, 0.086400, 0.000560, 145, 145, 145, 145  },	/* roll 4 */
+X	{ 0.948547, 0.096702, 0.000086, 269, 269, 269, 269  },	/* roll 5 */
+X};
+X
+Xrisk	std_risktbl[NDICE+1]	= {
+X/*	       any       all       aok  mix aces fives jokers	*/
+X	{ 0.000000, 0.000000, 0.000000,   0,   0,   0,   0  },	/* roll 0 */
+X	{ 0.333333, 0.333333, 0.166667,  25, 442, 233,   0  },	/* roll 1 */
+X	{ 0.555513, 0.110736, 0.027778,  50, 119,  84,   0  },	/* roll 2 */
+X	{ 0.722309, 0.055524, 0.004630,  86,  95,  91,   0  },	/* roll 3 */
+X	{ 0.842288, 0.095481, 0.000772, 161, 161, 161,   0  },	/* roll 4 */
+X	{ 0.922813, 0.099667, 0.000129, 309, 309, 309,   0  },	/* roll 5 */
+X};
+X
+X#define	risktbl			(jokermode == True ? joker_risktbl : std_risktbl)
+X
+X/*
+X**	cquery: computer rolling choice
+X*/
+Xcquery(comp, pd)
+Xint			comp;
+Xdiceset	   *pd;
+X{
+X	diceset				modi;		/* dice after re-rolling strategy */
+X	diceset				temp;		/* a temporary copy of the dice */
+X	int					stay;		/* points if we hold */
+X	int					need;		/* points needed beyond kept so far */
+X	int					xpct;		/* expectation value of next roll */
+X	boolean				canthold;	/* true if can't hold */
+X
+X	/*
+X	**	Fake human-like hesitation for kamelion and proxies.
+X	**	Otherwise, just allow time for screen update.
+X	*/
+X	if(iskamelion(comp) == True || isproxy(comp) == True)
+X		hesitate(1800L, 3600L);
+X	else
+X		hesitate(1500L, 2000L);
+X
+X	/*
+X	**	Mark Rolled dice as Taken, updating the value of d_rolling.
+X	*/
+X	keepall(pd);
+X
+X	/*
+X	**	Determine any minimum number of points we need above those
+X	**	accumulated on previous rolls.  For now, we just worry about
+X	XXX	onboard and offboard conditions, though in the future we
+X	XXX	could also worry about stopping winners and setting minimums.
+X	*/
+X	if(plr[comp].p_onboard == False && pd->d_pts_turn < ONBOARD)
+X		need = ONBOARD - pd->d_pts_turn;
+X	else if(pd->d_pts_turn < OFFBOARD && plr[comp].p_score < winscore) {
+X		if(plr[comp].p_score + pd->d_pts_turn >= winscore)
+X			need = OFFBOARD - pd->d_pts_turn;
+X	} else
+X		need = 0;
+X
+X	/*
+X	**	We get a copy of the dice and then use the computer's re-rolling
+X	**	strategy on it.  We can only do this once, because some players
+X	**	are using a fickle strategy that's different every time.  Set
+X	**	this copy of the dice up to roll again.
+X	*/
+X	modi = *pd;
+X	(*plr[comp].p_computer->c_strategy->s_func)(&modi, need);
+X	modi.d_again = True;
+X
+X	/*
+X	**	Evaluate the number of points we'd have if we held.
+X	**	Set this copy of the dice up to hold.
+X	*/
+X	pd->d_again = False;
+X	temp = *pd;
+X	scoredice(&temp);
+X	stay = temp.d_pts_turn;
+X
+X	/*
+X	**	Take care of conditions where we can't hold.
+X	*/
+X	if(plr[comp].p_onboard == False && stay < ONBOARD)
+X		canthold = True;
+X	else if(stay < OFFBOARD && plr[comp].p_score < winscore) {
+X		if(plr[comp].p_score + stay >= winscore)
+X			canthold = True;
+X	} else
+X		canthold = False;
+X
+X	/*
+X	**	If we can't hold, use the diceset with the best expectation value.
+X	**	Maybe this decision should be made by the temperament routine,
+X	**	but they aren't set up with that assumption.  Still, this should
+X	**	be an improvement over the previous situation, where the modified
+X	**	diceset was always selected.
+X	*/	
+X	if(canthold == True) {
+X		temp = *pd; 
+X		stay = expect(&temp);	/* stay is expectation of original */
+X		temp = modi;
+X		xpct = expect(&temp);	/* xpct is expectation of modified */
+X		if(xpct >= stay)		/* prefer modified version */
+X			*pd = modi;			/* use modified diceset */
+X		pd->d_again = True;		/* in case it's the orignal */
+X		return;
+X	}
+X
+X	/*
+X	**	Fake some indecision sometimes.  More rarely, call snoop to
+X	**	pretend to be a human interested in rankings.  The randint
+X	**	calls below work out to about one snoop per game for kamelion
+X	**	and proxies vs. about one snoop per two games for others
+X	**	(before checking value of stay, anyway).
+X	*/
+X	if(iscomp(comp) == False && randint(12) > 9) {
+X		int		thresh;
+X		switch(modi.d_rolling) {
+X		case 1: thresh = P_SMSTR; break;
+X		case 2: thresh = P_ASMSTR; break;
+X		case 3: thresh = P_3OKMULT * P_ACEMULT; break;
+X		case 4: thresh = P_4OKMULT * P_ACEMULT; break;
+X		default:thresh = P_AOKMULT * P_ACEMULT; break;
+X		}
+X		if(stay >= thresh) {
+X			hesitate(500L, 2000L);
+X			switch(randint(56)) {
+X			case 21: if(iskamelion(comp) == True) snoop(comp); break;
+X			case 14: if(isproxy(comp) == True) snoop(comp); break;
+X			case  7: snoop(comp); break;
+X			}
+X		}
+X	}
+X	
+X	/*
+X	**	Calculate the expectation value of rolling again.
+X	*/
+X	temp = modi;
+X	xpct = expect(&temp);
+X
+X	/*
+X	**	Player's temperament will chose which diceset to use.
+X	**	If c_temper->t_func returns True, it means roll again.
+X	*/
+X	if((*plr[comp].p_computer->c_temper->t_func)(comp,stay,xpct,&modi) == True)
+X		*pd = modi;		/* modi is the roll-again diceset */
+X}
+X
+X/*
+X**	sameface: all dice showing same face test
+X**		if scoring is False, considers only held dice
+X**		returns True if considered dice are all comb's
+X**		returns False in the case of no comb's or mixed faces
+X*/
+Xboolean
+Xsameface(pd, comb, scoring)
+Xdiceset		   *pd;
+Xcombination		comb;
+Xboolean			scoring;
+X{
+X	register int		d;
+X	register boolean	all;
+X	int					face;
+X
+X	switch(comb) {
+X	case Joker:	if(jokermode == False) return False; face = JOKER; break;
+X	case Five:	face = FIVE; break;
+X	case Ace:	face = ACE; break;
+X	default:	face = BADFACE; break;	/* non-scoring face */
+X	}
+X
+X	if(scoring == False) {
+X		all = False;
+X		for(d = 0;d < NDICE;++d) {
+X			if(pd->d_comb[d] == Previous) {
+X				if(face == BADFACE) {
+X					switch(pd->d_face[d]) {
+X					case ACE: case FIVE: case JOKER: return False;
+X					default: face = pd->d_face[d]; break;
+X					}
+X				} else if(pd->d_face[d] != face)
+X					return False;
+X				all = True;
+X			}
+X		}
+X		return all;
+X	}
+X
+X	all = False;
+X	for(d = 0;d < NDICE;++d) {
+X		switch(pd->d_comb[d]) {
+X		case Previous:
+X		case Three_of_a_kind:
+X		case Four_of_a_kind:
+X			if(face == BADFACE) {	/* comb == Nothing too */
+X				switch(pd->d_face[d]) {
+X				case ACE: case FIVE: case JOKER: return False;
+X				default: face = pd->d_face[d]; break;
+X				}
+X			} else if(pd->d_face[d] != face)
+X				return False;
+X			break;
+X		case All_of_a_kind:
+X			if(comb == Nothing) {
+X				switch(pd->d_face[d]) {
+X				case ACE: case FIVE: case JOKER: return False;
+X				default: return True;
+X				}
+X			}
+X			return (pd->d_face[d] == face) ? True : False;
+X		case Ace:		if(comb != Ace) return False; break;
+X		case Five:		if(comb != Five) return False; break;
+X		case Joker:		if(comb != Joker) return False; break;
+X		case Nothing:	continue;
+X		default:		return False;	/* scored but mixed faces */
+X		}
+X		all = True;
+X	}
+X
+X	return all;
+X}
+X
+X/*
+X**	expect: return expectation value of rolling dice as they stand
+X*/
+Xexpect(pd)
+Xregister diceset   *pd;
+X{
+X	int				d;
+X	boolean			allaces, allfives, alljokers, allofakind;
+X	risk		   *pr;
+X	diceset			temp;
+X	double			xpct;
+X	double			any, all;
+X
+X	/*
+X	**	Get a copy of the dice and forget the location of the original.
+X	*/
+X	temp = *pd;
+X	pd = &temp;
+X
+X	/*
+X	**	Four special conditions: all Aces, all Fives, all Jokers,
+X	**	or all of a kind (not in Aces, Fives, or Jokers).
+X	*/
+X	allaces = allfives = alljokers = allofakind = False;
+X	if(pd->d_rolling != 0 && pd->d_rolling != NDICE)
+X		if((allaces = sameface(pd, Ace, True)) == False)
+X			if((allfives = sameface(pd, Five, True)) == False)
+X				if(jokermode == False
+X				|| (alljokers = sameface(pd, Joker, True)) == False)
+X					allofakind = sameface(pd, Nothing, True);
+X
+X	/*
+X	**	Point to the appropriate risk values.  First get the expected
+X	**	value of the next roll, accounting for whether we have all Aces,
+X	**	all Fives, all Jokers or a mix.
+X	*/
+X	pr = &risktbl[pd->d_rolling == 0 ? NDICE : pd->d_rolling];
+X	any = pr->r_p_any, all = pr->r_p_all;
+X	if(allaces == True)			xpct = pr->r_e_aces;
+X	else if(allfives == True)	xpct = pr->r_e_fives;
+X	else if(alljokers == True)	xpct = pr->r_e_jokers;
+X	else						xpct = pr->r_e_mix;
+X
+X	scoredice(pd);				/* sets d_pts values */
+X
+X	/*
+X	**	Add additional expectation due to getting All_of_a_kind
+X	**	in what normally would be considered non-scoring dice.
+X	*/
+X	if(allofakind == True) {
+X		any += pr->r_p_aok, all += pr->r_p_aok;
+X		for(d = 0;d < NDICE;++d) {
+X			if(pd->d_comb[d] != Nothing) {
+X				xpct += pr->r_p_aok
+X					* (P_AOKMULT * pd->d_face[d] - pd->d_pts_dice);
+X				break;
+X			}
+X		}
+X	}
+X
+X#ifdef	ASMSTR
+X	/*
+X	**	Account for Asm_straight.  There are three basic ways to
+X	**	complete an assembled straight.  First is if an ace or five
+X	**	is held.  Second is if an ace and five are held.  Last is
+X	**	if a small straight is held, of which there are three varieties.
+X	*/
+X	switch(pd->d_rolling) {
+X	case ASMSTR-1:
+X		if(allaces == True) {
+X			/*
+X			**	To assemble here, what would be a Small_straight
+X			**	would need to be rolled.  That probability is
+X			**	already accounted for, but the expectation value
+X			**	of this combination is higher.
+X			*/
+X			xpct += (jokermode == True) ? 3 : 4;
+X		} else if(allfives == True) {
+X			/*
+X			**	To assemble here, a Small_straight or a 2346 is needed.
+X			**	The probability of the first is accounted for, the
+X			**	second is not.  Additional expectation from both.
+X			*/
+X			if(jokermode == True)
+X				any += 0.013445, all += 0.013445, xpct += 13;
+X			else
+X				any += 0.018519, all += 0.018519, xpct += 18;
+X		}
+X		break;
+X	case ASMSTR-2:
+X		if(allaces == False && allfives == False) {
+X			/*
+X			**	To assemble here, we need 234 which is unaccounted for
+X			**	and has additional expectation.
+X			*/
+X			if(jokermode == True)
+X				any += 0.021848, all += 0.021848, xpct += 13;
+X			else
+X				any += 0.027778, all += 0.027778, xpct += 16;
+X		}
+X		break;
+X	case 1:
+X		switch(heldsmall(pd)) {
+X		case ACE:	/* low die is an ACE */
+X			/*
+X			**	To assemble here, we need a FIVE.  The probability
+X			**	is accounted for, but the expectation is not.
+X			*/
+X			xpct += (jokermode == True) ? 46 : 50;
+X			break;
+X		case 2:		/* low die is a deuce */
+X			/*
+X			**	To assemble here, we need an ACE or a 6.  The
+X			**	first is accounted for, the second is not.  Both
+X			**	carry additional expectation.
+X			*/
+X			if(jokermode == True)
+X				any += 0.153846, all += 0.153846, xpct += 92;
+X			else
+X				any += 0.166667, all += 0.166667, xpct += 100;
+X			break;
+X		case 3:		/* low die is a three */
+X			/*
+X			**	To assemble here, we need a 2.  The probability
+X			**	and additional expectation are unaccounted for.
+X			*/
+X			if(jokermode == True)
+X				any += 0.153846, all += 0.153846, xpct += 53;
+X			else
+X				any += 0.166667, all += 0.166667, xpct += 58;
+X			break;
+X		default:	/* not holding small straight */
+X			break;
+X		}
+X		break;
+X	}
+X#endif	ASMSTR
+X
+X	/*
+X	**	Add the value of keeping what we've got.
+X	*/
+X	xpct += any * pd->d_pts_turn;
+X
+X	/*
+X	**	Add the value of getting to roll all dice again.
+X	**	This is probably the most faulty estimate due to the way
+X	**	we make use of r_e_mix and p_nothing * xpct.
+X	*/
+X	pr = &risktbl[NDICE];
+X	xpct = xpct + all * (pr->r_e_mix - (1.0 - pr->r_p_any) * xpct);
+X
+X	return (int)xpct;
+X}
+X
+X/*
+X**	ziprisk: return the probability of rolling nothing
+X**		assumes that rolling zero really means rolling all
+X*/
+Xdouble
+Xziprisk(pd)
+Xregister diceset   *pd;
+X{
+X	double			any;
+X
+X	/*
+X	**	Get the probability of anything assuming mixed dice held.
+X	*/
+X	any = risktbl[pd->d_rolling == 0 ? NDICE : pd->d_rolling].r_p_any;
+X
+X	/*
+X	**	Check for all held/scoring dice having same (usu. non-scoring) face.
+X	**	We count both Previous and scoring dice.
+X	*/
+X	if(pd->d_rolling != 0 && pd->d_rolling != NDICE)
+X		if(sameface(pd, Nothing, True) == True)
+X			any += risktbl[pd->d_rolling].r_p_aok;
+X
+X	return 1.0 - any;
+X}
+X
+X/*
+X**	mayendearly: return True if the game may end prematurely
+X**		(no human player is onboard == True)
+X*/
+Xboolean
+Xmayendearly()
+X{
+X	register int	c;
+X
+X	for(c = 0;c < PLAYERS;++c)
+X		if(plr[c].p_stat == Active && plr[c].p_onboard == True)
+X			return False;
+X	
+X	return True;
+X}
+X
+X/*
+X**	cfirst: hesitation before first roll
+X*/
+Xcfirst(comp)
+Xint		comp;
+X{
+X	int		high, half;
+X	int		winneed, halfneed;
+X
+X#define	QUIT	(winscore / 4)
+X
+X	/*
+X	**	Fake human-like hesitation for kamelion and proxies.
+X	**	Otherwise, just allow time for screen update.
+X	*/
+X	if(iskamelion(comp) == True || isproxy(comp) == True)
+X		hesitate(1800L, 3600L);
+X	else
+X		hesitate(1500L, 2000L);
+X
+X	/*
+X	**	If this player is not yet on board, and
+X	**	if this is not the COMP computer and also not a proxy player, and
+X	**	if this player is behind by more than QUIT points, and
+X	**	if the game is in little danger of ending prematurely, and
+X	**	if this player's score is less than half of its average score, and
+X	**	if this player needs more to reach half than the leader needs to win,
+X	**	then there is a probability of quitting that is initially 50%
+X	*/
+X	if(plr[comp].p_onboard == False) {
+X		if(iscomp(comp) == False && isproxy(comp) == False) {
+X			if((high = highscore(comp, (int *)0)) - plr[comp].p_score > QUIT) {
+X				hesitate(250L, 2000L);		/* fake consideration of quit */
+X				if(mayendearly() == False) {
+X					half = (winscore * histavgplr(comp)) / (2 * WINSCORE);
+X					if((halfneed = half - plr[comp].p_score) > 0) {
+X						if((winneed = winscore - high) < halfneed) {
+X							if(randint(2 * winneed) < halfneed) {
+X								oldplayer(comp);
+X								return -1;
+X							}
+X						}
+X					}
+X				}
+X			}
+X		}
+X	}
+X
+X	/*
+X	**	If this is a proxy computer, sometimes do more hesitating.
+X	*/
+X	if(isproxy(comp) == True)
+X		hesitate(100L, 1500L);
+X
+X	return 0;
+X
+X#undef	QUIT
+X}
+X
+X/*
+X**	snoop: make it look like a computer player is interested in rankings
+X**		It might be better to individualize this by putting calls
+X**		to the snooping routines in the temperament routines.  For now,
+X**		we'll just make some decisions based on computer temperament.
+X*/
+Xsnoop(comp)
+X{
+X	int				r;
+X	temper		   *ctemp;
+X	extern temper	te_robot, te_antsy, te_tracker, te_goalie;
+X	extern int		highscore(), closescore();
+X
+X	ctemp = plr[comp].p_computer->c_temper;
+X
+X	if(ctemp == &te_robot)
+X		return;
+X	
+X	if(ctemp == &te_antsy)
+X		r = peekhigh(comp, highscore);
+X	else if(ctemp == &te_tracker)
+X		r = peekhigh(comp, closescore);
+X	else if(ctemp == &te_goalie) {
+X		r = randint(3) == 1 ? myrank(comp, False) : peekhigh(comp, highscore);
+X	} else switch(randint(5)) {
+X		case 1: r = aboveme(comp, False); break;
+X		case 2: r = belowme(comp, False); break;
+X		case 3: r = peekhigh(comp, highscore); break;
+X		case 4: r = peekhuman(comp); break;
+X		default:r = myrank(comp, False); break;
+X	}
+X
+X	/*
+X	**	Pretend to consider the ranking info.
+X	*/
+X	if(r >= 0)
+X		hesitate(1000L, 3000L);
+X}
+X
+X/*
+X**	peekhigh: look at the high scorer's history
+X**		If there's a tie, don't bother.
+X*/
+Xpeekhigh(comp, track)
+Xint		comp;
+Xint	  (*track)();
+X{
+X	int		highc;
+X
+X	(void) (*track)(comp, &highc);
+X	if(highc < 0)
+X		return -1;
+X	return plrrank(comp, highc, False);
+X}
+X
+X/*
+X**	peekhuman: look at a random human's history
+X*/
+Xpeekhuman(comp)
+X{
+X	register int	c, pick;
+X	extern int		active, waiting, watching;
+X
+X	pick = randint(active + waiting + watching);
+X
+X	for(c = 0;c < PLAYERS;++c) {
+X		switch(plr[c].p_stat) {
+X		case Active:
+X		case Waiting:
+X		case Watching:
+X			if(--pick == 0)
+X				return plrrank(comp, c, False);
+X			break;
+X		}
+X	}
+X
+X	return -1;	/* huh? */
+X}
+END_OF_FILE
+if test 16470 -ne `wc -c <'risk.c'`; then
+    echo shar: \"'risk.c'\" unpacked with wrong size!
+fi
+# end of 'risk.c'
+fi
+if test -f 'strategies.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'strategies.c'\"
+else
+echo shar: Extracting \"'strategies.c'\" \(14014 characters\)
+sed "s/^X//" >'strategies.c' <<'END_OF_FILE'
+X/*	vi:set sw=4 ts=4: */
+X#ifndef	lint
+Xstatic char	sccsid[] = "@(#)strategies.c 5.1 (G.M. Paris) 89/01/22";
+X#endif	lint
+X
+X/*
+X**
+X**	cubes 5.1  Copyright 1989 Gregory M. Paris
+X**		Permission granted to redistribute on a no charge basis.
+X**		All other rights are reserved.
+X**
+X*/
+X
+X#include	<stdio.h>
+X#include	<syslog.h>
+X#include	"cubes.h"
+X
+Xextern boolean	jokermode;
+Xextern boolean	sameface();
+Xextern char	   *malloc();
+X
+X#define	P_HAND	(NDICE * P_ACE)		/* a threshold */
+X
+X/*
+X**	basic: (formerly) the most basic strategy
+X*/
+Xstatic
+Xbasic(pd, need)
+Xdiceset	   *pd;
+Xint			need;
+X{
+X	/*
+X	**	The basic strategy doesn't use need.
+X	*/
+X#ifdef	lint
+X	need = need;
+X#endif	lint
+X
+X	/*
+X	**	Respect a complete dice set.
+X	*/
+X	if(pd->d_rolling == 0)
+X		return;
+X
+X	/*
+X	**	If we're one away from All_of_a_kind, we're done.
+X	*/
+X	if(pd->d_rolling == 1) {
+X		if(sameface(pd, Ace, True) == True)
+X			return;
+X		if(sameface(pd, Five, True) == True)
+X			return;
+X		if(jokermode == True && sameface(pd, Joker, True) == True)
+X			return;
+X	}
+X
+X	/*
+X	**	Discard Jokers and Fives.
+X	*/
+X	if(jokermode == True)
+X		nojokers(pd);
+X	nofives(pd);
+X}
+X
+X/*
+X**	merrier: the more dice to throw, the merrier
+X*/
+Xstatic
+Xmerrier(pd, need)
+Xdiceset	   *pd;
+Xint			need;
+X{
+X	diceset	temp;
+X
+X	/*
+X	**	The merrier strategy doesn't use need.
+X	*/
+X#ifdef	lint
+X	need = need;
+X#endif	lint
+X
+X	/*
+X	**	Respect a complete dice set.
+X	*/
+X	if(pd->d_rolling == 0)
+X		return;
+X
+X	/*
+X	**	Discard Jokers, Fives, and Aces if the result is three or more dice.
+X	*/
+X	temp = *pd;
+X	if(jokermode == True)
+X		nojokers(&temp);
+X	nofives(&temp);
+X	noaces(&temp);
+X	if(temp.d_rolling >= THREE)
+X		*pd = temp;
+X}
+X
+X/*
+X**	respect: Respect the power of the Ace.
+X*/
+Xstatic
+Xrespect(pd, need)
+Xdiceset	   *pd;
+Xint			need;
+X{
+X	diceset	temp;
+X
+X	/*
+X	**	We've completed all dice.  Try discarding Jokers and Fives.
+X	**	If the result is one die to roll and all Aces showing,
+X	**	then do it -- going for All_of_a_kind in Aces.
+X	*/
+X	if(pd->d_rolling == 0) {
+X		if(need > 0 && need < P_ACEMULT * P_AOKMULT)
+X			return;
+X		if(pd->d_pts_turn >= P_HAND)
+X			return;
+X		temp = *pd;
+X		if(jokermode == True)
+X			nojokers(&temp);
+X		nofives(&temp);
+X		if(temp.d_rolling == 1 && sameface(&temp, Ace, True) == True)
+X			*pd = temp;
+X		return;
+X	}
+X
+X	/*
+X	**	Don't discard Aces if we're one away from All_of_a_kind.
+X	*/
+X	if(pd->d_rolling == 1)
+X		if(sameface(pd, Ace, True) == True)
+X			return;
+X
+X	/*
+X	**	If we've got some points accumulated, we must be a bit desperate
+X	**	to want to roll again.  Improve our chances of getting something
+X	**	by scrapping junky Small_straights, freeing an Ace.
+X	*/
+X	if(pd->d_best == Small_straight)
+X		if(need > P_SMSTR || (need == 0 && pd->d_pts_turn > P_SMSTR))
+X			noacesmall(pd);
+X
+X	/*
+X	**	Get rid of 3o'kind in deuces.  Scrap Jokers and Fives.
+X	*/
+X	if(pd->d_best == Three_of_a_kind)
+X		no3deuce(pd);
+X	if(jokermode == True)
+X		nojokers(pd);
+X	nofives(pd);
+X
+X	/*
+X	**	Discard Aces if we end up with three or more dice.
+X	*/
+X	temp = *pd;
+X	noaces(&temp);
+X	if(temp.d_rolling >= THREE)
+X		*pd = temp;
+X}
+X
+X/*
+X**	twohater: doesn't like 3o'kind in twos
+X*/
+Xstatic
+Xtwohater(pd, need)
+Xdiceset	   *pd;
+Xint			need;
+X{
+X	/*
+X	**	The twohater strategy doesn't use need.
+X	*/
+X#ifdef	lint
+X	need = need;
+X#endif	lint
+X
+X	/*
+X	**	Respect completed dice set.
+X	*/
+X	if(pd->d_rolling == 0)
+X		return;
+X
+X	/*
+X	**	Hates Jokers even more than 3o'kind in twos.
+X	*/
+X	if(jokermode == True)
+X		nojokers(pd);
+X
+X	/*
+X	**	Prefers Fives and Aces over 3o'kind in twos.
+X	*/
+X	if(pd->d_best == Three_of_a_kind)
+X		no3deuce(pd);
+X
+X	/*
+X	**	Discard Fives, but only discard Aces if
+X	**	we're already rolling more than one die.
+X	*/
+X	nofives(pd);
+X	if(pd->d_rolling > 1)
+X		noaces(pd);
+X}
+X
+X/*
+X**	greedy: Tries for All_of_a_kind in Aces, Fives, and Jokers.
+X*/
+Xstatic
+Xgreedy(pd, need)
+Xdiceset	   *pd;
+Xint			need;
+X{
+X	diceset	temp;
+X	int		d, held, jokers;
+X
+X	/*
+X	**	We've completed all dice.  If a single discard can get us
+X	**	closer to All_of_a_kind in Aces, Fives or Jokers, do it.
+X	*/
+X	if(pd->d_rolling == 0) {
+X		if(pd->d_pts_turn >= P_HAND)
+X			return;
+X
+X		/*
+X		**	Discard Fives and Aces.  Check for all Jokers.
+X		*/
+X		if(jokermode == True) {
+X			if(need > 0 && need < P_JOKERMULT * P_AOKMULT)
+X				return;
+X			temp = *pd;
+X			nofives(&temp);
+X			noaces(&temp);
+X			if(temp.d_rolling == 1 && sameface(&temp, Joker, True) == True) {
+X				*pd = temp;
+X				return;
+X			}
+X		}
+X
+X		/*
+X		**	Discard Jokers and Fives.  Check for all Aces.
+X		*/
+X		if(need > 0 && need < P_ACEMULT * P_AOKMULT)
+X			return;
+X		temp = *pd;
+X		if(jokermode == True)
+X			nojokers(&temp);
+X		nofives(&temp);
+X		if(temp.d_rolling == 1 && sameface(&temp, Ace, True) == True) {
+X			*pd = temp;
+X			return;
+X		}
+X
+X		/*
+X		**	Discard Jokers and Aces.  Check for all Fives.
+X		*/
+X		if(need > 0 && need < FIVE * P_AOKMULT)
+X			return;
+X		temp = *pd;
+X		if(jokermode == True)
+X			nojokers(&temp);
+X		noaces(&temp);
+X		if(temp.d_rolling == 1 && sameface(&temp, Five, True) == True) {
+X			*pd = temp;
+X			return;
+X		}
+X
+X		return;
+X	}
+X
+X	/*
+X	**	On the first roll, if we have the choice between holding Jokers
+X	**	and Fives, choose the Jokers -- going for AOK in Jokers.
+X	*/
+X	if(jokermode == True) {
+X		if(need == 0 || need >= P_JOKERMULT * P_AOKMULT) {
+X			if(pd->d_pts_turn == 0 && pd->d_best == Five) {
+X				held = jokers = 0;
+X				for(d = 0;d < NDICE;++d) {
+X					switch(pd->d_comb[d]) {
+X					case Previous:	++held; break;
+X					case Joker:		++jokers; break;
+X					}
+X				}
+X				if(held == 0 && jokers > 0)
+X					nofives(pd);
+X				return;
+X			}
+X		}
+X	}
+X
+X	/*
+X	**	Small_straights make getting 5o'kind difficult, but if
+X	**	ASMSTR is defined, they can be converted to Straights,
+X	**	giving us another chance with all dice.  The Small_straight
+X	**	containing an Ace is the most difficult to convert.
+X	**	If no ASMSTR, discard all Small_straights, otherwise
+X	**	discard only the tough kind.
+X	*/
+X	if(pd->d_best == Small_straight) {
+X#ifdef	ASMSTR
+X		noacesmall(pd);		/* this kind too hard to convert */
+X#else	ASMSTR
+X		nosmall(pd);		/* don't like any Small_straights */
+X#endif	ASMSTR
+X		return;
+X	}
+X
+X	/*
+X	**	Try to get all Aces showing.  If we can, we're done.
+X	*/
+X	temp = *pd;
+X	if(temp.d_best == Three_of_a_kind) {
+X		no3three(&temp);
+X		if(temp.d_best == Three_of_a_kind)
+X			no3deuce(&temp);
+X	}
+X	nofives(&temp);
+X	if(jokermode == True)
+X		nojokers(&temp);
+X	if(sameface(&temp, Ace, True) == True) {
+X		*pd = temp;
+X		return;
+X	}
+X
+X	/*
+X	**	Try to get all Fives showing.  If we can, we're done.
+X	*/
+X	if(need == 0 || need >= FIVE * P_AOKMULT) {
+X		temp = *pd;
+X		if(temp.d_best == Three_of_a_kind) {
+X			no3three(&temp);
+X			if(temp.d_best == Three_of_a_kind)
+X				no3deuce(&temp);
+X		}
+X		noaces(&temp);
+X		if(jokermode == True)
+X			nojokers(&temp);
+X		if(sameface(&temp, Five, True) == True) {
+X			*pd = temp;
+X			return;
+X		}
+X	}
+X
+X	/*
+X	**	Try to get all Jokers showing.  If we can, we're done.
+X	*/
+X	if(jokermode == True) {
+X		if(need == 0 || need >= P_JOKERMULT * P_AOKMULT) {
+X			temp = *pd;
+X			if(temp.d_best == Three_of_a_kind) {
+X				no3three(&temp);
+X				if(temp.d_best == Three_of_a_kind)
+X					no3deuce(&temp);
+X			}
+X			noaces(&temp);
+X			nofives(&temp);
+X			if(sameface(&temp, Joker, True) == True) {
+X				*pd = temp;
+X				return;
+X			}
+X		}
+X	}
+X
+X	/*
+X	**	Discard Jokers and Fives.
+X	**	Discard Aces if the result is three or more dice.
+X	*/
+X	if(jokermode == True)
+X		nojokers(pd);
+X	nofives(pd);
+X	temp = *pd;
+X	noaces(&temp);
+X	if(temp.d_rolling >= THREE)
+X		*pd = temp;
+X}
+X
+X/*
+X**	picky: be picky about what we'll keep
+X*/
+Xstatic
+Xpicky(pd, need)
+Xdiceset	   *pd;
+Xint			need;
+X{
+X	diceset	temp;
+X
+X	/*
+X	**	Respect a completed dice set.
+X	*/
+X	if(pd->d_rolling == 0)
+X		return;
+X
+X	/*
+X	**	Don't like 3o'kind in twos or threes.
+X	*/
+X	if(pd->d_best == Three_of_a_kind) {
+X		if(need == 0 || need > THREE * P_3OKMULT) {
+X			no3three(pd);
+X			if(pd->d_best == Three_of_a_kind)
+X				if(need == 0 || need > DEUCE * P_3OKMULT)
+X					no3deuce(pd);
+X		}
+X	}
+X
+X	/*
+X	**	We've got held Aces, discard Jokers and Fives.
+X	**	If not all Aces showing, discard Aces too.
+X	*/
+X	if(need == 0 || need >= P_ACEMULT * P_AOKMULT) {
+X		if(sameface(pd, Ace, False) == True) {
+X			if(jokermode == True)
+X				nojokers(pd);
+X			nofives(pd);
+X			if(sameface(pd, Ace, True) == False)
+X				noaces(pd);
+X			return;
+X		}
+X	}
+X	
+X	/*
+X	**	We've got held Fives, discard Jokers and Aces.
+X	**	If not all Fives showing, discard Fives too.
+X	*/
+X	if(need == 0 || need >= FIVE * P_AOKMULT) {
+X		if(sameface(pd, Five, False) == True) {
+X			if(jokermode == True)
+X				nojokers(pd);
+X			noaces(pd);
+X			if(sameface(pd, Five, True) == False)
+X				nofives(pd);
+X			return;
+X		}
+X	}
+X
+X	/*
+X	**	We've got held Jokers, discard Fives and Aces.
+X	**	If not all Jokers showing, discard Jokers too.
+X	*/
+X	if(jokermode == True) {
+X		if(need == 0 || need >= P_JOKERMULT * P_AOKMULT) {
+X			if(sameface(pd, Joker, False) == True) {
+X				nofives(pd);
+X				noaces(pd);
+X				if(sameface(pd, Joker, True) == False)
+X					nojokers(pd);
+X				return;
+X			}
+X		}
+X	}
+X	
+X	/*
+X	**	We're holding a mix or nothing.  Discard Jokers.
+X	**	Discard Fives and Aces if the result is three or more dice.
+X	*/
+X	if(jokermode == True)
+X		nojokers(pd);
+X	temp = *pd;
+X	nofives(&temp);
+X	noaces(&temp);
+X	if(temp.d_rolling >= THREE)
+X		*pd = temp;
+X}
+X
+X/*
+X**	finicky: a pickier picky
+X*/
+Xstatic
+Xfinicky(pd, need)
+Xdiceset	   *pd;
+Xint			need;
+X{
+X	diceset	temp;
+X
+X	/*
+X	**	Respect a completed set of dice.
+X	*/
+X	if(pd->d_rolling == 0)
+X		return;
+X
+X	/*
+X	**	Discard three twos and Small_straights containing an Ace.
+X	*/
+X	if(pd->d_best == Three_of_a_kind)
+X		if(need == 0 || need > DEUCE * P_3OKMULT)
+X			no3deuce(pd);
+X	if(pd->d_best == Small_straight)
+X		if(need == 0 || need > P_SMSTR)
+X			noacesmall(pd);
+X	
+X	/*
+X	**	We've held all Aces.  Discard Jokers and Fives.
+X	**	If rolling more than one die, discard Aces too.
+X	*/
+X	if(sameface(pd, Ace, False) == True) {
+X		if(jokermode == True)
+X			nojokers(pd);
+X		nofives(pd);
+X		if(pd->d_rolling > 1)
+X			noaces(pd);
+X		return;
+X	}
+X	
+X	/*
+X	**	We've held all Fives.  Discard Jokers and Aces.
+X	**	If rolling more than one die, discard Fives too.
+X	*/
+X	if(need == 0 || need >= FIVE * P_AOKMULT) {
+X		if(sameface(pd, Five, False) == True) {
+X			if(jokermode == True)
+X				nojokers(pd);
+X			noaces(pd);
+X			if(pd->d_rolling > 1)
+X				nofives(pd);
+X			return;
+X		}
+X	}
+X	
+X	/*
+X	**	We've held all Jokers.  Discard Fives and Aces.
+X	**	If we're rolling more than one die, discard Jokers too.
+X	**	Else, if it will give us three dice, discard Jokers.
+X	*/
+X	if(jokermode == True) {
+X		if(need == 0 || need >= P_JOKERMULT * P_AOKMULT) {
+X			if(sameface(pd, Joker, False) == True) {
+X				nofives(pd);
+X				noaces(pd);
+X				if(pd->d_rolling > 1)
+X					nojokers(pd);
+X				else {
+X					temp = *pd;
+X					nojokers(&temp);
+X					if(temp.d_rolling >= THREE)
+X						*pd = temp;
+X				}
+X				return;
+X			}
+X		}
+X	}
+X	
+X	/*
+X	**	Holding a mix or nothing.  Discard Jokers and Fives.
+X	**	If we're rolling more than one, discard Aces too.
+X	**	Else, if we can get three dice, discard Aces.
+X	**	Else, discard 3o'kind in threes.
+X	*/
+X	if(jokermode == True)
+X		nojokers(pd);
+X	nofives(pd);
+X	if(pd->d_rolling > 1)
+X		noaces(pd);
+X	else {
+X		temp = *pd;
+X		noaces(&temp);
+X		if(temp.d_rolling >= THREE)
+X			*pd = temp;
+X		else if(pd->d_best == Three_of_a_kind)
+X			no3three(pd);
+X	}
+X}
+X
+X/*
+X**	holdall: hold all scoring dice
+XXXX:	Intended for choosy selection only -- not a valid strategy.
+X*/
+Xstatic
+Xholdall(pd, need)
+Xdiceset	   *pd;
+Xint			need;
+X{
+X#ifdef	lint
+X	pd = pd;
+X	need = need;
+X#endif	lint
+X}
+X
+X/*
+X**	tossall: always throw maximum number of dice
+XXXX:	Intended for choosy selection only -- not a valid strategy.
+X*/
+Xstatic
+Xtossall(pd, need)
+Xdiceset	   *pd;
+Xint			need;
+X{
+X#ifdef	lint
+X	need = need;
+X#endif	lint
+X
+X	/*
+X	**	Discard Small_straights, all Three_of_a_kinds, Jokers, Fives, and Aces.
+X	**	We never honor a complete dice set!
+X	*/
+X	if(pd->d_best == Small_straight)
+X		nosmall(pd);
+X	if(pd->d_best == Three_of_a_kind)
+X		no3any(pd);
+X	if(jokermode == True)
+X		nojokers(pd);
+X	nofives(pd);
+X	noaces(pd);
+X}
+X
+X/*
+X**	choosy: try all known strategies then pick the one
+X**		with the best expectation for this diceset
+X*/
+Xstatic
+Xchoosy(pd, need)
+Xdiceset	   *pd;
+Xint			need;
+X{
+X	register int		n, best, maxx;
+X	diceset				temp;
+X	static int		   *xtbl	= 0;
+X	extern int			strategies;
+X	extern strategy	   *strattbl[];
+X
+X	if(xtbl == 0) {
+X		xtbl = (int *)malloc((unsigned)(strategies * sizeof *xtbl));
+X		if(xtbl == 0) {
+X			syslog(LOG_WARNING, "choosy: no memory for xtbl");
+X			fickle(pd, need);	/* emergency backup! */
+X			return;
+X		}
+X	}
+X
+X	for(n = 0;n < strategies - 1;++n) {	/* fickle is last */
+X		if(strattbl[n]->s_func == choosy) {
+X			*(xtbl+n) = -WINSCORE;
+X			continue;
+X		}
+X		temp = *pd;
+X		(*strattbl[n]->s_func)(&temp, need);
+X		*(xtbl+n) = expect(&temp);
+X	}
+X
+X	maxx = *(xtbl+(best=0));
+X	for(n = 1;n < strategies - 1;++n)	/* fickle is last */
+X		if(*(xtbl+n) > maxx)
+X			maxx = *(xtbl+(best=n));
+X
+X	(*strattbl[best]->s_func)(pd, need);
+X}
+X
+X/*
+X**	kamelion: should never be called
+X*/
+Xstatic
+Xkamelion(pd, need)
+Xdiceset	   *pd;
+Xint			need;
+X{
+X	syslog(LOG_WARNING, "kamelion strategy called!");
+X	choosy(pd, need);
+X}
+X
+X/*
+X**	fickle: pick another strategy randomly!
+X**		intended for proxy players only
+X*/
+Xstatic
+Xfickle(pd, need)
+Xdiceset	   *pd;
+Xint			need;
+X{
+X	int					n;
+X	extern int			strategies;
+X	extern strategy	   *strattbl[];
+X
+X	hesitate(100L, 1000L);
+X	n = randint(strategies - 1) - 1;	/* this one is last -- don't pick it */
+X	(*strattbl[n]->s_func)(pd, need);
+X}
+X
+X/*
+X**	strattbl: table listing available strategies
+X*/
+X
+Xstrategy		st_basic	= { basic,		"basic" };
+Xstrategy		st_merrier	= { merrier,	"merrier" };
+Xstrategy		st_respect	= { respect,	"respect" };
+Xstrategy		st_twohater	= { twohater,	"twohater" };
+Xstrategy		st_greedy	= { greedy,		"greedy" };
+Xstrategy		st_picky	= { picky,		"picky" };
+Xstrategy		st_finicky	= { finicky,	"finicky" };
+Xstatic strategy	st_holdall	= { holdall,	"holdall" };	/* table only */
+Xstatic strategy	st_tossall	= { tossall,	"tossall" };	/* table only */
+Xstrategy		st_choosy	= { choosy,		"choosy" };
+Xstrategy		st_fickle	= { fickle,		"fickle" };
+Xstrategy		st_kamelion	= { kamelion,	"kamelion" };	/* semi-dummy */
+X
+Xstrategy   *strattbl[]	= {
+X	&st_basic, &st_merrier, &st_respect, &st_twohater,
+X	&st_greedy, &st_picky, &st_finicky,
+X	&st_holdall, &st_tossall, &st_choosy,
+X	&st_fickle		/* st_fickle must be last */
+X};
+X
+Xint	strategies	= sizeof strattbl / sizeof strattbl[0];
+END_OF_FILE
+if test 14014 -ne `wc -c <'strategies.c'`; then
+    echo shar: \"'strategies.c'\" unpacked with wrong size!
+fi
+# end of 'strategies.c'
+fi
+echo shar: End of archive 7 \(of 8\).
+cp /dev/null ark7isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 8 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

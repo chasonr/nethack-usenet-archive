@@ -1,0 +1,1453 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,349d954739c5b56,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-12-21 06:24:31 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!decvax!duke!mcnc!ecsvax!emigh
+From: emigh@ecsvax.UUCP
+Newsgroups: net.sources
+Subject: Latest version of UC.C (UNIX-CP/M file transfer shell)
+Message-ID: <1738@ecsvax.UUCP>
+Date: Wed, 21-Dec-83 09:24:31 EST
+Article-I.D.: ecsvax.1738
+Posted: Wed Dec 21 09:24:31 1983
+Date-Received: Tue, 27-Dec-83 03:19:21 EST
+Lines: 1435
+
+Following is the latest version of UC.C (UNIX(tm) to CP/M file transfer
+shell) which corrects a minor bug.  To extract the program, delete this
+header and run through the shell.  The program was written by Rick Conn
+(...!ucbvax!rconn@brl).  The manual page previously posted is still valid.
+	Ted H. Emigh
+	mcnc!ecsvax!emigh
+------------------------------------------------------------------------
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting uc.c'
+sed 's/^X//' <<'//go.sysin dd *' >uc.c
+X/*
+ *  UC - a UNIX-to-CP/M file transfer shell
+ *	by Richard Conn
+ *
+ *  UC is based on ideas from UMODEM 3.5, where UMODEM was originally written
+ *  by Lauren Weinstein, and was mutated by Richard Conn, Bennett Marks,
+ *  Michael Rubenstein, Ben Goldfarb, David Hinnant, and Lauren Weinstein
+ *  into version 3.5.  UC is a totally new design, including many features
+ *  of similar function but different implementation and adding many new
+ *  features and both a menu-driven and command-completion user interface.
+ *
+ *  UC is a rather complete rewrite of the UMODEM program, with emphasis
+ *  on implementation as a "pseudo-shell".
+ *
+ */
+
+#define	versmaj	1	/* Major Version */
+#define	versmin	4	/* Minor Version */
+
+X/*  Basics  */
+#define	FALSE	0
+#define	TRUE	~FALSE
+
+X/*  ASCII Characters  */
+#define	SOH	001
+#define	STX	002
+#define	ETX	003
+#define	EOT	004
+#define	ENQ	005
+#define	ACK	006
+#define	LF	012
+#define	CR	015
+#define	NAK	025
+#define	SYN	026
+#define	CAN	030
+#define	CTRLZ	032
+#define	ESC	033
+
+X/*  UC Constants  */
+#define	TO	-1		/* Timeout Flag */
+#define	ERRMAX	10		/* Max errors tolerated */
+#define	BLOCKSZ	128		/* Size of transmission block */
+#define	CREATE	0644		/* Mode for New Files */
+#define	LOGFILE	"uc.log"	/* Log File */
+#define	CFGFILE	".ucsetup"	/* Configuration File */
+#define	DBGFILE	"uc.debug"	/* Debug File */
+
+X/*  UC Defaults  */
+#define	defarpa	FALSE		/* Not Using ARPA Net */
+#define	defmenu	FALSE		/* Menu */
+#define	defftp	3		/* FTP */
+#define	deflog	TRUE		/* Log to Disk? */
+#define	defbit7	FALSE		/* 7-Bit Transfer? */
+
+X/*  Library Utilities  */
+#include	<stdio.h>
+#include	<sys/types.h>
+#include	<sys/stat.h>
+#include	<sgtty.h>
+#include	<signal.h>
+#include	<ctype.h>
+
+X/*  Configuration Structure  */
+struct environ {
+	char filetype;	/* text or binary */
+	int ftp;	/* File Transfer Protocol */
+	int logflg;	/* log error summary to file */
+	int dbgflg;	/* debug output flag */
+	FILE *logfd;	/* file descriptor for log file */
+	FILE *dbgfd;	/* file descriptor for debug file */
+	int bit7;	/* allow only 7-bit transfers */
+	int menu;	/* menu for command mode */
+	int arpa;	/* negotiate binary on ARPA Net */
+}
+
+X/*  ARPA Net Constants  */
+X/*	The following constants are used to communicate with the ARPA
+ *	Net SERVER TELNET and TAC programs.  These constants are defined
+ *	as follows:
+ *		IAC			<-- Is A Command; indicates that
+ *						a command follows
+ *		WILL/WONT		<-- Command issued to SERVER TELNET
+ *						(Host); WILL issues command
+ *						and WONT issues negative of
+ *						the command
+ *		DO/DONT			<-- Command issued to TAC; DO issues
+ *						command and DONT issues
+ *						negative of the command
+ *		TRBIN			<-- Transmit Binary Command
+ *	Examples:
+ *		IAC WILL TRBIN	<-- Host is configured to transmit Binary
+ *		IAC WONT TRBIN	<-- Host is configured NOT to transmit binary
+ *		IAC DO TRBIN	<-- TIP is configured to transmit Binary
+ *		IAC DONT TRBIN	<-- TIP is configured NOT to transmit binary
+ */
+#define	     IAC	0377	/* Is A Command */
+#define	     DO		0375	/* Command to TAC */
+#define	     DONT	0376	/* Negative of Command to TAC */
+#define	     WILL	0373	/* Command to SERVER TELNET (Host) */
+#define	     WONT	0374	/* Negative of Command to SERVER TELNET */
+#define	     TRBIN	0	/* Transmit Binary Command */
+
+main (argc, argv)
+int argc;
+char *argv[];
+{
+	int sendflg, recvflg, statflg, cmndflg;	/* major functions */
+	int crckflg;				/* major function */
+	struct environ genv;			/* global environ */
+	FILE *fopen();				/* forward ref */
+
+	int index;	/* index for arg parsing loop */
+	char opt;	/* current option character */
+	char *getenv();	/* getenv function defn */
+	char logfile[50];	/* space for name of log file */
+	char cfgfile[50];	/* space for name of configuration file */
+	char dbgfile[50];	/* space for name of debug file */
+
+	/* Print Banner */
+	printf("UC Version %d.%d - UNIX-to-CP/M File Transfer Tool\n",
+	versmaj, versmin);
+
+	/* Check for Help Request */
+	if (argc == 1) {
+		help();
+		exit(0);
+	}
+
+	/* Determine Name of Log File */
+	strcat (logfile, getenv("HOME"));	/* Name of Home Dir */
+	strcat (logfile, "/");			/* Separator */
+	strcat (logfile, LOGFILE);		/* Name of Log File */
+
+	/* Determine Name of Configuration File */
+	strcat (cfgfile, getenv("HOME"));	/* Name of Home Dir */
+	strcat (cfgfile, "/");			/* Separator */
+	strcat (cfgfile, CFGFILE);		/* Name of Configuration File */
+
+	/* Determine Name of Debug File */
+	strcat (dbgfile, getenv("HOME"));	/* Name of Home Dir */
+	strcat (dbgfile, "/");		/* Separator */
+	strcat (dbgfile, DBGFILE);		/* Name of Debug File */
+
+	/* Set Defaults for ARPA Net, Menu, FTP, Logging, and 7/8-Bit Xfer */
+	genv.logflg = deflog;
+	genv.dbgflg = FALSE;			/* Debug Off */
+	genv.bit7 = defbit7;
+	genv.ftp = defftp;
+	genv.menu = defmenu;
+	genv.arpa = defarpa;
+	getdef (cfgfile, &genv);		/* Get Defs from File */
+
+	/* Init for Option Parsing */
+	sendflg = FALSE;
+	recvflg = FALSE;
+	statflg = FALSE;
+	crckflg = FALSE;
+	cmndflg = FALSE;
+
+	/* Process Options */
+	index = 0;
+	while ((opt = argv[1][index++]) != '\0')
+		switch (opt) {
+		case '-' :		/* skip dash */
+			break;
+		case '1' :
+			genv.ftp = 1;	/* select FTP 1 */
+			break;
+		case '3' :
+			genv.ftp = 3;	/* select FTP 3 */
+			break;
+		case '7' :
+			genv.bit7 = TRUE;	/* set 7 bits */
+			break;
+		case '8' :
+			genv.bit7 = FALSE;	/* set 8 bits */
+			break;
+		case 'A' :
+		case 'a' :
+			genv.arpa = TRUE;	/* set ARPA Net */
+			break;
+		case 'B' :
+		case 'b' :
+			genv.filetype = 'b';	/* set binary type */
+			break;
+		case 'C' :
+			crckflg = TRUE;	/* set crc check mode */
+			genv.filetype = 'b';	/* binary */
+			break;
+		case 'c' :
+			crckflg = TRUE;	/* set crc check mode */
+			genv.filetype = 't';	/* text */
+			break;
+		case 'D' :
+		case 'd' :
+			genv.dbgflg = ~genv.dbgflg;	/* flip flag */
+			break;
+		case 'F' :
+		case 'f' :
+			statflg = TRUE;	/* set file stat mode */
+			break;
+		case 'L' :
+		case 'l' :
+			genv.logflg = ~genv.logflg;  /* comp log */
+			break;
+		case 'R' :
+			recvflg = TRUE;	/* set file recv mode */
+			genv.filetype = 'b';
+			break;
+		case 'r' :
+			recvflg = TRUE;	/* set file recv mode */
+			genv.filetype = 't';
+			break;
+		case 'S' :
+			sendflg = TRUE;	/* set file send mode */
+			genv.filetype = 'b';
+			break;
+		case 's' :
+			sendflg = TRUE;	/* set file send mode */
+			genv.filetype = 't';
+			break;
+		case 'T' :
+		case 't' :
+			genv.filetype = 't';	/* set text file type */
+			break;
+		case 'Z' :
+		case 'z' :
+			cmndflg = TRUE;	/* set command mode */
+			break;
+		default :
+			printf("Invalid Option %c\n", opt);
+			break;
+		}
+
+	/* Open Debug File if Requested */
+	if (genv.dbgflg) {
+		genv.dbgfd = fopen(dbgfile, "w");
+		if (genv.dbgfd == NULL) {
+			printf("Can't Open Debug File\n");
+			exit(0);
+		}
+	}
+
+	/* Open Log File if Needed */
+	if ((sendflg || recvflg || cmndflg) && genv.logflg) {
+		genv.logfd = fopen(logfile, "w");
+		if (genv.logfd == NULL) {
+			printf("Can't Open Log File\n");
+			exit(0);
+		}
+	}
+
+	/* Select and Execute Major Mode */
+	if (cmndflg) {		/* Command Mode */
+		command(&genv);
+		if (genv.logflg) fclose(genv.logfd);
+		if (genv.dbgflg) fclose(genv.dbgfd);
+		exit(0);
+	}
+	if (statflg) {		/* File Status Display */
+		if (argc < 3) {
+			printf("File Name NOT Given\n");
+			exit(0);
+		}
+		genv.logflg = FALSE;	/* no logging right now */
+		fstat(&genv,argv[2]);
+		exit(0);
+	}
+	if (crckflg) {		/* CRC Check */
+		if (argc < 3) {
+			printf("File Name NOT Given\n");
+			exit(0);
+		}
+		if (genv.filetype == 't') crct(argv[2]);
+		else crcb(argv[2]);
+		exit(0);
+	}
+	if (sendflg) {		/* Send File */
+		if (argc < 3) {
+			printf("File Name NOT Given\n");
+			exit(0);
+		}
+		send(&genv,argv[2]);
+		if (genv.logflg) fclose(genv.logfd);
+		if (genv.dbgflg) fclose(genv.dbgfd);
+		exit(0);
+	}
+	if (recvflg) {		/* Receive File */
+		if (argc < 3) {
+			printf("File Name NOT Given\n");
+			exit(0);
+		}
+		recv(&genv,argv[2]);
+		if (genv.logflg) fclose(genv.logfd);
+		if (genv.dbgflg) fclose(genv.dbgfd);
+		exit(0);
+	}
+	printf("Major Mode NOT Selected\n");
+	help();
+	exit(0);
+}
+
+X/* Get Defaults from User's Configuration File, if Any */
+getdef (filename, env)
+char *filename;
+struct environ *env;
+{
+	FILE *fd;	/* File Descriptor */
+	FILE *fopen();	/* fopen Function */
+	int c;		/* Dummy Input Char */
+
+	/* Open File */
+	if ((fd = fopen (filename, "r")) == NULL) return;	/* no file */
+	printf("UC Configuration File %s\n", filename);
+
+	/* Read Loop */
+	while ((c = getc(fd)) != EOF)
+		switch (c) {
+		case '-' :
+			c = getc(fd);	/* get next char */
+			switch (c) {
+			case 'A' :
+			case 'a' :
+				env->arpa = FALSE;
+				break;
+			case 'L' :
+			case 'l' :
+				env->logflg = FALSE;
+				break;
+			case 'M' :
+			case 'm' :
+				env->menu = FALSE;
+				break;
+			default :
+				ungetc(fd,c);	/* put back */
+				break;
+			}
+			break;
+		case '!' :	/* Comment */
+			do {
+				c = getc(fd);	/* Flush Comment */
+			}
+			while (c != LF && c != EOF);
+			if (c == EOF) ungetc(fd,c);
+			break;
+		case '1' :
+			env->ftp = 1;
+			break;
+		case '3' :
+			env->ftp = 3;
+			break;
+		case '7' :
+			env->bit7 = TRUE;
+			break;
+		case '8' :
+			env->bit7 = FALSE;
+			break;
+		case 'A' :
+		case 'a' :
+			env->arpa = TRUE;
+		case 'L' :
+		case 'l' :
+			env->logflg = TRUE;
+			break;
+		case 'M' :
+		case 'm' :
+			env->menu = TRUE;
+			break;
+		default :
+			break;
+		}
+
+	/* Close File */
+	fclose(fd);
+}
+
+X/* Print Help */
+help()
+{
+	printf("Usage:  uc c[o] [filename]\n");
+	printf("\n");
+	printf("where 'c' MUST be One of the Following Commands --\n");
+	printf("\tC -- CRC Check on Binary File (filename required)\n");
+	printf("\tc -- CRC Check on Text File (filename required)\n");
+	printf("\td or D -- Debug Output (to UC.DEBUG)\n");
+	printf("\tf or F -- File Status (filename required)\n");
+	printf("\tR -- Receive Binary File (filename required)\n");
+	printf("\tr -- Receive Text File (filename required)\n");
+	printf("\tS -- Send Binary File (filename required)\n");
+	printf("\ts -- Send Text File (filename required)\n");
+	printf("\tz or Z -- Enter Command Mode (filename NOT required)\n");
+	printf("\n");
+	printf("and Additional Options 'o' Include --\n");
+	printf("\t1 -- Select File Transfer Protocol 1\n");
+	printf("\t7 -- Select 7-Bit Transfer\n");
+	printf("\ta or A -- Enable ARPA Net Communication\n");
+	printf("\tb or B -- Override 'c', 's', or 'r' to Binary\n");
+	printf("\tl or L -- Turn Off Log Entries\n");
+	printf("\tt or T -- Override 'C', 'S', or 'R' to Text\n");
+	printf("\n");
+	printf("Examples:\n");
+	printf("\tuc S myfile -or- uc sb myfile	<-- Send Binary File\n");
+	printf("\tuc s7l myfile	<-- Send Text File with 7 Bits and No Log\n");
+}
+
+X/* Command Mode */
+command(env)
+struct environ *env;
+{
+	int charx(), chelp();
+	int running;
+	int tlogflg;
+	char c, uline[200], cline[200];
+
+	printf("UC Command Mode -- Type 'h' for Help\n");
+	running = TRUE;
+	while (running) {
+		if (env->menu) chelp();
+		printf("UC Command? ");
+		switch (c = charx()) {
+		case CR :
+			printf("\n");
+			break;
+		case '1' :
+			env->ftp = 1;
+			printf("FTP 1\n");
+			break;
+		case '3' :
+			env->ftp = 3;
+			printf("FTP 3\n");
+			break;
+		case '7' :
+			env->bit7 = TRUE;
+			printf("7-Bit Transmission\n");
+			break;
+		case '8' :
+			env->bit7 = FALSE;
+			printf("8-Bit Transmission\n");
+			break;
+		case 'A' :
+		case 'a' :
+			env->arpa = ~env->arpa;
+			printf("ARPA Net Communication %s\n",
+				env->arpa ? "Enabled" : "Disabled");
+			break;
+		case 'C' :
+			printf("CRC of Binary File (file name) ");
+			gets(uline);
+			if (uline[0]) crcb(uline);
+			break;
+		case 'c' :
+			printf("CRC of Text File (file name) ");
+			gets(uline);
+			if (uline[0]) crct(uline);
+			break;
+		case 'D' :
+		case 'd' :
+			printf("Directory of (dir or file spec) ");
+			gets(uline);
+			cline[0] = '\0';
+			strcat (cline, "dir ");
+			strcat (cline, uline);
+			system(cline);
+			break;
+		case 'E' :
+		case 'e' :
+			printf("Transmission Environment\n");
+			printf("\tFile Transfer Protocol %c\n",
+			env->ftp==1 ? '1' : '3');
+			printf("\t%c-Bit Transfer\n",
+			env->bit7 ? '7' : '8');
+			printf("\tARPA Net Communication %s\n",
+			env->arpa ? "Enabled" : "Disabled");
+			break;
+		case 'F' :
+		case 'f' :
+			printf("File Status of (file name) ");
+			gets(uline);
+			tlogflg = env->logflg;
+			env->logflg = FALSE;
+			if (uline[0]) fstat(env,uline);
+			env->logflg = tlogflg;
+			break;
+		case '?' :
+		case '/' :
+		case 'H' :
+		case 'h' :
+			printf("\n");
+			chelp();
+			break;
+		case 'L' :
+		case 'l' :
+			printf("Login (directory) ");
+			gets(uline);
+			if (uline[0]) chdir(uline);
+			system("pwd");
+			break;
+		case 'M' :
+		case 'm' :
+			env->menu = ~env->menu;	/* toggle menu */
+			printf("Menu %s\n", env->menu ? "ON" : "OFF");
+			break;
+		case 'R' :
+			env->filetype = 'b';
+			env->bit7 = FALSE;
+			printf("Receive Binary File (file name) ");
+			gets(uline);
+			if (uline[0]) recv(env,uline);
+			printf("\n");
+			break;
+		case 'r' :
+			env->filetype = 't';
+			printf("Receive Text File (file name) ");
+			gets(uline);
+			if (uline[0]) recv(env,uline);
+			printf("\n");
+			break;
+		case 'S' :
+			env->filetype = 'b';
+			env->bit7 = FALSE;
+			printf("Send Binary File (file name) ");
+			gets(uline);
+			if (uline[0]) send(env,uline);
+			printf("\n");
+			break;
+		case 's' :
+			env->filetype = 't';
+			printf("Send Text File (file name) ");
+			gets(uline);
+			if (uline[0]) send(env,uline);
+			printf("\n");
+			break;
+		case 'X':
+		case 'x' :
+			running = FALSE;
+			printf("Exit\n");
+			break;
+		case 'Z' :
+		case 'z' :
+			printf("UNIX Command Line ");
+			printf("(command line) ");
+			gets(uline);
+			if (uline[0]) system(uline);
+			printf("\n");
+			break;
+		default :
+			printf("Invalid Command %c -- Type H for Help\n", c);
+			break;
+		}
+	}
+}
+
+X/* print help for command mode */
+chelp()
+{
+	printf("\t\t\t\tUC Command Summary\n");
+	printf("\n");
+	printf("\t------- Major Function -------    -- File Xfer Options --\n");
+	printf("\t c <file>  CRC Value of File      1 or 3  Select FTP\n");
+	printf("\t r <file>  Receive File           7 or 8  Select Bits\n");
+	printf("\t s <file>  Send File              a or A  Toggle ARPA Net\n");
+	printf("\t                                  e or E  Display Environ\n");
+	printf("\n");
+	printf("\t------- UNIX  Function -------    -------- Notes --------\n");
+	printf("\td <dir/file> Display Directory    Major Fct - if caps(C),\n");
+	printf("\tf <file>     File Size Info       binary file; if not(c),\n");
+	printf("\tl <dir>      Log Into Dir         text file\n");
+	printf("\tm            Toggle Menu\n");
+	printf("\tx            Exit to UNIX         UNIX Fct - either case\n");
+	printf("\tz            UNIX Command\n");
+	printf("\n");
+}
+
+X/* Send File */
+send(env,filename)
+struct environ *env;
+char *filename;
+{
+	FILE *fd, *fopen();
+	int blocknum;			/* Current Block Number */
+	int nlflg;			/* New Line for File Convert */
+	int sending;			/* Xmit In-Progress Flag */
+	int tries;			/* Attempt Count */
+	int bufctr;			/* Counter for Buffer Build */
+	int bitmask;			/* 7/8 Bit Mask */
+	int c;				/* Temp Char */
+	int rcode;			/* Return Code */
+	char buf[BLOCKSZ];		/* Buffer for Transfer */
+
+	/* Print Banner */
+	printf("UC Sending %s File: %s\n",
+		(env->filetype == 't') ? "Text" : "Binary",
+		filename);
+	if (env->logflg) fprintf(env->logfd,
+		"\nUC Sending %s File: %s\n",
+		(env->filetype == 't') ? "Text" : "Binary",
+		filename);
+	if (env->dbgflg) fprintf(env->dbgfd,
+		"\nUC Sending %s File: %s\n",
+		(env->filetype == 't') ? "Text" : "Binary",
+		filename);
+
+	/* Open File for Input and Print Opening Messages */
+	if ((fd = fopen(filename, "r")) == 0) {
+		printf("Can`t Open File %s for Send\n", filename);
+		if (env->logflg) fprintf(env->logfd,
+		"Can't Open File %s for Send\n", filename);
+		if (env->dbgflg) fprintf(env->dbgfd,
+		"Can't Open File %s for Send\n", filename);
+		return;
+	}
+	fstat(env,filename);	/* Print File Status Info */
+	printf("FTP %c, %c-Bit Transfer Selected\n",
+		(env->ftp == 1) ? '1' : '3',
+		env->bit7 ? '7' : '8');
+	if (env->logflg) fprintf(env->logfd,
+		"FTP %c, %c-Bit Transfer Selected\n",
+		(env->ftp == 1) ? '1' : '3',
+		env->bit7 ? '7' : '8');
+	if (env->dbgflg) fprintf(env->dbgfd,
+		"FTP %c, %c-Bit Transfer Selected\n",
+		(env->ftp == 1) ? '1' : '3',
+		env->bit7 ? '7' : '8');
+	printf("Ready to Send File\n");
+	binary(TRUE,TRUE);	/* Open Binary Communications */
+	if (env->arpa) setarpa();	/* Binary on ARPA Net? */
+	if (env->bit7) bitmask = 0x7f;
+	else bitmask = 0xff;
+
+	/* Init Parameters */
+	blocknum = 1;
+	nlflg = FALSE;
+	sending = TRUE;
+
+	/* Synchronize */
+	tries = 0;
+	if (env->ftp == 1) {
+		sendbyte(SYN);
+		while (recvbyte(5,bitmask) != ACK) {
+			if (++tries > ERRMAX) {
+				printf("Remote System Not Responding\n");
+				if (env->logflg) fprintf(env->logfd,
+				"Remote System Not Responding\n");
+				if (env->dbgflg) fprintf(env->dbgfd,
+				"Remote System Not Responding\n");
+				return;
+			}
+			sendbyte(SYN);
+		}
+	}
+	else {
+		while (recvbyte(30,bitmask) != NAK)
+			if (++tries > ERRMAX) {
+				printf("Remote System Not Responding\n");
+				if (env->logflg) fprintf(env->logfd,
+				"Remote System Not Responding\n");
+				if (env->dbgflg) fprintf(env->dbgfd,
+				"Remote System Not Responding\n");
+				return;
+			}
+	}
+
+	/* Main Transmission Loop */
+	while (sending) {
+		/* Build Next Block into buf */
+		for (bufctr = 0; bufctr < BLOCKSZ;) {
+			if (nlflg) {	/* New Line */
+				buf[bufctr++] = LF;	/* Store LF */
+				nlflg = FALSE;
+			}
+			if (bufctr == BLOCKSZ) break;	/* Leave for Loop */
+			c = getc(fd);	/* Get Next Byte from File */
+			if (c == EOF) {
+				sending = FALSE;	/* Done */
+				if (!bufctr)	/* Avoid Extra Block */
+					break;
+				if (env->filetype == 't')
+					for (;bufctr < BLOCKSZ; bufctr++)
+						buf[bufctr] = CTRLZ;
+				continue;	/* Exit for Loop */
+			}
+			if (c == LF && env->filetype == 't') {	/* NL? */
+				buf[bufctr++] = CR;	/* Insert CR */
+				nlflg = TRUE;		/* New Line */
+			}
+			else buf[bufctr++] = c;		/* Store Char */
+		}
+
+		/* Send Block */
+		tries = 0;	/* Set Try Count */
+		if (bufctr) do {
+			putblock(env,buf,blocknum);	/* Send Block */
+			rcode = recvbyte(10,bitmask);	/* Get Response */
+			if (env->ftp == 1 && rcode == ESC)
+				rcode = recvbyte(10,bitmask);
+			if (rcode != ACK && env->logflg) {
+				fprintf(env->logfd, "%s Received on Block %d\n",
+				(rcode == TO) ? "Timeout" : "Non-ACK",
+				blocknum);
+				if (env->dbgflg) fprintf(env->dbgfd,
+				"%s Received on Block %d\n",
+				(rcode == TO) ? "Timeout" : "Non-ACK",
+				blocknum);
+			}
+		}
+		while (rcode != ACK && ++tries < ERRMAX);
+		blocknum = (blocknum + 1) & bitmask;
+		if (tries == ERRMAX) {	/* Error Abort */
+			sending = FALSE;
+			if (env->logflg) fprintf(env->logfd, "Error Abort\n");
+			if (env->dbgflg) fprintf(env->dbgfd, "Error Abort\n");
+		}
+	}
+
+	/* Cleanup After Send */
+	fclose(fd);	/* Close File */
+	tries = 0;
+	if (env->ftp == 1) while (++tries < ERRMAX) sendbyte(EOT);
+	else {
+		sendbyte(EOT);
+		while (recvbyte(15,bitmask) != ACK && ++tries < ERRMAX)
+			sendbyte(EOT);
+		if (tries == ERRMAX && env->logflg) {
+			fprintf(env->logfd, "Remote System Not Completing\n");
+			if (env->dbgflg) fprintf(env->dbgfd,
+			"Remote System Not Completing\n");
+		}
+	}
+	if (env->logflg) fprintf(env->logfd, "Send Complete\n");
+	if (env->dbgflg) fprintf(env->dbgfd, "Send Complete\n");
+	if (env->arpa) resetarpa();	/* Binary on ARPA Net? */
+	binary(FALSE,TRUE);	/* Leave Binary Mode */
+	sleep(3);
+	printf("\n");
+}
+
+X/* Send Buffer to Receiver */
+putblock(env,buf,blocknum)
+struct environ *env;
+char *buf;
+int blocknum;
+{
+	int i, j, checksum, bitmask;
+	int dbgcnt;
+	char dbgchr[20];
+
+	if (env->bit7) bitmask = 0x7f;
+	else bitmask = 0xff;
+	sendbyte(SOH);		/* Send Start of Header */
+	if (env->dbgflg) fprintf(env->dbgfd, "SOH = %2x ", SOH);
+	if (env->ftp == 1) {
+		sendbyte(0);	/* FTP 1 Data Packet */
+		if (env->dbgflg) fprintf(env->dbgfd, "00 ");
+	}
+	if (env->arpa && blocknum&bitmask == IAC) {
+		sendbyte(IAC);
+		if (env->dbgflg) fprintf(env->dbgfd, "%2x ", IAC);
+	}
+	sendbyte(blocknum&bitmask);	/* Send Block Number */
+	if (env->dbgflg) fprintf(env->dbgfd, "%2x ", blocknum&bitmask);
+	if (env->arpa && (-blocknum-1)&bitmask == IAC) {
+		sendbyte(IAC);
+		if (env->dbgflg) fprintf(env->dbgfd, "%2x ", IAC);
+	}
+	sendbyte((-blocknum-1)&bitmask);	/* Send Block Complement */
+	if (env->dbgflg) fprintf(env->dbgfd, "%2x ", (-blocknum-1)&bitmask);
+	if (env->ftp == 1) {
+		sendbyte(STX);	/* FTP 1 Start of Text */
+		if (env->dbgflg) fprintf(env->dbgfd, "%2x ", STX);
+	}
+	checksum = 0;
+	dbgcnt = 0;
+	if (env->dbgflg) fprintf(env->dbgfd, "\n");
+	for (i = 0; i < BLOCKSZ; i++) {
+		if (env->arpa && *buf&bitmask == IAC) {
+			sendbyte(IAC);
+			if (env->dbgflg) {
+				fprintf(env->dbgfd, "%2x ", IAC);
+				dbgchr[dbgcnt++] = IAC;
+				}
+		}
+		sendbyte(*buf&bitmask);	/* Send Byte */
+		if (env->dbgflg) {
+			dbgchr[dbgcnt++] = *buf&0x7f;
+			fprintf(env->dbgfd, "%2x ", *buf&0xff);
+			if (((i+1) % 8) == 0) {
+				fprintf(env->dbgfd, "   |");
+				for (j=0; j<dbgcnt; j++) {
+					if (dbgchr[j] < ' ')
+					  fprintf(env->dbgfd, ".");
+					else
+					  fprintf(env->dbgfd, "%c", dbgchr[j]);
+				}
+				fprintf(env->dbgfd, "|\n");
+				dbgcnt = 0;
+			}
+		}
+		checksum = (checksum + *buf++) & bitmask;
+	}
+	if (env->dbgflg)
+		if (dbgcnt) {
+			fprintf(env->dbgfd, "   |");
+			for (j=0; j<dbgcnt; j++) {
+				if (dbgchr[j] < ' ')
+				  fprintf(env->dbgfd, ".");
+				else
+				  fprintf(env->dbgfd, "%c", dbgchr[j]);
+			}
+		fprintf(env->dbgfd, "|\n");
+		}
+	if (env->ftp == 1) {
+		sendbyte(ETX);	/* FTP 1 End of Text */
+		if (env->dbgflg) fprintf(env->dbgfd, "ETX = %2x ", ETX);
+	}
+	if (env->arpa && checksum&bitmask == IAC) {
+		sendbyte(IAC);
+		if (env->dbgflg) fprintf(env->dbgfd, "%2x ", IAC);
+	}
+	sendbyte(checksum&bitmask);		/* Checksum */
+	if (env->dbgflg) fprintf(env->dbgfd, "Checksum = %2x ",
+		checksum&bitmask);
+	if (env->ftp == 1) {
+		sendbyte(ENQ);	/* FTP 1 Enquiry */
+		if (env->dbgflg) fprintf(env->dbgfd, "ENQ = %2x ", ENQ);
+	}
+	if (env->dbgflg) fprintf(env->dbgfd, "\nEnd of Packet\n");
+}
+
+X/* Receive File */
+recv(env,filename)
+struct environ *env;
+char *filename;
+{
+	int fd;			/* file descriptor */
+	int blocknum;		/* next block to receive */
+	int rbcnt;		/* total number of received blocks */
+	int errorcnt;		/* number of errors on current block */
+	int receiving;		/* continuation flag */
+	int char1;		/* first char received in block */
+	int delay;		/* inter-char delay for FTP */
+	int rcode;		/* received block code */
+	int bitmask;		/* 7/8 bit mask */
+
+	/* Set Mask for 7/8 Bits */
+	if (env->bit7) bitmask = 0x7f;
+	else bitmask = 0xff;
+
+	if (!access(filename,2)) {
+		printf("File %s Exists -- Delete it? ", filename);
+		if (!getyn()) {
+			printf("Aborting\n");
+			if (env->logflg) fprintf(env->logfd,
+			"Overwrite of %s Disallowed\n", filename);
+			if (env->dbgflg) fprintf(env->dbgfd,
+			"Overwrite of %s Disallowed\n", filename);
+			return;
+		}
+	}
+	unlink(filename);	/* delete old file, if any */
+	if ((fd = creat(filename, CREATE)) == -1) {	/* can't create */
+		printf("Can't Create %s\n", filename);
+		if (env->logflg) fprintf(env->logfd,
+		"Can't Create %s\n", filename);
+		if (env->dbgflg) fprintf(env->dbgfd,
+		"Can't Create %s\n", filename);
+		return;
+	}
+
+	/* We Have a GO */
+	printf("UC Receiving %s File: %s\n",
+		(env->filetype == 't') ? "Text" : "Binary",
+		filename);
+	if (env->logflg)
+		fprintf(env->logfd, "\nUC Receiving File: %s\n", filename);
+	if (env->dbgflg)
+		fprintf(env->dbgfd, "\nUC Receiving File: %s\n", filename);
+	printf("FTP %c, %c-Bit Transmission Selected\n",
+	(env->ftp == 1) ? '1' : '3',
+	env->bit7 ? '7' : '8');
+	if (env->logflg)
+		fprintf(env->logfd, "FTP %c, %c-Bit Transmission Selected\n",
+		(env->ftp == 1) ? '1' : '3',
+		env->bit7 ? '7' : '8');
+	if (env->dbgflg)
+		fprintf(env->dbgfd, "FTP %c, %c-Bit Transmission Selected\n",
+		(env->ftp == 1) ? '1' : '3',
+		env->bit7 ? '7' : '8');
+	printf("Ready to Receive\n");
+
+	/* Init Counters et al */
+	blocknum = 1;
+	rbcnt = 0;
+	errorcnt = 0;
+	receiving = TRUE;
+
+	/* Establish Binary Communications */
+	binary(TRUE,TRUE);
+	if (env->arpa) setarpa();
+
+	/* Synchronize with Sender */
+	if (env->ftp == 1) {
+		while (recvbyte(4,bitmask) != SYN);
+		sendbyte(ACK);
+	}
+	else sendbyte(NAK);
+
+	/* Receive Next Packet */
+	while (receiving) {
+		do {
+			char1 = recvbyte(6,bitmask);
+		}
+		while ((char1 != SOH) && (char1 != EOT) && (char1 != TO));
+		switch (char1) {
+		case TO :	/* Timeout */
+			if (env->logflg)
+				fprintf(env->logfd, "Timeout on Block %d\n",
+				blocknum);
+			if (env->dbgflg)
+				fprintf(env->dbgfd, "Timeout on Block %d\n",
+				blocknum);
+			if (++errorcnt == ERRMAX) {
+				close(fd);	/* Close File */
+				sleep(3);	/* Delay for Sender */
+				if (env->arpa) resetarpa();	/* ARPA Net */
+				binary(FALSE,TRUE);	/* Normal I/O */
+				if (env->logflg)
+					fprintf(env->logfd, "Error Abort\n");
+				if (env->dbgflg)
+					fprintf(env->dbgfd, "Error Abort\n");
+				receiving = FALSE;
+			}
+			sendbyte(NAK);
+			break;
+		case EOT :	/* End of Transmission */
+			if (env->ftp == 3) sendbyte(ACK);
+			while (recvbyte(3,bitmask) != TO);
+			close(fd);	/* Close File */
+			sleep(3);	/* Delay for Sender */
+			if (env->arpa) resetarpa();	/* ARPA Net */
+			binary(FALSE,TRUE);	/* Normal I/O */
+			if (env->logflg) {
+				fprintf(env->logfd, "Receive Complete -- ");
+				fprintf(env->logfd, "%dK, %d Blocks Received\n",
+				(rbcnt%8) ? (rbcnt/8)+1 : rbcnt/8,
+				rbcnt);
+			}
+			if (env->dbgflg) {
+				fprintf(env->dbgfd, "Receive Complete -- ");
+				fprintf(env->dbgfd, "%dK, %d Blocks Received\n",
+				(rbcnt%8) ? (rbcnt/8)+1 : rbcnt/8,
+				rbcnt);
+			}
+			printf("\n");
+			receiving = FALSE;
+			break;
+		case SOH :	/* New or Old Block */
+			rcode = getblock(env,fd,blocknum);	/* read block */
+			switch (rcode) {
+			case 0 :	/* OK */
+				blocknum = ++blocknum & bitmask;
+				rbcnt++;
+			case 2 :	/* OK, but Duplicate Block */
+				errorcnt = 0;
+				if (env->ftp == 1) sendbyte(ESC);
+				sendbyte(ACK);
+				if (env->dbgflg) fprintf(env->dbgfd,
+					"\nSending ACK\n");
+				break;
+			case 1 :	/* Xmit Error, Non-Fatal */
+				if (++errorcnt < ERRMAX) {
+					sendbyte(NAK);
+					if (env->dbgflg) fprintf(env->dbgfd,
+					"\nSending NAK\n");
+					break;
+				}
+			default :	/* Xmit Error, Fatal */
+				if (env->logflg)
+					fprintf(env->logfd, "Error Abort\n");
+				if (env->dbgfd)
+					fprintf(env->dbgfd, "Error Abort\n");
+				close(fd);
+				if (env->ftp == 1) sendbyte(ESC);
+				sendbyte(CAN);
+				if (env->arpa) resetarpa();	/* ARPA Net */
+				binary(FALSE,TRUE);
+				while (recvbyte(3,bitmask) != TO);
+				receiving = FALSE;
+				break;
+			}
+			break;
+		}
+	}
+}
+
+X/* Get Block from Sender */
+getblock(env,fd,blocknum)
+struct environ *env;
+int fd, blocknum;
+{
+	int curblock, cmpblock, delay, bitmask;
+	int recdone, checksum, inchecksum, byte, bufcnt, c;
+	int startstx, endetx, endenq;
+	int errflg, errchr;
+	char buff[BLOCKSZ];
+	int j, dbgcnt;
+	char dbgchr[20];
+
+	if (env->ftp == 1) {
+		delay = 5;	/* FTP 1 Delay Constant */
+		recvbyte(5,bitmask);	/* Flush Leading Zero */
+	}
+	else delay = 3;		/* FTP 3 Delay Constant */
+	if (env->bit7) bitmask = 0x7f;
+	else bitmask = 0xff;
+
+	curblock = recvbyte(delay,bitmask);
+	if (env->dbgflg) fprintf(env->dbgfd, "Block Number = %4x\n", curblock);
+	if (curblock == TO) {
+		if (env->logflg)
+			fprintf(env->logfd, "Timeout on Block Number\n");
+		return(1);
+	}
+	cmpblock = recvbyte(delay,bitmask);
+	if (env->dbgflg) fprintf(env->dbgfd, "Block Compl  = %4x\n", cmpblock);
+	if (curblock == TO) {
+		if (env->logflg)
+			fprintf(env->logfd, "Timeout on Block Complement\n");
+		return(1);
+	}
+	if (env->ftp == 1) {
+		startstx = recvbyte(delay,bitmask);
+		if (env->dbgflg) fprintf(env->dbgfd, "STX = %4x\n", startstx);
+		if (startstx == TO) {
+			if (env->logflg)
+				fprintf(env->logfd, "Timeout on STX\n");
+			return(1);
+		}
+	}
+	if ((curblock + cmpblock) != bitmask) {
+		if (env->logflg) fprintf(env->logfd,
+		"Block Number Error on Block %d\n", blocknum);
+		if (env->dbgflg) fprintf(env->dbgfd,
+		"Block Number Error on Block %d\n", blocknum);
+		while (recvbyte(delay,bitmask) != TO);	/* Flush */
+		return(1);
+	}
+	checksum = 0;		/* Init Checksum */
+	dbgcnt = 0;		/* Init Char Count */
+	byte = 0;		/* Init Buff Ptr */
+	recdone = FALSE;	/* File Receive NOT Done */
+	for (bufcnt=0; bufcnt<BLOCKSZ; bufcnt++) {
+		c = recvbyte(delay,bitmask);
+		if (env->dbgflg) {
+			dbgchr[dbgcnt++] = c&0x7f;
+			fprintf(env->dbgfd, "%2x ", c&0xff);
+			if (((bufcnt+1) % 8) == 0) {
+				fprintf(env->dbgfd, "   |");
+				for (j=0; j<dbgcnt; j++) {
+					if (dbgchr[j] < ' ')
+					  fprintf(env->dbgfd, ".");
+					else
+					  fprintf(env->dbgfd, "%c", dbgchr[j]);
+				}
+				dbgcnt = 0;
+				fprintf(env->dbgfd, "|\n");
+			}
+		}
+		if (c == TO) {
+			if (env->logflg)
+				fprintf(env->logfd, "Timeout on Block Recv\n");
+			if (env->dbgflg)
+				fprintf(env->dbgfd, "Timeout on Block Recv\n");
+			return(1);
+		}
+		buff[byte] = c;
+		checksum = (checksum + c) & bitmask;
+		if (env->filetype != 't') {
+			byte++;		/* binary xfer, so advance */
+			continue;
+		}
+		if (c == CR) continue;	/* skip CR */
+		if (c == CTRLZ) {	/* done */
+			recdone = TRUE;
+			continue;
+		}
+		if (!recdone) byte++;		/* continue */
+	}
+	if (env->ftp == 1) {
+		endetx = recvbyte(delay,bitmask);
+		if (env->dbgflg) fprintf(env->dbgfd, "ETX = %4x\n", endetx);
+		if (endetx == TO) {
+			if (env->logflg)
+				fprintf(env->logfd, "Timeout on ETX\n");
+			return(1);
+		}
+	}
+	inchecksum = recvbyte(delay,bitmask);
+	if (env->dbgflg)
+		fprintf(env->dbgfd,
+			"Computed Checksum = %4x   Received Checksum = %4x\n",
+			checksum, inchecksum);
+	if (inchecksum == TO) {
+		if (env->logflg)
+			fprintf(env->logfd, "Timeout on Checksum\n");
+		return(1);
+	}
+	if (env->ftp == 1) {
+		endenq = recvbyte(delay,bitmask);
+		if (env->dbgflg) fprintf(env->dbgfd, "ENQ = %4x\n", endenq);
+		if (endenq == TO) {
+			if (env->logflg)
+				fprintf(env->logfd, "Timeout on ENQ\n");
+			return(1);
+		}
+	}
+	if (env->dbgflg) fprintf(env->dbgfd, "\nEnd of Packet\n");
+	errflg = FALSE;
+	if (env->ftp == 1) {
+		if (startstx != STX) {
+			errflg = TRUE;
+			errchr = STX;
+		}
+		if (endetx != ETX) {
+			errflg = TRUE;
+			errchr = ETX;
+		}
+		if (endenq != ENQ) {
+			errflg = TRUE;
+			errchr = ENQ;
+		}
+		if (errflg && env->logflg) {
+			fprintf(env->logfd, "Invalid Packet Control -- ");
+			switch (errchr) {
+			case STX :
+				fprintf(env->logfd,"STX");
+				break;
+			case ETX :
+				fprintf(env->logfd,"ETX");
+				break;
+			case ENQ :
+				fprintf(env->logfd,"ENQ");
+				break;
+			}
+			fprintf(env->logfd,"\n");
+		}
+	}
+	if (checksum != inchecksum) {
+		if (env->logflg)
+			fprintf(env->logfd,
+			"Checksum Error: Received %d/%xH vs Computed %d/%xH\n",
+			inchecksum, inchecksum, checksum, checksum);
+		errflg = TRUE;
+	}
+	if (errflg) return(1);
+	if (curblock != blocknum) {
+		if (curblock == (blocknum+1)&bitmask) {
+			if (env->logflg) fprintf(env->logfd,
+			"Phase Error\n");
+			if (env->dbgflg) fprintf(env->dbgfd,
+			"Phase Error\n");
+			return(99);
+		}
+		if (env->logflg)
+			fprintf(env->logfd, "Duplicate Block %d\n", blocknum);
+		if (env->dbgflg)
+			fprintf(env->dbgfd, "Duplicate Block %d\n", blocknum);
+		return(2);
+	}
+	if (write(fd,buff,byte) < 0) {
+		if (env->logflg) fprintf(env->logfd,
+		"File Write Error\n");
+		if (env->dbgflg) fprintf(env->dbgfd,
+		"File Write Error\n");
+		return(99);
+	}
+	return(0);
+}
+
+X/* Compute the CRC for a UNIX Text File */
+crct(filename)
+char *filename;
+{
+	unsigned crcupd();
+	FILE *fd, *fopen();
+	unsigned crc;
+	int c;
+	int bytecnt;
+
+	/* open file for input */
+	if ((fd=fopen(filename, "r")) == NULL) {
+		printf("File %s Not Found\n", filename);
+		return;
+	}
+
+	/* init byte counter (for last block) */
+	bytecnt = 0;
+
+	/* init CRC Value */
+	crc = 0;
+
+	/* compute CRC on all bytes of file with file format conversion */
+	while ((c = getc(fd)) != EOF) {
+		bytecnt++;
+		if (!(bytecnt%BLOCKSZ)) bytecnt=0;
+		if (c == LF) {
+			crc = crcupd(CR, crc);	/* Insert CR */
+			bytecnt++;
+			if (!(bytecnt%BLOCKSZ)) bytecnt=0;
+		}
+		crc = crcupd(c, crc);		/* Update CRC */
+	}
+
+	/* fill last block with CTRLZ's */
+	for (;bytecnt < BLOCKSZ; bytecnt++) crc = crcupd(CTRLZ, crc);
+
+	/* close file */
+	fclose(fd);
+
+	/* print result */
+	printf("CRC of Text File %s is %4X\n", filename, crc);
+}
+X/* Compute a CRC Value for a Binary File */
+crcb(filename)
+char *filename;
+{
+	unsigned crcupd();
+	FILE *fd, *fopen();
+	unsigned crc;
+	int c;
+
+	/* open file for input */
+	if ((fd=fopen(filename, "r")) == NULL) {
+		printf("File %s Not Found\n", filename);
+		return;
+	}
+
+	/* init CRC Value */
+	crc = 0;
+
+	/* compute CRC on all bytes of file */
+	while ((c = getc(fd)) != EOF) crc = crcupd(c, crc);
+
+	/* close file */
+	fclose(fd);
+
+	/* print result */
+	printf("CRC of Binary File %s is %4X\n", filename, crc);
+}
+
+X/* compute CRC on a byte-for-byte basis */
+unsigned crcupd(byteval, crc)
+int byteval;
+unsigned crc;
+{
+	unsigned newcrc, high, low;
+
+	newcrc = crc << 1;	/* shift CRC left one bit */
+	high = newcrc & 0xff00;	/* get new high byte */
+	low  = (newcrc + byteval) & 0xff;	/* get new low byte */
+	newcrc = high | low;	/* OR the two bytes together */
+	if (crc & 0x8000) crc = newcrc ^ 0xa097;	/* apply offset */
+	else crc = newcrc;
+	return(crc);
+}
+
+X/* File Status Display */
+fstat(env,filename)
+struct environ *env;
+char *filename;
+{
+	struct stat fsi;	/* file status info */
+
+	if (stat (filename, &fsi) == -1) {	/* get file status info */
+		printf("File %s Not Found\n", filename);
+		return;
+	}
+	printf("File Size of %s is %ldK, %ld Blocks\n",
+	filename,
+	fsi.st_size%1024 ? (fsi.st_size/1024)+1 : fsi.st_size/1024,
+	fsi.st_size%128 ? (fsi.st_size/128)+1 : fsi.st_size/128);
+	if (env->logflg) fprintf(env->logfd,
+	"File Size of %s is %ldK, %ld Blocks\n",
+	filename,
+	fsi.st_size%1024 ? (fsi.st_size/1024)+1 : fsi.st_size/1024,
+	fsi.st_size%128 ? (fsi.st_size/128)+1 : fsi.st_size/128);
+}
+
+X/*  SUPPORT ROUTINES  */
+
+X/* get yes or no response from user */
+getyn()
+{
+	int c;
+
+	c = charx();	/* get char */
+	if (c == 'y' || c == 'Y') {
+		printf("Yes\n");
+		return(TRUE);
+	}
+	else {
+		printf("No\n");
+		return(FALSE);
+	}
+}
+
+X/* get single char input */
+charx()
+{
+	int binary();
+	int c;
+
+	binary(TRUE,FALSE);
+	c = getchar();
+	binary(FALSE,FALSE);
+	return (c);
+}
+
+X/*  set ARPA Net for 8-bit transfers  */
+setarpa()
+{
+	sendbyte(IAC);	/* Is A Command */
+	sendbyte(WILL);	/* Command to SERVER TELNET (Host) */
+	sendbyte(TRBIN);	/* Command is:  Transmit Binary */
+
+	sendbyte(IAC);	/* Is A Command */
+	sendbyte(DO);	/* Command to TAC */
+	sendbyte(TRBIN);	/* Command is:  Transmit Binary */
+
+	sleep(3);  /* wait for TAC to configure */
+
+	return;
+}
+
+X/* reset the ARPA Net */
+resetarpa()
+{
+	sendbyte(IAC);	/* Is A Command */
+	sendbyte(WONT);	/* Negative Command to SERVER TELNET (Host) */
+	sendbyte(TRBIN);	/* Command is:  Don't Transmit Binary */
+
+	sendbyte(IAC);	/* Is A Command */
+	sendbyte(DONT);	/* Negative Command to TAC */
+	sendbyte(TRBIN);	/* Command is:  Don't Transmit Binary */
+
+	return;
+}
+
+X/* send byte to receiver */
+sendbyte(data)
+char data;
+{
+	write (1, &data, 1);	/* write the byte */
+}
+
+X/* receive a byte from sender */
+recvbyte(seconds,bitmask)
+unsigned seconds;
+int bitmask;
+{
+	char c;
+	int alarmfunc();		/* forward declaration */
+
+	signal(SIGALRM,alarmfunc);	/* catch alarms */
+	alarm(seconds);			/* set clock */
+	if (read (0, &c, 1) < 0)	/* get char or timeout */
+		return (TO);
+	alarm(0);			/* clear clock */
+	return (c&bitmask);
+}
+
+X/* dummy alarm function */
+alarmfunc()
+{
+	return;
+}
+
+X/* set and clear binary mode */
+binary(setflg,scope)
+int setflg, scope;
+{
+	static struct sgttyb ttys, ttysold;
+	static struct stat statbuf;
+
+	if (setflg) {	/* set binary */
+		if (gtty (0, &ttys) < 0) return(FALSE);	/* failed */
+		ttysold.sg_ispeed = ttys.sg_ispeed;	/* save old values */
+		ttysold.sg_ospeed = ttys.sg_ospeed;
+		ttysold.sg_erase = ttys.sg_erase;
+		ttysold.sg_kill = ttys.sg_kill;
+		ttysold.sg_flags = ttys.sg_flags;
+		ttys.sg_flags |= RAW;		/* set for RAW Mode */
+		ttys.sg_flags &= ~ECHO;		/* set no ECHO */
+		if (scope) {		/* cover all values? */
+			ttys.sg_flags &= ~XTABS;	/* set no tab exp */
+			ttys.sg_flags &= ~LCASE;	/* set no case xlate */
+			ttys.sg_flags |= ANYP;		/* set any parity */
+			ttys.sg_flags &= ~NL3;		/* no delays on nl */
+			ttys.sg_flags &= ~TAB0;		/* no tab delays */
+			ttys.sg_flags &= ~TAB1;
+			ttys.sg_flags &= ~CR3;		/* no CR delay */
+			ttys.sg_flags &= ~FF1;		/* no FF delay */
+			ttys.sg_flags &= ~BS1;		/* no BS delay */
+		}
+		if (stty (0, &ttys) < 0) return(FALSE);	/* failed */
+		if (scope) system("mesg n");	/* turn off messages */
+		return(TRUE);
+	}
+	else {		/* clear binary */
+		if (stty (0, &ttysold) < 0) return (FALSE);
+		if (scope) system("mesg y");	/* turn on messages */
+		return(TRUE);	/* OK */
+	}
+}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 uc.c
+	/bin/echo -n '	'; /bin/ls -ld uc.c
+fi
+
+

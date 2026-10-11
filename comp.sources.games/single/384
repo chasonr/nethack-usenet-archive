@@ -1,0 +1,4498 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,2343b7a4903c7268,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1988-06-30 11:06:50 PST
+Path: utzoo!attcan!uunet!tektronix!tekgen!tekred!games
+From: games@tekred.TEK.COM
+Newsgroups: comp.sources.games
+Subject: v04i095:  xconq5 - version 5 of the strategy game for X-windows and curses, Part07/18
+Message-ID: <2743@tekred.TEK.COM>
+Date: 30 Jun 88 18:06:50 GMT
+Sender: billr@tekred.TEK.COM
+Lines: 4482
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted by: "Stanley T. Shebs" <shebs%defun@cs.utah.edu>
+Comp.sources.games: Volume 4, Issue 95
+Archive-name: xconq5/Part07
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 7 (of 18)."
+# Contents:  input.c lib/xconq.bdf map.h
+# Wrapped by billr@saab on Wed Jun 29 08:55:39 1988
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f input.c -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"input.c\"
+else
+echo shar: Extracting \"input.c\" \(19011 characters\)
+sed "s/^X//" >input.c <<'END_OF_input.c'
+X/* Copyright (c) 1987, 1988  Stanley T. Shebs, University of Utah. */
+X/* This program may be used, copied, modified, and redistributed freely */
+X/* for noncommercial purposes, so long as this notice remains intact. */
+X
+X/* RCS $Header: input.c,v 1.1 88/06/21 12:30:17 shebs Exp $ */
+X
+X/* To accommodate simultaneous movement by several players, our setup must */
+X/* be a little elaborate.  Basically, the program keeps the initiative; */
+X/* when a side's movement phase needs input, it posts a "request" and a */
+X/* handler for that request.  When X gets an event, data about it is */
+X/* preprocessed and then stuffed into the request structure.  At the end */
+X/* of a movement subphase, the requests are fulfilled by calling the handler */
+X/* and passing it the side and a pointer to the request. */
+X
+X/* The bad part about all this is that *every* *single* interaction must */
+X/* be handled this way - no more calling a routine to get a value and */
+X/* waiting until it is complete! :-( */
+X
+X#include "config.h"
+X#include "misc.h"
+X#include "dir.h"
+X#include "period.h"
+X#include "side.h"
+X#include "unit.h"
+X#include "global.h"
+X#include "map.h"
+X
+X/* Magic values (unlikely to show up as player input) */
+X
+X#define DFLTFLAG (-12345)       /* flags when default arg to be used */
+X#define NEGFLAG  (-12346)       /* flags when default arg to be used */
+X#define ITERFLAG (-12347)       /* flags args that are "itertime" */
+X
+X#define ESCAPE '\033'           /* standard abort character */
+X#define BACKSPACE '\010'        /* for fixing strings being entered */
+X
+X/* The following structure is used only for the dispatch table. */
+X
+Xtypedef struct func_tab {
+X    char fchar;                 /* character to match against */
+X    int (*code)();              /* pointer to command's function */
+X    int defaultarg;             /* default for argument */
+X    bool needunit;              /* true if cmd always applies to a unit */
+X    char *help;                 /* short documentation string */
+X} FuncTab;
+X
+Xextern int giventime;           /* flags use of chess clock */
+X
+X/* Predeclarations of all commands. */
+X
+Xint do_sentry(), do_delay(), do_wakeup(), do_wakemain(), do_embark(),
+X    do_exit(), do_resign(), do_message(), do_follow(),
+X    do_redraw(), do_disband(), do_return(),
+X    do_sit(), do_product(), do_idle(), do_help(), do_version(),
+X    do_save(), do_standing(), do_ident(), do_moveto(), do_coast(),
+X    do_survey_mode(), do_unit_info(), do_printables(), do_occupant(),
+X    do_options(), do_name(), do_unit(), do_give_unit(), do_center(),
+X    do_mark_unit(), do_add_player(), do_patrol(), do_give(), do_take();
+X
+Xchar dirchars[] = DIRCHARS;     /* typable characters for directions */
+X
+X/* The command table itself.  Default iterations of ITERFLAG actually turn */
+X/* into the value of "itertime", which can be set by options cmd. */
+X
+XFuncTab commands[] = {
+X    's', do_sentry, ITERFLAG, TRUE, "put a unit on sentry duty",
+X    'w', do_wakemain, 0, FALSE, "wake units up from whatever they were doing",
+X    ' ', do_sit, 1, FALSE, "(Space Bar) make unit be on sentry this turn only",
+X    'r', do_return, 1, TRUE, "return unit to nearest city/transport",
+X    'd', do_delay, 1, TRUE, "delay unit's move until later in turn",
+X    'f', do_follow, ITERFLAG, TRUE, "follow a designated leader",
+X    'm', do_moveto, 1, TRUE, "move to given location",
+X    'z', do_survey_mode, 1, FALSE, "toggle between survey and move modes",
+X    'a', do_occupant, 1, TRUE, "look at the occupants",
+X    'e', do_embark, 1, TRUE, "embark units onto transport occupying same unit",
+X    'x', do_mark_unit, 1, TRUE, "mark unit for later reference",
+X    'g', do_give, -1, TRUE, "give supplies to the transport",
+X    't', do_take, -1, TRUE, "take supplies from the transport",
+X    'c', do_center, 1, FALSE, "designate current location as center of action",
+X    'o', do_options, 5, FALSE, "set various options",
+X    'p', do_printables, 1, FALSE, "put various data into files for printing",
+X    ' ', NULL, 0, 0, "",
+X    'P', do_product, 1, TRUE, "set/change unit production",
+X    'I', do_idle, ITERFLAG, TRUE, "set unit to not produce anything",
+X    'W', do_wakeup, 0, FALSE, "wake ALL units in area, including occupants",
+X    'D', do_disband, 1, TRUE, "disband a unit and send it home",
+X    'F', do_coast, ITERFLAG, TRUE, "follow a coastline",
+X    'Z', do_patrol, ITERFLAG, TRUE, "go on a patrol",
+X    'O', do_standing, 1, TRUE, "set standing orders for occupants",
+X    'G', do_give_unit, -2, TRUE, "turn unit over to another side",
+X    'M', do_message, -2, FALSE, "send a message to other sides",
+X    'C', do_name, 1, FALSE, "call a unit or side by a name",
+X    'X', do_resign, -2, FALSE, "resign from the game",
+X    'Q', do_exit, 1, FALSE, "kill game for all players",
+X    'S', do_save, 1, FALSE, "save the game into a file",
+X    'A', do_add_player, 1, FALSE, "add a new player to the game",
+X    '?', do_help, 1, FALSE, "display help info",
+X    '/', do_ident, 1, FALSE, "identify things on screen",
+X    '=', do_unit_info, 1, FALSE, "display details about a type of unit",
+X    'V', do_version, 1, FALSE, "display program version",
+X    '\\', do_unit, 1, FALSE, "build a new unit (Build mode only)",
+X    '\022', do_redraw, 1, FALSE, "(^R) redraw screen",
+X    '\014', do_redraw, 1, FALSE, "(^L) redraw screen",
+X    '\0', NULL, 0, FALSE, NULL   /* end of table marker */
+X};
+X
+X/* Just to get everything off on the right foot. */
+X
+Xinit_requests(side)
+XSide *side;
+X{
+X    side->reqvalue = DFLTFLAG;
+X}
+X
+X/* Post a request - need only know the handler that will be called to */
+X/* fulfill the request later, and sometimes a relevant unit. */
+X
+Xrequest_input(side, unit, handler)
+XSide *side;
+XUnit *unit;
+Xint (*handler)();
+X{
+X    if (Debug) printf("Making %s request ", side->name);
+X    if (!humanside(side)) fprintf(stderr, "Gack!\n");
+X    if (!side->reqactive) {
+X	if (Debug) printf("(accepted)\n");
+X	side->reqactive = TRUE;
+X	side->reqhandler = handler;
+X	side->reqtype = GARBAGE;
+X	side->requnit = unit;
+X	/* any other data slots are setup by callers of this routine */
+X    } else {
+X	if (Debug) printf("(ignored)\n");
+X    }
+X}
+X
+X/* Make a request go away.  Careful about using this! */
+X
+Xcancel_request(side)
+XSide *side;
+X{
+X    if (side->reqactive) {
+X	if (Debug) printf("Canceling %s request\n", side->name);
+X	side->reqactive = FALSE;
+X	erase_cursor(side);
+X	clear_info(side);
+X	flush_output(side);
+X    }
+X}
+X
+X/* Handle all requests at once.  This routine *will* wait forever for */
+X/* input (polling is evil).  This is also the right place to draw the */
+X/* unit cursor, since it is unwanted unless we are waiting on input. */
+X
+Xhandle_requests()
+X{
+X    bool waiters = FALSE;
+X    Side *side;
+X
+X    for_all_sides(side) {
+X	if (side->reqactive) {
+X	    waiters = TRUE;
+X	    /* wasteful to call this for everybody... */
+X	    show_info(side);
+X	    draw_cursor(side);
+X	}
+X    }
+X    if (waiters) {
+X	get_input();
+X	for_all_sides(side) {
+X	    if (side->reqactive && side->reqtype != GARBAGE) {
+X		if (Debug) printf("Fulfilling %s request with input type %d\n",
+X				  side->name, side->reqtype);
+X		side->reqactive = FALSE;
+X		(*(side->reqhandler))(side);
+X		erase_cursor(side);
+X		clear_info(side);
+X		flush_output(side);
+X	    }
+X	}
+X    }
+X}
+X
+X/* Acquire a command from the player.  Command may be prefixed with a */
+X/* nonnegative number which is given as an argument to the command function */
+X/* (otherwise arg defaults to value in third column of command table). */
+X/* This routine takes in both keyboard and mouse input, other kinds of */
+X/* devices should be handled here also (rriiiight...).  Don't do any of */
+X/* this if the clock ran out, just supply an innocuous command. */
+X
+Xx_command(side)
+XSide *side;
+X{
+X    int dir, terr, sign = 1;
+X
+X    switch (side->reqtype) {
+X    case KEYBOARD:
+X	if (Debug) printf("%s keyboard input: %c (%d)\n",
+X			  side->name, side->reqch, side->reqvalue);
+X	if (isdigit(side->reqch)) {
+X	    if (side->reqvalue == DFLTFLAG) {
+X		side->reqvalue = 0;
+X	    } else if (side->reqvalue == NEGFLAG) {
+X		side->reqvalue = 0;
+X		sign = -1;
+X	    } else {
+X		side->reqvalue *= 10;
+X	    }
+X	    side->reqvalue +=
+X		(side->reqvalue >= 0 ? 1 : -1) * (side->reqch - '0');
+X	    side->reqvalue *= sign;
+X	    sprintf(side->promptbuf, "Arg: %d", side->reqvalue);
+X	    show_prompt(side);
+X	    request_input(side, side->curunit, x_command);
+X	    return;
+X	} else {
+X	    clear_prompt(side);
+X	    if (Build && ((terr = find_terr(side->reqch)) >= 0)) {
+X		if (side->reqvalue == DFLTFLAG) side->reqvalue = 0;
+X		do_terrain(side, terr, side->reqvalue);
+X	    } else if (side->reqch == '-') {
+X		side->reqvalue = NEGFLAG;
+X		request_input(side, side->curunit, x_command);
+X		return;
+X	    } else if ((dir = iindex(side->reqch, dirchars)) >= 0) {
+X		if (side->reqvalue == DFLTFLAG) side->reqvalue = 1;
+X		do_dir(side, dir, side->reqvalue);
+X	    } else if ((dir = iindex(lowercase(side->reqch), dirchars)) >= 0) {
+X		if (side->reqvalue == DFLTFLAG)
+X		    side->reqvalue = side->itertime;
+X		if (side->mode == SURVEY) side->reqvalue = 10;
+X		do_dir(side, dir, side->reqvalue);
+X	    } else {
+X		execute_command(side, side->reqch, side->reqvalue);
+X	    }
+X	}
+X	break;
+X    case MAPPOS:
+X	if (Debug) printf("%s map input: %d,%d (%d)\n",
+X			  side->name, side->reqx, side->reqy, side->reqvalue);
+X	clear_prompt(side);
+X	if (side->reqx == side->curx && side->reqy == side->cury) {
+X	    if (side->curunit) do_sit(side, 1);
+X	    break;
+X	} else {
+X	    if (side->teach) {
+X		cache_moveto(side, side->reqx, side->reqy);
+X	    } else {
+X		switch (side->mode) {
+X		case MOVE:
+X		    if (side->curunit) {
+X			order_moveto(side->curunit, side->reqx, side->reqy);
+X			side->curunit->orders.flags &= ~SHORTESTPATH;
+X		    }
+X		    break;
+X		case SURVEY:
+X		    move_survey(side, side->reqx, side->reqy);
+X		    break;
+X		default:
+X		    case_panic("mode", side->mode);
+X		}
+X	    }
+X	}
+X	break;
+X    default:
+X	break;
+X    }
+X    if (giventime && !side->timedout && side->timeleft <= 0) {
+X	side->timedout = TRUE;
+X	notify(side, "You ran out of time!!");
+X	beep(side);
+X    }
+X    /* Reset the arg so we don't get confused next time around */
+X    side->reqvalue = DFLTFLAG;
+X}
+X
+X/* The requester proper, which just sets up the hook to call the main */
+X/* command interpreter when some input comes by. */
+X
+Xrequest_command(side)
+XSide *side;
+X{
+X    request_input(side, side->curunit, x_command);
+X}
+X
+X/* Search in command table and execute function if found, complaining if */
+X/* the command is not recognized.  Many commands operate on the "current */
+X/* unit", and all uniformly error out if there is no current unit, so put */
+X/* that test here.  Also fix up the arg if the value passed is one of the */
+X/* specially recognized ones. */
+X
+Xexecute_command(side, ch, n)
+XSide *side;
+Xchar ch;
+Xint n;
+X{
+X    struct func_tab *cmd;
+X    
+X    for (cmd = commands; cmd->fchar != '\0'; ++cmd) {
+X	if (ch == cmd->fchar) {
+X	    if (n == DFLTFLAG) n = cmd->defaultarg;
+X	    if (n == NEGFLAG)  n = 0 - cmd->defaultarg;
+X	    if (n == ITERFLAG) n = side->itertime;
+X	    if (Debug) printf("... actual arg is %d\n", n);
+X	    if (cmd->needunit) {
+X		if (side->curunit != NULL) {
+X		    (*(cmd->code))(side, side->curunit, n);
+X		} else {
+X		    cmd_error(side, "No unit to operate on here!");
+X		}
+X	    } else {
+X		(*(cmd->code))(side, n);
+X	    }
+X	    return;
+X	}
+X    }
+X    cmd_error(side, "Unknown command '%c'", ch);
+X}
+X
+X/* Help for the main command mode just dumps part of the table, and a little */
+X/* extra info about what's not in the table.  This may go onto a screen or */
+X/* into a file, depending on where this was called from. */
+X
+Xcommand_help(side)
+XSide *side;
+X{
+X    FuncTab *cmd;
+X
+X    wprintf(side, "To move a unit, use the mouse or [hlyubn]");
+X    wprintf(side, "[HLYUBN] moves unit repeatedly in that direction");
+X    wprintf(side, "Mousing unit makes it sit, mousing enemy unit attacks");
+X    if (Build) wprintf(side, "Terrain characters set what will be painted.");
+X    wprintf(side, "  ");
+X    for (cmd = commands; cmd->fchar != '\0'; ++cmd) {
+X	wprintf(side, "%c  %s", cmd->fchar, cmd->help);
+X    }
+X}
+X
+X/* The handler for unit production needs to make sure valid input has */
+X/* been received, will put in another request if not. */
+X
+Xx_product_type(side)
+XSide *side;
+X{
+X    int u;
+X
+X    if ((u = grok_unit_type(side)) >= 0) {
+X	set_product(side->requnit, u);
+X	set_schedule(side->requnit);
+X    } else {
+X	request_input(side, side->requnit, x_product_type);
+X    }
+X}
+X
+X/* This is called when production is to be set or changed.  Note that since */
+X/* the user has a pretty dull choice if there is only one possible type of */
+X/* unit to build, in such cases we can bypass requests altogether. */
+X
+Xrequest_new_product(unit)
+XUnit *unit;
+X{
+X    int u;
+X    Side *us = unit->side;
+X
+X    if (humanside(us)) {
+X	sprintf(spbuf, "%s will build: ", unit_handle(us, unit));
+X	u = ask_unit_type(us, spbuf, utypes[unit->type].make);
+X	if (u < 0) {
+X	    make_current(us, unit);
+X	    request_input(us, unit, x_product_type);
+X	} else {
+X	    set_product(unit, u);
+X	    set_schedule(unit);
+X	}
+X    } else {
+X	set_product(unit, machine_product(unit));
+X	set_schedule(unit);
+X    }
+X}
+X
+X/* Prompt for a type of a unit from player, maybe only allowing some types */
+X/* to be accepted.  Also allow specification of no unit type.  We do this */
+X/* by scanning the vector, building a string of chars and a vector of */
+X/* unit types, so as to be able to map back when done. */
+X
+Xask_unit_type(side, prompt, possibles)
+XSide *side;
+Xchar *prompt;
+Xshort *possibles;
+X{
+X    int numtypes = 0, u, type;
+X
+X    for_all_unit_types(u) {
+X	side->bvec[u] = 0;
+X	if (possibles == NULL || possibles[u]) {
+X	    side->bvec[u] = 1;
+X	    side->ustr[numtypes] = utypes[u].uchar;
+X	    side->uvec[numtypes] = u;
+X	    numtypes++;
+X	}
+X    }
+X    if (numtypes == 0) {
+X	type = NOTHING;
+X    } else if (numtypes == 1) {
+X	type = side->uvec[0];
+X	side->bvec[type] = 0;
+X    } else {
+X	side->ustr[numtypes] = '\0';
+X	sprintf(side->promptbuf, "%s [%s] ", prompt, side->ustr);
+X	show_prompt(side);
+X	draw_unit_list(side, side->bvec);
+X	type = -1;
+X    }
+X    return type;
+X}
+X
+X/* Do something with the char or unit type that the player entered. */
+X
+Xgrok_unit_type(side)
+XSide *side;
+X{
+X    int i, type = -1;
+X
+X    switch (side->reqtype) {
+X    case KEYBOARD:
+X	echo_at_prompt(side, side->reqch);
+X	if (side->reqch == '?') {
+X	    help_unit_type(side);
+X	} else if (side->reqch == ESCAPE) {
+X	    type = NOTHING;
+X	} else if (iindex(side->reqch, side->ustr) == -1) {
+X	    notify(side, "Unit type '%c' not in \"%s\"!",
+X		   side->reqch, side->ustr);
+X	} else {
+X	    type = find_unit_char(side->reqch);
+X	}
+X	break;
+X    case UNITTYPE:
+X	if (between(0, side->requtype, period.numutypes-1) &&
+X	    side->bvec[side->requtype]) {
+X	    type = side->requtype;
+X	} else {
+X	    notify(side, "Not a valid unit type!");
+X	}
+X	break;
+X    default:
+X	break;
+X    }
+X    if (type >= 0) {
+X	clear_prompt(side);
+X	for_all_unit_types(i) side->bvec[i] = 0;
+X	draw_unit_list(side, side->bvec);
+X    }
+X    return type;
+X}
+X
+X/* User is asked to pick a position on map.  This will iterate until the */
+X/* space bar designates the final position. */
+X
+Xask_position(side, prompt)
+XSide *side;
+Xchar *prompt;
+X{
+X    sprintf(side->promptbuf, "%s [mouse or keys to move, space bar to set]",
+X	    prompt);
+X    show_prompt(side);
+X    side->tmpcurx = side->curx;  side->tmpcury = side->cury;
+X    side->tmpcurunit = side->curunit;
+X}
+X
+X/* Restore the saved "cur" slots. */
+X
+Xrestore_cur(side)
+XSide *side;
+X{
+X    side->curx = side->tmpcurx;  side->cury = side->tmpcury;
+X    side->curunit = side->tmpcurunit;
+X}
+X
+X/* Interpret the user's input in response to a position request.  All we */
+X/* have to comprehend is direction keys and mouse hits.  Space bars and */
+X/* unmoving mice both mean that a position has been decided on. */
+X
+Xgrok_position(side)
+XSide *side;
+X{
+X    int dir;
+X
+X    switch (side->reqtype) {
+X    case KEYBOARD:
+X	if (side->reqch == ' ') {
+X	    clear_prompt(side);
+X	    return TRUE;
+X	} else if ((dir = iindex(side->reqch, dirchars)) >= 0) {
+X	    side->reqposx = wrap(side->reqposx + dirx[dir]);
+X	    side->reqposy = side->reqposy + diry[dir];
+X	} else if ((dir = iindex(lowercase(side->reqch), dirchars)) >= 0) {
+X	    side->reqposx = wrap(side->reqposx + 10*dirx[dir]);
+X	    side->reqposy = side->reqposy + 10*diry[dir];
+X	}
+X	break;
+X    case MAPPOS:
+X	if (side->reqx == side->reqposx && side->reqy == side->reqposy) {
+X	    clear_prompt(side);
+X	    return TRUE;
+X	} else {
+X	    side->reqposx = side->reqx;  side->reqposy = side->reqy;
+X	}
+X	break;
+X    default:
+X	break;
+X    }
+X    side->curx = side->reqposx;  side->cury = side->reqposy;
+X    side->curunit = NULL;
+X    show_info(side);
+X    return FALSE;
+X}
+X
+X/* Prompt for a yes/no answer with a settable default. */
+X
+Xask_bool(side, question, dflt)
+XSide *side;
+Xchar *question;
+Xbool dflt;
+X{
+X    sprintf(side->promptbuf, "%s [%s]", question, (dflt ? "yn" : "ny"));
+X    show_prompt(side);
+X    side->reqvalue2 = dflt;
+X}
+X
+X/* Figure out what the answer actually is, keeping the default in mind. */
+X
+Xgrok_bool(side)
+XSide *side;
+X{
+X    bool dflt = side->reqvalue2;
+X    char ch = side->reqch;
+X
+X    if (side->reqtype == KEYBOARD) {
+X	if (dflt ? (lowercase(ch) == 'n') : (lowercase(ch) == 'y'))
+X	    dflt = !dflt;
+X    }
+X    clear_prompt(side);
+X    return dflt;
+X}
+X
+X/* Prompt for a single character. */
+X
+Xask_char(side, question, choices)
+XSide *side;
+Xchar *question, *choices;
+X{
+X    sprintf(side->promptbuf, "%s [%s]", question, choices);
+X    show_prompt(side);
+X}
+X
+X/* The char has already been processed, so just pass it through. */
+X
+Xgrok_char(side)
+XSide *side;
+X{
+X    if (side->reqtype == KEYBOARD) {
+X	clear_prompt(side);
+X	return side->reqch;
+X    } else {
+X	return '\0';
+X    }
+X}
+X
+X/* Read a string from the prompt window.  Deletion is allowed, and a */
+X/* cursor is displayed (this should definitely be a toolkit call...) */
+X/* Some restrictions on what strings can be read - for instance can't */
+X/* read or default to a NULL string. */
+X
+Xask_string(side, prompt, dflt)
+XSide *side;
+Xchar *prompt, *dflt;
+X{
+X    if (dflt == NULL) {
+X	sprintf(side->promptbuf, "%s ", prompt);
+X    } else {
+X	sprintf(side->promptbuf, "%s (default \"%s\") ", prompt, dflt);
+X    }
+X    show_prompt(side);
+X    side->reqstrbeg = strlen(side->promptbuf);
+X    side->reqcurstr = side->reqstrbeg;
+X    write_str_cursor(side);
+X    side->reqdeflt = dflt;
+X}
+X
+X/* Dig a character from the filled-in request and add it into the string. */
+X/* Keep returning NULL until we get something. */
+X
+Xchar *
+Xgrok_string(side)
+XSide *side;
+X{
+X    if (side->reqtype == KEYBOARD) {
+X	if (side->reqch == '\r' ||
+X	    side->reqch == '\n' ||
+X	    side->reqcurstr >= BUFSIZE-2) {
+X	    if (side->reqcurstr == side->reqstrbeg && side->reqdeflt != NULL) {
+X		strcpy(side->promptbuf+side->reqstrbeg, side->reqdeflt);
+X	    } else {
+X		(side->promptbuf)[side->reqcurstr] = '\0';
+X	    }
+X	    clear_prompt(side);
+X	    return copy_string(side->promptbuf + side->reqstrbeg);
+X	} else {
+X	    if (side->reqch == BACKSPACE) {
+X		if (side->reqcurstr > side->reqstrbeg) --side->reqcurstr;
+X	    } else {
+X		echo_at_prompt(side, side->reqch);
+X		(side->promptbuf)[side->reqcurstr++] = side->reqch;
+X	    }
+X	}
+X	write_str_cursor(side);
+X	(side->promptbuf)[side->reqcurstr+1] = '\0';
+X    }
+X    return NULL;
+X}
+END_OF_input.c
+if test 19011 -ne `wc -c <input.c`; then
+    echo shar: \"input.c\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f lib/xconq.bdf -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"lib/xconq.bdf\"
+else
+echo shar: Extracting \"lib/xconq.bdf\" \(29701 characters\)
+sed "s/^X//" >lib/xconq.bdf <<'END_OF_lib/xconq.bdf'
+XSTARTFONT 2.1
+XCOMMENT The X10 name for this font was "/site/Chris/Xconq/lib/xconq.onx"
+XFONT /site/Chris/Xconq/lib/xconq.onx.bdf
+XSIZE 11 75 75
+XFONTBOUNDINGBOX 20 22 0 0
+XSTARTPROPERTIES 2
+XFONT_DESCENT 8
+XFONT_ASCENT 14
+XENDPROPERTIES
+XCHARS 127
+XSTARTCHAR C000
+XENCODING 0
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X800010
+X406020
+X209040
+X108080
+X088100
+X049200
+X026400
+X3108c0
+X489120
+X486120
+X586120
+X489120
+X3508c0
+X020400
+X049200
+X089100
+X10d080
+X20b040
+X409020
+X809010
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C001
+XENCODING 1
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C002
+XENCODING 2
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C003
+XENCODING 3
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C004
+XENCODING 4
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C005
+XENCODING 5
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C006
+XENCODING 6
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C007
+XENCODING 7
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C010
+XENCODING 8
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C011
+XENCODING 9
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C012
+XENCODING 10
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C013
+XENCODING 11
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C014
+XENCODING 12
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C015
+XENCODING 13
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C016
+XENCODING 14
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C017
+XENCODING 15
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C020
+XENCODING 16
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C021
+XENCODING 17
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C022
+XENCODING 18
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C023
+XENCODING 19
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C024
+XENCODING 20
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C025
+XENCODING 21
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C026
+XENCODING 22
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C027
+XENCODING 23
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C030
+XENCODING 24
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C031
+XENCODING 25
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C032
+XENCODING 26
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C033
+XENCODING 27
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C034
+XENCODING 28
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C035
+XENCODING 29
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C036
+XENCODING 30
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C037
+XENCODING 31
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C040
+XENCODING 32
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR !
+XENCODING 33
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR "
+XENCODING 34
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR #
+XENCODING 35
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR $
+XENCODING 36
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR %
+XENCODING 37
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X00e000
+X0d2000
+X120600
+X20e900
+X1c21c0
+X36c640
+X424940
+X4d2220
+X0128a0
+X560820
+X088240
+X1c3100
+X256860
+X448ca0
+X451420
+X180a40
+X028800
+X022300
+X019000
+X004000
+X000000
+XENDCHAR
+XSTARTCHAR &
+XENCODING 38
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR '
+XENCODING 39
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR (
+XENCODING 40
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X00f800
+X838610
+X760360
+X0c0180
+X3800c0
+Xe00070
+X000010
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR )
+XENCODING 41
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR *
+XENCODING 42
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR +
+XENCODING 43
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X040100
+X040100
+X040100
+X040100
+X040100
+X040100
+X040100
+X040100
+Xfffff0
+X040100
+X040100
+X040100
+X040100
+X040100
+X040100
+X040100
+X040100
+X040100
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR ,
+XENCODING 44
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X003800
+X000000
+X07ce00
+X000000
+X73ffc0
+X000000
+X3ff1f0
+X000000
+Xff3fe0
+X000000
+X3ffe70
+X000000
+Xffcf30
+X000000
+X3f7fe0
+X000000
+X1cfe00
+X000000
+X00f800
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR -
+XENCODING 45
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR .
+XENCODING 46
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X004000
+X00a000
+X031880
+X1c0700
+X000000
+X080200
+X360d80
+Xc1f070
+X000000
+X004010
+Xc1b060
+X3e0f80
+X000000
+X080200
+X360d80
+Xc1f070
+X000000
+X004000
+X00a000
+X011800
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR /
+XENCODING 47
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR 0
+XENCODING 48
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000380
+X000280
+X000280
+X000280
+X000380
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR 1
+XENCODING 49
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000100
+X000100
+X000100
+X000100
+X000100
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR 2
+XENCODING 50
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000380
+X000080
+X000380
+X000200
+X000380
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR 3
+XENCODING 51
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000380
+X000080
+X000380
+X000080
+X000380
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR 4
+XENCODING 52
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000280
+X000280
+X000380
+X000080
+X000080
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR 5
+XENCODING 53
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000380
+X000200
+X000380
+X000080
+X000380
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR 6
+XENCODING 54
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000380
+X000200
+X000380
+X000280
+X000380
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR 7
+XENCODING 55
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR 8
+XENCODING 56
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR 9
+XENCODING 57
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR :
+XENCODING 58
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X008000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000100
+X000000
+X000000
+X080000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR ;
+XENCODING 59
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR <
+XENCODING 60
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR =
+XENCODING 61
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X01f000
+X000000
+X000400
+X7e4440
+X002480
+X1fa480
+X001500
+X7f1570
+X000000
+X07ff80
+Xf00000
+X0207e0
+X222000
+X124fc0
+X124000
+X0a8000
+X0abf00
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR >
+XENCODING 62
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR ?
+XENCODING 63
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR @
+XENCODING 64
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR A
+XENCODING 65
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR B
+XENCODING 66
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR C
+XENCODING 67
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR D
+XENCODING 68
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR E
+XENCODING 69
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR F
+XENCODING 70
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR G
+XENCODING 71
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR H
+XENCODING 72
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR I
+XENCODING 73
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR J
+XENCODING 74
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR K
+XENCODING 75
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR L
+XENCODING 76
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR M
+XENCODING 77
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR N
+XENCODING 78
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR O
+XENCODING 79
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X006000
+X01f800
+X07fe00
+X1fff80
+X7fffe0
+Xfffff0
+Xfffff0
+Xfffff0
+Xfffff0
+Xfffff0
+Xfffff0
+Xfffff0
+Xfffff0
+Xfffff0
+Xfffff0
+Xfffff0
+Xfffff0
+X7fffe0
+X1fff80
+X07fe00
+X01f800
+X006000
+XENDCHAR
+XSTARTCHAR P
+XENCODING 80
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR Q
+XENCODING 81
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR R
+XENCODING 82
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR S
+XENCODING 83
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR T
+XENCODING 84
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR U
+XENCODING 85
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR V
+XENCODING 86
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR W
+XENCODING 87
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR X
+XENCODING 88
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR Y
+XENCODING 89
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR Z
+XENCODING 90
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR [
+XENCODING 91
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X1fff80
+X3fffc0
+X3fffc0
+X3801c0
+X3801c0
+X3801c0
+X3801c0
+X3801c0
+X3801c0
+X3801c0
+X3801c0
+X3801c0
+X3801c0
+X3fffc0
+X3fffc0
+X1fff80
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR \
+XENCODING 92
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR ]
+XENCODING 93
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X0fff00
+X100080
+X100080
+X100080
+X100080
+X100080
+X100080
+X100080
+X100080
+X100080
+X100080
+X100080
+X100080
+X0fff00
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR ^
+XENCODING 94
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X006000
+X007000
+X00d000
+X019800
+X014c00
+X034600
+X065380
+X1c88c0
+X32a660
+X641120
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR _
+XENCODING 95
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X001000
+X001000
+X003000
+X003800
+X002800
+X065800
+X065800
+X0a5400
+X19d400
+X11da00
+Xf34bf0
+Xe24df0
+Xc445f0
+X448280
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR `
+XENCODING 96
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR a
+XENCODING 97
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR b
+XENCODING 98
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X005000
+X019000
+X00e800
+X017000
+X00a800
+X012000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR c
+XENCODING 99
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X025000
+X012800
+X02aa00
+X0ca400
+X029800
+X056500
+X0af200
+X04f400
+X036c00
+X0c9300
+X015400
+X029200
+X024800
+X002800
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR d
+XENCODING 100
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X004000
+X01a000
+X029a00
+X1eb500
+X2a5280
+X452a40
+X3a5520
+X09fa20
+X65f9c0
+X13fca0
+X09fa20
+X6ffdc0
+X19f860
+X42af40
+X5452a0
+X054540
+X1aad00
+X029400
+X005000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR e
+XENCODING 101
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR f
+XENCODING 102
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR g
+XENCODING 103
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR h
+XENCODING 104
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR i
+XENCODING 105
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR j
+XENCODING 106
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR k
+XENCODING 107
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR l
+XENCODING 108
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR m
+XENCODING 109
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR n
+XENCODING 110
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR o
+XENCODING 111
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X006000
+X01f800
+X07fe00
+X1fff80
+X7fffe0
+Xffffe0
+Xffffe0
+Xffffe0
+Xffffe0
+Xffffe0
+Xffffe0
+Xffffe0
+Xffffe0
+Xffffe0
+Xffffe0
+Xffffe0
+X7fffe0
+X1fff80
+X07fe00
+X01f800
+X006000
+X000000
+XENDCHAR
+XSTARTCHAR p
+XENCODING 112
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR q
+XENCODING 113
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR r
+XENCODING 114
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR s
+XENCODING 115
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR t
+XENCODING 116
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR u
+XENCODING 117
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR v
+XENCODING 118
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR w
+XENCODING 119
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR x
+XENCODING 120
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR y
+XENCODING 121
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR z
+XENCODING 122
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR {
+XENCODING 123
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR |
+XENCODING 124
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR }
+XENCODING 125
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+X000000
+XENDCHAR
+XSTARTCHAR ~
+XENCODING 126
+XSWIDTH 1 0
+XDWIDTH 20 0
+XBBX 20 22 0 -8
+XBITMAP
+X004000
+X002000
+X008800
+X061200
+X094280
+X490c20
+X1a8280
+X485250
+X10a200
+X8a0920
+X08a500
+Xe7f6f0
+X050100
+X895220
+X2c0a80
+X2a2a10
+X889480
+X090280
+X045200
+X00a000
+X000000
+X004000
+XENDCHAR
+XENDFONT
+END_OF_lib/xconq.bdf
+if test 29701 -ne `wc -c <lib/xconq.bdf`; then
+    echo shar: \"lib/xconq.bdf\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f map.h -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"map.h\"
+else
+echo shar: Extracting \"map.h\" \(3444 characters\)
+sed "s/^X//" >map.h <<'END_OF_map.h'
+X/* Copyright (c) 1987, 1988  Stanley T. Shebs, University of Utah. */
+X/* This program may be used, copied, modified, and redistributed freely */
+X/* for noncommercial purposes, so long as this notice remains intact. */
+X
+X/* RCS $Header: map.h,v 1.1 88/06/21 12:29:42 shebs Exp $ */
+X
+X/* Definitions of levels of detail in mapfiles.  These values must be */
+X/* ordered, so careful about fiddling with them. */
+X
+X#define SIDEBASIC 1
+X#define SIDESLOTS 2
+X#define SIDEVIEW  3
+X#define SIDEMISC  4
+X#define SIDEALL   9  /* guaranteed max */
+X
+X#define UNITBASIC  1
+X#define UNITSLOTS  2
+X#define UNITORDERS 3
+X#define UNITALL    9  /* guaranteed max */
+X
+X/* These limit the junk in mapfile headers. */
+X
+X#define MAXINCLUDES 9     /* max number of included files */
+X#define MAXMAPNOTES 40    /* max lines of notes */
+X
+X/* Theoretically, there is no maximum size to xconq maps, but the minimum */
+X/* size is set by mystical properties of display, and is not negotiable. */
+X
+X#define MINWIDTH 5
+X#define MINHEIGHT 5
+X
+X/* Letters for hex and outlined hex.  Exact use is up to the interface - */
+X/* the X interface has hexagonal shapes in its xconq font for these.  No */
+X/* problems about conflicting with unit or terrain characters. */
+X
+X#define HEX 'O'
+X#define OHEX 'o'
+X
+X/* This structure should be as small as possible, since it is an */
+X/* individual entry in the array containing the entire world. */
+X/* The "type" and "people" slots could be combined, but this might */
+X/* slow accesses undesirably, because of bit field extraction. */
+X
+Xtypedef struct a_hex {
+X    char type;            /* terrain type at this spot */
+X    char people;          /* alignment/number of people in this hex */
+X    struct a_unit *surf;  /* pointer to unit if any */
+X} Hex;
+X
+X/* Just for convenience, global variables about map live in this structure. */
+X
+Xtypedef struct a_world {
+X    int width, height;    /* size of the world */
+X    int scale;            /* scale in km (not really very important) */
+X    bool known;           /* true if everybody knows what world looks like */
+X    Hex *terrain;         /* pointer to array of hexes */
+X} World;
+X
+X/* The type of a hex in the world is a small number representing the */
+X/* terrain type.  Only about 10 types are defined, in terrain.h */
+X
+X#define terrain_at(x,y) ((world.terrain[(y)*world.width+(x)]).type)
+X
+X#define set_terrain_at(x,y,t) \
+X  ((world.terrain[(y)*world.width+(x)]).type = (t))
+X
+X/* The people only have a side alignment, no mention of population */
+X/* (at least for now). */
+X
+X#define people_at(x,y) ((world.terrain[(y)*world.width+(x)]).people)
+X
+X#define set_people_at(x,y,p) \
+X  ((world.terrain[(y)*world.width+(x)]).people = (p))
+X
+X#define NOBODY 0
+X
+X#define unpopulated(x,y) (people_at((x),(y)) == NOBODY)
+X
+X/* The unit is a raw pointer - this macro is used a *lot*. (Any prospects */
+X/* for optimization?) */
+X
+X#define unit_at(x,y) ((world.terrain[(y)*world.width+(x)]).surf)
+X
+X#define set_unit_at(x,y,u) \
+X  ((world.terrain[(y)*world.width+(x)]).surf = (u))
+X
+X/* This little macro implements wraparound in the x direction. */
+X/* The stupid add is for the benefit of brain-damaged mod operators */
+X/* that don't handle negative numbers properly. */
+X
+X#define wrap(x) (((x) + 4*world.width) % world.width)
+X
+X/* Constrain y to northern and southern edges. */
+X
+X#define limit(y) (max(0, min((y), (world.height-1))))
+X
+X#define interior(y) (max(1, min((y), (world.height-2))))
+X
+X/* Declaration of the world itself. */
+X
+Xextern World world;
+END_OF_map.h
+if test 3444 -ne `wc -c <map.h`; then
+    echo shar: \"map.h\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+echo shar: End of archive 7 \(of 18\).
+cp /dev/null ark7isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 18 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

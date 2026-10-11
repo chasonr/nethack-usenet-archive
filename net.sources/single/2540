@@ -1,0 +1,1537 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,dad2db991091bd16,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-03-07 23:53:00 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: Notesfiles $Revision: 1.7 $; site okstate
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxr!ihnp4!okstate!authorplaceholder
+From: gregg@okstate.UUCP
+Newsgroups: net.sources
+Subject: C-KERMIT (Part 10 of 10)
+Message-ID: <5200025@okstate>
+Date: Fri, 8-Mar-85 02:53:00 EST
+Article-I.D.: okstate.5200025
+Posted: Fri Mar  8 02:53:00 1985
+Date-Received: Sun, 10-Mar-85 04:39:36 EST
+Lines: 1516
+Nf-ID: #N:okstate:5200025:000:40383
+Nf-From: okstate!gregg    Mar  8 01:53:00 1985
+
+
+
+echo x - ckcmd.c
+sed '1,$s/^X//' <<\!FUNKY!STUFF! > ckcmd.c
+Xchar *cmdv = "Unix cmd package V1.0(015) 27 Feb 85";
+X
+X/*  C K C M D  --  Interactive command package for Unix  */
+X/*
+X Modelled after the DECSYSTEM-20 command parser (the COMND JSYS)
+X
+X Features:
+X . parses and verifies keywords, text strings, numbers, and other data
+X . displays appropriate menu or help message when user types "?"
+X . does keyword and filename completion when user types ESC
+X . accepts any unique abbreviation for a keyword
+X . allows keywords to have attributes, like "invisible"
+X . can supply defaults for fields omitted by user
+X . provides command line editing (character, word, and line deletion)
+X . accepts input from keyboard, command files, or redirected stdin
+X . allows for full or half duplex operation, character or line input
+X . settable prompt, protected from deletion
+X
+X Functions:
+X  cmsetp - Set prompt
+X  cmsavp - Save current prompt
+X  prompt - Issue prompt
+X  cmini  - Clear the command buffer (before parsing a new command)
+X  cmres  - Reset command buffer pointers (before reparsing)
+X  cmkey  - Parse a keyword
+X  cmnum  - Parse a number
+X  cmifi  - Parse an input file name
+X  cmofi  - Parse an output file name
+X  cmfld  - Parse an arbitrary field
+X  cmtxt  - Parse a text string
+X  cmcfm  - Parse command confirmation (end of line)
+X  stripq - Strip out backslash quotes from a string.
+X
+X Return codes:
+X  -3: no input provided when required
+X  -2: input was invalid
+X  -1: reparse required (user deleted into a preceding field)
+X   0 or greater: success
+X  See individual functions for greater detail.
+X
+X Before using these routines, the caller should #include ckcmd.h, and
+X set the program's prompt by calling cmsetp().  If the file parsing
+X functions cmifi and cmofi are to be used, this module must be linked
+X with a ckz??? file system support module for the appropriate system,
+X e.g. ckzbsd for Berkeley Unix.  If the caller puts the terminal in
+X character wakeup ("cbreak") mode with no echo, then these functions will
+X provide line editing -- character, word, and line deletion, as well as
+X keyword and filename completion upon ESC and help strings, keyword, or
+X file menus upon '?'.  If the caller puts the terminal into character
+X wakeup/noecho mode, care should be taken to restore it before exit from
+X or interruption of the program.  If the character wakeup mode is not
+X set, the system's own line editor may be used.
+X
+X Author: Frank da Cruz (SY.FDC@CU20B),
+X Columbia University Center for Computing Activities, Jan 1985.
+X Copyright (C) 1985, Trustees of Columbia University in the City of New York.
+X Permission is granted to any individual or institution to copy or use this
+X software except for explicitly commercial purposes, provided this copyright
+X notice is retained.
+X*/
+X
+X/* Includes */
+X
+X#include <stdio.h>			/* Standard C I/O package */
+X#include <ctype.h>			/* Character types */
+X#include "ckcmd.h"			/* Command parsing definitions */
+X#include "ckdebu.h"			/* Formats for debug() */
+X
+X/* Local variables */
+X
+Xint psetf = 0,				/* Flag that prompt has been set */
+X    cc = 0,				/* Character count */
+X    dpx = 0;				/* Duplex (0 = full) */
+X
+Xint hw = HLPLW,				/* Help line width */
+X    hc = HLPCW,				/* Help line column width */
+X    hh,					/* Current help column number */
+X    hx;					/* Current help line position */
+X
+X#define PROML 60			/* Maximum length for prompt */
+X
+Xchar cmprom[PROML+1];			/* Program's prompt */
+Xchar *dfprom = "Command? ";		/* Default prompt */
+X
+Xint cmflgs;				/* Command flags */
+X
+Xchar cmdbuf[CMDBL+4];			/* Command buffer */
+Xchar hlpbuf[HLPBL+4];			/* Help string buffer */
+Xchar atmbuf[ATMBL+4];			/* Atom buffer */
+Xchar filbuf[ATMBL+4];			/* File name buffer */
+X
+X/* Command buffer pointers */
+X
+Xstatic char *bp,			/* Current command buffer position */
+X    *pp,				/* Start of current field */
+X    *np;				/* Start of next field */
+X
+X/*  C M S E T P  --  Set the program prompt.  */
+X
+Xcmsetp(s) char *s; {
+X    char *strncpy();
+X    psetf = 1;				/* Flag that prompt has been set. */
+X    strncpy(cmprom,s,PROML - 1);	/* Copy the string. */
+X    cmprom[PROML] = NUL;
+X}
+X
+X
+X/*  C M S A V P  --  Save a copy of the current prompt.  */
+X
+Xcmsavp(s,n) int n; char s[]; {
+X    strncpy(s,cmprom,n-1);
+X    s[n] = NUL;
+X}
+X
+X
+X/*  P R O M P T  --  Issue the program prompt.  */
+X
+Xprompt() {
+X    if (psetf == 0) cmsetp(dfprom);	/* If no prompt set, set default. */
+X    printf("\r%s",cmprom);		/* Print the prompt. */
+X}
+X
+X
+X/*  C M R E S  --  Reset pointers to beginning of command buffer.  */
+X
+Xcmres() {  
+X    cc = 0;				/* Reset character counter. */
+X    pp = np = bp = cmdbuf;		/* Point to command buffer. */
+X    cmflgs = -5;			/* Parse not yet started. */
+X}
+X
+X
+X/*  C M I N I  --  Clear the command and atom buffers, reset pointers.  */
+X
+X/*
+XThe argument specifies who is to echo the user's typein --
+X  1 means the cmd package echoes
+X  0 somebody else (system, front end, terminal) echoes
+X*/
+Xcmini(d) int d; {
+X    for (bp = cmdbuf; bp < cmdbuf+CMDBL; bp++) *bp = NUL;
+X    *atmbuf = NUL;
+X    dpx = d;
+X    cmres();
+X}
+X
+Xstripq(s) char *s; {			/* Function to strip '\' quotes */
+X    char *t;
+X    while (*s) {
+X	if (*s == '\\') {
+X	    for (t = s; *t != '\0'; t++) *t = *(t+1);
+X	}
+X	s++;
+X    }
+X}
+X
+X/*  C M N U M  --  Parse a number in the indicated radix  */
+X
+X/*  For now, only works for positive numbers in base 10.  */
+X
+X/*
+X Returns
+X   -3 if no input present when required,
+X   -2 if user typed an illegal number,
+X   -1 if reparse needed,
+X    0 otherwise, with n set to number that was parsed
+X*/
+Xcmnum(xhlp,xdef,radix,n) char *xhlp, *xdef; int radix, *n; {
+X    int x; char *s;
+X
+X    if (radix != 10) {			/* Just do base 10 for now */
+X	printf("cmnum: illegal radix - %d\n",radix);
+X	return(-1);
+X    }
+X
+X    x = cmfld(xhlp,xdef,&s);
+X    debug(F101,"cmnum: cmfld","",x);
+X    if (x < 0) return(x);    /* Parse a field */
+X
+X    if (digits(atmbuf)) {		/* Convert to number */
+X	*n = atoi(atmbuf);
+X	return(x);
+X    } else {
+X	printf("\n?not a number - %s\n",s);
+X	return(-2);	
+X    }
+X}
+X
+X/*  C M O F I  --  Parse the name of an output file  */
+X
+X/*
+X Depends on the external function zchko(); if zchko() not available, use
+X cmfld() to parse output file names.
+X
+X Returns
+X   -3 if no input present when required,
+X   -2 if permission would be denied to create the file,
+X   -1 if reparse needed,
+X    0 or 1 otherwise, with xp pointing to name.
+X*/
+Xcmofi(xhlp,xdef,xp) char *xhlp, *xdef, **xp; {
+X    int x; char *s;
+X
+X    if (*xhlp == NUL) xhlp = "Output file";
+X    *xp = "";
+X
+X    if ((x = cmfld(xhlp,xdef,&s)) < 0) return(x);
+X
+X    if (chkwld(s)) {
+X	printf("\n?Wildcards not allowed - %s\n",s);
+X	return(-2);
+X    }
+X    if (zchko(s) < 0) {
+X	printf("\n?Write permission denied - %s\n",s);
+X	return(-2);
+X    } else {
+X	*xp = s;
+X	return(x);
+X    }
+X}
+X
+X/*  C M I F I  --  Parse the name of an existing file  */
+X
+X/*
+X This function depends on the external functions:
+X   zchki()  - Check if input file exists and is readable.
+X   zxpand() - Expand a wild file specification into a list.
+X   znext()  - Return next file name from list.
+X If these functions aren't available, then use cmfld() to parse filenames.
+X*/
+X/*
+X Returns
+X   -4 EOF
+X   -3 if no input present when required,
+X   -2 if file does not exist or is not readable,
+X   -1 if reparse needed,
+X    0 or 1 otherwise, with:
+X	xp pointing to name,
+X    	wild = 1 if name contains '*' or '?', 0 otherwise.
+X*/
+Xcmifi(xhlp,xdef,xp,wild) char *xhlp, *xdef, **xp; int *wild; {
+X    int i, x, xc, y; char *sp;
+X
+X    cc = xc = 0;			/* Initialize counts & pointers */
+X    *xp = "";
+X    if ((x = cmflgs) != 1) {		/* Already confirmed? */
+X	x = getwd();			/* No, get a word */
+X    } else {
+X	cc = setatm(xdef);		/* If so, use default, if any. */
+X    }
+X    *xp = atmbuf;			/* Point to result. */
+X    *wild = chkwld(*xp);
+X
+X    while (1) {
+X	xc += cc;			/* Count the characters. */
+X	debug(F111,"cmifi: getwd",atmbuf,xc);
+X    	switch (x) {
+X	    case -4:			/* EOF */
+X	    case -2:			/* Out of space. */
+X	    case -1:			/* Reparse needed */
+X	    	return(x);
+X
+X/* cont'd... */
+X
+X/* ...cmifi(), cont'd */
+X
+X
+X	    case 0:			/* SP or NL */
+X	    case 1:
+X	    	if (xc == 0) *xp = xdef;    /* If no input, return default. */
+X		else *xp = atmbuf;
+X		if (**xp == NUL) return(-3); /* If field empty, return -3. */
+X		
+X		/* If filespec is wild, see if there are any matches */
+X
+X		*wild = chkwld(*xp);
+X		debug(F101," *wild","",*wild);
+X		if (*wild != 0) {
+X		    y = zxpand(*xp);
+X		    if (y == 0) {
+X			printf("\n?No files match - %s\n",*xp);
+X			return(-2);
+X		    } else if (y < 0) {
+X			printf("\n?Too many files match - %s\n",*xp);
+X			return(-2);
+X		    } else return(x);
+X		}
+X
+X		/* If not wild, see if it exists and is readable. */
+X
+X		y = zchki(*xp);
+X		if (y == -3) {
+X		    printf("\n?Read permission denied - %s\n",*xp);
+X		    return(-2);
+X		} else if (y == -2) {
+X		    printf("\n?File not readable - %s\n",*xp);
+X		    return(-2);
+X		} else if (y < 0) {
+X		    printf("\n?File not found - %s\n",*xp);
+X		    return(-2);
+X		}
+X		return(x);
+X/* cont'd... */
+X
+X/* ...cmifi(), cont'd */
+X
+X
+X	    case 2:			/* ESC */
+X	    	if (xc == 0) {
+X		    if (*xdef != '\0') {
+X			printf("%s ",xdef); /* If at beginning of field, */
+X			addbuf(xdef);	/* supply default. */
+X			cc = setatm(xdef);
+X		    } else {		/* No default */
+X			putchar(BEL);
+X		    }
+X		    break;
+X		} 
+X		if (*wild = chkwld(*xp)) {  /* No completion if wild */
+X		    putchar(BEL);
+X		    break;
+X		}
+X		sp = atmbuf + cc;
+X		*sp++ = '*';
+X		*sp-- = '\0';
+X		y = zxpand(atmbuf);	/* Add * and expand list. */
+X		*sp = '\0';		/* Remove *. */
+X
+X		if (y == 0) {
+X		    printf("\n?No files match - %s\n",atmbuf);
+X		    return(-2);
+X		} else if (y < 0) {
+X		    printf("\n?Too many files match - %s\n",atmbuf);
+X		    return(-2);
+X		} else if (y > 1) {	/* Not unique, just beep. */
+X		    putchar(BEL);
+X		} else {		/* Unique, complete it.  */
+X		    znext(filbuf);	/* Get whole name of file. */
+X		    sp = filbuf + cc;	/* Point past what user typed. */
+X		    printf("%s ",sp);	/* Complete the name. */
+X		    addbuf(sp);		/* Add the characters to cmdbuf. */
+X		    setatm(pp);		/* And to atmbuf. */
+X		    *xp = atmbuf;	/* Return pointer to atmbuf. */
+X		    return(cmflgs = 0);
+X		}
+X		break;
+X
+X/* cont'd... */
+X
+X/* ...cmifi(), cont'd */
+X
+X
+X	    case 3:			/* Question mark */
+X	    	if (*xhlp == NUL)
+X	    	    printf(" Input file specification");
+X		else
+X		    printf(" %s",xhlp);
+X		if (xc > 0) {
+X		    sp = atmbuf + cc;	/* Insert * at end */
+X		    *sp++ = '*';
+X		    *sp-- = '\0';
+X		    y = zxpand(atmbuf);
+X		    *sp = '\0';
+X		    if (y == 0) {		    
+X			printf("\n?No files match - %s\n",atmbuf);
+X			return(-2);
+X		    } else if (y < 0) {
+X			printf("\n?Too many file match - %s\n",atmbuf);
+X			return(-2);
+X		    } else {
+X			printf(", one of the following:\n");
+X			clrhlp();
+X			for (i = 0; i < y; i++) {
+X			    znext(filbuf);
+X			    addhlp(filbuf);
+X			}
+X			dmphlp();
+X		    }
+X		} else printf("\n");
+X		printf("%s%s",cmprom,cmdbuf);
+X		break;
+X	}
+X    x = getwd();
+X    }
+X}
+X
+X
+X
+X/*  C H K W L D  --  Check for wildcard characters '*' or '?'  */
+X
+Xchkwld(s) char *s; {
+X
+X    for ( ; *s != '\0'; s++) {
+X    	if ((*s == '*') || (*s == '?'))
+X	    return(1);
+X    }
+X    return(0);
+X}
+X
+X/*  C M F L D  --  Parse an arbitrary field  */
+X/*
+X Returns
+X   -3 if no input present when required,
+X   -2 if field too big for buffer,
+X   -1 if reparse needed,
+X    0 otherwise, xp pointing to string result.
+X*/
+Xcmfld(xhlp,xdef,xp) char *xhlp, *xdef, **xp; {
+X    int x, xc;
+X
+X    cc = xc = 0;			/* Initialize counts & pointers */
+X    *xp = "";
+X    if ((x = cmflgs) != 1) {		/* Already confirmed? */
+X	x = getwd();			/* No, get a word */
+X    } else {
+X	cc = setatm(xdef);		/* If so, use default, if any. */
+X    }
+X    *xp = atmbuf;			/* Point to result. */
+X
+X    while (1) {
+X	xc += cc;			/* Count the characters. */
+X	debug(F111,"cmfld: getwd",atmbuf,xc);
+X	debug(F101," x","",x);
+X    	switch (x) {
+X	    case -4:			/* EOF */
+X	    case -2:			/* Out of space. */
+X	    case -1:			/* Reparse needed */
+X	    	return(x);
+X	    case 0:			/* SP or NL */
+X	    case 1:
+X	    	if (xc == 0) *xp = xdef;    /* If no input, return default. */
+X		else *xp = atmbuf;
+X		if (**xp == NUL) x = -3;    /* If field empty, return -3. */
+X		return(x);
+X	    case 2:			/* ESC *** (maybe treat as SP) */
+X	    	if (xc == 0) {
+X		    printf("%s ",xdef);	/* If at beginning of field, */
+X		    addbuf(xdef);	/* supply default. */
+X		    cc = setatm(xdef);
+X		} else {
+X		    putchar(BEL);	/* Beep if already into field. */
+X    	    	}		    
+X		break;
+X	    case 3:			/* Question mark */
+X	    	if (*xhlp == NUL)
+X		    printf(" Please complete this field");
+X		else
+X	            printf(" %s",xhlp);
+X		printf("\n%s%s",cmprom,cmdbuf);
+X		break;
+X	}
+X    x = getwd();
+X    }
+X}
+X
+X/*  C M T X T  --  Get a text string, including confirmation  */
+X
+X/*
+X  Print help message 'xhlp' if ? typed, supply default 'xdef' if null
+X  string typed.  Returns
+X
+X   -1 if reparse needed or buffer overflows.
+X    1 otherwise.
+X
+X  with cmflgs set to return code, and xp pointing to result string.
+X*/
+X
+Xcmtxt(xhlp,xdef,xp) char *xhlp; char *xdef; char **xp; {
+X
+X    int x, xc;
+X
+X    cc = xc = 0;			/* Start counters off at 0 */
+X    *xp = "";				/* And pointer to null string. */
+X    *atmbuf = NUL;			/* And empty atom buffer. */
+X    if ((x = cmflgs) != 1) {
+X	x = getwd();			/* Get first word. */
+X	*xp = pp;			/* Save pointer to it. */
+X    }
+X    while (1) {
+X	xc += cc;			/* Accumulate count. */
+X	debug(F111,"cmtxt: getwd",atmbuf,xc);
+X	switch (x) {
+X	    case -4:			/* EOF */
+X	    case -2:			/* Overflow */
+X	    case -1:			/* Deletion */
+X	        return(x);
+X	    case 0:			/* Space */
+X		break;
+X	    case 1:			/* CR or LF */
+X	        if (xc == 0) *xp = xdef;
+X		return(x);
+X	    case 2:			/* ESC */
+X	    	if (xc == 0) {
+X		    printf("%s ",xdef);
+X		    cc = addbuf(xdef);
+X		} else {
+X		    putchar(BEL);
+X		}
+X		break;
+X	    case 3:			/* Question Mark */
+X	    	if (*xhlp == NUL)
+X		    printf(" Text string");
+X		else
+X		    printf(" %s",xhlp);
+X		printf("\n%s%s",cmprom,cmdbuf);
+X		break;
+X            default:
+X	    	printf("\n?Unexpected return code from getwd() - %d\n",x);
+X		return(-2);
+X        }
+X	x = getwd();
+X    }
+X}
+X
+X/*  C M K E Y  --  Parse a keyword  */
+X
+X/*
+X Call with:
+X   table    --  keyword table, in 'struct keytab' format;
+X   n        --  number of entries in table;
+X   xhlp     --  pointer to help string;
+X   xdef     --  pointer to default keyword;
+X
+X Returns:
+X   -3       --  no input supplied and no default available
+X   -2       --  input doesn't uniquely match a keyword in the table
+X   -1       --  user deleted too much, command reparse required
+X    n >= 0  --  value associated with keyword
+X*/
+X
+Xcmkey(table,n,xhlp,xdef) struct keytab table[]; int n; char *xhlp, *xdef; {
+X    int i, y, z, zz, xc;
+X    char *xp;
+X
+X    xc = cc = 0;			/* Clear character counters. */
+X
+X    if ((zz = cmflgs) == 1) 		/* Command already entered? */
+X	setatm(xdef);
+X    else zz = getwd(); 
+X
+Xdebug(F101,"cmkey: table length","",n);
+Xdebug(F101," cmflgs","",cmflgs);
+Xdebug(F101," zz","",zz);
+Xwhile (1) {
+X    xc += cc;
+X    debug(F111,"cmkey: getwd",atmbuf,xc);
+X
+X    switch(zz) {
+X	case -4:			/* EOF */
+X	case -2:			/* Buffer overflow */
+X    	case -1:			/* Or user did some deleting. */
+X	    return(zz);
+X
+X	case 0:				/* User terminated word with space */
+X	case 1:				/* or newline */
+X	    if (cc == 0) setatm(xdef);
+X	    y = lookup(table,atmbuf,n,&z);
+X	    switch (y) {
+X		case -2:
+X		    printf("\n?Ambiguous - %s\n",atmbuf);
+X		    return(cmflgs = -2);
+X		case -1:
+X		    printf("\n?Invalid - %s\n",atmbuf);
+X		    return(cmflgs = -2);
+X		default:
+X		    break;
+X	    }
+X	    return(y);
+X
+X/* cont'd... */
+X
+X/* ...cmkey(), cont'd */
+X
+X	case 2:				/* User terminated word with ESC */
+X	    if (cc == 0) {
+X	    	if (*xdef != NUL) {	/* Nothing in atmbuf */
+X		    printf("%s ",xdef);	/* Supply default if any */
+X		    addbuf(xdef);
+X		    cc = setatm(xdef);
+X		    debug(F111,"cmkey: default",atmbuf,cc);
+X		} else {
+X		    putchar(BEL);	/* No default, just beep */
+X		    break;
+X		}
+X	    }
+X	    y = lookup(table,atmbuf,n,&z); /* Something in atmbuf */
+X	    debug(F111,"cmkey: esc",atmbuf,y);
+X	    if (y == -2) {
+X		putchar(BEL);
+X		break;
+X    	    }
+X	    if (y == -1) {
+X		printf("\n?Invalid - %s\n",atmbuf);
+X		return(cmflgs = -2);
+X	    }
+X	    xp = table[z].kwd + cc;
+X    	    printf("%s ",xp);
+X	    addbuf(xp);
+X	    debug(F110,"cmkey: addbuf",cmdbuf,0);
+X	    return(y);
+X
+X/* cont'd... */
+X
+X/* ...cmkey(), cont'd */
+X
+X	case 3:				/* User terminated word with "?" */
+X	    y = lookup(table,atmbuf,n,&z);
+X	    if (y > -1) {
+X		printf(" %s\n%s%s",table[z].kwd,cmprom,cmdbuf);
+X		break;
+X	    } else if (y == -1) {
+X		printf("\n?Invalid\n");
+X		return(cmflgs = -2);
+X	    }
+X
+X	    if (*xhlp == NUL)
+X	    	printf(" One of the following:\n");
+X	    else
+X	    	printf(" %s, one of the following:\n",xhlp);
+X
+X	    clrhlp();
+X	    for (i = 0; i < n; i++) {	
+X		if (!strncmp(table[i].kwd,atmbuf,cc)
+X		    	&& !test(table[i].flgs,CM_INV))
+X		    addhlp(table[i].kwd);
+X	    }
+X	    dmphlp();
+X	    printf("%s%s", cmprom, cmdbuf);
+X	    break;
+X
+X    	default:	    
+X	    printf("\n%d - Unexpected return code from getwd\n",zz);
+X	    return(cmflgs = -2);
+X        }
+X	zz = getwd();
+X    }
+X}
+X
+X/*  C M C F M  --  Parse command confirmation (end of line)  */
+X
+X/*
+X Returns
+X   -2: User typed anything but whitespace or newline
+X   -1: Reparse needed
+X    0: Confirmation was received
+X*/
+X
+Xcmcfm() {
+X    int x, xc;
+X
+X    debug(F101,"cmcfm: cmflgs","",cmflgs);
+X
+X    xc = cc = 0;
+X    if (cmflgs == 1) return(0);
+X
+X    while (1) {
+X	x = getwd();
+X	xc += cc;
+X	debug(F111,"cmcfm: getwd",atmbuf,xc);
+X        switch (x) {
+X	    case -4:			/* EOF */
+X	    case -2:
+X	    case -1:
+X		return(x);
+X
+X	    case 0:			/* Space */
+X	    	continue;
+X	    case 1:			/* End of line */
+X	    	if (xc > 0) {
+X		    printf("?Not confirmed - %s\n",atmbuf);
+X		    return(-2);
+X    	    	} else return(0);		    
+X	    case 2:
+X	    	putchar(BEL);
+X		continue;
+X
+X            case 3:
+X	    	if (xc > 0) {
+X		    printf("\n?Not confirmed - %s\n",atmbuf);
+X		    return(-2);
+X		}
+X	        printf("\n Type a carriage return to confirm the command\n");
+X		printf("%s%s",cmprom,cmdbuf);
+X		continue;
+X	}
+X    }
+X}
+X
+X/* Keyword help routines */
+X
+X
+X/*  C L R H L P -- Initialize/Clear the help line buffer  */
+X
+Xclrhlp() {				/* Clear the help buffer */
+X    hlpbuf[0] = NUL;
+X    hh = hx = 0;
+X}
+X
+X
+X/*  A D D H L P  --  Add a string to the help line buffer  */
+X
+Xaddhlp(s) char *s; {			/* Add a word to the help buffer */
+X    int j;
+X
+X    hh++;				/* Count this column */
+X
+X    for (j = 0; j < hc; j++) {		/* Fill the column */
+X	if (*s != NUL)			/* First with chars from the string */
+X	    hlpbuf[hx++] = *s++;
+X	else {
+X	    if (hh < (hw / hc))		/* Then with spaces */
+X	    	hlpbuf[hx++] = SP;
+X	    else {
+X		hlpbuf[hx++] = NUL;	/* If last column, no spaces. */
+X		dmphlp();		/* Print it. */
+X		return;
+X		}
+X    	} 
+X    }
+X    if (*s != NUL)			/* Still some chars left in string? */
+X	hlpbuf[hx-1] = '+';		/* Mark as too long for column. */
+X}
+X
+X
+X/*  D M P H L P  --  Dump the help line buffer  */
+X
+Xdmphlp() {				/* Print the help buffer */
+X    hlpbuf[hx++] = NUL;
+X    printf(" %s\n",hlpbuf);
+X    clrhlp();
+X}
+X
+X/*  L O O K U P  --  Lookup the string in the given array of strings  */
+X
+X/*
+X Call this way:  v = lookup(table,word,n,&x);
+X
+X   table - a 'struct keytab' table.
+X   word  - the target string to look up in the table.
+X   n     - the number of elements in the table.
+X   x     - address of an integer for returning the table array index.
+X
+X The keyword table must be arranged in ascending alphabetical order, and
+X all letters must be lowercase.
+X
+X Returns the keyword's associated value ( zero or greater ) if found,
+X with the variable x set to the array index, or:
+X
+X  -3 if nothing to look up (target was null),
+X  -2 if ambiguous,
+X  -1 if not found.
+X
+X A match is successful if the target matches a keyword exactly, or if
+X the target is a prefix of exactly one keyword.  It is ambiguous if the
+X target matches two or more keywords from the table.
+X*/
+X
+Xlookup(table,cmd,n,x) char *cmd; struct keytab table[]; int n, *x; {
+X
+X    int i, v, cmdlen;
+X
+X/* Lowercase & get length of target, if it's null return code -3. */
+X
+X    if ((((cmdlen = lower(cmd))) == 0) || (n < 1)) return(-3);
+X
+X/* Not null, look it up */
+X
+X    for (i = 0; i < n-1; i++) {
+X	if (!strcmp(table[i].kwd,cmd) ||
+X           ((v = !strncmp(table[i].kwd,cmd,cmdlen)) &&
+X             strncmp(table[i+1].kwd,cmd,cmdlen))) {
+X		*x = i;
+X		return(table[i].val);
+X	     }
+X	if (v) return(-2);
+X    }	
+X
+X/* Last (or only) element */
+X
+X    if (!strncmp(table[n-1].kwd,cmd,cmdlen)) {
+X	*x = n-1;
+X	return(table[n-1].val);
+X    } else return(-1);
+X}
+X
+X/*  G E T W D  --  Gets a "word" from the command input stream  */
+X
+X/*
+XUsage: retcode = getwd();
+X
+XReturns:
+X -4 if end of file (e.g. pipe broken)
+X -2 if command buffer overflows
+X -1 if user did some deleting
+X  0 if word terminates with SP or tab
+X  1 if ... CR
+X  2 if ... ESC
+X  3 if ... ?
+X
+XWith:
+X  pp pointing to beginning of word in buffer
+X  bp pointing to after current position
+X  atmbuf containing a copy of the word
+X  cc containing the number of characters in the word copied to atmbuf
+X*/
+Xgetwd() {
+X
+X    int c;				/* Current char */
+X    static int inword = 0;		/* Flag for start of word found */
+X    int quote = 0;			/* Flag for quote character */
+X    int echof = 0;			/* Flag for whether to echo */
+X    int ignore = 0;
+X
+X    pp = np;				/* Start of current field */
+X    debug(F101,"getwd: cmdbuf","",(int) cmdbuf);
+X    debug(F101," bp","",(int) bp);
+X    debug(F101," pp","",(int) pp);
+X    debug(F110," cmdbuf",cmdbuf,0);
+X
+X    while (bp < cmdbuf+CMDBL) {		/* Loop */
+X
+X	ignore = echof = 0;		/* Flag for whether to echo */
+X
+X	if ((c = *bp) == NUL) {		/* Get next character */
+X	    if (dpx) echof = 1;		/* from reparse buffer */
+X	    c = getchar();		/* or from tty. */
+X	    if (c == EOF) return(-4);
+X	} else ignore = 1;
+X
+X	if (quote == 0) {
+X
+X	    if (!ignore && (c == '\\')) { /* Quote character */
+X	       quote = 1;
+X	       continue;
+X    	    }
+X	    if (c == FF) {		/* Formfeed. */
+X	    	c = NL;			/* Replace with newline */
+X	    	system("clear");	/* and clear the screen. */
+X	    }
+X
+X	    if (c == HT) c = SP; 	/* Substitute space for tab. */
+X
+X/* cont'd... */
+X
+X/* ...getwd(), cont'd */
+X
+X    	    if (c == SP) {		/* If space */
+X		*bp++ = c;		/* deposit it in buffer. */
+X		if (echof) putchar(c);	/* echo it. */
+X		if (inword == 0) {	/* If leading, gobble it. */
+X		    pp++;
+X		    continue;
+X		} else {		/* If terminating, return. */
+X		    np = bp;
+X		    setatm(pp);
+X		    inword = 0;
+X		    return(cmflgs = 0);
+X		}
+X	    }
+X	    if (c == NL) { 		/* CR, LF */
+X		*bp = NUL;		/* End the string */
+X		if (echof) putchar(c);	/* Echo the typein */
+X		np = bp;		/* Where to start next field. */
+X		setatm(pp);		/* Copy this field to atom buffer. */
+X		inword = 0;
+X		return(cmflgs = 1);
+X	    }
+X	    if (!ignore && (c == '?')) { /* Question mark */
+X		putchar(c);
+X		*bp = NUL;
+X		setatm(pp);
+X		return(cmflgs = 3);
+X    	    }
+X	    if (c == ESC) { 		/* ESC */
+X		*bp = NUL;
+X		setatm(pp);
+X		return(cmflgs = 2);
+X	    }
+X	    if (c == BS || c == RUB) { 	/* Character deletion */
+X		if (bp > cmdbuf) {	/* If still in buffer... */
+X		    printf("\b \b");	/* erase character from screen, */
+X		    bp--;		/* point behind it, */
+X		    if (*bp == SP) inword = 0; /* Flag if current field gone */
+X		    *bp = NUL;		/* Erase character from buffer. */
+X		} else {		/* Otherwise, */
+X		    putchar(BEL);	/* beep, */
+X		    cmres();		/* and start parsing a new command. */
+X		}
+X		if (pp < bp) continue;
+X		else return(cmflgs = -1);
+X	    }
+X	    if (c == LDEL) { 		/* ^U, line deletion */
+X	    	while ((bp--) > cmdbuf) {
+X	    	    printf("\b \b");
+X		    *bp = NUL;
+X		}
+X		cmres();		/* Restart the command. */
+X		inword = 0;
+X		return(cmflgs = -2);
+X	    }
+X
+X/* cont'd... */
+X
+X/* ...getwd(), cont'd */
+X
+X    	    if (c == WDEL) { 		/* ^W, word deletion */
+X	    	if (bp <= cmdbuf) {	/* Beep if nothing to delete */
+X		    putchar(BEL);
+X		    cmres();
+X		    return(cmflgs = -1);
+X		}
+X		bp--;
+X		for ( ; (bp >= cmdbuf) && (*bp == SP) ; bp--) {
+X		    printf("\b \b");
+X		    *bp = NUL;
+X		}
+X		for ( ; (bp >= cmdbuf) && (*bp != SP) ; bp--) {
+X		    printf("\b \b");
+X		    *bp = NUL;
+X		}
+X		*bp++ == NUL;
+X		inword = 0;
+X		return(cmflgs = -1);
+X	    }
+X	    if (c == RDIS) { 		/* ^R, redisplay */
+X		*bp = NUL;
+X		printf("\n%s%s",cmprom,cmdbuf);
+X		continue;
+X	    }
+X    	}
+X	if (echof) putchar(c);		/* If tty input, echo. */
+X	inword = 1;			/* Flag we're in a word. */
+X	quote = 0;			/* Turn off quote. */
+X	*bp++ = c;			/* And deposit it. */
+X    }					/* end of big while */
+X    putchar(BEL);			/* Get here if... */
+X    printf("\n?Buffer full\n");
+X    return(cmflgs = -2);
+X}
+X
+X/* Utility functions */
+X
+X/* A D D B U F  -- Add the string pointed to by cp to the command buffer  */
+X
+Xaddbuf(cp) char *cp; {
+X    int len = 0;
+X    while ((*cp != NUL) && (bp < cmdbuf+CMDBL)) {
+X    	*bp++ = *cp++;			/* Copy and */
+X    	len++;				/* count the characters. */
+X    }	
+X    *bp++ = SP;				/* Put a space at the end */
+X    *bp = NUL;				/* Terminate with a null */
+X    np = bp;				/* Update the next-field pointer */
+X    return(len);			/* Return the length */
+X}
+X
+X/*  S E T A T M  --  Deposit a string in the atom buffer  */
+X
+Xsetatm(cp) char *cp; {
+X    char *ap;
+X    cc = 0;
+X    ap = atmbuf;
+X    *ap = NUL;
+X    while (*cp == SP) cp++;
+X    while ((*cp != SP) && (*cp != NL) && (*cp != NUL)) {
+X	*ap++ = *cp++;
+X	cc++;
+X    }
+X    *ap++ = NUL;
+X    return(cc);				/* Return length */
+X}
+X
+X/*  D I G I T S  -- Verify that all the characters in line are digits  */
+X
+Xdigits(s) char *s; {
+X    while (*s) {
+X        if (!isdigit(*s)) return(0);
+X        s++;
+X    }
+X    return(1);
+X}
+X
+X/*  L O W E R  --  Lowercase a string  */
+X
+Xlower(s) char *s; {
+X    int n = 0;
+X    while (*s) {
+X	if (isupper(*s)) *s = tolower(*s);
+X	s++, n++;
+X    }
+X    return(n);
+X}
+X
+X/*  T E S T  --  Bit test  */
+X
+Xtest(x,m) int x, m; { /*  Returns 1 if any bits from m are on in x, else 0  */
+X    return((x & m) ? 1 : 0);
+X}
+!FUNKY!STUFF!
+echo x - ckconu.c
+sed '1,$s/^X//' <<\!FUNKY!STUFF! > ckconu.c
+Xchar *connv = "Connect Command for Unix, V4.2(006) 5 March 85";
+X
+X/*  C K C O N U  --  Dumb terminal connection to remote system, for Unix  */
+X/*
+X This module should work under all versions of Unix.  It calls externally
+X defined system-dependent functions for i/o, but depends upon the existence
+X of the fork() function.
+X
+X Enhanced by H. Fischer to detect when child process (modem reader)
+X reports that the communications line has been broken and hang up.
+X Also enhanced to allow escaping from connect state to command
+X interpreter, to allow sending/receiving without breaking connection.
+X*/
+X
+X#include "ckermi.h"
+X#include <signal.h>
+X#include <setjmp.h>
+X
+X#ifndef SIGUSR1
+X#define SIGUSR1 16
+X#endif
+X
+Xextern int local, speed, escape, duplex, parity, flow, seslog, mdmtyp;
+Xextern char ttname[], sesfil[];
+X
+Xint i, active;				/* Variables global to this module */
+Xchar *chstr();
+X
+X#define LBUFL 100			/* Line buffer */
+Xchar lbuf[LBUFL];
+X
+X/* Connect state parent/child communication signal handlers */
+X
+Xstatic jmp_buf env_con;			/* Envir ptr for connect errors */
+X
+Xstatic
+Xconn_int() {				/* Modem read failure handler, */
+X    longjmp(env_con,1);			/* notifies parent process to stop */
+X}
+X
+X/*  C O N E C T  --  Perform terminal connection  */
+X
+Xconect() {
+X    int pid, 			/* process id of child (modem reader) */
+X	parent_id,		/* process id of parent (keyboard reader) */
+X	n;
+X    int c;			/* c is a character, but must be signed 
+X				   integer to pass thru -1, which is the
+X				   modem disconnection signal, and is
+X				   different from the character 0377 */
+X    char errmsg[50], *erp;
+X
+X	if (!local) {
+X	    printf("Sorry, you must 'set line' first\n");
+X	    return(-2);
+X	}
+X	if (speed < 0) {
+X	    printf("Sorry, you must 'set speed' first\n");
+X	    return(-2);
+X        }
+X	if ((escape < 0) || (escape > 0177)) {
+X	    printf("Your escape character is not ASCII - %d\n",escape);
+X	    return(-2);
+X	}
+X	if (ttopen(ttname,local,mdmtyp) < 0) {
+X	    erp = errmsg;
+X	    sprintf(erp,"Sorry, can't open %s",ttname);
+X	    perror(errmsg);
+X	    return(-2);
+X    	}
+X    	printf("Connecting thru %s, speed %d.\r\n",ttname,speed);
+X	printf("The escape character is %s (%d).\r\n",chstr(escape),escape);
+X	printf("Type the escape character followed by C to get back,\r\n");
+X	printf("or followed by ? to see other options.\r\n");
+X	if (seslog) printf("(Session logged to %s.)\r\n",sesfil);
+X
+X/* Condition console terminal and communication line */	    
+X
+X    	if (conbin(escape) < 0) {
+X	    printf("Sorry, can't condition console terminal\n");
+X	    return(-2);
+X    	}
+X	if (ttvt(speed,flow) < 0) {
+X	    conres();
+X	    printf("Sorry, Can't condition communication line\n");
+X	    return(-2);
+X    	}
+X
+X/* cont'd... */
+X
+X/* ...connect, cont'd */
+X
+X
+X	parent_id = getpid();		/* get parent id for signalling */
+X	pid = fork();			/* All ok, make a fork */
+X	if (pid) {			
+X	  active = 1;			/* This fork reads, sends keystrokes */
+X	  if (!setjmp(env_con)) {	/* comm error in child process */
+X	    signal(SIGUSR1,conn_int);	/* routine for child process exit */
+X	    while (active) {
+X		c = coninc(0) & 0177;
+X		if (c == escape) {   	/* Look for escape char */
+X		    c = coninc(0) & 0177;
+X		    doesc(c);
+X		} else {		/* Ordinary character */
+X		    ttoc(dopar(c));	/* Send it out with desired parity */
+X		    if (duplex) {	/* Half duplex? */
+X			conoc(c);	/* Yes, also echo it. */
+X			if (seslog) zchout(ZSFILE,c);	/* And maybe log it. */
+X    	    	    }			
+X		}
+X	      }
+X    	    }				/* come here on death of child */
+X	    kill(pid,9);		/* Done, kill inferior. */
+X	    wait(0);			/* Wait till gone. */
+X	    conres();			/* Reset the console. */
+X	    printf("C-Kermit Disconnected\n");
+X	    return(0);
+X
+X	} else {			/* Inferior reads, prints port input */
+X
+X	    while (1) {			/* Fresh read, wait for a character */
+X		if ((c = ttinc(0)) < 0) { /* Comm line hangup detected*/
+X		    printf("\r\nC-Kermit: Communications line failure\r\n");
+X		    kill(parent_id,SIGUSR1);	/* notify parent. */
+X		    pause();		/* Wait to be killed by parent. */
+X                }
+X		c &= 0177;		/* Got a char, strip parity. */
+X		conoc(c);		/* Put it on the screen. */
+X		if (seslog) zchout(ZSFILE,c);	/* If logging, log it. */
+X		n = ttchk();		/* Any more left in buffer? */
+X		if (n > 0) {
+X		    if (n > LBUFL) n = LBUFL;  /* Get them all at once. */
+X		    if ((n = ttxin(n,lbuf)) > 0) {
+X			for (i = 0; i < n; i++) lbuf[i] &= 0177;
+X			conxo(n,lbuf);
+X			if (seslog) zsoutx(ZSFILE,lbuf,n);
+X		    }
+X	    	}
+X	    }
+X    	}
+X}
+X
+X/*  H C O N N E  --  Give help message for connect.  */
+X
+Xhconne() {
+X    int c;
+X    static char *hlpmsg[] = {"\
+X\r\nC to close the connection, or:",
+X"\r\n  S for status",
+X"\r\n  ? for help",
+X"\r\n  B to send a BREAK",
+X"\r\n  0 to send a null",
+X"\r\n escape character twice to send the escape character.\r\n\r\n",
+X"" };
+X
+X    conola(hlpmsg);			/* Print the help message. */
+X    conol("Command>");			/* Prompt for command. */
+X    c = coninc(0);
+X    conoc(c);				/* Echo it. */
+X    conoll("");
+X    c &= 0177;				/* Strip any parity. */
+X    return(c);				/* Return it. */
+X}
+X
+X
+X/*  C H S T R  --  Make a printable string out of a character  */
+X
+Xchar *
+Xchstr(c) int c; {
+X    static char s[8];
+X    char *cp = s;
+X
+X    if (c < SP) {
+X	sprintf(cp,"CTRL-%c",ctl(c));
+X    } else sprintf(cp,"'%c'\n",c);
+X    cp = s;
+X    return(cp);
+X}
+X
+X/*  D O E S C  --  Process an escape character argument  */
+X
+Xdoesc(c) char c; {
+X    int d;
+X  
+X    c &= 0177;
+X    while (1) {
+X	if (c == escape) {		/* Send escape character */
+X	    d = dopar(c);
+X	    ttoc(d);
+X	    return;
+X    	} else				/* Or else look it up below. */
+X	    if (isupper(c)) c = tolower(c);
+X
+X	switch (c) {
+X
+X	case 'c':			/* Close connection */
+X	case '\03':
+X	    active = 0;
+X	    conol("\r\n");
+X	    return;
+X
+X	case 'b':			/* Send a BREAK */
+X	case '\02':
+X	    ttsndb();
+X	    return;
+X
+X	case 's':			/* Status */
+X	case '\023':
+X	    conol("\r\nConnected thru ");
+X	    conoll(ttname);
+X	    if (seslog) {
+X		conol(", logging to ");
+X		conol(sesfil);
+X            }
+X	    return;
+X
+X	case '?':			/* Help */
+X	    c = hconne();
+X	    continue;
+X
+X	case '0':			/* Send a null */
+X	    c = '\0';
+X	    d = dopar(c);
+X	    ttoc(d);
+X	    return;
+X
+X	case SP:			/* Space, ignore */
+X	    return;
+X
+X	default:			/* Other */
+X	    conoc(BEL); 		/* Invalid esc arg, beep */
+X	    return;
+X    	}	    
+X    }
+X}    
+!FUNKY!STUFF!
+echo x - ckdial.c
+sed '1,$s/^X//' <<\!FUNKY!STUFF! > ckdial.c
+Xchar *dialv = "Dial Command for Unix, V0.0(005) 5 Mar 85";
+X
+X/*  C K D I A L  --  Dialing program for connection to remote system */
+X
+X/*
+X This module should work under all versions of Unix.  It calls externally
+X defined system-depended functions for i/o, but depends upon the existence
+X of various modem control functions.
+X
+X Author: Herm Fischer, Litton Data Systems, Van Nuys CA (HFISCHER@USC-ECLB)
+X*/
+X
+X#include "ckermi.h"
+X#include <signal.h>
+X#include <setjmp.h>
+X#include "ckcmd.h"
+X
+Xextern int local, speed, flow, mdmtyp;
+Xextern char ttname[], sesfil[];
+X
+X#define HAYES 1			/* for mdmtyp settings */
+X#define VENTEL 2
+X#define HAYESNV 3		/* internal use, non-verbal V0 setting */
+X
+Xstruct keytab mdmtab[] = {		/* Modem types for command parsing */
+X    "direct",	0, 0,
+X    "hayes",	HAYES, 0,
+X    "ventel",	VENTEL, 0
+X};
+Xint nmdm = (sizeof(mdmtab) / sizeof(struct keytab));
+X
+X#define DIALING 4		/* for ttvt parameter */
+X#define CONNECT 5
+X
+X#define CONNECTED 1		/* for completion status */
+X#define FAILED	  2
+X
+Xstatic int tries = 0;
+X
+X#define LBUFL 100
+Xstatic char lbuf[LBUFL];
+Xstatic char *lbp;
+X
+Xstatic jmp_buf sjbuf;
+X
+Xstatic
+Xtimerh() {			/* timer interrupt handler */
+X    longjmp(sjbuf,1);
+X}
+X
+Xstatic
+Xstripp(s) char *s; {	/* parity stripper aid */
+X    for ( ; *s ; *s++ &= 0177 );
+X}
+X
+X/*  D I A L  --  Dial up the remote system */
+X
+Xdial(telnbr) char *telnbr; {
+X
+X    char c;
+X    char *i;
+X    int waitct, status;
+X    char errmsg[50], *erp;
+X    int augMdm;		/* mdmtyp with switch settings added */
+X    int mdmEcho = 0;	/* assume modem does not echo */
+X    int n;
+X    int (*savAlrm)();	/* save incomming alarm function */
+X
+X	if (!mdmtyp) {
+X	    printf("Sorry, you must 'set modem' first\n");
+X	    return(-2);
+X	}
+X	augMdm = mdmtyp;	/* internal use, to add dialer switches info*/
+X
+X	if (!local) {
+X	    printf("Sorry, you must 'set line' first\n");
+X	    return(-2);
+X	}
+X	if (speed < 0) {
+X	    printf("Sorry, you must 'set speed' first\n");
+X	    return(-2);
+X        }
+X	if (ttopen(ttname,local,mdmtyp) < 0) {/* Open, no wait for carrier */
+X	    erp = errmsg;
+X	    sprintf(erp,"Sorry, can't open %s",ttname);
+X	    perror(errmsg);
+X	    return(-2);
+X    	}
+X/* cont'd... */
+X					/* interdigit waits for tone dial */
+X/* ...dial, cont'd */
+X
+X
+X	waitct = 1*strlen(telnbr) ;	/* compute time to dial worst case */
+X	switch (augMdm) {
+X	    case HAYES:
+X	    case HAYESNV:
+X		waitct += 35;		/* dial tone + carrier waits + slop */
+X		for (i=telnbr; *i; i++) if (*i == ',') waitct += 2;
+X		break;
+X	    case VENTEL:
+X		waitct += 10;		/* guess actual time for dialtones */
+X		waitct += 10;	/* ventel's apparent patience for carrier */
+X		for (i=telnbr; *i; i++) if (*i == '%') waitct += 5;
+X		break;
+X	    }
+X
+X       printf("Dialing thru %s, speed %d, number %s.\r\n",ttname,speed,telnbr);
+X       printf("The timeout for completing the call is %d seconds.\r\n",waitct);
+X
+X/* Condition console terminal and communication line */	    
+X				/* place line into "clocal" dialing state */
+X	if ( ttpkt(speed,DIALING) < 0 )  {
+X	    printf("Sorry, Can't condition communication line\n");
+X	    return(-2);
+X    	}
+X
+X/* Put modem into command state */
+X
+X    savAlrm = signal(SIGALRM,timerh);
+X    alarm(10);			/* give modem 10 seconds to wake up */
+X    if (setjmp(sjbuf)) {
+X	alarm(0);
+X	signal(SIGALRM,savAlrm);	/* cancel timer */
+X	ttpkt(speed,CONNECT);	/* cancel dialing state ioctl */
+X	printf("Sorry, unable to complete dialed connection\r\n");
+X	return(-2);
+X	}
+X    ttflui();			/* flush input buffer if any */
+X
+X#define OKAY 1			/* modem attention attempt status */
+X#define IGNORE 2
+X#define GOT_O -2
+X#define GOT_A -3
+X
+Xswitch (augMdm) {
+X    case HAYES:
+X    case HAYESNV:
+X	while(tries++ < 4) {
+X	    ttol("AT\r",3);	/* signal for attention, look for response */
+X	    status = 0;
+X	    while ( status <= 0 ) {
+X		switch (ttinc(0) & 0177) {
+X		    case 'A':			/* echoing, ignore */
+X			status = GOT_A;
+X			break;
+X		    case 'T':
+X			if (status == GOT_A) {
+X			    mdmEcho = 1;	/* expect echoing later */
+X			    status = 0;
+X			    break;
+X			}
+X			status = IGNORE;
+X			break;
+X		    case '\n':
+X		    case '\r':
+X			status = 0;
+X			break;
+X		    case '0':			/* numeric result code */
+X			augMdm = HAYESNV;	/* nonverbal result codes */
+X			status = OKAY;
+X			break;
+X		    case 'O':			/* maybe English result code*/
+X			status = GOT_O;
+X			break;
+X		    case 'K':
+X			if (status == GOT_O) {
+X			    augMdm = HAYES;
+X			    status = OKAY;
+X			    break;
+X			}			/* else its default anyway */
+X		    default:
+X			status = IGNORE;
+X			break;
+X		    }
+X		}
+X	    if (status == OKAY) break;
+X	    if (status == IGNORE) ttflui();
+X	    sleep(1);		/* wait before retrying */
+X	}
+X        if (status != 0) break;
+X        printf("Sorry, can't initialize modem\n");
+X	ttpkt(speed,CONNECT);		/* cancel dialing state ioctl */
+X	alarm(0);
+X	signal(SIGALRM,savAlrm);	/* cancel timer */
+X        return(-2);
+X
+X/* cont'd... */
+X					/* interdigit waits for tone dial */
+X/* ...dial, cont'd */
+X
+X    case VENTEL:
+X	ttoc('\r');		/* Put Ventel into command mode */
+X	sleep(1);
+X	ttoc('\r');
+X	sleep(1);
+X	ttoc('\r');
+X	while( (ttinc(0) & 0177) != '$');
+X	break;
+X    }
+X    alarm(0);			/* turn off alarm */
+X    sleep(1);			/* give things settling time */
+X
+X		
+X/* Dial the number */
+X
+Xswitch (augMdm) {
+X    case HAYES:
+X    case HAYESNV:		  
+X        sprintf(lbuf,"AT DT %s\r",telnbr);
+X	break;
+X    case VENTEL:
+X	sprintf(lbuf,"<K%s\r>",telnbr);
+X	break;
+X    }
+X
+X    alarm(waitct);		/* time to allow for connecting */
+X    ttflui();			/* clear out stuff from waking modem up */
+X    ttol(lbuf,strlen(lbuf));	/* send dialing string */
+X
+X/* cont'd... */
+X					/* interdigit waits for tone dial */
+X/* ...dial, cont'd */
+X
+X
+X/* Check for connection */
+X
+X    status = 0;
+X    while (status == 0) {
+X      switch (augMdm) {
+X	case HAYES:
+X	    for (n = 0; n < LBUFL; n++) lbuf[n] = '\0';
+X	    n = ttinl(lbuf,LBUFL,0,'\n');
+X	    if (n > 2) {
+X		lbp = lbuf;
+X		while ((*lbp == '\r') || (*lbp == '\n')) lbp++;
+X		stripp(lbp);
+X		if (strncmp(lbp,"CONNECT",7) == 0) status = CONNECTED;
+X		if (strncmp(lbp,"NO CARRIER",10) == 0) status = FAILED;
+X	    }
+X	    break;
+X
+X	case HAYESNV:
+X	    c = ttinc(0) & 0177;
+X	    if (mdmEcho) {		/* sponge up dialing string */
+X		mdmEcho = c!='\r';	/* until return is echoed */
+X		break;
+X		}
+X	    if (c == '1') status = CONNECTED;
+X	    if (c == '3') status = FAILED;
+X	    if (c == '5') status = CONNECTED;
+X	    break;
+X
+X	case VENTEL:
+X	    if ( (ttinc(0) & 0177) == '!') status = CONNECTED;
+X	    break;
+X	}
+X    }
+X	
+X/* Place line into modem-control (non-clocal) state */
+X
+X    if (status == 0) printf("Sorry, Can't get response from modem\r\n");
+X    else if (status == CONNECTED) printf("Connected!\r\n");
+X    else if (status == FAILED) printf("Sorry, No Carrier\r\n");
+X    else printf("Failed to complete call\r\n");
+X
+X    ttpkt(speed,CONNECT);	/* cancel dialing state ioctl */
+X    alarm(0);
+X    signal(SIGALRM,savAlrm);	/* cancel timer */
+X    return((status==CONNECTED) ? 0 : -2);
+X}
+!FUNKY!STUFF!
+
+

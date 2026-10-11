@@ -1,0 +1,923 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,4cb31b9b70ebd5bd,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-07-29 15:33:24 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site mnetor.UUCP
+Path: utzoo!utcs!mnetor!clewis
+From: clewis@mnetor.UUCP (Chris Lewis)
+Newsgroups: net.sources
+Subject: HP Laserjet/Troff filter.
+Message-ID: <1635@mnetor.UUCP>
+Date: Mon, 29-Jul-85 18:33:24 EDT
+Article-I.D.: mnetor.1635
+Posted: Mon Jul 29 18:33:24 1985
+Date-Received: Mon, 29-Jul-85 21:23:40 EDT
+Organization: Computer X (CANADA) Ltd., Toronto, Ontario, Canada
+Lines: 903
+
+Quite a number of people have been asking for an HP Laserjet/Troff filter.
+Here it is.  Sorta.
+
+I have been trying to write one, and have gotten a fair ways, but I've
+got to do some "real work", so...  This software is INCOMPLETE, but
+does manage to print something sorta useful.  At least it understands
+troff output.
+
+Status:
+	1) Seems to print normal text "reasonably" well.  The major difficulty
+	   is that I don't know how to set up troff width tables, so I
+	   ended up having to use CW.  The spacing leaves something to
+	   be desired.  Laserjet fonts don't work quite the same way
+	   that troff expects (eg: glyph origins etc.)
+	2) it only can print Laserjet EPROM fonts.  That is:
+		a) pitch selection is limited.  eg: only one.  The lroff
+		   shell file overrides the default pitch and turns
+		   off ligature mode.
+		b) italics and bold work if you have the right font cartridge
+		   (I'm using 92286A).
+		c) Not all troff characters are possible.  Note: in the
+		   mathematics fonts, if you attempt one that isn't supported
+		   you will get the "english version".
+		d) full fonts may be impossible due to buffer size limitations
+		   on the HP Laserjet.
+	3) troff does not output page breaks, so the filter has to resort
+	   to a kludge to figger out the end of a page (eg: EXACTLY 11 inches
+	   of vertical motion).  God help you if you change the page size
+	   in troff!  Also, some of the troff macro packages go to the
+	   trouble of emitting cut marks.  lcat tries to delete them, but
+	   may not always be successful.
+
+Files:
+	Makefile (what else)
+
+	lcat.c fastfonts.c (source for lcat filter)
+
+	lroff (a shell file that attempts to emulate troff - you will
+	       probably have to change some of the paths)
+
+	test.1 - a sample input for lroff.
+
+	This was built in the System V universe, and lroff depends upon
+	System V lp.  "lp -ob -op" means: "no output translations" whatsoever
+	(it depends on 8 bit character serial transmission)
+
+Lcat takes one parameter "-d" - VERY VERBOSE debugging output.
+
+I would dearly love to hear from anybody who manages to interface this
+durn thing to some sort of font library and/or at least gets the spacing
+correct.
+
+I know that this thing is hardly useful, but maybe some troff hackers
+can figger out how to extend it.
+
+Enjoy....
+
+#!/bin/sh
+echo 'Start of pack.out, part 01 of 01:'
+echo 'x - lcat.c'
+sed 's/^X//' > lcat.c << '/'
+X/*
+X
+X	Copyright:		Chris Lewis @ 1985
+X
+X	Author: Chris Lewis
+X
+X	Permission to copy and further distribute is freely given
+X	provided this copyright notice remains intact and that
+X	this software is not sold for profit.
+X
+X*/
+X#include <stdio.h>
+X
+X#define	ESC	0x80
+X#define	FLASH	0x00
+X#define	CONTROL	0x40
+X#define	LEAD	0x60
+X#define	SIZE	0x50
+X
+X#ifdef	DEBUG
+XFILE	*df;
+X#endif
+X
+X#define	DOWN	0
+X#define	UP	1
+X#define	LOWER	2
+X#define	UPPER	3
+X#define	FORWARD	4
+X#define	BACKWARD 5
+X#ifdef	DEBUG
+X#define	debpr	if (debug) fprintf
+X/*	EYUCK!	*/
+X#endif
+Xint	debug = 0;
+X
+X
+X/*	Scale factors:
+X		(td/ld) * (lu / tu)
+X		Where:
+X			td: troff dimension in inches
+X			ld: laserjet dimension in inches
+X			lu: laserjet precision/inch
+X			tu: troff precision/inch
+X
+X		td = 6.5 (width), 11 (length)
+X		tu = 432
+X		ld = 6.5 (width), 10 (length)
+X		lu = 720
+X*/
+X
+X#define	XSF	1.6666666	/* X Scale factor (troff to laserjet units) */
+X#define	YSF	1.5151515	/* Y Scale factor (troff to laserjet units) */
+X
+Xlong	xpos, oldypos = -9999, ypos = -153;
+X
+Xchar *words[] = {
+X	"down", "up", "lower", "upper", "forward", "backwards"
+X	};
+X
+X#define	CTOINT(val,sig)	((~c)&sig)
+X
+X#define	UNITS	432
+X#define	FONT4		/* 4 Font device */
+X
+X#ifdef	FONT4
+X#define	calcfont	font = ((mag == UPPER)<<1)|((rail == UPPER))
+X#else
+X#define	calcfont	font = ((mag == UPPER)<<2)|((rail == UPPER)<<1)|(tilt==DOWN)
+X#endif
+X
+Xextern char *native[], *specnative[];
+X
+Xmain(argc, argv)
+Xint	argc;
+Xchar	**argv; {
+X	register int nc, c;
+X	register char *rp;
+X	register int i,j;
+X	register int decipoints;
+X	register int units;
+X	register int oldfont, font, rail, mag, tilt, half, escape, lead;
+X	if (argc == 2 && strcmp(argv[1], "-d") == 0)
+X		debug = 1;
+X#ifdef	DEBUG
+X	if (debug) {
+X		df = fopen("diagnostics", "w");
+X		if (!df) {
+X			fprintf(stderr, "lcat: Cannot open diagnostics file\n");
+X			exit(1);
+X		}
+X		for (i = 0; i <= 107; i++)
+X			fprintf(df, "%d: native: %s, special: %s\n", i, native[i], specnative[i]);
+X	}
+X#endif
+X	while (!feof(stdin)) {
+X		c = getc(stdin);
+X		switch(c) {
+X		case 0x00:
+X#ifdef	DEBUG
+X			debpr(df, "NOP\n");
+X#endif
+X			break;
+X		/* Flash (print character) codes */
+X		case 0x01: case 0x02: case 0x03: case 0x04: 
+X		case 0x05: case 0x06: case 0x07: case 0x08: 
+X		case 0x09: case 0x0a: case 0x0b: case 0x0c: 
+X		case 0x0d: case 0x0e: case 0x0f: case 0x10: 
+X		case 0x11: case 0x12: case 0x13: case 0x14:
+X		case 0x15: case 0x16: case 0x17: case 0x18: 
+X		case 0x19: case 0x1a: case 0x1b: case 0x1c: 
+X		case 0x1d: case 0x1e: case 0x1f: case 0x20: 
+X		case 0x21: case 0x22: case 0x23: case 0x24: 
+X		case 0x25: case 0x26: case 0x27: case 0x28:
+X		case 0x29: case 0x2a: case 0x2b: case 0x2c: 
+X		case 0x2d: case 0x2e: case 0x2f: case 0x30: 
+X		case 0x31: case 0x32: case 0x33: case 0x34: 
+X		case 0x35: case 0x36: case 0x37: case 0x38: 
+X		case 0x39: case 0x3a: case 0x3b: case 0x3c:
+X		case 0x3d: case 0x3e: case 0x3f:
+X			/* This is terribly kludgey:
+X				In 432 units per inch, 4752 is 11 inches.
+X				When we go beyond this, we subtract 4752
+X				and ignore anything printed on this line.
+X			*/
+X			while (ypos >= 4752) {
+X				ypos -= 4752;
+X				oldypos = -9999;
+X#ifdef	DEBUG
+X				debpr(df, "Page break\n", 0, 0);
+X#endif
+X				putchar('\f');
+X			}
+X			if (ypos <= 20) {
+X#ifdef	DEBUG
+X				debpr(df, "Ignoring: %d, %d\n", xpos, ypos);
+X#endif
+X				break; /* ignore anything less than this
+X					from the beginning of a page */
+X			}
+X			c = c&0x3f;
+X#ifdef	DEBUG
+X			debpr(df, "Flash %02d %s font %d\n", c&0x3f, 
+X				words[half], font);
+X			debpr(df, "x,y=%ld,%ld; font=%d; rail=%s; mag=%s; tilt=%s; half=%s\n",
+X				xpos,ypos,font+1,words[rail],words[mag],words[tilt],
+X				words[half]);
+X#endif
+X			if (oldfont != font) {
+X#ifdef	DEBUG
+X				debpr(df, "Changing to font %d\n", font);
+X#endif
+X				switch(font) {
+X					case 3:
+X					case 0:
+X						/* upright, normal weight */
+X						printf("\033(s0s-2B");
+X						break;
+X					case 1:
+X						/* italics, light weight */
+X						printf("\033(s1s-5B");
+X						break;
+X					case 2:
+X						/* upright, heavy weight */
+X						printf("\033(s0s4B");
+X						break;
+X				}
+X			}
+X			oldfont = font;
+X			if (oldypos == ypos)
+X				printf("\033&a%dH",(int) (xpos*XSF));
+X			else
+X				printf("\033&a%dh%dV",(int) (xpos*XSF),
+X					(int) (ypos*YSF));
+X			oldypos = ypos;
+X			if (half == UPPER) {
+X				if (c > 46) {
+X					fprintf(stderr, "Illegal upper flash: %d\n", c);
+X					exit(1);
+X				}
+X				nc = c + 62;
+X			} else
+X				nc = c - 1;
+X			
+X			if (font < 3)
+X				for (rp = native[nc]; *rp; rp++)
+X					putc(*rp, stdout);
+X			else
+X				for (rp = specnative[nc]; *rp; rp++)
+X					putc(*rp, stdout);
+X#ifdef	DEBUG
+X			debpr(df, "Code %d is %d(%s)\n", c, nc, native[nc]);
+X#endif
+X			break;
+X		/* Control codes */
+X		case 0x40:
+X#ifdef	DEBUG
+X			debpr(df, "Initialize\n");
+X#endif
+X			xpos = 0;
+X			ypos = -153;
+X			escape = FORWARD;
+X			lead = FORWARD;
+X			half = LOWER;
+X			rail = LOWER;
+X			mag = LOWER;
+X			tilt = DOWN;
+X			calcfont;
+X			break;
+X		case 0x41:
+X#ifdef	DEBUG
+X			debpr(df, "Rail lower\n");
+X#endif
+X			rail = LOWER;
+X			calcfont;
+X			break;
+X		case 0x42:
+X#ifdef	DEBUG
+X			debpr(df, "Rail upper\n");
+X#endif
+X			rail = UPPER;
+X			calcfont;
+X			break;
+X		case 0x43:
+X#ifdef	DEBUG
+X			debpr(df, "Mag upper\n");
+X#endif
+X			mag = UPPER;
+X			calcfont;
+X			break;
+X		case 0x44:
+X#ifdef	DEBUG
+X			debpr(df, "Mag lower\n");
+X#endif
+X			mag = LOWER;
+X			calcfont;
+X			break;
+X		case 0x45:
+X#ifdef	DEBUG
+X			debpr(df, "half lower\n");
+X#endif
+X			half = LOWER;
+X			break;
+X		case 0x46:
+X#ifdef	DEBUG
+X			debpr(df, "half upper\n");
+X#endif
+X			half = UPPER;
+X			break;
+X		case 0x47:
+X#ifdef	DEBUG
+X			debpr(df, "Escape forward\n");
+X#endif
+X			escape = FORWARD;
+X			break;
+X		case 0x48:
+X#ifdef	DEBUG
+X			debpr(df, "Escape backward\n");
+X#endif
+X			escape = BACKWARD;
+X			break;
+X		case 0x49:
+X#ifdef	DEBUG
+X			debpr(df, "STOP\n");
+X#endif
+X			break;
+X		case 0x4a:
+X#ifdef	DEBUG
+X			debpr(df, "Lead forward\n");
+X#endif
+X			lead = FORWARD;
+X			break;
+X		case 0x4b:
+X#ifdef	DEBUG
+X			debpr(df, "Software cut!\n");
+X#endif
+X			break;
+X		case 0x4c:
+X#ifdef	DEBUG
+X			debpr(df, "Lead backward\n");
+X#endif
+X			lead = BACKWARD;
+X			break;
+X		case 0x4d:
+X#ifdef	DEBUG
+X			debpr(df, "UNKNOWN CONTROL CODE!\n");
+X#endif
+X			exit(0);
+X		case 0x4e:
+X#ifdef	DEBUG
+X			debpr(df, "Tilt up\n");
+X#endif
+X			tilt = UP;
+X			calcfont;
+X			break;
+X		case 0x4f:
+X#ifdef	DEBUG
+X			debpr(df, "Tilt down\n");
+X#endif
+X			tilt = DOWN;
+X			calcfont;
+X			break;
+X
+X		/* Size changes */
+X		case 0x50: case 0x51: case 0x52: case 0x53:
+X		case 0x54: case 0x55: case 0x56: case 0x57:
+X		case 0x58: case 0x59: case 0x5a: case 0x5b:
+X		case 0x5c: case 0x5d: case 0x5e: case 0x5f:
+X#ifdef	DEBUG
+X			debpr(df, "Size change %02x\n", c&0xf);
+X#endif
+X			break;
+X		/* Lead (vertical motion) codes */
+X		case 0x60: case 0x61: case 0x62: case 0x63:
+X		case 0x64: case 0x65: case 0x66: case 0x67:
+X		case 0x68: case 0x69: case 0x6a: case 0x6b:
+X		case 0x6c: case 0x6d: case 0x6e: case 0x6f:
+X		case 0x70: case 0x71: case 0x72: case 0x73:
+X		case 0x74: case 0x75: case 0x76: case 0x77:
+X		case 0x78: case 0x79: case 0x7a: case 0x7b:
+X		case 0x7c: case 0x7d: case 0x7e: case 0x7f:
+X
+X#ifdef	DEBUG
+X			debpr(df, "Lead(vertical) %02x\n", c&0x1f);
+X#endif
+X			units = CTOINT(c,0x1f);
+X			if (lead == FORWARD) {
+X				ypos += 3*units;
+X			} else {
+X				ypos -= 3*units;
+X			}
+X			break;
+X		/* Escape (horizontal motion) codes */
+X		case 0x80: case 0x81: case 0x82: case 0x83:
+X		case 0x84: case 0x85: case 0x86: case 0x87:
+X		case 0x88: case 0x89: case 0x8a: case 0x8b:
+X		case 0x8c: case 0x8d: case 0x8e: case 0x8f:
+X		case 0x90: case 0x91: case 0x92: case 0x93:
+X		case 0x94: case 0x95: case 0x96: case 0x97:
+X		case 0x98: case 0x99: case 0x9a: case 0x9b:
+X		case 0x9c: case 0x9d: case 0x9e: case 0x9f:
+X		case 0xa0: case 0xa1: case 0xa2: case 0xa3:
+X		case 0xa4: case 0xa5: case 0xa6: case 0xa7:
+X		case 0xa8: case 0xa9: case 0xaa: case 0xab:
+X		case 0xac: case 0xad: case 0xae: case 0xaf:
+X		case 0xb0: case 0xb1: case 0xb2: case 0xb3:
+X		case 0xb4: case 0xb5: case 0xb6: case 0xb7:
+X		case 0xb8: case 0xb9: case 0xba: case 0xbb:
+X		case 0xbc: case 0xbd: case 0xbe: case 0xbf:
+X		case 0xc0: case 0xc1: case 0xc2: case 0xc3:
+X		case 0xc4: case 0xc5: case 0xc6: case 0xc7:
+X		case 0xc8: case 0xc9: case 0xca: case 0xcb:
+X		case 0xcc: case 0xcd: case 0xce: case 0xcf:
+X		case 0xd0: case 0xd1: case 0xd2: case 0xd3:
+X		case 0xd4: case 0xd5: case 0xd6: case 0xd7:
+X		case 0xd8: case 0xd9: case 0xda: case 0xdb:
+X		case 0xdc: case 0xdd: case 0xde: case 0xdf:
+X		case 0xe0: case 0xe1: case 0xe2: case 0xe3:
+X		case 0xe4: case 0xe5: case 0xe6: case 0xe7:
+X		case 0xe8: case 0xe9: case 0xea: case 0xeb:
+X		case 0xec: case 0xed: case 0xee: case 0xef:
+X		case 0xf0: case 0xf1: case 0xf2: case 0xf3:
+X		case 0xf4: case 0xf5: case 0xf6: case 0xf7:
+X		case 0xf8: case 0xf9: case 0xfa: case 0xfb:
+X		case 0xfc: case 0xfd: case 0xfe:
+X
+X			units = CTOINT(c,0x7f);
+X			if (escape == FORWARD) {
+X				xpos += units;
+X			} else {
+X				xpos -= units;
+X			}
+X#ifdef	DEBUG
+X			debpr(df, "ESC (hor): %02x\n", c&0x7f);
+X#endif
+X			break;
+X
+X		case 0xff:
+X#ifdef	DEBUG
+X			debpr(df, "Illegal: %02x\n", c);
+X#endif
+X			break;
+X		}
+X	}
+X	exit(0);
+X}
+/
+echo 'x - fastfonts.c'
+sed 's/^X//' > fastfonts.c << '/'
+X/*
+X
+X	Copyright:		Chris Lewis @ 1985
+X
+X	Author: Chris Lewis
+X
+X	Permission to copy and further distribute is freely given
+X	provided this copyright notice remains intact and that
+X	this software is not sold for profit.
+X
+X*/
+X/*	Native Laser jet font where the index is the C/A/T
+X	codes */
+X
+X#define	UNASS	"\377"		/* unassigned in C/A/T */
+X#define	UNREP	"\377"		/* unrepresentable on Laser fonts */
+X/*	Regular characters, fonts 1-3	*/
+Xchar *native[108] = {
+X	/* num		howto	name */
+X	/*   1  */	"h",	/*h*/
+X	/*   2  */	"t",	/*t*/
+X	/*   3  */	"n",	/*n*/
+X	/*   4  */	"m",	/*m*/
+X	/*   5  */	"l",	/*l*/
+X	/*   6  */	"i",	/*i*/
+X	/*   7  */	"z",	/*z*/
+X	/*   8  */	"s",	/*s*/
+X	/*   9  */	"d",	/*d*/
+X	/*  10  */	"b",	/*b*/
+X	/*  11  */	"x",	/*x*/
+X	/*  12  */	"f",	/*f*/
+X	/*  13  */	"j",	/*j*/
+X	/*  14  */	"u",	/*u*/
+X	/*  15  */	"k",	/*k*/
+X	/*  16  */	UNASS,	/*unassigned*/
+X	/*  17  */	"p",	/*p*/
+X	/*  18  */	"\366",	/*3/4 em*/
+X	/*  19  */	";",	/*;*/
+X	/*  20  */	UNASS,	/*unassigned*/
+X	/*  21  */	"a",	/*a*/
+X	/*  22  */	"\366",	/*rule*/
+X	/*  23  */	"c",	/*c*/
+X	/*  24  */	"`",	/*` open*/
+X	/*  25  */	"e",	/*e*/
+X	/*  26  */	"'",	/*' close*/
+X	/*  27  */	"o",	/*o*/
+X	/*  28  */	"\367",	/*1/4*/
+X	/*  29  */	"r",	/*r*/
+X	/*  30  */	"\370",	/*1/2*/
+X	/*  31  */	"v",	/*v*/
+X	/*  32  */	"-",	/*- hyphen*/
+X	/*  33  */	"w",	/*w*/
+X	/*  34  */	"q",	/*q*/
+X	/*  35  */	"/",	/*/*/
+X	/*  36  */	".",	/*.*/
+X	/*  37  */	"g",	/*g*/
+X	/*  38  */	"\377",	/*3/4*/
+X	/*  39  */	",",	/*,*/
+X	/*  40  */	"&",	/*&*/
+X	/*  41  */	"y",	/*y*/
+X	/*  42  */	UNASS,	/*unassigned*/
+X	/*  43  */	"%",	/*%*/
+X	/*  44  */	UNASS,	/*unassigned*/
+X	/*  45  */	"Q",	/*Q*/
+X	/*  46  */	"T",	/*T*/
+X	/*  47  */	"O",	/*O*/
+X	/*  48  */	"H",	/*H*/
+X	/*  49  */	"N",	/*N*/
+X	/*  50  */	"M",	/*M*/
+X	/*  51  */	"L",	/*L*/
+X	/*  52  */	"R",	/*R*/
+X	/*  53  */	"G",	/*G*/
+X	/*  54  */	"I",	/*I*/
+X	/*  55  */	"P",	/*P*/
+X	/*  56  */	"C",	/*C*/
+X	/*  57  */	"V",	/*V*/
+X	/*  58  */	"E",	/*E*/
+X	/*  59  */	"Z",	/*Z*/
+X	/*  60  */	"D",	/*D*/
+X	/*  61  */	"B",	/*B*/
+X	/*  62  */	"S",	/*S*/
+X	/*  63  */	"Y",	/*Y*/
+X	/* from here on are actually code 1-45, upper half of font */
+X	/*  64  */	"F",	/*F*/
+X	/*  65  */	"X",	/*X*/
+X	/*  66  */	"A",	/*A*/
+X	/*  67  */	"W",	/*W*/
+X	/*  68  */	"J",	/*J*/
+X	/*  69  */	"U",	/*U*/
+X	/*  70  */	"K",	/*K*/
+X	/*  71  */	"0",	/*0*/
+X	/*  72  */	"1",	/*1*/
+X	/*  73  */	"2",	/*2*/
+X	/*  74  */	"3",	/*3*/
+X	/*  75  */	"4",	/*4*/
+X	/*  76  */	"5",	/*5*/
+X	/*  77  */	"6",	/*6*/
+X	/*  78  */	"7",	/*7*/
+X	/*  79  */	"8",	/*8*/
+X	/*  80  */	"9",	/*9*/
+X	/*  81  */	"*",	/***/
+X	/*  82  */	"-",	/*minus*/
+X	/*  83  */	"fi",	/*fi*/
+X	/*  84  */	"fl",	/*fl*/
+X	/*  85  */	"ff",	/*ff*/
+X	/*  86  */	"\277",	/*cent sign*/
+X	/*  87  */	"ffl",	/*ffl*/
+X	/*  88  */	"ffi",	/*ffi*/
+X	/*  89  */	"(",	/*(*/
+X	/*  90  */	")",	/*)*/
+X	/*  91  */	"[",	/*[*/
+X	/*  92  */	"]",	/*]*/
+X	/*  93  */	"\263",	/*degree*/
+X	/*  94  */	"\377",	/*dagger*/
+X	/*  95  */	"=",	/*=*/
+X	/*  96  */	"\377",	/*registered*/
+X	/*  97  */	":",	/*:*/
+X	/*  98  */	"+",	/*+*/
+X	/*  99  */	UNASS,	/*unassigned*/
+X	/* 100  */	"!",	/*!*/
+X	/* 101  */	"\374",	/*bullet*/
+X	/* 102  */	"?",	/*?*/
+X	/* 103  */	"\250",	/*foot mark*/
+X	/* 104  */	"|",	/*|*/
+X	/* 105  */	UNASS,	/*unassigned*/
+X	/* 106  */	"\377",	/*copyright*/
+X	/* 107  */	"\272",	/*square*/
+X	/* 108  */	"$"	/*$*/
+X};
+X
+Xchar *specnative[108] = {
+X	"psi",	/*psi*/
+X	"theta",	/*theta*/
+X	"nu",	/*nu*/
+X	"mu",	/*mu*/
+X	"lambda",	/*lambda*/
+X	"iota",	/*iota*/
+X	"zeta",	/*zeta*/
+X	"sigma",	/*sigma*/
+X	"delta",	/*delta*/
+X	"beta",	/*beta*/
+X	"xi",	/*xi*/
+X	"eta",	/*eta*/
+X	"phi",	/*phi*/
+X	"upsilon",	/*upsilon*/
+X	"kappa",	/*kappa*/
+X	UNASS,	/*unassigned*/
+X	"pi",	/*pi*/
+X	"@",	/*@*/
+X	"down arrow",	/*down arrow*/
+X	UNASS,	/*unassigned*/
+X	"alpha",	/*alpha*/
+X	"or (was star)",	/*or (was star)*/
+X	"chi",	/*chi*/
+X	"\"",	/*"*/
+X	"epsilon",	/*epsilon*/
+X	"equation equal",	/*equation equal*/
+X	"omicron",	/*omicron*/
+X	"left arrow",	/*left arrow*/
+X	"rho",	/*rho*/
+X	"up arrow",	/*up arrow*/
+X	"tau",	/*tau*/
+X	"_",	/*_*/
+X	"\\",	/*\*/
+X	"Psi",	/*Psi*/
+X	"bell system sign",	/*bell system sign*/
+X	"infinity",	/*infinity*/
+X	"gamma",	/*gamma*/
+X	" improper superset",	/* improper superset*/
+X	"proportional to",	/*proportional to*/
+X	"right hand",	/*right hand*/
+X	"omega",	/*omega*/
+X	"gradient",	/*gradient*/
+X	UNASS,	/*unassigned*/
+X	"Phi",	/*Phi*/
+X	"Theta",	/*Theta*/
+X	"Omega",	/*Omega*/
+X	"cup (union)",	/*cup (union)*/
+X	"root en",	/*root en*/
+X	"terminal sigma (was root em)",	/*terminal sigma (was root em)*/
+X	"Lambda",	/*Lambda*/
+X	"equation minus",	/*equation minus*/
+X	"Gamma",	/*Gamma*/
+X	"integral sign",	/*integral sign*/
+X	"Pi",	/*Pi*/
+X	"subset of",	/*subset of*/
+X	"superset of",	/*superset of*/
+X	"approximates",	/*approximates*/
+X	"partial derivative",	/*partial derivative*/
+X	"Delta",	/*Delta*/
+X	"square root",	/*square root*/
+X	"Sigma",	/*Sigma*/
+X	"approx =",	/*approx =*/
+X	UNASS,	/*unassigned*/
+X	">",	/*>*/
+X	"Xi",	/*Xi*/
+X	"<",	/*<*/
+X	"slash (longer)",	/*slash (longer)*/
+X	"cap (intersection)",	/*cap (intersection)*/
+X	"Upsilon",	/*Upsilon*/
+X	"not",	/*not*/
+X	"right ceiling (rt of \")",	/*right ceiling (rt of ")*/
+X	"left top (of big curly)",	/*left top (of big curly)*/
+X	"bold vertical",	/*bold vertical*/
+X	"left center of big curly bracket",	/*left center of big curly bracket*/
+X	"left bottom",	/*left bottom*/
+X	"right top",	/*right top*/
+X	"right center of big curly bracket",	/*right center of big curly bracket*/
+X	"right bot",	/*right bot*/
+X	"right floor (rb of \")",	/*right floor (rb of ")*/
+X	"left floor (left bot of big sq bract)",	/*left floor (left bot of big sq bract)*/
+X	"left ceiling (lt of \")",	/*left ceiling (lt of ")*/
+X	"multiply",	/*multiply*/
+X	"divide",	/*divide*/
+X	"plus-minus",	/*plus-minus*/
+X	"<=",	/*<=*/
+X	">=",	/*>=*/
+X	"identically equal",	/*identically equal*/
+X	"not equal",	/*not equal*/
+X	"{",	/*{*/
+X	"}",	/*}*/
+X	"acute accent",	/*acute accent*/
+X	"grave accent",	/*grave accent*/
+X	"^",	/*^*/
+X	"#",	/*#*/
+X	"left hand",	/*left hand*/
+X	"member of",	/*member of*/
+X	"~",	/*~*/
+X	"empty set",	/*empty set*/
+X	UNASS,	/*unassigned*/
+X	"dbl dagger",	/*dbl dagger*/
+X	"|",	/*box rule (was parallel sign)*/
+X	"math * ",	/*math * */
+X	"improper subset",	/*improper subset*/
+X	"circle",	/*circle*/
+X	UNASS,	/*unassigned*/
+X	"equation plus",	/*equation plus*/
+X	"right arrow",	/*right arrow*/
+X	"section"	/*section*/
+X};
+/
+echo 'x - Makefile'
+sed 's/^X//' > Makefile << '/'
+XCFLAGS = -O -DDEBUG -g
+XOBJ	= lcat.o fastfonts.o
+Xlcat:	$(OBJ)
+X	$(CC) -o lcat $(CFLAGS) $(OBJ)
+X
+Xpack:
+X	packmail lcat.c fastfonts.c Makefile lroff test.1
+X
+Xtest:
+X	lroff -mm test.1
+/
+echo 'x - lroff'
+sed 's/^X//' > lroff << '/'
+Xtrap "rm -f /tmp/$$; exit 1" 1 2 3 15
+Xcat > /tmp/$$ <<\EOF
+X.ps 12		\" point size 12
+X.fp 1 CW	\" constant width font 1
+X.fp 2 CW	\" constant width font 2
+X.fp 3 CW	\" constant width font 3
+X.lg 0		\" turn off ligature mode
+XEOF
+Xfor i 
+Xdo
+X	case $i in
+X		-)
+X			files="$files -"
+X			;;
+X		-t)
+X			test=y
+X			;;
+X		-*)
+X			args="$args $i"
+X			;;
+X		*)
+X			files="$files $i"
+X			;;
+X	esac
+Xdone
+Xif [ "$test" = "y" ]
+Xthen
+X	troff -t $args /tmp/$$ $files | /u/clewis/lcat/lcat -d > lroffout
+X	rc=$?
+Xelse
+X	troff -t $args /tmp/$$ $files | /u/clewis/lcat/lcat | lp -dpr1 -ob -op
+X	rc=$?
+Xfi
+Xrm -f /tmp/$$
+Xexit $rc
+/
+echo 'x - test.1'
+sed 's/^X//' > test.1 << '/'
+X.sp
+XThis is a test of the troff/laserjet filter.
+XIt should do all sorts of neat things.
+XFor example, this should be
+X\f2italic\fP,
+Xand this should be
+X\f3bold\fP.
+XThus, many things are possible, if you
+Xonly know how.
+XThis is not another paragraph.
+XMimsey were the
+X\f3borogroves\fP.
+X.sp
+XThis is test case 1 case 1 case 1 case 1 this is 
+Xmore of the testcase 1 if that is what you want?
+X.sp
+X.sp
+XSilly isn't it?
+X.sp 4
+XThis is a demonstration of the character set:
+X    abcdefghijklmnopqrstuvwxyz
+X    \f2abcdefghijklmnopqrstuvwxyz\fP
+X    \f3abcdefghijklmnopqrstuvwxyz\fP
+X    This is a filter of troff type
+X    ABCDEFGHIJKLMNOPQRSTUVWXYZ
+X    1234567890
+X    !@#$%^&*()_+~{}[]:".,';./?|
+X    {
+X    }
+X    (em \(em
+X    (hy \(hy
+X    (sq \(sq
+X    (bu \(bu
+X    (sq \(sq
+X    (ru \(ru
+X    (14 \(14
+X    (12 \(12
+X    (34 \(34
+X    (fi \(fi
+X    (fl \(fl
+X    (ff \(ff
+X    (Fi \(Fi
+X    (Fl \(Fl
+X    (de \(de
+X    (dg \(dg
+X    (fm \(fm
+X    (ct \(ct
+X    (rg \(rg
+X    (co \(co
+X    (pl \(pl
+X    (mi \(mi
+X    (eq \(eq
+X    (** \(**
+X    (sc \(sc
+X    (aa \(aa
+X    (ga \(ga
+X    (ul \(ul
+X    (sl \(sl
+X    (*a \(*a
+X    (*b \(*b
+X    (*g \(*g
+X    (*d \(*d
+X    (*e \(*e
+X    (*z \(*z
+X    (*y \(*y
+X    (*h \(*h
+X    (*i \(*i
+X    (*k \(*k
+X    (*l \(*l
+X    (*m \(*m
+X    (*n \(*n
+X    (*c \(*c
+X    (*o \(*o
+X    (*p \(*p
+X    (*r \(*r
+X    (*s \(*s
+X    (ts \(ts
+X    (*u \(*u
+X    (*f \(*f
+X    (*x \(*x
+X    (*q \(*q
+X    (*w \(*w
+X    (*A \(*A
+X    (*B \(*B
+X    (*G \(*G
+X    (*D \(*D
+X    (*E \(*E
+X    (*Z \(*Z
+X    (*Y \(*Y
+X    (*H \(*H
+X    (*I \(*I
+X    (*K \(*K
+X    (*L \(*L
+X    (*M \(*M
+X    (*B \(*B
+X    (*C \(*C
+X    (*O \(*O
+X    (*P \(*P
+X    (*R \(*R
+X    (*S \(*S
+X    (*T \(*T
+X    (*U \(*U
+X    (*F \(*F
+X    (*X \(*X
+X    (*Q \(*Q
+X    (*W \(*W
+X    (sr \(sr
+X    (rn \(rn
+X    (>= \(>=
+X    (<= \(<=
+X    (== \(==
+X    (~= \(~=
+X    (ap \(ap
+X    (!= \(!=
+X    (-> \(->
+X    (<- \(<-
+X    (ua \(ua
+X    (da \(da
+X    (mu \(mu
+X    (di \(di
+X    (+- \(+-
+X    (cu \(cu
+X    (ca \(ca
+X    (sb \(sb
+X    (sp \(sp
+X    (ib \(ib
+X    (ip \(ip
+X    (if \(if
+X    (pd \(pd
+X    (gr \(gr
+X    (no \(no
+X    (is \(is
+X    (pt \(pt
+X    (es \(es
+X    (mo \(mo
+X    (br \(br
+X    (dd \(dd
+X    (rh \(rh
+X    (lh \(lh
+X    (bs \(bs
+X    (or \(or
+X    (ci \(ci
+X    (lt \(lt
+X    (lb \(lb
+X    (rt \(rt
+X    (rb \(rb
+X    (lk \(lk
+X    (rk \(rk
+X    (bv \(bv
+X    (lf \(lf
+X    (rf \(rf
+X    (lc \(lc
+X    (rc \(rc
+/
+echo 'Part 01 of pack.out complete.'
+exit
+-- 
+Chris Lewis,
+UUCP: {allegra, linus, ihnp4}!utzoo!mnetor!clewis
+BELL: (416)-475-8980 ext. 321
+
+

@@ -1,0 +1,533 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,9f6f7495ed09331a
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-07-11 03:01:54 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 UW 5/3/83; site uw-beaver
+Path: utzoo!watmath!clyde!burl!mgnetp!ihnp4!zehntel!dual!amd!fortune!hpda!hplabs!tektronix!uw-beaver!furuta
+From: furuta@uw-beaver (Richard Furuta)
+Newsgroups: net.sources
+Subject: Re: MacTerminal file xfer for UNIX - (nf)
+Message-ID: <1189@uw-beaver>
+Date: Wed, 11-Jul-84 06:01:54 EDT
+Article-I.D.: uw-beave.1189
+Posted: Wed Jul 11 06:01:54 1984
+Date-Received: Wed, 18-Jul-84 01:51:42 EDT
+References: <135@bragvax.UUCP>
+Organization: U of Washington Computer Science
+Lines: 512
+
+Ok, ok, don't get touchy!  here's macput.
+
+=========macput.c:
+#include <stdio.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+
+#define RECORDBYTES 132
+#define DATABYTES 128
+#define NAMEBYTES 63
+
+#define RETRIES 10
+#define ACKTIMO 10
+
+#define MAXRECNO 0xff
+#define BYTEMASK 0xff
+
+#define TMO -1
+#define DUP '\000'
+#define SOH '\001'
+#define EOT '\004'
+#define ACK '\006'
+#define NAK '\025'
+#define CAN '\030'
+#define EEF '\032'
+#define ESC '\033'
+
+#define H_NLENOFF 1
+#define H_NAMEOFF 2
+#define H_TYPEOFF 65
+#define H_AUTHOFF 69
+#define H_DLENOFF 81
+#define H_RLENOFF 85
+
+#define TEXT 0
+#define DATA 1
+#define RSRC 2
+#define FULL 3
+
+int mode, txtmode;
+
+struct macheader {
+	char m_name[NAMEBYTES+1];
+	char m_type[4];
+	char m_author[4];
+	int m_datalen;
+	int m_rsrclen;
+} mh;
+
+struct filenames {
+	char f_info[256];
+	char f_data[256];
+	char f_rsrc[256];
+} files;
+
+int recno;
+char buf[DATABYTES];
+
+/*
+ * macput -- send file to macintosh using xmodem protocol
+ * Dave Johnson, Brown University Computer Science  6/17/84
+ */
+char usage[] =
+    "usage: \"macput [-rdu] [-t type] [-a author] [-n name] filename\"\n";
+
+main(ac, av)
+char **av;
+{
+	int n;
+	char *filename;
+
+	if (ac == 1) {
+		fprintf(stderr, usage);
+		exit(1);
+	}
+
+	mode = FULL;
+	ac--; av++;
+	while (ac) {
+		if (av[0][0] == '-') {
+			switch (av[0][1]) {
+			case 'r':
+				mode = RSRC;
+				strncpy(mh.m_type, "APPL", 4);
+				strncpy(mh.m_author, "CCOM", 4);
+				break;
+			case 'u':
+				mode = TEXT;
+				strncpy(mh.m_type, "TEXT", 4);
+				strncpy(mh.m_author, "MACA", 4);
+				break;
+			case 'd':
+				mode = DATA;
+				strncpy(mh.m_type, "TEXT", 4);
+				strncpy(mh.m_author, "????", 4);
+				break;
+			case 'n':
+				if (ac > 1) {
+					ac--; av++;
+					n = strlen(av[0]);
+					if (n > NAMEBYTES) n = NAMEBYTES;
+					strncpy(mh.m_name, av[0], n);
+					mh.m_name[n] = '\0';
+					break;
+				}
+				else goto bad_usage;
+			case 't':
+				if (ac > 1) {
+					ac--; av++;
+					strncpy(mh.m_type, av[0], 4);
+					break;
+				}
+				else goto bad_usage;
+			case 'a':
+				if (ac > 1) {
+					ac--; av++;
+					strncpy(mh.m_author, av[0], 4);
+					break;
+				}
+				else goto bad_usage;
+			default:
+bad_usage:
+				fprintf(stderr, usage);
+				exit(1);
+			}
+		}
+		else {
+			filename = av[0];
+		}
+		ac--; av++;
+	}
+
+	find_files(filename, mode);
+	if (mode != FULL)
+		forge_info();
+	setup_tty();
+	if (send_sync() == ACK) {
+		txtmode = 0;
+		send_file(files.f_info, 1);
+		if (mode == TEXT) txtmode++;
+		send_file(files.f_data, 1);
+		txtmode = 0;
+		send_file(files.f_rsrc, 0);
+	}
+	if (mode != FULL)
+		unlink(files.f_info);
+	reset_tty();
+}
+
+find_files(filename, mode)
+{
+	int n;
+	struct stat stbuf;
+
+	sprintf(files.f_data, "%s.data", filename);
+	sprintf(files.f_rsrc, "%s.rsrc", filename);
+	if (mode == FULL) {
+		sprintf(files.f_info, "%s.info", filename);
+		if (stat(files.f_info, &stbuf) != 0) {
+			perror(files.f_info);
+			cleanup(-1);
+		}
+		return;
+	}
+	else {
+		strcpy(files.f_info, "#machdrXXXXXX");
+		mktemp(files.f_info);
+	}
+	if (mode == RSRC) {
+		strcpy(files.f_data, "/dev/null");
+		if (stat(files.f_rsrc, &stbuf) != 0) {
+			strcpy(files.f_rsrc, filename);
+			if (stat(files.f_rsrc, &stbuf) != 0) {
+				perror(files.f_rsrc);
+				cleanup(-1);
+			}
+		}
+		mh.m_datalen = 0;
+		mh.m_rsrclen = stbuf.st_size;
+	}
+	else {
+		strcpy(files.f_rsrc, "/dev/null");
+		if (stat(files.f_data, &stbuf) != 0) {
+			sprintf(files.f_data, "%s.text", filename);
+			if (stat(files.f_data, &stbuf) != 0) {
+				strcpy(files.f_data, filename);
+				if (stat(files.f_data, &stbuf) != 0) {
+					perror(files.f_data);
+					cleanup(-1);
+				}
+			}
+		}
+		mh.m_datalen = stbuf.st_size;
+		mh.m_rsrclen = 0;
+	}
+	if (mh.m_name[0] == '\0') {
+		n = strlen(filename);
+		if (n > NAMEBYTES) n = NAMEBYTES;
+		strncpy(mh.m_name, filename, n);
+		mh.m_name[n] = '\0';
+	}
+}
+
+forge_info()
+{
+	int status, n;
+	char *np;
+	FILE *fp;
+
+	for (np = mh.m_name; *np; np++)
+		if (*np == '_') *np = ' ';
+
+	buf[H_NLENOFF] = n = np - mh.m_name;
+	strncpy(buf + H_NAMEOFF, mh.m_name, n);
+	strncpy(buf + H_TYPEOFF, mh.m_type, 4);
+	strncpy(buf + H_AUTHOFF, mh.m_author, 4);
+	put4(buf + H_DLENOFF, mh.m_datalen);
+	put4(buf + H_RLENOFF, mh.m_rsrclen);
+
+	fp = fopen(files.f_info, "w");
+	if (fp == NULL) {
+		perror("temp file");
+		cleanup(-1);
+	}
+	fwrite(buf, 1, DATABYTES, fp);
+	fclose(fp);
+}
+
+send_sync()
+{
+	int c, i;
+
+	for (i = 0; i < 3; i++) {
+		tputc(ESC);
+		tputc('a');
+		while ((c = tgetc(ACKTIMO)) != TMO) {
+			switch (c) {
+			case CAN:
+			case EOT:
+			case ACK:
+				return c;
+			default:
+				continue;
+			}
+		}
+		fprintf(stderr, "starting handshake timeout\r\n");
+	}
+	fprintf(stderr, "giving up\r\n");
+}
+
+send_file(fname, more)
+char *fname;
+int more;
+{
+	register int status, i, n;
+	register char *bp;
+	FILE *inf;
+	int naks = 0;
+
+	inf = fopen(fname, "r");
+	if (inf == NULL) {
+		perror(fname);
+		cleanup(-1);
+	}
+	recno = 1;
+	for (;;) {
+		n = fread(buf, 1, DATABYTES, inf);
+		if (n > 0) {
+			for (i = 0; i < RETRIES; i++) {
+				send_rec(buf, DATABYTES);
+				status = tgetc(ACKTIMO);
+				if (status != NAK)
+					break;
+			} 
+			if (status == NAK || status == CAN) {
+				fclose(inf);
+				cleanup(-1);
+				/* NOTREACHED */
+			}
+		}
+		if (n < DATABYTES) {
+			tputc(EOT);
+			if (more) {
+				status = tgetc(ACKTIMO);
+			}
+			return;
+		}
+		recno++;
+		recno &= MAXRECNO;
+	}
+}
+
+send_rec(buf, recsize)
+char buf[];
+int recsize;
+{
+	int i, cksum;
+	char *bp;
+
+	cksum = 0;
+	bp = buf;
+	for (i = 0; i < recsize; i++, bp++) {
+		if (txtmode && *bp == '\n')
+			*bp = '\r';
+		cksum += *bp;
+	}
+
+	tputc(SOH);
+	tputc((char)recno);
+	tputc((char)(MAXRECNO - recno));
+	tputrec(buf, recsize);
+	tputc((char)cksum);
+}
+
+static int ttyfd;
+static FILE *ttyf;
+static jmp_buf timobuf;
+
+tgetc(timeout)
+int timeout;
+{
+	int c;
+
+	if (setjmp(timobuf))
+		return TMO;
+
+	alarm(timeout);
+	c = getc(ttyf);
+	alarm(0);
+
+	if (c == -1)	/* probably hung up or logged off */
+		return EOT;
+	else
+		return c & BYTEMASK;
+}
+
+tputrec(buf, count)
+char *buf;
+int count;
+{
+	write(ttyfd, buf, count);
+}
+
+tputc(c)
+char c;
+{
+	write(ttyfd, &c, 1);
+}
+
+timedout()
+{
+	longjmp(timobuf, 1);
+}
+
+static struct sgttyb otty, ntty;
+/* should turn messages off */
+
+setup_tty()
+{
+	int cleanup();
+	int timedout();
+
+	ttyf = stdin;
+	ttyfd = fileno(stdin);
+	ioctl(ttyfd, TIOCGETP, &otty);
+	signal(SIGHUP, cleanup);
+	signal(SIGINT, cleanup);
+	signal(SIGQUIT, cleanup);
+	signal(SIGTERM, cleanup);
+	signal(SIGALRM, timedout);
+	ntty = otty;
+	ntty.sg_flags = RAW|ANYP;
+	ioctl(ttyfd, TIOCSETP, &ntty);
+}
+
+reset_tty()
+{
+	if (ttyf != NULL) {
+		sleep(2);	/* should wait for output to drain */
+		ioctl(ttyfd, TIOCSETP, &otty);
+	}
+}
+
+cleanup(sig)
+int sig;
+{
+	reset_tty();
+	exit(sig);
+}
+
+put4(bp, value)
+char *bp;
+int value;
+{
+	register int i, c;
+
+	for (i = 0; i < 4; i++) {
+		c = (value >> 24) & BYTEMASK;
+		value <<= 8;
+		*bp++ = c;
+	}
+}
+============macput.l
+.TH MACPUT local "22 June 1984"
+.UC 4
+.SH NAME
+macput \- send file to macintosh via modem7 / macterminal
+.SH SYNOPSIS
+.B macput
+file
+.br
+.B macput
+[
+.B \-rdu
+] file
+[
+.B \-t 
+type
+]
+[
+.B \-a
+author
+]
+[
+.B \-n
+name
+]
+.SH DESCRIPTION
+.I Macput
+sends a file to a Macintosh running MacTerminal.
+MacTerminal should be set to use the modem7 protocol,
+and should have flow control disabled.
+This program has only been tested with version -0.15x
+of MacTerminal.
+.PP
+If none of the
+.B \-rdu
+flags are specified, 
+.I macput 
+sends three files to the mac:
+.IB file .info ,
+.IB file .data ,
+and
+.IB file .rsrc .
+This is useful for returning files to the mac which were stored
+using macget.
+.PP
+The
+.B \-r
+flag specifies 
+.I resource
+mode.
+Either
+.IB file .rsrc
+or
+.I file
+will be sent to the Mac, along with a forged
+.B .info
+file and an empty 
+.B .data
+file.
+The file sent becomes the resource fork of the Mac file.
+.PP
+The
+.B \-d
+flag specifies 
+.I data
+mode.
+Either
+.IB file .data
+,
+.IB file .text
+or
+.I file
+will be sent to the Mac, along with a forged
+.B .info
+file and an empty 
+.B .rsrc
+file.
+The file sent becomes the data fork of the Mac file.
+.PP
+The 
+.B \-u
+flag requests 
+.I unix
+mode, which is the same as 
+.I data
+mode except unix newline characters are converted
+into carriage returns.
+.PP
+The remaining options serve to override the default
+file type, author, and file name to be used on the Mac.
+The defaults for 
+.I resource
+mode are "APPL", "CCOM", and 
+.IR file .
+.I data
+mode defaults are "TEXT", "????", and 
+.I unix
+mode defaults are "TEXT" and "MACA".
+.SH SEE ALSO
+macget(local)
+.SH BUGS
+Doesn't work over flow controlled communication lines,
+or when using rlogin.
+.PP
+Doesn't set the bundle bit on resource files, to incorporate any
+icons into the Desk Top.
+Use setfile to set the bundle bit.
+
+

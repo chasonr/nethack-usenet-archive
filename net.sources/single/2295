@@ -1,0 +1,770 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,42c178a93bc4347d,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-01-22 20:00:00 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: Notesfiles $Revision: 1.6.2.17 $; site uiucdcsb.UUCP
+Path: utzoo!watmath!clyde!cbosgd!ihnp4!inuxc!pur-ee!uiucdcsb!grunwald
+From: grunwald@uiucdcsb.UUCP
+Newsgroups: net.sources
+Subject: pascref.p
+Message-ID: <15400005@uiucdcsb.UUCP>
+Date: Tue, 22-Jan-85 23:00:00 EST
+Article-I.D.: uiucdcsb.15400005
+Posted: Tue Jan 22 23:00:00 1985
+Date-Received: Thu, 24-Jan-85 08:11:02 EST
+Lines: 750
+Nf-ID: #N:uiucdcsb:15400005:000:18209
+Nf-From: uiucdcsb!grunwald    Jan 22 22:00:00 1985
+
+(*$b9	-- block buffering *)
+program pascref(input, output);
+ 
+(* pascref - cross reference pascal programs.                        *)
+(*                                                                   *)
+(* original program (named xref).                                    *)
+(*    - n. wirth 71/01/15, 74/05/07, 75/07/02, 76/02/10.             *)
+(*      (see chapter 4 in "algorithms + data structures = programs") *)
+(* use better sort, case statement in scanner, procedure map,        *)
+(* control statement processing.                                     *)
+(*    - a. mickel 75/12/08.                                          *)
+(* use ring structure for references.                                *)
+(*    - r. cichelli 76/11/14.                                        *)
+(* process line numbers.                                             *)
+(*    - d. laliberte 78/03/15.                                       *)
+(* process compiler titles, different print densities,               *)
+(* use value part, sort correctly, add nesting levels.               *)
+(*   - j. strait 78/12/28.                                           *)
+(* fix nesting-level indicators, handle percent in 64-char set.      *)
+(*   - j.f. miner 1982-01-06                                         *)
+(* Port pascref to the UCB UNIX enviornment. Removed the pagination  *)
+(* routines. added new options (tab size), made it be able to deal   *)
+(* with tabs (cntrl-i) as far as knowing how wide a page is	     *)
+(*   - d. c. grunwald sometime in late '82			     *)
+(* Extended port to UNIX:					     *)
+(*	get file names from command line or use stdin		     *)
+(*	handle path pascal keywords				     *)
+(*	avoid duplicating line references if the last reference is   *)
+(*	  to the same line					     *)
+(*	allow people to pascref large files which have been split    *)
+(*	up for editing and still make sense of error messages from   *)
+(*	compilers (added: filename, fileline, filehead, etc)	     *)
+(*   - d. c. grunwald 3/5/83					     *)
+(*                                                                   *)
+ 
+const
+    p = 32749;			(*size of hash table*)
+    nk = 43;			(*no. of keywords*)
+    kln = 15;			(*keylength*)
+    llinmax = 120;		(*maximum input line length*)
+    lloutmax = 132;		(*maximum output line length*)
+    maxn = 100000;		(*max no. of lines*)
+    dgpn = 6;			(*no. of digits per number*)
+    stars = ' *****';
+    tab = '	';
+    deftab = 8;	(* default number of columns a tab is worth	*)
+
+    fnamesize = 20;	(* maximum name of a file passed via command line *)
+    dispfnsize = 15;	(* part of the filename that we display *)
+    eject = 12;		(* form feed or newpage to do a page eject *)
+
+
+type
+    index = 0..p;
+    alfa = packed array [1..kln] of char;
+    ref = ^ item;
+    word = 
+	record 
+	    key: alfa;
+	    last: ref
+	end;
+    item = packed 
+	record 
+	    lno: 0..maxn;
+	    next: ref
+	end;
+    nestkind = (nestbegin, nestopen, nestclose, nestclear, nestnull);
+    procref = ^ proc;		(*procedure or function reference*)
+    proc = packed 
+	record 
+	    name: alfa;
+	    lno: 0..maxn;
+	    next: procref
+	end;
+    filepnt = ^filetype;
+    filetype = record
+	name	: array[1..fnamesize] of char;
+	length	: integer;
+	starting: integer;	(* starting/end lines for this file	*)
+	ending	: integer;
+	next	: filepnt;
+	end;
+
+ 
+var
+    i,j: index;
+    k: integer;
+    c00: char;
+    ln: integer;		(*current line number*)
+    llout: integer;		(*line length for output*)
+    llin: integer;		(*line length for input*)
+    ccount: integer;		(*character count in line*)
+    nopl: integer;		(*no. of line-numbers per line*)
+    empty: alfa;
+    id: alfa;
+    t: array [index] of word;	(*hash table*)
+    keyindex: 0..nk;
+    key: array [0..nk] of 
+	record 
+	    k: alfa;
+	    nestchange: nestkind
+	end;
+    inbody: boolean;
+    nesting, nestingatbol: 0..maxint;
+    nestcount: 0..llinmax;	(* highest element of nest being used *)
+    nest: array [1..llinmax] of nestbegin..nestclear;
+    procorfunc, paginating  : boolean;
+    firstproc, procptr: procref; (*pointers to chain of procedures*)
+
+(*	added for UCB port					*)
+    tabinc: integer;		(* specifies how many chars a tab is	*)
+
+    filehead 	: filepnt;
+    fpnt	: filepnt;
+    multifile	: boolean;	(* is there more than stdin to process? *)
+    filename	: array[1..dispfnsize] of char; (* name to display for file *)
+    fileline	: integer;	(* line number for the current file	*)
+ 
+    procedure dovalue;
+
+    var
+	i: integer;
+	pnt: integer;
+
+	procedure add(s: alfa; n: nestkind);
+	var
+	    i: integer;
+	begin
+	    for i := 1 to kln do 
+		if s[i] = ' ' then 
+		    key[pnt].k[i] := c00
+		else 
+		    key[pnt].k[i] := s[i];
+	    key[pnt].nestchange := n;
+	    pnt := pnt + 1
+	end; (* add *)
+
+    begin (* dovalue *)
+	c00 := chr(0);
+	for i := 1 to kln do 
+	    empty[i] := c00;
+	for i := 1 to p do begin
+	    t[i].key := empty;
+	    t[i].last := nil
+	end (* for *);
+	pnt := 0;	(* start adding items to the 'key' array	*)
+	add(empty, nestnull);
+	add('and            ', nestnull);
+	add('array          ', nestnull);
+	add('begin          ', nestbegin);
+	add('boolean        ', nestnull);
+	add('case           ', nestopen);
+	add('char           ', nestnull);
+	add('const          ', nestnull);
+	add('div            ', nestnull);
+	add('do             ', nestnull);
+	add('downto         ', nestnull);
+	add('else           ', nestnull);
+	add('end            ', nestclose);
+	add('entry          ', nestnull);
+	add('false          ', nestnull);
+	add('file           ', nestnull);
+	add('for            ', nestnull);
+	add('function       ', nestclear);
+	add('if             ', nestnull);
+	add('in             ', nestnull);
+	add('integer        ', nestnull);
+	add('mod            ', nestnull);
+	add('nil            ', nestnull);
+	add('not            ', nestnull);
+	add('object         ', nestnull);
+	add('of             ', nestnull);
+	add('or             ', nestnull);
+	add('packed         ', nestnull);
+	add('path           ', nestbegin);
+	add('procedure      ', nestclear);
+	add('process        ', nestclear);
+	add('program        ', nestclear);
+	add('real           ', nestnull);
+	add('record         ', nestnull);
+	add('repeat         ', nestopen);
+	add('set            ', nestnull);
+	add('then           ', nestnull);
+	add('to             ', nestnull);
+	add('true           ', nestnull);
+	add('type           ', nestnull);
+	add('until          ', nestclose);
+	add('var            ', nestnull);
+	add('while          ', nestnull);
+	add('with           ', nestnull);
+
+	llin := llinmax;
+	llout := lloutmax;
+	procorfunc := true;
+	nesting := 0;
+	inbody := false;
+	ccount := 0;
+	ln := 0
+    end; (* procedure dovalue *)
+ 
+    procedure classify;
+    var
+	i, j, k: integer;
+    begin
+	i := 1;
+	j := nk;				(*binary search*)
+	keyindex := 0;
+	repeat
+	    k := (i + j) div 2;
+	    if key[k].k <= id then 
+		i := k + 1
+	    else 
+		j := k - 1
+	until i > j;
+	if key[j].k = id then 
+	    keyindex := j
+    end; (*classify*)
+ 
+    procedure advance;
+
+    var
+	t : integer;
+
+	function tabcount: integer;
+	(*	tabcount figures out how many spaces to add for the tab	*)
+	(* 	character assuming tabstops every tabinc spots and	*)
+	(*	that ccount contains the current column count		*)
+	begin
+	    if ccount = 0 then 
+		tabcount := tabinc		(* avoid division by zero *)
+	    else 
+		tabcount := tabinc - ccount mod tabinc
+	end; (* tabcount *)
+
+    begin
+	if not eoln then begin
+	    if input^ = tab then begin	(* compensate for tab characters  *)
+		t := tabcount;
+		if t > 0 then write(' ':t);
+		ccount := ccount + t
+	    end else begin
+		ccount := ccount + 1;
+		write(input^)
+	    end;
+	    get(input);
+	    if ccount >= llin then 
+		while not eoln(input) do begin
+		    if input^ = tab then begin
+			t := tabcount;
+			if t > 0 then write(' ':t);
+			ccount := ccount + tabcount
+		    end else begin
+			ccount := ccount + 1;
+			write(input^)
+		    end;
+		    get(input)
+		end (* while *)
+	end
+    end; (*advance*)
+ 
+    procedure newline;
+ 
+    begin
+	ccount := 0;
+	nestcount := 0;
+	nestingatbol := nesting;
+	if ln < maxn then begin
+	    ln := ln + 1;
+	    fileline := fileline + 1;
+
+(*	removed the code to manage the compiler title as well as code	*)
+(*	concerned with pagination (this would be done by lpr handler)	*)
+
+	    write(ln: 6, ' ')
+	end else begin
+	    writeln(stars, ' text too long', stars);
+	    halt;
+	end
+    end; (*newline*)
+ 
+    procedure search;				(*modulo p hash search*)
+    var
+	h, d: integer;
+	x, y: ref;
+	f: boolean;
+    begin
+	h := 0;
+	for i := 1 to kln do
+	    h := (h + ord(id[i]))*2;
+	h := abs(h) mod p;
+	f := false;
+	d := 1;
+	repeat
+	    if t[h].key = id then begin (*found*)
+		f := true;
+		y := t[h].last;
+		if ( y^.lno <> ln) then begin
+		    new(x);
+		    x^.lno := ln;
+		    x^.next := y^.next;
+		    y^.next := x;
+		    t[h].last := x
+		    end
+	    end else if t[h].key = empty then begin (*new entry*)
+		new(x);
+		x^.lno := ln;
+		f := true;
+		t[h].key := id;
+		t[h].last := x;
+		x^.next := x
+	    end else begin (*collision*)
+		h := h + d;
+		d := d + 2;
+		if h >= p then 
+		    h := h - p;
+		if d = p then begin
+		    writeln;
+		    writeln(stars, ' table full', stars);
+		    halt;
+		end
+	    end
+	until f
+    end; (*search*)
+ 
+    procedure sort(min, max: integer);
+ 
+(* quicksort with bounded recursion depth *)
+(* requires min <= max *)
+ 
+    var
+	low, high: integer;
+	midkey: alfa;
+	temp: word;
+ 
+    begin
+	repeat (*pick split point*)
+	    midkey := t[(min + max) div 2].key;
+	    low := min;
+	    high := max;
+	    repeat (*partition*)
+		while t[low].key < midkey do 
+		    low := low + 1;
+		while t[high].key > midkey do 
+		    high := high - 1;
+		if low <= high then begin
+		    temp := t[low];
+		    t[low] := t[high];
+		    t[high] := temp;
+		    low := low + 1;
+		    high := high - 1
+		end
+	    until low > high;
+ 
+	    (*recursively sort shorter sub-segment*)
+	    if high - min < max - low then begin
+		if min < high then 
+		    sort(min, high);
+		min := low
+	    end else begin
+		if low < max then 
+		    sort(low, max);
+		max := high
+	    end
+	until max <= min
+    end; (*sort*)
+ 
+ 
+    procedure noteproc;		(*note instance of procedure or function*)
+    var
+	p: procref;
+    begin
+	procorfunc := false;
+	new(p);
+	procptr^.next := p;
+	p^.name := id;
+	p^.lno := ln;
+	p^.next := nil;
+	procptr := p
+    end; (*noteproc*)
+ 
+    procedure printword(w: word);
+    var
+	l: integer;
+	x, y: ref;
+	k: alfa;
+    begin
+	k := w.key;
+	l := kln;
+	while k[l] = c00 do begin
+	    k[l] := ' ';
+	    l := l - 1
+	end;
+	write(' ', k);
+	x := w.last^.next;
+	y := x;
+	l := 0;
+	repeat
+	    if l = nopl then begin
+		l := 0;
+		writeln;
+		write(' ': kln + 1)
+	    end;
+	    l := l + 1;
+	    write(x^.lno: dgpn);
+	    x := x^.next
+	until x = y;
+	writeln
+    end; (*printword*)
+ 
+    procedure printtable;
+    var
+	i, m: integer;
+    begin
+	m := 0;					(*compress table*)
+	for i := 0 to p - 1 do 
+	    if t[i].key <> empty then begin
+		t[m] := t[i];
+		m := m + 1
+	    end;
+	if m > 0 then 
+	    sort(0, m - 1);
+	nopl := (llout - kln - 1) div dgpn;
+	writeln(' cross reference of identifiers,',
+		' label declarations and goto statements:');
+	writeln;
+	for i := 0 to m - 1 do 
+	    printword(t[i])
+    end; (*printtable*)
+ 
+    procedure printprocs;
+    var
+	n: alfa;
+	l: integer;
+    begin
+	writeln; writeln;
+	writeln(' list of procedures and functions:');
+	writeln;
+	procptr := firstproc^.next;
+	while procptr <> nil do 
+	    with procptr^ do begin
+		n := name;
+		l := kln;
+		while n[l] = c00 do begin
+		    n[l] := ' ';
+		    l := l - 1
+		end;
+		writeln(n: 24, lno: 10);
+		procptr := next
+	    end
+    end; (*printprocs*)
+
+    procedure printfiles(f : filepnt);
+    begin
+	writeln('File':dispfnsize+5,'Goes from line':20,'To Line':20);
+	writeln;
+	while( f <> nil ) do begin
+	    writeln(f^.name:dispfnsize+5,f^.starting:20,f^.ending:20);
+	    f := f^.next;
+	    end;
+    end (* procedure printfiles *);
+
+    procedure initialize;
+    var
+	optstr: array [1..fnamesize] of char;
+	i: integer;
+	p : filepnt;
+	files : integer;
+ 
+    begin
+
+(*	check for options passed from the command line			*)
+
+	paginating := true;
+	tabinc := deftab;
+	multifile := false;
+	filehead := nil;
+	p := nil;
+	files := 0;
+
+	for i := 1 to argc - 1 do begin
+	    argv(i, optstr);			(* get the next arg *)
+	    if (optstr[1] = '-') then begin
+		if (optstr[2] = 't') then
+		    tabinc := ord( optstr[3] ) - ord('0')
+		else if (optstr[2] = 'e') then
+		    paginating := false
+		end
+	    else begin (* must be a file name, right? *)
+		files := files + 1;
+		if ( p = nil ) then begin (* first file name? *)
+		    new(p);
+		    filehead := p;
+		    end
+		else begin
+		    new(p^.next);
+		    p := p^.next;
+		    end;
+		with p^ do begin
+		    name := optstr;	(* save the file name for reset *)
+		    next := nil;
+		    length := fnamesize;
+		    while( (length > 1) and (optstr[length] = ' ') ) do
+			length := length - 1;
+		    end;
+		end;
+	end (* for *);
+
+	if files > 1 then multifile := true;
+
+	new(procptr);
+	firstproc := procptr;
+	procptr^.next := nil;
+    end; (*initialize*)
+ 
+    procedure scanandlistinput;
+    var
+	i: 1..llinmax;
+	nc, nclast: nestkind;
+	filelinecount : integer;
+
+    begin
+	filelinecount := 1;
+	while not eof(input) do begin
+	    newline;
+	    while not eoln(input) do 
+		if input^ in [tab, ' '..'~'] then 
+		    case input^ of
+			'A', 'B', 'C', 'D', 'E', 'F', 'G',
+			'H', 'I', 'J', 'K', 'L', 'M', 'N',
+			'O', 'P', 'Q', 'R', 'S', 'T', 'U',
+			'V', 'W', 'X', 'Y', 'Z', 'a', 'b',
+			'c', 'd', 'e', 'f', 'g', 'h', 'i',
+			'j', 'k', 'l', 'm', 'n', 'o', 'p',
+			'q', 'r', 's', 't', 'u', 'v', 'w',
+			'x', 'y', 'z':
+			    begin
+				k := 0;
+				id := empty;
+				repeat
+				    if k < kln then begin
+					k := k + 1;
+					id[k] := input^
+				    end;
+				    advance
+				until not (input^ in ['a'..'z', 'A'..'Z', '0'..'9']);
+				classify;
+				if keyindex = 0 then begin
+				    search;
+				    if procorfunc then 
+					noteproc
+				end else begin
+				    nc := key[keyindex].nestchange;
+				    case nc of
+					nestbegin:
+					    begin
+						nesting := nesting + 1;
+						inbody := true
+					    end;
+					nestopen:
+					    if inbody then 
+						nesting := nesting + 1
+					    else 
+						nc := nestnull;
+					nestclose:
+					    if inbody then 
+						nesting := nesting - 1
+					    else 
+						nc := nestnull;
+					nestclear:
+					    begin
+						procorfunc := true;
+						inbody := false;
+						if nesting = 0 then 
+						    nc := nestnull
+						else 
+						    nesting := 0
+					    end;
+					nestnull:
+					    null
+				    end;
+				    if nc <> nestnull then begin
+					nestcount := nestcount + 1;
+					nest[nestcount] := nc
+				    end
+				end
+			    end;
+			'0', '1', '2', '3', '4', '5', '6',
+			'7', '8', '9':
+			    repeat
+				advance
+			    until not (input^ in ['b', 'e', '0'..'9']);
+			'''':
+			    begin (*string*)
+				repeat
+				    advance
+				until (input^ = '''') or eoln(input);
+				if not eoln(input) then 
+				    advance
+			    end;
+			'{':
+			    begin (*comment*)
+				repeat
+				    advance;
+				    while eoln(input) do begin
+					writeln;
+					get(input);
+					newline
+				    end
+				until input^ = '}';
+				advance
+			    end;
+			'(':
+			    begin
+				advance;
+				if input^ = '*' then begin (*comment*)
+				    advance;
+				    repeat
+					while input^ <> '*' do begin
+					    if eoln(input) then begin
+						get(input);
+						writeln;
+						newline
+					    end else 
+						advance
+					end;
+					advance
+				    until input^ = ')';
+				    advance
+				end
+			    end;
+			'+', '-', '*', '/', ')', '$', '=',
+			' ', ',', '.', '[', ']', '"', '!',
+			'&', '#', '?', '<', '>', '@', '\',
+			'^', ';', ':', tab, '%', '_', '`',
+			'|', '~':
+			    advance
+		    end (*case*);
+	    if (llout = lloutmax) and (nestcount > 0) then begin
+		if ccount >= 100 then 
+		    write(' ':2)
+		else 
+		    write(' ': 100 - ccount);
+		nesting := nestingatbol;
+		nclast := nestnull;
+		if nest[1] = nestclose then 
+		    write(' ');
+		for i := 1 to nestcount do begin
+		    nc := nest[i];
+		    case nc of
+			nestbegin, nestopen:
+			    begin
+				nesting := nesting + 1;
+				write('[', nesting: 1)
+			    end;
+			nestclose: begin
+			    if nesting = 0 then 
+				write('*]')
+			    else begin
+				if not (nclast in [nestbegin, nestopen]) then 
+				    write(nesting: 1);
+				write(']');
+				nesting := nesting - 1
+				end;
+			    end;
+			nestclear:
+			    begin
+				write(' * ');
+				nesting := 0
+			    end
+		    end;
+		    nclast := nc
+		end (* for *);
+		writeln;
+		filelinecount := filelinecount + 1;
+		readln;
+		end (* then begin *)
+
+	    else if multifile then begin
+		if (filelinecount >= 10) then begin
+		    if ccount >= 100 then
+			write(' ':2)
+		    else
+			write(' ': 100 - ccount);
+		    write(' ':3);
+		    write(' ', fileline:5,' ', filename:dispfnsize);
+		    filelinecount := 0;
+		    end;
+		writeln;
+		filelinecount := filelinecount + 1;
+		readln;
+		end
+
+	    else begin
+		writeln;
+		filelinecount := filelinecount + 1;
+		readln;
+	    end (* if *);
+	end (* while not eof *)
+    end; (*scanandlistinput*)
+ 
+begin (*crossref*)
+
+    dovalue;			(* simulate the value clause *)
+
+    initialize;
+
+    if ( filehead = nil ) then begin 	(* read fron stdin *)
+	scanandlistinput;
+	if paginating then writeln(chr(eject));
+	printtable;
+	if paginating then writeln(chr(eject));
+	printprocs
+	end
+    else if (filehead <> nil) then begin (* read from command line files *)
+	fpnt := filehead;
+	while( fpnt <> nil ) do begin
+	    with fpnt^ do begin
+		reset(input,name);
+		for i := 1 to dispfnsize do filename[i] := ' ';
+		if (length <= dispfnsize) then
+		    for i := 1 to 10 do filename[i] := name[i]
+(*
+ *	if the entire filename can not be displayed, display the last
+ *	part of it -- this is to allow reasonable renderings of things like
+ *	/usr/woof/gronk/test.p
+ *)
+		else begin
+		    i := length; j := dispfnsize;
+		    while ( j > 0 ) do begin
+			filename[j] := name[i];
+			i := i-1; j := j-1;
+			end;
+		    end;
+		end;
+	    fileline := 0;
+	    fpnt^.starting := ln;
+	    scanandlistinput;
+	    fpnt^.ending := ln;
+	    fpnt := fpnt^.next;
+	    if paginating then writeln(chr(eject));
+	    end (* while *);
+
+	printtable;
+	if paginating then writeln(chr(eject));
+	printprocs;
+	if paginating then writeln(chr(eject));
+	printfiles(filehead);
+	end;
+end.
+
+

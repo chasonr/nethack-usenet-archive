@@ -1,0 +1,2517 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,932024a3698072d3,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-03-11 11:37:41 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.3 (USS@Tek, v1.1) based on 4.3bsd-beta 6/6/85; site tekcrl.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!bellcore!decvax!decwrl!pyramid!hplabs!tektronix!tekcrl!toddb
+From: toddb@tekcrl.UUCP (Todd Brunhoff)
+Newsgroups: net.sources
+Subject: release #2, shar 3 of 7
+Message-ID: <563@tekcrl.UUCP>
+Date: Tue, 11-Mar-86 14:37:41 EST
+Article-I.D.: tekcrl.563
+Posted: Tue Mar 11 14:37:41 1986
+Date-Received: Fri, 14-Mar-86 06:42:16 EST
+Reply-To: toddb@tekcrl.UUCP (Todd Brunhoff)
+Organization: Tektronix, Inc., Beaverton, OR.
+Lines: 2496
+
+#!/bin/sh
+#
+# RFS, a kernel-resident remote file system.  Shar 3 of 7
+#
+#
+# This is a shell archive, meaning:
+# 1. Remove everything above the #!/bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#	remote/info.c
+#	remote/init.c
+#	remote/list.c
+#	remote/make.base
+#	remote/make.base.M68
+#	remote/make.base.magnolia
+#	remote/make.base.pyramid
+#	remote/make.base.vax
+#	remote/make.base.vaxnorfs
+#	remote/make.log
+#	remote/new.c
+#	remote/rhost.c
+#	remote/rmtmnt.c
+#	remote/route.c
+#	remote/server.h
+#
+# remote/info.c
+#
+if [ -f remote/info.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/info.c or ^C to quit' 
+	read ans 
+	rm -f remote/info.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/info.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Log:	info.c,v $
+X * Revision 2.1  86/01/27  11:27:54  toddb
+X * Changed the h_addr component of the hosts structure to be h_iaddr so
+X * as not to conflict with the 4.3 define if h_addr in netdb.h.
+X * 
+X * Revision 2.0  85/12/07  18:21:28  toddb
+X * First public release.
+X * 
+X */
+Xstatic char	*rcsid = "$Header: info.c,v 2.1 86/01/27 11:27:54 toddb Exp $";
+X#include	"server.h"
+X#include	<stdio.h>
+X#include	<sys/wait.h>
+X#include	<sys/file.h>
+X#include	<sys/stat.h>
+X#include	<netdb.h>
+X#include	<errno.h>
+X
+Xextern users	*default_user;
+Xextern hosts	*host;
+Xextern hosts	*thishost;
+Xextern char	byteorder[];
+Xextern char	*logfile;
+Xextern long	serviceport;
+Xextern long	errno;
+Xextern short	current_pid;
+Xextern process	*wildcard;
+Xextern boolean	in_root_directory;
+Xextern boolean	i_am_asleep;
+X
+Xgetbyteorder(h)
+X	register hosts	*h;
+X{
+X	register char	*p;
+X
+X	/*
+X	 * Read the byte order info.
+X	 */
+X	alarm(5);
+X	p = (char *)h->h_byteorder;
+X	if (read(h->h_cmdfd, p, 4) != 4)
+X	{
+X		log("can't read mount info from \"%s\"\n", h->h_names[0]);
+X		alarm(0);
+X		bzero(p, 4);
+X		close(h->h_cmdfd);
+X		h->h_cmdfd = -1;
+X		return;
+X	}
+X	alarm(0);
+X	if (bcmp(p, byteorder, 4) == 0)
+X		h->h_byteorderok = TRUE;
+X	else
+X		h->h_byteorderok = FALSE;
+X	debug4("byteorder=%d,%d,%d,%d: %s ours\n",
+X		p[0], p[1], p[2], p[3],
+X		h->h_byteorderok ? "same as" : "different than");
+X}
+X
+Xgetrusers(h)
+X	register hosts	*h;
+X{
+X	char	buf[ BUFSIZ ];
+X	register rusers	*ruser;
+X	register FILE	*input;
+X	register char	*p;
+X	register int	uid;
+X
+X	errno = 0;
+X	/*
+X	 * Read in the users from the remote host and squirrel them away.
+X	 * Actually it is the actual password file from the remote
+X	 * host, and we ignore most of the info, and save the user name and
+X	 * uid.
+X	 */
+X	if ((input = fdopen(h->h_cmdfd, "r")) == NULL)
+X		log_fatal("getrusers: cannot fdopen\n");
+X
+X	alarm(30);
+X	while (fgets(buf, BUFSIZ, input))
+X	{
+X		/*
+X		 * First, the user name.
+X		 */
+X		for(p=buf; *p && *p != ':'; p++) ;
+X		*p = '\0';
+X
+X		/*
+X		 * now the user id number
+X		 */
+X		for(p++; *p && *p != ':'; p++) ;
+X		uid = atoi(p+1);
+X
+X		/*
+X		 * Now we need to add the info to our database on this remote
+X		 * host.  If the user is already present, just update the uid
+X		 * number.  If the user is not present, and there is a default
+X		 * local user for this remote host, use that.  If not, then
+X		 * use the default user entry for this host (where the server
+X		 * runs).
+X		 */
+X		if (ruser = findrusername(&h->h_rusers, buf))
+X		{
+X			debug2("(existing) ");
+X			ruser->r_uid = uid;
+X		}
+X		else
+X		{
+X			debug2("(new, ");
+X			ruser = newruser();
+X			ruser->r_name = copy(buf);
+X			ruser->r_uid = uid;
+X			if (h->h_default_user)
+X			{
+X				debug2("%s default)", *h->h_names);
+X				ruser->r_user = h->h_default_user;
+X			}
+X			else
+X			{
+X				ruser->r_user = default_user;
+X				debug2("host default)");
+X			}
+X			addlist(&h->h_rusers, ruser);
+X		}
+X		debug2("host %s: user %s (%d) -> local user %s (%d)\n",
+X			h->h_names[ 0 ], ruser->r_name, ruser->r_uid,
+X			ruser->r_user->u_name, ruser->r_user->u_local_uid);
+X	}
+X	fclose(input);
+X	h->h_cmdfd = -1;
+X	alarm(0);
+X	if (errno == EINTR)
+X		log("can't get remote users from \"%s\"\n", h->h_names[0]);
+X}
+X
+X/*
+X * Try to obtain mount information for host 'h'.
+X */
+Xgetmount(h)
+X	register hosts	*h;
+X{
+X	long	savefd = h->h_cmdfd;
+X	struct message	msgbuf;
+X	register struct message	*msg = &msgbuf;
+X	register long	len;
+X
+X	if (thishost == h) /* our own machine */
+X	{
+X		log("we are talking to ourselves\n");
+X		h->h_cmdfd = open("/etc/passwd", O_RDONLY);
+X		bcopy(byteorder, h->h_byteorder, 4);
+X		h->h_byteorderok = TRUE;
+X	}
+X	else
+X	{
+X		if ((h->h_cmdfd = tcpconnect(h)) < 0)
+X			goto done;
+X		len = R_MINRMSG + sizeof(long);
+X		msg->m_hdlen = htons(len);
+X		msg->m_totlen = htonl(len);
+X		msg->m_syscall = htons(RSYS_nosys);
+X		msg->m_args[ 0 ] = htonl(CMD_NEEDMOUNT);
+X		if (!sndmsg(h->h_cmdfd, msg, len, 0, 0))
+X		{
+X			log("can't ask for mount info\n");
+X			close(h->h_cmdfd);
+X			goto done;
+X		}
+X		getbyteorder(h);
+X	}
+X	getrusers(h); /* getrusers() closes the file descriptor */
+Xdone:
+X	h->h_cmdfd = savefd;
+X}
+X
+X/*
+X * Send mount information.  This includes a 4-byte header containing the
+X * byte order for our machine,  followed by /etc/passwd.
+X */
+Xsendmount(h)
+X	register hosts	*h;
+X{
+X	char	buf[ BUFSIZ ];
+X	register long	fd = open("/etc/passwd", O_RDONLY),
+X			cnt;
+X	register char	*p = buf;
+X
+X	write(h->h_cmdfd, byteorder, 4);
+X	while ((cnt = read(fd, p, BUFSIZ)) > 0)
+X		_rmtio(write, h->h_cmdfd, p, cnt);
+X	close(h->h_cmdfd);
+X	h->h_cmdfd = -1;
+X	close(fd);
+X}
+X
+X/*
+X * Mourne the death of any children.
+X */
+Xmourne()
+X{
+X	union wait	status;
+X	char		buf[ BUFSIZ ];
+X	register char	*p = buf;
+X	register long	pid;
+X
+X	while ((pid = wait3(&status, WNOHANG, 0)) > 0)
+X	{
+X		sprintf(p, "server %d found dead", pid);
+X		p += strlen(p);
+X		if (status.w_termsig)
+X			sprintf(p, " by sig #%d", status.w_termsig);
+X		p += strlen(p);
+X		if (status.w_coredump)
+X			sprintf(p, " with core dump", status.w_termsig);
+X		p += strlen(p);
+X		sprintf(p, " exit=%d\n", status.w_retcode);
+X		debug5("%s", buf);
+X		p = buf;
+X	}
+X}
+X
+X/*
+X * Catch signals and only report.
+X */
+Xcatch(sig, code, scp)
+X	register long	sig,
+X			code;
+X	register struct sigcontext	*scp;
+X{
+X	log("caught signal #%d...", sig);
+X	if (sig == SIGILL || sig == SIGSEGV || sig == SIGBUS)
+X	{
+X		change_to_uid(0);
+X		chdir("/usr/tmp");
+X		log("aborting: code=%d, scp=%x, sp=%x, pc=%x, end of scp=%x\n",
+X			code, scp, scp->sc_sp, scp->sc_pc, scp+1);
+X		sendsig(current_pid, SIGEMT);
+X		log_fatal("could not abort\n");
+X	}
+X	else if (sig == SIGTERM) /* quietly go away */
+X	{
+X		/*
+X		 * unlink the file only if we are allowed to and if it is
+X		 * not the sentry server's logfile.
+X		 */
+X		if ((remote_debug & 0x800) == 0 && host != NULL)
+X			unlink(logfile);
+X		cleanup();
+X		log("goodbye.\n");
+X		exit(0);
+X	}
+X	else
+X		log_fatal("exiting\n");
+X}
+X
+X/*
+X * Receive a wakeup call.
+X */
+Xwakeup_call()
+X{
+X	if (! i_am_asleep)
+X	{
+X		log("recieved spurious wakeup call!\n");
+X		return;
+X	}
+X	i_am_asleep = FALSE;
+X}
+X
+X/*
+X * Provide name server function for kernel.  At this point we have just
+X * recieved a SIGURG signal because the kernel wants us to translate a
+X * name.
+X */
+Xnameserver()
+X{
+X#ifdef CANREMOTE
+X	char		path[ BUFSIZ ],
+X			hostname[ BUFSIZ ];
+X	struct sockaddr_in	sinbuf;
+X	register char	*p1, *p2, *name;
+X	register hosts	*h = NULL;
+X	register struct sockaddr_in	*sin;
+X
+X	if (remotename(NM_WHATNAME, 0, BUFSIZ, path) < 0)
+X		return;
+X	/*
+X	 * Find the end of the '/' prefix and copy up to the next '/' or
+X	 * null character.
+X	 */
+X	p1 = path;
+X	while (*p1 == '/')
+X		p1++;
+X	p2 = hostname;
+X	*p2++ = '/';
+X	while (*p1 && *p1 != '/')
+X		*p2++ = *p1++;
+X	*p2 = '\0';
+X
+X	/*
+X	 * Now look it up.
+X	 */
+X	if (hostname[1])
+X		h = findhostname(hostname+1);
+X	if (h == NULL)
+X	{
+X		debug6("cannot find host for path \"%s\"\n", path);
+X		sin = NULL;
+X	}
+X	else
+X	{
+X		sin = &sinbuf;
+X		debug6("path %s mapped to host %s\n", path, h->h_names[0]);
+X		bzero((char *)sin, sizeof (struct sockaddr_in));
+X		bcopy(&h->h_iaddr, (char *)&sin->sin_addr,
+X			sizeof(struct in_addr));
+X		sin->sin_family = AF_INET;
+X		sin->sin_port = serviceport;
+X	}
+X	remotename(NM_NAMEIS, sin, sizeof(struct sockaddr_in), hostname);
+X#endif CANREMOTE
+X}
+X
+X/*
+X * Decide if a file is really a local file to the client or not.  We only
+X * look for explicit references like
+X *	name1/name2/../name3 ...
+X * And we then check to see whether name2 is the root directory.  If it is
+X * then we send the request back to the client.
+X */
+Xislocal(msg, type)
+X	register struct message *msg;
+X{
+X	register char	*p;
+X	register boolean	checktwopaths;
+X	register short	syscall = msg->m_syscall;
+X	register long	offset1,
+X			offset2 = -1,
+X			localcnt = 0;
+X	register process	*proc;
+X	char	buf[ BUFSIZ ];
+X
+X	debug10("cwd=%s\n", getwd(buf));
+X	checktwopaths = (type & NEED_2REMOTE);
+X
+X	if (checktwopaths)
+X		p = twopath1addr(msg);
+X	else
+X		p = path1addr(msg);
+X	if ((offset1 = find_dotdot(p)) >= 0)
+X		localcnt++;
+X	if (checktwopaths)
+X		if ((offset2 = find_dotdot(twopath2addr(msg))) >= 0)
+X			localcnt++;
+X	if (localcnt)
+X	{
+X		debug10("%d paths are remote: \"%s\" @ %d, \"%s\" @ %d\n",
+X			localcnt,
+X			checktwopaths ? twopath1addr(msg) : path1addr(msg),
+X			offset1, checktwopaths ? twopath2addr(msg) : "",
+X			offset2);
+X		setup_proc(proc = wildcard, msg->m_uid, msg->m_pid);
+X		proc->p_errno = -1;
+X		proc->p_returnval = offset1;
+X		sendreturn(proc, host->h_cmdfd, NULL, 1, offset2);
+X	}
+X	return(localcnt);
+X}
+X
+X/*
+X * kernel code stolen for speed.
+X */
+Xmyaccess(st, user, perm)
+X	register struct stat	*st;
+X	register long	perm;
+X	register users	*user;
+X{
+X	register long	*gp, i;
+X
+X	perm <<= 6;
+X	if (user->u_local_uid != st->st_uid) {
+X		perm >>= 3;
+X		gp = user->u_local_groups;
+X		for (i=0; i < user->u_numgroups; i++, gp++)
+X			if (st->st_gid == *gp)
+X				goto found;
+X		perm >>= 3;
+Xfound:
+X		;
+X	}
+X	if ((st->st_mode & perm) != 0)
+X		return (TRUE);
+X	return(FALSE);
+X}
+X
+X/*
+X * look for a component of ".." terminated by a '/' or a null character.
+X * If we find one, examine the previous component to see if it is our
+X * root directory.
+X */
+Xfind_dotdot(path)
+X	register char	*path;
+X{
+X	struct stat	statb;
+X	register char	*p;
+X	register struct stat	*statp = &statb;
+X	register long	retval;
+X	extern struct stat	root;
+X
+X	for (p = path; *p;)
+X	{
+X		while (*p == '/')
+X			p++;
+X		if (p[0] == '.' && p[1] == '.'
+X		&& (p[2] == '\0' || p[2] == '/'))
+X		{
+X			if (p == path)
+X				if (in_root_directory)
+X					return(0);
+X				else
+X					goto next_component;
+X			*p = '\0'; /* we know it is a '.' */
+X			retval = lstat(path, statp);
+X			*p = '.';
+X			if (retval < 0)
+X				return(retval);
+X			if (isroot(statp))
+X				return(p - path + 1);
+X		}
+Xnext_component:
+X		while (*p && *p != '/')
+X			p++;
+X	}
+X	return(-1);
+X}
+SHAREOF
+chmod 444 remote/info.c
+#
+# remote/init.c
+#
+if [ -f remote/init.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/init.c or ^C to quit' 
+	read ans 
+	rm -f remote/init.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/init.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Log:	init.c,v $
+X * Revision 2.3  86/03/10  13:55:58  toddb
+X * Added support for a .rhosts entry that has only a host name.
+X * 
+X * Revision 2.2  86/01/27  11:28:24  toddb
+X * Changed the h_addr component of the hosts structure to be h_iaddr so
+X * as not to conflict with the 4.3 define if h_addr in netdb.h.
+X * 
+X * Revision 2.1  86/01/05  18:13:54  toddb
+X * Added include for sys/stat.h because pyramid machines get upset.
+X * 
+X * Revision 2.0  85/12/07  18:21:37  toddb
+X * First public release.
+X * 
+X */
+Xstatic char	*rcsid = "$Header: init.c,v 2.3 86/03/10 13:55:58 toddb Exp $";
+X#include	"server.h"
+X#include	<stdio.h>
+X#include	<pwd.h>
+X#include	<grp.h>
+X#include	<netdb.h>
+X#include	<fcntl.h>
+X#include	<sys/dir.h>
+X#include	<sys/user.h>
+X#include	<sys/signal.h>
+X#include	<sys/ioctl.h>
+X#include	<sys/stat.h>
+X
+Xextern hosts	*hostlist;
+Xextern hosts	*thishost;
+Xextern users	*userlist;
+Xextern users	*default_user;
+Xextern char	hostname[];
+Xextern char	*service;
+Xextern short	current_uid;
+Xextern short	current_pid;
+Xextern process	*wildcard;
+Xextern struct sigvec	sig_vec;
+Xextern struct sigvec	sig_name;
+Xextern struct sigvec	sig_alarm;
+Xextern struct sigvec	sig_ignore;
+Xextern struct sigvec	sig_continue;
+X#ifdef RFSDEBUG
+Xextern struct sigvec	sig_debug;
+X#endif
+Xextern struct stat	root;
+X
+X/*
+X * Initialize the host tables and user tables.
+X */
+Xinit()
+X{
+X	long	tt;
+X	struct hostent	*gethostent();
+X	struct passwd	*getpwent();
+X	struct group	*getgrent();
+X
+X	/*
+X	 * catch signals.
+X	 */
+X	sigvec(SIGHUP, &sig_ignore, (struct sigvec *)0);
+X	sigvec(SIGINT, &sig_vec, (struct sigvec *)0);
+X	sigvec(SIGQUIT, &sig_vec, (struct sigvec *)0);
+X	sigvec(SIGILL, &sig_vec, (struct sigvec *)0);
+X#ifdef RFSDEBUG
+X	sigvec(SIGTRAP, &sig_debug, (struct sigvec *)0);
+X#endif RFSDEBUG
+X	/*	SIGIOT		*/
+X	/*	SIGEMT		*/
+X	/*	SIGFPE		*/
+X	/*	SIGKILL		*/
+X	sigvec(SIGBUS, &sig_vec, (struct sigvec *)0);
+X	sigvec(SIGSEGV, &sig_vec, (struct sigvec *)0);
+X	sigvec(SIGSYS, &sig_vec, (struct sigvec *)0);
+X	sigvec(SIGPIPE, &sig_vec, (struct sigvec *)0);
+X	sigvec(SIGALRM, &sig_alarm, (struct sigvec *)0);
+X	sigvec(SIGTERM, &sig_vec, (struct sigvec *)0);
+X	sigvec(SIGURG, &sig_name, (struct sigvec *)0);
+X	/*	SIGSTOP		*/
+X	/*	SIGTSTP		*/
+X	/*	SIGCONT		*/
+X	/*	SIGCHLD		*/
+X	sigvec(SIGTTIN, &sig_vec, (struct sigvec *)0);
+X	sigvec(SIGTTOU, &sig_vec, (struct sigvec *)0);
+X	sigvec(SIGIO, &sig_continue, (struct sigvec *)0);
+X	sigvec(SIGXCPU, &sig_vec, (struct sigvec *)0);
+X	sigvec(SIGXFSZ, &sig_vec, (struct sigvec *)0);
+X	sigvec(SIGVTALRM, &sig_vec, (struct sigvec *)0);
+X	/*	SIGPROF		*/
+X
+X	/*
+X	 * set up some important global values, including uid, pid,
+X	 * the pipe file descriptors for messages to and from the gateway
+X	 * server.  Register as the nameserver.  Get host name.  Get service.
+X	 * Get root stat info.
+X	 */
+X	if (chdir("/") == -1)
+X		log_fatal("cannot chdir(\"/\")\n");
+X	wildcard = newprocess();
+X	fcntl(2, F_SETFL, FAPPEND);
+X	close(0);
+X	close(1);
+X	change_to_uid(0);
+X	if (gethostname(hostname, HOSTNAMELEN) < 0 || *hostname == '\0')
+X		log_fatal("host name not set!\n");
+X	if (stat("/", &root) < 0)
+X		log_fatal("cannot stat /\n");
+X#ifdef CANREMOTE
+X	if (remotename(NM_SERVER, 0, 0, 0) < 0)
+X		log("cannot register as nameserver\n");
+X	/*
+X	 * Turn off remote access, if we have any.
+X	 */
+X	remoteoff(NULL);
+X#endif
+X	tt = open("/dev/tty", 2);
+X
+X	if (tt >= 0)
+X	{
+X		ioctl(tt, TIOCNOTTY, 0);
+X		close(tt);
+X	}
+X	setpgrp(0,0);
+X
+X	initusers();
+X	initgroups();
+X	inithosts();
+X	initrhosts();
+X}
+X
+X/*
+X * build the list of users on this host (where the server runs).
+X */
+Xinitusers()
+X{
+X	register struct passwd	*pw;
+X	register users	*user;
+X	char		buf[ BUFSIZ ];
+X	register char	*pbuf = buf;
+X
+X	while(pw = getpwent())
+X	{
+X		if (*pw->pw_dir == '\0' || *pw->pw_name == '\0')
+X		{
+X			log("login \"%s\" has problems, dir=\"%s\"\n",
+X				pw->pw_name, pw->pw_dir);
+X			continue;
+X		}
+X		user = newuser();
+X		user->u_local_uid = pw->pw_uid;
+X		user->u_name = copy( pw->pw_name );
+X		addgroup(user, pw->pw_gid);
+X		user->u_dir = copy( pw->pw_dir );
+X		sprintf(pbuf, "%s/.rhosts", pw->pw_dir);
+X		user->u_rhosts = copy( pbuf );
+X		addlist(&userlist, user);
+X	}
+X	endpwent();
+X	if (user = findusername(DEFAULTUSER))
+X		default_user = user;
+X	else
+X		log_fatal("The user \"%s\" must be in /etc/passwd (%s)\n",
+X			DEFAULTUSER, "for default permissions");
+X}
+X
+X/*
+X * Build the list of groups that each user belongs to.
+X */
+Xinitgroups()
+X{
+X	register struct group	*gr;
+X	register users	*user;
+X	register char	**p;
+X
+X
+X	while(gr = getgrent())
+X	{
+X		for (p = gr->gr_mem; *p; p++)
+X			if (user = findusername(*p))
+X				addgroup(user, gr->gr_gid);
+X			else
+X				log("group %s: bad user=%s\n",
+X					gr->gr_name, *p);
+X	}
+X	endgrent();
+X}
+X
+X/*
+X * Then build the list of all hosts.
+X */
+Xinithosts()
+X{
+X	register struct hostent	*h;
+X	register rusers	*ruser;
+X	register hosts	*hst;
+X	register users	*user;
+X	register long	i;
+X
+X	while (h = gethostent())
+X	{
+X		hst = newhost();
+X		hst->h_names = newname(hst->h_names, h->h_name);
+X		for (i=0; h->h_aliases[ i ]; i++)
+X			hst->h_names = newname(hst->h_names,
+X					h->h_aliases[ i ]);
+X
+X		hst->h_iaddr = *((struct in_addr *)(h->h_addr));
+X		addlist(&hostlist, hst);
+X
+X		/*
+X		 * now if there exists a user on this machine having
+X		 * the same name as the name of this host (NOT AN
+X		 * ALIAS!), then that will be our defaut local user
+X		 * to map to.  Be sure that we don't allow a machine
+X		 * to be mapped onto a user if the uid is real small:
+X		 * e.g. a machine named root, where all its user ids
+X		 * become root using the remote fs!
+X		 */
+X		user = findusername(hst->h_names[ 0 ]);
+X		if (user && user->u_local_uid <= UID_TOO_LOW)
+X		{
+X			log("host/user %s: uid %d too low for alias\n",
+X				hst->h_names[ 0 ], user->u_local_uid);
+X			user = NULL;
+X		}
+X		else if (user)
+X		{
+X			hst->h_default_user = user;
+X			debug2("default user for host %s (%s) is %s\n",
+X				hst->h_names[ 0 ],
+X				inet_ntoa(hst->h_iaddr), user->u_name);
+X		}
+X		ruser = hst->h_default_ruser = newruser();
+X		if (user)
+X			ruser->r_user = user;
+X		else
+X			ruser->r_user = default_user;
+X		ruser->r_uid = -1;
+X		ruser->r_name = copy(BOGUSUSER);
+X	}
+X	endhostent();
+X	if ((thishost = findhostname(hostname)) == NULL)
+X		log_fatal("this host (\"%s\") is not in host file\n",
+X			hostname);
+X}
+X
+X/*
+X * Now for each user that has a .rhosts file, assemble the
+X * references and attach them to the appropriate host.
+X */
+Xinitrhosts()
+X{
+X	register hosts	*hst;
+X	register rhost	*rh;
+X	register users	*user;
+X	char		buf[ BUFSIZ ];
+X	register char	*pbuf = buf;
+X
+X	for (user=userlist; user; user=user->u_next)
+X	{
+X		setrhost(user->u_rhosts);
+X		while (rh = getrhostent(pbuf)) {
+X			if (rh->rh_user == NULL) 
+X				rh->rh_user = user->u_name;
+X			if (hst = findhostname(rh->rh_host))
+X				addremoteuser(hst, user, rh->rh_user);
+X		}
+X		endrhost();
+X	}
+X}
+X
+Xchar	*copy(string)
+X	register char	*string;
+X{
+X	register char	*ret = malloc( strlen(string)+1 );
+X
+X	if (ret == NULL)
+X		log_fatal("cannot allocate space\n");
+X	strcpy(ret, string);
+X	return(ret);
+X}
+X
+X/*
+X * Add a remote user to those recognized on a certain host.
+X */
+Xaddremoteuser(h, user, remoteuser)
+X	register hosts	*h;
+X	register users	*user;
+X	register char	*remoteuser;
+X{
+X	register rusers	*ruser;
+X	register long	old = FALSE;
+X
+X	debug2("\t%s!%s --> %s ", *h->h_names, remoteuser, user->u_name);
+X	if ((ruser = findrusername(&h->h_rusers, remoteuser)) == NULL)
+X	{
+X		debug2("\n");
+X		ruser = newruser();
+X	}
+X	else
+X	{
+X		old = TRUE;
+X		if (strcmp(remoteuser, user->u_name) != 0)
+X		{
+X			debug2("(old, ignored)\n");
+X			return;
+X		}
+X		else
+X			debug2("(old)\n");
+X	}
+X	ruser->r_name = copy(remoteuser);
+X	ruser->r_uid = -1;
+X	ruser->r_user = user;
+X	if (! old)
+X		addlist(&h->h_rusers, ruser);
+X}
+SHAREOF
+chmod 444 remote/init.c
+#
+# remote/list.c
+#
+if [ -f remote/list.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/list.c or ^C to quit' 
+	read ans 
+	rm -f remote/list.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/list.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Log:	list.c,v $
+X * Revision 2.0  85/12/07  18:21:44  toddb
+X * First public release.
+X * 
+X */
+Xstatic char	*rcsid = "$Header: list.c,v 2.0 85/12/07 18:21:44 toddb Rel $";
+X#include	"server.h"
+X#include	<stdio.h>
+X
+X/*
+X * Stick a new item of any type on top of the list.
+X */
+Xl_list *addlist(list, item)
+X	register l_list	**list;
+X	register l_list	*item;
+X{
+X	item->l_next = *list;
+X	if (*list)
+X	{
+X		item->l_prev = (*list)->l_prev;
+X		(*list)->l_prev = item;
+X	}
+X	else
+X		item->l_prev = item;
+X	*list = item;
+X	return(item);
+X}
+X
+X/*
+X * delete an item from a list.  The item itself is left intact.  It is
+X * the responsibility of the caller to deal with the deleted item.
+X */
+Xl_list *deletelist(list, item)
+X	register l_list	**list;
+X	register l_list	*item;
+X{
+X	if (item == *list)
+X	{
+X		if (item->l_next == NULL)
+X			*list = NULL;
+X		else
+X		{
+X			*list = item->l_next;
+X			item->l_next->l_prev = item->l_next;
+X		}
+X	}
+X	else
+X	{
+X		item->l_prev->l_next = item->l_next;
+X		if (item->l_next != NULL)
+X			item->l_next->l_prev = item->l_prev;
+X	}
+X	return (*list);
+X}
+X
+X/*
+X * stick 'item' at the top of the 'list' ( if it isn't there
+X * already.
+X */
+Xl_list *toplist(list, item)
+X	register l_list	**list;
+X	register l_list	*item;
+X{
+X	if (item == *list)
+X		return;
+X	item->l_prev->l_next = item->l_next;
+X	if (item->l_next)
+X		item->l_next->l_prev = item->l_prev;
+X	item->l_next = (*list);
+X	/*
+X	 * if our target is the last on the list, then
+X	 * be careful that we don't make a cycle.  Since
+X	 * we want the head of the list's l_prev pointer
+X	 * to point to the last in the list, we don't
+X	 * have to do anything.
+X	 */
+X	if (item != (*list)->l_prev) /* NOT last on list */
+X		item->l_prev = (*list)->l_prev;
+X	(*list)->l_prev = item;
+X	*list = item;
+X}
+SHAREOF
+chmod 444 remote/list.c
+#
+# remote/make.base
+#
+if [ -f remote/make.base ]; then 
+	echo -n 'Hit <return> to overwrite remote/make.base or ^C to quit' 
+	read ans 
+	rm -f remote/make.base 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/make.base
+XSOBJS      = change.$O file.$O fileserver.$O find.$O \
+X		info.$O init.$O list.$O new.$O \
+X		rhost.$O route.$O serverdata.$O serverdir.$O serverio.$O \
+X		serversyscall.$O
+XCFILES     = change.c file.c fileserver.c find.c \
+X		info.c init.c list.c new.c \
+X		rhost.c route.c serverdata.c serverdir.c serverio.c \
+X		serversyscall.c
+X
+Xall: $(ALL)
+X
+X$(RFS_SERVER): $(SOBJS)
+X	$(CC) -o $@ $(SOBJS) $(LDFLAGS)
+X	$(XINU) $(RFS_SERVER)
+X$(RMTMNT): rmtmnt.$O
+X	$(CC) -o $@ rmtmnt.$O $(LDFLAGS)
+X	$(XINU) $(RMTMNT)
+X$(DEBUG): debug.$O
+X	$(CC) -o $@ debug.$O $(LDFLAGS)
+X	$(XINU) $(DEBUG)
+Xtags: $(CFILES)
+X	ctags $(CFILES) $(INCLUDE)
+X$(SOBJS): $(INCLUDE)
+X
+Xinstall: all
+X	$(INSTALL) -c -m 755 $(RFS_SERVER) $(DEST)/etc/rfs_server
+X	$(INSTALL_RMTMNT) -c -m 0755 $(RMTMNT) $(DEST)/etc/rmtmnt
+SHAREOF
+chmod 664 remote/make.base
+#
+# remote/make.base.M68
+#
+if [ -f remote/make.base.M68 ]; then 
+	echo -n 'Hit <return> to overwrite remote/make.base.M68 or ^C to quit' 
+	read ans 
+	rm -f remote/make.base.M68 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/make.base.M68
+XDEST           = /usr3/mag
+XHOST	       =
+XINCLUDE        = $(DEST)/usr/include/remote/remotefs.h server.h
+XCFLAGS         = -G$(HOST) -O -DRFSDEBUG -DCANREMOTE -DBYTEORDER=3,2,1,0 -DREMOTEFS -DMACHTYPE=magnolia
+XLDFLAGS        = -z
+XCC             = cc68
+XO	       = b
+XRFS_SERVER     = rfs_server.x
+XRMTMNT         = rmtmnt.x
+XDEBUG          = debug.x
+XINSTALL_RMTMNT = install68
+XINSTALL        = install68
+XALL	       = $(RFS_SERVER) $(RMTMNT)
+XXINU	       = xinu68
+X
+X.SUFFIXES:
+X.SUFFIXES: .b .c
+X
+X.c.b:
+X	$(CC) $(CFLAGS) $< -c
+SHAREOF
+chmod 664 remote/make.base.M68
+#
+# remote/make.base.magnolia
+#
+if [ -f remote/make.base.magnolia ]; then 
+	echo -n 'Hit <return> to overwrite remote/make.base.magnolia or ^C to quit' 
+	read ans 
+	rm -f remote/make.base.magnolia 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/make.base.magnolia
+XHOST	       = tekcrl
+XINCLUDE        = /usr/include/remote/remotefs.h server.h
+XO              = o
+XCFLAGS         = -G$(HOST) -O -DRFSDEBUG -DCANREMOTE -DBYTEORDER=3,2,1,0 -DREMOTEFS
+XLDFLAGS        = -z
+XRFS_SERVER     = rfs_server
+XRMTMNT         = rmtmnt
+XDEBUG          = debug
+XINSTALL        = install68
+XINSTALL_RMTMNT = install68
+XDEST           =
+XCC	       = cc
+XALL	       = $(RFS_SERVER) $(RMTMNT)
+XXINU	       = :
+SHAREOF
+chmod 664 remote/make.base.magnolia
+#
+# remote/make.base.pyramid
+#
+if [ -f remote/make.base.pyramid ]; then 
+	echo -n 'Hit <return> to overwrite remote/make.base.pyramid or ^C to quit' 
+	read ans 
+	rm -f remote/make.base.pyramid 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/make.base.pyramid
+XINCLUDE        = ../usr.include/remote/remotefs.h server.h
+XO              = o
+XLDFLAGS        = -z
+XRFS_SERVER     = rfs_server
+XINS_RFS_SERVER = rfs_server
+XRMTMNT         = rmtmnt
+XDEBUG          = debug
+XINSTALL_RMTMNT = install
+XINSTALL        = install
+XDEST	       =
+XCC             = cc
+XALL	       = $(RFS_SERVER) $(RMTMNT)
+XXINU	       = :
+XDEFINES        = -DRFSDEBUG -DCANREMOTE -DBYTEORDER=3,2,1,0 -DREMOTEFS -I/usr/include/sys
+XCFLAGS         = -O ${DEFINES} -I../usr.include
+SHAREOF
+chmod 644 remote/make.base.pyramid
+#
+# remote/make.base.vax
+#
+if [ -f remote/make.base.vax ]; then 
+	echo -n 'Hit <return> to overwrite remote/make.base.vax or ^C to quit' 
+	read ans 
+	rm -f remote/make.base.vax 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/make.base.vax
+XINCLUDE        = ../usr.include/remote/remotefs.h server.h
+XO              = o
+XLDFLAGS        = -z
+XRFS_SERVER     = rfs_server
+XINS_RFS_SERVER = rfs_server
+XRMTMNT         = rmtmnt
+XDEBUG          = debug
+XINSTALL_RMTMNT = install
+XINSTALL        = install
+XDEST	       =
+XCC             = cc
+XALL	       = $(RFS_SERVER) $(RMTMNT)
+XXINU	       = :
+XDEFINES        = -DRFSDEBUG -DCANREMOTE -DBYTEORDER=0,1,2,3 -DREMOTEFS
+XCFLAGS         = -O ${DEFINES} -I../usr.include
+SHAREOF
+chmod 664 remote/make.base.vax
+#
+# remote/make.base.vaxnorfs
+#
+if [ -f remote/make.base.vaxnorfs ]; then 
+	echo -n 'Hit <return> to overwrite remote/make.base.vaxnorfs or ^C to quit' 
+	read ans 
+	rm -f remote/make.base.vaxnorfs 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/make.base.vaxnorfs
+XINCLUDE        = ../usr.include/remote/remotefs.h server.h
+XO              = o
+XLDFLAGS        = -z
+XRFS_SERVER     = rfs_server
+XINS_RFS_SERVER = rfs_server
+XRMTMNT         = rmtmnt
+XDEBUG          = debug
+XINSTALL_RMTMNT = :
+XINSTALL        = install
+XDEST	       =
+XCC             = cc
+XALL	       = $(RFS_SERVER)
+XXINU	       = :
+XCFLAGS         = -O -DRFSDEBUG -DBYTEORDER=0,1,2,3 -DNREMOTE=1 -I../usr.include
+SHAREOF
+chmod 664 remote/make.base.vaxnorfs
+#
+# remote/make.log
+#
+if [ -f remote/make.log ]; then 
+	echo -n 'Hit <return> to overwrite remote/make.log or ^C to quit' 
+	read ans 
+	rm -f remote/make.log 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/make.log
+Xcc -O -DRFSDEBUG -DBYTEORDER=0,1,2,3 -DNREMOTE=1 -I../usr.include -c fileserver.c
+Xcc -O -DRFSDEBUG -DBYTEORDER=0,1,2,3 -DNREMOTE=1 -I../usr.include -c info.c
+Xcc -O -DRFSDEBUG -DBYTEORDER=0,1,2,3 -DNREMOTE=1 -I../usr.include -c init.c
+Xcc -o rfs_server change.o file.o fileserver.o find.o  info.o init.o list.o new.o  rhost.o route.o serverdata.o serverdir.o serverio.o  serversyscall.o -z newlibc.a
+X: rfs_server
+SHAREOF
+chmod 664 remote/make.log
+#
+# remote/new.c
+#
+if [ -f remote/new.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/new.c or ^C to quit' 
+	read ans 
+	rm -f remote/new.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/new.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Log:	new.c,v $
+X * Revision 2.0  85/12/07  18:21:48  toddb
+X * First public release.
+X * 
+X */
+Xstatic char	*rcsid = "$Header: new.c,v 2.0 85/12/07 18:21:48 toddb Rel $";
+X#include	"server.h"
+X#include	<stdio.h>
+X
+Xextern short	current_pid;
+Xextern hosts	*host;
+X
+Xusers *newuser()
+X{
+X	register users	*user;
+X
+X	user = (users *)malloc(sizeof(users));
+X	if (user == NULL)
+X		log_fatal("cannot allocate space\n");
+X	bzero(user, sizeof(users));
+X	return(user);
+X}
+X
+Xhosts *newhost()
+X{
+X	register hosts	*h;
+X
+X	h = (hosts *)malloc(sizeof(hosts));
+X	if (h == NULL)
+X		log_fatal("cannot allocate space\n");
+X	bzero(h, sizeof(hosts));
+X	h->h_cmdfd = -1;
+X	return(h);
+X}
+X
+Xrusers *newruser()
+X{
+X	register rusers	*ruser;
+X
+X	ruser = (rusers *)malloc(sizeof(rusers));
+X	if (ruser == NULL)
+X		log_fatal("cannot allocate space\n");
+X	bzero(ruser, sizeof(rusers));
+X	return(ruser);
+X}
+X
+Xprocess *newprocess()
+X{
+X	register process	*p;
+X
+X	p = (process *)malloc(sizeof(process));
+X	if (p == NULL)
+X		log_fatal("cannot allocate space\n");
+X	bzero(p, sizeof(process));
+X	return(p);
+X}
+X
+Xfreeproc(p)
+X	register process *p;
+X{
+X	if (p->p_execfd >= 0)
+X		close(p->p_execfd);
+X	free(p);
+X}
+X
+Xchar	**newname(namelist, name)
+X	register char	**namelist;
+X	register char	*name;
+X{
+X	register long	i = 0;
+X
+X	if (namelist == NULL)
+X		namelist = (char **)malloc(sizeof(char *) * 2);
+X	else
+X	{
+X		/*
+X		 * count the elements in the list now.
+X		 */
+X		for (i=0; namelist && namelist[i]; i++) ;
+X
+X		namelist = (char **)realloc(namelist, sizeof(char *) * (i+2));
+X	}
+X	namelist[ i++ ] = copy(name);
+X	namelist[ i ] = NULL;
+X	return(namelist);
+X}
+X
+X/*
+X * Add a group to 'user' unless he has exceeded the limit or the group
+X * is already in his domain.
+X */
+Xaddgroup(user, gid)
+X	register users	*user;
+X	register short	gid;
+X{
+X	register long	i = 0,
+X			*gr = user->u_local_groups;
+X
+X	for (i=0; i < user->u_numgroups; i++)
+X		if (gr[ i ] == gid)
+X			return;
+X	if (i >= NGROUPS)
+X		return;
+X	gr[ user->u_numgroups++ ] = gid;
+X}
+X
+Xprocess *add_new_process(uid, pid)
+X	register short	uid, pid;
+X{
+X	register process	*p;
+X	register long	i;
+X
+X	debug0("allocate new proc: pid=%d uid=%d host=%s\n",
+X		pid, uid, host->h_names[0]);
+X	setup_proc(p = newprocess(), uid, pid);
+X	addlist(&host->h_proclist, p);
+X
+X	/*
+X	 * Initialize the file descriptors for this process.
+X	 */
+X	for(i=0; i<NOFILE; i++)
+X		p->p_fds[ i ] = 0x80;	/* -128 */
+X
+X	return(p);
+X}
+X
+Xsetup_proc(proc, uid, pid)
+X	register process	*proc;
+X	register short	uid, pid;
+X{
+X	register rusers	*ruser;
+X
+X	proc->p_pid = pid;
+X	proc->p_uid = uid;
+X	proc->p_handler = current_pid;
+X	proc->p_returnval = 0;
+X	proc->p_execfd = -1;
+X	if (ruser = findremuid(&host->h_rusers, uid))
+X		proc->p_ruser = ruser;
+X	else
+X		proc->p_ruser = host->h_default_ruser;
+X}
+SHAREOF
+chmod 444 remote/new.c
+#
+# remote/rhost.c
+#
+if [ -f remote/rhost.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/rhost.c or ^C to quit' 
+	read ans 
+	rm -f remote/rhost.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/rhost.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Log:	rhost.c,v $
+X * Revision 2.1  86/03/10  13:56:34  toddb
+X * Added support for a .rhosts entry that has only a host name.
+X * 
+X * Revision 2.0  85/12/07  18:21:52  toddb
+X * First public release.
+X * 
+X */
+Xstatic char	*rcsid = "$Header: rhost.c,v 2.1 86/03/10 13:56:34 toddb Exp $";
+X#include	<stdio.h>
+X#include	"server.h"
+X
+Xstatic char	*rhostpath;
+Xstatic FILE	*fd;
+Xstatic rhost	rh;
+X
+Xsetrhost(path)
+X	register char	*path;
+X{
+X	extern int	errno;
+X
+X	if ((fd = fopen(path, "r")) != 0)
+X		debug2("rhost %s\n", path);
+X	errno = 0;
+X}
+X
+Xrhost *getrhostent(buf)
+X	register char	*buf;
+X{
+X	register char	*p;
+X
+X	do {
+X		if (fd == NULL || fgets(buf, BUFSIZ, fd) == NULL)
+X			return(NULL);
+X
+X		/*
+X		 * assign the first token to rh_host and then look for the
+X		 * second token on the line.  If there is none, then
+X		 * return a null user name and let our caller sort it out.
+X		 */
+X		rh.rh_host = buf;
+X		for (p=buf; *p && *p != ' ' && *p != '\n'; p++) ;
+X		if (p == buf)
+X			continue;
+X		if (*p == '\n' || *p == '\0') {
+X			*p = '\0';
+X			rh.rh_user = NULL;
+X		} else {
+X			/*
+X			 * remove the newline on the end
+X			 */
+X			rh.rh_user = p+1;
+X			*p = '\0';
+X			for (p++; *p && *p != ' ' && *p != '\n'; p++) ;
+X			*p = '\0';
+X		}
+X	} while(FALSE);
+X	debug2("%s -> %s\n", rh.rh_host, rh.rh_user? rh.rh_user : "NULL");
+X	return(&rh);
+X}
+X
+Xendrhost()
+X{
+X	if (fd)
+X	{
+X		fclose(fd);
+X		fd = NULL;
+X	}
+X}
+SHAREOF
+chmod 444 remote/rhost.c
+#
+# remote/rmtmnt.c
+#
+if [ -f remote/rmtmnt.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/rmtmnt.c or ^C to quit' 
+	read ans 
+	rm -f remote/rmtmnt.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/rmtmnt.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Log:	rmtmnt.c,v $
+X * Revision 2.0  85/12/07  18:21:56  toddb
+X * First public release.
+X * 
+X */
+Xstatic char	*rcsid = "$Header: rmtmnt.c,v 2.0 85/12/07 18:21:56 toddb Rel $";
+X#include	"server.h"
+X#include	<stdio.h>
+X#include	<sys/file.h>
+X#include	<netdb.h>
+X#include	<signal.h>
+X#include	<setjmp.h>
+X#include	<nlist.h>
+X
+Xextern int	errno;		/* for errors */
+Xchar		*service;	/* service name */
+Xchar		byteorder[4] = { BYTEORDER };
+X
+X/*
+X * for slow or dead remote hosts, we catch alarms.
+X */
+Xint		onalrm();
+Xstruct sigvec	vec = { onalrm, 0, 0 };
+X
+X/*
+X * Displaying current mount points requires that we read kernel space.
+X */
+Xstruct nlist	nl[] = {
+X#ifdef magnolia
+X	{ "remote_info" },
+X#else
+X	{ "_remote_info" },
+X#endif
+X	{ "" },
+X};
+X#ifdef magnolia
+Xchar		*kernel = "/magix";
+X#else
+Xchar		*kernel = "/vmunix";
+X#endif
+X
+Xmain(argc, argv)
+X	int	argc;
+X	char	**argv;
+X{
+X	long	generic = FALSE,
+X		unmount = FALSE;
+X	char	*mntpt = NULL,
+X		*host = NULL;
+X
+X	/*
+X	 * Parse the args.
+X	 */
+X	for (argv++, argc--; argc; argv++, argc--)
+X	{
+X		if (**argv != '-')
+X			break;
+X		switch(argv[0][1]) {
+X		case 's':	/* service name */
+X			if (argv[0][2])
+X				service = argv[0]+2;
+X			else
+X				argv++, argc--, service = argv[0];
+X			break;
+X		case 'g':	/* Make this a generic mount point */
+X			generic = TRUE;
+X			break;
+X		case 'u':	/* unmount this mount point */
+X			unmount = TRUE;
+X			break;
+X		default:
+X			fprintf(stderr, "unknown option = %s\n", *argv);
+X			usage();
+X			exit(1);
+X		}
+X	}
+X
+X	if (! generic && ! unmount && argc-- > 0)
+X		host = *argv++;
+X	if (argc-- > 0)
+X	{
+X		mntpt = *argv++;
+X		if (*mntpt != '/')
+X		{
+X			fprintf(stderr, "mount point must begin with '/'\n");
+X			mntpt = NULL;
+X		}
+X	}
+X	else
+X	{
+X		show();
+X		exit(0);
+X	}
+X
+X	if (argc > 0
+X	|| (generic && unmount)
+X	|| (mntpt == NULL))
+X		usage();
+X
+X	if (unmount)
+X		turnoff(mntpt);
+X	else
+X		turnon(mntpt, host);
+X}
+X
+X/*
+X * Display the current mount points in the kernal.
+X */
+Xshow()
+X{
+X	long		index = 0,
+X			diff,
+X			now,
+X			kfd;
+X	char		buf[BUFSIZ],
+X			*p;
+X	struct sockaddr_in hostaddr;
+X	struct sockaddr_in	*sys;
+X	struct servent *servp;
+X	struct hostent	*hostent;
+X	struct remoteinfo rinfo[ R_MAXSYS ],
+X			*rp;
+X	struct mbuf	bufs[ R_MAXSYS ],
+X			*m;
+X
+X	servp = getservbyname(REMOTE_FS_SERVER, "tcp");
+X	/*
+X	 * Get the address of the remote mount point information
+X	 * and read kernel memory.
+X	 */
+X	nlist(kernel, nl);
+X	if(nl[0].n_type == 0)
+X		log_fatal("no %s for namelist\n", kernel);
+X	kfd = open("/dev/kmem", 0);
+X	if(kfd < 0)
+X		log_fatal("cannot open /dev/kmem\n");
+X	lseek(kfd, (long)nl[0].n_value, 0);
+X	read(kfd, rinfo, sizeof(struct remoteinfo) * R_MAXSYS);
+X
+X	/*
+X	 * Now get the mbufs on each mount point.
+X	 */
+X	m = bufs;
+X	time(&now);
+X	for (index=0, rp = rinfo; rp < rinfo+R_MAXSYS; rp++, index++)
+X	{
+X		buf[0] = '\0';
+X		if (rp->r_name || rp->r_mntpt)
+X			printf("%d: ", index);
+X		else
+X			continue;
+X		if (rp->r_name)
+X		{
+X			lseek(kfd, (long)rp->r_name, 0);
+X			read(kfd, m, sizeof(struct mbuf));
+X			rp->r_name = m++;
+X			sys = mtod(rp->r_name, struct sockaddr_in *);
+X			hostent = gethostbyaddr(&sys->sin_addr,
+X				sizeof (struct in_addr), sys->sin_family);
+X			if (hostent == NULL)
+X			{
+X				log("no host entry for %s\n",
+X					inet_ntoa(sys->sin_addr));
+X				continue;
+X			}
+X			bprintf(buf, "%s(%s) on ",
+X				hostent->h_name, inet_ntoa(sys->sin_addr));
+X		}
+X		else
+X			bprintf(buf, "generic mount point ");
+X		bprintf(buf, "%s", rp->r_mntpath);
+X		if (rp->r_mntpt == NULL)
+X			bprintf(buf, ", implied");
+X		if (rp->r_name && sys->sin_port != servp->s_port)
+X			bprintf(buf, ", port %d", sys->sin_port);
+X		if (rp->r_sock)
+X			bprintf(buf, ", connected");
+X		if (rp->r_close)
+X			bprintf(buf, ", closing");
+X		if (rp->r_users)
+X			bprintf(buf, ", %d process%s",
+X				rp->r_users, rp->r_users > 1 ? "es" : "");
+X		if (rp->r_nfile)
+X			bprintf(buf, ", %d open file%s",
+X				rp->r_nfile, rp->r_nfile > 1 ? "s" : "");
+X		if (rp->r_nchdir)
+X			bprintf(buf, ", %d chdir%s",
+X				rp->r_nchdir, rp->r_nchdir > 1 ? "'s" : "");
+X		if (rp->r_opening)
+X			bprintf(buf, ", opening");
+X		if (rp->r_failed)
+X		{
+X			bprintf(buf, ", connect failed, retry ");
+X			diff = rp->r_age - now;
+X			if (diff <= 0)
+X				bprintf(buf, "time reached");
+X			else
+X			{
+X				bprintf(buf, "in ");
+X				if (diff / 60)
+X					bprintf(buf, "%d minute%s", diff/60,
+X						(diff/60) > 1 ? "s" : "");
+X				if (diff / 60 && diff % 60)
+X					bprintf(buf, " and ");
+X				if (diff % 60)
+X					bprintf(buf, "%d second%s", diff%60,
+X						(diff%60) > 1 ? "s" : "");
+X			}
+X		}
+X		else if(rp->r_sock == NULL && rp->r_age)
+X		{
+X			bprintf(buf, ", last closed %s",
+X				ctime(&rp->r_age));
+X			buf[ strlen(buf)-1 ] = '\0'; /* remove newline */
+X		}
+X		printf("%s\n", buf);
+X	}
+X}
+X
+X/*
+X * buffer printf.  i.e. do a printf into a buffer, appending to whatever
+X * is there.  Split long lines.
+X */
+Xbprintf(buf, x0,x1,x2,x3,x4,x5,x6,x7,x8,x9)
+X	char	*buf;
+X{
+X	char	xbuf[ BUFSIZ ],
+X		*pfrom, *pto, c;
+X	long	col;
+X
+X	sprintf(xbuf, x0,x1,x2,x3,x4,x5,x6,x7,x8,x9);
+X	for (pto = buf; *pto; pto++) ;
+X	for (pfrom = xbuf, col=0; *pfrom; pfrom++, col++)
+X	{
+X		c = *pfrom;
+X		*pto++ = c;
+X		if (c == '\n')
+X			col = -1;
+X		else if (c == ' ' && col > 50)
+X		{
+X			*pto++ = '\n';
+X			*pto++ = '\t';
+X			col = 7;
+X		}
+X	}
+X	*pto = '\0';
+X}
+X
+X/*
+X * Do a mount.
+X */
+Xturnon(mntpt, host)
+X	char	*mntpt, *host;
+X{
+X	int	index, ret, fdout, fdin;
+X	struct message msgbuf, *msg = &msgbuf;
+X	struct sockaddr_in	sys;
+X	char	buf[ BUFSIZ ];
+X
+X	if (strlen(mntpt) >= R_MNTPATHLEN)
+X		log_fatal("mount point must be < %d chars\n", R_MNTPATHLEN);
+X
+X	/*
+X	 * Connect to the machine and send it our byte order and
+X	 * password file.
+X	 */
+X	if (host)
+X	{
+X		if ((fdout = tcpname(&sys, host)) < 0)
+X			log("system unreachable now...");
+X		index = remoteon(mntpt, strlen(mntpt)+1,
+X			&sys, sizeof(struct sockaddr_in));
+X	}
+X	else
+X		index = remoteon(mntpt, strlen(mntpt), 0, 0);
+X	if (index == -1)
+X		log_fatal("cant mount remote fs\n");
+X	else if (host && fdout < 0)
+X		log(" system mounted anyway\n");
+X	if (host == NULL)
+X		return;
+X	if ((fdin = open("/etc/passwd", O_RDONLY)) == -1)
+X		log_fatal("can't open /etc/passwd\n");
+X	msg->m_syscall = htons(RSYS_nosys);
+X	msg->m_hdlen = htons(R_MINRMSG + sizeof(long));
+X	msg->m_totlen = htonl(R_MINRMSG + sizeof(long));
+X	msg->m_args[0] = htonl(CMD_MOUNT);
+X	write(fdout, msg, R_MINRMSG + sizeof(long));
+X	write(fdout, byteorder, 4);
+X	while ((ret = read(fdin, buf, BUFSIZ)) > 0)
+X		write(fdout, buf, ret);
+X	close(fdout);
+X	close(fdin);
+X	return;
+X}
+X
+Xturnoff(mntpt)
+X	char	*mntpt;
+X{
+X	int	index, fd;
+X
+X	index = remoteoff(mntpt);
+X	if (index == -1)
+X		log_fatal("can't unmount remote fs\n");
+X	close(fd);
+X}
+X
+Xusage()
+X{
+X	fprintf(stderr, "Usage:\t%s\n\t%s\n\t%s\n",
+X		"rmtmnt [-sservicename] -g path",
+X		"rmtmnt [-sservicename] host path",
+X		"rmtmnt");
+X	exit(1);
+X}
+X
+Xtcpname(sin, host)
+X	struct sockaddr_in *sin;
+X	char	*host;
+X{
+X	struct servent *servp;
+X	struct hostent *hostp;
+X	int s;
+X
+X	servp = getservbyname(service ? service : REMOTE_FS_SERVER, "tcp");
+X
+X	if (servp == NULL) {
+X		fprintf(stderr, "%s: unknown service\n", REMOTE_FS_SERVER);
+X		exit(1);
+X	}
+X
+X	hostp = gethostbyname(host);
+X	if (hostp == NULL) {
+X		fprintf(stderr, "%s: unknown host\en", host);
+X		exit(1);
+X	}
+X	bzero((char *)sin, sizeof (struct sockaddr_in));
+X	bcopy(hostp->h_addr, (char *)&sin->sin_addr, hostp->h_length);
+X	sin->sin_family = hostp->h_addrtype;
+X	sin->sin_port = servp->s_port;
+X
+X	/*
+X	 * Ok, now make sure that the connection will work
+X	 */
+X	if (sigvec(SIGALRM, &vec, (struct sigvec *)0) == -1) {
+X		perror("signals");
+X		return(-1);
+X	}
+X	s = socket(AF_INET, SOCK_STREAM, 0);
+X	if (s < 0)
+X		return(-1);
+X	alarm(5);
+X	if(connect(s, sin, sizeof(struct sockaddr_in)) < 0) {
+X		alarm(0);
+X		return(-1);
+X	}
+X	alarm(0);
+X	return(s);
+X}
+X
+Xonalrm(sig)
+X{
+X	fprintf(stderr, "timeout: ");
+X}
+X
+Xlog_fatal(x0,x1,x2,x3,x4,x5,x6,x7,x8,x9)
+X{
+X	log(x0,x1,x2,x3,x4,x5,x6,x7,x8,x9);
+X	exit(1);
+X}
+X
+Xlog(x0,x1,x2,x3,x4,x5,x6,x7,x8,x9)
+X{
+X	if (errno)
+X		perror("rmtmnt");
+X	errno = 0;
+X	fprintf(stderr, x0,x1,x2,x3,x4,x5,x6,x7,x8,x9);
+X}
+SHAREOF
+chmod 444 remote/rmtmnt.c
+#
+# remote/route.c
+#
+if [ -f remote/route.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/route.c or ^C to quit' 
+	read ans 
+	rm -f remote/route.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/route.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Log:	route.c,v $
+X * Revision 2.2  86/01/05  18:14:47  toddb
+X * Added a forgotten case to gateway_listen(): S_CORRUPTED.
+X * 
+X * Revision 2.1  85/12/19  15:53:23  toddb
+X * Changed declaration of a local variable (sigmask) because it conflicts
+X * with a 4.3 define.
+X * 
+X * Revision 2.0  85/12/07  18:22:04  toddb
+X * First public release.
+X * 
+X */
+Xstatic char	*rcsid = "$Header: route.c,v 2.2 86/01/05 18:14:47 toddb Exp $";
+X#include	"server.h"
+X#include	<sys/file.h>
+X#include	<sys/time.h>
+X#include	<setjmp.h>
+X#include	<errno.h>
+X
+Xextern short	current_pid;
+Xextern short	current_ppid;
+Xextern short	gateway_server;
+Xextern short	current_server;
+Xextern long	blocking_servers;
+Xextern long	to_gateway;
+Xextern long	from_servers;
+Xextern long	errno;
+Xextern boolean	i_am_gateway;
+Xextern boolean	i_have_control;
+Xextern boolean	gateway_needs_control;
+Xextern boolean	route_to_gateway;
+Xextern boolean	watch_for_lock;
+Xextern boolean	i_am_asleep;
+Xextern hosts	*host;
+X
+X/*
+X * Reroute to the server whose pid is 'pid'.
+X */
+Xreroute(pid, msg)
+X	register short	pid;
+X	register struct message	*msg;
+X{
+X	if (route_to_gateway)
+X	{
+X		debug5("routing changed from server %d to gateway\n", pid);
+X		route_to_gateway = FALSE;
+X		pid = gateway_server;
+X	}
+X	watch_for_lock = gateway_needs_control = FALSE;
+X	dont_gobble_msg(msg);
+X
+X	if (pid == current_pid)
+X		log_fatal("reroute myself???\n");
+X	debug5("%d waking up %d\n", current_pid, pid);
+X
+X	/*
+X	 * If we are the gateway, there may be some servers that are blocking
+X	 * on a request.  If so, then we lock file descriptor 2 with an
+X	 * shared lock.  This tells the server to always check to see if
+X	 * the lock goes up to an exclusive lock.  If so, then the server
+X	 * must then return control to the gateway.
+X	 */
+X	if (i_am_gateway)
+X	{
+X		set_label("reading messages");
+X		i_have_control = FALSE;
+X		if (blocking_servers)
+X			if (flock(2, LOCK_NB | LOCK_SH) < 0)
+X				log_fatal("cannot lock fd 2\n");
+X	}
+X
+X	i_am_asleep = TRUE;
+X	if (pid == gateway_server)
+X		say_something(S_THIS_IS_YOURS, gateway_server);
+X	else
+X		wake_up(pid);
+X	slumber(FALSE);
+X	if (! i_am_gateway)
+X	{
+X		/*
+X		 * Check for the lock on fd 2.  But even if the gateway wants
+X		 * control, go ahead an serve this request.
+X		 */
+X		if (flock(2, LOCK_NB | LOCK_EX) < 0)
+X			if (flock(2, LOCK_NB | LOCK_SH) >= 0)
+X			{
+X				debug5("watch for lock on each request\n");
+X				watch_for_lock = TRUE;
+X				flock(2, LOCK_UN);
+X			}
+X			else
+X			{
+X				debug5("Gateway wants control\n");
+X				gateway_needs_control = TRUE;
+X			}
+X		else
+X			flock(2, LOCK_UN);
+X	}
+X}
+X
+X
+X/*
+X * Tell the gateway something.
+X */
+Xsay_something(cmd, arg)
+X	register long	cmd, arg;
+X{
+X	gtmsgs		gmsg[2];
+X	register gtmsgs	*g = gmsg;
+X	register long	len = sizeof(gtmsgs);
+X
+X
+X	if (cmd == S_NEWSERVER)	/* actually 2 messages */
+X	{
+X		g->g_server = current_ppid;
+X		g->g_cmd = cmd;
+X		g->g_pid = current_pid;
+X		cmd = S_NEWPROCESS;
+X		g++;
+X		len += sizeof(gtmsgs);
+X	}
+X	g->g_server = current_pid;
+X	g->g_cmd = cmd;
+X	g->g_pid = arg;
+X
+X	debug5("say: cmd=%d, arg=%d\n", cmd, arg);
+X	if (write(to_gateway, gmsg, len) != len)
+X		log_fatal("pid %d: can't write to gateway!!\n",
+X			current_pid);
+X}
+X
+X/*
+X * Read message from servers.  We do the allocation of space and maintain it.
+X */
+Xgtmsgs *read_gtmsgs()
+X{
+X	static gtmsgs	*msgs;
+X	static long	current_len,
+X			len_needed = 10;
+X	register long	red;
+X	register gtmsgs	*g;
+X
+X	/*
+X	 * Allocate space for the current read.
+X	 */
+X	if (current_len < len_needed)
+X	{
+X		if (msgs)
+X			msgs = (gtmsgs *)realloc(msgs,
+X				len_needed * sizeof(gtmsgs));
+X		else
+X			msgs = (gtmsgs *)malloc(len_needed * sizeof(gtmsgs));
+X		current_len = len_needed;
+X	}
+X
+X	/*
+X	 * Now read the messages.
+X	 */
+X	red = read(from_servers, msgs, (current_len-1) * sizeof(gtmsgs));
+X	if (red % sizeof(gtmsgs) != 0)
+X		log_fatal("partial message on read = %d\n", red);
+X	red /= sizeof(gtmsgs);
+X	if (red == current_len-1)
+X		len_needed++;
+X	msgs[ red ].g_server = 0;
+X#ifdef RFSDEBUG
+X	for (g=msgs; g->g_server; g++)
+X		debug14("red: server %d, cmd %d, pid=%d\n",
+X			g->g_server, g->g_cmd, g->g_pid);
+X#endif RFSDEBUG
+X	return(msgs);
+X}
+X	
+X/*
+X * This process is called to gather incomming messages from servers out
+X * there with something interesting to say.  We return TRUE if we have
+X * read a message from a process that is relinquishing control, FALSE
+X * otherwise.
+X */
+Xgateway_listen()
+X{
+X	register process	*proc;
+X	register gtmsgs		*msgs, *g;
+X	short			dequeue();
+X	register short		cmd, i, pid, server;
+X
+X	msgs = read_gtmsgs();
+X
+X	errno = 0;
+X	for (g=msgs; g->g_server; g++)
+X	{
+X		pid    = g->g_pid;
+X		server = g->g_server;
+X		cmd    = g->g_cmd;
+X
+X		switch(cmd) {
+X		case S_NEWSERVER: /* a new server forked by another server */
+X			debug5("hear: %d forks new server %d\n", server, pid);
+X			break;
+X		case S_NEWPROCESS: /* a new process is being served */
+X			proc = add_new_process(0, pid);
+X			proc->p_handler = server;
+X			debug5("hear: pid %d serving pid %d\n", server, pid);
+X			break;
+X		case S_PROCEXIT: /* some server's client did an exit() call */
+X			debug5("hear: proc exit from server %d: pid=%d\n",
+X				server, pid);
+X			if ((proc = findprocess(pid, -1)) == NULL)
+X				log("can't find pid %d!\n", pid);
+X			else
+X			{
+X				deletelist(&host->h_proclist, proc);
+X				freeproc(proc);
+X			}
+X			break;
+X		case S_I_WOULD_BLOCK: /* server will block on I/O */
+X			debug5("hear: server %d blocks\n", server);
+X			blocking_servers++;
+X			goto gateway_control;
+X		case S_ALLDONE:	/* an existing server is ready to die */
+X		case S_EOF:	/* a server got eof on command socket */
+X			mourne();
+X			debug5("hear: server %d %s... ", server,
+X				cmd == S_ALLDONE ? "dead" : "got eof");
+X			for (proc=host->h_proclist; proc; proc=proc->p_next)
+X				if (proc->p_handler == server)
+X				{
+X					debug5("free proc %d...", proc->p_pid);
+X					deletelist(&host->h_proclist, proc);
+X					freeproc(proc);
+X				}
+X			debug5("\n");
+X			/* fall through */
+X		case S_THIS_IS_YOURS: /* just relinquish control */
+X	gateway_control:
+X			/*
+X			 * Always unlock when we have control.
+X			 */
+X			flock(2, LOCK_UN);
+X			if (cmd == S_THIS_IS_YOURS)
+X				debug5("hear: server %d gives us control\n",
+X					server);
+X			/*
+X			 * Now that we have control, see about dequeing
+X			 * a server that is ready to go.  If there is one,
+X			 * Then change this message so that it looks like
+X			 * a message from ourself saying to reroute to
+X			 * 'server'.
+X			 */
+X			server = dequeue();
+X			if (server > 0)
+X			{
+X				debug5("server %d ready to go\n", server);
+X				wake_up(server);
+X			}
+X			else
+X			{
+X				debug5("gateway pid %d continuing\n",
+X					current_pid);
+X				set_label("active");
+X				i_have_control = TRUE;
+X			}
+X			break;
+X		case S_I_AM_READY:
+X			debug5("hear: server %d ready\n", server);
+X			blocking_servers--;
+X			if (flock(2, LOCK_EX) < 0)
+X				log_fatal("cannot lock fd 2\n");
+X			queue(server);
+X			break;
+X		case S_CORRUPTED:
+X			log_fatal("corrupted input stream\n");
+X			break;
+X		default:
+X			log("unknown message from %d = %d\n", server, cmd);
+X			break;
+X		}
+X	}
+X
+X	return(FALSE);
+X}
+X
+Xwake_up(pid)
+X	long	pid;
+X{
+X	sendsig(pid, SIGIO);
+X}
+X
+Xsendsig(pid, sig)
+X	long	pid,
+X		sig;
+X{
+X	register func	logger;
+X	extern long	log(), log_fatal();
+X
+X	change_to_uid(0);
+X	if (kill(pid, sig) < 0)
+X	{
+X		if (errno == ESRCH)
+X			logger = log;
+X		else
+X			logger = log_fatal;
+X		logger("couldn't signal %d w/ sig=%d\n", pid, sig);
+X		return(FALSE);
+X	}
+X	return(TRUE);
+X}
+X
+Xstatic short	*server_queue;
+Xstatic short	server_len;
+Xstatic short	last_server;
+X/*
+X * Put a server on a queue to be run again.  Fifo queue.
+X */
+Xqueue(pid)
+X	register short	pid;
+X{
+X	if (++last_server > server_len)
+X	{
+X		server_len++;
+X		if (server_queue == NULL)
+X			server_queue = (short *)malloc(sizeof(short));
+X		else
+X			server_queue = (short *)realloc(server_queue,
+X				server_len*sizeof(short));
+X	}
+X	server_queue[ last_server - 1 ] = pid;
+X}
+X
+X/*
+X * Get the first server off the queue.  Blech!  We have to copy all the
+X * queue back one.
+X */
+Xshort dequeue()
+X{
+X	register short	retval, i;
+X
+X	if (last_server == 0)
+X		return(0);
+X	retval = server_queue[ 0 ];
+X	for (i=1; i<last_server; i++)
+X		server_queue[ i-1 ] = server_queue[ i ];
+X	last_server--;
+X	return( retval );
+X}
+X
+X/*
+X * Go to sleep awaiting a wakup call.  Do not return until we receive it.
+X * However, if we are the gateway, we, of course MUST return and go
+X * on reading messages.
+X *
+X * Since there is a window between testing the i_am_asleep flag and doing
+X * the pause, in which we could be awakened, we must always jump around
+X * this loop using longjmp() from the interrupt routine.
+X */
+Xslumber(forked)
+X	boolean	forked;
+X{
+X	register long	signalmask;
+X
+X	if (i_am_gateway)
+X	{
+X		set_label("reading messages");
+X		i_have_control = FALSE;
+X		return;
+X	}
+X	set_label("asleep");
+X	signalmask = sigblock(1<<(SIGIO-1));
+X	while (i_am_asleep)
+X		sigpause(signalmask);
+X	sigsetmask(signalmask);
+X
+X	debug5("pid %d continuing%s\n",
+X		current_pid, forked ? "after fork" : "");
+X	set_label("active");
+X	mourne();
+X}
+SHAREOF
+chmod 444 remote/route.c
+#
+# remote/server.h
+#
+if [ -f remote/server.h ]; then 
+	echo -n 'Hit <return> to overwrite remote/server.h or ^C to quit' 
+	read ans 
+	rm -f remote/server.h 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/server.h
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Header: server.h,v 2.1 86/01/27 11:31:33 toddb Exp $
+X *
+X * $Log:	server.h,v $
+X * Revision 2.1  86/01/27  11:31:33  toddb
+X * Changed the h_addr component of the hosts structure to be h_iaddr so
+X * as not to conflict with the 4.3 define if h_addr in netdb.h.
+X * 
+X * Revision 2.0  85/12/07  18:22:12  toddb
+X * First public release.
+X * 
+X */
+X#include	<sys/param.h>
+X#include	<sys/mbuf.h>
+X#include	<sys/socket.h>
+X#include	<netinet/in.h>
+X#include	<remote/remotefs.h>
+X
+Xtypedef	unsigned char	boolean;
+X
+X/*
+X * The maximum number of longs in a message that we accept
+X */
+X#define	MAXMSGS		((R_MAXMBUFS*MLEN)/sizeof(long))
+X/*
+X * The name of a host for which we have no record.  And the name of the user
+X * to use if we don't recognize the user on the remote host.
+X */
+X#define	BOGUSHOST	"unknown host"
+X#define	BOGUSUSER	"unknown user"
+X#define DEFAULTUSER	"guest"
+X
+X/*
+X * The uid number below which we reserve for privilaged users.
+X */
+X#define	UID_TOO_LOW	20
+X
+X/*
+X * This is to make the debug? macro work for the server.
+X *
+X * The bits and what they turn on are as follows
+X *	0x00000001	process switching
+X *	0x00000002	system calls
+X *	0x00000004	setuid/setgid, umask
+X *	0x00000008	file descriptor allocation
+X *	0x00000010	connections
+X *	0x00000020	server switching
+X *	0x00000040	nameserver
+X *	0x00000080	directory nuxi
+X *	0x00000100	message in and out
+X *	0x00000200	don't fork child for gateway (good for adb)
+X *	0x00000400	local/remote file decisions
+X *	0x00000800	don't remove log file on exit (except exit on error)
+X *	0x00001000	exec information
+X *	0x00002000	auto debug for 0x20 (server switching)
+X *	0x00004000	parsing messages to gateway
+X */
+X#define	rmt_debug	log
+X#ifndef RFSDEBUG
+X#define dumphost()
+X#endif RFSDEBUG
+X
+X/*
+X * The size of the initial allocation for internal io buffers.
+X */
+X#define	BIGBUF		(8*1024)
+X
+X/*
+X * other Manifest constants...
+X */
+X#define	HOSTNAMELEN	255
+X
+X/*
+X * Map a file descriptor from the user's fd to our own internal fd.
+X */
+X#define	MAPFD(fd, proc)			\
+X	(((unsigned)fd > NOFILE) ? -1 : (proc)->p_fds[ fd ] )
+X/*
+X * requirements for different system calls.
+X */
+X#define	NEED_ZIP	0x000	/* don't need anything special */
+X#define	NEED_CWD	0x001	/* need the current working directory set */
+X#define	NEED_PERM	0x002	/* need the user and group ids set */
+X#define	NEED_FD		0x004	/* need a file descriptor allocated */
+X#define	NEED_2PATH	0x010	/* uses two paths */
+X#define	NEED_MYSERVER	0x020	/* must be run by the assigned server */
+X#define	NEED_2REMOTE	0x040	/* both paths must be remote */
+X
+X/*
+X * Commands to the server sent by external programs (like rmtmnt, to mount
+X * a remote system.
+X */
+X#define	CMD_SERVICE	1
+X#define	CMD_MOUNT	2	/* here is mount information */
+X#define	CMD_NEEDMOUNT	3	/* give me mount information */
+X#define	CMD_WHOAMI	4	/* what uid am I on your host */
+X
+X/*
+X * Finally, some commands that are sent to the gateway server by other
+X * servers.
+X */
+X#define	S_NEWSERVER	0
+X#define	S_NEWPROCESS	1
+X#define	S_ALLDONE	2
+X#define	S_THIS_IS_YOURS	3
+X#define	S_PROCEXIT	4
+X#define	S_EOF		5
+X#define	S_I_WOULD_BLOCK	6
+X#define	S_I_AM_READY	7
+X#define	S_CORRUPTED	8
+X
+X/*
+X * Macros for getting the address of the paths out of the incomming message.
+X * Note that path1addr is for system calls that deal with only one path,
+X * and twopath1addr() and twopath2addr() are for system calls that have
+X * two paths (in the latter cases, path2 appears in the same position
+X * as path1 does for single path system calls).
+X */
+X#define	path1addr(msg)		((char *)&(msg)->m_args[R_PATHSTART])
+X#define	twopath1addr(msg)	((char *)(msg) + (msg)->m_args[R_PATHOFF])
+X#define	twopath2addr(msg)	((char *)&(msg)->m_args[R_PATHSTART])
+X
+X/*
+X * Macro for preventing getmsg(), and thereby gobble_last_msg() from
+X * reading the last message.  This is used when control is being passed
+X * from one server to another.
+X */
+X#define	dont_gobble_msg(msg)	(msg)->m_totlen = 0
+X
+X/*
+X * Macro for determining whether a stat structure reflects the root inode
+X * of our machine or not.
+X */
+X#define	isroot(p)	(p->st_ino == root.st_ino && p->st_dev == root.st_dev)
+X
+X/*
+X * This structure is one-to-one with each local user where the server runs.
+X * Note that the u_next and u_prev pointers must be located
+X * in the first and second spots of the structure, respectively so that
+X * they can be modified by the linked-list routines.
+X */
+Xtypedef struct users_type	users;
+Xstruct users_type {
+X	users	*u_next;	/* pointers for linked list, both forward... */
+X	users	*u_prev;	/* ... and back. */
+X	char	*u_name;	/* The ascii name of same. */
+X	char	*u_dir;		/* login directory for same */
+X	char	*u_rhosts;	/* path of the user's rhost file */
+X	short	u_local_uid;	/* A user id number on the local host */
+X	long	u_local_groups[NGROUPS];/* The groups this user belongs to */
+X	char	u_numgroups;	/* The number of groups in u_local_groups */
+X};
+X
+X/*
+X * Remote user specification.
+X */
+Xtypedef struct ruser_type	rusers;
+Xstruct ruser_type {
+X	rusers	*r_next;
+X	rusers	*r_prev;
+X	short     r_uid;	/* Uid number on remote host ... */
+X	char	*r_name;	/* Uid name on remote host ... */
+X	users	*r_user;	/* corresponding local user */
+X};
+X
+X/*
+X * This is the important stuff.  There is one of these structures for
+X * each pid that we are providing service to.
+X */
+Xtypedef struct process_type	process;
+Xstruct process_type {
+X	process		*p_next;
+X	process		*p_prev;
+X	long		p_returnval;	/* return value from last syscall */
+X	rusers		*p_ruser;	/* info about the owner of this pid */
+X	short		p_pid;		/* process id number on remote host */
+X	short		p_uid;		/* remote uid that was last known */
+X	short		p_handler;	/* the handler for this process */
+X	short		p_errno;	/* errno for the system call */
+X	char		p_execfd;	/* file descriptor of exec file */
+X	boolean		p_execstarted;	/* whether we have done first read */
+X	char		p_fds[ NOFILE ];/* fd's assoc. with this pid */
+X};
+X
+X/*
+X * This structure keeps track of the possible hosts that may make a connection
+X * the the remote fs server.  Note that the h_next and hprev pointers must be
+X * located in the first and second spots of the structure, respectively,
+X * so that they can be modified by the linked-list routines.
+X */
+Xtypedef struct hosts_type	hosts;
+Xstruct hosts_type {
+X	hosts	*h_next;
+X	hosts	*h_prev;
+X	char	**h_names;	/* name (and aliases) of a host */
+X	rusers	*h_rusers;	/* the user list for this host */
+X	users	*h_default_user;/* default local user (if defined */
+X	rusers	*h_default_ruser;/* default when the remote user is unknown */
+X	long	h_portnum;	/* port number that we connected on */
+X	char	*h_mntpt;	/* mount point for this machine */
+X	process	*h_proclist;	/* processes we know about on this host */
+X	struct in_addr	h_iaddr;/* internet address */
+X	union h_bytes {
+X		long	hu_mounted; /* non-zero if host has been mounted */
+X		u_char	hu_byteorder[4]; /* byte order for this host */
+X	} h_bytes;
+X#define		h_mounted	h_bytes.hu_mounted
+X#define		h_byteorder	h_bytes.hu_byteorder
+X	char	h_cmdfd;	/* file descriptor for commands */
+X	boolean	h_byteorderok;	/* true if byte order same as ours */
+X	short	h_serverpid;	/* gateway server for this host */
+X};
+X
+X/*
+X * This structure is the mask structure that the linked list routines use
+X * to modify any linked-list type of structure.  Note that l_next and l_prev
+X * must be in the first and second spots.
+X */
+Xtypedef struct l_list_type	l_list;
+Xstruct l_list_type {
+X	l_list	*l_next;
+X	l_list	*l_prev;
+X	long	l_data;		/* never used */
+X};
+X
+X/*
+X * This structure is for convenience: it simply defines an easy way of
+X * storing the host/user line found in a .rhost file.
+X */
+Xtypedef struct rhost_type	rhost;
+Xstruct rhost_type {
+X	char	*rh_host;
+X	char	*rh_user;
+X};
+X
+X/*
+X * Each message from the servers to the gateway, is placed into this
+X * structure, the "gateway message".
+X */
+Xtypedef struct gtmsg_type	gtmsgs;
+Xstruct gtmsg_type {
+X	short	g_server;	/* server that sent the message. */
+X	short	g_pid;		/* pid of whom this message is about */
+X	short	g_cmd;		/* what this message is about */
+X};
+X
+X/*
+X * Finally, this is the way we keep database info on the system calls
+X * themselves.
+X */
+Xtypedef struct syscallmap	syscallmap;
+Xstruct syscallmap {
+X	func	s_server;
+X	func	s_syscall;
+X	char	s_type;
+X};
+X
+Xrhost	*getrhostent();
+Xhosts	*tcpaccept();
+Xhosts	*findhostaddr();
+Xhosts	*findhostname();
+Xhosts	*newhost();
+Xl_list	*toplist();
+Xl_list	*bottomlist();
+Xl_list	*addlist();
+Xl_list	*deletelist();
+Xprocess *newprocess();
+Xprocess	*findprocess();
+Xprocess	*change_to_proc();
+Xprocess	*add_new_process();
+Xusers	*finduid();
+Xusers	*findusername();
+Xusers	*newuser();
+Xrusers	*findremuid();
+Xrusers	*findrusername();
+Xrusers	*newruser();
+Xchar	**newname();
+Xchar	*copy();
+Xchar	*malloc();
+Xchar	*realloc();
+Xchar	*get_data_buf();
+Xshort	*newshortlist();
+SHAREOF
+chmod 444 remote/server.h
+
+

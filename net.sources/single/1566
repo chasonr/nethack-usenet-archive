@@ -1,0 +1,2413 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,7d3eb5cfc870857,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-08-27 07:23:18 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 beta 3/9/83; site x.UUCP
+Path: utzoo!linus!decvax!genrad!mit-eddie!frog!x!john
+From: john@x.UUCP (John Woods)
+Newsgroups: net.sources
+Subject: Modified XLISP, part 2 of 5
+Message-ID: <137@x.UUCP>
+Date: Mon, 27-Aug-84 10:23:18 EDT
+Article-I.D.: x.137
+Posted: Mon Aug 27 10:23:18 1984
+Date-Received: Sat, 15-Sep-84 07:40:43 EDT
+Reply-To: frog!john
+Organization: Charles River Data Systems, Framingham MA
+Lines: 2392
+
+This represents part 2 of 5 of my modified XLISP.  Tear at the dotted line,
+and run "sh" over it to extract.
+
+Thanks to Dave Betz for providing the original XLISP.
+________________________________________________________________
+echo extract with /bin/sh, not /bin/csh
+echo x xleval.c
+sed -n -e 's/^X//p' > xleval.c << '!Funky!Stuff!'
+X			  /* XLISP evaluation module */
+X
+X#ifdef CI_86
+X#include "a:stdio.h"
+X#include "xlisp.h"
+X#endif
+X
+X
+X#ifdef AZTEC
+X#include "a:stdio.h"
+X#include "a:setjmp.h"
+X#include "xlisp.h"
+X#endif
+X
+X#ifdef unix
+X#include <stdio.h>
+X#include <setjmp.h>
+X#include "xlisp.h"
+X#endif
+X
+X
+X			     /* global variables */
+X    struct node *xlstack;
+X				/* trace stack */
+X    static struct node *trace_stack[TDEPTH];
+X    static int trace_pointer = -1;
+X
+X			    /* external variables */
+X    extern struct node *self;
+X    extern struct node *xlenv;
+X    extern struct node *Lambda, *Subrprop, *Fsubrprop, *Exprop, *Fexprop,
+X				*Macprop;
+X    extern struct node *xlget();
+X
+X			      /* local variables */
+X    static struct node *slash;
+X    static struct node *argatom;
+X
+X#ifdef HACK
+X	   /* forward declarations (the extern hack is for decusc) */
+X    extern struct node *evlist();
+X    extern struct node *evsym();
+X    extern struct node *evfun();
+X#endif
+X
+X		    /***************************************
+X		    *  eval - the builtin function 'eval'  *
+X		    ***************************************/
+X
+Xstatic struct node *eval(args)
+X    struct node *args;
+X{
+X    struct node *oldstk,expr,*val;
+X
+X    oldstk = xlsave(&expr,NULL);                 /* Create new stack frame */
+X
+X    expr.n_ptr = xlarg(&args);                   /* Expression to evaluate */
+X    xllastarg(args);                             /* No more args ! */
+X
+X    val = xleval(expr.n_ptr);                    /* Do evaluation */
+X
+X    xlstack = oldstk;                            /* Restore old stack frame */
+X    return (val);
+X}
+X
+X		   /******************************************
+X		   *  xleval - evaluate an xlisp expression  *
+X		   ******************************************/
+X
+X
+Xstruct node *xleval(expr)
+X    struct node *expr;
+X{
+X    if (expr == NULL)                            /* Null evaluates to null */
+X	return (NULL);
+X
+X    switch (expr->n_type)                        /* Value type */
+X    {
+X    case LIST:
+X	    return (evlist(expr));
+X
+X    case SYM:
+X	    return (evsym(expr));
+X
+X    case INT:
+X    case STR:
+X    case SUBR:
+X    case FSUBR:
+X    case REAL:
+X	    return (expr);
+X
+X    default:
+X	    xlfail("can't evaluate expression");
+X    }
+X}
+X
+X		     /*************************************
+X		     *  xlsave - save nodes on the stack  *
+X		     *************************************/
+X
+Xstruct node *xlsave(n)
+X    struct node *n;
+X{
+X    struct node **nptr,*oldstk;
+X
+X    oldstk = xlstack;                            /* Save old stack pointer */
+X
+X    for (nptr = &n; *nptr != NULL; nptr++)       /* Save for each node */
+X    {
+X	(*nptr)->n_type = LIST;
+X	(*nptr)->n_listvalue = NULL;
+X	(*nptr)->n_listnext = xlstack;
+X	xlstack = *nptr;
+X    }
+X
+X    return (oldstk);                             /* Return old stack pointer */
+X}
+X
+X			/******************************
+X			 * funcall - builtin func.    *
+X			 ******************************/
+Xstatic struct node *funcall(args)
+X    struct node *args;
+X{
+X	struct node *oldstk,fun,arglist, *val;
+X
+X	oldstk = xlsave(&fun,&arglist,NULL);
+X	fun.n_ptr = xlarg(&args);
+X	val = xlapply(fun.n_ptr,args);
+X	xlstack = oldstk;
+X	return val;
+X}
+X
+X
+X			 /*****************************
+X			 *  apply - builtin function  *
+X			 *****************************/
+X
+Xstatic struct node *apply(args)
+X    struct node *args;
+X{
+X	struct node *oldstk,fun,arglist, *val;
+X
+X	oldstk = xlsave(&fun,&arglist,NULL);
+X	fun.n_ptr = xlarg(&args);
+X	arglist.n_ptr = xlarg(&args);
+X	xllastarg(args);
+X	val = xlapply(fun.n_ptr,arglist.n_ptr);
+X	xlstack = oldstk;
+X	return val;
+X}
+X
+Xstruct node *xlapply(funp,arglist)
+Xstruct node *funp,*arglist;
+X{
+X    struct node *val,*oldstk,nptr;
+X
+X    oldstk = xlsave(&nptr,NULL);
+X
+X    nptr.n_ptr = newnode(LIST);			/* cons up trace entry */
+X    nptr.n_ptr->n_listvalue = funp;
+X    nptr.n_ptr->n_listnext = arglist;
+X
+X    tpush(nptr.n_ptr);                          /* Add trace entry */
+X
+X    if (funp == NULL) xlfail("null function");
+X    if (funp->n_type == SYM)
+X    {	if ((funp = evsym(funp)) == NULL
+X	&&  (funp = xlget(funp,Subrprop)) == NULL
+X	&&  (funp = xlget(funp,Fsubrprop)) == NULL
+X	&&  (funp = xlget(funp,Exprop)) == NULL
+X	&&  (funp = xlget(funp,Exprop)) == NULL
+X	&&  (funp = xlget(funp,Macprop)) == NULL)
+X		xlfail("null function");
+X    }
+X
+X    switch (funp->n_type)                   /* Evaluate function */
+X    {
+X    case FSUBR:
+X    case SUBR:
+X	    val = (*funp->n_subr)(arglist);
+X	    break;
+X
+X    case LIST:
+X	    val = evfun(funp,arglist);
+X	    break;
+X
+X    case OBJ:
+X	    val = xlsend(funp,arglist);
+X	    break;
+X
+X    default:
+XBadFun:
+X	    xlfail("bad function");
+X    }
+X
+X    xlstack = oldstk;                            /* Restore old stack frame */
+X    tpop();                                      /* Remove trace entry */
+X    return (val);                                /* and return result value */
+X}
+X			 /*****************************
+X			 *  evlist - evaluate a list  *
+X			 *****************************/
+X
+Xstatic struct node *evlist(nptr)
+X    struct node *nptr;
+X{
+X    struct node *oldstk,fun,args,*val, *funp, formarg;
+X    int funny = 0, macro=0;
+X
+X    oldstk = xlsave(&fun,&args,&formarg,NULL);  /* Creat a stack frame */
+X
+X    fun.n_ptr = nptr->n_listvalue;               /* Get function and arg list*/
+X    args.n_ptr = nptr->n_listnext;
+X
+X    tpush(nptr);                                 /* Add trace entry */
+X
+X    if (fun.n_ptr == Lambda)		/* lambda form is self-literal */
+X    {   
+X	val = nptr;
+X	goto out;
+X    }
+X
+X	/* get a function from the first expression */
+X    if ( fun.n_ptr->n_type == SYM) {
+X	if ((funp = xlget(fun.n_ptr,Subrprop)) 
+X	||  ((funp = xlget(fun.n_ptr,Fsubrprop)) && (funny=1))
+X	||  (funp = xlget(fun.n_ptr,Exprop))
+X	||  ((funp = xlget(fun.n_ptr,Fexprop)) && (funny=1))
+X	||  ((funp = xlget(fun.n_ptr,Macprop)) && (macro=1)))
+X	{	fun.n_ptr = funp;
+X		goto doit;
+X	}
+X    }
+X	/* last resort: evaluation */
+X    if ((fun.n_ptr = xleval(fun.n_ptr)) == NULL)
+X	xlfail("null function");
+X
+Xdoit:
+X    switch (fun.n_ptr->n_type)                   /* Evaluate function */
+X    {
+X    case SUBR:
+X	    if (!funny) args.n_ptr = xlevlis(args.n_ptr);
+X	    /* fall through to raw apply code */
+X    case FSUBR:
+X	    val = (*fun.n_ptr->n_subr)(args.n_ptr);
+X	    break;
+X
+X    case LIST:
+X		/* macros and fexprs get a single argument:
+X		   macro: the original form
+X		   fexpr: the actual parameters (unevaluated)
+X		 */
+X	    if (funny || macro) {
+X		formarg.n_ptr = newnode(LIST);
+X		formarg.n_ptr->n_listvalue = (macro? nptr : args.n_ptr);
+X	    } else {
+X		formarg.n_ptr = xlevlis(args.n_ptr);
+X	    }
+X	    val = evfun(fun.n_ptr,formarg.n_ptr);
+X	    if (macro)
+X		val = xleval(val);
+X	    break;
+X
+X    case OBJ:
+X	    val = xlsend(fun.n_ptr,args.n_ptr);
+X	    break;
+X
+X    default:
+X	    xlfail("bad function");
+X    }
+Xout:
+X    xlstack = oldstk;                            /* Restore old stack frame */
+X    tpop();                                      /* Remove trace entry */
+X    return (val);                                /* and return result value */
+X}
+X
+X		 /*****************************************
+X		 *  evlis - evaluate a list of arguments  *
+X		 ******************************************/
+X
+Xstruct node *xlevlis(args)
+X	struct node *args;
+X{
+X    struct node *oldstk,arg,list,val,*last,*lptr;
+X
+X    oldstk = xlsave(&arg,&list,&val,NULL);
+X    arg.n_ptr = args;
+X
+X    for (last = NULL; arg.n_ptr != NULL; last = lptr)
+X    {
+X	val.n_ptr = xlevarg(&arg.n_ptr);
+X	lptr = newnode(LIST);
+X	if (last == NULL)
+X	    list.n_ptr = lptr;
+X	else
+X	    last->n_listnext = lptr;
+X	lptr->n_listvalue = val.n_ptr;
+X    }
+X
+X    xlstack = oldstk;
+X    return (list.n_ptr);
+X}
+X
+X			 /******************************
+X			 *  evsym - evaluate a symbol  *
+X			 ******************************/
+X
+Xstatic struct node *evsym(sym)
+X    struct node *sym;
+X{
+X    struct node *lptr;
+X
+X    if ((lptr = xlobsym(sym)) != NULL)           /* Check for current object */
+X	return (lptr->n_listvalue);
+X    else
+X	return (sym->n_symvalue);
+X}
+X
+X
+X			/********************************
+X			*  evfun - evaluate a function  *
+X			********************************/
+X
+Xstatic struct node *evfun(fun,args)
+X    struct node *fun,*args;
+X{
+X    struct node *oldenv,*oldstk,cptr,*fargs,*val;
+X    int lexpr = 0;
+X
+X    oldstk = xlsave(&cptr,NULL);                 /* Creat a new stack frame */
+X
+X    if (fun->n_listvalue != Lambda)
+X	xlfail("Bad functional argument");
+X    fun = fun->n_listnext;
+X    /* get the formal argument list */
+X    if ((fargs = fun->n_listvalue) != NULL && fargs->n_type != LIST)
+X    {	if (fargs->n_type != SYM)
+X		xlfail("bad argument list");
+X	lexpr = 1;
+X    }
+X
+X    oldenv = xlenv;                              /*Bind the formal parameters*/
+X    if (lexpr)
+X	xlLbind(fargs,args);
+X    else
+X	xlabind(fargs,args);
+X    xlfixbindings(oldenv);
+X
+X    for (cptr.n_ptr = fun->n_listnext; cptr.n_ptr != NULL; )    /* execute */
+X	val = xlevarg(&cptr.n_ptr);	/* eval forms of body */
+X
+X    xlunbind(oldenv);                            /* Restore environment */
+X    if (lexpr)	/* pop lexpr stack */
+X	xlputprop(argatom,xlget(argatom,argatom)->n_listnext,argatom);
+X    xlstack = oldstk;                            /* ..then the stack frame */
+X    return (val);                                /* ...and return result */
+X}
+X
+X		/****************************************
+X		 * xlLbind - bind arguments for a lexpr *
+X		 ****************************************/
+XxlLbind(farg,arglist) struct node *farg, *arglist;
+X{
+X    struct node *oldstk,al,num,*ptr;
+X    int i;
+X
+X    oldstk = xlsave(&num,&al,NULL);      /* Create a stack frame */
+X
+X    /* step one: count the arguments */
+X    for (i = 0, ptr = arglist; ptr != NULL; ptr = ptr->n_listnext, i++)
+X	;
+X
+X    num.n_ptr = newnode(INT);
+X    num.n_ptr->n_int = i;
+X
+X    xlbind(farg,num.n_ptr);
+X
+X    /* now leave arg list where it will be handy */
+X    al.n_ptr = newnode(LIST);
+X    al.n_ptr->n_listnext = xlget(argatom,argatom);
+X    al.n_ptr->n_listvalue = arglist;
+X    xlputprop(argatom, al.n_ptr, argatom);
+X
+X    xlstack = oldstk;
+X}
+X
+X		/************************************************
+X		*  xlabind - bind the arguments for a function  *
+X		************************************************/
+X
+Xxlabind(fargs,aargs)
+X    struct node *fargs,*aargs;
+X{
+X    struct node *val;
+X
+X    while (fargs != NULL && aargs != NULL)  /* evaluate and bind */
+X    {
+X	if (fargs->n_listvalue == slash)    /* Check for local separator*/
+X	    break;
+X
+X	val = xlarg(&aargs);          /* Get the arg */
+X	xlbind(fargs->n_listvalue,val);    /* and bind to formal */
+X
+X	fargs = fargs->n_listnext;     /* Move pointer ahead */
+X    }
+X
+X						 /* check for local variables*/
+X    if (fargs != NULL && fargs->n_listvalue == slash)
+X	while ((fargs = fargs->n_listnext) != NULL)
+X	    xlbind(fargs->n_listvalue,NULL);
+X
+X    if (fargs != aargs)                /* Check for correct # */
+X	xlfail("incorrect number of arguments to a function");
+X}
+X
+X
+X
+X		      /************************************
+X		      *  xlfail - error handling routine  *
+X		      ************************************/
+Xxlfail(err)
+X    char *err;
+X{
+X    printf("error: %s\n",err);         /* Print the error message */
+X    self = NULL;		       /* reset object package */
+X    xlunbind(NULL);                    /* Unbind any bound symbols */
+X    xltin(TRUE);                       /* Restore input to terminal */
+X    trace();                           /* Do the back trace */
+X    trace_pointer = -1;
+X    xlabort();                         /* Restart */
+X}
+X
+X
+X		  /********************************************
+X		  *  tpush - add an entry to the trace stack  *
+X		  ********************************************/
+X
+Xstatic tpush(nptr)
+X    struct node *nptr;
+X{
+X    if (++trace_pointer < TDEPTH)
+X	trace_stack[trace_pointer] = nptr;
+X}
+X
+X
+X
+X		 /*********************************************
+X		 *  tpop - pop an entry from the trace stack  *
+X		 *********************************************/
+X
+Xstatic tpop()
+X{
+X    trace_pointer--;
+X}
+X
+X
+X
+X			  /****************************
+X			  *  trace - do a back trace  *
+X			  ****************************/
+X
+Xstatic trace()
+X{
+X    for (; trace_pointer >= 0; trace_pointer--)
+X	if (trace_pointer < TDEPTH)
+X	 {
+X	    xlprint(trace_stack[trace_pointer],TRUE);
+X	    putchar('\n');
+X	}
+X}
+X
+X/*****************************************************************
+X *** THE FOLLOWING ROUTINES IMPLEMENT THE PROG FEATURE, WHICH  ***
+X *** IS INTIMATELY TIED UP WITH EVALUATION (UNFORTUNATELY)     ***
+X *****************************************************************/
+X
+Xstatic struct node *progstk, *returnval, *goatom;
+X
+X		/**************************************
+X		 * prog - bind locals to nil and loop *
+X		 **************************************/
+X
+Xstatic struct node *prog(args)
+Xstruct node *args;
+X{
+X	struct node *locals, *oldenv, *val;
+X		/* bind locals to nil */
+X	oldenv = xlenv;
+X	locals = xlarg(&args);
+X	for ( ; locals != NULL; locals = locals->n_listnext)
+X		xlbind(locals->n_listvalue, NULL);
+X	xlfixbindings(oldenv);		/* make bindings available */
+X
+X	val = doprog(args,NULL,NULL,NULL,1);	/* 1 is no good pointer */
+X	xlunbind(oldenv);
+X	return val;
+X}
+X
+X		/*******************************
+X		 * olddo - MACLISP oldstyle do *
+X		 *******************************/
+Xstatic struct node *olddo(args) struct node *args;
+X{
+X	struct node *var, *init, *rpt, *endtest, *val, *oldenv;
+X
+X	var = xlarg(&args);
+X	if (var && var->n_type != SYM)
+X		xlfail("bad do variable");
+X	init = xlarg(&args);
+X	rpt = xlarg(&args);
+X	endtest = xlarg(&args);
+X
+X	oldenv = xlenv;
+X	if (var)
+X		xlbind(var,xleval(init));
+X	xlfixbindings(oldenv);
+X	val = doprog(args,var,init,rpt,endtest);
+X	xlunbind(oldenv);
+X	return val;
+X}
+X
+X		/***********************
+X		 * do/prog common code *
+X		 ***********************/
+X
+Xstatic struct node *doprog(forms,var,init,rpt,endtest)
+Xstruct node *forms, *var, *init, *rpt, *endtest;
+X{
+X	jmp_buf progjmp;
+X	int x, tracesave;
+X	struct node *oldstk, *nowstk, val, new, *ip, *nowenv;
+X
+X	oldstk = xlsave(&val, &new, NULL);
+X	nowstk = xlstack;
+X
+X		/* push entry onto prog stack */
+X	new.n_ptr = newnode(PROGSTK);
+X	new.n_ptr->n_progval = &progjmp;
+X	new.n_ptr->n_prognext = progstk;
+X	progstk = new.n_ptr;
+Xtop:
+X	nowenv = xlenv;			/* record current environment */
+X		/* save trace pointer */
+X	tracesave = trace_pointer;
+X		/* set interpretation pointer */
+X	ip = forms;
+X	val.n_ptr = NULL;		/* set return value */
+X	/* evaluate endtest first time */
+X	if (endtest != 1 && xleval(endtest))
+X		goto byebye;
+X	/* loop on forms */
+X	while (ip != NULL) {
+X		if (x = setjmp(progjmp)) {
+X			if (x == RETURN) {
+X				val.n_ptr = returnval;
+X				goto byebye;
+X			}
+X			/* else is a go */
+X			for (ip = forms;
+X			     ip != NULL && !xeq(goatom,ip->n_listvalue);
+X			     ip = ip->n_listnext)
+X				continue;
+X			if (ip == NULL) {
+X				if (!progstk)	xlfail("go target not found");
+X				/* else resignal */
+X				progstk = progstk->n_prognext;
+X				longjmp(progstk->n_progval,GO);
+X			}
+X			/* reset everything */
+X			xlstack = nowstk;
+X			xlunbind(nowenv);
+X			xlenv   = nowenv;
+X			trace_pointer = tracesave;
+X			/* point after atom */
+X			ip = ip->n_listnext;
+X			continue;
+X		}
+X		if (ip->n_listvalue->n_type != SYM)
+X			val.n_ptr = xleval(ip->n_listvalue);
+X		ip = ip->n_listnext;
+X	}
+X	/* for do, compute end test */
+X	if (endtest != 1) { /* no good pointer */
+X		if (var)
+X			var->n_symvalue = xleval(rpt);
+X		if (xleval(endtest) == NULL)
+X			goto top;
+X	}
+Xbyebye:
+X	/* prepare to exit */
+X	trace_pointer = tracesave;
+X	progstk = progstk->n_prognext;
+X	xlstack = oldstk;
+X	return val.n_ptr;
+X}
+X
+Xstatic struct node *go(args) struct node *args;
+X{
+X	struct node *oldstk, sym, *arg;
+X
+X	if (!progstk) xlfail("go no prog");
+X
+X	oldstk = xlsave(&sym,NULL);
+X	sym.n_ptr = xlarg(&args);
+X	xllastarg(args);
+X
+X	while(sym.n_ptr && sym.n_ptr->n_type != SYM)
+X		sym.n_ptr = xleval(sym.n_ptr);
+X	if (sym.n_ptr == NULL)
+X		xlfail("can't go nil");
+X	goatom = sym.n_ptr;
+X	xlstack = oldstk;
+X	longjmp(progstk->n_progval,GO);
+X}
+X
+Xstatic struct node *retrn(args) struct node *args;
+X{
+X	if (!progstk) xlfail("go no prog");
+X
+X	returnval = xlarg(&args);
+X	xllastarg(args);
+X
+X	longjmp(progstk->n_progval,RETURN);
+X}
+X
+Xstatic struct node *progn(args) struct node *args;
+X{
+X	struct node *oldstk, val;
+X	oldstk = xlsave(&val,NULL);
+X	while (args)
+X		val.n_ptr = xlevarg(&args);
+X	xlstack = oldstk;
+X	return val.n_ptr;
+X}
+X
+Xstatic struct node *prog2(args) struct node *args;
+X{
+X	struct node *oldstk, val;
+X	int i = 0;
+X	oldstk = xlsave(&val,NULL);
+X	while (args)
+X		if (++i == 2) val.n_ptr = xlevarg(&args);
+X		else xlevarg(&args);
+X	xlstack = oldstk;
+X	return val.n_ptr;
+X}
+X
+X		/*********************************************************
+X		 * arg - select an argument of the current lexpr	 *
+X		 * cdr down current arg property of arg atom count times *
+X		 *********************************************************/
+Xstruct node *arg(args) struct node *args;
+X{
+X	struct node *val;
+X	int i;
+X
+X	val = xlmatch(INT,&args);
+X	xllastarg(args);
+X	if ( ( i = val->n_int) < 1)	xlfail("bad count to ARG");
+X	if ((val = xlget(argatom,argatom)) == NULL)
+X		xlfail("no lexpr active");
+X	val = val->n_listvalue;
+X	for ( ; --i > 0 && val != NULL ; val = val->n_listnext) ;
+X	if (!val) xlfail("bad count to arg");
+X	return val->n_listvalue;
+X}
+X
+X		/*********************************************************
+X		 * setarg - set an argument of the current lexpr	 *
+X		 * cdr down current arg property of arg atom count times *
+X		 *********************************************************/
+Xstruct node *setarg(args) struct node *args;
+X{
+X	struct node *val, *to;
+X	int i;
+X
+X	val = xlmatch(INT,&args);
+X	to = xlarg(&args);
+X	xllastarg(args);
+X	if ( ( i = val->n_int) < 1)	xlfail("bad count to ARG");
+X	if ((val = xlget(argatom,argatom)) == NULL)
+X		xlfail("no lexpr active");
+X	val = val->n_listvalue;
+X	for ( ; --i > 0 && val != NULL ; val = val->n_listnext) ;
+X	if (!val) xlfail("bad count to arg");
+X	return (val->n_listvalue = to);
+X}
+X
+X		    /***************************************
+X		    *  xleinit - initialize the evaluator  *
+X		    ***************************************/
+X
+Xxleinit()
+X{
+X    slash = xlenter("/");              /* the local variable separator */
+X
+X    trace_pointer = -1;                /* Initialize debugging */
+X
+X    xlsubr("eval",eval);               /* Built in functions from this module*/
+X    xlsubr("apply",apply);
+X    xlsubr("funcall",funcall);
+X    xlsubr("arg",arg);
+X    argatom = xlenter("arg");
+X    xlsubr("setarg",setarg);
+X    xlfsubr("prog",prog);
+X    xlfsubr("do",olddo);
+X    xlsubr("return",retrn);
+X    xlfsubr("go",go);
+X    xlfsubr("prog2",prog2);
+X    xlfsubr("progn",progn);
+X}
+!Funky!Stuff!
+echo x xlext.c
+sed -n -e 's/^X//p' > xlext.c << '!Funky!Stuff!'
+X		   /* xlextensions - xlisp wild extensions */
+X
+X#ifdef CI_86
+X#include "a:stdio.h"
+X#include "xlisp.h"
+X#endif
+X
+X#ifdef AZTEC
+X#include "a:stdio.h"
+X#include "xlisp.h"
+X#endif
+X
+X#ifdef unix
+X#include <stdio.h>
+X#include "xlisp.h"
+X#endif
+X
+X
+X			    /* external variables */
+X
+Xextern struct node *xlstack;
+Xextern struct node *oblist;
+Xextern struct node *xlapply();
+Xextern int (*xlofun)();
+Xextern int xeq(), xequal();
+Xextern int xlstrout();
+X
+X			/* global variables sourced here */
+Xstruct node *strstk = 0;
+X
+X			/* local variables */
+Xstatic struct node *t;
+X
+X		/*************************************************
+X		 * putprop - put a property indicator on a plist *
+X		 *************************************************/
+Xstatic struct node *putprop(args)
+Xstruct node *args;
+X{
+X	struct node *atom,*value,*prop;
+X
+X	atom = xlmatch(SYM,&args);
+X	value = xlarg(&args);
+X	prop = xlarg(&args);
+X	xllastarg(args);
+X
+X	return xlputprop(atom,value,prop);
+X}
+X
+Xstruct node *xlputprop(atom,value,prop) struct node *atom,*value,*prop;
+X{	struct node *oldstk,list,*lptr;
+X	oldstk = xlsave(&list,NULL);
+X
+X	/* see if property already exists */
+X	for (lptr = atom->n_plist; lptr != NULL;
+X			lptr = lptr->n_listnext->n_listnext)
+X	{	if (xeq(prop,lptr->n_listvalue)) {
+X			lptr->n_listnext->n_listvalue = value;
+X			xlstack = oldstk;
+X			return value;
+X		}
+X	}
+X	if (value != NULL)	/* if null, is to be "deleted" */
+X	{	/* add property */
+X		list.n_ptr = newnode(LIST);
+X		list.n_ptr->n_listvalue = prop;
+X		list.n_ptr->n_listnext = newnode(LIST);
+X		list.n_ptr->n_listnext->n_listvalue = value;
+X		list.n_ptr->n_listnext->n_listnext = atom->n_plist;
+X		atom->n_plist = list.n_ptr;
+X	}
+X	xlstack = oldstk;
+X	return value;
+X}
+X
+X 		       /***************************************
+X		       *  get - get key from property list    *
+X		       ****************************************/
+Xstatic struct node *get(args)
+Xstruct node *args;
+X{
+X	struct node *atom,*val,*prop;
+X
+X	atom = xlmatch(SYM,&args);
+X	prop = xlarg(&args);
+X	xllastarg(args);
+X	return xlget(atom,prop);
+X}
+X
+Xstruct node *xlget(atom,prop) struct node *atom, *prop;
+X{	struct node *lptr;
+X
+X	/* see if property already exists */
+X	for (lptr = atom->n_plist; lptr != NULL;
+X			lptr = lptr->n_listnext->n_listnext)
+X	{	if (xeq(prop,lptr->n_listvalue)) {
+X			return lptr->n_listnext->n_listvalue;
+X		}
+X	}
+X	return NULL;
+X}
+X
+X 		       /***************************************
+X		       *  remprop - remove from property list *
+X		       ****************************************/
+Xstatic struct node *remprop(args)
+Xstruct node *args;
+X{
+X	struct node *atom,*prop;
+X
+X	atom = xlmatch(SYM,&args);
+X	prop = xlarg(&args);
+X	xllastarg(args);
+X	return xlremprop(atom,prop);
+X}
+X
+Xstruct node *xlremprop(atom,prop) struct node *atom, *prop;
+X{	struct node *val,*lptr,*last;
+X
+X	/* see if property already exists */
+X	if (atom->n_plist == NULL) return NULL;
+X	if (xeq(atom->n_plist->n_listvalue,prop))
+X		atom->n_plist = atom->n_plist->n_listnext->n_listnext;
+X	else
+X		for (last = atom->n_plist,
+X		     lptr = last->n_listnext->n_listnext;
+X		     lptr != NULL;
+X		     last = lptr,
+X		     lptr = lptr->n_listnext->n_listnext)
+X		{	if (xeq(prop,lptr->n_listvalue)) {
+X			       last->n_listnext = lptr->n_listnext->n_listnext;
+X				break;
+X			}
+X		}
+X	return NULL;
+X}
+X
+Xstatic struct node *shellc(args) struct node *args;
+X{
+X	struct node *thing = xlmatch(STR,&args);
+X	xllastarg(args);
+X	if (system(thing->n_str) == 0)
+X		return t;
+X	return NULL;
+X}
+X
+X	/********************************************************
+X	 * The following routines implement output to strings,  *
+X	 * with recursive stacking of output strings		*
+X	 ********************************************************/
+X
+Xstrstart()	/* strstart - begin a level of string output */
+X{	struct node *oldstk, new;
+X	int strout();
+X
+X	oldstk = xlsave(&new,NULL);
+X
+X	/* cons up three list cells, a string, and 2 ints */
+X	new.n_ptr = newnode(LIST);
+X	new.n_ptr->n_listvalue = newnode(INT);
+X	new.n_ptr->n_listnext = strstk;
+X	strstk = new.n_ptr;
+X	strstk->n_listvalue->n_int = xlofun;	/* current output function */
+X
+X	new.n_ptr = newnode(LIST);
+X	new.n_ptr->n_listvalue = newnode(INT);
+X	new.n_ptr->n_listnext = strstk;
+X	strstk = new.n_ptr;
+X	strstk->n_listvalue->n_int = 1024;		/* init. buffer size */
+X
+X	new.n_ptr = newnode(LIST);
+X	new.n_ptr->n_listvalue = newnode(STR);
+X	new.n_ptr->n_listnext = strstk;
+X	strstk = new.n_ptr;
+X	strstk->n_listvalue->n_str = stralloc(1023);	/* initial buffer */
+X	strstk->n_listvalue->n_str[0] = 0;
+X
+X	xlofun = &strout;
+X	xlstack = oldstk;
+X}
+X
+X#define BUFFER	(strstk->n_listvalue->n_str)
+X#define SIZE	(strstk->n_listnext->n_listvalue->n_int)
+X
+Xstrout(s) char *s;
+X{
+X	int n = strlen(s);
+X	char *p;
+X
+X	if (n + strlen(BUFFER) + 1 > SIZE) {
+X		p = stralloc(SIZE += (n > 1024 ? n : 1024) - 1);
+X		strcpy(p,BUFFER);
+X		strfree(BUFFER);
+X		BUFFER = p;
+X	}
+X	strcat(BUFFER,s);
+X}
+X
+Xstruct node *strpop()		/* pop current level of string output */
+X{
+X	struct node *rv;
+X
+X	if (strstk == NULL) return NULL;
+X	rv = strstk->n_listvalue;
+X	strstk = strstk->n_listnext->n_listnext;
+X	xlofun = strstk->n_listvalue->n_int;
+X	strstk = strstk->n_listnext;
+X	return rv;
+X}
+X
+Xstroflush() 			/* flush ALL layers of string output */
+X{
+X	strstk = NULL;
+X	xlofun = xlstrout;
+X}
+X
+X		/*****************************************************
+X		 * explode, explodec - make a list of the characters *
+X		 * in the printed representation of a lisp object    *
+X		 *****************************************************/
+X
+Xstatic struct node *explode(args) struct node *args;
+X{
+X	return boom(args,TRUE);	/* slashify */
+X}
+Xstatic struct node *xplodec(args) struct node *args;
+X{
+X	return boom(args,FALSE);	/* no slashify */
+X}
+Xstatic struct node *boom(args,flag) struct node *args;
+X{
+X	char buf[2], *p;
+X	struct node *oldstk, *expr, *lptr = NULL, list, prt;
+X
+X	oldstk = xlsave(&list, &prt, NULL);
+X
+X	expr = xlarg(&args);	xllastarg(args);
+X
+X	strstart();	/* set output into a string */
+X	xlprint(expr,flag);
+X	prt.n_ptr = strpop();	/* get that string */
+X
+X	buf[1] = 0;
+X	for (p = prt.n_ptr->n_str; *p; p++)
+X	{	if (!list.n_ptr) {
+X			list.n_ptr = lptr = newnode(LIST);
+X		} else {
+X			lptr->n_listnext = newnode(LIST);
+X			lptr = lptr->n_listnext;
+X		}
+X		buf[0] = *p;
+X		lptr->n_listvalue = xlenter(buf);
+X	}
+X	xlstack = oldstk;
+X	return list.n_ptr;
+X}
+X
+Xstatic struct node *implode(args) struct node *args;
+X{
+X	struct node *oldstk, arglist, *at, *sym;
+X	char buffer[STRMAX], *p = buffer;
+X
+X	oldstk = xlsave(&arglist,NULL);
+X
+X	arglist.n_ptr = xlmatch(LIST,&args);
+X	
+X	while (arglist.n_ptr) {
+X		at = xlmatch(SYM,&arglist.n_ptr);
+X		if (p-buffer == STRMAX)
+X			xlfail("Too many characters to maknam");
+X		*p++ = at->n_symname[0];
+X	}
+X	*p = 0;
+X	xlstack = oldstk;
+X	return xlenter(buffer);
+X}
+X
+Xstatic struct node *maknam(args) struct node *args;
+X{
+X	struct node *oldstk, arglist, *at, *sym;
+X	char buffer[STRMAX], *p = buffer;
+X
+X	oldstk = xlsave(&arglist,NULL);
+X
+X	arglist.n_ptr = xlmatch(LIST,&args);
+X	xllastarg(args);
+X	
+X	while (arglist.n_ptr) {
+X		at = xlmatch(SYM,&arglist.n_ptr);
+X		if (p-buffer == STRMAX)
+X			xlfail("Too many characters to maknam");
+X		*p++ = at->n_symname[0];
+X	}
+X	*p = 0;
+X	xlstack = oldstk;
+X	sym = newnode(SYM);
+X	sym->n_symname = strsave(buffer);
+X	return sym;
+X}
+X
+X			/********************************************
+X			 * intern - add a symbol to the oblist if it*
+X			 * is not already there, or tell us which   *
+X			 * symbol already has this printname	    *
+X			 ********************************************/
+X
+Xstatic struct node *intern(args) struct node *args;
+X{
+X    struct node *sym = xlarg(&args), *sptr;
+X    xllastarg(args);
+X    if (sym->n_type == STR)
+X	return xlenter(sym->n_str);
+X    else if (sym->n_type != SYM)
+X	xlfail("bad argument type");
+X    /* else  SYM */
+X    if (strcmp(sym->n_symname,"nil") == 0)      /* Check for nil */
+X    return (NULL);
+X
+X    sptr = oblist->n_symvalue;     /* check for symbol already in table */
+X    while (sptr != NULL) {
+X	if (sptr->n_listvalue == NULL)		/* OOPS! */
+X	{   printf("bad oblist\n");
+X	    sptr = oblist->n_symvalue;
+X	    while (sptr != NULL) {
+X		 if (sptr->n_listvalue == NULL) xlfail("end oblist");
+X		 printf("\n%s",sptr->n_listvalue->n_symname);
+X		 sptr = sptr->n_listnext;
+X	     }
+X	}
+X	else if (sptr->n_listvalue->n_symname == NULL)
+X	    printf("bad oblist symbol\n");
+X	else
+X	if (strcmp(sptr->n_listvalue->n_symname,sym->n_symname) == 0)
+X	    return (sptr->n_listvalue);
+X	sptr = sptr->n_listnext;
+X    }
+X    /* no symbol by this name yet exists */
+X    sptr = newnode(LIST);              /* Create and link new symbol */
+X    sptr->n_listnext = oblist->n_symvalue;
+X    oblist->n_symvalue = sptr;
+X    sptr->n_listvalue = sym;
+X    return sym;
+X}
+X
+Xstatic struct node *gensym(args) struct node *args;
+X{
+X	static int counter = 0, letter = 'G';
+X	char buffer[10];
+X	struct node *sym;
+X	
+X	if (args) {
+X		sym = xlarg(&args);
+X		xllastarg(args);
+X		switch(sym->n_type) {
+X		case SYM:
+X			letter = sym->n_symname[0];
+X			break;
+X		case STR:
+X			letter = sym->n_str[0];
+X			break;
+X		case INT:
+X			counter = sym->n_int - 1;
+X			break;
+X		default:
+X			xlfail("bad argument type");
+X		}
+X		return NULL;
+X	}
+X	if (counter == 99999) counter = -1;
+X	sprintf(buffer,"%c%05u",letter,++counter);
+X	sym = newnode(SYM);
+X	sym->n_symname = strsave(buffer);
+X	return sym;
+X}
+X
+X	/*****************************************************
+X	 * assfun - look up something on an association list *
+X	 *****************************************************/
+X
+Xstatic struct node *assfun(find,list, fun)
+Xstruct node *find, *list, *(*fun)();
+X{
+X	while (list) {
+X		if (list->n_type != LIST
+X		||  list->n_listvalue->n_type != LIST)
+X			xlfail("bad assoc list");
+X		if ( (*fun) (find, list->n_listvalue->n_listvalue) )
+X			return list->n_listvalue->n_listnext;
+X		list = list->n_listnext;
+X	}
+X	return NULL;
+X}
+X
+X		/* and the associative twins, assoc and assq */
+Xstatic struct node *assoc(args) struct node *args;
+X{
+X	struct node *find, *list;
+X	find = xlarg(&args);
+X	list = xlarg(&args);
+X	xllastarg(args);
+X	return assfun(find,list, xequal);
+X}
+X
+Xstatic struct node *assq(args) struct node *args;
+X{
+X	struct node *find, *list;
+X	find = xlarg(&args);
+X	list = xlarg(&args);
+X	xllastarg(args);
+X	return assfun(find,list, xeq);
+X}
+X
+X		/************************************************
+X		*  xlxinit - xlisp ext. initialization routine  *
+X		************************************************/
+X
+Xxlxinit()
+X{
+X    /* find t */
+X    t = xlenter("t");
+X    /* builtins defined here */
+X    xlsubr("putprop",putprop);
+X    xlfsubr("defprop",putprop);
+X    xlsubr("get",get);
+X    xlsubr("remprop",remprop);
+X    xlsubr("shell",shellc);
+X    xlsubr("explode",explode);
+X    xlsubr("explodec",xplodec);
+X    xlfsubr("gensym",gensym);
+X    xlsubr("implode",implode);
+X    xlsubr("maknam",maknam);
+X    xlsubr("intern",intern);
+X    xlsubr("assoc",assoc);
+X    xlsubr("assq",assq);
+X}
+X
+!Funky!Stuff!
+echo x xlfio.c
+sed -n -e 's/^X//p' > xlfio.c << '!Funky!Stuff!'
+X			  /* xlfio - xlisp file i/o */
+X
+X#ifdef CI_86
+X#include "a:stdio.h"
+X#include "xlisp.h"
+X#endif
+X
+X#ifdef AZTEC
+X#include "a:stdio.h"
+X#include "xlisp.h"
+X#endif
+X
+X#ifdef unix
+X#include <stdio.h>
+X#include "xlisp.h"
+X#endif
+X
+X
+X			    /* external variables */
+X
+Xextern struct node *xlstack;
+X
+X
+X			      /* local variables */
+X
+Xstatic char buf[STRMAX+1];
+X
+X
+X			   /**************************
+X			   *  xlfopen - open a file  *
+X			   **************************/
+X
+Xstatic struct node *xlfopen(args)
+X  struct node *args;
+X{
+X    struct node *oldstk,arg,fname,mode,*val;
+X    FILE *fp;
+X
+X    oldstk = xlsave(&arg,&fname,&mode,NULL);
+X    arg.n_ptr = args;
+X
+X    fname.n_ptr = xlmatch(STR,&arg.n_ptr);
+X    mode.n_ptr = xlmatch(STR,&arg.n_ptr);
+X
+X    xllastarg(arg.n_ptr);
+X
+X    if ((fp = fopen(fname.n_ptr->n_str,
+X			mode.n_ptr->n_str)) != NULL)
+X    {
+X	val = newnode(FPTR);
+X	val->n_fp = fp;
+X    }
+X    else
+X	val = NULL;
+X
+X    xlstack = oldstk;
+X    return (val);
+X}
+X
+X
+X			  /****************************
+X			  *  xlfclose - close a file  *
+X			  ****************************/
+X
+Xstatic struct node *xlfclose(args)
+X  struct node *args;
+X{
+X    struct node *fptr;
+X
+X    fptr = xlmatch(FPTR,&args);
+X
+X    xllastarg(args);
+X
+X    if (fptr->n_fp == NULL)
+X	xlfail("file not open");
+X
+X    fclose(fptr->n_fp);
+X    fptr->n_fp = NULL;
+X
+X    return (NULL);
+X}
+X
+X
+X		   /*****************************************
+X		   *  xlgetc - get a character from a file  *
+X		   *****************************************/
+X
+Xstatic struct node *xlgetc(args)
+X  struct node *args;
+X{
+X    struct node *val;
+X    FILE *fp;
+X    int ch;
+X
+X    if (args != NULL)
+X	fp = xlmatch(FPTR,&args)->n_fp;
+X    else
+X	fp = stdin;
+X
+X    xllastarg(args);
+X
+X    if (fp == NULL)
+X	xlfail("file not open");
+X
+X    if ((ch = getc(fp)) != EOF)
+X    {
+X	val = newnode(INT);
+X	val->n_int = ch;
+X    }
+X    else
+X	val = NULL;
+X
+X    return (val);
+X}
+X
+X
+X		    /***************************************
+X		    *  xlputc - put a character to a file  *
+X		    ***************************************/
+X
+Xstatic struct node *xlputc(args)
+X  struct node *args;
+X{
+X    struct node *oldstk,arg,chr;
+X    FILE *fp;
+X
+X    oldstk = xlsave(&arg,&chr,NULL);
+X    arg.n_ptr = args;
+X
+X    chr.n_ptr = xlmatch(INT,&arg.n_ptr);
+X
+X    if (arg.n_ptr != NULL)
+X	fp = xlmatch(FPTR,&arg.n_ptr)->n_fp;
+X    else
+X	fp = stdout;
+X
+X    xllastarg(arg.n_ptr);
+X
+X    if (fp == NULL)
+X	xlfail("file not open");
+X
+X    putc(chr.n_ptr->n_int,fp);
+X
+X    xlstack = oldstk;
+X    return (chr.n_ptr);
+X}
+X
+X
+X		    /***************************************
+X		    *  xlfgets - get a string from a file  *
+X		    ***************************************/
+X
+Xstatic struct node *xlfgets(args)
+X  struct node *args;
+X{
+X    struct node *str;
+X    char *sptr;
+X    FILE *fp;
+X
+X    if (args != NULL)
+X	fp = xlmatch(FPTR,&args)->n_fp;
+X    else
+X	fp = stdin;
+X
+X    xllastarg(args);
+X
+X    if (fp == NULL)
+X	xlfail("file not open");
+X
+X    if (fgets(buf,STRMAX,fp) != NULL)
+X    {
+X	str = newnode(STR);
+X	str->n_str = strsave(buf);
+X
+X	while (buf[strlen(buf)-1] != '\n')
+X	{
+X	    if (fgets(buf,STRMAX,fp) == NULL)
+X		break;
+X	    sptr = str->n_str;
+X	    str->n_str = stralloc(strlen(sptr) + strlen(buf));
+X	    strcpy(str->n_str,sptr);
+X	    strcat(str->n_str,buf);
+X	    strfree(sptr);
+X	}
+X    }
+X    else
+X	str = NULL;
+X
+X    return (str);
+X}
+X
+X
+X		     /*************************************
+X		     *  xlfputs - put a string to a file  *
+X		     *************************************/
+X
+Xstatic struct node *xlfputs(args)
+X  struct node *args;
+X{
+X    struct node *oldstk,arg,str;
+X    FILE *fp;
+X
+X    oldstk = xlsave(&arg,&str,NULL);
+X    arg.n_ptr = args;
+X
+X    str.n_ptr = xlmatch(STR,&arg.n_ptr);
+X
+X    if (arg.n_ptr != NULL)
+X	fp = xlmatch(FPTR,&arg.n_ptr)->n_fp;
+X    else
+X	fp = stdout;
+X
+X    xllastarg(arg.n_ptr);
+X
+X    if (fp == NULL)
+X	xlfail("file not open");
+X
+X    fputs(str.n_ptr->n_str,fp);
+X
+X    xlstack = oldstk;
+X    return (str.n_ptr);
+X}
+X
+X
+X		      /************************************
+X		      *  xlfinit - initialize file stuff  *
+X		      ************************************/
+X
+Xxlfinit()
+X{
+X    xlsubr("fopen",xlfopen);
+X    xlsubr("fclose",xlfclose);
+X    xlsubr("getc",xlgetc);
+X    xlsubr("putc",xlputc);
+X    xlsubr("fgets",xlfgets);
+X    xlsubr("fputs",xlfputs);
+X}
+!Funky!Stuff!
+echo x xlfmath.c
+sed -n -e 's/^X//p' > xlfmath.c << '!Funky!Stuff!'
+X
+X		/* xlmath - xlisp builtin arithmetic functions */
+X
+X#ifdef CI_86
+X#include "a:stdio.h"
+X#include "xlisp.h"
+X#endif
+X
+X#ifdef AZTEC
+X#include "a:stdio.h"
+X#include "xlisp.h"
+X#endif
+X
+X#ifdef unix
+X#include <stdio.h>
+X#include "xlisp.h"
+X#endif
+X
+X
+X			    /* external variables */
+X
+Xextern struct node *xlstack;
+X
+X
+X			      /* local variables */
+X
+Xstatic struct node *true;
+X
+X#ifdef HACK
+X	   /* forward declarations (the extern hack is for decusc) */
+X
+Xextern struct node *iarith();
+Xextern struct node *compare();
+X#endif
+X
+X			/* Comparison operator defines */
+X
+X#define  lss_op    1
+X#define  leq_op    2
+X#define  eql_op    3
+X#define  neq_op    4
+X#define  geq_op    5
+X#define  gtr_op    6
+X
+X#define  sign(n)   (((n)<0) ? -1 : (((n)>0) ? 1 : 0))
+X
+X
+X		    /****************************************
+X		    *  add - builtin function for addition  *
+X		    ****************************************/
+X
+Xstatic struct node *add(args)
+X  struct node *args;
+X{
+X    return iarith(args,'+');
+X}
+X
+X
+X		  /*******************************************
+X		  *  sub - builtin function for subtraction  *
+X		  *******************************************/
+X
+Xstatic struct node *sub(args)
+X  struct node *args;
+X{
+X    return iarith(args,'-');
+X}
+X
+X
+X		 /**********************************************
+X		 *  mul - builtin function for multiplication  *
+X		 **********************************************/
+X
+Xstatic struct node *mul(args)
+X  struct node *args;
+X{
+X    return iarith(args,'*');
+X}
+X
+X
+X		    /****************************************
+X		    *  div - builtin function for division  *
+X		    ****************************************/
+X
+Xstatic struct node *div(args)
+X  struct node *args;
+X{
+X    return iarith(args,'/');
+X}
+X
+X
+X		    /***************************************
+X		    *  mod - builtin function for modulus  *
+X		    ***************************************/
+X
+Xstatic struct node *mod(args)
+X  struct node *args;
+X{
+X    return iarith(args,'%');
+X}
+X
+X
+X		    /***************************************
+X		    *  min - builtin function for minimum  *
+X		    ***************************************/
+X
+Xstatic struct node *min(args)
+X  struct node *args;
+X{
+X    return iarith(args,'m');
+X}
+X
+X
+X		    /***************************************
+X		    *  max - builtin function for maximum  *
+X		    ***************************************/
+X
+Xstatic struct node *max(args)
+X  struct node *args;
+X{
+X    return iarith(args,'M');
+X}
+X
+X
+X		    /***************************************
+X		    *  and - builtin function for modulus  *
+X		    ***************************************/
+X
+Xstatic struct node *and(args)
+X  struct node *args;
+X{
+X    return iarith(args,'&');
+X}
+X
+X
+X		     /**************************************
+X		     *  or - builtin function for modulus  *
+X		     **************************************/
+X
+Xstatic struct node *or(args)
+X  struct node *args;
+X{
+X    return iarith(args,'|');
+X}
+X
+X
+X			     /**********************
+X			     *  not - bitwise not  *
+X			     **********************/
+X
+Xstatic struct node *not(args)
+X  struct node *args;
+X{
+X    struct node *rval;
+X    int val;
+X
+X    val = xlmatch(INT,&args)->n_int;      /* Evaluate the argument */
+X    xllastarg(args);
+X
+X    rval = newnode(INT);
+X    rval->n_int = ~val;
+X    return (rval);
+X}
+X
+Xextern double cos(), sin(), tan(), atan(), atan2(), log();
+X
+Xstatic struct node *lsin(args) struct node *args;
+X{	return mathop(args,'S');
+X}
+Xstatic struct node *lcos(args) struct node *args;
+X{	return mathop(args,'C');
+X}
+Xstatic struct node *ltan(args) struct node *args;
+X{	return mathop(args,'T');
+X}
+Xstatic struct node *latan(args) struct node *args;
+X{	return mathop(args,'t');
+X}
+Xstatic struct node *llog(args) struct node *args;
+X{	return mathop(args,'l');
+X}
+Xstatic struct node *lexp(args) struct node *args;
+X{	return mathop(args,'e');
+X}
+X
+Xstatic struct node *mathop(args,op) struct node *args;
+X{
+X	struct node *arg1, *arg2 = NULL, *rval;
+X	double a1, a2;
+X	arg1 = xlarg(&args);
+X	switch(arg1->n_type) {
+X	default:
+X		xlfail("non-numeric argument");
+X	case INT:
+X		a1 = (double) arg1->n_int;
+X		break;
+X	case REAL:
+X		a1 = arg1->n_real;
+X		break;
+X	}
+X	if (op == 't' && args != NULL)
+X	{	arg2 = xlarg(&args);
+X		switch(arg2->n_type) {
+X		case INT:	a2 = arg2->n_int; break;
+X		case REAL:	a2 = arg2->n_real; break;
+X		default:	xlfail("non-numeric argument");
+X		}
+X	}
+X	xllastarg(args);
+X	rval = newnode(REAL);
+X	switch(op) {
+X	case 'S': rval->n_real = sin(a1); break;
+X	case 'C': rval->n_real = cos(a1); break;
+X	case 'T': rval->n_real = tan(a1); break;
+X	case 't': if (!arg2) rval->n_real = atan(a1);
+X		  else	     rval->n_real = atan2(a1,a2);
+X		  break;
+X	case 'l': 
+X		if (a1 <= 0.0)
+X			xlfail("log of non-positive number");
+X		rval->n_real = log(a1);
+X		break;
+X	case 'e':
+X		rval->n_real = exp(a1);
+X		break;
+X	}
+X	return rval;
+X}
+X			   /*************************
+X			   *  abs - absolute value  *
+X			   *************************/
+Xstatic struct node *abs(args)
+X  struct node *args;
+X{
+X     return UOP(args,'A');
+X}
+X			   /*************************
+X			   *  sqrt - square root    *
+X			   *************************/
+Xstatic struct node *Sqrt(args)
+X  struct node *args;
+X{
+X    return UOP(args,'S');
+X}
+X
+Xstatic struct node *add1(args)
+X  struct node *args;
+X{
+X    return UOP(args,'+');
+X}
+Xstatic struct node *sub1(args)
+X  struct node *args;
+X{
+X    return UOP(args,'-');
+X}
+Xstatic struct node *minus(args)
+X  struct node *args;
+X{
+X    return UOP(args,'N');
+X}
+X			   /****************************
+X			   *  unary operation routine  *
+X			   *****************************/
+X
+Xstatic struct node *UOP(args,uoperator)
+X  struct node *args;
+X{
+X    struct node *rval, *argp;
+X#ifdef REALS
+X    double sqrt();
+X#endif
+X    int i;
+X
+X    switch (gettype(argp = xlarg(&args)))
+X    {
+X    case INT:
+X	xllastarg(args);
+X	rval = newnode(INT);
+X	switch(uoperator) {
+X	case 'A':
+X	    if ((rval->n_int = argp->n_int) < 0)
+X		rval->n_int = -rval->n_int;
+X	    break;
+X	case 'S':
+X	    if (argp->n_int < 0)	xlfail("sqrt of negative number");
+X	    if (argp->n_int < 4) {
+X		rval->n_int = 1;
+X		break;
+X	    }
+X	    for (i = (argp->n_int+1) / 2;
+X		 ! (i*i <= argp->n_int && i*i + 2*i + 1 > argp->n_int) ;
+X		 i = (i + argp->n_int/i) / 2) ;
+X	    rval->n_int = i;
+X	    break;
+X	case '+':
+X	    rval->n_int = argp->n_int + 1;
+X	    break;
+X	case '-':
+X	    rval->n_int = argp->n_int - 1;
+X	    break;
+X	case 'N':
+X	    rval->n_int = -argp->n_int;
+X	    break;
+X	}
+X	break;
+X
+X#ifdef REALS
+X    case REAL:
+X	 xllastarg(args);
+X	 rval = newnode(REAL);
+X	 switch(uoperator) {
+X	 case 'A':
+X		if ((rval->n_real = argp->n_real) < 0)
+X			rval->n_real =  -rval->n_real;
+X		break;
+X	 case 'S':
+X		 rval->n_real = sqrt(argp->n_real);
+X		 break;
+X	case '+':
+X	    rval->n_real = argp->n_real + 1;
+X	    break;
+X	case '-':
+X	    rval->n_real = argp->n_real - 1;
+X	    break;
+X	case 'N':
+X	    rval->n_real = -argp->n_real;
+X	    break;
+X	}
+X	break;
+X#endif
+X
+X    default:
+X	 xlfail("bad argument type");
+X    }
+X
+X    return (rval);
+X}
+X
+Xstatic int ipow(x, y) int x,y;
+X{
+X	int res = x;
+X
+X	if (y == 0) return 1;
+X	--y;	/* since res == x already */
+X	while (y>0) {
+X		if ((y & 1) == 0)	/* even power */
+X		{	res = res*res;	/* square it */
+X			y >>= 1;
+X		} else {
+X			res = res*x;
+X			y -= 1;
+X		}
+X	}
+X	return res;
+X}
+X			   /*************************
+X			   *  expt - exponent func. *
+X			   *************************/
+X
+Xstatic struct node *Expt(args)
+X  struct node *args;
+X{
+X    struct node *rval, *argxp, *argyp;
+X    double pow();
+X
+X    argxp = xlarg(&args);
+X    argyp = xlarg(&args);
+X    xllastarg(args);
+X    switch (gettype(argyp))
+X    {
+X    case INT:	/* integer power, can have integer result */
+X	switch(gettype(argxp)) {
+X		case INT:
+X		    if (argyp->n_int >= 0)
+X		    {	rval = newnode(INT);
+X			rval->n_int = ipow(argxp->n_int,argyp->n_int);
+X		    } else {
+X#ifdef REALS
+X			rval = newnode(REAL);
+X			rval->n_real = pow((double)argxp->n_int,
+X					   (double)argyp->n_int);
+X#else no REALS
+X			rval = newnode(INT);
+X			rval->n_int = 0;
+X#endif
+X		    }
+X		    break;
+X#ifdef REALS
+X		case REAL:
+X		    rval = newnode(REAL);
+X		    rval->n_real = pow(argxp->n_real,(double)argyp->n_int);
+X		    break;
+X#endif
+X		default:
+X		    xlfail("bad argument type");
+X		}
+X	break;
+X
+X#ifdef REALS
+X    case REAL:
+X	rval = newnode(REAL);
+X	switch(gettype(argxp)) {
+X	default:	xlfail("Bad argument type");
+X	case INT:
+X	    rval = newnode(REAL);
+X	    rval->n_real = pow((double)argxp->n_int,argyp->n_real);
+X	    break;
+X	case REAL:
+X	    rval = newnode(REAL);
+X	    rval->n_real = pow(argxp->n_real,argyp->n_real);
+X	    break;
+X	}
+X	break;
+X#endif
+X
+X    default:
+X	 xlfail("bad argument type");
+X    }
+X
+X    return (rval);
+X}
+X
+X
+X#ifdef REALS
+X
+X			  /****************************
+X			  *  fix - integer from real  *
+X			  ****************************/
+X
+Xstatic struct node *fix(args)
+X  struct node *args;
+X{
+X    struct node *rval, *argp;
+X
+X    switch (gettype(argp = xlarg(&args)))
+X    {
+X    case INT:
+X	 xllastarg(args);
+X	 rval = newnode(INT);
+X	 rval->n_int = argp->n_int;
+X	 break;
+X
+X    case REAL:
+X	 xllastarg(args);
+X	 rval = newnode(INT);
+X	 rval->n_int = (int) argp->n_real;
+X	 break;
+X
+X    default:
+X	 xlfail("bad argument type");
+X    }
+X
+X    return (rval);
+X}
+X
+X
+X		       /******************************
+X		       *  float - real from integer  *
+X		       ******************************/
+X
+Xstatic struct node *lfloat(args)
+X  struct node *args;
+X{
+X    struct node *rval, *argp;
+X
+X    switch (gettype(argp = xlarg(&args)))
+X    {
+X    case INT:
+X	 xllastarg(args);
+X	 rval = newnode(REAL);
+X	 rval->n_real = argp->n_int;
+X	 break;
+X
+X    case REAL:
+X	 xllastarg(args);
+X	 rval = newnode(REAL);
+X	 rval->n_real = argp->n_real;
+X	 break;
+X
+X    default:
+X	 xlfail("bad argument type");
+X    }
+X
+X    return (rval);
+X}
+X
+X
+X	       /*************************************************
+X	       *  farith - common floating arithmetic function  *
+X	       *************************************************/
+X
+Xstatic struct node *farith(ival, oldstk, arg, val, ifunct, funct)
+X    struct node *oldstk, *arg, *val;
+X    int ival;
+X    char ifunct, funct;
+X{
+X    struct node *rval;
+X    long float rslt = (long float) ival, arg_val;
+X    int arg_typ = REAL;
+X
+X    while(1)
+X    {
+X	if (arg_typ == INT)
+X	    arg_val = (long float) (val->n_ptr)->n_int;
+X	else
+X	if (arg_typ == REAL)
+X	    arg_val = (val->n_ptr)->n_real;
+X	else
+X	    xlfail("bad argument type");
+X
+X	switch (ifunct)
+X	{
+X	case '+':
+X	    rslt += arg_val;
+X	    break;
+X
+X	case '-':
+X	    rslt -= arg_val;
+X	    break;
+X
+X	case '*':
+X	    rslt *= arg_val;
+X	    break;
+X
+X	case '/':
+X	    rslt /= arg_val;
+X	    break;
+X
+X	case '%':
+X	case '&':
+X	case '|':
+X	    xlfail("bad argument type");
+X
+X	case 'm':
+X	    if (rslt > arg_val)
+X		rslt = arg_val;
+X	    break;
+X
+X	case 'M':
+X	    if (rslt < arg_val)
+X		rslt = arg_val;
+X	   break;
+X	}
+X
+X	ifunct = funct;
+X
+X	if (arg->n_ptr == NULL)
+X	     break;
+X
+X	arg_typ = gettype((val->n_ptr = xlarg(&(arg->n_ptr))));
+X    }
+X
+X    rval = newnode(REAL);
+X    rval->n_real = rslt;
+X
+X    xlstack = oldstk;
+X    return (rval);
+X}
+X#endif
+X
+X
+X		    /***************************************
+X		    *  arith - common arithmetic function  *
+X		    ***************************************/
+X
+Xstatic struct node *iarith(args,funct)
+X    struct node *args;
+X    char funct;
+X{
+X    struct node *oldstk,arg,val,*rval;
+X    int rslt, arg_val;
+X
+X    oldstk = xlsave(&arg,&val,NULL);   /* Create a new stack frame */
+X
+X    arg.n_ptr = args;                  /* Get first parameter */
+X
+X    arg_val = gettype((val.n_ptr = xlarg(&arg.n_ptr)));
+X
+X#ifdef REALS
+X    if (arg_val == REAL)
+X	 return farith(0, oldstk, &arg, &val, '+', funct);
+X#endif
+X
+X    if (arg_val != INT)
+X	xlfail("bad argument type");
+X
+X    rslt = val.n_ptr->n_int;
+X
+X    while (arg.n_ptr != NULL)
+X    {
+X	arg_val = gettype((val.n_ptr = xlarg(&arg.n_ptr)));
+X
+X#ifdef REALS
+X	if (arg_val == REAL)
+X	    return farith(rslt, oldstk, &arg, &val, funct, funct);
+X#endif
+X
+X	if (arg_val != INT)
+X	    xlfail("bad argument type");
+X
+X	arg_val = val.n_ptr->n_int;
+X
+X	switch (funct)
+X	{
+X	case '+':
+X	    rslt += arg_val;
+X	    break;
+X
+X	case '-':
+X	    rslt -= arg_val;
+X	    break;
+X
+X	case '*':
+X	    rslt *= arg_val;
+X	    break;
+X
+X	case '/':
+X	    rslt /= arg_val;
+X	    break;
+X
+X	case '%':
+X	    rslt %= arg_val;
+X	    break;
+X
+X	case '&':
+X	    rslt &= arg_val;
+X	    break;
+X
+X	case '|':
+X	    rslt |= arg_val;
+X	    break;
+X
+X	case 'm':
+X	    if (rslt > arg_val)
+X		rslt = arg_val;
+X	    break;
+X
+X	case 'M':
+X	    if (rslt < arg_val)
+X		rslt = arg_val;
+X	   break;
+X	}
+X    }
+X
+X    rval = newnode(INT);
+X    rval->n_int = rslt;
+X
+X    xlstack = oldstk;
+X    return (rval);
+X}
+X
+X
+X			    /***********************
+X			    *  land - logical and  *
+X			    ***********************/
+X
+Xstatic struct node *land(args)
+X  struct node *args;
+X{
+X    struct node *oldstk,arg,*val;
+X
+X    oldstk = xlsave(&arg,NULL);
+X    arg.n_ptr = args;
+X
+X    while (arg.n_ptr != NULL)
+X	if ((val = xlevarg(&arg.n_ptr)) == NULL)
+X	{
+X	    break;
+X	}
+X
+X    xlstack = oldstk;
+X    return (val);
+X}
+X
+X
+X			     /*********************
+X			     *  lor - logical or  *
+X			     *********************/
+X
+Xstatic struct node *lor(args)
+X  struct node *args;
+X{
+X    struct node *oldstk,arg,*val;
+X
+X    oldstk = xlsave(&arg,NULL);
+X    arg.n_ptr = args;
+X
+X    while (arg.n_ptr != NULL)
+X	if ((val = xlevarg(&arg.n_ptr)) != NULL)
+X	{
+X	    break;
+X	}
+X
+X    xlstack = oldstk;
+X    return (val);
+X}
+X
+X
+X			    /***********************
+X			    *  lnot - logical not  *
+X			    ***********************/
+X
+Xstatic struct node *lnot(args)
+X  struct node *args;
+X{
+X    struct node *val;
+X
+X    val = xlarg(&args);
+X    xllastarg(args);
+X
+X    if (val == NULL)
+X	return (true);
+X    else
+X	return (NULL);
+X}
+X
+X
+X		       /*********************************
+X		       *  lss - builtin function for <  *
+X		       *********************************/
+X
+Xstatic struct node *lss(args)
+X  struct node *args;
+X{
+X    return (compare(args,lss_op));
+X}
+X
+X
+X		       /**********************************
+X		       *  leq - builtin function for <=  *
+X		       **********************************/
+X
+Xstatic struct node *leq(args)
+X  struct node *args;
+X{
+X    return (compare(args,leq_op));
+X}
+X
+X
+X		       /**********************************
+X		       *  eql - builtin function for ==  *
+X		       **********************************/
+X
+Xstatic struct node *eql(args)
+X  struct node *args;
+X{
+X    return (compare(args,eql_op));
+X}
+X
+X
+X		       /**********************************
+X		       *  neq - builtin function for !=  *
+X		       **********************************/
+X
+Xstatic struct node *neq(args)
+X  struct node *args;
+X{
+X    return (compare(args,neq_op));
+X}
+X
+X
+X		       /**********************************
+X		       *  geq - builtin function for >=  *
+X		       **********************************/
+X
+Xstatic struct node *geq(args)
+X  struct node *args;
+X{
+X    return (compare(args,geq_op));
+X}
+X
+X
+X		       /*********************************
+X		       *  gtr - builtin function for >  *
+X		       *********************************/
+X
+Xstatic struct node *gtr(args)
+X  struct node *args;
+X{
+X    return (compare(args,gtr_op));
+X}
+X
+X
+X		     /**************************************
+X		     *  compare - common compare function  *
+X		     **************************************/
+X
+Xstatic struct node *compare(args,funct)
+X    struct node *args;
+X    int funct;
+X{
+X    struct node *oldstk,arg,arg1,arg2;
+X    int type1,type2,cmp;
+X
+X    oldstk = xlsave(&arg,&arg1,&arg2,NULL);
+X    arg.n_ptr = args;
+X
+X    type1 = gettype(arg1.n_ptr = xlarg(&arg.n_ptr));
+X    type2 = gettype(arg2.n_ptr = xlarg(&arg.n_ptr));
+X    xllastarg(arg.n_ptr);
+X
+X    if ((type1 == STR) && (type2 == STR))
+X	cmp = strcmp(arg1.n_ptr->n_str,arg2.n_ptr->n_str);
+X    else
+X
+X#ifdef REALS
+X    if (type1 == INT)
+X    {
+X	if (type2 == INT)
+X	    cmp = sign(arg1.n_ptr->n_int - arg2.n_ptr->n_int);
+X	else
+X
+X	if (type2 == REAL)
+X	    cmp = sign(arg1.n_ptr->n_int - arg2.n_ptr->n_real);
+X	else
+X	    cmp = arg1.n_ptr - arg2.n_ptr;
+X    }
+X    else
+X
+X    if (type1 == REAL)
+X    {
+X	if (type2 == INT)
+X	    cmp = sign(arg1.n_ptr->n_real - arg2.n_ptr->n_int);
+X	else
+X
+X	if (type2 == REAL)
+X	    cmp = sign(arg1.n_ptr->n_real - arg2.n_ptr->n_real);
+X	else
+X	    cmp = arg1.n_ptr - arg2.n_ptr;
+X    }
+X#else
+X
+X    if ((type1 == INT) && (type2 == INT))
+X	cmp = sign(arg1.n_ptr->n_int - arg2.n_ptr->n_int);
+X#endif
+X
+X    else
+X	cmp = arg1.n_ptr - arg2.n_ptr;
+X
+X    xlstack = oldstk;
+X
+X    switch (funct)
+X    {
+X    case lss_op:
+X	return (cmp <  0) ? true : NULL;
+X
+X    case leq_op:
+X	return (cmp <= 0) ? true : NULL;
+X
+X    case eql_op:
+X	return (cmp == 0) ? true : NULL;
+X
+X    case neq_op:
+X	return (cmp != 0) ? true : NULL;
+X
+X    case geq_op:
+X	return (cmp >= 0) ? true : NULL;
+X
+X    case gtr_op:
+X	return (cmp >  0) ? true : NULL;
+X
+X    }
+X    xlfail("bad compare operator");
+X}
+X
+X
+X		 /*********************************************
+X		 *  gettype - return the type of an argument  *
+X		 *********************************************/
+X
+Xstatic int gettype(arg)
+X  struct node *arg;
+X{
+X    if (arg == NULL)
+X	return (LIST);
+X    else
+X	return (arg->n_type);
+X}
+X
+Xstatic struct node *gcd(args) struct node *args;
+X{	struct node *arg1, *arg2, *rval;
+X	int a1, a2, r;
+X
+X	a1 = (arg1 = xlmatch(INT,&args))->n_int;
+X	a2 = (arg2 = xlmatch(INT,&args))->n_int;
+X	xllastarg(args);
+X
+X	if (a1 == 0 || a2 == 0) xlfail("zero in gcd!");
+X	if (a1 < 0) a1 = -a1;
+X	if (a2 < 0) a2 = -a2;
+X
+X	/* euclid's algorithm */
+X	if (a1 < a2) r = a1, a1 = a2, a2 = r;
+Xtop:
+X	if ((r = a1 % a2) == 0) {
+X		(rval = newnode(INT))->n_int = a2;
+X		return rval;
+X	}
+X	a1 = a2; a2 = r; goto top;
+X}
+X
+Xstatic struct node *minusp(args) struct node *args;
+X{
+X	struct node *arg = xlarg(&args);
+X	xllastarg(args);
+X	switch(gettype(arg)) {
+X	default:	xlfail("non-numeric arg");
+X	case INT:
+X		if (arg->n_int < 0) return true;
+X		return NULL;
+X	case REAL:
+X		if (arg->n_real < 0.0) return true;
+X		return NULL;
+X	}
+X}
+X
+Xstatic struct node *zerop(args) struct node *args;
+X{
+X	struct node *arg = xlarg(&args);
+X	xllastarg(args);
+X	switch(gettype(arg)) {
+X	default:	xlfail("non-numeric arg");
+X	case INT:
+X		if (arg->n_int == 0) return true;
+X		return NULL;
+X	case REAL:
+X		if (arg->n_real == 0.0) return true;
+X		return NULL;
+X	}
+X}
+X
+X		/************************************************
+X		*  xlminit - xlisp math initialization routine  *
+X		************************************************/
+X
+Xxlminit()
+X{
+X    xlsubr("+",add);		xlsubr("plus",add);
+X    xlsubr("-",sub);		xlsubr("difference",sub);
+X    xlsubr("*",mul);		xlsubr("times",mul);
+X    xlsubr("/",div);		xlsubr("quotient",div);
+X    xlsubr("%",mod);		xlsubr("remainder",mod);
+X    xlsubr("&",and);
+X    xlsubr("|",or);
+X    xlsubr("~",not);
+X    xlsubr("<",lss);		xlsubr("lessp",lss);
+X    xlsubr("<=",leq);
+X    xlsubr("==",eql);		xlsubr("=",eql);
+X    xlsubr("!=",neq);
+X    xlsubr(">=",geq);
+X    xlsubr(">",gtr);		xlsubr("greaterp",gtr);
+X    xlfsubr("&&",land);		xlfsubr("and", land);
+X    xlfsubr("||",lor);		xlfsubr("or",lor);
+X    xlsubr("!",lnot);		xlsubr("not",lnot);
+X    xlsubr("min",min);
+X    xlsubr("max",max);
+X    xlsubr("abs",abs);
+X    xlsubr("expt",Expt);
+X    xlsubr("sqrt",Sqrt);
+X    xlsubr("gcd",gcd);
+X
+X    xlsubr("add1",add1);
+X    xlsubr("sub1",sub1);
+X    xlsubr("minus",minus);
+X
+X    xlsubr("minusp",minusp);
+X    xlsubr("zerop",zerop);
+X
+X    xlsubr("cos",lcos);
+X    xlsubr("sin",lsin);
+X    xlsubr("tan",ltan);
+X    xlsubr("atan",latan);
+X    xlsubr("log",llog);
+X    xlsubr("exp",lexp);
+X
+X#ifdef REALS
+X    xlsubr("fix",fix);
+X    xlsubr("float",lfloat);
+X#endif
+X
+X    true = xlenter("t");
+X    true->n_symvalue = true;
+X}
+!Funky!Stuff!
+exit 0
+-- 
+John Woods, Charles River Data Systems, Framingham MA, (617) 626-1114
+...!decvax!frog!john, ...!mit-eddie!jfw, JFW@MIT-XX.ARPA
+
+I have absolutely nothing clever to say in this signature.
+
+

@@ -1,0 +1,468 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,a3b5aa2377428978,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-12-21 22:12:32 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!philabs!seismo!hao!hplabs!hpda!fortune!amd70!decwrl!flairvax!turtleva!ken
+From: ken@turtleva.UUCP (Ken Turkowski)
+Newsgroups: net.sources
+Subject: Graphics source in C: hsalgs/shiny_tlr.c
+Message-ID: <295@turtleva.UUCP>
+Date: Thu, 22-Dec-83 01:12:32 EST
+Article-I.D.: turtleva.295
+Posted: Thu Dec 22 01:12:32 1983
+Date-Received: Sun, 18-Dec-83 09:03:28 EST
+Lines: 450
+
+echo x - hsalgs/shiny_tlr.c
+cat >hsalgs/shiny_tlr.c <<'!Funky!Stuff!'
+
+
+
+
+/* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ 
+    shiny_tlr.c - simpler anti-aliasing tiler for convex polygons with
+		  highlights (up to 16 light sources) and transparency
+       Entries:
+     - shiny_tlr(npts,pts) - short npts;  
+			     struct { double x,y,z,r,g,b,xn,yn,zn,t; } pts[];
+NOTE!!!  needs to be loaded with rgbtiler.c to pick up initialization proc.,
+	rgbtilinit(), and BB i/o, getseg() and putseg().
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */  
+
+#define HRES 640 
+#define VRES 484 
+#define SUBPIX .01              /* minimum allowable width or height */
+#define MAX_OPAQUE .02          /* maximum transmittance considered opaque */
+#define MAXLTS	16		/* max number of light sources */
+#define MAXLONG 0x7FFFFFFF
+#define MAXFLOAT 0xFFFF7FFF   /* yes, that's right (look in the VAX manual) */
+#define TRUE   1  
+#define FALSE  0
+#define sqr(x) ((x)*(x))
+
+/* parameters for image placement in big buffer memory */
+extern short Xofset,Yofset,rgb_24bit,rgb_16bit,bw_8bit,bw_4bit,field;
+extern short hres,vres,Y_pos,xleft,xrght,cvr[642]; 
+extern double red[642],grn[642],blu[642]; 
+
+/* polygon edge data structure */
+typedef struct  {  double       xn,yn,zn;  }  edge_normal;
+typedef struct  {  double       x,r,g,b,t,ht;
+		   short        lnth;
+		   edge_normal *nml_ptr;   }  edge_position;
+
+static short num_lights;
+static double hilit_power;
+static struct { double r,g,b; }  light[MAXLTS];
+
+
+ 
+/* +++++++++++++++++++++++++ SHINY_TLR +++++++++++++++++++++++++++++++++++ */ 
+
+shiny_tlr(npts,pts,shinyness,nmls,nlts)/* tile a convex poly, taken clockwise */
+    short npts,nlts;    double shinyness; 
+    struct { double x,y,z,r,g,b,xn,yn,zn,t; } pts[];
+    struct { double xn,yn,zn,r,g,b; } nmls[][MAXLTS];
+{
+    edge_position l_edge,r_edge,l_incr,r_incr,l_old,r_old;
+    edge_normal ln_edge[MAXLTS],rn_edge[MAXLTS],ln_incr[MAXLTS],rn_incr[MAXLTS],
+		ln_old[MAXLTS],rn_old[MAXLTS];
+    short i,lpt,rpt,ptcnt,top_pt,next_line,top_line; 
+    double top,bot,lft,rgt,ceil(),floor(),fabs();
+
+    if (npts < 3) {  printf(" degenerate polygon\n");    return;   } 
+
+    hilit_power = shinyness;                            /* store hilit power */
+    num_lights = nlts;					/* and no. of lights */
+    for (i=0; i<nlts; i++)
+    {   light[i].r = nmls[0][i].r * 255.;    light[i].g = nmls[0][i].g * 255.;
+        light[i].b = nmls[0][i].b * 255.;   }
+
+    top = 0.0;    bot = VRES;    lft = HRES;    rgt = 0.; 
+    for(i=0; i<npts; i++)        /* scale to screen and find topmost vertex */
+    {   pts[i].x = hres * (pts[i].x + 1.) + SUBPIX + Xofset;
+        pts[i].y = vres * (pts[i].y + 1.) + SUBPIX + Yofset;   
+        if (pts[i].y > top)  {   top = pts[i].y; top_pt = i;   }
+ 	if (pts[i].y < bot)  bot = pts[i].y;  /* get bounding box */
+ 	if (pts[i].x < lft)  lft = pts[i].x;  /* for size check */
+ 	if (pts[i].x > rgt)  rgt = pts[i].x;
+        /* convert to 8-bit color values */ 
+        pts[i].r *= 255.;    pts[i].g *= 255.;    pts[i].b *= 255.;
+    }
+    if ((top - bot < SUBPIX) || (rgt - lft < SUBPIX))  /* ignore tiny polys */ 
+    {   printf(" rejected eensy polygon\n");    return;   } 
+
+    l_edge.lnth = r_edge.lnth = 0;                         /* scanlines left */
+    lpt = top_pt;  rpt = top_pt;                        /* vertex pointers */
+    Y_pos =  floor(top);                             /* set to top scanline */
+    next_line = FALSE;    top_line = TRUE;
+    xleft = HRES;    xrght = 0;              /* initialize segment extremes */ 
+    ptcnt = 0;     /* zero processed point count */
+
+    r_edge.x  = l_edge.x  = pts[top_pt].x;             /* load top position */
+    r_edge.r  = l_edge.r  = pts[top_pt].r; 
+    r_edge.g  = l_edge.g  = pts[top_pt].g; 
+    r_edge.b  = l_edge.b  = pts[top_pt].b; 
+    r_edge.t  = l_edge.t  = pts[top_pt].t; 
+    r_edge.ht = l_edge.ht = pts[top_pt].y - floor(pts[top_pt].y);
+    r_edge.nml_ptr = rn_edge;    l_edge.nml_ptr = ln_edge;
+    r_incr.nml_ptr = rn_incr;    l_incr.nml_ptr = ln_incr;
+    r_old.nml_ptr = rn_old;      l_old.nml_ptr = ln_old;
+    for (i=0; i<num_lights; i++)
+    {   rn_edge[i].xn = ln_edge[i].xn = nmls[top_pt][i].xn; 
+        rn_edge[i].yn = ln_edge[i].yn = nmls[top_pt][i].yn; 
+        rn_edge[i].zn = ln_edge[i].zn = nmls[top_pt][i].zn;
+    }
+
+    /* ----------------------- scan loop --------------------------------- */
+    while(ptcnt <= npts) 
+    {  
+        /* get left side bottom positions */ 
+        sh_copy(&l_edge,&l_old,ln_edge,ln_old,next_line);/* copy to top posns */
+        if ((l_edge.lnth > 0) && next_line)
+	    sh_increment(&l_edge,&l_incr,lpt,pts,nmls);
+        else if (l_edge.lnth <= 0)             /* get new edge block if nec. */
+        {   sh_mkedge(&lpt,pts,nmls,&l_edge,&l_incr,npts-1,npts);   ptcnt++;   } 
+
+        /* get right side bottom positions */ 
+        sh_copy(&r_edge,&r_old,rn_edge,rn_old,next_line);/* copy to top posns */
+        if ((r_edge.lnth > 0) && next_line) 
+	    sh_increment(&r_edge,&r_incr,rpt,pts,nmls);
+        else if (r_edge.lnth <= 0)            /* get new edge block if nec. */
+        {   sh_mkedge(&rpt,pts,nmls,&r_edge,&r_incr,npts+1,npts);   ptcnt++;   }
+
+        sh_scanseg(&l_edge,&l_old,&r_old,&r_edge,next_line | top_line);
+    
+        if ((l_edge.ht == 0.) && (r_edge.ht == 0.)) /* outpt seg if ln done */
+        {   next_line = TRUE;   putseg(xleft,xrght);   Y_pos--;   } 
+        else            next_line = FALSE; 
+
+	top_line = FALSE;
+
+	if ((Y_pos <= bot)     && (ptcnt >= npts) &&
+	    (l_edge.lnth == 0) && (r_edge.lnth == 0))  break; /* quit if done */
+    } 
+    putseg(xleft,xrght);        /* store away bottom segment */
+}
+
+
+/* ++++++++++++++++++++++++++++ SH_COPY ++++++++++++++++++++++++++++++++++++ */
+
+sh_copy(bot,top,botnml,topnml,newln) 
+		 /* copy bottom-of-scanline pos. to top-of-scanline pos. */
+    edge_position  *bot,*top;    edge_normal topnml[],botnml[];  
+{   short i;
+    top->x = bot->x;    top->ht = newln?  1. : bot->ht;
+    top->r = bot->r;    top->g = bot->g;    top->b = bot->b;
+    top->t = bot->t; 
+    for (i=0; i<num_lights; i++)
+    {   topnml[i].xn = botnml[i].xn;    topnml[i].yn = botnml[i].yn;
+	topnml[i].zn = botnml[i].zn;   }
+}
+
+
+
+/* +++++++++++++++++++++++++++ INCREMENT ++++++++++++++++++++++++++++++++++ */
+
+sh_increment(edge,incr,ptr,pts,nmls)                  /* increment edge block */
+    edge_position *edge,*incr;    short ptr; 
+    struct {  double x,y,z,r,g,b,xn,yn,zn,t;  }  pts[]; 
+    struct {  double xn,yn,zn,r,g,b;  } nmls[][MAXLTS];
+{   double floor();   short i;   edge_normal *edge_nml,*incr_nml;
+    if (edge->lnth > 1) 
+    {   edge->x += incr->x;
+        edge->r += incr->r;    edge->g += incr->g;    edge->b += incr->b;
+        edge->t += incr->t; 
+        edge->lnth--; 
+	edge_nml = edge->nml_ptr;    incr_nml = incr->nml_ptr;
+	for (i=0; i<num_lights; i++)
+	{   edge_nml[i].xn += incr_nml[i].xn;  edge_nml[i].yn += incr_nml[i].yn;
+	    edge_nml[i].zn += incr_nml[i].zn;   }
+    }
+    else
+    {   edge->x = pts[ptr].x;
+        edge->r = pts[ptr].r;   edge->g = pts[ptr].g;   edge->b = pts[ptr].b;
+        edge->t = pts[ptr].t;
+        edge->ht = pts[ptr].y - floor(pts[ptr].y);
+        edge->lnth = 0;
+	edge_nml = edge->nml_ptr;
+	for (i=0; i<num_lights; i++)
+	{   edge_nml[i].xn = nmls[ptr][i].xn;  edge_nml[i].yn = nmls[ptr][i].yn;
+	    edge_nml[i].zn = nmls[ptr][i].zn;   }
+    }
+}
+
+
+
+/* +++++++++++++++++++++++++++++ SH_SCANSEG +++++++++++++++++++++++++++++ */
+
+sh_scanseg(lbot,ltop,rtop,rbot,newln)  /* trapezoidal section of scan segment */
+    edge_position  *lbot,*ltop,*rtop,*rbot;    short newln;
+{   short left_top,rght_top,new_left,new_rght,same_slope;
+    double left_ht,rght_ht,sh_get_ht();
+    edge_position *lb,*lt,*rt,*rb,*v1,*v2,*v3,*v4;
+
+    /* allow for twisted or counterclockwise polygons */
+    if (ltop->x > rtop->x)  { lt=rtop;  rt=ltop; }  else { lt=ltop;  rt=rtop; }
+    if (lbot->x > rbot->x)  { lb=rbot;  rb=lbot; }  else { lb=lbot;  rb=rbot; }
+    
+    /* find leftmost and rightmost pixels */
+    left_top = (lt->x < lb->x)?  TRUE : FALSE; 
+    rght_top = (rt->x > rb->x)?  TRUE : FALSE;
+    
+    /* get section of scanline if new line or smaller left or bigger right */ 
+    new_left = left_top?  lt->x : lb->x;   new_rght = rght_top?  rt->x : rb->x;
+    if (newln)  { xleft = new_left;  xrght = new_rght;  getseg(xleft,xrght); } 
+    else {  if (new_rght > xrght)  {   getseg(xrght+1,new_rght);
+                                       xrght = new_rght;            } 
+            if (new_left < xleft)  {   getseg(new_left,xleft-1);
+                                       xleft = new_left;            }
+         }
+    
+    /* order left-to-right and calculate thickness at inner vertices */ 
+    if (left_top) {  v1 = lt;
+       if (rght_top) if (lb->x < rb->x) { v2=lb; v3=rb; 
+                                                        same_slope = FALSE; }
+                                   else               { v2=rb; v3=lb; 
+                                                        same_slope = FALSE; }
+                     else          if (lb->x < rt->x) { v2=lb; v3=rt; 
+                                                        same_slope = TRUE; } 
+                                   else               { v2=rt; v3=lb;  
+                                                        same_slope = TRUE; }
+    }
+    else          {  v1 = lb;
+       if (rght_top) if (lt->x < rb->x) { v2=lt; v3=rb; 
+                                                        same_slope = TRUE; }
+                                   else               { v2=rb; v3=lt; 
+                                                        same_slope = TRUE; }
+                     else          if (lt->x < rt->x) { v2=lt; v3=rt; 
+                                                        same_slope = FALSE; } 
+                                   else               { v2=rt; v3=lt;
+                                                        same_slope = FALSE; }
+    }
+    v4 = rght_top?  rt : rb;
+    if (same_slope) {   left_ht = sh_get_ht(v1,v2,v3);
+			rght_ht = sh_get_ht(v2,v3,v4);   }
+    else            {   left_ht = sh_get_ht(v1,v2,v4);
+			rght_ht = sh_get_ht(v1,v3,v4);   }
+    
+    /* call shader  for nonzero length segments */ 
+    if ((v2->x - v1->x) > SUBPIX)  sh_shader(v1,     0.,v2,left_ht);
+    if ((v3->x - v2->x) > SUBPIX)  sh_shader(v2,left_ht,v3,rght_ht);
+    if ((v4->x - v3->x) > SUBPIX)  sh_shader(v3,rght_ht,v4,     0.);
+    
+}
+
+
+
+
+/* +++++++++++++++++++++++ SH_GET_HT +++++++++++++++++++++++++++++++++++++ */
+double sh_get_ht(v1,v2,v3) /* vertical distance from v2 to line from v1 to v3 */
+edge_position *v1,*v2,*v3; 
+{   double fabs(),div;
+    div = v3->x - v1->x;    if (div <= 0.)  div = 1.;
+    return  fabs( v2->ht - ( v1->ht + (v3->ht - v1->ht) * 
+                                        (v2->x - v1->x) / div ));
+}
+
+
+
+
+
+/* +++++++++++++++++++++++ SH_SHADER +++++++++++++++++++++++++++++++++++++++ */ 
+sh_shader(left,lht,rght,rht)         /* shade segment - trapezoid with sloping
+                                     top, aligned with scanline at bottom and
+                                     with vertical sides assumed     */ 
+edge_position *left,*rght;    double lht,rht;
+{   short xleft,xrght;
+
+    xleft = left->x;    xrght = rght->x;
+
+    /* --------------------------
+    |   single pixel spanned    | 
+    -------------------------- */
+    if (xleft == xrght)
+    {   double cvrge; 
+        cvrge = (rght->x - left->x) * (lht + rht) / 2;
+        sh_pixout(xleft,left,cvrge);   
+    }
+
+    /* ------------------------
+    |   two pixels spanned    |
+    ------------------------ */
+    else if (xleft - xrght == 1)
+    {   double lcvrge,rcvrge,midhght;
+        lcvrge = xleft + 1 - left->x;    rcvrge = rght->x - xrght;
+        midhght = lht + (rht - lht) * lcvrge / (lcvrge + rcvrge);
+        lcvrge = lcvrge * (lht + midhght) / 2.;
+        rcvrge = rcvrge * (rht + midhght) / 2.;
+        sh_pixout(xleft,left,lcvrge);   
+        sh_pixout(xrght,rght,rcvrge);    
+    }
+
+    /* ---------------------
+    |   Multiple pixels    |
+    --------------------- */ 
+    else
+    {   edge_position  pixel;    edge_normal  px_nml[MAXLTS],px_inc[MAXLTS];
+        short i,ix;    double adj,xlnth,rxinc,gxinc,bxinc,tinc,ht,hxinc,cvrge;
+        
+        xlnth = (rght->x - left->x);           /* ----  do left pixel ----- */
+        hxinc = (rht - lht) / xlnth;            /* height increment / pixel */ 
+        adj = xleft + 1 - left->x;
+        ht = lht + hxinc * adj; 
+        cvrge = (xleft + 1 - left->x) * (lht + ht) / 2; /* part pixel covrge */
+        sh_pixout(xleft,left,cvrge); 
+        
+        rxinc = (rght->r - left->r) / xlnth;    /* color increments */
+        gxinc = (rght->g - left->g) / xlnth;
+        bxinc = (rght->b - left->b) / xlnth;
+        tinc = (rght->t - left->t) / xlnth;     /* transparency increment */
+	for (i=0; i<num_lights; i++)  		/* normal vector increments */
+	{   px_inc[i].xn = (rght->nml_ptr[i].xn - left->nml_ptr[i].xn) / xlnth;
+            px_inc[i].yn = (rght->nml_ptr[i].yn - left->nml_ptr[i].yn) / xlnth;
+            px_inc[i].zn = (rght->nml_ptr[i].zn - left->nml_ptr[i].zn) / xlnth;
+	}
+        pixel.r = left->r + adj * rxinc;
+        pixel.g = left->g + adj * gxinc;
+        pixel.b = left->b + adj * bxinc;
+        pixel.t = left->t + adj * tinc;
+	pixel.nml_ptr = px_nml;
+	for (i=0; i<num_lights; i++)
+        {   px_nml[i].xn = left->nml_ptr[i].xn + adj * px_inc[i].xn; 
+            px_nml[i].yn = left->nml_ptr[i].yn + adj * px_inc[i].yn; 
+            px_nml[i].zn = left->nml_ptr[i].zn + adj * px_inc[i].zn; 
+        }
+        for (ix=xleft+1; ix<=xrght; ix++) /* - loop through rest of pixels - */
+        {   if (ix != xrght)  cvrge = ht + hxinc/2.;         /* middle pixel */ 
+            else              cvrge = (rght->x - ix) * (ht + rht)/2.; /* rgt */
+            sh_pixout(ix,&pixel,cvrge); 
+            if (ix != xrght)                               /* middle pixel */
+            {   pixel.r += rxinc;    pixel.g += gxinc;    pixel.b += bxinc;
+                pixel.t += tinc; 
+                for (i=0; i<num_lights; i++)
+		{   px_nml[i].xn += px_inc[i].xn;  
+		    px_nml[i].yn += px_inc[i].yn;  
+		    px_nml[i].zn += px_inc[i].zn;  
+		}
+                ht      += hxinc; 
+            }
+        } 
+    }
+}
+
+
+
+
+/* ++++++++++++++++++++++++ SH_MKEDGE ++++++++++++++++++++++++++++++++ */
+
+sh_mkedge(ptr,pts,nmls,edge,incmnts,ptrinc,npts)/* calc. edge block for tiler */
+    short *ptr,ptrinc,npts;
+    struct { double x,y,z,r,g,b,xn,yn,zn,t; } pts[]; 
+    struct { double xn,yn,zn,r,g,b; } nmls[][MAXLTS];
+    edge_position *edge,*incmnts;
+{
+    short opt,i;  double floor();
+
+    opt = *ptr; *ptr = (*ptr + ptrinc) % npts;  /* increment vertex ptr. */ 
+    edge->lnth = floor(pts[opt].y) - floor(pts[*ptr].y);  /* lines spanned */
+
+    if (edge->lnth <= 0)            /* -------- all in one scanline -------- */
+    {   edge->x = pts[*ptr].x;                           /* load edge posns. */
+        edge->r = pts[*ptr].r;  edge->g = pts[*ptr].g;  edge->b = pts[*ptr].b; 
+        edge->t = pts[*ptr].t;
+        edge->ht = pts[*ptr].y - floor(pts[*ptr].y); 
+        for (i=0; i<num_lights; i++)
+	{   edge->nml_ptr[i].xn = nmls[*ptr][i].xn;
+	    edge->nml_ptr[i].yn = nmls[*ptr][i].yn;
+	    edge->nml_ptr[i].zn = nmls[*ptr][i].zn;
+        }
+	return; 
+    }
+    else                             /* ----- multiple scanlines ----------- */
+    {   double blnd,ydif;
+        ydif = pts[opt].y - pts[*ptr].y;
+        incmnts->x  = (pts[*ptr].x  - pts[opt].x ) / ydif;
+        incmnts->r  = (pts[*ptr].r  - pts[opt].r ) / ydif; 
+        incmnts->g  = (pts[*ptr].g  - pts[opt].g ) / ydif; 
+        incmnts->b  = (pts[*ptr].b  - pts[opt].b ) / ydif; 
+        incmnts->t  = (pts[*ptr].t  - pts[opt].t ) / ydif;
+        for (i=0; i<num_lights; i++)
+        {  incmnts->nml_ptr[i].xn = (nmls[*ptr][i].xn - nmls[opt][i].xn) / ydif;
+           incmnts->nml_ptr[i].yn = (nmls[*ptr][i].yn - nmls[opt][i].yn) / ydif;
+           incmnts->nml_ptr[i].zn = (nmls[*ptr][i].zn - nmls[opt][i].zn) / ydif;
+        }
+	blnd = pts[opt].y - floor(pts[opt].y); /* adjust to scanline */
+        edge->x  = pts[opt].x  + incmnts->x  * blnd; 
+        edge->r  = pts[opt].r  + incmnts->r  * blnd; 
+        edge->g  = pts[opt].g  + incmnts->g  * blnd; 
+        edge->b  = pts[opt].b  + incmnts->b  * blnd; 
+        edge->t  = pts[opt].t  + incmnts->t  * blnd; 
+        edge->ht = 0.; 
+        for (i=0; i<num_lights; i++)
+        { edge->nml_ptr[i].xn = nmls[opt][i].xn + incmnts->nml_ptr[i].xn * blnd;
+          edge->nml_ptr[i].yn = nmls[opt][i].yn + incmnts->nml_ptr[i].yn * blnd;
+          edge->nml_ptr[i].zn = nmls[opt][i].zn + incmnts->nml_ptr[i].zn * blnd;
+	}
+    }
+}
+
+
+
+
+
+/* ++++++++++++++++++++++++++ SH_PIXOUT +++++++++++++++++++++++++++++++++ */
+
+sh_pixout(X,pixel,covrge)
+short X;    edge_position *pixel;    double covrge; 
+{   double oldcvr,mag_norm,hilit_value,newred,newgrn,newblu,transmittance,
+           pow();
+    short i;
+    if (!rgb_24bit) error(" only 24-bit rgb output just now");
+
+    newred = pixel->r;    newgrn = pixel->g;    newblu = pixel->b;
+
+    if (hilit_power > 0.)  for (i=0; i<num_lights; i++)		  /* hilight */
+    {   mag_norm = sqr(pixel->nml_ptr[i].xn) + sqr(pixel->nml_ptr[i].yn) + 
+					       sqr(pixel->nml_ptr[i].zn);
+	hilit_value = pow(sqr(pixel->nml_ptr[i].zn) / mag_norm , hilit_power);
+	newred = newred + (light[i].r - newred) * hilit_value;
+	newgrn = newgrn + (light[i].g - newgrn) * hilit_value;
+	newblu = newblu + (light[i].b - newblu) * hilit_value;
+   
+	transmittance = (hilit_value > (1.0 - pixel->t))?  1.0 - hilit_value :
+                                                       		      pixel->t; 
+    }
+    else transmittance = pixel->t;
+
+    if (transmittance > MAX_OPAQUE)  covrge *= 1.0 - transmittance; /* trans */
+
+    oldcvr = cvr[X];                     /* get previous pixel coverage */
+    if (oldcvr == 0.) 
+    {   cvr[X] = covrge * 255. + .5;		    /* no previous coverage */
+        if (cvr[X] > 0)
+        {   red[X] = newred;    grn[X] = newgrn;    blu[X] = newblu;   } 
+    } 
+    else if (oldcvr < 255.)			/* partial previous coverage */
+    {   oldcvr /= 255.;          /* convert to 0. <= oldcvr <= 1. */
+        if ((oldcvr + covrge) >= 1.)      /* pixel fully covered */
+        {   covrge = 1. - oldcvr;    cvr[X] = 255;   } 
+        else                            /* pixel partially covered */
+        {   double adj;
+            adj = oldcvr + covrge;      cvr[X] = adj * 255. + .5; 
+            oldcvr /= adj;              covrge /= adj;
+        }
+
+        red[X] = red[X] * oldcvr + newred * covrge; 
+        grn[X] = grn[X] * oldcvr + newgrn * covrge; 
+        blu[X] = blu[X] * oldcvr + newblu * covrge;
+    }
+}
+ 
+ 
+
+
+!Funky!Stuff!
+
+

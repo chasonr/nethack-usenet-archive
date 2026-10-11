@@ -1,0 +1,984 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,df0199058768c8c6,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-01-19 00:52:59 PST
+Message-ID: <bnews.sb6.122>
+Newsgroups: net.sources
+Path: utzoo!decvax!duke!harpo!eagle!mhuxt!mhuxi!mhuxj!mhuxv!burl!sb1!sb6!jca
+X-Path: utzoo!decvax!duke!harpo!eagle!mhuxt!mhuxi!mhuxj!mhuxv!burl!sb1!sb6!jca
+From: sb6!jca
+Date: Wed Jan 19 03:52:55 1983
+Subject: SQZDIR
+X-Google-Info: Converted from the original B-News header
+Posted: Mon Jan 17 00:21:45 1983
+Received: Wed Jan 19 03:52:55 1983
+
+/*
+**	program	= [ sqzdir ]
+**	author	= [ Jackson C. allen ]
+**	compile = [ cc -O -s -i sqzdir.c ]
+*/
+
+#include	<stdio.h>
+#include	<sys/types.h>
+#include	<sys/stat.h>
+#include	<sys/dir.h>
+#include	<signal.h>
+
+/*
+**	These defines and include contorl certain options
+**	to be complied in and or if the system this is
+**	run on supports certain features.
+**
+**	LOCK:
+**		If process is to be locked in core (not swapped), system
+**		has to support this feature.
+**
+**	ASAP:
+**		If process is to have a very high priority.
+**
+*/
+
+#define	LOCK	1
+#define	ASAP	1
+
+#ifdef	LOCK
+#include	<sys/lock.h>
+int	plock();
+#endif
+
+/*********************************************************************/
+
+#define	PROG	"sqzdir"
+#define	VPRINT	(void)fprintf
+#define	VSPRINT	(void)sprintf
+#define	VCPY	(void)strcpy
+#define	VNCPY	(void)strncpy
+#define	VCAT	(void)strcat
+#define	MAXPATH		256	/* MAX path length */
+#define	ROOT		0	/* ROOT uid */
+#define	ROOTNODE	2	/* ROOT inode for a file system */
+#define	MAXARG		100	/* MAX number of directories on command line */
+#define	MAXSIG		18	/* MAX singnals to ignore, etc. */
+#define	MAXENTRY	1000	/* MAX active entries in a directory */
+#define	SAME		(0)
+#define	PASS		(0)
+#define	FAIL		(-1)
+#define	OFF		(0)
+#define	ON		(1)
+#define	DIR		(1)
+#define	OTHER		(2)
+
+extern	int	errno;
+
+extern	char	*sys_errlist[];
+
+ino_t	cwd_ino;
+
+dev_t	cwd_dev;
+
+struct	FINFO {
+	int	type;
+	long	atime;
+	char	name[DIRSIZ+1];
+	};
+struct	FINFO	finfo[MAXENTRY];
+
+int	(*signal())();
+int	sigcatch();
+int	(*sigsave[MAXSIG])();
+int	cmp();
+int	argcnt;
+int	sigflag	= OFF;
+int	Dflag	= OFF;		/* DEBUG FLAG */
+int	rflag	= OFF;		/* recursive flag */
+int	vflag 	= OFF;		/* verbose flag */
+int	lflag	= OFF;		/* list flag */
+
+char	*strcpy();
+char	*strcat();
+char	*strncpy();
+char	*argptr[MAXARG];
+
+
+main(agc,arg,env)
+int agc;
+char **arg;
+char **env;
+{
+	register int i;
+	register int n;
+	struct stat statb;
+
+	if(env);	/* MAKE LINT HAPPY FOR NOW */
+	/*
+	** Make sure the program is being executed by root or
+	** that it's effected uid is root.
+	*/
+	if(getuid() != ROOT && geteuid() != ROOT) {
+		VPRINT(stdout,"%s: Must be root or program set uid to root\n",
+			PROG);
+		exit(1);
+		}
+	if(stat(".",&statb) == FAIL) {
+		VPRINT(stdout,"%s: INIT() Can't stat current directory\n",
+			PROG);
+		syserr();
+		exit(1);
+		}
+	cwd_ino = statb.st_ino;
+	cwd_dev = statb.st_dev;
+	/*
+	** If there are not any arguments we can't do much.
+	*/
+	if(agc == 1) {
+		usage();
+		exit(1);
+		}
+	/*
+	** Well there was some arguments so we will have to look
+	** at them and see if any are flag options.
+	*/
+	for(i=1;i < agc;i++) {
+		if(arg[i][0] == '-') {
+			for(n=1;n < strlen(arg[i]);n++) {
+				switch(arg[i][n]) {
+					case 'v':
+						vflag = ON;
+						break;
+
+					case 'r':
+						rflag = ON;
+						break;
+
+					case 'D':
+						Dflag = ON;
+						vflag = ON;
+						break;
+
+					case 'l':
+						lflag = ON;
+						vflag = ON;
+						break;
+
+					default:	/* UNKNOWN FLAG */
+						usage();
+						exit(1);
+					}
+				}
+			}
+		else {
+			/*
+			** If there is room put the argumnet on the list.
+			*/
+			if(argcnt < MAXARG) {
+				/*
+				** Validate that the argument is a directory
+				** and it is not the current directory.
+				*/
+				valid(arg[i]);
+				argptr[argcnt] = arg[i];
+				argcnt++;
+				}
+			else {
+				VPRINT(stdout,"%s: Argument count overflow\n",
+					PROG);
+				exit(1);
+				}
+			}
+		}
+#ifdef	ASAP
+	/*
+	** Make priority so that this will get done ASAP
+	** if lflag is OFF.
+	*/
+	if(lflag == OFF)
+		(void)nice(-100);
+#endif
+#ifdef	LOCK
+	/*
+	** Lock process in memory so we can't be swaped out, only
+	** if the lflag is OFF. This will help keep some other program
+	** from creating new files in a directory slot we have already
+	** found to be empty. This will only be of much good if we are
+	** running this on an active system on a directory that
+	** is of public access (/usr/tmp, /usr/spool, ...). It
+	** mite be a little over kill and not realy do much
+	** good on top of that. Anyway lock both text and data
+	** protions of the program in memory.
+	*/
+	if(lflag == OFF)
+		(void)plock(PROCLOCK);
+#endif
+	/*
+	** Everything is OK so far so let's squeeze some directoies.
+	*/
+	for(i=0;i < argcnt;i++) {
+		if(vflag == ON)
+			VPRINT(stdout,"01 '%s':\n",argptr[i]);
+		/*
+		** Ignore signals because some of the work done
+		** by sqzdir will really screw up the file system
+		** if inrrupted before it completes.
+		*/
+		setsigs(OFF);
+		if(sqzdir(argptr[i],1) == FAIL)
+			exit(1);
+		setsigs(ON);
+		/*
+		** If sigflag is on then we caught some signal
+		** so we will just exit.
+		*/
+		if(sigflag == ON) {
+			VPRINT(stdout,"\n");
+			exit(1);
+			}
+		}
+	exit(0);
+}
+
+
+sqzdir(dir,level)
+register char *dir;
+int level;
+{
+	register int i;
+	register int n;
+	FILE *ifd;
+	ushort d_mode;
+	ushort d_uid;
+	ushort d_gid;
+	struct stat statb;
+	struct direct dirb;
+	long offset;
+	int sqz;
+	int dcnt;
+	int slots;
+	int vaccant;
+	char dpath[MAXPATH];
+	char oldp[MAXPATH];
+	char newp[MAXPATH];
+	char fname[MAXPATH];
+	char tmpdir[MAXPATH];
+	char name[16];
+
+	if(sigflag == ON)
+		return(PASS);
+	if(stat(dir,&statb) == FAIL) {
+		d_stat("SQZDIR",dir);
+		return(FAIL);
+		}
+	d_mode = (statb.st_mode & 07777);
+	d_uid = statb.st_uid;
+	d_gid = statb.st_gid;
+	sqz = ON;
+	/*
+	** If this is the current working directory then we will not
+	** sort or squeeze this directory, but if there are other
+	** directories in this directory then they may be squeezed.
+	** Or if the directory is a mounted file system and the rflag
+	** is not ON then just don't do anything.
+	*/
+	if((statb.st_ino == cwd_ino && statb.st_dev == cwd_dev) ||
+	   (statb.st_ino == ROOTNODE))
+		sqz = OFF;
+	if(sqz == OFF && rflag == OFF && lflag == OFF)
+		return(PASS);
+	if((ifd=fopen(dir,"r")) == NULL) {
+		d_open("SQZDIR","open",dir);
+		return(FAIL);
+		}
+	n = 0;
+	dcnt = 0;
+	slots = 0;
+	vaccant = 0;
+	while(fread((char *)&dirb,sizeof(dirb),1,ifd) == 1) {
+		slots++;		/* count the slots */
+		if(dirb.d_ino == 0) {
+			vaccant++;	/* count the vaccant ones */
+			continue;
+			}
+		VNCPY(name,"",sizeof(name));
+		VNCPY(name,dirb.d_name,sizeof(dirb.d_name));
+		if(strcmp(name,".") == SAME || strcmp(name,"..") == SAME)
+			continue;
+		VSPRINT(fname,"%s/%s",dir,name);
+		if(stat(fname,&statb) == FAIL) {
+			de_stat("SQZDIR",fname);
+			(void)fclose(ifd);
+			return(FAIL);
+			}
+		/*
+		** If the entry is a directory then finfo[n].type will
+		** be set to DIR else it will be set to OTHER.
+		** finfo[n].atime will be set to the last access
+		** time for the entry and finally finfo[n].name will
+		** contain the entry name. This will be sorted in
+		** reverse order which will cause all the directories
+		** to be at the top and in order of last accessed first
+		** and then the others in last accessed first.
+		*/
+		if((statb.st_mode & S_IFMT) == S_IFDIR) {
+			finfo[n].type = DIR;
+			dcnt++;
+			}
+		else
+			finfo[n].type = OTHER;
+		finfo[n].atime = statb.st_atime;
+		VCPY(finfo[n].name,name);
+		n++;
+		/*
+		** There is a limit to the number of active entries in a
+		** directory that will fit in memory and have room to
+		** recursively call yourself.
+		*/
+		if(n >= MAXENTRY) {
+			VPRINT(stdout,"\n\n%s: SQZDIR() Too many directory",
+				PROG);
+			VPRINT(stdout,"entries, MAX=(%d)\n",MAXENTRY);
+			return(FAIL);
+			}
+		/*
+		** If there is a mounted file system in this directory
+		** or our current working directory then we can't squeeze
+		** this directory, but we have to go through this in case
+		** rflag is set and there are some other directories.
+		*/
+		if((statb.st_ino == cwd_ino && statb.st_dev == cwd_dev) ||
+		   (statb.st_ino == ROOTNODE))
+			sqz = OFF;
+		}
+	(void)fclose(ifd);
+	if(sigflag == ON)
+		return(PASS);
+	if(vflag == ON) {
+		for(i=1;i < level;i++)
+			VPRINT(stdout," ");
+		VPRINT(stdout,"   Entries: %.3d  Directroies: ",slots);
+		VPRINT(stdout,"%.3d  Unused: %.3d  ",dcnt,vaccant);
+		}
+	if(sqz == OFF && rflag == OFF) {
+		if(vflag)
+			VPRINT(stdout,"\n\n");
+		return(PASS);
+		}
+	/*
+	** If there are not any vaccant slots and none of
+	** the slots are directories there is nothing else to do.
+	*/
+	if(vaccant == 0 && dcnt == 0) {
+		if(vflag)
+			VPRINT(stdout,"\n\n");
+		return(PASS);
+		}
+	/*
+	** If sqz is not ON or the lflag in ON then don't waste time
+	** sorting, makeing a temporary directory, fixing mode, fixing
+	** ownership, and squeezing the directory.
+	*/
+	if(sqz == ON && lflag == OFF) {
+		qsort((char *)finfo,(unsigned int)n,sizeof(finfo[0]),cmp);
+		if(sigflag == ON) {
+			if(vflag)
+				VPRINT(stdout,"\n\n");
+			return(PASS);
+			}
+		path(dir,dpath);
+		/*
+		** We have to try and create a temporary directory
+		** that does not already exist. It's name will be
+		** SQZppppp.llnn where ppppp = process id,
+		** ll = level down in sub-directories, nn = next
+		** number incase the rest match a directroy or file
+		** that already exist for some unknow reason.
+		*/
+		i = 0;
+		do  {
+			if(strlen(dpath))
+				VSPRINT(tmpdir,"%s/SQZ%.5d.%.2d%.2d",
+					dpath,getpid(),level,i);
+			else
+				VSPRINT(tmpdir,"SQZ%.5d.%.2d%.2d",
+					getpid(),level,i);
+			i++;
+			}while(access(tmpdir,0) == PASS);
+		if(mkdir(tmpdir) == FAIL)
+			return(FAIL);
+		/*
+		** We have to make sure it belongs to the same owner
+		** and group and has the same mode.
+		*/
+		if(chown(tmpdir,(int)d_uid,(int)d_gid) == FAIL) {
+			VPRINT(stdout,"\n\n%s: SQZDIR() Can't chown ",PROG);
+			VPRINT(stdout,"and group for '%s'\n",tmpdir);
+			syserr();
+			(void)rmdir(tmpdir,OFF);
+			return(FAIL);
+			}
+		if(chmod(tmpdir,(int)d_mode) == FAIL) {
+			VPRINT(stdout,"\n\n%s: SQZDIR() Can't chmod ",PROG);
+			VPRINT(stdout,"for directory '%s'\n",tmpdir);
+			syserr();
+			(void)rmdir(tmpdir,OFF);
+			return(FAIL);
+			}
+		if(sigflag == ON) {
+			if(vflag)
+				VPRINT(stdout,"\n\n");
+			(void)rmdir(tmpdir,OFF);
+			return(PASS);
+			}
+		if(vflag)
+			VPRINT(stdout,"+");
+		/*
+		** Now that the temporary directory is there we can move
+		** all the other directories and files to it.
+		*/
+		for(i=0;i < n;i++) {
+			VSPRINT(oldp,"%s/%s",dir,finfo[i].name);
+			VSPRINT(newp,"%s/%s",tmpdir,finfo[i].name);
+			if(finfo[i].type == DIR)
+				if(mvdir(oldp,newp) == FAIL)
+					return(FAIL);
+			if(finfo[i].type == OTHER)
+				if(mvfile(oldp,newp) == FAIL)
+					return(FAIL);
+			}
+		/*
+		** Now that everything has been moved we can
+		** remove the old directory and rename the temporary
+		** directory the same as the old directory.
+		*/
+		if(rmdir(dir,ON) == FAIL)
+			return(FAIL);
+		if(link(tmpdir,dir) == FAIL) {
+			d_link("SQZDIR",tmpdir,dir);
+			corrupt();
+			return(FAIL);
+			}
+		if(unlink(tmpdir) == FAIL) {
+			d_unlink("SQZDIR",tmpdir);
+			corrupt();
+			return(FAIL);
+			}
+		if(sigflag == ON) {
+			if(vflag)
+				VPRINT(stdout,"\n\n");
+			return(PASS);
+			}
+		}
+	if(vflag)
+		VPRINT(stdout,"\n\n");
+	/*
+	** If the rflag is ON and there are sub-directories in this
+	** directory then walk througt them and squeeze them and ...
+	*/
+	if(rflag == ON && dcnt != 0) {
+		if((ifd=fopen(dir,"r")) == NULL) {
+			d_open("SQZDIR","reopen",dir);
+			return(FAIL);
+			}
+		while(fread((char *)&dirb,sizeof(dirb),1,ifd) == 1) {
+			if(dirb.d_ino == 0)
+				continue;
+			VNCPY(name,"",sizeof(name));
+			VNCPY(name,dirb.d_name,sizeof(dirb.d_name));
+			if(strcmp(name,".") == SAME ||
+			   strcmp(name,"..") == SAME)
+				continue;
+			VSPRINT(fname,"%s/%s",dir,name);
+			/*
+			** We have to stat the entry to find out if
+			** it is a directory. We can't use the table
+			** we built earlier because it is global and
+			** may have changed.
+			*/
+			if(stat(fname,&statb) == FAIL) {
+				de_stat("SQZDIR",fname);
+				(void)fclose(ifd);
+				return(FAIL);
+				}
+			if((statb.st_mode & S_IFMT) == S_IFDIR) {
+				if(vflag == ON) {
+					for(i=0;i < level;i++)
+						VPRINT(stdout," ");
+					VPRINT(stdout,"%.2d '%s':\n",
+						(level + 1),fname);
+					}
+				/*
+				** We first find out which slot we are
+				** at in this directory and then close
+				** it so we don't get too many files
+				** opened at once. When we get back we
+				** will have to reopen it and seek to
+				** the proper slot.
+				*/
+				offset = ftell(ifd);
+				(void)fclose(ifd);
+				if(sqzdir(fname,(level + 1)) == FAIL)
+					return(FAIL);
+				if(sigflag == ON)
+					return(PASS);
+				if((ifd=fopen(dir,"r")) == NULL) {
+					d_open("SQZDIR","reopen",dir);
+					return(FAIL);
+					}
+				if(fseek(ifd,offset,0) == FAIL) {
+					VPRINT(stdout,"\n\n%s: SQZDIR() ",
+						PROG);
+					VPRINT(stdout,"Can't seek to (%ld) ",
+						offset);
+					VPRINT(stdout,"on directory '%s'\n",
+						dir);
+					syserr();
+					(void)fclose(ifd);
+					return(FAIL);
+					}
+				}
+			/*
+			** If lflag is OFF then we have squeezed the directory
+			** and all sub-directories are at the top so if
+			** it is not a directory in this slot then there
+			** is nothing else to do
+			*/
+			else if(lflag == OFF)
+				break;
+			}
+		(void)fclose(ifd);
+		}
+	return(PASS);
+}
+
+
+valid(dir)
+register char *dir;
+{
+	struct stat statb;
+	char dname[32];
+
+	if(access(dir,0) == FAIL) {
+		VPRINT(stdout,"%s: '%s' does not exist\n",PROG,dir);
+		exit(1);
+		}
+	basename(dir,dname);
+	if(strlen(dname) == 0) {
+		VPRINT(stdout,"%s: NULL directory name\n",PROG);
+		exit(1);
+		}
+	if(stat(dir,&statb) == FAIL) {
+		VPRINT(stdout,"%s: VALID() Can't stat '%s'\n",PROG);
+		syserr();
+		exit(1);
+		}
+	if((statb.st_mode & S_IFMT) != S_IFDIR) {
+		VPRINT(stdout,"%s: '%s' is not a directory\n",PROG,dir);
+		exit(1);
+		}
+	if(cwd_ino == statb.st_ino && cwd_dev == statb.st_dev) {
+		VPRINT(stdout,"%s: Current directory not allowed\n",PROG);
+		exit(1);
+		}
+}
+
+
+/*
+**	Basename is used to find the last part of
+**	a path and put it in dname.
+*/
+
+basename(dir,dname)
+char *dir;
+char *dname;
+{
+	register char *p1;
+	register char *p2;
+
+	p1 = dir;
+	p2 = dir;
+	while(*p1)
+		p1++;
+	while(p1 != p2 && *p1 != '/')
+		p1--;
+	if(*p1 == '/')
+		p1++;
+	VCPY(dname,p1);
+}
+
+
+/*
+**	Path is used to find the path leading up
+**	to the last part and puts it in dpath.
+*/
+
+path(dir,dpath)
+char *dir;
+char *dpath;
+{
+	register char *p1;
+	register char *p2;
+
+	VCPY(dpath,dir);
+	p1 = dpath;
+	p2 = dpath;
+	while(*p1)
+		p1++;
+	while(p1 != p2) {
+		if(*p1 == '/')
+			break;
+		p1--;
+		}
+	*p1 = '\0';
+}
+
+
+/*
+**	Rmdir is used to remove all the entries in a directory
+**	including '.' and '..' and then the directory itself.
+**	Note that the entries really are not delete since they
+**	should have a link into another directory. All this really
+**	does is correct link counts for some other directory and
+**	then delete the directory that was passed.
+*/
+
+rmdir(dir,flag)
+register char *dir;
+register int flag;
+{
+	register FILE *tfd;
+	struct direct dirb;
+	char fname[MAXPATH];
+	char name[MAXPATH];
+
+	/*
+	** First open the directory and look at each slot
+	** and delete each entry except "." and ".." which
+	** are deleted last thing.
+	*/
+	if((tfd=fopen(dir,"r")) == NULL) {
+		if(flag == ON)
+			d_open("RMDIR","open",dir);
+		return(FAIL);
+		}
+	while(fread((char *)&dirb,sizeof(dirb),1,tfd) == 1) {
+		if(dirb.d_ino == 0)
+			continue;
+		VNCPY(name,"",sizeof(name));
+		VNCPY(name,dirb.d_name,sizeof(dirb.d_name));
+		if(strcmp(name,".") == SAME || strcmp(name,"..") == SAME)
+			continue;
+		VSPRINT(fname,"%s/%s",dir,name);
+		if(unlink(fname) == FAIL) {
+			(void)fclose(tfd);
+			if(flag == ON) {
+				VPRINT(stdout,"\n\n%s: RMDIR() Can't ",PROG);
+				VPRINT(stdout,"unlink directory entry '%s'\n",
+					fname);
+				syserr();
+				}
+			return(FAIL);
+			}
+		}
+	(void)fclose(tfd);
+	VSPRINT(fname,"%s/..",dir);
+	if(unlink(fname) == FAIL) {
+		if(flag == ON) {
+			d_unlink("RMDIR",fname);
+			corrupt();
+			}
+		return(FAIL);
+		}
+	VSPRINT(fname,"%s/.",dir);
+	if(unlink(fname) == FAIL) {
+		if(flag == ON) {
+			d_unlink("RMDIR",fname);
+			corrupt();
+			}
+		return(FAIL);
+		}
+	if(unlink(dir) == FAIL) {
+		if(flag == ON) {
+			d_unlink("RMDIR",dir);
+			corrupt();
+			}
+		return(FAIL);
+		}
+	return(PASS);
+}
+
+
+usage()
+{
+	VPRINT(stdout,"%s: Usage = %s [-r] [-l] [-v] directory ...\n",
+		PROG,PROG);
+}
+
+
+/*
+**	NOTE:	The bulk of this code was taken form the mkdir command in
+**		(/usr/src/cmd/mkdir.c). Error messages were added.
+*/
+
+mkdir(dir)
+register char *dir;
+{
+	register int i;
+	register int slash;
+	char pname[MAXPATH];
+	char dname[MAXPATH];
+
+	slash = 0;
+	pname[0] = '\0';
+	for(i=0;dir[i];++i)
+		if(dir[i] == '/')
+			slash = (i + 1);
+	if(slash)
+		VNCPY(pname,dir,slash);
+	VCPY((pname+slash),".");
+	if((mknod(dir,040777,0)) == FAIL) {
+		VPRINT(stdout,"\n\n%s: MKDIR() Can't mknod ",PROG);
+		VPRINT(stdout,"for directory '%s'\n",dir);
+		syserr();
+		return(FAIL);
+		}
+	VCPY(dname,dir);
+	VCAT(dname, "/.");
+	if((link(dir,dname)) == FAIL) {
+		d_link("MKDIR",dir,dname);
+		(void)unlink(dir);
+		return(FAIL);
+		}
+	VCAT(dname, ".");
+	if((link(pname,dname)) == FAIL) {
+		d_link("MKDIR",pname,dname);
+		dname[strlen(dname)] = '\0';
+		(void)unlink(dname);
+		(void)unlink(dir);
+		return(FAIL);
+		}
+	return(PASS);
+}
+
+
+/*
+**	Mvdir is used to mv a directory form the old directory
+**	to the new temporary directory. Care must be taken to
+**	make sure we get the link count correct in all the
+**	directories concerned.
+*/
+
+mvdir(oldp,newp)
+register char *oldp;
+register char *newp;
+{
+	char d1[MAXPATH];
+	char d2[MAXPATH];
+
+	/*
+	** First link the old directory to the new directory.
+	*/
+	if(link(oldp,newp) == FAIL) {
+		d_link("MVDIR",oldp,newp);
+		corrupt();
+		return(FAIL);
+		}
+	/*
+	** Then unlink the old entry.
+	*/
+	if(unlink(oldp) == FAIL) {
+		d_unlink("MVDIR",oldp);
+		corrupt();
+		return(FAIL);
+		}
+	/*
+	** Now correct some of the link counts and associate the
+	** new directory with it's correct parrent.
+	*/
+	VSPRINT(d1,"%s/..",newp);
+	/*
+	** Do away with the link to the old parrent.
+	*/
+	if(unlink(d1) == FAIL) {
+		d_unlink("MVDIR",d1);
+		corrupt();
+		return(FAIL);
+		}
+	path(newp,d2);
+	/*
+	** Associate it with it's new parrent.
+	*/
+	if(link(d2,d1) == FAIL) {
+		d_link("MVDIR",d2,d1);
+		corrupt();
+		return(FAIL);
+		}
+	return(PASS);
+}
+
+
+/*
+**	Mvfile is used to mv a file from the old directory
+**	to it's new home. It is a lot more simple than the
+**	mvdir subroutine.
+*/
+
+mvfile(oldp,newp)
+register char *oldp;
+register char *newp;
+{
+	if(link(oldp,newp) == FAIL) {
+		f_link("MVFILE",oldp,newp);
+		corrupt();
+		return(FAIL);
+		}
+	if(unlink(oldp) == FAIL) {
+		f_unlink("MVFILE",oldp);
+		corrupt();
+		return(FAIL);
+		}
+	return(PASS);
+}
+
+
+corrupt()
+{
+	VPRINT(stdout,"\tFile system may be corrupted\n");
+}
+
+
+syserr()
+{
+	VPRINT(stdout,"\t%s\n",sys_errlist[errno]);
+}
+
+
+setsigs(flag)
+register int flag;
+{
+	register int i;
+
+	switch(flag) {
+		case OFF:
+			for(i=0;i < MAXSIG;i++)
+				sigsave[i] = signal(i,sigcatch);
+			break;
+
+		case ON:
+			for(i=0;i < MAXSIG;i++)
+				(void)signal(i,sigsave[i]);
+			break;
+		}
+}
+
+
+sigcatch(sig)
+register int sig;
+{
+	(void)signal(sig,sigcatch);
+	sigflag = ON;
+}
+
+
+/*
+**	Cmp is called by qsort() to compare 2 entries in
+**	finfo table.
+*/
+
+cmp(e1,e2)
+register struct FINFO *e1;
+register struct FINFO *e2;
+{
+	register int r;
+
+	r = 0;
+	if(e1->type < e2->type)
+		r--;
+	if(e1->type > e2->type)
+		r++;
+	/*
+	** If types are the same then compare the access times
+	** highest number means the entry has been accessed
+	** the latest.
+	*/
+	if(r == 0) {
+		if(e1->atime < e2->atime)
+			r++;
+		if(e1->atime > e2->atime)
+			r--;
+		}
+	return(r);
+}
+
+
+d_link(sub,dir1,dir2)
+register char *sub;
+register char *dir1;
+register char *dir2;
+{
+	VPRINT(stdout,"\n\n%s: %s() Can't link directory '%s' to '%s`,\n",
+		PROG,sub,dir1,dir2);
+	syserr();
+}
+
+
+d_unlink(sub,dir)
+register char *sub;
+register char *dir;
+{
+	VPRINT(stdout,"\n\n%s: %s() Can't unlink directory '%s',\n",
+		PROG,sub,dir);
+	syserr();
+}
+
+
+d_stat(sub,dir)
+register char *sub;
+register char *dir;
+{
+	VPRINT(stdout,"\n\n%s: %s() Can't stat directory '%s',\n",
+		PROG,sub,dir);
+	syserr();
+}
+
+
+de_stat(sub,dir)
+register char *sub;
+register char *dir;
+{
+	VPRINT(stdout,"\n\n%s: %s() Can't stat directory entry '%s',\n",
+		PROG,sub,dir);
+	syserr();
+}
+
+
+d_open(sub,type,dir)
+register char *sub;
+register char *type;
+register char *dir;
+{
+	VPRINT(stdout,"\n\n%s: %s() Can't %s directory '%s',",
+		PROG,sub,type,dir);
+	syserr();
+}
+
+
+f_link(sub,file1,file2)
+register char *sub;
+register char *file1;
+register char *file2;
+{
+	VPRINT(stdout,"\n\n%s: %s() Can't link file '%s' to '%s',\n",
+		PROG,sub,file1,file2);
+	syserr();
+}
+
+
+f_unlink(sub,file)
+register char *sub;
+register char *file;
+{
+	VPRINT(stdout,"\n\n%s: %s() Can't unlink file '%s',\n",
+		PROG,sub,file);
+	syserr();
+}
+
+

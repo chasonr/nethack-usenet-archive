@@ -1,0 +1,849 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,cc052b800a075b28,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-02-12 03:17:41 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!decvax!genrad!panda!talcott!harvard!seismo!mcvax!enea!erix!mike
+From: mike@erix.UUCP (Mike Williams)
+Newsgroups: net.sources
+Subject: Notice Board System for 4.2BSD
+Message-ID: <1072@erix.UUCP>
+Date: Wed, 12-Feb-86 06:17:41 EST
+Article-I.D.: erix.1072
+Posted: Wed Feb 12 06:17:41 1986
+Date-Received: Sun, 16-Feb-86 09:06:50 EST
+Organization: L M Ericsson, Stockholm, Sweden
+Lines: 830
+
+These programs are parts of the automatic notice board "dispd".
+If you haven't got 4.2BSD, this isn't for you.
+
+This notice board is displayed on a standard terminal and contains:
+
+0. A header with the last update time.
+
+1. A line per user (who is defined as using this service) with his
+   full name and a message (eg "arriving late today", "away sick",
+   "in", "out" or anything else you feel like).
+   
+2. A global message which affects all users. (eg "Coffee at 1600 today")
+
+On pressing "1" on the keybord of the "notice board" terminal the login
+status of the users is display (only real ttys, pseudo ttys are ignored).
+
+"^R" on the notice board terminal refreshes the screen.
+
+
+This system works across machines on the same Ethernet so messages may be
+entered from any machine.
+
+"dispd" is the deamon which udates the notice board. This should
+use an INET socket < 1000 so should be started by root.
+
+"message [text]" sends a message to the notice board.
+"message -u user [text]" may be used to send a message on behalf of
+another user.
+
+"whatmess" displays the pressent status of the notice board on any terminal
+
+"gone" text enters the message "gone text" (eg "gone for lunch") on the 
+notice board and locks the terminal (ie disables all signals) and prompts
+for the users password. On typing the password, the message is removed and
+the terminal unlocked (an antisocial command if you have too few terminals!).
+
+
+
+# -------------------------CUT HERE----------------------------------
+# This is a shell archive.  Remove anything before this line, then
+# unpack it by saving it in a file and typing "sh file".  (Files
+# unpacked will be owned by you and have default permissions.)
+#
+# This archive contains:
+# dispd.c gone.c message.c whatmess.c dispd.h APOLOGY READ_ME INSTALL makefile
+
+echo x - dispd.c
+cat > "dispd.c" << '//E*O*F dispd.c//'
+#include "dispd.h"
+#include <stdio.h>
+#include <ctype.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <sys/file.h>
+#include <curses.h>
+#include <sys/time.h>
+#include <pwd.h>
+#include <sys/dir.h>
+#include "/usr/src/etc/rwhod/rwhod.h"
+#include <strings.h>
+#define	WHDRSIZE	(sizeof (wd) - sizeof (wd.wd_we))
+#define LARGE 2147483647
+
+struct sgttyb disptty = {
+	B9600,B9600,
+	0,0,
+	ANYP|CRMOD|ECHO
+};
+
+struct user_data user_info[50];
+
+
+int lineno;
+
+/* find if a user is defined as using this system and return a 
+ * pointer to his data
+ */
+struct user_data *user_slot(s)
+char *s;
+{
+	struct user_data *ud;
+	lineno = 0;
+	ud = user_info;
+	while (ud->user_name[0] != '\0') {
+		if (strcmp(ud->user_name, s) == 0) return(ud);
+		ud++;
+		lineno++;
+	}
+	return((struct user_data *) 0);
+}
+
+/* read the USERS file and fill in the initial data */
+fill_table()
+{
+	FILE *us;
+	struct user_data *ud;
+	struct passwd *pw;
+	char name[20];
+	ud = user_info;
+	if ((us = fopen(USERS,"r")) == NULL) {
+		perror(USERS);
+		exit(1);
+	}
+	while (fscanf(us, "%s", ud->user_name) == 1) {
+		if ((pw = getpwnam(ud->user_name)) == NULL) {
+			fprintf(stderr,"No entry for %s in passwd file\n",ud->user_name);
+			exit(1);
+		}
+		(void) sscanf(pw->pw_gecos,"%[^,]",name);
+		if (name[0] == '&') {
+			(void) strcpy(ud->real_name, ud->user_name);
+			(void) strcat(ud->real_name, &name[1]);
+			if (islower(ud->real_name[0])) ud->real_name[0] -=  32;
+		}
+		else (void) strcpy(ud->real_name, name);
+		ud++;
+	}
+	ud->user_name[0] = '\0';
+	(void) fclose(us);
+}
+
+WINDOW *user_win, *header_win, *glob_win, *head, *info, *instruct;
+
+int lineno;
+main()
+{
+	FILE *message;
+	char mess[200];
+	struct tm *tim;
+	time_t tnow;
+	int s, mf;
+	struct servent *sp;
+	int fres, ldisc = NTTYDISC, fd;
+	struct sockaddr_in sin; 
+	char u_name[20], host[20];
+	struct user_data *ud;
+/* define the terminal type */
+	Def_term = DISTYPE;
+	My_term = TRUE;
+
+/* get the port number */
+	if ((sp = getservbyname("display", "udp")) == 0) {
+		perror("can't find service");
+		exit(1);
+	}
+/* read backup data if crashed */
+	if ((mf = open(MFILE, O_RDONLY, 0)) > 0) {
+		if (read(mf, (char *) user_info, 
+		  sizeof(user_info)) < sizeof(user_info)) {
+			perror("can't read message file");
+			exit(1);
+		}
+		(void) close(mf);
+	}
+	(void) fill_table();	
+	
+/* create and bind the socket */
+	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
+		perror("Cant create socket");
+		exit(1);
+	}
+	sin.sin_family = AF_INET;
+	sin.sin_port = sp->s_port;
+	if (bind(s, (struct sockaddr *)&sin, sizeof(sin)) == -1) {
+		perror("Cant bind socket");
+		exit(1);
+	}
+/* fork of the child and then die */
+#ifndef DEBUG
+	if ((fres = fork()) == -1) {
+		perror("Cant fork, goodbye!");
+		exit(1);
+	}
+	if (fres) exit(0); /* parent */
+	/* child only */
+
+	/* delete contoling terminal */
+	if ( (fd = open("/dev/tty", 2)) >= 0 ) {
+		(void) ioctl(fd, TIOCNOTTY, (char *) 0);
+		(void) close(fd);
+	}
+	/* close all standard files */
+	(void) close(0);
+	(void) close(1);
+	(void) close(2);
+
+	if (open(DISTTY,O_RDWR) < 0) exit(1); /* stdin */
+	if (open(DISTTY,O_RDWR) < 0) exit(1); /* stdout*/
+	if (open(DISTTY,O_RDWR) < 0) exit(1); /* stderr*/
+	
+/* set speed, line disciplin etc */
+	(void) ioctl(0,TIOCSETD, (char *) &ldisc); /* line discipline */
+	(void) ioctl(0,TIOCSETP,(char *) &disptty); /* speed etc */
+#endif
+
+/* start up curses */
+	(void) initscr();
+	(void) raw();
+	(void) noecho();
+	
+/* define the windows and put initial data into them */
+	header_win = newwin(3,80,0,0);
+	user_win = newwin(15,80,3,0);
+	glob_win = newwin(3,80,19,0);
+	instruct = newwin(1,79,23,0);
+	head = newwin( 3,80,0,0);
+	info = newwin(15,80,3,0);
+	leaveok(user_win,TRUE);
+	(void) wstandout(header_win);
+	(void) mvwprintw(header_win,0,0,TITLE);
+	(void) mvwprintw(header_win,0,45, UPDATE);
+	(void) mvwprintw(header_win,1,0,"Name");
+	(void) mvwprintw(header_win,1,19,"Message");
+	(void) wstandend(header_win);
+	inst("Hit 1 for login info");
+	lineno = 0;
+	ud = user_info;
+	while (ud->user_name[0] != '\0') {
+		(void) mvwprintw(user_win, lineno, 0, "%-10s", ud->real_name);
+		(void) mvwprintw(user_win, lineno++, 18, "%-61s", ud->user_message);
+		ud++;
+	}
+/* read the global message file */
+	if ((message = fopen(GLOB_MESS, "r")) != NULL) {
+		int co;
+		co = 3;
+		lineno = 0;
+		while (co-- > 0 && getline(mess,80,message) == 0) {
+			(void) mvwprintw(glob_win,lineno++,0,"%-80s",mess);
+		}
+		(void) fclose(message);
+	}
+/* display the windows */
+	(void) wrefresh(header_win);
+	(void) wrefresh(user_win);
+	(void) wmove(glob_win,3,0);
+	(void) wrefresh(glob_win);
+	
+/* loop forever (will hang on select when nothing happens ) */
+	while(1) {
+		char text[100], termchar;
+		int readfds;
+		readfds = 1 | 1 << s; 
+		/* wait for some input */
+		while (select(s+1, &readfds,(int *) 0,(int *) 0,
+		  (struct timeval *) 0) == 0);
+		if (readfds & 1 << fileno(stdin)) { /* data from the keyboard */
+			(void) read(0,&termchar,1);
+			switch (termchar) {
+				case '\022' : (void) wrefresh(curscr); /* ^R */
+				break;
+				case '1' : login_info(); /* display login info */
+				break;
+#ifdef DEBUG
+/* nice to have these when debugging */
+				case 'x' : endwin(); /* exit - debugging only */
+					exit(1);
+				case 's' : tstp(); /* stop - debugging only */
+					break;
+#endif
+				case ' ' : break; /* do nothing */
+				default: termchar = '\007';
+					(void) write(1,&termchar,1); /* Bell for incorrect input */
+			}
+			inst("Hit 1 for login info");
+/* touch since we have windows on top of each other */
+			touchwin(header_win);
+			touchwin(user_win);
+			touchwin(glob_win);
+/* rewrite the windows */
+			(void) wrefresh(header_win);
+			(void) wrefresh(user_win);
+			(void) wmove(glob_win,3,0);
+			(void) wrefresh(glob_win);
+			
+			continue;
+		}
+		if (!(readfds & 1 << s)) continue; /* this shouldn't happen */
+		(void) recvfrom(s,text,100, 0, (struct sockaddr *) 0, (int *) 0);
+		
+/* read the global message */
+		(void) werase(glob_win);
+		if ((message = fopen(GLOB_MESS, "r")) != NULL) {
+			int co;
+			co = 3;
+			lineno = 0;
+			while (co-- > 0) {
+				if (getline(mess,80,message) == 0) {
+					(void) mvwprintw(glob_win,lineno, 0,"%-80s",mess);
+				}
+				else (void) mvwprintw(glob_win,lineno,0, "%80s", " ");
+				lineno++;
+			}
+			(void) fclose(message);
+		}
+		
+/* read the message from the (remote) user */
+		if (sscanf(text,"%s%s%[^\0]", u_name, host, mess) < 3)
+			continue;
+		lineno = 0;
+		
+/* update the time */
+		tnow = time((time_t *) 0);
+		tim = localtime(&tnow);
+		(void) mvwprintw(header_win,0,65,"%02d-%02d-%02d:%02d:%02d\n",
+		tim->tm_year,tim->tm_mon + 1, tim->tm_mday,
+		tim->tm_hour,tim->tm_min);
+		
+/* find the user slot */
+		ud = user_slot(u_name);
+		if ( ud == (struct user_data *) 0) { /* user not defined */
+			(void) wrefresh(header_win);
+			(void) wrefresh(user_win);
+			(void) wmove(glob_win,3,0);
+			(void) wrefresh(glob_win);
+			continue;
+		}
+		
+/* copy the message and update the window */
+		(void) strncpy(ud->user_message,mess,60);
+		(void) mvwprintw(user_win, lineno, 0, "%-18s", ud->real_name);
+		(void) mvwprintw(user_win, lineno, 18, "%-61s", ud->user_message);
+		
+/* open the message file and update it. This stores all information
+ * so that messages survive a crash - this is messy */
+		if ((mf = open(MFILE,O_CREAT|O_RDWR,0770)) <= 0) {
+			perror("can't open/create message file");
+			exit(1);
+		}
+		if (write(mf, (char *) user_info, 
+		  sizeof(user_info)) < sizeof(user_info)) {
+			perror("Can't write message file");
+			exit(1);
+		}
+		
+/* refresh the windows */
+		(void) close(mf);
+		(void) wrefresh(header_win);
+		(void) wrefresh(user_win);
+		(void) wmove(glob_win,3,0);
+		(void) wrefresh(glob_win);
+	}
+}
+
+
+
+/* read a line from a file */
+getline(s, n, iop)
+char *s;
+register FILE *iop;
+{
+	register c;
+	register char *cs;
+
+	cs = s;
+	while (--n>0 && (c = getc(iop))>=0 && c != '\n') *cs++ = c;
+	if (c<0 && cs==s) return(-1);
+	*cs++ = '\0';
+	return(0);
+}
+
+/* display the login info, gets the info from the same files a rwho, if
+ * you want it to work you will have to run /etc/rwhod
+ */
+login_info()
+{
+	struct whod wd;
+	struct whoent *we;
+	DIR *dp;
+	struct direct *dirent;
+	int cc, fd, m,n, machno, gotone, readfds = 1;
+	char fname[100], machines[15][15];
+	struct user_data *ud;
+	struct timeval timeout;
+	timeout.tv_usec = 0;
+	timeout.tv_sec = 10;
+	machno = 0;
+/* search through the files in spool directory for rwhod */
+	if ((dp = opendir(WHDIR)) == NULL) {
+		perror("can't open");
+		return;
+	}
+	for (n = 0; n < 50; n++) {
+		for (m =0; m < 15; m++) user_info[n].machtty[m][0] = '\0';
+		user_info[n].idle = LARGE;
+		user_info[n].lastmach = -1;
+	}
+	while ((dirent = readdir(dp)) != NULL) {
+		if (strncmp(dirent->d_name,"whod.",5) != 0) continue;
+		(void) strcpy(fname,WHDIR);
+		(void) strcat(fname,"/");
+		(void) strcat(fname,dirent->d_name);
+		if ((fd = open(fname, O_RDONLY, 0)) <= 0) {
+			perror("Can''t open spool file");
+			continue;
+		}
+/* read the file - might just fail if you clash with rwhod - however this
+ * would only mean that this machine was ignored */
+		cc = read(fd, (char *) &wd, sizeof(wd));
+		if (cc < WHDRSIZE) { /* we have clashed with rwhod !!! */
+			fprintf(stderr,"Can't read whod\n");
+			(void) close(fd);
+			continue;
+		}
+		(void) strcpy(machines[machno], wd.wd_hostname);
+		gotone = 0;
+		cc -= WHDRSIZE;
+		we = wd.wd_we;
+/* check each user in turn */
+		for (n = cc / sizeof (struct whoent); n > 0; n--) {
+			if (((ud = user_slot(we->we_utmp.out_name)) !=
+			  (struct user_data *) 0) 
+			  && (strncmp(we->we_utmp.out_line, "ttyp", 4) != 0)) {
+			  /* ignore pseudo ttys */
+			  	int swidle;
+			  	gotone++;
+/* only the terminal with the lowest idle time will be dispayed */
+				if (we->we_idle < ud->idle) swidle = 1; else swidle = 0;
+			  	if (!(ud->lastmach == machno) ||  (swidle == 1))
+				  (void) strcpy(ud->machtty[machno], we->we_utmp.out_line);
+				if (swidle) {
+					ud->idle = we->we_idle;
+					ud->lastmach = machno;
+					}
+			}
+			we++;
+		}
+		if (gotone) machno++;
+		(void) close(fd);
+	}
+	(void) closedir(dp);
+	lineno = 0;
+/* display standard text */
+	(void) werase(head);
+	(void) werase(info);
+	(void) wstandout(head);
+	(void) mvwprintw(head,0,0,"Name");
+	
+/* print the machine names */
+	for (n = 0; n < machno; n++)
+	  (void) mvwprintw(head,0,(18 + 8 * n), "%-8s", machines[n]);
+	(void) wstandend(head);
+	
+/* print the login ttys - a * shows the last used tty */
+	ud = user_info;
+	while (ud->user_name[0] != '\0') {
+		(void) mvwprintw(info,lineno,0,"%-18s", ud->real_name);
+		for(n = 0; n < machno; n++) if (ud->lastmach == n)
+			(void) mvwprintw(info,lineno,(18 + 8 * n), "*%-7s", ud->machtty[n]);
+		else (void) mvwprintw(info,lineno,(18 + 8 * n), " %-7s", ud->machtty[n]);
+		ud++; lineno++;
+	}
+/* display the data */
+	inst("Hit space to return to display window");
+	touchwin(head);
+	touchwin(info);
+	(void) wrefresh(head);
+	(void) wmove(info,3,0);
+	(void) wrefresh(info); 
+/* wait here for input but time out after 10 seconds */
+	(void) select(1,&readfds,(int *) 0,(int *) 0,(struct timeval *) &timeout);
+}
+
+/* display some instructions at the bottom of the screen */
+inst(str)
+char *str;
+{
+	(void) wstandout(instruct);
+	(void) mvwprintw(instruct,0,0,"%-79s", str);
+	(void) wstandend(instruct);
+	(void) wrefresh(instruct);
+}
+//E*O*F dispd.c//
+
+echo x - gone.c
+cat > "gone.c" << '//E*O*F gone.c//'
+#include <signal.h>
+#include <stdio.h>
+#include <pwd.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <strings.h>
+#include "dispd.h"
+#define BELL    007
+
+struct  passwd *getpwuid();
+struct sockaddr_in sin;
+char text[200];
+int s;
+
+main(argc,argv)
+char **argv;
+{
+	int t,n, hupped();
+	char    pwbuf[10];
+	char    *getpass();
+	char    *crypt();
+	char    *pw;
+	struct passwd *pwd;
+	struct hostent *hp;
+	struct servent *sp;
+	char text[200], host[10], mess[200];
+	char *ttyname();
+	if (argc < 2) {
+		fprintf(stderr,"%s: usage: gone to_where\n", argv[0]);
+		exit(1);
+	}
+	(void) gethostname(host,10); /* 4.2 llib-lc is wrong here !! */
+	(void) strcat(mess, "Gone ");
+	for (n = 1 ; n < argc; n++) {
+		(void) strcat(mess, argv[n]);
+		(void) strcat(mess, " ");
+	}
+	
+	/* get password entry */
+	pwd = getpwuid(getuid());
+
+	(void) sprintf(text,"%s %s %s",pwd->pw_name,host,mess);
+	if ((hp = gethostbyname(HOST)) == 0) {
+		perror("cant find host");
+		exit(1);
+	}
+	if ((sp = getservbyname("display", "udp")) == 0) {
+		perror("can't find service");
+		exit(1);
+	}
+	if ((s = socket(AF_INET, SOCK_DGRAM,0)) == -1) {
+		perror("socket");
+		exit(1);
+		}
+	sin.sin_family = AF_INET;
+	sin.sin_port = sp->s_port;
+	bcopy(hp->h_addr, (char *)&sin.sin_addr, hp->h_length);
+
+	/* signal handling */
+	for (t = 1; t <= 26; t++)
+		(void) signal(t, SIG_IGN);
+	if (sendto(s, text, 100, 0,(struct sockaddr *) &sin, sizeof(sin)) ==  -1) {
+		perror("sendto");
+		exit(1);
+	}
+	
+	/* Process will die if HUP is received - good for modem lines!   */
+		(void) signal(SIGHUP,hupped);
+	mess[0] = '\0';
+	/* Delete the message */
+	(void) sprintf(text,"%s %s %s",pwd->pw_name,host, mess);
+
+
+	
+	/* loop here to wait for correct password */
+	while (1) {
+		(void) strcpy(pwbuf, getpass("Password:"));
+		pw = crypt(pwbuf, pwd->pw_passwd);
+		if(strcmp(pw, pwd->pw_passwd) == 0) {			
+			if (sendto(s, text, 100, 0, 
+			  (struct sockaddr *) &sin, sizeof(sin)) ==  -1) {
+				perror("sendto");
+			}
+		exit(0);
+		}
+		(void) putchar(BELL);
+		(void) fflush(stdout);
+	}
+}
+
+hupped()
+{
+	(void) strcat(text, " Hupped");
+	if (sendto(s, text, 100, 0, (struct sockaddr *)&sin, sizeof(sin)) ==  -1) {
+		perror("sendto");
+		exit(1);
+	}
+}
+//E*O*F gone.c//
+
+echo x - message.c
+cat > "message.c" << '//E*O*F message.c//'
+#include "dispd.h"
+#include <pwd.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <strings.h>
+main(argc,argv)
+char **argv;
+{
+	struct passwd *pw;
+	int s,n;
+	struct sockaddr_in sin;
+	struct hostent *hp;
+	struct servent *sp;
+	char text[200], host[10], mess[200];
+	char *ttyname();
+	(void) gethostname(host, 10); /* error in  4.2 llib-lc here ??? */
+	n = 1;
+	if ((argc > 1) && (argv[1][0] == '-')) {
+		n = 3;
+		if ((argc < 3) || (argv[1][1] != 'u')) {
+			fprintf(stderr,"usage -u %s username [message]\n", argv[0]);
+			exit(1);
+		}
+		if ((pw = getpwnam(argv[2])) == 0) {
+			fprintf(stderr, "Unknown user\n");
+			exit(1);
+		}
+	}
+	else if ((pw = getpwuid(getuid())) == 0) exit(1);
+	
+	for ( ; n < argc; n++) {
+		(void) strcat(mess, argv[n]);
+		(void) strcat(mess, " ");
+	}
+	(void) sprintf(text,"%s %s %s",pw->pw_name,host,mess);
+	if ((hp = gethostbyname(HOST)) == 0) {
+		perror("cant find host");
+		exit(1);
+	}
+	if ((sp = getservbyname("display", "udp")) == 0) {
+		perror("can't find service");
+		exit(1);
+	}
+	if ((s = socket(AF_INET, SOCK_DGRAM,0)) == -1) {
+		perror("socket");
+		exit(1);
+		}
+	sin.sin_family = AF_INET;
+	sin.sin_port = sp->s_port;
+	bcopy(hp->h_addr, (char *)&sin.sin_addr, hp->h_length);
+	if (sendto(s, text, 100, 0, (struct sockaddr *)&sin, sizeof(sin)) ==  -1) {
+		perror("sendto");
+		exit(1);
+	}
+	
+}
+
+//E*O*F message.c//
+
+echo x - whatmess.c
+cat > "whatmess.c" << '//E*O*F whatmess.c//'
+#include "dispd.h"
+#include <stdio.h>
+#include <sys/file.h>
+struct user_data user_info[50];
+
+main()
+{
+	int mf;
+	FILE *fd;
+	struct user_data *ud;
+	char mess[100];
+	
+	if ((mf = open(MFILE, O_RDONLY, 0)) > 0) {
+		if (read(mf, (char *) user_info, 
+			  sizeof(user_info)) < sizeof(user_info)) {
+			perror("can't read message file");
+			exit(1);
+		}
+		(void) close(mf);
+	}
+	ud = user_info;
+	printf("User               Message\n\n");
+	while (ud->user_name[0] != '\0') {
+		printf("%-18s%-61s\n", ud->real_name, ud->user_message);
+		ud++;
+	}
+	if ((fd = fopen(GLOB_MESS, "r")) == NULL) exit(1);
+	printf("\n\n");
+	while (fgets(mess,80,fd) != NULL) printf("%s",mess);
+	(void) fclose(fd);
+}
+//E*O*F whatmess.c//
+
+echo x - dispd.h
+cat > "dispd.h" << '//E*O*F dispd.h//'
+#define USERS "/u/lme/du/users" /* only users in this file will be displayed */
+#define MFILE "/usr/spool/message/dumess" /* file for backing up the display */
+#define TITLE "XT/DU ERICSSON COMPUTER SCIENCE LABORATORY" /* title */
+#define UPDATE "Last updated at:" /* text on the display */
+#define DISTTY "/dev/tty25" /* terminal to which the display is connected */
+#define GLOB_MESS "/u/lme/du/message" /* file for the global message */
+#define WHDIR "/usr/spool/rwho" /* standard 4.2 */
+#define HOST "erix" /* host for the deamon */
+#define DISTYPE "vt100"
+struct user_data {
+	char user_name[10];
+	char user_message[81];
+	char real_name[20];
+	char machtty[15][9];
+	int idle, lastmach;
+}; 
+//E*O*F dispd.h//
+
+echo x - APOLOGY
+cat > "APOLOGY" << '//E*O*F APOLOGY//'
+The whole thing is rather a hack. I apologise for my messy code!
+However it is better to have somthing that works than nothing at all
+and may inspire someone to do it better!
+
+I take no responsibilty for this code at all. Do what you want with it.
+//E*O*F APOLOGY//
+
+echo x - READ_ME
+cat > "READ_ME" << '//E*O*F READ_ME//'
+These programs are parts of the automatic notice board "dispd".
+If you haven't got 4.2BSD, this isn't for you.
+
+This notice board is displayed on a standard terminal and contains:
+
+0. A header with the last update time.
+
+1. A line per user (who is defined as using this service) with his
+   full name and a message (eg "arriving late today", "away sick",
+   "in", "out" or anything else you feel like).
+   
+2. A global message which affects all users. (eg "Coffee at 1600 today")
+
+On pressing "1" on the keybord of the "notice board" terminal the login
+status of the users is display (only real ttys, pseudo ttys are ignored).
+
+"^R" on the notice board terminal refreshes the screen.
+
+
+This system works across machines on the same Ethernet so messages may be
+entered from any machine.
+
+"dispd" is the deamon which udates the notice board. This should
+use an INET socket < 1000 so should be started by root.
+
+"message [text]" sends a message to the notice board.
+"message -u user [text]" may be used to send a message on behalf of
+another user.
+
+"whatmess" displays the pressent status of the notice board on any terminal
+
+"gone" text enters the message "gone text" (eg "gone for lunch") on the 
+notice board and locks the terminal (ie disables all signals) and prompts
+for the users password. On typing the password, the message is removed and
+the terminal unlocked (an antisocial command if you have too few terminals!).
+//E*O*F READ_ME//
+
+echo x - INSTALL
+cat > "INSTALL" << '//E*O*F INSTALL//'
+1. Edit the file dispd.h as follows
+
+USERS: this defines the file which shows which users are to be displayed
+one user per line (ie login name).
+
+MFILE: the file name of the file for backing up the notice board -
+so the messages will survive a machine crash.
+
+TITLE: what you want to appear as the title on the screen
+
+DISTTY: The tty file name of the terminal which will display the notice board
+Make sure that there is no getty for this terminal!
+
+GLOB_MESS: The file name of the file containing a global message
+
+HOST: The host name of the machine where the notice board will be attached
+
+DISTYPE: The tty type of the terminal to be used (eg anything sensible
+in /etc/termcap)
+
+
+2. Edit /etc/services as follows:
+
+Add a line similar to the line below on all machines where the message
+command can be given.
+
+display		990/udp
+
+990 is a port number which can of course be changed to any other suitable 
+number (< 1000) if this conficts with anything you already have.
+
+3. If you wish to run the notice board terminal at a speed other than 9600
+b/s edit dispd.c so that the correct speed is inserted in the sgttyb
+disptty struct.
+
+4. Compile the system with the command "make all" and install the commands
+in suitable places.
+
+5. Add lines similar to the following in /etc/rc.local in the bit where
+the local deamons are started. (change /usr/local/lib/dispd to where you
+have installed dispd of course).
+
+if [ -f /usr/local/lib/dispd ]; then
+	/usr/local/lib/dispd & echo -n ' dispd'	>/dev/console
+fi
+
+6. Check that the gecos field of /etc/passwd contains the full name for
+each user in USERS file. ie the user's full name should be in the 
+5th field (after the 4th ":") and be terminated by a "," eg
+
+blogs:cryp_passwd:101:15:Fred Blogs, other, gecos, info:/u/blogs:/bin/csh
+
+
+7. Start up "dispd" by typing "dispd" when you are su. (you need to be su
+since it binds an INET socket < 1000).
+
+8. See if the system works by sending a message.
+
+I have tested the system on a net comprising SUN's and a VAX.
+
+
+//E*O*F INSTALL//
+
+echo x - makefile
+cat > "makefile" << '//E*O*F makefile//'
+#makefile for the display system
+
+all : message gone dispd whatmess
+
+message : message.o dispd.h
+	cc -o message message.o
+gone : gone.o dispd.h
+	cc -o gone gone.o
+whatmess : whatmess.o dispd.h
+	cc -o whatmess whatmess.o
+dispd : dispd.o dispd.h
+	cc -o dispd dispd.c -lcurses -ltermlib
+//E*O*F makefile//
+
+exit 0
+
+

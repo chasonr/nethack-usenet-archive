@@ -1,0 +1,249 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,5d0b1ecf8eabfa4d,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-06-22 15:23:40 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site umcp-cs.UUCP
+Path: utzoo!linus!philabs!seismo!rlgvax!cvl!umcp-cs!fred
+From: fred@umcp-cs.UUCP
+Newsgroups: net.sources
+Subject: preen: program to run multiple fsck's in parallel
+Message-ID: <73@umcp-cs.UUCP>
+Date: Wed, 22-Jun-83 18:23:40 EDT
+Article-I.D.: umcp-cs.73
+Posted: Wed Jun 22 18:23:40 1983
+Date-Received: Thu, 23-Jun-83 19:29:55 EDT
+Organization: Univ. of Maryland, Computer Science Dept.
+Lines: 229
+
+This program runs under 4.1BSD. It reads your /etc/fstab file and
+starts an ``fsck -p'' on each file system which is normally mounted
+read-writable.  This is the same thing which fsck would do anyway,
+except that it would do them each in sequence. Preen forks separate
+processes, so the fsck's are running in parallel. This can speed
+up reboots & such, since fsck spends most of its time thrashing
+the disk head around, it's not really tying down the CPU, so you
+might as well run other fsck's at the same time and let them thrash
+their assigned disk heads around. The reason I didn't hack it
+directly into fsck is that: 1) I don't understand fsck, and
+2) There's no headache of re-implementing it in future releases
+of fsck.
+
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+/bin/echo 'Extracting preen.8l'
+sed 's/^X//' <<'//go.sysin dd *' >preen.8l
+X.TH PREEN 8l "11-Jan-83 (U of Maryland)"
+X.UC 4
+X.SH NAME
+Xpreen \- automatic file system consistency check using fsck
+X.SH SYNOPSIS
+X.B /etc/preen
+X.SH DESCRIPTION
+X.I Preen
+Xis intended to be invoked from
+X.I /etc/rc.
+XIt invokes
+X.I /etc/fsck -p
+Xon all normally read-write mounted file systems, as defined in the file
+X.I /etc/fstab.
+X.I Fsck
+X``preens'' the file system, cleaning up trivial inconsistencies.
+X.I Preen
+Xdoes the root file system first, then the raw versions of all the others,
+Xin parallel.
+XThis speeds up automatic reboots, since it keeps more than one disk head
+Xmoving at a time, which
+X.I fsck
+Xdoesn't normally do.
+XEach individual invocation of
+X.I fsck
+Xspends most of its time waiting for disk seeks, so having multiple
+Xinvocations on separate drives makes more efficient use of the processor.
+X.sp
+XIf any of the
+X.I fsck\c
+Xs exit with an abnormal return status,
+X.I preen
+Xwill also, causing an automatic reboot to fail.
+X.PP
+X.SH FILES
+X.br
+X.ns
+X.TP 21
+X/etc/fstab
+Xcontains default list of file systems to check.
+X.TP 21
+X/etc/fsck
+Xexecutable disk patcher program.
+X.SH DIAGNOSTICS
+XThe diagnostics produced by 
+X.I preen
+Xare intended to be self-explanatory.
+X.SH "SEE ALSO"
+Xfsck(8), fstab(5), fs(5), crash(8), reboot(8)
+X.SH BUGS
+//go.sysin dd *
+/bin/chmod 644 preen.8l
+/bin/echo -n '	'; /bin/ls -ld preen.8l
+/bin/echo 'Extracting preen.c'
+sed 's/^X//' <<'//go.sysin dd *' >preen.c
+X#ifndef	lint
+Xstatic char *sccsid = "@(#)preen.c	(U of Maryland - FLB) $Header: /usr/fred/sys/preen.c,v 1.2 83/06/22 17:58:46 fred Exp $";
+X#endif	lint
+X
+X/*
+X * preen - Run ``fsck -p'' on disks. Root file system first, then others in
+X *	   parallel. Device names, other than root, are converted to the raw
+X *	   device name by converting ``/dev/'' to ``/dev/r''. Error status
+X *	   from any instance of ``fsck'' is returned as the exit status of
+X *	   this program. Preen is intended to be invoked from ``/etc/rc''.
+X *
+X * To compile:
+X *	   cc -s -O preen.c -o preen
+X * or:
+X *	   cc -s -O -DDEBUG preen.c -o preen
+X * for debugging.
+X *
+X * Fred Blonder, University of Maryland, College Park, Md. <fred@umcp-cs>
+X *
+X * $Log:	preen.c,v $
+X * Revision 1.2  83/06/22  17:58:46  fred
+X * Bug causing short lines in fstab to cause the remainder of the file
+X * to be ignored, fixed by Chris Torek.
+X * 
+X *
+X */
+X
+X#include <stdio.h>
+X#include <fstab.h>
+X#include <sys/types.h>
+X#include <sys/dir.h>
+X
+X#ifdef	DEBUG
+X#undef	FSTAB
+X#define	FSTAB	"fstab"
+X#define	FSCK	"/bin/echo"
+X#else
+X#define	FSCK	"/etc/fsck"
+X#endif
+X
+X#define	MODE_LENGTH	3
+X
+Xmain()
+X{
+XFILE *fstab;
+Xchar device[FSNMLG], file[FSNMLG], mode[MODE_LENGTH], *sbrk();
+Xchar linebuf[BUFSIZ];
+Xstruct fs_buf {
+X	char fs_device[FSNMLG];
+X	char fs_file[FSNMLG];
+X	char fs_mode[MODE_LENGTH];
+X	struct fs_buf *fs_next;
+X	} *fs_list = (struct fs_buf *)0, *fs_tmp;
+Xint status, pid, value = 0;
+X
+Xif ((fstab = fopen(FSTAB, "r")) == NULL) {
+X	fprintf(stderr, "Can't read ``%s''\n", FSTAB);
+X	exit(1);
+X	}
+X
+Xwhile (fgets(linebuf, sizeof(linebuf), fstab)) {
+X	if (sscanf(linebuf, "%[^:]:%[^:]:%[^:]:%*[^\n]\n",
+X						device, file, mode) == 3) {
+X		fs_tmp = (struct fs_buf *) sbrk(sizeof(struct fs_buf));
+X		strncpy(fs_tmp->fs_device, device, sizeof(device));
+X		strncpy(fs_tmp->fs_file, file, sizeof(file));
+X		strncpy(fs_tmp->fs_mode, mode, sizeof(mode));
+X		fs_tmp->fs_next = fs_list;
+X		fs_list = fs_tmp;
+X		}
+X	}
+X
+Xfor (fs_tmp = fs_list; fs_tmp && strcmp(fs_tmp->fs_file, "/");
+X	fs_tmp = fs_tmp->fs_next);
+X
+Xif (!fs_tmp) {
+X	fprintf(stderr, "Can't find root file system\n");
+X	exit(1);
+X	}
+X
+Xif (!(pid = fork())) {
+X	printf("Checking root file system (%s):\n", fs_tmp->fs_device);
+X	execl(FSCK, "fsck", "-p", fs_tmp->fs_device, 0);
+X	fprintf(stderr, "Can't exec fsck\n");
+X	exit(1);
+X	}
+X
+Xif (pid < 0) {
+X	perror("fork error");
+X	exit(1);
+X	}
+X
+Xwhile (wait(&status) != pid);
+X
+Xif (status)
+X	exit(status >> 8);
+X
+Xprintf("Root ok. Checking other disks");
+Xfor (fs_tmp = fs_list; fs_tmp; fs_tmp = fs_tmp->fs_next)
+X	if (strcmp(fs_tmp->fs_file, "/")
+X				&& !strcmp(fs_tmp->fs_mode, FSTAB_RW)) {
+X		make_raw(fs_tmp->fs_device);
+X		printf(" (%s)", fs_tmp->fs_device);
+X		(void) fflush(stdout);
+X		}
+Xprintf(":\n");
+X
+Xfor (fs_tmp = fs_list; fs_tmp; fs_tmp = fs_tmp->fs_next)
+X	if (strcmp(fs_tmp->fs_file, "/")
+X				&& !strcmp(fs_tmp->fs_mode, FSTAB_RW)) {
+X		if ((pid = fork()) == 0) {
+X			execl(FSCK, "fsck", "-p", fs_tmp->fs_device, 0);
+X			fprintf(stderr, "Can't exec fsck\n");
+X			exit(1);
+X			}
+X		else if (pid < 0) {
+X			fprintf(stderr, "Can't fork\n");
+X			exit(1);
+X			}
+X		}
+X
+Xwhile (wait(&status) >= 0)
+X	if (status)
+X		value = status >> 8;
+X
+Xif (!value)
+X	printf("Other disks ok.\n");
+X
+Xexit(value);
+X}
+X
+Xmake_raw(dev_name)	/* Make raw device name by inserting an ``r'' after */
+Xchar dev_name[];	/* the last ``/'' in the device name.		    */
+X{
+Xregister char *cp, *cp1;
+Xchar *rindex();
+X
+X/* find the last slash */
+Xif (!(cp = rindex(dev_name, '/'))) {
+X	fprintf(stderr, "\nWierd device name ``%s'' in %s\n", dev_name, FSTAB);
+X	exit(1);
+X	}
+X
+Xfor (cp1 = dev_name; *cp1; cp1++);	/* find the trailing null	   */
+X
+Xif (cp1 > &cp[DIRSIZ])			/* if file name already max length */
+X	return;				/*	. . . don't do anything	   */
+X
+Xfor (;cp1 > cp; cp1--)			/* bump everything to the right of */
+X	cp1[1] = *cp1;			/* the slash right by one char	   */
+X
+Xcp[1] = 'r';				/* insert the ``r''		   */
+X}
+//go.sysin dd *
+/bin/chmod 644 preen.c
+/bin/echo -n '	'; /bin/ls -ld preen.c
+
+

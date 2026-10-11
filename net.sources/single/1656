@@ -1,0 +1,2325 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,d36f3d7ec13da1ae,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-09-08 15:54:00 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site seismo.UUCP
+Path: utzoo!watmath!clyde!burl!mgnetp!ihnp4!cbosgd!seismo!rick
+From: rick@seismo.UUCP (Rick Adams)
+Newsgroups: net.sources
+Subject: news 2.10.2 src part 4 (reposting)
+Message-ID: <3807@seismo.UUCP>
+Date: Sat, 8-Sep-84 18:54:00 EDT
+Article-I.D.: seismo.3807
+Posted: Sat Sep  8 18:54:00 1984
+Date-Received: Thu, 13-Sep-84 19:03:52 EDT
+References: <3674@seismo.UUCP>
+Distribution: net
+Organization: Center for Seismic Studies, Arlington, VA
+Lines: 2303
+
+if test ! -d src
+then
+	mkdir src
+fi
+echo x - src/inews.c
+sed 's/^X//' >src/inews.c <<'*-*-END-of-src/inews.c-*-*'
+X/*
+X * inews - insert, receive, and transmit news articles.
+X */
+X
+X#ifndef lint
+Xstatic char	*SccsId = "@(#)inews.c	2.44	9/3/84";
+X#endif !lint
+X
+X#include "iparams.h"
+X
+X/* local defines for inews */
+X
+X#define OPTION	0	/* pick up an option string */
+X#define STRING	1	/* pick up a string of arguments */
+X
+X#define UNKNOWN 0001	/* possible modes for news program */
+X#define UNPROC	0002	/* Unprocessed input */
+X#define PROC	0004	/* Processed input */
+X#define	CANCEL	0010	/* Cancel an article */
+X#define	CREATENG 0020	/* Create a new newsgroup */
+X
+Xchar	forgedname[NAMELEN];	/* A user specified -f option. */
+Xextern char histline[];
+X
+Xchar *Progname = "inews";	/* used by xerror to identify failing program */
+X
+Xstruct {			/* options table. */
+X	char	optlet;		/* option character. */
+X	char	filchar;	/* if to pickup string, fill character. */
+X	int	flag;		/* TRUE if have seen this opt. */
+X	int	oldmode;	/* OR of legal input modes. */
+X	int	newmode;	/* output mode. */
+X	char	*buf;		/* string buffer */
+X} *optpt, options[] = { /*
+Xoptlet	filchar		flag	oldmode	newmode		buf	*/
+X't',	' ',		FALSE,	UNPROC,	UNKNOWN,	header.title,
+X'n',	NGDELIM,	FALSE,	UNPROC,	UNKNOWN,	header.nbuf,
+X'd',	'\0',		FALSE,	UNPROC,	UNKNOWN,	header.distribution,
+X'e',	' ',		FALSE,	UNPROC,	UNKNOWN,	header.expdate,
+X'p',	'\0',		FALSE,	UNKNOWN,PROC,		filename,
+X'f',	'\0',		FALSE,	UNPROC,	UNKNOWN,	forgedname,
+X'F',	' ',		FALSE,	UNPROC,	UNKNOWN,	header.followid,
+X'c',	'\0',		FALSE,	UNKNOWN,CANCEL,		filename,
+X'C',	'\0',		FALSE,	UNKNOWN,CREATENG,	header.nbuf,
+X#define hflag	options[9].flag
+X'h',	'\0',		FALSE,	UNPROC,	UNKNOWN,	filename,
+X'\0',	'\0',		0,	0,	0,		(char *)NULL
+X};
+X
+XFILE *mailhdr();
+Xchar *any();
+Xchar *genversion();
+X
+X/*
+X *	Authors:
+X *		Matt Glickman	glickman@ucbarpa.Berkeley.ARPA
+X *		Mark Horton	mark@cbosgd.UUCP
+X *		Stephen Daniels	swd@mcnc.UUCP
+X *		Tom Truscott	trt@duke.UUCP
+X *	IHCC version adapted by:
+X *		Larry Marek	larry@ihuxf.UUCP
+X */
+Xmain(argc, argv)
+Xint	argc;
+Xregister char **argv;
+X{
+X	int	state;		/* which type of argument to pick up	*/
+X	int	tlen, len;	/* temps for string processing routine	*/
+X	register char *ptr;	/* pointer to rest of buffer		*/
+X	int	filchar;	/* fill character (state = STRING)	*/
+X	char	*user, *home;	/* environment temps			*/
+X	struct passwd	*pw;	/* struct for pw lookup			*/
+X	struct group	*gp;	/* struct for group lookup		*/
+X	register int	i;
+X	FILE	*mfd;		/* mail file file-descriptor		*/
+X	char	cbuf[BUFLEN];	/* command buffer			*/
+X
+X	/* uuxqt doesn't close all it's files */
+X	for (i = 3; !close(i); i++)
+X		;
+X	/* set up defaults and initialize. */
+X	mode = UNKNOWN;
+X	pathinit();
+X	ptr = rindex(*argv, '/');
+X	if (!ptr)
+X		ptr = *argv - 1;
+X	if (!strncmp(ptr+1, "rnews", 5))
+X		mode = PROC;
+X	else if (argc < 2)
+X		goto usage;
+X
+X	state = OPTION;
+X	header.title[0] = header.nbuf[0] = filename[0] = '\0';
+X
+X	/* check for existence of special files */
+X	if (!rwaccess(ARTFILE)) {
+X		mfd = mailhdr((struct hbuf *)NULL, exists(ARTFILE) ? "Unwritable files!" : "Missing files!");
+X		if (mfd != NULL) {
+X			fprintf(mfd,"System: %s\n\nThere was a problem with %s!!\n", FULLSYSNAME, ARTFILE);
+X			sprintf(cbuf, "touch %s;chmod 666 %s", ARTFILE, ARTFILE);
+X			system(cbuf);
+X			if (rwaccess(ARTFILE))
+X				fprintf(mfd, "The problem has been taken care of.\n");
+X			else
+X				fprintf(mfd, "Corrective action failed - check suid bits.\n");
+X			mclose(mfd);
+X		}
+X	}
+X	if (!rwaccess(ACTIVE)) {
+X		mfd = mailhdr((struct hbuf *)NULL, exists(ACTIVE) ? "Unwritable files!" : "Missing files!");
+X		if (mfd != NULL) {
+X			fprintf(mfd, "System: %s\n\nThere was a problem with %s!!\n", FULLSYSNAME, ACTIVE);
+X			sprintf(cbuf, "touch %s;chmod 666 %s", ACTIVE, ACTIVE);
+X			system(cbuf);
+X			if (rwaccess(ACTIVE))
+X				fprintf(mfd, "The problem has been taken care of.\n");
+X			else
+X				fprintf(mfd, "Corrective action failed - check suid bits.\n");
+X			mclose(mfd);
+X		}
+X	}
+X	sigtrap = FALSE;	/* true if a signal has been caught */
+X	if (mode != PROC) {
+X		signal(SIGHUP, onsig);
+X		signal(SIGINT, onsig);
+X	}
+X	savmask = umask(N_UMASK);	/* set up mask */
+X	uid = getuid();
+X	gid = getgid();
+X	duid = geteuid();
+X	dgid = getegid();
+X	if (uid == 0 && geteuid() == 0) {
+X		/*
+X		 * Must go through with this kludge since
+X		 * some systems do not honor the setuid bit
+X		 * when root invokes a setuid program.
+X		 */
+X		if ((pw = getpwnam(NEWSUSR)) == NULL)
+X			xerror("Cannot get NEWSU pw entry");
+X
+X		duid = pw->pw_uid;
+X		if ((gp = getgrnam(NEWSGRP)) == NULL)
+X			xerror("Cannot get NEWSG gr entry");
+X		dgid = gp->gr_gid;
+X		setgid(dgid);
+X		setuid(duid);
+X	}
+X
+X#ifndef IHCC
+X	/*
+X	 * We force the use of 'getuser()' to prevent forgery of articles
+X	 * by just changing $LOGNAME
+X	 */
+X	if (isatty(fileno(stderr))) {
+X		if ((user = getenv("USER")) == NULL)
+X			user = getenv("LOGNAME");
+X		if ((home = getenv("HOME")) == NULL)
+X			home = getenv("LOGDIR");
+X	}
+X#endif
+X	if (user == NULL || home == NULL)
+X		getuser();
+X	else {
+X		if (username == NULL || username[0] == 0) {
+X			username = AllocCpy(user);
+X		}
+X		userhome = AllocCpy(home);
+X	}
+X	getuser();
+X
+X	/* loop once per arg. */
+X
+X	++argv;		/* skip first arg, which is prog name. */
+X
+X	while (--argc) {
+X	    if (state == OPTION) {
+X		if (**argv != '-') {
+X			xerror("Bad option string \"%s\"", *argv);
+X		}
+X		while (*++*argv != '\0') {
+X			for (optpt = options; optpt->optlet != '\0'; ++optpt) {
+X				if (optpt->optlet == **argv)
+X					goto found;
+X			}
+X			/* unknown option letter */
+Xusage:
+X			fprintf(stderr, "usage: inews -t title");
+X			fprintf(stderr, " [ -n newsgroups ]");
+X			fprintf(stderr, " [ -e expiration date ]\n");
+X			fprintf(stderr, "\t[ -f sender]\n\n");
+X			xxit(1);
+X
+X		    found:;
+X			if (optpt->flag == TRUE || (mode != UNKNOWN &&
+X			    (mode&optpt->oldmode) == 0)) {
+X				xerror("Bad %c option", **argv);
+X			}
+X			if (mode == UNKNOWN)
+X				mode = optpt->newmode;
+X			filchar = optpt->filchar;
+X			optpt->flag = TRUE;
+X			state = STRING;
+X			ptr = optpt->buf;
+X			len = BUFLEN;
+X		}
+X
+X		argv++;		/* done with this option arg. */
+X
+X	    } else {
+X
+X		/*
+X		 * Pick up a piece of a string and put it into
+X		 * the appropriate buffer.
+X		 */
+X		if (**argv == '-') {
+X			state = OPTION;
+X			argc++;	/* uncount this arg. */
+X			continue;
+X		}
+X
+X		if ((tlen = strlen(*argv)) >= len)
+X			xerror("Argument string too long");
+X		strcpy(ptr, *argv++);
+X		ptr += tlen;
+X		if (*(ptr-1) != filchar)
+X			*ptr++ = filchar;
+X		len -= tlen + 1;
+X		*ptr = '\0';
+X	    }
+X	}
+X
+X	/*
+X	 * ALL of the command line has now been processed. (!)
+X	 */
+X
+X	tty = isatty(fileno(stdin));
+X
+X	/* This code is really intended to be replaced by the control message. */
+X	if (mode == CANCEL) {
+X		char *p; FILE *f;
+X		f = xfopen(filename, "r");
+X		hread(&header, f, TRUE);
+X		p = index(header.path, ' ');
+X		if (p != NULL)
+X			*p = 0;
+X		p = header.path;
+X		if (strncmp(username, p, strlen(username))
+X			&& uid != ROOTID && uid != geteuid() && uid)
+X			xerror("Not contributor");
+X		cancel();
+X		xxit(0);
+X	}
+X
+X	if (*header.nbuf)
+X		lcase(header.nbuf);
+X	nstrip(header.title);
+X	nstrip(header.expdate);
+X	nstrip(header.followid);
+X	if (mode != PROC) {
+X		getident(&header);
+X#ifdef MYORG
+X		strncpy(header.organization, MYORG, BUFLEN);
+X		if (strncmp(header.organization, "Frobozz", 7) == 0)
+X			header.organization[0] = '\0';
+X		if (ptr = getenv("ORGANIZATION"))
+X			strncpy(header.organization, ptr, BUFLEN);
+X		/*
+X		 * Note that the organization can also be turned off by
+X		 * setting it to the null string, either in MYORG or
+X		 * $ORGANIZATION in the environment.
+X		 */
+X		if (header.organization[0] == '/') {
+X			mfd = fopen(header.organization, "r");
+X			if (mfd) {
+X				fgets(header.organization, sizeof header.organization, mfd);
+X				fclose(mfd);
+X			}
+X			ptr = index(header.organization, '\n');
+X			if (ptr)
+X				*ptr = 0;
+X		}
+X#endif
+X		if (hflag) {
+X			/* Fill in a few to make frmread return TRUE */
+X			strcpy(header.subdate, "today");
+X			strcpy(header.path, "me");
+X			strcpy(header.oident, "id");
+X			/* Allow the user to supply some headers. */
+X			hread(&header, stdin, FALSE);
+X			/* But there are certain fields we won't let him specify. */
+X			if (header.from[0])
+X				strcpy(forgedname, header.from);
+X			header.from[0] = '\0';
+X			header.path[0] = '\0';
+X			header.subdate[0] = '\0';
+X			header.sender[0] = '\0';
+X			if (strcmp(header.oident, "id") == 0)
+X				header.oident[0] = '\0';
+X		}
+X		if (forgedname[0]) {
+X			strcpy(header.path, forgedname);
+X			if (any(forgedname, "@ (<") == NULL)
+X				sprintf(header.from,"%s@%s%s",
+X					forgedname, FULLSYSNAME, MYDOMAIN);
+X			else
+X				strncpy(header.from, forgedname, BUFLEN);
+X			sprintf(header.sender, "%s@%s%s",
+X				username, FULLSYSNAME, MYDOMAIN);
+X		} else {
+X			gensender(&header, username);
+X		}
+X		strncpy(header.postversion, genversion(), BUFLEN);
+X	}
+X
+X	/* Authorize newsgroups. */
+X	if (mode == PROC) {
+X#ifdef BATCH
+X		checkbatch();
+X#endif BATCH
+X		signal(SIGHUP, SIG_IGN);
+X		signal(SIGINT, SIG_IGN);
+X		signal(SIGQUIT, SIG_IGN);
+X		if (hread(&header, stdin, TRUE) == NULL)
+X			xerror("Inbound news is garbled");
+X		input();
+X		if (history(&header)) {
+X			log("Duplicate article %s rejected", header.ident);
+X			xxit(0);
+X		}
+X	}
+X
+X	/* Easy way to make control messages, since all.all.ctl is unblessed */
+X	if (mode != PROC && prefix(header.title, "cmsg ") && header.ctlmsg[0] == 0)
+X		strcpy(header.ctlmsg, &header.title[5]);
+X	is_ctl = mode != CREATENG &&
+X		(ngmatch(header.nbuf, "all.all.ctl,") || header.ctlmsg[0]);
+X#ifdef DEBUG
+X	fprintf(stderr,"is_ctl set to %d\n", is_ctl);
+X#endif
+X
+X			/* Must end in comma (NGDELIM) */
+X#define MODGROUPS	"mod.all,all.mod,all.announce,"
+X	if (ngmatch(header.nbuf, MODGROUPS) && !header.approved[0]) {
+X		mfd = mailhdr(&header, "Moderated newsgroup");
+X		if (mfd) {
+X			fprintf(mfd, "This newsgroup is moderated, and cannot be posted to directly.\n");
+X			fprintf(mfd, "Please mail your article to the moderator for posting.\n");
+X			hwrite(&header, mfd);
+X			if (infp)
+X				while ((i = getc(infp)) != EOF)
+X					putc(i, mfd);
+X			mclose(mfd);
+X		}
+X		xerror("Unapproved moderated newsgroup.");
+X	}
+X
+X	if (mode != CREATENG) {
+X		if (!*header.title)
+X			xerror("No title");
+X		if (!*header.nbuf)
+X			strcpy(header.nbuf, DFLTNG);
+X	}
+X
+X	if (mode <= UNPROC)
+X		ctlcheck();
+X
+X	if (mode == CREATENG)
+X		createng();
+X	/* Determine input. */
+X	if (mode != PROC)
+X		input();
+X
+X#ifndef VMS
+X	/* Go into the background so the user can get on with his business. */
+X	if (mode != PROC) {
+X		i = fork();
+X		if (i != 0)
+X			exit(0);
+X	}
+X#endif VMS
+X
+X	/* Do the actual insertion. */
+X	insert();
+X}
+X
+X/*
+X *	Create a newsgroup
+X */
+Xcreateng()
+X{
+X
+X	/*
+X	 * Only certain users are allowed to create newsgroups
+X	 */
+X	if (uid != ROOTID && uid != geteuid() && uid) {
+X		fprintf(stderr, "Please contact one of the local netnews people\n\tto create this group for you");
+X		xxit(1);
+X	}
+X
+X	ngdel(header.nbuf);
+X	sprintf(bfr, "%s/inews -n %s.ctl -t cmsg newgroup %s", LIB,
+X		header.nbuf, header.nbuf);
+X	printf("Please type in a paragraph describing the new newsgroup.\n");
+X	printf("End with control D as usual.\n");
+X	printf("%s\n", bfr);
+X	fflush(stdout);
+X	system(bfr);
+X	exit(0);
+X#ifdef lint
+X	return 0;
+X#endif lint
+X}
+X
+X#include <errno.h>
+Xchar firstbufname[BUFLEN];
+X/*
+X *	Link ARTICLE into dir for ngname and update active file.
+X */
+Xlocalize(ngname)
+Xchar	*ngname;
+X{
+X	char afline[BUFLEN];
+X	long ngsize;
+X	long fpos;
+X	int e;
+X	char *cp;
+X	extern int errno;
+X
+X	lock();
+X	actfp = xfopen(ACTIVE, "r+");
+X
+X	for(;;) {
+X		fpos = ftell(actfp);
+X		if (fgets(afline, sizeof afline, actfp) == NULL) {
+X			unlock();
+X			fclose(actfp);
+X			return FALSE;		/* No such newsgroup locally */
+X		}
+X		if (prefix(afline, ngname)) {
+X			sscanf(afline, "%s %ld", bfr, &ngsize);
+X			if (strcmp(bfr, ngname) == 0) {
+X				break;
+X			}
+X			if (ngsize < 0 || ngsize > 99998) {
+X				logerr("found bad ngsize %d ng %s, setting to 1", ngsize, bfr);
+X				ngsize = 1;
+X			}
+X		}
+X	}
+X	for (;;) {
+X		cp = dirname(ngname);
+X		if (!exists(cp))
+X			mknewsg(cp, ngname);
+X
+X		sprintf(bfr, "%s/%ld", cp, ngsize+1);
+X#ifdef VMS
+X		if ((f2 = creat(bfr, 0666)) >=0 ) {
+X			f1 = open(article, 0);
+X			if (f1 > 0) {
+X				while((e=read(f1, afline, BUFLEN)) > 0)
+X					write(f2, afline, r);
+X				close(f1);
+X				close(f2);
+X				break;
+X			}
+X		}
+X#else !VMS
+X		if (link(ARTICLE, bfr) == 0)
+X			break;
+X#endif !VMS
+X		e = errno;	/* keep log from clobbering it */
+X		logerr("Cannot install article as %s", bfr);
+X		if (e != EEXIST) {
+X			logerr("Link into %s failed, errno %d, check dir permissions.", bfr, e);
+X			unlock();
+X			fclose(actfp);
+X			return FALSE;
+X		}
+X		ngsize++;
+X	}
+X
+X	/* Next two lines program around a bug in 4.1BSD stdio. */
+X	fclose(actfp);
+X	actfp = fopen(ACTIVE, "r+");
+X
+X	fseek(actfp, fpos, 0);
+X	/* Has to be same size as old because of %05d.
+X	 * This will overflow with 99999 articles.
+X	 */
+X	fprintf(actfp, "%s %05ld", ngname, ngsize+1);
+X	fclose(actfp);
+X	unlock();
+X	if (firstbufname[0] == '\0')
+X		strcpy(firstbufname, bfr);
+X	sprintf(bfr, "%s/%ld ", ngname, ngsize+1);
+X	addhist(bfr);
+X	return TRUE;
+X}
+X
+X/*
+X *	Localize for each newsgroup and broadcast.
+X */
+Xinsert()
+X{
+X	register char *ptr;
+X	register FILE *tfp;
+X	char c;
+X	struct srec srec;	/* struct for sys file lookup	*/
+X	int is_invalid = FALSE;
+X
+X	/* Fill up the rest of header. */
+X	if (mode != PROC) {
+X		history(&header);
+X	}
+X	dates(&header);
+X	ptr = ctime(&header.rectime);
+X	ptr[16] = 0;
+X	ptr += 4;
+X
+X	addhist(ptr);
+X	addhist("\t");
+X	log("%s %s ng %s subj '%s'", mode==PROC ? "received" : "posted", header.ident, header.nbuf, header.title);
+X	if (mode==PROC)
+X		log("from %s relay %s", header.from, header.relayversion);
+X
+X	/* Clean up Newsgroups: line */
+X	if (!is_ctl && mode != CREATENG)
+X		is_invalid = ngfcheck(mode == PROC);
+X
+X	/* Write article to temp file. */
+X	tfp = xfopen(mktemp(ARTICLE), "w");
+X	if ( (c=getc(infp)) == ' ' || c == '\t' ) {
+X		header.intnumlines++;
+X		sprintf(header.numlines,"%d",header.intnumlines);
+X	}
+X	lhwrite(&header, tfp);
+X	/* Kludge to get around article truncation problem */
+X	if (c == ' ' || c == '\t' )
+X		putc('\n', tfp);
+X	putc(c,tfp);
+X	while (fgets(bfr, BUFLEN, infp) != NULL)
+X		fputs(bfr, tfp);
+X
+X	if (bfr[strlen(bfr)-1] != '\n')
+X		putc('\n',tfp);
+X	fclose(tfp);
+X	fclose(infp);
+X
+X	if (is_invalid) {
+X		logerr("No valid newsgroups found, moved to junk");
+X		if (localize("junk"))
+X			savehist(histline);
+X		xxit(1);
+X	}
+X
+X	if (time((time_t)0) > (cgtdate(header.subdate) + DFLTEXP) ){
+X		logerr("Article too old, moved to junk");
+X		if (localize("junk"))
+X			savehist(histline);
+X		xxit(1);
+X	}
+X
+X	if (is_ctl) {
+X		control(&header);
+X		localize("control");
+X	} else {
+X		if (s_find(&srec, FULLSYSNAME) == FALSE)
+X			xerror("Cannot find my name '%s' in %s", FULLSYSNAME, SUBFILE);
+X		for (ptr = nbuf; *ptr;) {
+X			if (ngmatch(ptr, srec.s_nbuf) || index(ptr,'.') == NULL)
+X				localize(ptr);
+X			while (*ptr++)
+X				;
+X		}
+X		if (firstbufname[0] == '\0') {
+X			logerr("Newsgroups in active, but not sys");
+X			localize("junk");
+X		}
+X	}
+X
+X	broadcast();
+X	savehist(histline);
+X	xxit(0);
+X}
+X
+Xinput()
+X{
+X	register int empty = TRUE;
+X	register char *cp;
+X	int c;
+X	long chcount = 0;
+X	FILE *tmpfp;
+X	int consec_newlines = 0;
+X	int linecount = 0;
+X
+X	tmpfp = xfopen(mktemp(INFILE), "w");
+X	if (*filename) {
+X		tty = FALSE;
+X		infp = xfopen(filename, "r");
+X	} else {
+X		infp = stdin;
+X	}
+X	while (!sigtrap && fgets(bfr, BUFLEN, stdin) != NULL) {
+X 		if (mode == PROC) {	/* zap trailing empty lines */
+X 			if (bfr[0] == '\n') {	/* 1 empty line, to go */
+X 				consec_newlines++;	/* count it, in case */
+X 				continue;		/* but don't write it*/
+X 			}
+X 			/* foo! a non-empty line. write out all saved lines. */
+X 			while (consec_newlines > 0) {
+X 				putc('\n', tmpfp);
+X 				consec_newlines--;
+X				linecount++;
+X 			}
+X#ifdef ZAPNOTES
+X			if (empty && bfr[0] == '#' && bfr[2] == ':') {
+X				strcpy(header.nf_id, bfr);
+X				nstrip(header.nf_id);
+X				fgets(bfr, BUFLEN, stdin);
+X				strcpy(header.nf_from, bfr);
+X				nstrip(header.nf_from);
+X				fgets(bfr, BUFLEN, stdin);
+X
+X				header.intnumlines -= 2;
+X				sprintf(header.numlines, "%d", header.intnumlines);
+X
+X				/* Strip trailing " - (nf)" */
+X				if ((cp = rindex(header.title, '-')) != NULL
+X				    && !strcmp(--cp, " - (nf)"))
+X					*cp = '\0';
+X				log("Stripped notes header on %s", header.ident);
+X				continue;
+X			}
+X#endif ZAPNOTES
+X 		}
+X		if (mode != PROC && tty && strcmp(bfr, ".\n") == 0)
+X			break;
+X		for (cp = bfr; c = *cp; cp++) {
+X			if (isprint(c) || isspace(c) || c=='\b')
+X				putc(c, tmpfp);
+X			if (isprint(c))
+X				chcount++;
+X			if (c == '\n')
+X				linecount++;
+X		}
+X		empty = FALSE;
+X	}
+X	if (*filename)
+X		fclose(infp);
+X
+X	if (mode != PROC && !is_ctl) {
+X		sprintf(bfr, "%s/%s", userhome, ".signature");
+X		if (infp = fopen(bfr, "r")) {
+X			fprintf(tmpfp, "-- \n");	/* To separate */
+X			linecount++;
+X			while ((c = getc(infp)) != EOF) {
+X				putc(c, tmpfp);
+X				if (c == '\n')
+X					linecount++;
+X			}
+X			fclose(infp);
+X		}
+X	}
+X
+X	fclose(tmpfp);
+X	if (sigtrap) {
+X		if (tty)
+X			fprintf(stderr, "Interrupt\n");
+X		if (tty && !empty)
+X			fwait(fsubr(newssave, (char *) NULL, (char *) NULL));
+X		if (!tty)
+X			log("Blown away by an interrupt %d", sigtrap);
+X		xxit(1);
+X	}
+X	if (tty)
+X		printf("EOT\n");
+X	fflush(stdout);
+X	infp = fopen(INFILE, "r");
+X	if (chcount < 5 && mode <= UNPROC && !is_ctl) {
+X		fprintf(stderr,"Body of article too short, not posted\n");
+X		xxit(1);
+X	}
+X	if (header.numlines[0]) {
+X		/* adjust count for blank lines we stripped off */
+X		if (consec_newlines) {
+X			header.intnumlines -= consec_newlines;
+X			if (header.intnumlines < 0 )
+X				header.intnumlines = 0; /* paranoia */
+X			sprintf(header.numlines, "%d", header.intnumlines);
+X		}
+X
+X		/*
+X		 * Check line count if there's already one attached to
+X		 * the article.  Could make this a fatal error -
+X		 * throwing it away if it got chopped, in hopes that
+X		 * another copy will come in later with a correct
+X		 * line count.  But that seems a bit much for now.
+X		 */
+X		if (linecount != header.intnumlines) {
+X			if (linecount)
+X				log("linecount expected %d, got %d", header.intnumlines, linecount);
+X			else
+X				xerror("%s rejected. linecount expected %d, got 0", header.ident, header.intnumlines);
+X		}
+X	} else {
+X		/* Attach a line count to the article. */
+X		header.intnumlines = linecount;
+X		sprintf(header.numlines, "%d", linecount);
+X	}
+X}
+X
+X/*
+X * Make the directory for a new newsgroup.  ngname should be the
+X * full pathname of the directory.  Do the other stuff too.
+X * The various games with setuid and chown are to try to make sure
+X * the directory is owned by NEWSUSR and NEWSGRP, which is tough to
+X * do if you aren't root.  This will work on a UCB system (which allows
+X * setuid(geteuid()) or a USG system (which allows you to give away files
+X * you own with chown), otherwise you have to change your kernel to allow
+X * one of these things or run with your dirs 777 so that it doesn't matter
+X * who owns them.
+X */
+Xmknewsg(fulldir, ngname)
+Xchar	*fulldir;
+Xchar	*ngname;
+X{
+X	int	pid;
+X	register char *p;
+X	char sysbuf[200];
+X	char parent[200];
+X	struct stat sbuf;
+X
+X	if (ngname == NULL || !isalpha(ngname[0]))
+X		xerror("Tried to make illegal newsgroup %s", ngname);
+X
+X	/*
+X	 * If the parent is 755 and we're on a USG system, the setuid(getuid)
+X	 * will fail, and since mkdir is suid, and our real uid is random,
+X	 * the mkdir will fail.  So we have to temporarily chmod it to 777.
+X	 */
+X	strcpy(parent, fulldir);
+X	while (p = rindex(parent, '/')) {
+X		*p = '\0';
+X		if (stat(parent, &sbuf) == 0) {
+X			chmod(parent, 0777);
+X			break;
+X		}
+X	}
+X
+X	if ((pid = fork()) <= 0) {
+X		setgid(getegid());
+X		if (setuid(geteuid()))	/* This fails on some systems, but
+X					 * works on 4BSD, and 2BSD. */
+X#ifndef USG
+X			umask(0)
+X#endif
+X				;
+X		/* Create the directory */
+X		mkparents(fulldir);
+X		sprintf(sysbuf, "mkdir %s", fulldir);
+X		exit(system(sysbuf));
+X	} else if (fwait(pid)) {
+X		xerror("Cannot mkdir %s", fulldir);
+X	}
+X
+X	chmod(parent, (int)sbuf.st_mode);	/* put it back */
+X
+X#ifdef USG
+X# ifndef CHEAP
+X	/*
+X	 * Give away the files we just created, which were assigned to our
+X	 * REAL uid.  This only works on USG systems.  It is an alternative
+X	 * to the setuid call above.  The directories we just made are owned
+X	 * by our real uid, so we have to temporarily set our effective uid
+X	 * the same to allow the chown.  Fortunately, USG lets us setuid back.
+X	 */
+X	setuid(getuid());
+X	chown(fulldir, duid, dgid);
+X	strcpy(sysbuf, fulldir);
+X	while (p = rindex(sysbuf, '/')) {
+X		*p = '\0';
+X		/* stop when we get to last known "good" parent */
+X		if (strcmp(sysbuf, parent) == 0)
+X			break;
+X		chown(sysbuf, duid, dgid);
+X	}
+X	setuid(duid);
+X# endif
+X#endif
+X
+X	/* Update the "active newsgroup" file, unless it's already there */
+X	if (validng(ngname) == 0) {
+X		actfp = xfopen(ACTIVE, "a");
+X		fprintf(actfp, "%s 00000 00001 %c\n", ngname,
+X			prefix(ngname, "fa.") ? 'n' : 'y');
+X		fclose(actfp);
+X	}
+X
+X	log("make newsgroup %s in dir %s", ngname, fulldir);
+X}
+X
+X/*
+X * If any parent directories of this dir don't exist, create them.
+X */
+Xmkparents(dname)
+Xchar *dname;
+X{
+X	char buf[200], sysbuf[200];
+X	register char *p;
+X
+X	strcpy(buf, dname);
+X	p = rindex(buf, '/');
+X	if (p)
+X		*p = '\0';
+X	if (exists(buf))
+X		return;
+X	mkparents(buf);
+X	sprintf(sysbuf, "mkdir %s", buf);
+X	system(sysbuf);
+X}
+X
+Xcancel()
+X{
+X	register FILE *fp;
+X
+X	log("cancel article %s", filename);
+X	fp = xfopen(filename, "r");
+X	if (hread(&header, fp, TRUE) == NULL)
+X		xerror("Article is garbled.");
+X	fclose(fp);
+X	unlink(filename);
+X}
+X
+X
+X/*
+X * Return the ptr in sp at which a character in sq appears;
+X * NULL if not found
+X *
+X */
+X
+Xchar *
+Xany(sp, sq)
+Xchar *sp, *sq;
+X{
+X	register c1, c2;
+X	register char *q;
+X
+X	while (c1 = *sp++) {
+X		q = sq;
+X		while (c2 = *q++)
+X			if (c1 == c2)
+X				return(--sp);
+X	}
+X	return(NULL);
+X}
+*-*-END-of-src/inews.c-*-*
+echo x - src/install.sh
+sed 's/^X//' >src/install.sh <<'*-*-END-of-src/install.sh-*-*'
+X: '@(#)install.sh	1.5	9/3/84'
+X
+Xif test "$#" != 5
+Xthen
+X	echo "usage: $0 spooldir libdir nuser ngroup ostype"
+X	exit 1
+Xfi
+XSPOOLDIR=$1
+XLIBDIR=$2
+XNEWSUSR=$3
+XNEWSGRP=$4
+XOSTYPE=$5
+X
+X: Get name of local system
+Xcase $OSTYPE in
+X	usg)	SYSNAME=`uname -n`;;
+X	v7)	SYSNAME=`uuname -l`
+X		touch $LIBDIR/history.pag $LIBDIR/history.dir;;
+X	*)	echo "$0: Unknown Ostype"
+X		exit 1;;
+Xesac
+X
+Xif test "$SYSNAME" = ""
+Xthen
+X	echo "$0: Cannot get system name"
+X	exit 1
+Xfi
+X
+X: Ensure SPOOLDIR exists
+Xif test ! -d $SPOOLDIR
+Xthen
+X	mkdir $SPOOLDIR
+Xfi
+Xchmod 777 $SPOOLDIR
+Xchown $NEWSUSR $SPOOLDIR
+Xchgrp $NEWSGRP $SPOOLDIR
+X
+Xchown $NEWSUSR $LIBDIR
+Xchgrp $NEWSGRP $LIBDIR
+X
+X: Ensure certain files in LIBDIR exist
+Xtouch $LIBDIR/history $LIBDIR/active $LIBDIR/log $LIBDIR/errlog $LIBDIR/users
+Xchmod 666 $LIBDIR/users
+X
+X: If no sys file, make one.
+Xif test ! -f $LIBDIR/sys
+Xthen
+Xecho
+Xecho Making a $LIBDIR/sys file to link you to oopsvax.
+Xecho You must change oopsvax to your news feed.
+Xecho If you are not in the USA, remove '"usa"' from your line in the sys file.
+Xecho If you are not in North America, remove '"na"' from your line in the sys file.
+X	cat > $LIBDIR/sys << EOF
+X$SYSNAME:net,fa,mod,na,usa,to::
+Xoopsvax:net,fa,mod,na,usa,to.oopsvax::
+XEOF
+Xfi
+X
+X: If no seq file, make one.
+Xif test ! -s $LIBDIR/seq
+Xthen
+X	echo '100' >$LIBDIR/seq
+Xfi
+X
+X: if no moderators file, make one.
+Xif test ! -f $LIBDIR/moderators
+Xthen
+X	cat > $LIBDIR/moderators << EOF
+Xnet.announce	cbosgd!mark
+Xmod.ber		bellcore!ber
+XEOF
+Xecho
+Xecho Make sure the uucp paths in $LIBDIR/moderators are correct for your site.
+Xfi
+X
+Xsh makeactive.sh $LIBDIR $SPOOLDIR $NEWSUSR $NEWSGRP
+X
+Xfor i in $LIBDIR/ngfile $BINDIR/inews
+Xdo
+X	if test -f $i
+X	then
+X		echo "$i is no longer used. You should remove it."
+X	fi
+Xdone
+X
+X: if no aliases file, make one
+Xif test ! -f $LIBDIR/aliases
+Xthen
+X	cat >$LIBDIR/aliases <<EOF
+Xnet.trivia	net.games.trivia
+Xnet.stat	net.math.stat
+Xnet.unix.wizards	net.unix-wizards
+Xnet.apollo	net.works.apollo
+Xnet.puzzles	net.puzzle
+XEOF
+Xfi
+X
+X: if no distributions file, make one
+Xif test ! -f $LIBDIR/distributions
+Xthen
+X	cat >$LIBDIR/distributions <<EOF
+Xlocal		Local to this site
+Xusa		Everywhere in the USA
+Xna		Everywhere in North America
+Xworld		Everywhere on Usenet in the world (same as net)
+XEOF
+Xecho
+Xecho You may want to add distributions to $LIBDIR/distributions if your
+Xecho site particpates in a regional distribution such as '"ba"' or '"dc"'.
+Xfi
+X
+Xchown $NEWSUSR $LIBDIR/[a-z]*
+Xchgrp $NEWSGRP $LIBDIR/[a-z]*
+X
+Xecho
+Xecho Reminder: uux must permit rnews if running over uucp.
+*-*-END-of-src/install.sh-*-*
+echo x - src/iparams.h
+sed 's/^X//' >src/iparams.h <<'*-*-END-of-src/iparams.h-*-*'
+X/*
+X * iparams - parameters for inews.
+X */
+X
+X/*	@(#)iparams.h	2.10	8/28/84	*/
+X
+X#include "params.h"
+X
+X/* external declarations specific to inews */
+Xextern	char	nbuf[], *ARTICLE, *INFILE, *ALIASES, *PARTIAL;
+X#ifndef ROOTID
+Xextern	int	ROOTID;
+X#endif
+X
+X#ifdef NOTIFY
+Xextern	char	*TELLME;
+X#endif NOTIFY
+X
+Xextern	FILE	*infp,*actfp;
+Xextern	int	tty, flag, is_ctl;
+Xextern	char	filename[], *DFLTNG, whatever[];
+*-*-END-of-src/iparams.h-*-*
+echo x - src/localize.sampl
+sed 's/^X//' >src/localize.sampl <<'*-*-END-of-src/localize.sampl-*-*'
+X
+Xrm -f Makefile
+Xcp Makefile.v7 Makefile
+Xchmod u+w Makefile
+Xed - Makefile  <<'EOF'
+X/NEWSGRP/s/news/uucp/
+X/UUXFLAGS/s/-r -z/-r -z -n -gd/
+Xw
+Xq
+XEOF
+Xrm -f defs.h
+Xcp defs.dist defs.h
+Xchmod u+w defs.h
+Xed - defs.h <<'EOF'
+X/ROOTID/s/10/6/
+X/N_UMASK/s/000/022/
+X/DFTXMIT/s/-z/-z -gd/
+X/UXMIT/s/-z/-z -gd/
+X/GHNAME/s;/\* ;;
+X/BSD4_2/s;/\* ;;
+X/SENDMAIL/s;/\* ;;
+X/MYORG/s/Frobozz Inc., St. Louis/Center for Seismic Studies, Arlington, VA/
+Xw
+Xq
+XEOF
+*-*-END-of-src/localize.sampl-*-*
+echo x - src/localize.sh
+sed 's/^X//' >src/localize.sh <<'*-*-END-of-src/localize.sh-*-*'
+*-*-END-of-src/localize.sh-*-*
+echo x - src/logdir.c
+sed 's/^X//' >src/logdir.c <<'*-*-END-of-src/logdir.c-*-*'
+X/*
+X *	UNIX shell - logdir routine
+X *
+X *	Joe Steffen
+X *	Bell Telephone Laboratories
+X *
+X *	This routine does not use the getpwent(3) library routine
+X *	because the latter uses the stdio package.  The allocation of
+X *	storage in this package destroys the integrity of the shell's
+X *	storage allocation.
+X *
+X *	Modified 2/82 by DJ Molny
+X *
+X *	This routine now implements name cacheing, so multiple requests
+X *	for the same logdir do not result in multiple open/reads of
+X *	/etc/passwd.  If the previous request was successful and the name
+X *	is the same as the last request, the same login directory is returned.
+X */
+X#ifndef lint
+Xstatic char	*SccsId = "@(#)logdir.c	1.3	8/21/84";
+X#endif !lint
+X
+X#define	BUFSIZ	160
+X
+Xstatic char line[BUFSIZ+1];
+X
+Xchar *
+Xlogdir(name)
+Xchar *name;
+X{
+X	int	pwf;
+X	static char lastname[BUFSIZ+1];
+X	static char lastdir[BUFSIZ+1];
+X	register char *p;
+X	register int i, j;
+X	char *getenv(), *field(), *strcpy();
+X
+X	if (*lastdir && !strcmp(lastname,name))		/* djm */
+X		return(lastdir);
+X
+X	strcpy(lastname,name);			/* djm */
+X	strcpy(lastdir,"");			/* djm */
+X
+X#ifdef IHCC
+X	/* if the logname is exptools, see if $TOOLS is set */
+X	if (strcmp(name, "exptools") &&
+X	    (p = getenv("TOOLS")) != 0 && *p != '\0') {
+X		strcpy(lastdir, p);
+X		return(lastdir);
+X	}
+X#endif
+X
+X	/* attempt to open the password file */
+X	if ((pwf = open("/etc/passwd", 0)) == -1)
+X		return(0);
+X
+X	/* find the matching password entry */
+X	do {
+X		/* get the next line in the password file */
+X		i = read(pwf, line, BUFSIZ);
+X		for (j = 0; j < i; j++)
+X			if (line[j] == '\n')
+X				break;
+X		/* return a null pointer if the whole file has been read */
+X		if (j >= i)
+X			return(0);
+X		line[++j] = 0;			/* terminate the line */
+X		lseek(pwf, (long) (j - i), 1);	/* point at the next line */
+X		p = field(line);		/* get the logname */
+X	} while (strcmp(name, line) != 0);
+X	close(pwf);
+X
+X	/* skip the intervening fields */
+X	p = field(p);
+X	p = field(p);
+X	p = field(p);
+X	p = field(p);
+X
+X	/* return the login directory */
+X	field(p);
+X	strcpy(lastdir,p);			/* djm */
+X	return(p);
+X}
+X
+Xstatic char *
+Xfield(p)
+Xregister char *p;
+X{
+X	while (*p && *p != ':')
+X		++p;
+X	if (*p) *p++ = 0;
+X	return(p);
+X}
+*-*-END-of-src/logdir.c-*-*
+echo x - src/ndir.c
+sed 's/^X//' >src/ndir.c <<'*-*-END-of-src/ndir.c-*-*'
+X#include "defs.h"
+X#if !defined(BSD4_2) && !defined(BSD4_1C)
+X#include <sys/param.h>
+X#include "ndir.h"
+X
+Xstatic char	*SccsId = "@(#)ndir.c	1.4	7/17/84";
+X
+X/*
+X * suport for Berkeley directory reading routine on a V7 file system
+X */
+X
+X/*
+X * open a directory.
+X */
+XDIR *
+Xopendir(name)
+Xchar *name;
+X{
+X	register DIR *dirp;
+X	register int fd;
+X
+X	if ((fd = open(name, 0)) == -1)
+X		return NULL;
+X	if ((dirp = (DIR *)malloc(sizeof(DIR))) == NULL) {
+X		close (fd);
+X		return NULL;
+X	}
+X	dirp->dd_fd = fd;
+X	dirp->dd_loc = 0;
+X	return dirp;
+X}
+X
+X/*
+X * read an old stlye directory entry and present it as a new one
+X */
+X#define	ODIRSIZ	14
+X
+Xstruct	olddirect {
+X	short	od_ino;
+X	char	od_name[ODIRSIZ];
+X};
+X
+X/*
+X * get next entry in a directory.
+X */
+Xstruct direct *
+Xreaddir(dirp)
+Xregister DIR *dirp;
+X{
+X	register struct olddirect *dp;
+X	static struct direct dir;
+X
+X	for (;;) {
+X		if (dirp->dd_loc == 0) {
+X			dirp->dd_size = read(dirp->dd_fd, dirp->dd_buf,
+X			    DIRBLKSIZ);
+X			if (dirp->dd_size <= 0)
+X				return NULL;
+X		}
+X		if (dirp->dd_loc >= dirp->dd_size) {
+X			dirp->dd_loc = 0;
+X			continue;
+X		}
+X		dp = (struct olddirect *)(dirp->dd_buf + dirp->dd_loc);
+X		dirp->dd_loc += sizeof(struct olddirect);
+X		if (dp->od_ino == 0)
+X			continue;
+X		dir.d_ino = dp->od_ino;
+X		strncpy(dir.d_name, dp->od_name, ODIRSIZ);
+X		dir.d_name[ODIRSIZ] = '\0'; /* insure null termination */
+X		dir.d_namlen = strlen(dir.d_name);
+X		dir.d_reclen = DIRSIZ(&dir);
+X		return (&dir);
+X	}
+X}
+X
+X/*
+X * close a directory.
+X */
+Xvoid
+Xclosedir(dirp)
+Xregister DIR *dirp;
+X{
+X	close(dirp->dd_fd);
+X	dirp->dd_fd = -1;
+X	dirp->dd_loc = 0;
+X	free(dirp);
+X}
+X#endif !BSD4_2 && !BSD4_1C
+*-*-END-of-src/ndir.c-*-*
+echo x - src/ndir.h
+sed 's/^X//' >src/ndir.h <<'*-*-END-of-src/ndir.h-*-*'
+X/* SCCS ID @(#)ndir.h	1.2	6/26/84	*/
+X#ifndef DEV_BSIZE
+X#define	DEV_BSIZE	512
+X#endif
+X#define DIRBLKSIZ	DEV_BSIZE
+X#define	MAXNAMLEN	255
+X
+Xstruct	direct {
+X	long	d_ino;			/* inode number of entry */
+X	short	d_reclen;		/* length of this record */
+X	short	d_namlen;		/* length of string in d_name */
+X	char	d_name[MAXNAMLEN + 1];	/* name must be no longer than this */
+X};
+X
+X/*
+X * The DIRSIZ macro gives the minimum record length which will hold
+X * the directory entry.  This requires the amount of space in struct direct
+X * without the d_name field, plus enough space for the name with a terminating
+X * null byte (dp->d_namlen+1), rounded up to a 4 byte boundary.
+X */
+X#undef DIRSIZ
+X#define DIRSIZ(dp) \
+X    ((sizeof (struct direct) - (MAXNAMLEN+1)) + (((dp)->d_namlen+1 + 3) &~ 3))
+X
+X/*
+X * Definitions for library routines operating on directories.
+X */
+Xtypedef struct _dirdesc {
+X	int	dd_fd;
+X	long	dd_loc;
+X	long	dd_size;
+X	char	dd_buf[DIRBLKSIZ];
+X} DIR;
+X#ifndef NULL
+X#define NULL 0
+X#endif
+Xextern	DIR *opendir();
+Xextern	struct direct *readdir();
+Xextern	long telldir();
+Xextern	void seekdir();
+X#define rewinddir(dirp)	seekdir((dirp), (long)0)
+Xextern	void closedir();
+*-*-END-of-src/ndir.h-*-*
+echo x - src/params.h
+sed 's/^X//' >src/params.h <<'*-*-END-of-src/params.h-*-*'
+X/*
+X * params.h - parameters for everyone.
+X */
+X
+X/*	@(#)params.h	2.12	9/3/84	*/
+X
+X#include <stdio.h>
+X#include <signal.h>
+X#include <sys/types.h>
+X#include <grp.h>
+X#include <pwd.h>
+X#include <sys/stat.h>
+X#include <ctype.h>
+X#include <time.h>
+X
+X#include "defs.h"
+X
+X#ifndef UNAME
+X/*
+X * 9 bytes is for compatibility with USG, in case you forget to define UNAME.
+X * 33 bytes in nodename because many sites have names longer than 8 chars.
+X */
+Xstruct utsname {
+X	char	sysname[9];
+X	char	nodename[33];
+X	char	release[9];
+X	char	version[9];
+X};
+X#else
+X#include <sys/utsname.h>
+X#endif
+X
+X#ifndef USG
+X#include <sys/timeb.h>
+X#else
+Xstruct timeb
+X{
+X	time_t	time;
+X	unsigned short millitm;
+X	short	timezone;
+X	short	dstflag;
+X};
+X#endif
+X
+X#include "header.h"
+X
+X/* line from SUBFILE */
+Xstruct	srec {
+X	char	s_name[BUFLEN];		/* system name		*/
+X	char	s_nbuf[LBUFLEN];	/* system subscriptions */
+X	char	s_flags[BUFLEN];	/* system flags		*/
+X	char	s_xmit[LBUFLEN];	/* system xmit routine	*/
+X};
+X
+Xextern	int	uid, gid, duid, dgid;
+Xextern	int	savmask, sigtrap, mode, lockcount, defexp;
+Xextern	struct	hbuf header;
+Xextern	char	bfr[LBUFLEN], *username, *userhome;
+X
+Xextern	char	*SPOOL, *LIB, *BIN, *SUBFILE, *ACTIVE;
+Xextern	char	*LOCKFILE, *SEQFILE, *ARTFILE;
+Xextern	char	*news_version;
+X
+X#ifdef NOTIFY
+Xextern	char	*TELLME;
+X#endif
+X
+Xextern	char	*FULLSYSNAME;
+X#ifndef SHELL
+Xextern char	*SHELL;
+X#endif
+X
+X/* external function declarations */
+Xextern	FILE	*xfopen(), *hread();
+Xextern	char	*strcpy(), *strncpy(), *strcat(), *index(), *rindex();
+Xextern	char	*ctime(), *mktemp(), *malloc(), *realloc(), *getenv();
+Xextern	char	*arpadate(), *dirname(), *dotname(), *AllocCpy();
+Xextern	struct	passwd *getpwnam(), *getpwuid(), *getpwent();
+Xextern	struct	group *getgrnam();
+Xextern	time_t	time(), getdate(), cgtdate();
+Xextern	int	broadcast(), save(), newssave(), ushell(), pshell(), onsig();
+Xextern	long	atol();
+*-*-END-of-src/params.h-*-*
+echo x - src/pathinit.c
+sed 's/^X//' >src/pathinit.c <<'*-*-END-of-src/pathinit.c-*-*'
+X/*
+X * This function initializes all the strings used for the various
+X * filenames.  They cannot be compiled into the program, since that
+X * would be non-portable.  With this convention, the netnews sub-system
+X * can be owned by any non-priviledged user.  It is also possible
+X * to work when the administration randomly moves users from one
+X * filesystem to another.  The convention is that a particular user
+X * (HOME, see Makefile) is searched for in /etc/passwd and all files
+X * are presumed relative to there.  This method also allows one copy
+X * of the object code to be used on ANY machine.  (this code runs
+X * un-modified on 50+ machines at IH!!)
+X *
+X * The disadvantage to using this method is that all netnews programs
+X * (inews, readnews, rnews, checknews) must first search /etc/passwd
+X * before they can start up.  This can cause significant overhead if
+X * you have a big password file.
+X *
+X * Some games are played with ifdefs to get three .o files out of this
+X * one source file.  INEW is defined for inews, READ for readnews,
+X * and CHKN for checknews.
+X */
+X
+X#ifndef lint
+Xstatic char	*SccsId = "@(#)pathinit.c	1.13	9/3/84";
+X#endif !lint
+X
+X#ifdef INEW
+X#include	"iparams.h"
+X#endif INEW
+X
+X#ifdef READ
+X#include	"rparams.h"
+X#endif READ
+X
+X#if CHKN || EXP
+X#include <stdio.h>
+X#endif CHKN
+X
+Xchar *FULLSYSNAME, *SPOOL, *LIB, *BIN, *ACTIVE, *OLDNEWS, *SUBFILE, *ARTFILE,
+X	*MAILPARSER, *LOCKFILE, *SEQFILE, *ARTICLE, *INFILE, *ALIASES,
+X	*TELLME, *username, *userhome;
+X
+Xextern char bfr[];
+X
+Xstruct passwd *getpwnam();
+Xchar *rindex();
+X
+X#define Sprintf(where,fmt,arg)	sprintf(bfr,fmt,arg); where = AllocCpy(bfr)
+X
+Xchar *
+XAllocCpy(cp)
+Xregister char *cp;
+X{
+X	register char *mp;
+X	char *malloc();
+X
+X	mp = malloc(strlen(cp)+1);
+X
+X	if (mp == NULL)
+X		xerror("malloc failed on %s",cp);
+X
+X	strcpy(mp, cp);
+X	return mp;
+X}
+X
+Xpathinit()
+X{
+X	FILE	*nfd;		/* notify file descriptor		*/
+X#ifndef ROOTID
+X	struct passwd	*pw;	/* struct for pw lookup			*/
+X#endif !ROOTID
+X#ifdef EXP
+X	char *p;
+X#endif EXP
+X#if INEW || READ
+X	struct utsname ubuf;
+X
+X	uname(&ubuf);
+X	FULLSYSNAME = AllocCpy(ubuf.nodename);
+X#endif INEW || READ
+X
+X#ifdef HOME
+X	/* Relative to the home directory of user HOME */
+X	sprintf(bfr, "%s/%s", logdir(HOME), SPOOLDIR);
+X	SPOOL = AllocCpy(bfr);
+X	sprintf(bfr, "%s/%s", logdir(HOME), LIBDIR);
+X	LIB = AllocCpy(bfr);
+X#else !HOME
+X	/* Fixed paths defined in Makefile */
+X	SPOOL = AllocCpy(SPOOLDIR);
+X	LIB = AllocCpy(LIBDIR);
+X#endif !HOME
+X
+X#ifdef IHCC
+X	sprintf(bfr, "%s/%s", logdir(HOME), BINDIR);
+X	BIN = AllocCpy(bfr);
+X#else !IHCC
+X	Sprintf(BIN, "%s", BINDIR);
+X#endif !IHCC
+X
+X	Sprintf(ACTIVE, "%s/active", LIB);
+X
+X#ifdef EXP
+X	strcpy(bfr, SPOOL);
+X	p = rindex(bfr, '/');
+X	if (p) {
+X		strcpy(++p, "oldnews");
+X		OLDNEWS = AllocCpy(bfr);
+X	} else
+X		OLDNEWS = AllocCpy("oldnews");
+X#endif EXP
+X
+X#if INEW || READ || EXP
+X	Sprintf(SUBFILE, "%s/sys", LIB);
+X	Sprintf(ARTFILE, "%s/history", LIB);
+X# endif INEW || READ
+X
+X# ifdef READ
+X#ifdef SENDMAIL
+X	MAILPARSER = AllocCpy(SENDMAIL);
+X#else !SENDMAIL
+X	Sprintf(MAILPARSER, "%s/recmail", LIB);
+X#endif !SENDMAIL
+X# endif READ
+X
+X# ifdef INEW
+X	Sprintf(LOCKFILE, "%s/LOCK", LIB);
+X	Sprintf(SEQFILE, "%s/seq", LIB);
+X	Sprintf(ARTICLE, "%s/.arXXXXXX", SPOOL);
+X	Sprintf(INFILE, "%s/.inXXXXXX", SPOOL);
+X	Sprintf(ALIASES, "%s/aliases", LIB);
+X/*
+X * The person notified by the netnews sub-system.  Again, no name is
+X * compiled in, but instead the information is taken from a file.
+X * If the file does not exist, a "default" person will get the mail.
+X * If the file exists, but is empty, nobody will get the mail.  This
+X * may seem backwards, but is a better fail-safe.
+X */
+X# ifdef NOTIFY
+X	sprintf(bfr, "%s/notify", LIB);
+X	nfd = fopen(bfr, "r");
+X	if (nfd != NULL) {
+X		bfr[0] = '\0';
+X		fscanf(nfd, "%s", bfr);
+X		TELLME = AllocCpy(bfr);
+X		fclose(nfd);
+X	} else
+X		TELLME = AllocCpy(NOTIFY);
+X# endif NOTIFY
+X
+X/*
+X * Since the netnews owner's id number is different on different
+X * systems, we'll extract it from the /etc/passwd file.  If no entry,
+X * default to root.  This id number seems to only be used to control who
+X * can input certain control messages or cancel any message.  Note that
+X * entry is the name from the "notify" file as found above if possible.
+X * Defining ROOTID in defs.h hardwires in a number and avoids
+X * another search of /etc/passwd.
+X */
+X# ifndef ROOTID
+X	if ((pw = getpwnam(TELLME)) != NULL)
+X		ROOTID =  pw->pw_uid;
+X	else if ((pw = getpwnam(HOME)) != NULL)
+X		ROOTID =  pw->pw_uid;
+X	else
+X		ROOTID = 0;		/* nobody left, let only root */
+X# endif ROOTID
+X#endif INEW
+X}
+*-*-END-of-src/pathinit.c-*-*
+echo x - src/postnews.c
+sed 's/^X//' >src/postnews.c <<'*-*-END-of-src/postnews.c-*-*'
+X/*
+X * Postnews: post a news message to Usenet.  This C version replaces a shell
+X * script, and does more intelligent prompting and filtering than possible
+X * in a shell script.
+X */
+X
+X#ifndef lint
+Xstatic char	*SccsId = "@(#)postnews.c	1.12	9/3/84";
+X#endif !lint
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include <pwd.h>
+X#ifdef USG
+Xstruct passwd *getpwent(), *getpwuid(), *getpwnam();
+X#endif USG
+X#include "defs.h"
+X#define ARCHIVES_DEF "NEWSARCHIVE"
+X
+Xchar tempfname[50];		/* file name used for making article */
+Xchar original[BUFLEN];		/* file name of original, used in followup */
+Xchar homedir[BUFLEN];		/* HOME environment setting */
+Xchar ccname[BUFLEN];		/* file name for article copy */
+X
+X/* article header information */
+Xchar subject[BUFLEN];
+Xchar distribution[BUFLEN];
+Xchar references[BUFLEN];
+Xchar newsgroups[BUFLEN];
+Xchar moderator[BUFLEN];
+X
+Xchar *Progname = "postnews";		/* for xerror */
+X
+Xtime_t fmodtime;
+Xint ismod = 0;
+Xextern char *LIB;
+Xextern char *SPOOL;
+Xchar buf[BUFLEN];
+X
+Xstruct distr {
+X	char abbr[24];
+X	char descr[128];
+X} distr[16];
+X
+XFILE *xfopen();
+X
+Xmain(argc, argv)
+Xchar *argv[];
+X{
+X	init();
+X
+X	if (argc == 2) {
+X		if (strncmp(SPOOL, argv[1], strlen(SPOOL)))
+X			xerror("Can only followup to articles in %s", SPOOL);
+X		followup(argv[1]);
+X		strcpy(original, argv[1]);
+X	} else
+X	if (askyes("Is this message in response to some other message? ","no")) {
+X		char ng[BUFLEN], num[BUFLEN];
+X		long i, j;
+X		register char *c;
+X		int fd;
+X		char canpost;
+X
+X		getpr("In what newsgroup was the article posted? ",ng);
+X		if (!valid_ng(ng, &i, &j, &canpost))
+X			if (canpost != 'n' )
+X				byebye("There is no such newsgroup.");
+X			else
+X				byebye("You are not allowed to post to that group.");
+X
+X		printf("Valid article numbers are from %ld to %ld\n", j, i);
+X
+X		for(;;) {
+X			getpr("\nWhat was the article number? ", num);
+X			if (num == 0)
+X				continue;
+X			sprintf(original, "%s/%s", SPOOL, ng);
+X			for (c=original+strlen(SPOOL)+1; *c ;++c)
+X				if (*c == '.')
+X					*c = '/';
+X			strcat(original, "/");
+X			strcat(original, num);
+X
+X			if ((fd=open(original,0)) >= 0) {
+X				close(fd);
+X				printf("\narticle %s\n", original);
+X				if (article_line(original, "From: ", buf))
+X					printf("%s\n", buf);
+X				if (article_line(original, "Subject: ", buf))
+X					printf("%s\n", buf);
+X				if (askyes("Is this the one you want? ", ""))
+X					break;
+X			} else
+X				printf("I can't find that article.\n");
+X		}
+X
+X		followup(original);
+X	} else {
+X		do {
+X			getpr("Subject: ", subject);
+X		} while (*subject == '\0');
+X
+X		while (!get_newsgroup())
+X			;
+X		get_distribution();
+X	}
+X
+X	if (pre_checks())
+X		exit(1);
+X	edit_article();
+X	post_checks();
+X
+X	save_article();
+X	post_article();
+X}
+X
+X/*
+X * Find out the topic of interest.
+X */
+Xget_newsgroup()
+X{
+X	int n;
+X	long i;
+X	char canpost;
+X
+X	printf("Newsgroups (enter one at a time, end with a blank line):\n");
+X	printf("For a list of newsgroups, type ?\n");
+X	n = 0;
+X	newsgroups[0] = '\0';
+X
+X	for(;;) {
+X		getpr("> ", buf);
+X		if (buf[0] == '\0')
+X			if (n == 0)
+X				return FALSE;
+X			else
+X				return TRUE;
+X		if (buf[0] == '?'){
+X			/* too lazy to do it myself.... */
+X			printf("These are the currently active groups:\n");
+X			sprintf(buf,"exec cat %s/newsgroups", LIB);
+X			system(buf);
+X			continue;
+X		}
+X		if (valid_ng(buf, &i, &i, &canpost)) {
+X			if (n++ != 0)
+X				strcat(newsgroups, ",");
+X			strcat(newsgroups, buf);
+X		} else {
+X			if (canpost == 'n')
+X				printf("You are not allowed to post to %s\n",
+X					buf);
+X			else
+X				printf("%s is not a valid newsgroup.\n", buf);
+X		}
+X	}
+X}
+X
+X/*
+X * Find out how widely the author wants the message distributed.
+X */
+Xget_distribution()
+X{
+X	register int i;
+X	register char *r;
+X	char def[BUFLEN];
+X	char *index();
+X
+X	strcpy(def, newsgroups);
+X	r = index(def, '.');
+X	if (r) {
+X		*r = '\0';
+X		if (strcmp(def, "net") == 0)
+X			strcpy(def, "world");
+X	} else
+X		strcpy(def, "local");
+X
+X	if (strcmp(def,"to") == 0) {
+X		distribution[0] = '\0';
+X		return;		/* He's probably testing something */
+X	}
+X	if (ngmatch("net.test", newsgroups))
+X		strcpy(def, "local");
+X	for(;;) {
+X		sprintf(buf, "Distribution (default='%s', '?' for help) : ", def);
+X		getpr(buf, distribution);
+X		if (distribution[0] == '\0')
+X			strcpy(distribution, def);
+X
+X		/* Did the user ask for help? */
+X		if (distribution[0] == '?') {
+X			printf("How widely should your article be distributed?\n");
+X			for (i=0; distr[i].abbr[0]; i++)
+X				printf("%s\t%s\n", distr[i].abbr, distr[i].descr);
+X			continue;
+X		}
+X
+X		/* Check that it's a proper distribution */
+X		for (i=0; distr[i].abbr[0]; i++) {
+X			if (strncmp(distr[i].abbr, distribution, sizeof(distr[0].abbr)) == 0) {
+X				/* Found a match. Do any special rewriting. */
+X				if (strcmp(distribution, "world") == 0)
+X					strcpy(distribution, "net");
+X				return;
+X			}
+X		}
+X
+X		printf("Type ? for help.\n");
+X	}
+X}
+X
+X/*
+X * Do sanity checks before the author types in the message.
+X */
+Xpre_checks()
+X{
+X	check_mod();
+X	if (recording(newsgroups))
+X		return 1;
+X	return 0;
+X}
+X
+X/*
+X * Check to see if the newsgroup is moderated.
+X */
+Xcheck_mod()
+X{
+X	register FILE *fd;
+X	char ng[64], mod[BUFLEN];
+X
+X	sprintf(buf, "%s/%s", LIB, "moderators");
+X	fd = xfopen(buf, "r");
+X
+X	while (!feof(fd)) {
+X		if (fgets(buf, sizeof buf, fd) == NULL) {
+X			fclose(fd);
+X			return;
+X		}
+X		twosplit(buf, ng, mod);
+X		if (ngmatch(newsgroups, ng)) {
+X			strcpy(moderator, mod);
+X			ismod = 1;
+X			return;
+X		}
+X	}
+X}
+X
+X/*
+X * Set up the temp file with headers.
+X */
+Xedit_article()
+X{
+X	FILE *tf, *of;
+X	char *editor;
+X	char *endflag = "";
+X	char *p;
+X	char *getenv();
+X	struct stat stbuf;
+X
+X	editor = getenv("EDITOR");
+X	strcpy(tempfname, "/tmp/postXXXXXX");
+X	mktemp(tempfname);
+X
+X	/* insert a header */
+X	tf = xfopen(tempfname, "w");
+X	fprintf(tf, "Subject: %s\n", subject);
+X	fprintf(tf, "Newsgroups: %s\n", newsgroups);
+X	if (distribution[0] != '\0')
+X		fprintf(tf, "Distribution: %s\n", distribution);
+X	if (ismod)
+X		fprintf(tf, "To: %s\n", moderator);
+X
+X	if (references[0] != '\0') {
+X		fprintf(tf, "References: %s\n\n", references);
+X
+X		of = xfopen(original, "r");
+X		while (fgets(buf, BUFSIZ, of) != NULL)
+X			if (buf[0] == '\n')	/* skip headers */
+X				break;
+X		while (fgets(buf, BUFSIZ, of) != NULL)
+X			fprintf(tf, "> %s", buf);
+X		fclose(of);
+X	}
+X
+X	fprintf(tf, "\n*** REPLACE THIS LINE WITH YOUR MESSAGE ***\n");
+X	fflush(tf);
+X	fstat(fileno(tf), &stbuf);
+X	fmodtime = stbuf.st_mtime;
+X	fclose(tf);
+X
+X	/* edit the file */
+X	if (editor == NULL)
+X		editor = DFTEDITOR;
+X
+X	p = editor + strlen(editor) - 2;
+X	if (strcmp(p, "vi") == 0 && references[0] == '\0')
+X		endflag = "+";
+X
+X	sprintf(buf, "exec %s %s %s", editor, endflag, tempfname);
+X
+X	system(buf);
+X}
+X
+X/*
+X * Do sanity checks after the author has typed in the message.
+X */
+Xpost_checks()
+X{
+X	char group[BUFLEN];
+X	char *c;
+X	struct stat stbuf;
+X
+X	if (stat(tempfname, &stbuf) < 0) {
+X		printf("File deleted - no message posted.\n");
+X		unlink(tempfname);
+X		exit(1);
+X	}
+X
+X	if (stbuf.st_mtime == fmodtime || stbuf.st_size < 5) {
+X		printf("File not modified - no message posted.\n");
+X		unlink(tempfname);
+X		exit(1);
+X	}
+X
+X	/* Sanity checks for certain newsgroups */
+X	if (ngmatch(newsgroups, "all.wanted") && ngmatch(distribution,"net,na,usa,att,btl")) {
+X		printf("Is your message something that might go in your local\n");
+X		printf("newspaper, for example a used car ad, or an apartment\n");
+X		printf("for rent? ");
+X		if (askyes("","")) {
+X			printf("It's pointless to distribute your article widely, since\n");
+X			printf("people more than a hundred miles away won't be interested.\n");
+X			printf("Please use a more restricted distribution.\n");
+X			get_distribution();
+X			modify_article(tempfname,"Distribution: ",distribution,"replace");
+X		}
+X	}
+X
+X	if (ngmatch(newsgroups, "all.jokes")) {
+X		if (askyes("Could this be offensive to anyone? ","")) {
+X			getpr("Whom might it offend? ", group);
+X			sprintf(buf," - offensive to %s (ROT13)",group);
+X			modify_article(tempfname, "Subject: ", buf, "append");
+X			encode(tempfname);
+X		}
+X	}
+X
+X	if (ngmatch(newsgroups, "net.general")) {
+X		c = newsgroups;
+X		while (*c != ',' && *c)
+X			++c;
+X		if (*c == ',') {
+X			printf("Everybody reads net.general, so it doesn't make sense to\n");
+X			printf("post to newsgroups in addition to net.general.	If your\n");
+X			printf("article belongs in one of these other newsgroups, then you\n");
+X			printf("should not post to net.general.	If it is important enough\n");
+X			printf("for net.general, then you shouldn't post it in other places\n");
+X			printf("as well.	Please reenter the newsgroups.\n");
+X			get_newsgroup();
+X			modify_article(tempfname,"Newsgroups: ",newsgroups,"replace");
+X		}
+X		else {
+X			printf("net.general is for important announcements.\n");
+X			printf("It is not for items for which you couldn't think\n");
+X			printf("of a better place - those belong in net.misc.\n");
+X			if (!askyes("Are you sure your message belongs in net.general? ","")) {
+X				get_newsgroup();
+X				modify_article(tempfname, "Newsgroups: ", newsgroups, "replace");
+X			}
+X		}
+X	}
+X}
+X
+X/*
+X * Save a copy of the article in the users NEWSARCHIVE directory.
+X */
+Xsave_article()
+X{
+X	FILE *in, *out;
+X	int c;
+X	time_t timenow, time();
+X	char *today, *ctime();
+X
+X
+X	in = xfopen(tempfname, "r");
+X	out = xfopen(ccname, "a");
+X	timenow = time((time_t)0);
+X	today = ctime(&timenow);
+X	fprintf(out,"From postnews %s",today);
+X	while ((c=getc(in)) != EOF)
+X		putc(c, out);
+X	putc('\n', out);
+X	fclose(in);
+X	fclose(out);
+X}
+X
+X/*
+X * Post the article to the net.
+X */
+Xpost_article()
+X{
+X	extern char MAILPARSER[];
+X	int status;
+X
+X	printf("%s article...\n", ismod ? "Mailing" : "Posting" );
+X	if (ismod)
+X		sprintf(buf, "exec %s -t < %s", MAILPARSER, tempfname);
+X	else
+X		sprintf(buf, "exec %s/%s -h < %s", LIB, "inews", tempfname);
+X	status = system(buf);
+X
+X	if (status)
+X		printf("Article not %s - exit status %d\n", ismod ? "mailed" : "posted", status);
+X	else
+X		printf("Article %s successfully.\n", ismod ? "mailed" : "posted" );
+X
+X	if (ccname[0])
+X		printf("A copy has been saved in %s\n", ccname);
+X
+X	unlink(tempfname);
+X}
+X
+X/*
+X * Initialization.
+X */
+Xinit()
+X{
+X	FILE *fd;
+X	register char *p;
+X	int i;
+X	char *getenv();
+X
+X	references[0] = '\0';
+X	distribution[0] = '\0';
+X
+X	p = getenv("HOME");
+X	if (p == NULL) {
+X		p = getenv("LOGDIR");
+X		if (p == NULL) {
+X			struct passwd *pw;
+X			pw = getpwuid(getuid());
+X			if (pw == NULL) {
+X				fprintf(stderr,"You're not in /etc/passwd\n");
+X				exit(1);
+X			}
+X			p = pw->pw_dir;
+X		}
+X	}
+X	strcpy(homedir, p);
+X
+X
+X	p = getenv(ARCHIVES_DEF);
+X	if (p == NULL)
+X		sprintf(ccname, "%s/author_copy", homedir);
+X	else
+X		strcpy(ccname, p);
+X
+X	pathinit();
+X	sprintf(buf, "%s/%s", LIB, "distributions");
+X	fd = xfopen(buf, "r");
+X	for (i=0; !feof(fd); i++) {
+X		if (fgets(buf, sizeof buf, fd) == NULL)
+X			break;
+X		twosplit(buf, distr[i].abbr,distr[i].descr);
+X	}
+X	fclose(fd);
+X}
+X
+X/*
+X * Split a line of the form
+X *		text whitespace text
+X * into two strings.	Also trim off any trailing newline.
+X * This is destructive on src.
+X */
+Xtwosplit(src, dest1, dest2)
+Xchar *src, *dest1, *dest2;
+X{
+X	register char *p;
+X
+X	nstrip(src);
+X	for (p=src; isalnum(*p) || ispunct(*p); p++)
+X		;
+X	*p++ = 0;
+X	for ( ; isspace(*p); p++)
+X		;
+X	strcpy(dest1, src);
+X	strcpy(dest2, p);
+X}
+X
+X/*
+X * Get a yes or no answer to a question.	A default may be used.
+X */
+Xaskyes(msg, def)
+Xchar *msg, *def;
+X{
+X
+X	printf("%s", msg);
+X	buf[0] = 0;
+X	gets(buf);
+X	switch(buf[0]) {
+X	case 'y':
+X	case 'Y':
+X		return TRUE;
+X	case 'n':
+X	case 'N':
+X		return FALSE;
+X	case '\0':
+X		switch(*def) {
+X		case 'y':
+X		case 'Y':
+X			return TRUE;
+X		case 'n':
+X		case 'N':
+X			return FALSE;
+X		}
+X	default:
+X		printf("Please answer yes or no.\n");
+X		return askyes(msg, def);
+X	}
+X}
+X
+X/*
+X * Get a character string into buf, using prompt msg.
+X */
+Xgetpr(msg, bfr)
+Xchar *msg, *bfr;
+X{
+X	static int numeof = 0;
+X	printf("%s", msg);
+X	gets(bfr);
+X	nstrip(bfr);
+X	if (feof(stdin)) {
+X		if (numeof++ > 3) {
+X			fprintf(stderr,"Too many EOFs\n");
+X			exit(1);
+X		}
+X		clearerr(stdin);
+X	}
+X}
+X
+Xbyebye(mesg)
+Xchar *mesg;
+X{
+X	printf("%s\n", mesg);
+X	exit(1);
+X}
+X
+X/*
+X * make a modification to the header of an article
+X *
+X *	 fname -- name of article
+X *	 field -- header field to modify
+X *	 line	-- modification line
+X *	 how	 -- 'a' or 'A' to append line to existing header line
+X *			anything else to replace existing line
+X *
+X * example:
+X *	 modify_article("/tmp/article" , "Subject: " , "new subject" , "replace");
+X *
+X *
+X */
+Xmodify_article(fname, field, line, how)
+Xchar *fname, *field, *line, *how;
+X{
+X	FILE *fpart, *fptmp;
+X	char *temp2fname = "/tmp/postXXXXXX";
+X	int i;
+X
+X	mktemp(temp2fname);
+X
+X	fptmp = xfopen(temp2fname, "w");
+X	fpart = xfopen(fname, "r");
+X
+X	i = strlen(field);
+X	while (fgets(buf, BUFLEN, fpart) != NULL) {
+X		if (strncmp(field, buf, i) == 0) {
+X			nstrip(buf);
+X			if (*how=='a' || *how=='A')
+X				/* append to current field */
+X				sprintf(buf, "%s%s\n", buf, line);
+X			else
+X				/* replace current field */
+X				sprintf(buf, "%s%s\n", field, line);
+X		}
+X		fputs(buf, fptmp);
+X	}
+X
+X	fclose(fpart);
+X	fclose(fptmp);
+X
+X	fptmp = xfopen(temp2fname, "r");
+X	fpart = xfopen(fname, "w");
+X
+X	i = strlen(field);
+X	while (fgets(buf,BUFLEN,fptmp) != NULL)
+X		fputs(buf, fpart);
+X
+X	fclose(fpart);
+X	fclose(fptmp);
+X	unlink(temp2fname);
+X}
+X
+X
+X/* verify that newsgroup exists, and get number of entries */
+Xvalid_ng(ng, maxart, minart, canpost)
+Xchar *ng;
+Xlong *maxart, *minart;
+Xchar *canpost;
+X{
+X	char ng_check[BUFLEN], ng_read[BUFLEN];
+X	extern char *ACTIVE;
+X	FILE *fp;
+X
+X	fp = xfopen(ACTIVE, "r");
+X	while (fgets(ng_read, BUFLEN, fp) != NULL) {
+X		sscanf(ng_read, "%s %ld %ld %c", ng_check, maxart, minart, canpost);
+X		if (strcmp(ng_check, ng) == 0) {
+X			fclose(fp);
+X			if (*canpost == 'y')
+X				return TRUE;
+X			else
+X				return FALSE;
+X		}
+X	}
+X	*canpost = 'i';
+X	*maxart = 0;
+X	*minart = 0;
+X	fclose(fp);
+X	return FALSE;
+X}
+X
+X/* get the line specified by field from an article */
+Xarticle_line(article, field, line)
+Xchar *article, *field, *line;
+X{
+X	FILE *fp;
+X	char *c;
+X	int i = strlen(field);
+X
+X	fp = xfopen(article,"r");
+X	while ((c=fgets(line,BUFLEN,fp)) != NULL && strncmp(field,line,i) != 0)
+X		;
+X	fclose(fp);
+X	if (c != NULL) {
+X		nstrip(line);
+X		return TRUE;
+X	} else {
+X		line[0] = '\0';
+X		return FALSE;
+X	}
+X}
+X
+X
+X/* get the header information for a followup article */
+Xfollowup(baseart)
+Xregister char *baseart;
+X{
+X	/* subject */
+X	if (article_line(baseart, "Subject: ", buf))
+X		sprintf(subject, "Re: %s", buf+9);
+X	else
+X		strcpy(subject, "Re: orphan response");
+X
+X	/* newsgroup */
+X	if (article_line(baseart, "Newsgroups: ", buf))
+X		strcpy(newsgroups, buf+12);
+X	if (ngmatch(newsgroups, "net.general"))
+X		strcpy(newsgroups,"net.followup");
+X
+X	/* distribution */
+X	if (article_line(baseart, "Distribution: ", buf))
+X		strcpy(distribution, buf+14);
+X
+X	/* references */
+X	if (article_line(baseart, "References: ", buf)) {
+X		strcpy(references, buf+12);
+X		strcat(references, " ");
+X	}
+X	if (article_line(baseart, "Message-ID: ", buf))
+X		strcat(references, buf+12);
+X}
+X
+Xencode(article)
+Xchar *article;
+X{
+X	FILE *fpart, *fphead, *fpcoded;
+X	char *headerfile = "/tmp/pheadXXXXXX";
+X	char *codedfile = "/tmp/pcodeXXXXXX";
+X
+X	mktemp(headerfile);
+X	mktemp(codedfile);
+X
+X	fpart = xfopen(article, "r");
+X
+X	/* place article header in "headerfile" file */
+X	fphead = xfopen(headerfile, "w");
+X	while (fgets(buf, BUFLEN, fpart) != NULL) {
+X		fputs(buf, fphead);
+X		if (buf[0] == '\n')
+X			break;
+X	}
+X	fclose(fphead);
+X
+X	/* place article body in "codedfile" file */
+X	fpcoded = xfopen(codedfile, "w");
+X	while (fgets(buf, BUFLEN, fpart) != NULL)
+X		fputs(buf, fpcoded);
+X	fclose(fpcoded);
+X	fclose(fpart);
+X
+X	/* encode body and put back together with header */
+X	unlink(article);
+X	link(headerfile, article);
+X	unlink(headerfile);
+X
+X	sprintf(buf,"exec %s/%s 13 < %s >> %s\n", LIB, "caesar", codedfile, article);
+X	printf("Encoding article -- please stand by\n");
+X	if (system(buf)) {
+X		printf("encoding failed");
+X		exit(2);
+X	}
+X	unlink(codedfile);
+X}
+X
+X
+X/*
+X * Print a recorded message warning the poor luser what he is doing
+X * and demand that he understands it before proceeding.  Only do
+X * this for newsgroups listed in LIBDIR/recording.
+X */
+Xrecording(ngrps)
+Xchar *ngrps;
+X{
+X	char recbuf[BUFLEN];
+X	FILE *fd;
+X	char nglist[BUFLEN], fname[BUFLEN];
+X	int  c, n, yes;
+X
+X	sprintf(recbuf, "%s/%s", LIB, "recording");
+X	fd = fopen(recbuf, "r");
+X	if (fd == NULL)
+X		return 0;
+X	while ((fgets(recbuf, sizeof recbuf, fd)) != NULL) {
+X		sscanf(recbuf, "%s %s", nglist, fname);
+X		if (ngmatch(ngrps, nglist)) {
+X			fclose(fd);
+X			if (fname[0] == '/')
+X				strcpy(recbuf, fname);
+X			else
+X				sprintf(recbuf, "%s/%s", LIB, fname);
+X			fd = fopen(recbuf, "r");
+X			if (fd == NULL)
+X				return 0;
+X			while ((c = getc(fd)) != EOF)
+X				putc(c, stderr);
+X			fprintf(stderr, "Do you understand this?  Hit <return> to proceed, <BREAK> to abort: ");
+X			n = read(2, recbuf, 100);
+X			c = recbuf[0];
+X			yes = (c=='y' || c=='Y' || c=='\n' || c=='\n' || c==0);
+X			if (n <= 0 || !yes)
+X				return -1;
+X		}
+X	}
+X	return 0;
+X}
+X
+Xxxit(i)
+X{
+X	exit(i);
+X}
+*-*-END-of-src/postnews.c-*-*
+exit
+
+

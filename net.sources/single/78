@@ -1,0 +1,170 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,3b7a1780ca11244f,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1982-08-19 23:07:19 PST
+Message-ID: <bnews.n44a.113>
+Newsgroups: net.sources
+Path: utzoo!decvax!cca!ima!n44a!dan
+X-Path: utzoo!decvax!cca!ima!n44a!dan
+From: n44a!dan
+Date: Fri Aug 20 02:07:18 1982
+Subject: UUCP and line turn around code
+X-Google-Info: Converted from the original B-News header
+Posted: Wed Aug 18 17:37:45 1982
+Received: Fri Aug 20 02:07:18 1982
+
+
+	I have received requests for the code to implement the scheme of
+line turn around mentioned in a previous article under net.unix-wizards.
+One should refer to that article for the reasons for each piece of code.
+Since there are so many tty drivers around it seemed reasonable to present
+the code in a commentary fashion rather than any diff listing or our driver
+in its entirety. In the v7 tty.c, there is an XCLUDE bit; this code might be
+thought of as an extension of that facilty.
+
+*** In ttyopen(),
+	A news process group is being started by a fork of init. These should
+block if the line is locked. One can, of course, sleep on some other address
+than tp->t_state.
+***
+
+	pp = u.u_procp;
+	if (pp->p_pgrp == 0 && pp->p_pid != 1) {
+		pp->p_pgrp = pp->p_pid;
+		u.u_ttyp = tp;
+		/* u.u_ttyd set up by openi in fio.c */
+#ifdef	EXCLUDE
+		if (tp->t_state&EXCLUDE) {
+			spl5();
+			while (tp->t_state&EXCLUDE)
+				sleep(&tp->t_state, TTIPRI);
+			spl0();
+			u.u_error = EBUSY;
+			return;
+		}
+#endif
+		if (tp->t_pgrp) {
+			signal(tp->t_pgrp, SIGHUP);
+			flushtty(tp);
+		}
+		tp->t_pgrp = pp->p_pid;
+	}
+
+*** Also in ttyopen(),
+	If the inode of the device entry has its x-bit set, call ttlock() to
+lock the line. In our application, /dev/cul0 has its x-bit set and is a
+different inode than its /dev/tty?.
+***
+
+#ifdef	EXCLUDE
+	if ((fp = getf(u.u_ar0[R0])) == NULL)
+		return;
+	if (fp->f_inode->i_mode&IEXEC)
+		ttlock(tp);
+#endif
+
+	tp->t_state =& ~WOPEN;
+	tp->t_state =| ISOPEN;
+}
+
+ttyclose(tp)
+register struct tty *tp;
+{
+
+*** In ttyclose(),
+	The basic issue is to see if we should really close the device. If the
+line is locked, then only the process group which set the lock is allowed to
+close it. The line is also unlocked if it is closed.
+	A bit of a kluge is used here and in ttlock(). The process group t_pgrp
+is stored by ttlock() as the negative of pp->p_pgrp, if the process is not a
+fork of init. The point is to try to avoid getting SIGHUP upon reopening and
+carrier drops, while still knowing which p_pgrp set the lock.
+***
+
+#ifdef	EXCLUDE
+	if ((tp->t_state&EXCLUDE) == 0
+		|| abs(tp->t_pgrp) == u.u_procp->p_pgrp) {
+#endif
+		if (tp->t_state&CARR_ON)
+			wflushtty(tp);
+		else
+			flushtty(tp);
+#ifdef	EXCLUDE
+	}
+	spl5();
+	if (tp->t_state&EXCLUDE)
+		if (abs(tp->t_pgrp) == u.u_procp->p_pgrp)
+			ttunlock(tp);
+		else {	
+			spl0();
+			return(1);
+		}
+#endif
+	tp->t_state &= (CARR_ON|SSTART|EXCLUDE);
+#ifdef	EXCLUDE
+	spl0();
+#endif
+	return(0);
+}
+
+*** Then in ttysgtty()/ttioctl(),
+	One needs a way of calling ttlock() and ttunlock() from user programs.
+***
+
+#ifdef	EXCLUDE
+	case(TTLOCK):
+		ttlock(tp);
+		break;
+	case(TTUNLOCK):
+		ttunlock(tp);
+		break;
+#endif
+	default:
+		u.u_error = EINVAL;
+	}
+}
+
+*** Finally the short routines ttlock() and ttunlock()
+***
+
+#ifdef	EXCLUDE
+ttlock(tp)
+register struct tty *tp;
+{
+	register struct proc *pp;
+
+	pp = u.u_procp;
+	spl5();
+*** Slight subtlety, members of the locking p_pgrp should be able to do reopens.
+	while ((tp->t_state&EXCLUDE) && abs(tp->t_pgrp) != pp->p_pgrp)
+		sleep(&tp->t_state, TTIPRI);
+	tp->t_state |= EXCLUDE;
+*** If not fork of init
+	if (tp->t_pgrp != pp->p_pgrp) {
+		if (tp->t_pgrp > 0)
+			signal(tp->t_pgrp, SIGHUP);
+		tp->t_pgrp = - pp->p_pgrp;
+	}
+	spl0();
+}
+
+ttunlock(tp)
+register struct tty *tp;
+{
+
+	tp->t_state &= ~EXCLUDE;
+	wakeup(&tp->t_state);
+	if (tp->t_pgrp < 0)
+		tp->t_pgrp = 0;
+}
+
+#endif
+
+***
+				Have fun,
+				Dan Ts'o
+
+				...decvax!cca!ima!n44a!dan
+
+
+

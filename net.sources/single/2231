@@ -1,0 +1,1219 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 13544e,aaa0b18585903ed2,start
+X-Google-Attributes: gid13544e,public
+X-Google-Thread: 159752,aaa0b18585903ed2,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-01-12 13:20:51 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site green.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!genrad!teddy!panda!talcott!harvard!seismo!umcp-cs!aplvax!green!bill
+From: bill@green.UUCP (bill)
+Newsgroups: net.unix,net.sources
+Subject: 4.2BSD driver for DEC Deuna Ethernet board
+Message-ID: <145@green.UUCP>
+Date: Sat, 12-Jan-85 16:20:51 EST
+Article-I.D.: green.145
+Posted: Sat Jan 12 16:20:51 1985
+Date-Received: Mon, 14-Jan-85 03:14:02 EST
+Distribution: net
+Organization: JHU/Biophysics Dept., Baltimore, MD
+Lines: 1195
+Xref: watmath net.unix:3306 net.sources:2364
+
+#	Here is a driver for a DEC Deuna Ethernet driver.
+# We have had it installed on two 11/750's here for about four months
+# now without any problems which can be attributed to the
+# driver.
+#
+#	I'm not sure who we got it from, but the comments attribute it
+# to Lou Salkind of New York University.
+#
+
+#				Bill Bogstad
+#				green!bill
+
+#---CUT HERE---
+#!/bin/sh
+: This is a shar archieve.  Extract with sh, not csh.
+: The rest of this file will extract:
+: if_de.c if_dereg.h
+echo extracting - if_de.c
+sed 's/^X//' > if_de.c << '~FUNKY STUFF~'
+X#ifdef	RCSIDENT
+Xstatic char *rcsident = "$Header: if_de.c,v 1.1 84/02/01 17:18:51 mike Exp $";
+X#endif
+X
+X#include "de.h"
+X#if NDE > 0
+X
+X/*
+X * DEC DEUNA interface
+X *
+X *	Lou Salkind
+X *	New York University
+X *
+X * TODO:
+X *	timeout routine (get statistics)
+X */
+X#include "../machine/pte.h"
+X
+X#include "../h/param.h"
+X#include "../h/systm.h"
+X#include "../h/mbuf.h"
+X#include "../h/buf.h"
+X#include "../h/protosw.h"
+X#include "../h/socket.h"
+X#include "../h/vmmac.h"
+X#include "../h/ioctl.h"
+X#include "../h/errno.h"
+X
+X#include "../net/if.h"
+X#include "../net/netisr.h"
+X#include "../net/route.h"
+X#include "../netinet/in.h"
+X#include "../netinet/in_systm.h"
+X#include "../netinet/ip.h"
+X#include "../netinet/ip_var.h"
+X#include "../netinet/if_ether.h"
+X#include "../netpup/pup.h"
+X
+X#include "../vax/cpu.h"
+X#include "../vax/mtpr.h"
+X#include "../vaxif/if_dereg.h"
+X#include "../vaxif/if_uba.h"
+X#include "../vaxuba/ubareg.h"
+X#include "../vaxuba/ubavar.h"
+X
+X#define	NXMT	2	/* number of transmit buffers */
+X#define	NRCV	4	/* number of receive buffers (must be > 1) */
+X#define	NTOT	(NXMT + NRCV)
+X
+Xint	dedebug = 0;
+X
+Xint	deprobe(), deattach(), deintr();
+Xstruct	uba_device *deinfo[NDE];
+Xu_short destd[] = { 0 };
+Xstruct	uba_driver dedriver =
+X	{ deprobe, 0, deattach, 0, destd, "de", deinfo };
+X#define	DEUNIT(x)	minor(x)
+Xint	deinit(),deoutput(),deioctl(),dereset();
+Xstruct	mbuf *deget();
+X
+X
+X/*
+X * The following generalizes the ifuba structure
+X * to an arbitrary number of receive and transmit
+X * buffers.
+X */
+Xstruct	deuba {
+X	short	ifu_uban;		/* uba number */
+X	short	ifu_hlen;		/* local net header length */
+X	struct	uba_regs *ifu_uba;	/* uba regs, in vm */
+X	struct	ifrw ifu_r[NRCV];	/* receive information */
+X	struct	ifrw ifu_w[NXMT];	/* transmit information */
+X				/* these should only be pointers */
+X	short	ifu_flags;		/* used during uballoc's */
+X};
+X
+X/*
+X * Ethernet software status per interface.
+X *
+X * Each interface is referenced by a network interface structure,
+X * ds_if, which the routing code uses to locate the interface.
+X * This structure contains the output queue for the interface, its address, ...
+X * We also have, for each interface, a UBA interface structure, which
+X * contains information about the UNIBUS resources held by the interface:
+X * map registers, buffered data paths, etc.  Information is cached in this
+X * structure for use by the if_uba.c routines in running the interface
+X * efficiently.
+X */
+Xstruct	de_softc {
+X	struct	arpcom ds_ac;		/* Ethernet common part */
+X#define	ds_if	ds_ac.ac_if		/* network-visible interface */
+X#define	ds_addr	ds_ac.ac_enaddr		/* hardware Ethernet address */
+X	int	ds_flags;
+X#define	DSF_LOCK	1		/* lock out destart */
+X#define	DSF_RUNNING	2
+X	int	ds_ubaddr;		/* map info for incore structs */
+X	struct	deuba ds_deuba;		/* unibus resource structure */
+X	/* the following structures are always mapped in */
+X	struct	de_pcbb ds_pcbb;	/* port control block */
+X	struct	de_ring ds_xrent[NXMT];	/* transmit ring entrys */
+X	struct	de_ring ds_rrent[NRCV];	/* receive ring entrys */
+X	struct	de_udbbuf ds_udbbuf;	/* UNIBUS data buffer */
+X	/* end mapped area */
+X#define	INCORE_BASE(p)	((char *)&(p)->ds_pcbb)
+X#define	RVAL_OFF(n)	((char *)&de_softc[0].n - INCORE_BASE(&de_softc[0]))
+X#define	LVAL_OFF(n)	((char *)de_softc[0].n - INCORE_BASE(&de_softc[0]))
+X#define	PCBB_OFFSET	RVAL_OFF(ds_pcbb)
+X#define	XRENT_OFFSET	LVAL_OFF(ds_xrent)
+X#define	RRENT_OFFSET	LVAL_OFF(ds_rrent)
+X#define	UDBBUF_OFFSET	RVAL_OFF(ds_udbbuf)
+X#define	INCORE_SIZE	RVAL_OFF(ds_xindex)
+X	int	ds_xindex;		/* UNA index into transmit chain */
+X	int	ds_rindex;		/* UNA index into receive chain */
+X	int	ds_xfree;		/* index for next transmit buffer */
+X	int	ds_nxmit;		/* # of transmits in progress */
+X} de_softc[NDE];
+X
+Xdeprobe(reg)
+X	caddr_t reg;
+X{
+X	register int br, cvec;		/* r11, r10 value-result */
+X	register struct dedevice *addr = (struct dedevice *)reg;
+X	register i;
+X
+X#ifdef lint
+X	br = 0; cvec = br; br = cvec;
+X	i = 0; derint(i); deintr(i);
+X#endif
+X
+X	addr->pcsr0 = PCSR0_RSET;
+X	while ((addr->pcsr0 & PCSR0_INTR) == 0)
+X		;
+X	/* make board interrupt by executing a GETPCBB command */
+X	addr->pcsr0 = PCSR0_INTE;
+X	addr->pcsr2 = 0;
+X	addr->pcsr3 = 0;
+X	addr->pcsr0 = PCSR0_INTE|CMD_GETPCBB;
+X	DELAY(100000);
+X	return(1);
+X}
+X
+X/*
+X * Interface exists: make available by filling in network interface
+X * record.  System will initialize the interface when it is ready
+X * to accept packets.  We get the ethernet address here.
+X */
+Xdeattach(ui)
+X	struct uba_device *ui;
+X{
+X	register struct de_softc *ds = &de_softc[ui->ui_unit];
+X	register struct ifnet *ifp = &ds->ds_if;
+X	register struct dedevice *addr = (struct dedevice *)ui->ui_addr;
+X	struct sockaddr_in *sin;
+X	int csr0;
+X
+X	ifp->if_unit = ui->ui_unit;
+X	ifp->if_name = "de";
+X	ifp->if_mtu = ETHERMTU;
+X
+X	/*
+X	 * Reset the board and temporarily map
+X	 * the pcbb buffer onto the Unibus.
+X	 */
+X	addr->pcsr0 = PCSR0_RSET;
+X	while ((addr->pcsr0 & PCSR0_INTR) == 0)
+X		;
+X	csr0 = addr->pcsr0;
+X	addr->pchigh = csr0 >> 8;
+X	if (csr0 & PCSR0_PCEI)
+X		printf("de%d: reset failed, csr0=%b csr1=%b\n", ui->ui_unit,
+X		    csr0, PCSR0_BITS, addr->pcsr1, PCSR1_BITS);
+X	ds->ds_ubaddr = uballoc(ui->ui_ubanum, (char *)&ds->ds_pcbb,
+X		sizeof (struct de_pcbb), 0);
+X	addr->pcsr2 = ds->ds_ubaddr & 0xffff;
+X	addr->pcsr3 = (ds->ds_ubaddr >> 16) & 0x3;
+X	addr->pclow = CMD_GETPCBB;
+X	while ((addr->pcsr0 & PCSR0_INTR) == 0)
+X		;
+X	csr0 = addr->pcsr0;
+X	addr->pchigh = csr0 >> 8;
+X	if (csr0 & PCSR0_PCEI)
+X		printf("de%d: pcbb failed, csr0=%b csr1=%b\n", ui->ui_unit,
+X		    csr0, PCSR0_BITS, addr->pcsr1, PCSR1_BITS);
+X	ds->ds_pcbb.pcbb0 = FC_RDPHYAD;
+X	addr->pclow = CMD_GETCMD;
+X	while ((addr->pcsr0 & PCSR0_INTR) == 0)
+X		;
+X	csr0 = addr->pcsr0;
+X	addr->pchigh = csr0 >> 8;
+X	if (csr0 & PCSR0_PCEI)
+X		printf("de%d: rdphyad failed, csr0=%b csr1=%b\n", ui->ui_unit,
+X		    csr0, PCSR0_BITS, addr->pcsr1, PCSR1_BITS);
+X	ubarelse(ui->ui_ubanum, &ds->ds_ubaddr);
+X	if (dedebug)
+X		printf("de%d: addr=%d:%d:%d:%d:%d:%d\n", ui->ui_unit,
+X		    ds->ds_pcbb.pcbb2&0xff, (ds->ds_pcbb.pcbb2>>8)&0xff,
+X		    ds->ds_pcbb.pcbb4&0xff, (ds->ds_pcbb.pcbb4>>8)&0xff,
+X		    ds->ds_pcbb.pcbb6&0xff, (ds->ds_pcbb.pcbb6>>8)&0xff);
+X	bcopy((caddr_t)&ds->ds_pcbb.pcbb2, (caddr_t)ds->ds_addr,
+X	    sizeof (ds->ds_addr));
+X	sin = (struct sockaddr_in *)&ifp->if_addr;
+X	sin->sin_family = AF_INET;
+X	sin->sin_addr = arpmyaddr((struct arpcom *)0);
+X	ifp->if_init = deinit;
+X	ifp->if_output = deoutput;
+X	ifp->if_ioctl = deioctl;
+X	ifp->if_reset = dereset;
+X	ds->ds_deuba.ifu_flags = UBA_CANTWAIT;
+X#ifdef notdef
+X	/* CAN WE USE BDP's ??? */
+X	ds->ds_deuba.ifu_flags |= UBA_NEEDBDP;
+X#endif
+X	if_attach(ifp);
+X}
+X
+X/*
+X * Reset of interface after UNIBUS reset.
+X * If interface is on specified uba, reset its state.
+X */
+Xdereset(unit, uban)
+X	int unit, uban;
+X{
+X	register struct uba_device *ui;
+X
+X	if (unit >= NDE || (ui = deinfo[unit]) == 0 || ui->ui_alive == 0 ||
+X	    ui->ui_ubanum != uban)
+X		return;
+X	printf(" de%d", unit);
+X	deinit(unit);
+X}
+X
+X/*
+X * Initialization of interface; clear recorded pending
+X * operations, and reinitialize UNIBUS usage.
+X */
+Xdeinit(unit)
+X	int unit;
+X{
+X	register struct de_softc *ds = &de_softc[unit];
+X	register struct uba_device *ui = deinfo[unit];
+X	register struct dedevice *addr;
+X	register struct ifrw *ifrw;
+X	int s;
+X	register struct ifnet *ifp = &ds->ds_if;
+X	register struct sockaddr_in *sin;
+X	struct de_ring *rp;
+X	int incaddr;
+X	int csr0;
+X
+X	sin = (struct sockaddr_in *)&ifp->if_addr;
+X	if (sin->sin_addr.s_addr == 0)	/* if address still unknown */
+X		return;
+X
+X	if (ifp->if_flags & IFF_RUNNING)
+X		goto justarp;
+X	if (de_ubainit(&ds->ds_deuba, ui->ui_ubanum,
+X	    sizeof (struct ether_header), (int)btoc(ETHERMTU)) == 0) { 
+X		printf("de%d: can't initialize\n", unit);
+X		ds->ds_if.if_flags &= ~IFF_UP;
+X		return;
+X	}
+X	ds->ds_ubaddr = uballoc(ui->ui_ubanum, INCORE_BASE(ds), INCORE_SIZE,0);
+X	addr = (struct dedevice *)ui->ui_addr;
+X
+X	/* set the pcbb block address */
+X	incaddr = ds->ds_ubaddr + PCBB_OFFSET;
+X	addr->pcsr2 = incaddr & 0xffff;
+X	addr->pcsr3 = (incaddr >> 16) & 0x3;
+X	addr->pclow = CMD_GETPCBB;
+X	while ((addr->pcsr0 & PCSR0_INTR) == 0)
+X		;
+X	csr0 = addr->pcsr0;
+X	addr->pchigh = csr0 >> 8;
+X	if (csr0 & PCSR0_PCEI)
+X		printf("de%d: pcbb failed, csr0=%b csr1=%b\n", ui->ui_unit,
+X		    csr0, PCSR0_BITS, addr->pcsr1, PCSR1_BITS);
+X
+X	/* set the transmit and receive ring header addresses */
+X	incaddr = ds->ds_ubaddr + UDBBUF_OFFSET;
+X	ds->ds_pcbb.pcbb0 = FC_WTRING;
+X	ds->ds_pcbb.pcbb2 = incaddr & 0xffff;
+X	ds->ds_pcbb.pcbb4 = (incaddr >> 16) & 0x3;
+X
+X	incaddr = ds->ds_ubaddr + XRENT_OFFSET;
+X	ds->ds_udbbuf.b_tdrbl = incaddr & 0xffff;
+X	ds->ds_udbbuf.b_tdrbh = (incaddr >> 16) & 0x3;
+X	ds->ds_udbbuf.b_telen = sizeof (struct de_ring) / sizeof (short);
+X	ds->ds_udbbuf.b_trlen = NXMT;
+X	incaddr = ds->ds_ubaddr + RRENT_OFFSET;
+X	ds->ds_udbbuf.b_rdrbl = incaddr & 0xffff;
+X	ds->ds_udbbuf.b_rdrbh = (incaddr >> 16) & 0x3;
+X	ds->ds_udbbuf.b_relen = sizeof (struct de_ring) / sizeof (short);
+X	ds->ds_udbbuf.b_rrlen = NRCV;
+X
+X	addr->pclow = CMD_GETCMD;
+X	while ((addr->pcsr0 & PCSR0_INTR) == 0)
+X		;
+X	csr0 = addr->pcsr0;
+X	addr->pchigh = csr0 >> 8;
+X	if (csr0 & PCSR0_PCEI)
+X		printf("de%d: wtring failed, csr0=%b csr1=%b\n", ui->ui_unit,
+X		    csr0, PCSR0_BITS, addr->pcsr1, PCSR1_BITS);
+X
+X	/* initialize the mode - enable hardware padding */
+X	ds->ds_pcbb.pcbb0 = FC_WTMODE;
+X	/* let hardware do padding - set MTCH bit on broadcast */
+X	ds->ds_pcbb.pcbb2 = MOD_TPAD|MOD_HDX;
+X	addr->pclow = CMD_GETCMD;
+X	while ((addr->pcsr0 & PCSR0_INTR) == 0)
+X		;
+X	csr0 = addr->pcsr0;
+X	addr->pchigh = csr0 >> 8;
+X	if (csr0 & PCSR0_PCEI)
+X		printf("de%d: wtmode failed, csr0=%b csr1=%b\n", ui->ui_unit,
+X		    csr0, PCSR0_BITS, addr->pcsr1, PCSR1_BITS);
+X
+X	/* set up the receive and transmit ring entries */
+X	ifrw = &ds->ds_deuba.ifu_w[0];
+X	for (rp = &ds->ds_xrent[0]; rp < &ds->ds_xrent[NXMT]; rp++) {
+X		rp->r_segbl = ifrw->ifrw_info & 0xffff;
+X		rp->r_segbh = (ifrw->ifrw_info >> 16) & 0x3;
+X		rp->r_flags = 0;
+X		ifrw++;
+X	}
+X	ifrw = &ds->ds_deuba.ifu_r[0];
+X	for (rp = &ds->ds_rrent[0]; rp < &ds->ds_rrent[NRCV]; rp++) {
+X		rp->r_slen = sizeof (struct de_buf);
+X		rp->r_segbl = ifrw->ifrw_info & 0xffff;
+X		rp->r_segbh = (ifrw->ifrw_info >> 16) & 0x3;
+X		rp->r_flags = RFLG_OWN;		/* hang receive */
+X		ifrw++;
+X	}
+X
+X	/* start up the board (rah rah) */
+X	s = splimp();
+X	ds->ds_rindex = ds->ds_xindex = ds->ds_xfree = 0;
+X	ds->ds_if.if_flags |= IFF_UP|IFF_RUNNING;
+X	destart(unit);				/* queue output packets */
+X	addr->pclow = PCSR0_INTE;		/* avoid interlock */
+X	addr->pclow = CMD_START | PCSR0_INTE;
+X	ds->ds_flags |= DSF_RUNNING;
+X	splx(s);
+Xjustarp:
+X	if_rtinit(&ds->ds_if, RTF_UP);
+X	arpattach(&ds->ds_ac);
+X	arpwhohas(&ds->ds_ac, &sin->sin_addr);
+X}
+X
+X/*
+X * Setup output on interface.
+X * Get another datagram to send off of the interface queue,
+X * and map it to the interface before starting the output.
+X */
+Xdestart(unit)
+X	int unit;
+X{
+X        int len;
+X	struct uba_device *ui = deinfo[unit];
+X	struct dedevice *addr = (struct dedevice *)ui->ui_addr;
+X	register struct de_softc *ds = &de_softc[unit];
+X	register struct de_ring *rp;
+X	struct mbuf *m;
+X	register int nxmit;
+X
+X	/*
+X	 * the following test is necessary, since
+X	 * the code is not reentrant and we have
+X	 * multiple transmission buffers.
+X	 */
+X	if (ds->ds_flags & DSF_LOCK)
+X		return;
+X	for (nxmit = ds->ds_nxmit; nxmit < NXMT; nxmit++) {
+X		IF_DEQUEUE(&ds->ds_if.if_snd, m);
+X		if (m == 0)
+X			break;
+X		rp = &ds->ds_xrent[ds->ds_xfree];
+X		if (rp->r_flags & XFLG_OWN)
+X			panic("deuna xmit in progress");
+X		len = deput(&ds->ds_deuba.ifu_w[ds->ds_xfree], m);
+X		if (ds->ds_deuba.ifu_flags & UBA_NEEDBDP)
+X			UBAPURGE(ds->ds_deuba.ifu_uba,
+X			ds->ds_deuba.ifu_w[ds->ds_xfree].ifrw_bdp);
+X		rp->r_slen = len;
+X		rp->r_tdrerr = 0;
+X		rp->r_flags = XFLG_STP|XFLG_ENP|XFLG_OWN;
+X
+X		ds->ds_xfree++;
+X		if (ds->ds_xfree == NXMT)
+X			ds->ds_xfree = 0;
+X	}
+X	if (ds->ds_nxmit != nxmit) {
+X		ds->ds_nxmit = nxmit;
+X		if (ds->ds_flags & DSF_RUNNING)
+X			addr->pclow = PCSR0_INTE|CMD_PDMD;
+X	}
+X}
+X
+X/*
+X * Command done interrupt.
+X */
+Xdeintr(unit)
+X	int unit;
+X{
+X	struct uba_device *ui = deinfo[unit];
+X	register struct dedevice *addr = (struct dedevice *)ui->ui_addr;
+X	register struct de_softc *ds = &de_softc[unit];
+X	register struct de_ring *rp;
+X	short csr0;
+X
+X	/* save flags right away - clear out interrupt bits */
+X	csr0 = addr->pcsr0;
+X	addr->pchigh = csr0 >> 8;
+X
+X
+X	ds->ds_flags |= DSF_LOCK;	/* prevent entering destart */
+X	/*
+X	 * if receive, put receive buffer on mbuf
+X	 * and hang the request again
+X	 */
+X	derecv(unit);
+X
+X	/*
+X	 * Poll transmit ring and check status.
+X	 * Be careful about loopback requests.
+X	 * Then free buffer space and check for
+X	 * more transmit requests.
+X	 */
+X	for ( ; ds->ds_nxmit > 0; ds->ds_nxmit--) {
+X		rp = &ds->ds_xrent[ds->ds_xindex];
+X		if (rp->r_flags & XFLG_OWN)
+X			break;
+X		ds->ds_if.if_opackets++;
+X		/* check for unusual conditions */
+X		if (rp->r_flags & (XFLG_ERRS|XFLG_MTCH|XFLG_ONE|XFLG_MORE)) {
+X			if (rp->r_flags & XFLG_ERRS) {
+X				/* output error */
+X				ds->ds_if.if_oerrors++;
+X				if (dedebug)
+X			printf("de%d: oerror, flags=%b tdrerr=%b (len=%d)\n",
+X				    unit, rp->r_flags, XFLG_BITS,
+X				    rp->r_tdrerr, XERR_BITS, rp->r_slen);
+X			} else if (rp->r_flags & XFLG_ONE) {
+X				/* one collision */
+X				ds->ds_if.if_collisions++;
+X			} else if (rp->r_flags & XFLG_MORE) {
+X				/* more than one collision */
+X				ds->ds_if.if_collisions += 2;	/* guess */
+X			} else if (rp->r_flags & XFLG_MTCH) {
+X				/* received our own packet */
+X				ds->ds_if.if_ipackets++;
+X				deread(ds, &ds->ds_deuba.ifu_w[ds->ds_xindex],
+X				    rp->r_slen - sizeof (struct ether_header));
+X			}
+X		}
+X		/* check if next transmit buffer also finished */
+X		ds->ds_xindex++;
+X		if (ds->ds_xindex == NXMT)
+X			ds->ds_xindex = 0;
+X	}
+X	ds->ds_flags &= ~DSF_LOCK;
+X	destart(unit);
+X
+X	if (csr0 & PCSR0_RCBI) {
+X		printf("de%d: buffer unavailable\n", unit);
+X		addr->pclow = PCSR0_INTE|CMD_PDMD;
+X	}
+X}
+X
+X/*
+X * Ethernet interface receiver interface.
+X * If input error just drop packet.
+X * Otherwise purge input buffered data path and examine 
+X * packet to determine type.  If can't determine length
+X * from type, then have to drop packet.  Othewise decapsulate
+X * packet based on type and pass to type specific higher-level
+X * input routine.
+X */
+Xderecv(unit)
+X	int unit;
+X{
+X	register struct de_softc *ds = &de_softc[unit];
+X	register struct de_ring *rp;
+X	int len;
+X
+X	rp = &ds->ds_rrent[ds->ds_rindex];
+X	while ((rp->r_flags & RFLG_OWN) == 0) {
+X		ds->ds_if.if_ipackets++;
+X		if (ds->ds_deuba.ifu_flags & UBA_NEEDBDP)
+X			UBAPURGE(ds->ds_deuba.ifu_uba,
+X			ds->ds_deuba.ifu_r[ds->ds_rindex].ifrw_bdp);
+X		len = (rp->r_lenerr&RERR_MLEN) - sizeof (struct ether_header)
+X			- 4;	/* don't forget checksum! */
+X		/* check for errors */
+X		if ((rp->r_flags & (RFLG_ERRS|RFLG_FRAM|RFLG_OFLO|RFLG_CRC)) ||
+X		    (rp->r_flags&(RFLG_STP|RFLG_ENP)) != (RFLG_STP|RFLG_ENP) ||
+X		    (rp->r_lenerr & (RERR_BUFL|RERR_UBTO|RERR_NCHN)) ||
+X		    len < ETHERMIN || len > ETHERMTU) {
+X			ds->ds_if.if_ierrors++;
+X			if (dedebug)
+X			printf("de%d: ierror, flags=%b lenerr=%b (len=%d)\n",
+X				unit, rp->r_flags, RFLG_BITS, rp->r_lenerr,
+X				RERR_BITS, len);
+X		} else
+X			deread(ds, &ds->ds_deuba.ifu_r[ds->ds_rindex], len);
+X
+X		/* hang the receive buffer again */
+X		rp->r_lenerr = 0;
+X		rp->r_flags = RFLG_OWN;
+X
+X		/* check next receive buffer */
+X		ds->ds_rindex++;
+X		if (ds->ds_rindex == NRCV)
+X			ds->ds_rindex = 0;
+X		rp = &ds->ds_rrent[ds->ds_rindex];
+X	}
+X}
+X
+X/*
+X * Pass a packet to the higher levels.
+X * We deal with the trailer protocol here.
+X */
+Xderead(ds, ifrw, len)
+X	register struct de_softc *ds;
+X	struct ifrw *ifrw;
+X	int len;
+X{
+X	struct ether_header *eh;
+X    	struct mbuf *m;
+X	int off, resid;
+X	register struct ifqueue *inq;
+X
+X	/*
+X	 * Deal with trailer protocol: if type is PUP trailer
+X	 * get true type from first 16-bit word past data.
+X	 * Remember that type was trailer by setting off.
+X	 */
+X	eh = (struct ether_header *)ifrw->ifrw_addr;
+X	eh->ether_type = ntohs((u_short)eh->ether_type);
+X#define	dedataaddr(eh, off, type)	((type)(((caddr_t)((eh)+1)+(off))))
+X	if (eh->ether_type >= ETHERPUP_TRAIL &&
+X	    eh->ether_type < ETHERPUP_TRAIL+ETHERPUP_NTRAILER) {
+X		off = (eh->ether_type - ETHERPUP_TRAIL) * 512;
+X		if (off >= ETHERMTU)
+X			return;		/* sanity */
+X		eh->ether_type = ntohs(*dedataaddr(eh, off, u_short *));
+X		resid = ntohs(*(dedataaddr(eh, off+2, u_short *)));
+X		if (off + resid > len)
+X			return;		/* sanity */
+X		len = off + resid;
+X	} else
+X		off = 0;
+X	if (len == 0)
+X		return;
+X
+X	/*
+X	 * Pull packet off interface.  Off is nonzero if packet
+X	 * has trailing header; deget will then force this header
+X	 * information to be at the front, but we still have to drop
+X	 * the type and length which are at the front of any trailer data.
+X	 */
+X	m = deget(&ds->ds_deuba, ifrw, len, off);
+X	if (m == 0)
+X		return;
+X	if (off) {
+X		m->m_off += 2 * sizeof (u_short);
+X		m->m_len -= 2 * sizeof (u_short);
+X	}
+X	switch (eh->ether_type) {
+X
+X#ifdef INET
+X	case ETHERPUP_IPTYPE:
+X		schednetisr(NETISR_IP);
+X		inq = &ipintrq;
+X		break;
+X
+X	case ETHERPUP_ARPTYPE:
+X		arpinput(&ds->ds_ac, m);
+X		return;
+X#endif
+X	default:
+X		m_freem(m);
+X		return;
+X	}
+X
+X	if (IF_QFULL(inq)) {
+X		IF_DROP(inq);
+X		m_freem(m);
+X		return;
+X	}
+X	IF_ENQUEUE(inq, m);
+X}
+X
+X/*
+X * Ethernet output routine.
+X * Encapsulate a packet of type family for the local net.
+X * Use trailer local net encapsulation if enough data in first
+X * packet leaves a multiple of 512 bytes of data in remainder.
+X */
+Xdeoutput(ifp, m0, dst)
+X	struct ifnet *ifp;
+X	struct mbuf *m0;
+X	struct sockaddr *dst;
+X{
+X	int type, s, error;
+X	u_char edst[6];
+X	struct in_addr idst;
+X	register struct de_softc *ds = &de_softc[ifp->if_unit];
+X	register struct mbuf *m = m0;
+X	register struct ether_header *eh;
+X	register int off;
+X
+X	switch (dst->sa_family) {
+X
+X#ifdef INET
+X	case AF_INET:
+X		idst = ((struct sockaddr_in *)dst)->sin_addr;
+X		if (!arpresolve(&ds->ds_ac, m, &idst, edst))
+X			return (0);	/* if not yet resolved */
+X		off = ntohs((u_short)mtod(m, struct ip *)->ip_len) - m->m_len;
+X		/* need per host negotiation */
+X		if ((ifp->if_flags & IFF_NOTRAILERS) == 0)
+X		if (off > 0 && (off & 0x1ff) == 0 &&
+X		    m->m_off >= MMINOFF + 2 * sizeof (u_short)) {
+X			type = ETHERPUP_TRAIL + (off>>9);
+X			m->m_off -= 2 * sizeof (u_short);
+X			m->m_len += 2 * sizeof (u_short);
+X			*mtod(m, u_short *) = htons((u_short)ETHERPUP_IPTYPE);
+X			*(mtod(m, u_short *) + 1) = htons((u_short)m->m_len);
+X			goto gottrailertype;
+X		}
+X		type = ETHERPUP_IPTYPE;
+X		off = 0;
+X		goto gottype;
+X#endif
+X
+X	case AF_UNSPEC:
+X		eh = (struct ether_header *)dst->sa_data;
+X		bcopy((caddr_t)eh->ether_dhost, (caddr_t)edst, sizeof (edst));
+X		type = eh->ether_type;
+X		goto gottype;
+X
+X	default:
+X		printf("de%d: can't handle af%d\n", ifp->if_unit,
+X			dst->sa_family);
+X		error = EAFNOSUPPORT;
+X		goto bad;
+X	}
+X
+Xgottrailertype:
+X	/*
+X	 * Packet to be sent as trailer: move first packet
+X	 * (control information) to end of chain.
+X	 */
+X	while (m->m_next)
+X		m = m->m_next;
+X	m->m_next = m0;
+X	m = m0->m_next;
+X	m0->m_next = 0;
+X	m0 = m;
+X
+Xgottype:
+X	/*
+X	 * Add local net header.  If no space in first mbuf,
+X	 * allocate another.
+X	 */
+X	if (m->m_off > MMAXOFF ||
+X	    MMINOFF + sizeof (struct ether_header) > m->m_off) {
+X		m = m_get(M_DONTWAIT, MT_HEADER);
+X		if (m == 0) {
+X			error = ENOBUFS;
+X			goto bad;
+X		}
+X		m->m_next = m0;
+X		m->m_off = MMINOFF;
+X		m->m_len = sizeof (struct ether_header);
+X	} else {
+X		m->m_off -= sizeof (struct ether_header);
+X		m->m_len += sizeof (struct ether_header);
+X	}
+X	eh = mtod(m, struct ether_header *);
+X	eh->ether_type = htons((u_short)type);
+X	bcopy((caddr_t)edst, (caddr_t)eh->ether_dhost, sizeof (edst));
+X	/* DEUNA fills in source address */
+X
+X	/*
+X	 * Queue message on interface, and start output if interface
+X	 * not yet active.
+X	 */
+X	s = splimp();
+X	if (IF_QFULL(&ifp->if_snd)) {
+X		IF_DROP(&ifp->if_snd);
+X		splx(s);
+X		m_freem(m);
+X		return (ENOBUFS);
+X	}
+X	IF_ENQUEUE(&ifp->if_snd, m);
+X	destart(ifp->if_unit);
+X	splx(s);
+X	return (0);
+X
+Xbad:
+X	m_freem(m0);
+X	return (error);
+X}
+X
+X/*
+X * Routines supporting UNIBUS network interfaces.
+X */
+X
+X/*
+X * Init UNIBUS for interface on uban whose headers of size hlen are to
+X * end on a page boundary.  We allocate a UNIBUS map register for the page
+X * with the header, and nmr more UNIBUS map registers for i/o on the adapter,
+X * doing this for each receive and transmit buffer.  We also
+X * allocate page frames in the mbuffer pool for these pages.
+X */
+Xde_ubainit(ifu, uban, hlen, nmr)
+X	register struct deuba *ifu;
+X	int uban, hlen, nmr;
+X{
+X	register caddr_t cp, dp;
+X	register struct ifrw *ifrw;
+X	int ncl;
+X
+X	ncl = clrnd(nmr + CLSIZE) / CLSIZE;
+X	if (ifu->ifu_r[0].ifrw_addr)
+X		/*
+X		 * If the first read buffer has a non-zero
+X		 * address, it means we have already allocated core
+X		 */
+X		cp = ifu->ifu_r[0].ifrw_addr - (CLBYTES - hlen);
+X	else {
+X		cp = m_clalloc(NTOT * ncl, MPG_SPACE);
+X		if (cp == 0)
+X			return (0);
+X		ifu->ifu_hlen = hlen;
+X		ifu->ifu_uban = uban;
+X		ifu->ifu_uba = uba_hd[uban].uh_uba;
+X		dp = cp + CLBYTES - hlen;
+X		for (ifrw = ifu->ifu_r; ifrw < &ifu->ifu_r[NRCV]; ifrw++) {
+X			ifrw->ifrw_addr = dp;
+X			dp += ncl * CLBYTES;
+X		}
+X		for (ifrw = ifu->ifu_w; ifrw < &ifu->ifu_w[NXMT]; ifrw++) {
+X			ifrw->ifrw_addr = dp;
+X			dp += ncl * CLBYTES;
+X		}
+X	}
+X	/* allocate for receive ring */
+X	for (ifrw = ifu->ifu_r; ifrw < &ifu->ifu_r[NRCV]; ifrw++) {
+X		if (de_ubaalloc(ifu, ifrw, nmr) == 0) {
+X			struct ifrw *if2;
+X
+X			for (if2 = ifu->ifu_r; if2 < ifrw; if2++)
+X				ubarelse(ifu->ifu_uban, &if2->ifrw_info);
+X			goto bad;
+X		}
+X	}
+X	/* and now transmit ring */
+X	for (ifrw = ifu->ifu_w; ifrw < &ifu->ifu_w[NXMT]; ifrw++) {
+X		if (de_ubaalloc(ifu, ifrw, nmr) == 0) {
+X			struct ifrw *if2;
+X
+X			for (if2 = ifu->ifu_w; if2 < ifrw; if2++)
+X				ubarelse(ifu->ifu_uban, &if2->ifrw_info);
+X			for (if2 = ifu->ifu_r; if2 < &ifu->ifu_r[NRCV]; if2++)
+X				ubarelse(ifu->ifu_uban, &if2->ifrw_info);
+X			goto bad;
+X		}
+X	}
+X	return (1);
+Xbad:
+X	m_pgfree(cp, NTOT * ncl);
+X	ifu->ifu_r[0].ifrw_addr = 0;
+X	return(0);
+X}
+X
+X/*
+X * Setup either a ifrw structure by allocating UNIBUS map registers,
+X * possibly a buffered data path, and initializing the fields of
+X * the ifrw structure to minimize run-time overhead.
+X */
+Xstatic
+Xde_ubaalloc(ifu, ifrw, nmr)
+X	struct deuba *ifu;
+X	register struct ifrw *ifrw;
+X	int nmr;
+X{
+X	register int info;
+X
+X	info =
+X	    uballoc(ifu->ifu_uban, ifrw->ifrw_addr, nmr*NBPG + ifu->ifu_hlen,
+X	        ifu->ifu_flags);
+X	if (info == 0)
+X		return (0);
+X	ifrw->ifrw_info = info;
+X	ifrw->ifrw_bdp = UBAI_BDP(info);
+X	ifrw->ifrw_proto = UBAMR_MRV | (UBAI_BDP(info) << UBAMR_DPSHIFT);
+X	ifrw->ifrw_mr = &ifu->ifu_uba->uba_map[UBAI_MR(info) + 1];
+X	return (1);
+X}
+X
+X/*
+X * Pull read data off a interface.
+X * Len is length of data, with local net header stripped.
+X * Off is non-zero if a trailer protocol was used, and
+X * gives the offset of the trailer information.
+X * We copy the trailer information and then all the normal
+X * data into mbufs.  When full cluster sized units are present
+X * on the interface on cluster boundaries we can get them more
+X * easily by remapping, and take advantage of this here.
+X */
+Xstruct mbuf *
+Xdeget(ifu, ifrw, totlen, off0)
+X	register struct deuba *ifu;
+X	register struct ifrw *ifrw;
+X	int totlen, off0;
+X{
+X	struct mbuf *top, **mp, *m;
+X	int off = off0, len;
+X	register caddr_t cp = ifrw->ifrw_addr + ifu->ifu_hlen;
+X
+X	top = 0;
+X	mp = &top;
+X	while (totlen > 0) {
+X		MGET(m, M_DONTWAIT, MT_DATA);
+X		if (m == 0)
+X			goto bad;
+X		if (off) {
+X			len = totlen - off;
+X			cp = ifrw->ifrw_addr + ifu->ifu_hlen + off;
+X		} else
+X			len = totlen;
+X		if (len >= CLBYTES) {
+X			struct mbuf *p;
+X			struct pte *cpte, *ppte;
+X			int x, *ip, i;
+X
+X			MCLGET(p, 1);
+X			if (p == 0)
+X				goto nopage;
+X			len = m->m_len = CLBYTES;
+X			m->m_off = (int)p - (int)m;
+X			if (!claligned(cp))
+X				goto copy;
+X
+X			/*
+X			 * Switch pages mapped to UNIBUS with new page p,
+X			 * as quick form of copy.  Remap UNIBUS and invalidate.
+X			 */
+X			cpte = &Mbmap[mtocl(cp)*CLSIZE];
+X			ppte = &Mbmap[mtocl(p)*CLSIZE];
+X			x = btop(cp - ifrw->ifrw_addr);
+X			ip = (int *)&ifrw->ifrw_mr[x];
+X			for (i = 0; i < CLSIZE; i++) {
+X				struct pte t;
+X				t = *ppte; *ppte++ = *cpte; *cpte = t;
+X				*ip++ =
+X				    cpte++->pg_pfnum|ifrw->ifrw_proto;
+X				mtpr(TBIS, cp);
+X				cp += NBPG;
+X				mtpr(TBIS, (caddr_t)p);
+X				p += NBPG / sizeof (*p);
+X			}
+X			goto nocopy;
+X		}
+Xnopage:
+X		m->m_len = MIN(MLEN, len);
+X		m->m_off = MMINOFF;
+Xcopy:
+X		bcopy(cp, mtod(m, caddr_t), (unsigned)m->m_len);
+X		cp += m->m_len;
+Xnocopy:
+X		*mp = m;
+X		mp = &m->m_next;
+X		if (off) {
+X			/* sort of an ALGOL-W style for statement... */
+X			off += m->m_len;
+X			if (off == totlen) {
+X				cp = ifrw->ifrw_addr + ifu->ifu_hlen;
+X				off = 0;
+X				totlen = off0;
+X			}
+X		} else
+X			totlen -= m->m_len;
+X	}
+X	return (top);
+Xbad:
+X	m_freem(top);
+X	return (0);
+X}
+X
+X/*
+X * Map a chain of mbufs onto a network interface
+X * in preparation for an i/o operation.
+X * The argument chain of mbufs includes the local network
+X * header which is copied to be in the mapped, aligned
+X * i/o space.
+X *
+X * This routine is unlike if_wubaput in that pages are
+X * actually switched, rather than the UNIBUS maps temporarily
+X * remapped.
+X */
+Xdeput(ifrw, m)
+X	register struct ifrw *ifrw;
+X	register struct mbuf *m;
+X{
+X	register struct mbuf *mp;
+X	register caddr_t cp;
+X	int cc;
+X	register caddr_t dp;
+X	register int i;
+X	int x;
+X
+X	cp = ifrw->ifrw_addr;
+X	while (m) {
+X		dp = mtod(m, char *);
+X		if (claligned(cp) && claligned(dp) && m->m_len == CLBYTES) {
+X			struct pte *cpte, *ppte;
+X			int *ip;
+X
+X			cpte = &Mbmap[mtocl(cp)*CLSIZE];
+X			ppte = &Mbmap[mtocl(dp)*CLSIZE];
+X			x = btop(cp - ifrw->ifrw_addr);
+X			ip = (int *)&ifrw->ifrw_mr[x];
+X			for (i = 0; i < CLSIZE; i++) {
+X				struct pte t;
+X				t = *ppte; *ppte++ = *cpte; *cpte = t;
+X				*ip++ =
+X				    cpte++->pg_pfnum|ifrw->ifrw_proto;
+X				mtpr(TBIS, cp);
+X				cp += NBPG;
+X				mtpr(TBIS, dp);
+X				dp += NBPG;
+X			}
+X		} else {
+X			bcopy(mtod(m, caddr_t), cp, (unsigned)m->m_len);
+X			cp += m->m_len;
+X		}
+X		MFREE(m, mp);
+X		m = mp;
+X	}
+X
+X	cc = cp - ifrw->ifrw_addr;
+X	return (cc);
+X}
+X#endif
+X
+X/*
+X * Process an ioctl request.
+X */
+Xdeioctl(ifp, cmd, data)
+X	register struct ifnet *ifp;
+X	int cmd;
+X	caddr_t data;
+X{
+X	register struct ifreq *ifr = (struct ifreq *)data;
+X	int s = splimp(), error = 0;
+X
+X	switch (cmd) {
+X
+X	case SIOCSIFADDR:
+X		if (ifp->if_flags & IFF_RUNNING)
+X			if_rtinit(ifp, -1);	/* delete previous route */
+X		desetaddr(ifp, (struct sockaddr_in *)&ifr->ifr_addr);
+X		deinit(ifp->if_unit);
+X		break;
+X
+X	default:
+X		error = EINVAL;
+X	}
+X	splx(s);
+X	return (error);
+X}
+X
+Xdesetaddr(ifp, sin)
+X	register struct ifnet *ifp;
+X	register struct sockaddr_in *sin;
+X{
+X
+X	ifp->if_addr = *(struct sockaddr *)sin;
+X	ifp->if_net = in_netof(sin->sin_addr);
+X	ifp->if_host[0] = in_lnaof(sin->sin_addr);
+X	sin = (struct sockaddr_in *)&ifp->if_broadaddr;
+X	sin->sin_family = AF_INET;
+X	sin->sin_addr = if_makeaddr(ifp->if_net, INADDR_ANY);
+X	ifp->if_flags |= IFF_BROADCAST;
+X}
+~FUNKY STUFF~
+echo extracting - if_dereg.h
+sed 's/^X//' > if_dereg.h << '~FUNKY STUFF~'
+X/*
+X * DEC DEUNA interface
+X */
+Xstruct dedevice {
+X	union {
+X		short	p0_w;
+X		char	p0_b[2];
+X	} u_p0;
+X#define	pcsr0	u_p0.p0_w
+X#define	pclow		u_p0.p0_b[0]
+X#define	pchigh		u_p0.p0_b[1]
+X	short	pcsr1;
+X	short	pcsr2;
+X	short	pcsr3;
+X};
+X
+X/*
+X * PCSR 0 bit descriptions
+X */
+X#define	PCSR0_SERI	0x8000		/* Status error interrupt */
+X#define	PCSR0_PCEI	0x4000		/* Port command error interrupt */
+X#define	PCSR0_RXI	0x2000		/* Receive done interrupt */
+X#define	PCSR0_TXI	0x1000		/* Transmit done interrupt */
+X#define	PCSR0_DNI	0x0800		/* Done interrupt */
+X#define	PCSR0_RCBI	0x0400		/* Receive buffer unavail intrpt */
+X#define	PCSR0_FATI	0x0100		/* Fatal error interrupt */
+X#define	PCSR0_INTR	0x0080		/* Interrupt summary */
+X#define	PCSR0_INTE	0x0040		/* Interrupt enable */
+X#define	PCSR0_RSET	0x0020		/* DEUNA reset */
+X#define	PCSR0_CMASK	0x000f		/* command mask */
+X
+X#define	PCSR0_BITS	"\20\20SERI\17PCEI\16RXI\15TXI\14DNI\13RCBI\11FATI\10INTR\7INTE\6RSET"
+X
+X/* bits 0-3 are for the PORT_COMMAND */
+X#define	CMD_NOOP	0x0
+X#define	CMD_GETPCBB	0x1		/* Get PCB Block */
+X#define	CMD_GETCMD	0x2		/* Execute command in PCB */
+X#define	CMD_STEST	0x3		/* Self test mode */
+X#define	CMD_START	0x4		/* Reset xmit and receive ring ptrs */
+X#define	CMD_BOOT	0x5		/* Boot DEUNA */
+X#define	CMD_PDMD	0x8		/* Polling demand */
+X#define	CMD_TMRO	0x9		/* Sanity timer on */
+X#define	CMD_TMRF	0xa		/* Sanity timer off */
+X#define	CMD_RSTT	0xb		/* Reset sanity timer */
+X#define	CMD_STOP	0xf		/* Suspend operation */
+X
+X/*
+X * PCSR 1 bit descriptions
+X */
+X#define	PCSR1_XPWR	0x8000		/* Transceiver power BAD */
+X#define	PCSR1_ICAB	0x4000		/* Interconnect cabling BAD */
+X#define	PCSR1_STCODE	0x3f00		/* Self test error code */
+X#define	PCSR1_PCTO	0x0080		/* Port command timed out */
+X#define	PCSR1_ILLINT	0x0040		/* Illegal interrupt */
+X#define	PCSR1_TIMEOUT	0x0020		/* Timeout */
+X#define	PCSR1_POWER	0x0010		/* Power fail */
+X#define	PCSR1_RMTC	0x0008		/* Remote console reserved */
+X#define	PCSR1_STMASK	0x0007		/* State */
+X
+X/* bit 0-3 are for STATE */
+X#define	STAT_RESET	0x0
+X#define	STAT_PRIMLD	0x1		/* Primary load */
+X#define	STAT_READY	0x2
+X#define	STAT_RUN	0x3
+X#define	STAT_UHALT	0x5		/* UNIBUS halted */
+X#define	STAT_NIHALT	0x6		/* NI halted */
+X#define	STAT_NIUHALT	0x7		/* NI and UNIBUS Halted */
+X
+X#define	PCSR1_BITS	"\20\20XPWR\17ICAB\10PCTO\7ILLINT\6TIMEOUT\5POWER\4RMTC"
+X
+X/*
+X * Port Control Block Base
+X */
+Xstruct de_pcbb {
+X	short	pcbb0;		/* function */
+X	short	pcbb2;		/* command specific */
+X	short	pcbb4;
+X	short	pcbb6;
+X};
+X
+X/* PCBB function codes */
+X#define	FC_NOOP		0x00		/* NO-OP */
+X#define	FC_LSUADDR	0x01		/* Load and start microaddress */
+X#define	FC_RDDEFAULT	0x02		/* Read default physical address */
+X#define	FC_RDPHYAD	0x04		/* Read physical address */
+X#define	FC_WTPHYAD	0x05		/* Write physical address */
+X#define	FC_RDMULTI	0x06		/* Read multicast address list */
+X#define	FC_WTMULTI	0x07		/* Read multicast address list */
+X#define	FC_RDRING	0x08		/* Read ring format */
+X#define	FC_WTRING	0x09		/* Write ring format */
+X#define	FC_RDCNTS	0x0a		/* Read counters */
+X#define	FC_RCCNTS	0x0b		/* Read and clear counters */
+X#define	FC_RDMODE	0x0c		/* Read mode */
+X#define	FC_WTMODE	0x0d		/* Write mode */
+X#define	FC_RDSTATUS	0x0e		/* Read port status */
+X#define	FC_RCSTATUS	0x0f		/* Read and clear port status */
+X#define	FC_DUMPMEM	0x10		/* Dump internal memory */
+X#define	FC_LOADMEM	0x11		/* Load internal memory */
+X#define	FC_RDSYSID	0x12		/* Read system ID parameters */
+X#define	FC_WTSYSID	0x13		/* Write system ID parameters */
+X#define	FC_RDSERAD	0x14		/* Read load server address */
+X#define	FC_WTSERAD	0x15		/* Write load server address */
+X
+X/*
+X * Unibus Data Block Base (UDBB) for ring buffers
+X */
+Xstruct de_udbbuf {
+X	short	b_tdrbl;	/* Transmit desc ring base low 16 bits */
+X	char	b_tdrbh;	/* Transmit desc ring base high 2 bits */
+X	char	b_telen;	/* Length of each transmit entry */
+X	short	b_trlen;	/* Number of entries in the XMIT desc ring */
+X	short	b_rdrbl;	/* Receive desc ring base low 16 bits */
+X	char	b_rdrbh;	/* Receive desc ring base high 2 bits */
+X	char	b_relen;	/* Length of each receive entry */
+X	short	b_rrlen;	/* Number of entries in the RECV desc ring */
+X};
+X
+X/*
+X * Transmit/Receive Ring Entry
+X */
+Xstruct de_ring {
+X	short	r_slen;			/* Segment length */
+X	short	r_segbl;		/* Segment address (low 16 bits) */
+X	char	r_segbh;		/* Segment address (hi 2 bits) */
+X	u_char	r_flags;		/* Status flags */
+X	u_short	r_tdrerr;		/* Errors */
+X#define	r_lenerr	r_tdrerr
+X	short	r_rid;			/* Request ID */
+X};
+X
+X#define	XFLG_OWN	0x80		/* If 0 then owned by driver */
+X#define	XFLG_ERRS	0x40		/* Error summary */
+X#define	XFLG_MTCH	0x20		/* Address match on xmit request */
+X#define	XFLG_MORE	0x10		/* More than one entry required */
+X#define	XFLG_ONE	0x08		/* One collision encountered */
+X#define	XFLG_DEF	0x04		/* Transmit deferred */
+X#define	XFLG_STP	0x02		/* Start of packet */
+X#define	XFLG_ENP	0x01		/* End of packet */
+X
+X#define	XFLG_BITS	"\10\10OWN\7ERRS\6MTCH\5MORE\4ONE\3DEF\2STP\1ENP"
+X
+X#define	XERR_BUFL	0x8000		/* Buffer length error */
+X#define	XERR_UBTO	0x4000		/* UNIBUS tiemout
+X#define	XERR_LCOL	0x1000		/* Late collision */
+X#define	XERR_LCAR	0x0800		/* Loss of carrier */
+X#define	XERR_RTRY	0x0400		/* Failed after 16 retries */
+X#define	XERR_TDR	0x03ff		/* TDR value */
+X
+X#define	XERR_BITS	"\20\20BUFL\17UBTO\15LCOL\14LCAR\13RTRY"
+X
+X#define	RFLG_OWN	0x80		/* If 0 then owned by driver */
+X#define	RFLG_ERRS	0x40		/* Error summary */
+X#define	RFLG_FRAM	0x20		/* Framing error */
+X#define	RFLG_OFLO	0x10		/* Message overflow */
+X#define	RFLG_CRC	0x08		/* CRC error */
+X#define	RFLG_STP	0x02		/* Start of packet */
+X#define	RFLG_ENP	0x01		/* End of packet */
+X
+X#define	RFLG_BITS	"\10\10OWN\7ERRS\6FRAM\5OFLO\4CRC\2STP\1ENP"
+X
+X#define	RERR_BUFL	0x8000		/* Buffer length error */
+X#define	RERR_UBTO	0x4000		/* UNIBUS tiemout */
+X#define	RERR_NCHN	0x2000		/* No data chaining */
+X#define	RERR_MLEN	0x0fff		/* Message length */
+X
+X#define	RERR_BITS	"\20\20BUFL\17UBTO\16NCHN"
+X
+X/* mode description bits */
+X#define	MOD_HDX		0x0001		/* Half duplex mode */
+X#define	MOD_LOOP	0x0004		/* Enable internal loopback */
+X#define	MOD_DTCR	0x0008		/* Disables CRC generation */
+X#define	MOD_DMNT	0x0200		/* Disable maintenance features */
+X#define	MOD_ECT		0x0400		/* Enable collision test */
+X#define	MOD_TPAD	0x1000		/* Transmit message pad enable */
+X#define	MOD_DRDC	0x2000		/* Disable data chaining */
+X#define	MOD_ENAL	0x4000		/* Enable all multicast */
+X#define	MOD_PROM	0x8000		/* Enable promiscuous mode */
+X
+Xstruct	de_buf {
+X	struct ether_header db_head;	/* header */
+X	char	db_data[ETHERMTU];	/* packet data */
+X	int	db_crc;			/* CRC - on receive only */
+X};
+~FUNKY STUFF~
+exit
+
+

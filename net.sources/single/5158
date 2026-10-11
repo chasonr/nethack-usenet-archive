@@ -1,0 +1,800 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,c777e2539e420518,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-11-24 10:49:05 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!mnetor!seismo!think!husc6!harvard!adelie!cdx39!jc
+From: jc@cdx39.UUCP (John Chambers)
+Newsgroups: net.sources
+Subject: chars, a program to generate arbitrary output characters.
+Message-ID: <484@cdx39.UUCP>
+Date: Mon, 24-Nov-86 13:49:05 EST
+Article-I.D.: cdx39.484
+Posted: Mon Nov 24 13:49:05 1986
+Date-Received: Fri, 28-Nov-86 18:10:00 EST
+Distribution: net
+Organization: Codex Corp, a subsidiary of Motorola Inc, Canton MA, USA
+Lines: 780
+
+We all occasionally have need of a way of generating (usually 
+from a script) an arbitrary string of bytes, including some
+which can't be conveniently entered from our terminal.  On
+some Unix (tm) systems, there is a program called 'ascii' 
+which does this; on many there isn't.  
+
+Here's a simple C program that does the job.  I don't like
+the name 'ascii', since I often use it for non-ascii things.
+What I do is put it into our /usr/local as 'chars'.  After
+you've unpacked it and typed 'make', try the command:
+	chars -S1 LF lf H e l l o bang -r3 cr lf nl nl
+
+After doing that, type:
+	chars -t
+and it'll show you its symbol table.  One thing you might
+like to do is to augment the table with whatever bizarre
+names you like to use for funny characters.  I'm sure that
+my list, comprehensive though it may be, still omits some
+of your favorite names.
+
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+: This is a shar archive. Extract with sh, not csh
+echo file: chars.c
+cat > chars.c << '\!Funky\!Stuff\!'
+/*  chars [options] char...
+**
+** [1985/12/23 by John Chambers]
+**
+** Character-string generator.
+**
+** Each command-line argument represents one character to be written
+** to standard output.  One-byte arguments are copied as-is.  Others 
+** are octal (if they start with '\' or '0'), hex (if they start with
+** 'x' or ** '0x'), or decimal (if they start with a digit).  In all 
+** other cases, the arg is looked up in a table of symbolic names.
+**
+** The output is written one character at a time, via write(1,&c,1).
+** Options exist to control the speed of writing, making this program
+** useful for talking to devices that can't listen very fast.
+**
+** Only the characters listed in command-line arguments are written;
+** no extra newlines, nulls, or anything else will be produced, so
+** you can have precise control over what is generated.
+**
+** Examples:
+**
+** 	chars H i bang NL CR 
+** 	chars -S1 bel -r999 >/dev/tty17
+** 	chars esc '[' 7 i >/dev/pty3
+** 	chars esc % U FF >>foo.pr
+**
+** The first writes "Hi!" plus a newline (LF) and carriage return.
+** The second sends 1000 "bell" characters to /dev/tty17, one per
+** second.  The third sends an escape control sequence to a device.
+** The bracket is quoted to protect it from the shell.  The fourth
+** example appends a 3-char escape sequence and a form feed to a file 
+** (for printer control).
+**
+** Interesting options:
+**
+** -b<n>  set baud rate to <n> [1200, 2400, 4800, 9600 defined].
+** -B<n>  same as -b<n>.
+**
+** -c<n>  count to <n>, thus delaying by wasting time.
+** -C<n>  count to <n> before each character.
+**
+** -d<n>  debug level <n>;	default = 0.
+** -D<n>  same as -d<n>.
+** \d<n>  same as -d<n>, for compatibility with cu and uucp.
+**
+** -r<n>  repeat the preceding char <n> times, honoring -C and -S delays.
+** -R<n>  same as -r<n>.
+**
+** -s<n>  sleep <n> seconds.
+** -S<n>  sleep <n> seconds before each char.
+**
+** -t<n>  display the symbol table, <n> chars per line [default=1].
+** -T<n>  same as -t<n>.
+*/
+#include <stdio.h>
+#include <fcntl.h>
+
+#define Done goto done
+#define Fail goto fail
+#define U32 unsigned long
+
+extern unsigned sleep();
+extern void exit();
+extern int errno;		/* Unix system-call error indicator */
+
+char  *crlf   = "\n";		/* Line terminator string, could be "\n\r" */
+FILE  *dbgout = stderr;		/* Can be assigned to switch to stdout */
+int    debug  = 0;		/* Set to desired debug level (0-9) */
+char  *ofile  = 0;		/* Output file name */
+char  *progid = "ERR";		/* Set to argv[0] */
+
+#define D1 if(debug>=1)dmsg
+#define D2 if(debug>=2)dmsg
+#define D3 if(debug>=3)dmsg
+#define D4 if(debug>=4)dmsg
+#define D5 if(debug>=5)dmsg
+#define D6 if(debug>=6)dmsg
+#define D7 if(debug>=7)dmsg
+#define D8 if(debug>=8)dmsg
+#define D9 if(debug>=9)dmsg
+#define E emsg
+#define P pmsg
+
+#ifdef SYS5
+# include <termio.h>
+  struct termio termio;
+  struct termio termxx;
+#endif
+
+#define BRK -1  /* Break code */
+#define B12 -2  /* 1200 baud */
+#define B24 -3  /* 2400 baud */
+#define B48 -4  /* 4800 baud */
+#define B96 -5  /* 9600 baud */
+/* 
+** Table of recognized "names" of characters.
+*/
+struct {
+  char *name;		/* Symbolic name on cmmand line */
+  int   value;		/* Char value, or negative flag */
+}  codes[] = {		/* Note final entry must be {0,0} */
+  {"ACK",	0x06},
+  {"AK",	0x06},
+  {"AMPERSAND",	0x26},
+  {"AND",	0x26},
+  {"APOSTROPHE",0x27},
+  {"AT",	0x4F},
+  {"B12",	B12},
+  {"B1200",	B12},
+  {"B24",	B24},
+  {"B2400",	B24},
+  {"B48",	B48},
+  {"B4800",	B48},
+  {"B96",	B96},
+  {"B9600",	B96},
+  {"BANG",	0x21},
+  {"BEL",	0x07},
+  {"BELL",	0x07},
+  {"BL",	0x07},
+  {"BRK",	BRK},
+  {"BREAK",	BRK},
+  {"BS",	0x08},
+  {"CAN",	0x18},
+  {"CARAT",	0x5E},
+  {"CARROT",	0x5E},
+  {"CIRCUMFLEX",0x5E},
+  {"COLON",	0x3A},
+  {"COMMA",	0x2C},
+  {"CR",	0x0D},
+  {"D1",	0x11},
+  {"D2",	0x12},
+  {"D3",	0x13},
+  {"D4",	0x14},
+  {"DC1",	0x11},
+  {"DC2",	0x12},
+  {"DC3",	0x13},
+  {"DC4",	0x14},
+  {"DEL",	0x7F},
+  {"DL",	0x10},
+  {"DLE",	0x10},
+  {"DOLLAR",	0x24},
+  {"DOT",	0x2E},
+  {"DQUOTE",	0x22},
+  {"EB",	0x17},
+  {"EM",	0x19},
+  {"EN",	0x05},
+  {"ENQ",	0x05},
+  {"EOF",	0x04},
+  {"EOT",	0x04},
+  {"EQ",	0x3D},
+  {"ESC",	0x1B},
+  {"ET",	0x04},
+  {"ETB",	0x17},
+  {"ETX",	0x03},
+  {"EX",	0x03},
+  {"EXCLAIM",	0x21},
+  {"EXP",	0x5E},
+  {"FF",	0x0C},
+  {"FS",	0x1C},
+  {"GEAR",	0x2A},
+  {"GS",	0x1D},
+  {"GT",	0x3E},
+  {"HT",	0x09},
+  {"LB",	0x5B},
+  {"LBR",	0x7B},
+  {"LF",	0x0A},
+  {"LP",	0x28},
+  {"LT",	0x3C},
+  {"MINUS",	0x2D},
+  {"NAK",	0x15},
+  {"NK",	0x15},
+  {"NL",	0x0A},
+  {"NU",	0x00},
+  {"NUL",	0x00},
+  {"NULL",	0x00},
+  {"OR",	0x7C},
+  {"PERCENT",	0x25},
+  {"PERIOD",	0x2E},
+  {"PIPE",	0x7C},
+  {"PLUS",	0x2B},
+  {"POUND",	0x23},
+  {"QRY",	0x3F},
+  {"QUERY",	0x3F},
+  {"QUESTION",	0x3F},
+  {"QUOTE",	0x22},
+  {"RB",	0x5D},
+  {"RBR",	0x7D},
+  {"RP",	0x29},
+  {"RS",	0x1E},
+  {"SB",	0x1A},
+  {"SEMI",	0x3B},
+  {"SEMICOLON",	0x3B},
+  {"SH",	0x01},
+  {"SHARP",	0x23},
+  {"SI",	0x0F},
+  {"SN",	0x16},
+  {"SO",	0x0E},
+  {"SOH",	0x01},
+  {"SP",	0x20},
+  {"SQUOTE",	0x27},
+  {"STAR",	0x2A},
+  {"START",	0x11},
+  {"STOP",	0x13},
+  {"STX",	0x02},
+  {"SUB",	0x1A},
+  {"SX",	0x02},
+  {"SY",	0x16},
+  {"SYN",	0x16},
+  {"TAB",	0x09},
+  {"TILDE",	0x7E},
+  {"TIMES",	0x2A},
+  {"UNDER",	0x5F},
+  {"US",	0x1F},
+  {"VIRGULE",	0x2F},
+  {"VT",	0x0B},
+  {"ack",	0x06},
+  {"ak",	0x06},
+  {"ampersand",	0x26},
+  {"and",	0x26},
+  {"apostrophe",0x27},
+  {"at",	0x4f},
+  {"b12",	B12},
+  {"b1200",	B12},
+  {"b24",	B24},
+  {"b2400",	B24},
+  {"b48",	B48},
+  {"b4800",	B48},
+  {"b96",	B96},
+  {"b9600",	B96},
+  {"bang",	0x21},
+  {"bel",	0x07},
+  {"bell",	0x07},
+  {"bl",	0x07},
+  {"brk",	BRK},
+  {"break",	BRK},
+  {"bs",	0x08},
+  {"can",	0x18},
+  {"carat",	0x5e},
+  {"carrot",	0x5e},
+  {"circumflex",0x5e},
+  {"cn",	0x18},
+  {"colon",	0x3a},
+  {"comma",	0x2c},
+  {"cr",	0x0d},
+  {"d1",	0x11},
+  {"d2",	0x12},
+  {"d3",	0x13},
+  {"d4",	0x14},
+  {"dc1",	0x11},
+  {"dc2",	0x12},
+  {"dc3",	0x13},
+  {"dc4",	0x14},
+  {"del",	0x7f},
+  {"dl",	0x10},
+  {"dle",	0x10},
+  {"dollar",	0x24},
+  {"dot",	0x2e},
+  {"dquote",	0x22},
+  {"eb",	0x17},
+  {"em",	0x19},
+  {"en",	0x05},
+  {"enq",	0x05},
+  {"eof",	0x04},
+  {"eot",	0x04},
+  {"eq",	0x3d},
+  {"es",	0x1b},
+  {"esc",	0x1b},
+  {"et",	0x04},
+  {"et",	0x04},
+  {"etb",	0x17},
+  {"etx",	0x03},
+  {"ex",	0x03},
+  {"exclaim",	0x21},
+  {"exp",	0x5e},
+  {"ff",	0x0c},
+  {"fs",	0x1c},
+  {"gear",	0x2a},
+  {"gs",	0x1d},
+  {"gt",	0x3e},
+  {"ht",	0x09},
+  {"lb",	0x5b},
+  {"lbr",	0x7b},
+  {"lf",	0x0a},
+  {"lp",	0x28},
+  {"lt",	0x3c},
+  {"minus",	0x2d},
+  {"nak",	0x15},
+  {"nk",	0x15},
+  {"nl",	0x0a},
+  {"nu",	0x00},
+  {"nul",	0x00},
+  {"null",	0x00},
+  {"or",	0x7c},
+  {"percent",	0x25},
+  {"period",	0x2e},
+  {"pipe",	0x7c},
+  {"plus",	0x2b},
+  {"pound",	0x23},
+  {"qry",	0x3f},
+  {"query",	0x3f},
+  {"question",	0x3f},
+  {"quote",	0x22},
+  {"rb",	0x5d},
+  {"rbr",	0x7d},
+  {"rp",	0x29},
+  {"rs",	0x1e},
+  {"sb",	0x1a},
+  {"semi",	0x3b},
+  {"semicolon",	0x3b},
+  {"sh",	0x01},
+  {"sharp",	0x23},
+  {"si",	0x0f},
+  {"sn",	0x16},
+  {"so",	0x0e},
+  {"soh",	0x01},
+  {"sp",	0x20},
+  {"squote",	0x27},
+  {"star",	0x2a},
+  {"start",	0x11},
+  {"stop",	0x13},
+  {"stx",	0x02},
+  {"sub",	0x1a},
+  {"sx",	0x02},
+  {"sy",	0x16},
+  {"syn",	0x16},
+  {"tab",	0x09},
+  {"tilde",	0x7e},
+  {"times",	0x2a},
+  {"under",	0x5f},
+  {"us",	0x1f},
+  {"virgule",	0x2f},
+  {"vt",	0x0b},
+  {0,	0},		/* Must be the final entry */
+};
+U32  lcount = 0;	/* Repeat counter */
+char lastc  = 0;	/* Last output char */
+int  scount = 0;	/* Sleep time between chars */
+int  symblo = 0;	/* Index of first-known symbol */
+int  symbhi = 0;	/* Index of last-known symbol */
+
+help()
+{
+  P("Usage: %s [-option]... [symbol]...",progid);
+  P("where each symbol describes one character of output.");
+  P("Options are:");
+  P("   -b<n>   Baud rate <n> [1200, 2400, 4800, 9600]");
+  P("   -c<n>   Slow output by counting to <n>.");
+  P("   -C<n>   Count to <n> before each character.");
+  P("   -f<f>   Send output to file <f>.");
+  P("   -h      Display this help information");
+  P("   -r<n>   Repeat previous character <n> times.");
+  P("   -s<n>   Slow output by sleeping <n> seconds.");
+  P("   -S<n>   Sleep <n> seconds before each character.");
+  P("   -t<n>   Display the symbol table, <n> items per line.");
+  P("Symbols are:");
+  P("   Any single character stands for itself.");
+  P("   Any ASCII name [BEL, etx, SO, lf] may be used.");
+  P("   ^G      means CTRL-G, a bell.");
+  P("   025     is an octal value for a NAK.");
+  P("   \\025    is also an octal value for a NAK.");
+  P("   \\d<n>   Delay <n> seconds [same as -s<n>].");
+  P("   x1B     is a hex value for an escape.");
+  P("   0x1B    is also a hex value for an escape.");
+  P("   BRK     causes a BREAK on a serial port.");
+  P("Note that symbols may be upper or lower case, but not mixed.");
+  P("Example:");
+  P("   %s -S2 H e l l o bang cr lf nl bell -r9 >/dev/tty23",progid);
+  P("types \"Hello!\" very slowly, plus an extra blank line and ten beeps.");
+}
+/* Debugging package for C programs.  The primary functions are
+** based on conditional calls of fprintf(), with the program's
+** name inserted at the start, a newline appended, and fflush()
+** called to send it on its way.  
+**
+** The global variable "debug" should be set to a value in [0,9],
+** to control the amount of debugging output.
+**
+** Note that "dbgout" is a FILE*, either stdout or stderr as you
+** wish, with stderr the default.   For Bourne-shell users, you
+** may find it convenient to make dbgout = stdout.
+*/
+/*
+** Debug output routine.  The program's name is
+** prepended to the message, a terminator is added,
+** and an optional sleep is done.
+*/
+dmsg(fmt,x0,x1,x2,x3,x4,x5,x6,x7,x8,x9) char *fmt;
+{
+  fprintf(dbgout,"%s: ",progid);
+  fprintf(dbgout,fmt,x0,x1,x2,x3,x4,x5,x6,x7,x8,x9);
+  fprintf(dbgout,crlf);
+  fflush(dbgout);
+}
+/* Produce an error message, complete with program name and a final newline.
+** Note that emsg() may write to both dbgout and stderr.
+*/
+emsg(fmt,x0,x1,x2,x3,x4,x5,x6,x7,x8,x9) char *fmt;
+{
+  if (dbgout != stderr)
+    dmsg(fmt,x0,x1,x2,x3,x4,x5,x6,x7,x8,x9);
+  fprintf(stderr,"%s: ",progid);
+  fprintf(stderr,fmt,x0,x1,x2,x3,x4,x5,x6,x7,x8,x9);
+  fprintf(stderr,crlf);
+  fflush(stderr);
+}
+/* Print a message to the debug output, adding only
+** a terminator, but don't add program identification.
+*/
+pmsg(fmt,x0,x1,x2,x3,x4,x5,x6,x7,x8,x9) char *fmt;
+{
+  fprintf(dbgout,fmt,x0,x1,x2,x3,x4,x5,x6,x7,x8,x9);
+  fprintf(dbgout,crlf);
+  fflush(dbgout);
+}
+/* Generate a printable char for x.  If x is an ASCII
+** printable char, it is returned.  For others, '_' is
+** returned.
+*/
+dsp(x) {x &= 0x7F; return (0x20<=x && x<=0x7E) ? x : '_';}
+/*
+** Set the baud rate for the output device,
+** which must be a serial port, or it won't work.
+*/
+setbaud(rate)
+{ int i;
+
+  D5("setbaud(%06o)",rate);
+  errno = 0;
+#ifdef SYS5
+  i = ioctl(1,TCGETA,&termio);
+  if (debug || i<0 || errno)
+    D6("setbaud:ioctl(%d,TCGETA,%06X)=%d\t[errno=%d]",1,&termio,i,errno);
+  D6("setbaud:c_fflag = %06o [old value]",termio.c_cflag);
+  termio.c_cflag &= ~CBAUD;
+  termio.c_cflag |=  rate;
+  D6("setbaud:c_fflag = %06o [new value]",termio.c_cflag);
+  i = ioctl(1,TCSETA,&termio);
+/*
+** Some systems have shown problems with ioctl() working correctly.
+** The following code reads back the termio control block, and checks
+** to see that the kernel really did what we told it.  This extreme
+** paranoia may be commented out once you verify that your kernel's
+** terminal driver is cooperative.
+*/
+  if (debug || i<0 || errno)
+    D5("setbaud:ioctl(%d,TCSETA,%06X)=%d\t[errno=%d]",1,&termio,i,errno);
+  i = ioctl(1,TCGETA,&termxx);		/* Verify the change */
+  if (debug || i<0 || errno)
+    D5("setbaud:ioctl(%d,TCGETA,%06X)=%d\t[errno=%d]",1,&termxx,i,errno);
+  if (termxx.c_cflag != termio.c_cflag) {
+    D1("setbaud:c_fflag = %06o [new value]",termxx.c_cflag);
+    E("****Can't set stdout's baud rate.");
+  }
+#endif
+}
+/* String comparison;	searches for nulls or differing chars.
+** Returns the difference between the first differing chars.
+** Returns 0 only if the null-terminated strings are identical.
+*/
+compare(p,q)
+  char *p, *q;
+{
+  D5("compare(\"%s\",\"%s\")",p,q);
+  while (*p && *q) {	/* Stop if either char is null */
+    D9("compare c=%02X='%c' d=%02X='%c'",*p,*p,*q,*q);
+    if (*p != *q)	/* Stop if they differ */
+      break;
+    ++p;
+    ++q;
+  }
+  D9("compare c=%02X='%c' d=%02X='%c' [STOP]",*p,*p,*q,*q);
+  D5("compare()=%02X",*p - *q);
+  return (*p - *q);	/* This will give ASCII sort order */
+}
+/*
+** Each option on the command line is passed to this routine.
+*/
+option(op)
+  char *op;
+{ int   i, n;
+  U32   l, u32;
+  char *p;
+
+  D5("option(\"%s\")",op);
+
+  switch (op[1]) {
+  case 'c':		/* -c<n> means count to <n> */
+    i = sscanf(op+2,"%ld",&u32);
+    if (i <= 0) u32 = 1;
+    D2("option:u32=%ld",u32);
+    while (--u32 > 0);
+    break;
+  case 'C':		/* -C<n> means count to <n> after each char*/
+    i = sscanf(op+2,"%ld",&u32);
+    if (i <= 0) u32 = 1;
+    D2("option:u32=%ld",u32);
+    lcount = u32;
+    D2("option:lcount=%ld",lcount);
+    while (--u32 > 0);
+    break;
+  case 'f':		/* -f<file> redirects output to new file */
+  case 'F':
+    ofile = op + 2;
+    close(1);
+    if ((i = open(ofile,O_WRONLY|O_NDELAY|O_CREAT,0666)) != 1) {
+      E("****%s: open(\"%s\",%o,%o)=%d",ofile,O_WRONLY|O_NDELAY|O_CREAT,0666);
+      exit(1);
+    }
+    break;
+  case 'd':
+  case 'D':
+    i = sscanf(op+2,"%d",&debug);
+    if (i <= 0) debug = 1;
+    D2("option:debug=%d",debug);
+    break;
+  case 'h':
+  case 'H':		/* Help */
+    help();
+    break;
+  case 'r':
+  case 'R':		/* -r<n> repeats last char <n> times */
+    i = sscanf(op+2,"%ld",&u32);
+    if (i <= 0) u32 = 1;
+    D3("option:R: write lastc=%02X='%c' u32=%ld",lastc,dsp(lastc),u32);
+    while (u32-- > 0) {
+      if (scount > 0) sleep(scount);
+      if (lcount > 0) for (l=lcount;	l>0; l--);
+      write(1,&lastc,1);
+    }
+    break;
+  case 's':		/* -s<n> means sleep <n> seconds */
+    sdelay(op+2);
+    break;
+  case 'S':		/* -S<n> means sleep <n> seconds before each char */
+    i = sscanf(op+2,"%d",&scount);
+    if (i <= 0) scount = 1;
+    D4("option:scount=%d",scount);
+    break;
+  case 't':
+  case 'T':		/* -T<n> displays the table, <n> entries per line */
+    i = sscanf(op+2,"%d",&n);
+    if (i <= 0) n = 1;
+    D4("option:n=%d",n);
+    i = 0;
+    while (codes[i].name) {
+      if (codes[i].value < 0)
+           printf("%10.10s --- -- ",codes[i].name);
+      else printf("%10.10s %03o=%02X ",codes[i].name,0x7F&codes[i].value,0x7F&codes[i].value);
+      if ((++i % n) == 0)
+	printf("\n");
+    }
+    if (i % n) printf("\n");
+    fflush(stdout);
+    break;
+  default:
+    E("Unknown option \"%s\"",op);
+    break;
+  }
+  D5("option(\"%s\") done",op);
+}
+/* All the non-options on the command line are passed to this routine.
+** It decodes a symbolic name for a char, and write the char.  If it 
+** describes an action rather than a char, the action is performed 
+** (to the extent possible at this time).
+*/
+symbol(sp)
+  char *sp;		/* First char of null-terminated symbol */
+{ char  c, c0, c1;
+  char *p;		/* Pointer into the sp string */
+  int   i, j, n, x;
+  int   lo, hi;
+  U32   l, u32;
+
+  D5("symbol(\"%s\")",sp);
+
+  c = 0;
+  c0 = sp[0];
+  c1 = sp[1];
+  /*
+  ** This switch normally exits with c containing a character to be written.
+  ** If a case (or subroutine) does the job, a "Done" is used instead.
+  ** Note that some cases also have labels, to handle alternate ways of
+  ** saying the same thing (like 0x48 and x48).
+  */
+  switch (c0) {			/* Long sp, it's symbolic */
+  case '+':
+  case '-':			/* Option */
+    option(sp);
+    Done;
+  case '^':			/* ^G is a bell, and so on */
+    c = c1 & 0x1F;
+    break;
+  case '0':			/* Numeric value */
+    x = *(p = sp+1);		/* What kind of number? */
+    if (x=='x' || x=='X') {	/* 0x__ is a hexadecimal value */
+      ++p;			/* Find first digit */
+      goto Hex;
+    }				/* 0___ is an octal value */
+  case '\\':			/* Escape is octal value or delay */
+    x = *(p = sp + 1);
+    if ('0'<=x && x<='7')	/* Digit is octal value */
+      goto Oct;
+    if (x == 'd') {		/* \d<n> is an <n>-second delay */
+      sdelay(p+1);
+      Done;
+    }
+    Fail;
+  Oct:
+    while ('0'<=x && x<='7') {	/* Scan octal digits */
+      c = (c << 3) + (x & 7);	/* Convert to binary value */
+      x = *++p;			/* Next char */
+    }
+    D8("symbol:Oct c=%03o=%d=%02X='%c'",c,c,c,dsp(c));
+    break;
+  case '1': case '2': case '3':
+  case '4': case '5': case '6':
+  case '7': case '8': case '9':	/* Decimal value */
+    sscanf(sp,"%d",&i);
+    c = i;
+    D8("symbol:Dec c=%03o=%d=%02X='%c'",c,c,c,dsp(c));
+    break;
+  case 'x':
+  case 'X':		
+    c = 0;
+    p = sp + 1;
+  Hex:				/* Hex value */
+    while (x = *p++)
+      c = (c << 4) + (('A'<=x && x<='F')? (x - 'A' + 10)
+        : ('a'<=x && x<='f')? (x - 'a' + 10)
+        : (x & 0xF)
+        );
+    D8("symbol:Hex c=%03o=%d=%02X='%c'",c,c,c,dsp(c));
+    break;
+  default:			/* Symbolic name for char */
+    D4("symbol:Sym \"%s\"",sp);
+    c = '?';			/* Unknown symbol */
+    lo = symblo;
+    hi = symbhi;
+    while (lo <= hi)  {		/* Binary search for symbol */
+      i = (lo + hi) / 2;	/* Pick out the middle symbol */
+      D5("symbol:lo=%d i=%d hi=%d",lo,i,hi);
+      j = compare(sp,codes[i].name);
+      D5("symbol:compare(\"%s\",\"%s\")=%d",sp,codes[i].name,j);
+      if (j < 0) {		/* sp is earlier */
+        hi = i - 1;
+        continue;
+      }
+      if (j > 0) {		/* sp is later */
+        lo = i + 1;
+        continue;
+      }
+      c = x = codes[i].value;	/* Extract char for this symbol */
+
+      D4("symbol:Sym c=%03o=%d=%02X='%c'",c,c,c,dsp(c));
+      switch (x) {		/* Is it a special flag? */
+      case BRK:			/* Send a break */
+        D2("symbol:BRK");
+        errno = 0;
+#ifdef SYS5
+        i = ioctl(1,TCSBRK,0);
+        if (i<0 || errno)
+          D5("symbol:ioctl(%d,TCSBRK=%d,0)=%d\t[errno=%d]",1,TCSBRK,i,errno);
+#endif
+        Done;
+      case B12:	setbaud(B1200);	Done;
+      case B24:	setbaud(B2400);	Done;
+      case B48:	setbaud(B4800);	Done;
+      case B96:	setbaud(B9600);	Done;
+      }
+      break;
+    }
+    break;
+  }
+/* If the above switch exits normally, we assume that c contains 
+** a character to be written.  If the character has already been
+** written, or none is needed, the above code should use Done to
+** skip past the following code:
+*/
+  if (scount > 0) sleep(scount);
+  if (lcount > 0) for (l=lcount; l>0; l--);
+  D3("symbol:before write(1,%02X='%c',1)",c,dsp(c));
+
+  i = write(1,&c,1);		/* Write the char!!! */
+
+  D8("symbol:after  write(1,%02X='%c',1)=%d",c,dsp(c),i);
+  lastc = c;
+done:
+  D5("symbol(\"%s\") done",sp);
+  return;
+fail:
+  E("Symbol \"%s\" unknown, ignored.",sp);
+}
+main(ac,av)
+  int   ac;
+  char**av;
+{ int   a, i;
+  U32   l;
+  char  c0, c1;
+
+  progid = av[0];
+  lastc = 0;
+  while (codes[++symbhi].name);
+  --symbhi;	/* Index of last symbol */
+
+  for (a=1; a<ac; a++) {	/* Run thru the command-line args */
+    c0 = av[a][0];		/* Note first char of arg */
+    D9("c0=%02X='%c',1)",c0,dsp(c0));
+    c1 = av[a][1];		/* Note first char of arg */
+    D9("c1=%02X='%c',1)",c1,dsp(c1));
+    if (c1 == 0) {		/* Arg more than one byte? */
+      if (scount > 0) sleep(scount);
+      if (lcount > 0) for (l=lcount;	l>0; l--);
+      D3("before write(1,%02X='%c',1)",c0,dsp(c0));
+  
+      i = write(1,&c0,1);	/* Write the char */
+  
+      D8("after  write(1,%02X='%c',1)=%d",c0,dsp(c0),i);
+      lastc = c0;
+      continue;
+    }
+    symbol(av[a]);	/* It's a symbolic char */
+  }
+  return 0;
+}
+/* Delay by sleeping.  The parameter is a char string 
+** giving the number of seconds; 1 if null.
+*/
+sdelay(p) char *p;
+{ int   i, n;
+
+  D5("sdelay(%06lX)",p);
+  n = sscanf(p,"%d",&i);
+  if (n <= 0) i = 1;
+  D2("Delay %d seconds.",lcount);
+  sleep(i);
+}
+\!Funky\!Stuff\!
+echo file: Makefile
+cat > Makefile << '\!Funky\!Stuff\!'
+#
+F=	-DSYS5 -I.
+C=	cc $F -c 
+L=	cc $F -o 
+# Arbitrary-char-string generator.
+#
+chars:		chars.c;	$L chars chars.c
+chars.L:	chars.c;	lint $F chars.c	>chars.L
+chars.shar:	chars.c Makefile;	shar chars.c Makefile >chars.shar
+\!Funky\!Stuff\!
+-- 
+	John M Chambers			Phone: 617/364-2000x7304
+Email: ...{adelie,harvax,inmet,mcsbos,mit-eddie,mot[bos],rclex}!cdx39!{jc,news,root,usenet,uucp}
+Smail: Codex Corporation; Mailstop C1-30; 20 Cabot Blvd; Mansfield MA 02048-1193
+[The following added so that an NSA computer will take notice, guaranteeing that I'll have at least one reader:-]
+> cryptography, cipher, DES, homosexual, drugs, secret, decode, NSA, CIA, NRO, terrorist, Soviet, Libya, Iran.
+
+

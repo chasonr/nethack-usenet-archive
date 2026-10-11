@@ -1,0 +1,2027 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,728507f089545029,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1993-02-01 11:50:09 PST
+Path: sparky!uunet!news.tek.com!master!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v16i071:  nethack31 - display oriented dungeons & dragons (Ver. 3.1), Part63/108
+Message-ID: <4374@master.CNA.TEK.COM>
+Date: 1 Feb 93 19:50:09 GMT
+Sender: news@master.CNA.TEK.COM
+Lines: 2011
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: izchak@linc.cis.upenn.edu (Izchak Miller)
+Posting-number: Volume 16, Issue 71
+Archive-name: nethack31/Part63
+Supersedes: nethack3p9: Volume 10, Issue 46-102
+Environment: Amiga, Atari, Mac, MS-DOS, OS2, Unix, VMS, X11
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 63 (of 108)."
+# Contents:  src/restore.c sys/amiga/Makefile.ami
+# Wrapped by billr@saab on Wed Jan 27 16:09:11 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'src/restore.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'src/restore.c'\"
+else
+echo shar: Extracting \"'src/restore.c'\" \(21955 characters\)
+sed "s/^X//" >'src/restore.c' <<'END_OF_FILE'
+X/*	SCCS Id: @(#)restore.c	3.1	93/01/23	*/
+X/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+X/* NetHack may be freely redistributed.  See license for details. */
+X
+X#include "hack.h"
+X#include "lev.h"
+X#include "termcap.h" /* for TERMLIB and ASCIIGRAPH */
+X
+X#ifdef MICRO
+Xextern int dotcnt;	/* shared with save */
+X#endif
+X
+X#ifdef ZEROCOMP
+Xstatic int NDECL(mgetc);
+X#endif
+Xstatic void NDECL(find_lev_obj);
+X#ifndef NO_SIGNAL
+Xstatic void NDECL(inven_inuse);
+X#endif
+Xstatic void FDECL(restlevchn, (int));
+Xstatic void FDECL(restdamage, (int,BOOLEAN_P));
+Xstatic struct obj * FDECL(restobjchn, (int,BOOLEAN_P));
+Xstatic struct monst * FDECL(restmonchn, (int,BOOLEAN_P));
+Xstatic void FDECL(restgenoinfo, (int));
+Xstatic boolean FDECL(restgamestate, (int, unsigned int *));
+Xstatic int FDECL(restlevelfile, (int,XCHAR_P));
+X
+X#ifdef MULDGN
+X#include "quest.h"
+X#endif
+X
+Xboolean restoring = FALSE;
+X#ifdef TUTTI_FRUTTI
+Xstatic struct fruit NEARDATA *oldfruit;
+X#endif
+Xstatic long NEARDATA omoves;
+X
+X/* Recalculate level.objects[x][y], since this info was not saved. */
+Xstatic void
+Xfind_lev_obj()
+X{
+X	register struct obj *fobjtmp = (struct obj *)0;
+X	register struct obj *otmp;
+X	int x,y;
+X
+X	for(x=0; x<COLNO; x++) for(y=0; y<ROWNO; y++)
+X		level.objects[x][y] = (struct obj *)0;
+X
+X	/* Reverse the entire fobj chain, which is necessary so that we can
+X	 * place the objects in the proper order.
+X	 */
+X	while ((otmp = fobj) != 0) {
+X		fobj = otmp->nobj;
+X		otmp->nobj = fobjtmp;
+X		fobjtmp = otmp;
+X	}
+X	/* Set level.objects (as well as reversing the chain back again) */
+X	while ((otmp = fobjtmp) != 0) {
+X		place_object(otmp, otmp->ox, otmp->oy);
+X		fobjtmp = otmp->nobj;
+X		otmp->nobj = fobj;
+X		fobj = otmp;
+X	}
+X}
+X
+X#ifndef NO_SIGNAL
+Xstatic void
+Xinven_inuse()
+X/* Things that were marked "in_use" when the game was saved (ex. via the
+X * infamous "HUP" cheat) get used up here.
+X */
+X{
+X	register struct obj *otmp, *otmp2;
+X
+X	for(otmp = invent; otmp; otmp = otmp2) {
+X		otmp2 = otmp->nobj;
+X		if(otmp->in_use) {
+X			/* in_use and oldcorpse share a bit, but we don't
+X			 * want nasty messages for old corpses --
+X			 * remove_cadavers() will clean them up nicely
+X			 */
+X			if (otmp->otyp == CORPSE &&
+X					mons[otmp->corpsenm].mlet == S_TROLL)
+X				continue;
+X			pline("Finishing off %s...", xname(otmp));
+X			useup(otmp);
+X		}
+X	}
+X}
+X#endif
+X
+Xstatic void
+Xrestlevchn(fd)
+Xregister int fd;
+X{
+X	int cnt;
+X	s_level	*tmplev, *x;
+X
+X	sp_levchn = (s_level *) 0;
+X	mread(fd, (genericptr_t) &cnt, sizeof(int));
+X	for(; cnt > 0; cnt--) {
+X
+X	    tmplev = (s_level *)alloc(sizeof(s_level));
+X	    mread(fd, (genericptr_t) tmplev, sizeof(s_level));
+X	    if(!sp_levchn) sp_levchn = tmplev;
+X	    else {
+X
+X		for(x = sp_levchn; x->next; x = x->next);
+X		x->next = tmplev;
+X	    }
+X	    tmplev->next = (s_level *)0;
+X	}
+X}
+X
+Xstatic void
+Xrestdamage(fd, ghostly)
+Xint fd;
+Xboolean ghostly;
+X{
+X	int counter;
+X	struct damage *tmp_dam;
+X
+X	mread(fd, (genericptr_t) &counter, sizeof(counter));
+X	if (!counter)
+X	    return;
+X	tmp_dam = (struct damage *)alloc(sizeof(struct damage));
+X	while (1) {
+X	    char damaged_shops[5], *shp = NULL;
+X
+X	    mread(fd, (genericptr_t) tmp_dam, sizeof(*tmp_dam));
+X	    if (ghostly)
+X		tmp_dam->when += (monstermoves - omoves);
+X	    Strcpy(damaged_shops,
+X		   in_rooms(tmp_dam->place.x, tmp_dam->place.y, SHOPBASE));
+X	    if (u.uz.dlevel) {
+X		/* when restoring, there are two passes over the current
+X		 * level.  the first time, u.uz isn't set, so neither is
+X		 * shop_keeper().  just wait and process the damage on
+X		 * the second pass.
+X		 */
+X		for (shp = damaged_shops; *shp; shp++) {
+X		    struct monst *shkp = shop_keeper(*shp);
+X
+X		    if (shkp && inhishop(shkp) && repair_damage(shkp, tmp_dam))
+X			break;
+X		}
+X	    }
+X	    if (!shp || !*shp) {
+X		tmp_dam->next = level.damagelist;
+X		level.damagelist = tmp_dam;
+X		tmp_dam = (struct damage *)alloc(sizeof(*tmp_dam));
+X	    }
+X	    if (!(--counter)) {
+X		free((genericptr_t)tmp_dam);
+X		return;
+X	    }
+X	}
+X}
+X
+Xstatic struct obj *
+Xrestobjchn(fd, ghostly)
+Xregister int fd;
+Xboolean ghostly;
+X{
+X	register struct obj *otmp, *otmp2;
+X	register struct obj *first = (struct obj *)0;
+X#ifdef TUTTI_FRUTTI
+X	register struct fruit *oldf;
+X#endif
+X	int xl;
+X
+X#if defined(LINT) || defined(GCC_WARN)
+X	/* suppress "used before set" warning from lint */
+X	otmp2 = 0;
+X#endif
+X	while(1) {
+X		mread(fd, (genericptr_t) &xl, sizeof(xl));
+X		if(xl == -1) break;
+X		otmp = newobj(xl);
+X		if(!first) first = otmp;
+X		else otmp2->nobj = otmp;
+X		mread(fd, (genericptr_t) otmp,
+X					(unsigned) xl + sizeof(struct obj));
+X		if(!otmp->o_id) otmp->o_id = flags.ident++;
+X#ifdef TUTTI_FRUTTI
+X		if(ghostly && otmp->otyp == SLIME_MOLD) {
+X			for(oldf=oldfruit; oldf; oldf=oldf->nextf)
+X				if (oldf->fid == otmp->spe) break;
+X			if(!oldf) impossible("no old fruit?");
+X			else otmp->spe = fruitadd(oldf->fname);
+X		}
+X#endif
+X		/* Ghost levels get object age shifted from old player's clock
+X		 * to new player's clock.  Assumption: new player arrived
+X		 * immediately after old player died.
+X		 */
+X		if (ghostly && otmp->otyp != OIL_LAMP
+X				&& otmp->otyp != BRASS_LANTERN
+X				&& otmp->otyp != CANDELABRUM_OF_INVOCATION
+X				&& !Is_candle(otmp))
+X			otmp->age = monstermoves-omoves+otmp->age;
+X
+X		/* get contents of the container */
+X		if (Is_container(otmp) || otmp->otyp == STATUE)
+X		    otmp->cobj = restobjchn(fd,ghostly);
+X
+X		otmp2 = otmp;
+X	}
+X	if(first && otmp2->nobj){
+X		impossible("Restobjchn: error reading objchn.");
+X		otmp2->nobj = 0;
+X	}
+X
+X	return(first);
+X}
+X
+Xstatic struct monst *
+Xrestmonchn(fd, ghostly)
+Xregister int fd;
+Xboolean ghostly;
+X{
+X	register struct monst *mtmp, *mtmp2;
+X	register struct monst *first = (struct monst *)0;
+X	int xl;
+X	struct permonst *monbegin;
+X	boolean moved;
+X
+X	/* get the original base address */
+X	mread(fd, (genericptr_t)&monbegin, sizeof(monbegin));
+X	moved = (monbegin != mons);
+X
+X#if defined(LINT) || defined(GCC_WARN)
+X	/* suppress "used before set" warning from lint */
+X	mtmp2 = 0;
+X#endif
+X	while(1) {
+X		mread(fd, (genericptr_t) &xl, sizeof(xl));
+X		if(xl == -1) break;
+X		mtmp = newmonst(xl);
+X		if(!first) first = mtmp;
+X		else mtmp2->nmon = mtmp;
+X		mread(fd, (genericptr_t) mtmp, (unsigned) xl + sizeof(struct monst));
+X		if(!mtmp->m_id)
+X			mtmp->m_id = flags.ident++;
+X		if (moved && mtmp->data) {
+X			int offset = mtmp->data - monbegin;	/*(ptrdiff_t)*/
+X			mtmp->data = mons + offset;  /* new permonst location */
+X		}
+X		if(mtmp->minvent)
+X			mtmp->minvent = restobjchn(fd, ghostly);
+X#ifdef MUSE
+X		if (mtmp->mw) mtmp->mw = mtmp->minvent;	/* wield 1st obj in inventory */
+X#endif
+X		if (mtmp->isshk) restshk(mtmp);
+X
+X		mtmp2 = mtmp;
+X	}
+X	if(first && mtmp2->nmon){
+X		impossible("Restmonchn: error reading monchn.");
+X		mtmp2->nmon = 0;
+X	}
+X	return(first);
+X}
+X
+Xstatic void
+Xrestgenoinfo(fd)
+Xregister int fd;
+X{
+X	register int i;
+X	unsigned genolist[NUMMONS];
+X
+X	mread(fd, (genericptr_t) genolist, sizeof(genolist));
+X
+X	for (i = 0; i < NUMMONS; i++)
+X		mons[i].geno = genolist[i];
+X}
+X
+Xstatic
+Xboolean
+Xrestgamestate(fd, mid)
+Xregister int fd;
+Xunsigned int *mid;
+X{
+X	struct obj *otmp;
+X	int tmp;		/* not a register ! */
+X	struct flag oldflags;
+X#ifdef TUTTI_FRUTTI
+X	struct fruit *fruit;
+X#endif
+X
+X	invent = restobjchn(fd, FALSE);
+X	migrating_objs = restobjchn(fd, FALSE);
+X	migrating_mons = restmonchn(fd, FALSE);
+X	restgenoinfo(fd);
+X
+X	mread(fd, (genericptr_t) &tmp, sizeof tmp);
+X#ifdef WIZARD
+X	if(!wizard)
+X#endif
+X	    if(tmp != getuid()) {		/* strange ... */
+X		pline("Saved game was not yours.");
+X		return(FALSE);
+X	    }
+X
+X	oldflags = flags;
+X	mread(fd, (genericptr_t) &flags, sizeof(struct flag));
+X	/* Some config file and command line OPTIONS take precedence over
+X	 * those in save file.
+X	 */
+X#ifdef TERMLIB
+X	flags.DECgraphics = oldflags.DECgraphics;
+X#endif
+X#ifdef ASCIIGRAPH
+X	flags.IBMgraphics = oldflags.IBMgraphics;
+X#endif
+X#ifdef MICRO
+X	flags.rawio = oldflags.rawio;
+X	flags.BIOS = oldflags.BIOS;
+X#endif
+X#ifdef TEXTCOLOR
+X	flags.use_color = oldflags.use_color;
+X	flags.hilite_pet = oldflags.hilite_pet;
+X#endif
+X#ifdef MAC_GRAPHICS_ENV
+X	flags.MACgraphics = oldflags.MACgraphics;
+X	flags.large_font = oldflags.large_font;
+X#endif
+X	/* these come from the current environment; ignore saved values */
+X	flags.window_inited = oldflags.window_inited;
+X	flags.msg_history = oldflags.msg_history;
+X	flags.echo = oldflags.echo;
+X	flags.cbreak = oldflags.cbreak;
+X
+X	mread(fd, (genericptr_t) &u, sizeof(struct you));
+X	if(u.uhp <= 0) {
+X	    You("were not healthy enough to survive restoration.");
+X	    /* wiz1_level.dlevel is used by mklev.c to see if lots of stuff is
+X	     * uninitialized, so we only have to set it and not the other stuff.
+X	     */
+X	    wiz1_level.dlevel = 0;
+X	    u.uz.dnum = 0;
+X	    u.uz.dlevel = 1;
+X	    return(FALSE);
+X	}
+X
+X	/* don't do this earlier to avoid complicating abort above */
+X	for(otmp = invent; otmp; otmp = otmp->nobj)
+X		if(otmp->owornmask)
+X			setworn(otmp, otmp->owornmask);
+X
+X	restore_dungeon(fd);
+X	mread(fd, (genericptr_t) &inv_pos, sizeof inv_pos);
+X	restlevchn(fd);
+X	mread(fd, (genericptr_t) &moves, sizeof moves);
+X	mread(fd, (genericptr_t) &monstermoves, sizeof monstermoves);
+X#ifdef MULDGN
+X	mread(fd, (genericptr_t) &quest_status, sizeof(struct q_score));
+X#endif
+X	mread(fd, (genericptr_t) spl_book,
+X				sizeof(struct spell) * (MAXSPELL + 1));
+X	restore_artifacts(fd);
+X	restore_oracles(fd);
+X	if(u.ustuck)
+X		mread(fd, (genericptr_t) mid, sizeof (*mid));
+X	mread(fd, (genericptr_t) pl_character, sizeof pl_character);
+X
+X#ifdef TUTTI_FRUTTI
+X	mread(fd, (genericptr_t) pl_fruit, sizeof pl_fruit);
+X	mread(fd, (genericptr_t) &current_fruit, sizeof current_fruit);
+X	ffruit = 0;
+X	while (fruit = newfruit(),
+X	       mread(fd, (genericptr_t)fruit, sizeof(struct fruit)),
+X	       fruit->fid) {
+X		fruit->nextf = ffruit;
+X		ffruit = fruit;
+X	}
+X	dealloc_fruit(fruit);
+X#endif
+X	restnames(fd);
+X	restore_waterlevel(fd);
+X	return(TRUE);
+X}
+X
+X/*ARGSUSED*/	/* fd used in MFLOPPY only */
+Xstatic int
+Xrestlevelfile(fd, ltmp)
+Xregister int fd;
+Xxchar ltmp;
+X{
+X	register int nfd;
+X
+X	nfd = create_levelfile(ltmp);
+X
+X	if (nfd < 0)	panic("Cannot open temp level %d!", ltmp);
+X#ifdef MFLOPPY
+X	if (!savelev(nfd, ltmp, COUNT_SAVE)) {
+X
+X		/* The savelev can't proceed because the size required
+X		 * is greater than the available disk space.
+X		 */
+X		pline("Not enough space on `%s' to restore your game.",
+X			levels);
+X
+X		/* Remove levels and bones that may have been created.
+X		 */
+X		(void) close(nfd);
+X		eraseall(levels, alllevels);
+X# ifndef AMIGA
+X		eraseall(levels, allbones);
+X
+X		/* Perhaps the person would like to play without a
+X		 * RAMdisk.
+X		 */
+X		if (ramdisk) {
+X			/* PlaywoRAMdisk may not return, but if it does
+X			 * it is certain that ramdisk will be 0.
+X			 */
+X			playwoRAMdisk();
+X			/* Rewind save file and try again */
+X			(void) lseek(fd, (off_t)0, 0);
+X			return dorecover(fd);	/* 0 or 1 */
+X		} else {
+X# endif
+X			pline("Be seeing you...");
+X			terminate(0);
+X# ifndef AMIGA
+X		}
+X# endif
+X	}
+X#endif
+X	bufon(nfd);
+X	savelev(nfd, ltmp, WRITE_SAVE | FREE_SAVE);
+X	bclose(nfd);
+X	return(2);
+X}
+X
+Xint
+Xdorecover(fd)
+Xregister int fd;
+X{
+X	unsigned int mid;		/* not a register */
+X	xchar ltmp;
+X	int rtmp;
+X	struct obj *otmp;
+X
+X	minit();	/* ZEROCOMP */
+X	restoring = TRUE;
+X	getlev(fd, 0, (xchar)0, FALSE);
+X	if (!restgamestate(fd, &mid)) {
+X		(void) close(fd);
+X		(void) delete_savefile();
+X		restoring = FALSE;
+X		return(0);
+X	}
+X#ifdef INSURANCE
+X	savestateinlock();
+X#endif
+X	rtmp = restlevelfile(fd, ledger_no(&u.uz));
+X	if (rtmp < 2) return(rtmp);  /* dorecover called recursively */
+X
+X#ifdef MICRO
+X# ifdef AMIGA
+X	{
+X	extern winid WIN_BASE;
+X	clear_nhwindow(WIN_BASE);	/* hack until there's a hook for this */
+X	}
+X# else
+X	clear_nhwindow(WIN_MAP);
+X# endif
+X	clear_nhwindow(WIN_MESSAGE);
+X	You("got as far as level %d in %s%s.",
+X		depth(&u.uz), dungeons[u.uz.dnum].dname,
+X		flags.debug ? " while in WIZARD mode" :
+X		flags.explore ? " while in discovery mode" : "");
+X	curs(WIN_MAP, 1, 1);
+X	dotcnt = 0;
+X	putstr(WIN_MAP, 0, "Restoring:");
+X#endif
+X	while(1) {
+X#ifdef ZEROCOMP
+X		if(mread(fd, (genericptr_t) &ltmp, sizeof ltmp) < 0)
+X#else
+X		if(read(fd, (genericptr_t) &ltmp, sizeof ltmp) != sizeof ltmp)
+X#endif
+X			break;
+X		getlev(fd, 0, ltmp, FALSE);
+X#ifdef MICRO
+X		curs(WIN_MAP, 11 + dotcnt++, 1);
+X		putstr(WIN_MAP, 0, ".");
+X#endif
+X		rtmp = restlevelfile(fd, ltmp);
+X		if (rtmp < 2) return(rtmp);  /* dorecover called recursively */
+X	}
+X
+X#ifdef BSD
+X	(void) lseek(fd, 0L, 0);
+X#else
+X	(void) lseek(fd, (off_t)0, 0);
+X#endif
+X	minit();	/* ZEROCOMP */
+X	getlev(fd, 0, (xchar)0, FALSE);
+X	(void) close(fd);
+X
+X#if defined(WIZARD) || defined(EXPLORE_MODE)
+X	if(
+X# ifdef WIZARD
+X	   !wizard
+X#  ifdef EXPLORE_MODE
+X		   &&
+X#  endif
+X# endif
+X# ifdef EXPLORE_MODE
+X		      !discover
+X# endif
+X				)
+X#endif
+X		(void) delete_savefile();
+X#ifdef REINCARNATION
+X	if (Is_rogue_level(&u.uz)) assign_rogue_graphics(TRUE);
+X#endif
+X	if(u.ustuck) {
+X		register struct monst *mtmp;
+X
+X		for(mtmp = fmon; mtmp; mtmp = mtmp->nmon)
+X			if(mtmp->m_id == mid) goto monfnd;
+X		panic("Cannot find the monster ustuck.");
+X	monfnd:
+X		u.ustuck = mtmp;
+X	}
+X#ifdef MFLOPPY
+X	gameDiskPrompt();
+X#endif
+X	max_rank_sz(); /* to recompute mrank_sz (botl.c) */
+X#ifdef POLYSELF
+X	set_uasmon();
+X#endif
+X	/* take care of iron ball & chain */
+X	for(otmp = fobj; otmp; otmp = otmp->nobj)
+X		if(otmp->owornmask)
+X			setworn(otmp, otmp->owornmask);
+X#ifndef NO_SIGNAL
+X	/* in_use processing must be after:
+X	 *    + The inventory has been read so that freeinv() works.
+X	 *    + The current level has been restored so billing information
+X	 *	is available.
+X	 */
+X	inven_inuse();
+X#endif
+X#ifdef MULDGN
+X	load_qtlist();	/* re-load the quest text info */
+X#endif
+X	/* Set up the vision internals, after levl[] data is loaded */
+X	/* but before docrt().					    */
+X	vision_reset();
+X	vision_full_recalc = 1;	/* recompute vision (not saved) */
+X	docrt();
+X	restoring = FALSE;
+X	clear_nhwindow(WIN_MESSAGE);
+X	return(1);
+X}
+X
+Xvoid
+Xtrickery()
+X{
+X	pline("Strange, this map is not as I remember it.");
+X	pline("Somebody is trying some trickery here...");
+X	pline("This game is void.");
+X	done(TRICKED);
+X}
+X
+Xvoid
+Xgetlev(fd, pid, lev, ghostly)
+Xint fd, pid;
+Xxchar lev;
+Xboolean ghostly;
+X{
+X	register struct trap *trap;
+X	register struct monst *mtmp;
+X	branch *br;
+X	int hpid;
+X	xchar dlvl;
+X	int x, y;
+X#ifdef TOS
+X	short tlev;
+X#endif
+X
+X#if defined(MSDOS) || defined(OS2)
+X	setmode(fd, O_BINARY);
+X#endif
+X#ifdef TUTTI_FRUTTI
+X	/* Load the old fruit info.  We have to do it first, so the
+X	 * information is available when restoring the objects.
+X	 */
+X	if (ghostly) {
+X		struct fruit *fruit;
+X
+X		oldfruit = 0;
+X		while (fruit = newfruit(),
+X		       mread(fd, (genericptr_t)fruit, sizeof(struct fruit)),
+X		       fruit->fid) {
+X			fruit->nextf = oldfruit;
+X			oldfruit = fruit;
+X		}
+X		dealloc_fruit(fruit);
+X	}
+X#endif
+X
+X	/* First some sanity checks */
+X	mread(fd, (genericptr_t) &hpid, sizeof(hpid));
+X/* CHECK:  This may prevent restoration */
+X#ifdef TOS
+X	mread(fd, (genericptr_t) &tlev, sizeof(tlev));
+X	dlvl=tlev&0x00ff;
+X#else
+X	mread(fd, (genericptr_t) &dlvl, sizeof(dlvl));
+X#endif
+X	if((pid && pid != hpid) || (lev && dlvl != lev)) {
+X#ifdef WIZARD
+X		if (wizard) {
+X			if (pid && pid != hpid)
+X				pline("PID (%d) doesn't match saved PID (%d)!", hpid, pid);
+X			else if (lev && dlvl != lev)
+X				pline("This is level %d, not %d!", dlvl, lev);
+X		}
+X#endif
+X		trickery();
+X	}
+X
+X#ifdef RLECOMP
+X	{
+X		short	i, j;
+X		uchar	len;
+X		struct rm r;
+X		
+X		i = 0; j = 0; len = 0;
+X		while(i < ROWNO) {
+X		    while(j < COLNO) {
+X			if(len > 0) {
+X			    levl[j][i] = r;
+X			    len -= 1;
+X			    j += 1;
+X			} else {
+X			    mread(fd, (genericptr_t)&len, sizeof(uchar));
+X			    mread(fd, (genericptr_t)&r, sizeof(struct rm));
+X			}
+X		    }
+X		    j = 0;
+X		    i += 1;
+X		}
+X	}
+X#else
+X	mread(fd, (genericptr_t) levl, sizeof(levl));
+X#endif	/* RLECOMP */
+X
+X	mread(fd, (genericptr_t)&omoves, sizeof(omoves));
+X	mread(fd, (genericptr_t)&upstair, sizeof(stairway));
+X	mread(fd, (genericptr_t)&dnstair, sizeof(stairway));
+X	mread(fd, (genericptr_t)&upladder, sizeof(stairway));
+X	mread(fd, (genericptr_t)&dnladder, sizeof(stairway));
+X	mread(fd, (genericptr_t)&sstairs, sizeof(stairway));
+X	mread(fd, (genericptr_t)&updest, sizeof(dest_area));
+X	mread(fd, (genericptr_t)&dndest, sizeof(dest_area));
+X	mread(fd, (genericptr_t)&level.flags, sizeof(level.flags));
+X
+X	fmon = restmonchn(fd, ghostly);
+X
+X	/* regenerate animals while on another level */
+X	{ long tmoves = (monstermoves > omoves) ? monstermoves-omoves : 0;
+X	  register struct monst *mtmp2;
+X
+X	  for(mtmp = fmon; mtmp; mtmp = mtmp2) {
+X		mtmp2 = mtmp->nmon;
+X		if(mtmp->data->geno & G_GENOD) {
+X			/* mondead() would try to link the monster's objects
+X			 * into fobj and the appropriate nexthere chain.
+X			 * unfortunately, such things will not have sane
+X			 * values until after find_lev_obj() well below
+X			 * here, so we'd go chasing random pointers if we
+X			 * tried that.  we could save the monster's objects
+X			 * in another chain and insert them in the level
+X			 * later, but that's a lot of work for very little
+X			 * gain.  hence, just throw the objects away via
+X			 * mongone() and pretend the monster wandered off
+X			 * somewhere private before the genocide.
+X			 */
+X			mongone(mtmp);
+X			continue;
+X		}
+X
+X		if (ghostly) {
+X			/* reset peaceful/malign relative to new character */
+X			if(!mtmp->isshk)
+X				/* shopkeepers will reset based on name */
+X				mtmp->mpeaceful = peace_minded(mtmp->data);
+X			set_malign(mtmp);
+X		} else if (mtmp->mtame && tmoves > 250)
+X			mtmp->mtame = mtmp->mpeaceful = 0;
+X
+X		/* restore shape changers - Maarten Jan Huisjes */
+X		if (mtmp->data == &mons[PM_CHAMELEON]
+X		    && !Protection_from_shape_changers
+X		    && !mtmp->cham)
+X			mtmp->cham = 1;
+X		else if(Protection_from_shape_changers) {
+X			if (mtmp->cham) {
+X				mtmp->cham = 0;
+X				(void) newcham(mtmp, &mons[PM_CHAMELEON]);
+X			} else if(is_were(mtmp->data) && !is_human(mtmp->data))
+X				new_were(mtmp);
+X		}
+X
+X		if (!ghostly) {
+X			long nhp = mtmp->mhp +
+X				(regenerates(mtmp->data) ? tmoves : tmoves/20);
+X
+X			if(!mtmp->mcansee && mtmp->mblinded) {
+X				if ((long) mtmp->mblinded <= tmoves) {
+X					mtmp->mblinded = 0;
+X					mtmp->mcansee = 1;
+X				} else mtmp->mblinded -= tmoves;
+X			}
+X			if(!mtmp->mcanmove && mtmp->mfrozen) {
+X				if ((long) mtmp->mfrozen <= tmoves) {
+X					mtmp->mfrozen = 0;
+X					mtmp->mcanmove = 1;
+X				} else mtmp->mfrozen -= tmoves;
+X			}
+X			if(mtmp->mflee && mtmp->mfleetim) {
+X				if ((long) mtmp->mfleetim <= tmoves) {
+X					mtmp->mfleetim = 0;
+X					mtmp->mflee = 0;
+X				} else mtmp->mfleetim -= tmoves;
+X			}
+X			if(nhp >= mtmp->mhpmax)
+X				mtmp->mhp = mtmp->mhpmax;
+X			else
+X				mtmp->mhp = nhp;
+X		}
+X	  }
+X	}
+X
+X	rest_worm(fd);	/* restore worm information */
+X	ftrap = 0;
+X	while (trap = newtrap(),
+X	       mread(fd, (genericptr_t)trap, sizeof(struct trap)),
+X	       trap->tx) {
+X		trap->ntrap = ftrap;
+X		ftrap = trap;
+X	}
+X	dealloc_trap(trap);
+X	fobj = restobjchn(fd, ghostly);
+X	find_lev_obj();
+X	billobjs = restobjchn(fd, ghostly);
+X	rest_engravings(fd);
+X	rest_rooms(fd);		/* No joke :-) */
+X	mread(fd, (genericptr_t)doors, sizeof(doors));
+X
+X	/* reset level.monsters for new level */
+X	for (x = 0; x < COLNO; x++)
+X	    for (y = 0; y < ROWNO; y++)
+X		level.monsters[x][y] = (struct monst *) 0;
+X	for (mtmp = level.monlist; mtmp; mtmp = mtmp->nmon) {
+X	    if (mtmp->isshk)
+X		set_residency(mtmp, FALSE);
+X	    place_monster(mtmp, mtmp->mx, mtmp->my);
+X	    if (mtmp->wormno) place_wsegs(mtmp);
+X	}
+X	restdamage(fd, ghostly);
+X
+X
+X#ifdef TUTTI_FRUTTI
+X	/* Now get rid of all the temp fruits... */
+X	if (ghostly) {
+X		struct fruit *fruit;
+X
+X		while(oldfruit) {
+X			fruit = oldfruit->nextf;
+X			dealloc_fruit(oldfruit);
+X			oldfruit = fruit;
+X		}
+X	}
+X#endif
+X	if (ghostly && lev > ledger_no(&medusa_level) &&
+X			lev < ledger_no(&stronghold_level) && xdnstair == 0) {
+X		coord cc;
+X
+X		mazexy(&cc);
+X		xdnstair = cc.x;
+X		ydnstair = cc.y;
+X		levl[cc.x][cc.y].typ = STAIRS;
+X	}
+X	if (ghostly && (br = Is_branchlev(&u.uz)) && u.uz.dlevel == 1) {
+X	    d_level ltmp;
+X
+X	    if (on_level(&u.uz, &br->end1))
+X		assign_level(&ltmp, &br->end2);
+X	    else
+X		assign_level(&ltmp, &br->end1);
+X
+X	    switch(br->type) {
+X	    case BR_STAIR:
+X	    case BR_NO_END1:
+X	    case BR_NO_END2: /* OK to assign to sstairs if it's not used */
+X		assign_level(&sstairs.tolev, &ltmp);
+X		break;		
+X	    case BR_PORTAL: /* max of 1 portal per level */
+X		{
+X		    register struct trap *ttmp;
+X		    for(ttmp = ftrap; ttmp; ttmp = ttmp->ntrap)
+X			if (ttmp->ttyp == MAGIC_PORTAL)
+X			    break;
+X		    if (!ttmp) panic("getlev: need portal but none found");
+X		    assign_level(&ttmp->dst, &ltmp);
+X		}
+X		break;
+X	    }
+X	}
+X}
+X
+X#ifdef ZEROCOMP
+X#define RLESC '\0'	/* Leading character for run of RLESC's */
+X
+X#ifndef ZEROCOMP_BUFSIZ
+X#define ZEROCOMP_BUFSIZ BUFSZ
+X#endif
+Xstatic unsigned char NEARDATA inbuf[ZEROCOMP_BUFSIZ];
+Xstatic unsigned short NEARDATA inbufp = 0;
+Xstatic unsigned short NEARDATA inbufsz = 0;
+Xstatic short NEARDATA inrunlength = -1;
+Xstatic int NEARDATA mreadfd;
+X
+Xstatic int
+Xmgetc()
+X{
+X    if (inbufp >= inbufsz) {
+X	inbufsz = read(mreadfd, (genericptr_t)inbuf, sizeof inbuf);
+X	if (!inbufsz) {
+X	    if (inbufp > sizeof inbuf)
+X		error("EOF on file #%d.\n", mreadfd);
+X	    inbufp = 1 + sizeof inbuf;  /* exactly one warning :-) */
+X	    return -1;
+X	}
+X	inbufp = 0;
+X    }
+X    return inbuf[inbufp++];
+X}
+X
+Xvoid
+Xminit()
+X{
+X    inbufsz = 0;
+X    inbufp = 0;
+X    inrunlength = -1;
+X}
+X
+Xint
+Xmread(fd, buf, len)
+Xint fd;
+Xgenericptr_t buf;
+Xregister unsigned len;
+X{
+X    /*register int readlen = 0;*/
+X    mreadfd = fd;
+X    while (len--) {
+X	if (inrunlength > 0) {
+X	    inrunlength--;
+X	    *(*((char **)&buf))++ = '\0';
+X	} else {
+X	    register short ch = mgetc();
+X	    if (ch < 0) return -1; /*readlen;*/
+X	    if ((*(*(char **)&buf)++ = ch) == RLESC) {
+X		inrunlength = mgetc();
+X	    }
+X	}
+X	/*readlen++;*/
+X    }
+X    return 0; /*readlen;*/
+X}
+X
+X#else /* ZEROCOMP */
+X
+Xvoid
+Xminit()
+X{
+X    return;
+X}
+X
+Xvoid
+Xmread(fd, buf, len)
+Xregister int fd;
+Xregister genericptr_t buf;
+Xregister unsigned int len;
+X{
+X	register int rlen;
+X
+X#if defined(BSD) || defined(ULTRIX)
+X	rlen = read(fd, buf, (int) len);
+X	if(rlen != len){
+X#else /* e.g. SYSV, __TURBOC__ */
+X	rlen = read(fd, buf, (unsigned) len);
+X	if((unsigned)rlen != len){
+X#endif
+X		pline("Read %d instead of %u bytes.", rlen, len);
+X		if(restoring) {
+X			(void) close(fd);
+X			(void) delete_savefile();
+X			error("Error restoring old game.");
+X		}
+X		panic("Error reading level file.");
+X	}
+X}
+X#endif /* ZEROCOMP */
+X
+X/*restore.c*/
+END_OF_FILE
+if test 21955 -ne `wc -c <'src/restore.c'`; then
+    echo shar: \"'src/restore.c'\" unpacked with wrong size!
+fi
+# end of 'src/restore.c'
+fi
+if test -f 'sys/amiga/Makefile.ami' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'sys/amiga/Makefile.ami'\"
+else
+echo shar: Extracting \"'sys/amiga/Makefile.ami'\" \(32666 characters\)
+sed "s/^X//" >'sys/amiga/Makefile.ami' <<'END_OF_FILE'
+X#	NetHack Makefile.
+X#	SCCS Id: @(#)Makefile.ami	3.3	93/01/08
+X# Copyright (c) Kenneth Lorber, Bethesda, Maryland, 1991, 1992, 1993.
+X# NetHack may be freely redistributed.  See license for details.
+X
+X# This makefile is arranged for compiling for the Amiga with SAS/C 5.10b but
+X# can be configured for compiling with Manx C 5, SAS/C 6.1, or registered DICE
+X# with simple changes.  The appropriate changes are identified by #[compiler]
+X# where compiler is one of: SAS5, SAS6, MANX, or DICE; the options in
+X# this makefile as should be set according to the compiler being used.
+X
+X# Note: When using the Manx compiler, an alternate make utility is
+X# required. The bundled Aztec make is just too damaged.
+X
+X# The following assignments should be made before using this makefile:
+X#
+X#   HackExe:	directory where final executable should go
+X#   NetHack:	directory where other runtime support files should go
+X#   Amiga:	"amiga" directory
+X#   Dat:	"dat" directory
+X#   Doc:	"doc" directory
+X#   Incl:	"include" directory
+X#   Share:	"share" directory
+X#   NHS:	"src" directory
+X#   Util:	"util" directory
+X#   OBJ:	destination for object files for main binary
+X#   OBJO:	destination for object files for everything else
+X#		NB: OBJ and OBJO MUST be different directories
+X#
+X# Startup makefile with:
+X#
+X#[SAS6]
+X#	cd OBJ:
+X#	smake -f Amiga:Makefile.ami
+X#	cd NetHack:
+X#	smake -f Amiga:Makefile.ami install
+X#
+X#[SAS5]
+X#	cd OBJ:
+X#	lmk -f Amiga:Makefile.ami
+X#	cd NetHack:
+X#	lmk -f Amiga:Makefile.ami install
+X#
+X#[MANX]
+X#	cd OBJ:
+X#	make -f Amiga:Makefile.ami
+X#	cd NetHack:
+X#	make -f Amiga:Makefile.ami install
+X#
+X#[DICE]
+X#	cd OBJ:
+X#	make -f Amiga:Makefile.ami
+X#	cd NetHack:
+X#	make -f Amiga:Makefile.ami install
+X#
+X# You may use following targets on lmk/make command lines:
+X#   all		do it all (default)
+X#   link	just create $(GAME) from object files
+X#   obj		just create common object files
+X#   obja	just create amiga object files
+X#   objs	just create shared object files
+X#   clean	deletes the object files
+X#   spotless	deletes the object files, $(GAME), and more
+X#
+X# Note:  We do not build the Guidebook here since it needs tbl
+X# (See the file sys/unix/Makefile.doc for more information)
+X
+X# Precompiled header files:
+X#   $(HDEP) should appear in any dependency list for an object file where
+X#   we would want to make use of the precompiled version of Incl:hack.h,
+X#   while $(CSYM) should appear in the C compiler command line that creates
+X#   any such object file.  (Changes made here should agree with the $(HDEP):
+X#   target that appears later in this makefile.)
+X#
+X#   Notice that since this file would be created on Ram: that we would
+X#   end up recompiling everything if we followed the normal make sequence.
+X#   Thus, we could use:
+X#
+X#[SAS6]
+X#	cd NetHack:
+X#	smake -f Amiga:Makefile.ami Ram:hack.sym
+X#	setdate Ram:hack.sym {date & time of Incl:hack.h}
+X#	smake -f Amiga:Makefile.ami
+X#
+X#[SAS5]
+X#	cd NetHack:
+X#	lmk -f Amiga:Makefile.ami Ram:hack.sym
+X#	setdate Ram:hack.sym {date & time of Incl:hack.h}
+X#	lmk -f Amiga:Makefile.ami
+X#
+X#[MANX]
+X#	cd NetHack:
+X#	make -f Amiga:Makefile.ami Ram:hack.sym
+X#	setdate Ram:hack.sym {date & time of Incl:hack.h}
+X#	make -f Amiga:Makefile.ami
+X
+X#[SAS5]
+X#   If we were to use the precompiled header file feature, we would uncomment
+X#   these following two lines.  However, there are still problems in the
+X#   behavior of this feature in version 5.04, so these lines are commented
+X#   out for now.
+X
+X#HDEP	= Ram:hack.sym
+X#CSYM	= -HRam:hack.sym
+X
+X#[SAS5]
+X#   If we were to use the precompiled header file feature in a newer version
+X#   of SAS/C, we would comment out these following two lines.
+X#   If we don't use precompiled header files, we uncomment it as well.
+X
+XHDEP	= Incl:hack.h
+XCSYM	=
+X
+X#[MANX]
+X#   If we were compiling with Aztec, and wanted to use the symbol table
+X#   pre-loading feature, we would uncomment these following two lines.
+X
+X#HDEP	= Ram:hack.sym
+X#CSYM	= +IRam:hack.sym
+X
+X#[DICE]
+X#   If we were compiling with DICE and wanted to use the symbol table
+X#   pre-loading feature, we would uncomment these following two lines.
+X
+X#HDEP	= Incl:hack.sym
+X#CSYM	= -HIncl:hack.sym=Incl:hack.h
+X
+X# [OPTION] Pathname for (optional) uudecode program:
+X#   If uudecode is available for use by this makefile, give its name below.
+X#   Use a harmless command (like echo) otherwise.
+X
+X#UUDEC	= echo
+XUUDEC	= uudecode
+X
+X# Flex/Bison command assignments -- Useful only if you have flex/bison
+XFLEX	= flex
+XBISON	= bison
+X# FBFIL and FBLIB may be used, if required by your version of flex or bison,
+X# to specify additional files or libraries to be linked with
+XFBFIL	=
+XFBLIB	= lib:compat.lib
+X
+X# If you're compiling this on a 1.3 system, you'll have to uncomment the
+X# following (for use with the ifchange script below).  Also useful instead of
+X# "protect +s ifchange"
+XEXECUTE = execute
+X
+X# Pathname for the C compiler being used.
+X
+X#[SAS6]
+X#CC	= sc
+X
+X#[SAS5]
+XCC	= lc
+X
+X#[MANX]
+X#CC	= cc
+X
+X#[DICE]
+X#CC	= dcc
+X
+X# Compilation flags for selected C Compiler:
+X#   $(CFLAGS) should appear before filename arguments of $(CC) command line.
+X
+X#[SAS6]
+X#   Note: make sure your CLI stack size is large (at least 50K) or lev_comp
+X#   and makedefs may fail terribly - stack checking is disabled.
+X#
+X#  **** WARNING ****	GST support is not fool proof.  You must make makedefs
+X#			without a GST first so that the generated headers
+X#			that are part of the GST can be made.
+X#
+X#GSTSRC=Amiga:amigst.c
+X#
+X#GSTHEAD=Incl:hack.h Incl:pm.h Incl:trap.h Incl:onames.h \
+X#	Amiga:winami.p Amiga:amidos.p Amiga:amiwind.p
+X#
+X#GSTFILE=OBJ:NetHack.gst
+X#MKGSTFILE=OBJ:MakeDefs.gst
+X#NHGSTFILE=OBJ:Game.gst
+X#COPYMGST=copymgst
+X#COPYNGST=copyngst
+X# undefine this to not compile with GSTs
+X#GST=gst=$(GSTFILE)
+X#
+X#DEBUG=l
+X#CFLAGS	= data=far nminc debug=$(DEBUG) idir=incl: cpu=any nostkchk ign=104 \
+X#		ignore=85,62 strmerge optsize ppbuf=8000 afp $(ERRREXX) $(GST)
+X# for files that are too large for the standard flags:
+X#CFLAGS2 = code=far nostrmerge
+X#WBCFLAGS = ignore=217,62 data=far ansi nminc code=far debug=sf $(ERRREXX) $(GST)
+X#WBC2FLAGS = define=CLI
+X#WBLFLAGS =
+X#CCFLAGS = define=
+X#SPLFLAGS = ignore=77 define=SPLIT
+X
+X#[SAS5]
+X#   Note: make sure your CLI stack size is large (at least 50K) or lev_comp
+X#   and makedefs may fail terribly - stack checking is disabled.
+XCFLAGS	= -b0 -cfi -d1 -iIncl: -ma -v -cs -ms -z8000 -r0 #-O
+X# for files that are too large for the standard flags: 
+XCFLAGS2 = -r0
+XCCDEF = -d
+XWBCFLAGS = -r0 -b0 -cafis -d1 #-O
+XWBC2FLAGS = -dCLI
+XWBLFLAGS =
+XSPLFLAGS = -cd -dSPLIT
+X
+X#[MANX]
+X#CFLAGS = -iincl: -mc -md -ms -pa -ps -bs -wo -qq
+X#WBCFLAGS = -mc -md -ms -pa -ps -bs -wo -qq -pp
+X#WBLFLAGS = +cd
+X
+X#[DICE]
+X#CFLAGS = -c -Iincl: -mD -mC -ms
+X#WBCFLAGS = -c -ms
+X#WBLFLAGS =
+X
+X# Components of varous link command lines:
+X#   $(LINK) should be the pathname of the linker being used (with any options
+X#   that should appear at the beginning of the command line).  The name of the
+X#   output file should appear immediately after $(LINK).  $(LIN) should appear
+X#   before the list of object files in each link command.  $(LLINK) should
+X#   appear as the list of object files in the link command line that creates
+X#   the NetHack executable.  $(LLIB) should appear at the end of each link
+X#   command line.
+X
+X# Note: amiga.lib added due to missing prototypes/pragmas.
+X# Should be deleted when this is resolved.
+X
+X#[SAS6]
+X
+X#LINK	= sc link
+X#LIN	= startup=catch
+X#LLINK	= with Amiga:ami.lnk
+X#LLIB	= lib=Lib:sc.lib lib=lib:amiga.lib BATCH #scnb.lib or sc.lib
+X#FLLIB	= lib=$(FBLIB) Lib:sc.lib BATCH
+X#OBJSPEC = objname=
+X#PNSPEC = pname=
+X#INCLSPEC = idir=
+X#DEFSPEC = define=
+X#IGNSPEC = ignore=
+X#COMPACT_HEADERS=$(GSTFILE) $(COPYNGST)
+X
+X#[SAS5]
+X
+XLINK	= Blink to
+XLIN	= from Lib:catch.o
+XLLINK	= with Amiga:ami.lnk
+XLLIB	= lib Lib:lc.lib lib:amiga.lib BATCH #lcnb.lib or lc.lib
+XFLLIB	= lib $(FBLIB) Lib:lc.lib BATCH
+XOBJSPEC = -o
+XPNSPEC =
+XINCLSPEC = -i
+XDEFSPEC = -d
+XIGNSPEC = -j
+X
+X#[MANX]
+X
+X#LINK	= ln -g +q +ss -o
+X#LIN	=
+X#LLINK	= -f Amiga:ami.lnk
+X#LLIB	= -lcl16
+X#FLLIB  = -lcl16
+X#OBJSPEC = -o
+X#PNSPEC = -o
+X#INCLSPEC = -i
+X#DEFSPEC = -d
+X#IGNSPEC = -j
+X
+X#[DICE]
+X
+X#LINK	 = dcc -s -o -frag
+X#LIN	 =
+X#LLINK	 = @Amiga:ami.lnk
+X#LLIB	 =
+X#FLLIB	 = -l$(FBLIB)
+X#OBJSPEC = -o
+X#PNSPEC = -o
+X#INCLSPEC = -i
+X#DEFSPEC = -d
+X#IGNSPEC = -j
+X
+X# Name of the game:
+X
+XGAME	= HackExe:NetHack
+X
+X# A more reasonable random number generator (recommended for the Amiga):
+X
+XRANDOBJ	= OBJ:random.o
+X
+X.PRECIOUS:  Incl:config.h Incl:decl.h Incl:hack.h Incl:permonst.h Incl:you.h
+X
+X# Almost nothing below this line should have to be changed.
+X# (Exceptions are marked by [SAS6], [MANX], etc.)
+X#
+X# Other things that have to be reconfigured are in config.h,
+X# (amiconf.h, pcconf.h), and possibly system.h, tradstdc.h.
+X
+X# Object files for makedefs:
+X
+XMAKEOBJS = \
+X	OBJO:makedefs.o OBJ:monst.o OBJ:objects.o
+X
+X# Object files for special levels compiler:
+X
+XSPLEVOBJS = \
+X	OBJO:lev_yacc.o OBJO:lev_lex.o	OBJO:lev_main.o \
+X	OBJ:decl.o 	OBJ:drawing.o	OBJ:monst.o \
+X	OBJ:objects.o
+X
+X# Object files for dungeon compiler
+X
+XDGNCOMPOBJS = \
+X	OBJO:dgn_yacc.o	OBJO:dgn_lex.o	OBJO:dgn_main.o OBJ:alloc.o OBJO:panic.o
+X
+X# Object files for NetHack:
+X
+XCOMMOBJ = \
+X	OBJ:allmain.o	OBJ:alloc.o	OBJ:apply.o 	OBJ:artifact.o	\
+X	OBJ:attrib.o	OBJ:ball.o	OBJ:bones.o	OBJ:botl.o	\
+X	OBJ:cmd.o	OBJ:dbridge.o	OBJ:decl.o	OBJ:detect.o	\
+X	OBJ:display.o	OBJ:do.o	OBJ:do_name.o	OBJ:do_wear.o	\
+X	OBJ:dog.o	OBJ:dogmove.o	OBJ:dokick.o	OBJ:dothrow.o	\
+X	OBJ:drawing.o	OBJ:dungeon.o	OBJ:eat.o	OBJ:end.o	\
+X	OBJ:engrave.o	OBJ:exper.o	OBJ:explode.o	OBJ:extralev.o	\
+X	OBJ:files.o	OBJ:fountain.o 	OBJ:hack.o	OBJ:invent.o	\
+X 	OBJ:lock.o	OBJ:mail.o	OBJ:makemon.o	OBJ:mcastu.o	\
+X	OBJ:mhitm.o	OBJ:mhitu.o	OBJ:minion.o	OBJ:mklev.o	\
+X	OBJ:mkmap.o	OBJ:mkmaze.o	OBJ:mkobj.o	OBJ:mkroom.o	\
+X	OBJ:mon.o	OBJ:mondata.o	OBJ:monmove.o	OBJ:monst.o	\
+X	OBJ:mplayer.o	OBJ:mthrowu.o	OBJ:muse.o	OBJ:music.o	\
+X	OBJ:o_init.o	OBJ:objects.o	OBJ:objnam.o	OBJ:options.o	\
+X	OBJ:pager.o	OBJ:pickup.o	OBJ:polyself.o	OBJ:potion.o	\
+X	OBJ:pline.o     OBJ:hacklib.o	OBJ:pray.o	OBJ:priest.o	\
+X	OBJ:quest.o	OBJ:questpgr.o	OBJ:read.o	OBJ:rect.o	\
+X	OBJ:restore.o	OBJ:rnd.o	OBJ:rumors.o	OBJ:save.o	\
+X	OBJ:shk.o	OBJ:shknam.o	OBJ:sit.o	OBJ:sounds.o	\
+X	OBJ:sp_lev.o	OBJ:spell.o	OBJ:steal.o	OBJ:timeout.o	\
+X	OBJ:topten.o	OBJ:track.o	OBJ:trap.o	OBJ:u_init.o	\
+X	OBJ:uhitm.o	OBJ:vault.o	OBJ:version.o	OBJ:vision.o	\
+X	OBJ:weapon.o	OBJ:were.o	OBJ:wield.o	OBJ:windows.o	\
+X	OBJ:wizard.o	OBJ:worm.o	OBJ:worn.o	OBJ:write.o	\
+X	OBJ:zap.o
+X
+XMAKEDEFOBJ = \
+X	OBJ:monstr.o
+X
+XAMIGAOBJ = \
+X	OBJ:amidos.o	OBJ:amirip.o 	OBJ:amiwbench.o OBJ:amiwind.o	\
+X	OBJ:winami.o
+X
+XSHAREOBJ = \
+X	OBJ:pcmain.o	$(RANDOBJ)
+X
+X
+X# All the object files for NetHack:
+X
+XHOBJ = $(COMMOBJ) $(AMIGAOBJ) $(SHAREOBJ) $(MAKEDEFOBJ)
+X
+X# Getting down to business:
+X
+Xall:  $(COMPACT_HEADERS) NetHack:lev_comp NetHack:dgn_comp $(GAME) \
+X	NetHack:HackWB NetHack:recover NetHack:HackCli NetHack:splitter
+X
+Xinstall: inst-data inst-dungeon inst-icons inst-fonts HackExe:NetHack.dir
+X
+XAmiga:compacted:
+X	lmk -f compact.lmk DST=$(COMPACT_DEST) SRC=$(COMPACT_SRC)
+X
+X$(GAME):  $(HOBJ) Amiga:ami.lnk
+X	$(LINK) $(PNSPEC)$(GAME) $(LIN) $(LLINK) $(LLIB)
+X
+Xlink:
+X	$(LINK) $(PNSPEC)$(GAME) $(LIN) $(LLINK) $(LLIB)
+X
+XOBJ:Game.gst: $(GSTHEAD)
+X	$(CC) $(CFLAGS) makegst $(NHGSTFILE) $(GSTSRC)
+X
+XOBJ:MakeDefs.gst: $(GSTSRC)
+X	$(CC) $(CFLAGS) define=TEMP_BUILD makegst $(MKGSTFILE) $(GSTSRC)
+X
+Xcopymgst:
+X	copy $(MKGSTFILE) to $(GSTFILE)
+X
+Xcopyngst:
+X	copy $(NHGSTFILE) to $(GSTFILE)
+X
+XAmiga:ami.lnk: Amiga:Makefile.ami
+X	list to Amiga:ami.lnk OBJ:\#?.o QUICK NOHEAD
+X
+Xobj:  $(HOBJ)
+Xobja:  $(AMIGAOBJ)
+Xobjs:  $(SHAREOBJ)
+X
+X# The default method for creating object files:
+X
+X#[SAS6]
+X#[SAS5]
+X
+X.c.o:
+X	$(CC) $(CFLAGS) $(CSYM) $(OBJSPEC)$@ $<
+X
+X#[DICE]
+X
+X#$(COMMOBJ):
+X#	$(CC) $(CFLAGS) $(CSYM) $(OBJSPEC)$@ NHS:$*.c
+X
+X#$(AMIGAOBJ):
+X#	$(CC) $(CFLAGS) $(CSYM) $(OBJSPEC)$@ Amiga:$*.c
+X
+X#$(SHAREOBJ):
+X#	$(CC) $(CFLAGS) $(CSYM) $(OBJSPEC)$@ Share:$*.c
+X
+Xclean:
+X	-delete OBJ:\#?.o OBJO:\#?.o
+X
+Xspotless:  clean
+X	-delete $(GAME) NetHack:lev_comp NetHack:makedefs NetHack:dgn_comp
+X	-delete Amiga:8
+X	-delete Amiga:hack.font
+X	-delete Dat:data Dat:rumors
+X	-delete NetHack:data NetHack:rumors
+X	-delete NetHack:castle.lev NetHack:dungeon
+X	-delete NetHack:earth.lev NetHack:air.lev NetHack:fire.lev
+X	-delete NetHack:water.lev NetHack:astral.lev
+X	-delete NetHack:tower1.lev NetHack:tower2.lev NetHack:tower3.lev
+X	-delete NetHack:fakewiz1.lev NetHack:fakewiz2.lev
+X	-delete NetHack:medusa-1.lev NetHack:medusa-2.lev
+X	-delete NetHack:oracle.lev NetHack:wizard1.lev NetHack:wizard2.lev
+X	-delete NetHack:wizard3.lev NetHack:dungeon.pdf NetHack:valley.lev
+X	-delete NetHack:minetown.lev NetHack:minefill.lev
+X	-delete $(ADFILES)
+X	-delete $(BDFILES)
+X	-delete $(CDFILES)
+X	-delete $(EDFILES)
+X	-delete $(HDFILES)
+X	-delete $(KDFILES)
+X	-delete $(PDFILES)
+X	-delete $(RDFILES)
+X	-delete $(SDFILES)
+X	-delete $(TDFILES)
+X	-delete $(VDFILES)
+X	-delete $(WDFILES)
+X	-delete Incl:onames.h Incl:pm.h
+X	-echo to Incl:onames.h "" noline
+X	-wait 2
+X	-echo to Incl:pm.h "" noline
+X	-wait 2
+X	-setdate NHS:makedefs.c
+X	-wait 2
+X
+X# Creating precompiled version of Incl:hack.h to save disk I/O.
+X
+X#[SAS5]
+X#   If we were to use the precompiled header file feature of SAS/C, we
+X#   would uncomment the following lines.  (Also see defines for HDEP and
+X#   CSYM near the beginning of this file, as these should be appropriately
+X#   defined.)
+X
+X#$(HDEP):  Incl:hack.h NetHack:makedefs
+X#	echo to Ram:hackincl.c "#include <Incl:hack.h>"
+X#	$(CC) $(CFLAGS) -ph $(OBJSPEC)$@ Ram:hackincl.c
+X#	-delete Ram:hackincl.c
+X
+X#[MANX]
+X#   If we were compiling with Aztec, and wanted to use the symbol table
+X#   pre-loading feature, we would uncomment these following two lines.
+X
+X#$(HDEP):  Incl:hack.h NetHack:makedefs
+X#	$(CC) $(CFLAGS) -a $(OBJSPEC)Ram:hack.asm +h$@ Incl:hack.h
+X#	-delete Ram:hack.asm
+X
+X#[DICE]
+X#   If we were compiling with DICE and wanted to use the symbol table
+X#   pre-loading feature, we would not need a rule to make the
+X#   precompiled header file, because DCC handles this automatically.
+X
+X#
+X#	Please note:	The dependency lines for the modules here are
+X#			deliberately incorrect.  Including "hack.h" in
+X#			the dependency list would cause a dependency
+X#			loop.
+X#
+X
+XNetHack:makedefs:  $(MKGSTFILE) $(COPYMGST) $(MAKEOBJS)
+X	$(LINK) $(PNSPEC)NetHack:makedefs $(LIN) $(MAKEOBJS) $(LLIB)
+X
+XOBJO:makedefs.o:  Util:makedefs.c Incl:config.h Incl:permonst.h Incl:objclass.h  Incl:patchlevel.h Incl:qtext.h Incl:artilist.h
+X	$(CC) $(DEFSPEC)MAKEDEFS_C $(CFLAGS) $(OBJSPEC)$@ Util:makedefs.c
+X
+XNetHack:lev_comp:  $(SPLEVOBJS)
+X	$(LINK) $(PNSPEC)NetHack:lev_comp $(LIN) $(SPLEVOBJS) $(FBFIL) $(FLLIB)
+X
+XNetHack:dgn_comp:  $(DGNCOMPOBJS)
+X	$(LINK) $(PNSPEC)NetHack:dgn_comp $(LIN) $(DGNCOMPOBJS) $(FBFIL) $(FLLIB)
+X
+XOBJO:lev_yacc.o:  Util:lev_yacc.c $(HDEP) Incl:sp_lev.h Incl:pm.h Incl:onames.h
+X	setdate Util:lev_yacc.c
+X	$(CC) $(DEFSPEC)LEV_LEX_C $(CFLAGS) $(OBJSPEC)$@ Util:lev_yacc.c
+X
+XOBJO:lev_lex.o: Util:lev_lex.c $(HDEP) Incl:lev_comp.h Incl:sp_lev.h
+X	$(CC) $(DEFSPEC)LEV_LEX_C $(CFLAGS) $(OBJSPEC)$@ Util:lev_lex.c
+X
+XOBJO:lev_main.o:  Util:lev_main.c $(HDEP)
+X	$(CC) $(DEFSPEC)LEV_LEX_C $(DEFSPEC)AMIGA $(CFLAGS) $(OBJSPEC)$@ Util:lev_main.c
+X
+XOBJO:dgn_yacc.o:  Util:dgn_yacc.c $(HDEP) Incl:dgn_file.h
+X	$(CC) $(DEFSPEC)LEV_LEX_C $(CFLAGS) $(OBJSPEC)$@ Util:dgn_yacc.c
+X
+XOBJO:dgn_lex.o: Util:dgn_lex.c $(HDEP) Incl:dgn_comp.h
+X	$(CC) $(DEFSPEC)LEV_LEX_C $(CFLAGS) $(OBJSPEC)$@ Util:dgn_lex.c
+X
+XOBJO:dgn_main.o: Util:dgn_main.c $(HDEP)
+X	$(CC) $(DEFSPEC)LEV_LEX_C $(DEFSPEC)AMIGA $(CFLAGS) $(OBJSPEC)$@ Util:dgn_main.c
+X
+XOBJO:panic.o: Util:panic.c $(HDEP)
+X
+XOBJO:recover.o: Util:recover.c $(HDEP)
+X	$(CC) $(DEFSPEC)LEV_LEX_C $(DEFSPEC)AMIGA $(CFLAGS) $(OBJSPEC)$@ Util:recover.c
+X
+XNetHack:recover: OBJO:recover.o
+X	$(LINK) $(PNSPEC)NetHack:recover $(LIN) OBJO:recover.o $(LLIB)
+X
+X# [OPTION] -- If you have flex/bison, leave these uncommented.  Otherwise,
+X# comment them out and be careful! (You're not guaranteed to have the most
+X# up to date *_comp.c, *_comp.h and *_lex.c)
+X
+XIncl:lev_comp.h: Util:lev_yacc.c
+X
+XUtil:lev_yacc.c:  Util:lev_comp.y
+X	$(BISON) -d Util:lev_comp.y
+X	copy Util:lev_comp.tab.c Util:lev_yacc.c
+X	copy Util:lev_comp.tab.h Incl:lev_comp.h
+X	delete Util:lev_comp.tab.c
+X	delete Util:lev_comp.tab.h
+X
+XUtil:lev_lex.c:  Util:lev_comp.l
+X	$(FLEX) Util:lev_comp.l
+X	copy lex.yy.c Util:lev_lex.c
+X	delete lex.yy.c
+X
+XIncl:dgn_comp.h: Util:dgn_yacc.c
+X
+XUtil:dgn_yacc.c:  Util:dgn_comp.y
+X	$(BISON) -d Util:dgn_comp.y
+X	copy Util:dgn_comp.tab.c Util:dgn_yacc.c
+X	copy Util:dgn_comp.tab.h Incl:dgn_comp.h
+X	delete Util:dgn_comp.tab.c
+X	delete Util:dgn_comp.tab.h
+X
+XUtil:dgn_lex.c:  Util:dgn_comp.l
+X	$(FLEX) Util:dgn_comp.l
+X	copy lex.yy.c Util:dgn_lex.c
+X	delete lex.yy.c
+X
+X#
+X#	The following include files depend on makedefs to be created.
+X#	As a result, they are not defined in HACKINCL, instead, their
+X#	dependencies are explicitly outlined here.
+X#
+X
+X#
+X#	date.h should be remade any time any of the source or include code
+X#	is modified.  Unfortunately, this would make the contents of this
+X#	file far more complex.	Since "hack.h" depends on most of the include
+X#	files, we kludge around this by making date.h dependent on hack.h,
+X#	even though it doesn't include this file.
+X#
+X
+XIncl:date.h Dat:options:  $(HDEP) NetHack:makedefs $(AMIGAOBJ)
+X	NetHack:makedefs -v
+X	$(EXECUTE) Amiga:ifchange MOVE Incl:t.date.h Incl:date.h
+X	-wait 2
+X
+XIncl:onames.h:  NetHack:makedefs
+X	NetHack:makedefs -o
+X	$(EXECUTE) Amiga:ifchange TOUCH Incl:t.onames.h Incl:onames.h Incl:decl.h
+X	$(EXECUTE) Amiga:ifchange MOVE Incl:t.onames.h Incl:onames.h
+X	-wait 2
+X
+XIncl:pm.h:  NetHack:makedefs
+X	NetHack:makedefs -p
+X	$(EXECUTE) Amiga:ifchange TOUCH Incl:t.pm.h Incl:pm.h Incl:decl.h Incl:youprop.h
+X	$(EXECUTE) Amiga:ifchange MOVE Incl:t.pm.h Incl:pm.h
+X	-wait 2
+X
+XNetHack:quest.dat:	Dat:quest.dat
+X	copy Dat:quest.dat $@
+X
+XDat:quest.dat:	Dat:quest.txt NetHack:makedefs
+X	NetHack:makedefs -q
+X
+XNHS:monstr.c:  $(HDEP) NetHack:makedefs
+X	NetHack:makedefs -m
+X	-wait 2
+X
+XDat:oracles:	Dat:oracles.txt NetHack:makedefs
+X	NetHack:makedefs -h
+X	-wait 2
+X
+X#
+X#	The following programs vary depending on what OS you are using.
+X#	As a result, they are not defined in HACKSRC and their dependancies
+X#	are explicitly outlined here.
+X#
+X
+XOBJ:amidos.o:  Amiga:amidos.c $(HDEP)
+X
+XOBJ:amirip.o:  Amiga:amirip.c $(HDEP)
+X
+XOBJ:amiwind.o:  Amiga:amiwind.c Amiga:amimenu.c $(HDEP)
+X
+XOBJ:winami.o:	Amiga:winami.c $(HDEP) Amiga:char.c Amiga:colorwin.c Amiga:randwin.c
+X
+XOBJ:amiwbench.o:  Amiga:amiwbench.c $(HDEP)
+X
+XOBJ:random.o:  Share:random.c
+X
+XOBJ:pcmain.o:  Share:pcmain.c $(HDEP)
+X
+X# Stuff to build the front ends
+XNetHack:HackWB: OBJO:wb.o OBJO:wbx.o OBJO:loader.o OBJO:multi.o
+X	$(LINK) $(PNSPEC)NetHack:HackWB $(LIN) OBJO:wb.o OBJO:wbx.o OBJO:loader.o OBJO:multi.o $(LLIB)
+X
+XNetHack:HackCli: OBJO:cli.o OBJO:loader.o OBJO:multi.o
+X	$(LINK) $(PNSPEC)NetHack:HackCli $(LIN) OBJO:cli.o OBJO:loader.o OBJO:multi.o $(LLIB)
+X
+X# This needs to exist to eliminate the HackWB startup message
+XNetHack:WBDefaults.def:
+X	echo to NetHack:WBDefaults.def
+X
+XWBH	= Amiga:wbdefs.h Amiga:wbstruct.h Amiga:wbprotos.h
+XASP	= Amiga:splitter
+XOBJO:wb.o: $(WBH) Amiga:wb.c Amiga:wbwin.c Amiga:wbdata.c
+X	$(CC) $(WBCFLAGS) $(SPLFLAGS) $(OBJSPEC)OBJO:wb.o Amiga:wb.c
+XOBJO:wbx.o: $(WBH) Amiga:wbcli.c Amiga:wbwin.c Amiga:wbdata.c Incl:date.h
+X	$(CC) $(WBCFLAGS) $(SPLFLAGS) $(OBJSPEC)OBJO:wbx.o Amiga:wbcli.c
+XOBJO:loader.o: $(ASP)/loader.c $(ASP)/split.h $(ASP)/amiout.h $(ASP)/multi.h
+X	$(CC) $(WBCFLAGS) $(SPLFLAGS) $(OBJSPEC)OBJO:loader.o $(ASP)/loader.c
+XOBJO:multi.o: $(ASP)/multi.c $(ASP)/multi.h
+X	$(CC) $(WBCFLAGS) $(SPLFLAGS) $(OBJSPEC)OBJO:multi.o $(ASP)/multi.c
+XOBJO:cli.o: $(WBH) Amiga:wbcli.c Incl:date.h
+X	$(CC) $(WBCFLAGS) $(WBC2FLAGS) $(SPLFLAGS) $(OBJSPEC)OBJO:cli.o Amiga:wbcli.c
+X####
+X# splitter support
+XNetHack:splitter:	OBJO:splitter.o OBJO:arg.o
+X	$(LINK) $(PNSPEC)NetHack:splitter $(LIN) OBJO:splitter.o OBJO:arg.o $(LLIB)
+XHackExe:NetHack.dir:	NetHack:splitter Hackexe:NetHack
+X	NetHack:splitter $(GAME)
+X
+XOBJO:splitter.o:	$(ASP)/splitter.c $(ASP)/split.h $(ASP)/amiout.h $(ASP)/arg.h
+X	$(CC) $(WBCFLAGS) $(SPLFLAGS) $(OBJSPEC)OBJO:splitter.o $(ASP)/splitter.c
+XOBJO:arg.o:	$(ASP)/arg.c $(ASP)/arg.h
+X	$(CC) $(WBCFLAGS) $(SPLFLAGS) $(OBJSPEC)OBJO:arg.o $(ASP)/arg.c 
+X
+X# Create/copy other stuff into NetHack: directory:
+X
+X# quest files
+XADFILES= NetHack:A-goal.lev NetHack:A-fill.lev NetHack:A-locate.lev NetHack:A-start.lev
+XBDFILES= NetHack:B-goal.lev NetHack:B-fill.lev NetHack:B-locate.lev NetHack:B-start.lev
+XCDFILES= NetHack:C-goal.lev NetHack:C-fill.lev NetHack:C-locate.lev NetHack:C-start.lev
+XEDFILES= NetHack:E-goal.lev NetHack:E-fill.lev NetHack:E-locate.lev NetHack:E-start.lev
+XHDFILES= NetHack:H-goal.lev NetHack:H-fill.lev NetHack:H-locate.lev NetHack:H-start.lev
+XKDFILES= NetHack:K-goal.lev NetHack:K-fill.lev NetHack:K-locate.lev NetHack:K-start.lev
+XPDFILES= NetHack:P-goal.lev NetHack:P-fill.lev NetHack:P-locate.lev NetHack:P-start.lev
+XRDFILES= NetHack:R-goal.lev NetHack:R-fill.lev NetHack:R-locate.lev NetHack:R-start.lev
+XSDFILES= NetHack:S-goal.lev NetHack:S-fill.lev NetHack:S-locate.lev NetHack:S-start.lev
+XTDFILES= NetHack:T-goal.lev NetHack:T-fill.lev NetHack:T-locate.lev NetHack:T-start.lev
+XVDFILES= NetHack:V-goal.lev NetHack:V-fill.lev NetHack:V-locate.lev NetHack:V-start.lev
+XWDFILES= NetHack:W-goal.lev NetHack:W-fill.lev NetHack:W-locate.lev NetHack:W-start.lev
+X
+XXDFILES=	$(ADFILES) $(BDFILES) $(CDFILES) $(EDFILES) $(HDFILES) \
+X		$(KDFILES) $(PDFILES) $(RDFILES) $(SDFILES) $(TDFILES) \
+X		$(VDFILES) $(WDFILES)
+X
+XINSTDUNGEONFILES= \
+X	NetHack:NetHack.cnf NetHack:air.lev NetHack:asmodeus.lev \
+X	NetHack:astral.lev NetHack:baalz.lev NetHack:bigroom.lev \
+X	NetHack:castle.lev NetHack:dungeon NetHack:earth.lev \
+X	NetHack:fakewiz1.lev NetHack:fakewiz2.lev NetHack:fire.lev \
+X	NetHack:juiblex.lev NetHack:knox.lev NetHack:medusa-1.lev \
+X	NetHack:medusa-2.lev NetHack:mine_end.lev NetHack:minefill.lev \
+X	NetHack:minetown.lev NetHack:options NetHack:oracle.lev \
+X	NetHack:orcus.lev NetHack:sanctum.lev NetHack:tower1.lev \
+X	NetHack:tower2.lev NetHack:tower3.lev NetHack:valley.lev \
+X	NetHack:water.lev NetHack:wizard1.lev NetHack:wizard2.lev \
+X	NetHack:wizard3.lev $(XDFILES)
+X
+XDUNGEONTOOLS= \
+X	NetHack:lev_comp NetHack:dgn_comp NetHack:makedefs
+X
+Xinst-dungeon: $(INSTDUNGEONFILES)
+X
+XNetHack:options : Dat:options
+X	copy Dat:options $@
+X
+X# Create compiled dungeon files
+XNetHack:bigroom.lev:	Dat:bigroom.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:bigroom.des
+X
+XNetHack:castle.lev:  Dat:castle.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:castle.des
+X
+XNetHack:air.lev NetHack:earth.lev NetHack:fire.lev NetHack:water.lev NetHack:astral.lev:	Dat:endgame.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:endgame.des
+X
+XNetHack:asmodeus.lev NetHack:baalz.lev NetHack:juiblex.lev NetHack:orcus.lev NetHack:sanctum.lev NetHack:valley.lev:	Dat:gehennom.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:gehennom.des
+X
+XNetHack:knox.lev: Dat:knox.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:knox.des
+X
+XNetHack:mine_end.lev NetHack:minetown.lev NetHack:minefill.lev: Dat:mines.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:mines.des
+X
+XNetHack:oracle.lev: Dat:oracle.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:oracle.des
+X
+XNetHack:tower1.lev NetHack:tower2.lev NetHack:tower3.lev:  Dat:tower.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:tower.des
+X
+XNetHack:wizard1.lev NetHack:wizard2.lev NetHack:wizard3.lev NetHack:fakewiz1.lev NetHack:fakewiz2.lev:   Dat:yendor.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:yendor.des
+X
+XNetHack:medusa-1.lev NetHack:medusa-2.lev: Dat:medusa.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:medusa.des
+X
+X$(ADFILES):	Dat:Arch.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:Arch.des
+X
+X$(BDFILES):	Dat:Barb.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:Barb.des
+X
+X$(CDFILES):	Dat:Caveman.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:Caveman.des
+X
+X$(EDFILES):	Dat:Elf.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:Elf.des
+X
+X$(HDFILES):	Dat:Healer.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:Healer.des
+X
+X$(KDFILES):	Dat:Knight.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:Knight.des
+X
+X$(PDFILES):	Dat:Priest.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:Priest.des
+X
+X$(RDFILES):	Dat:Rogue.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:Rogue.des
+X
+X$(SDFILES):	Dat:Samurai.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:Samurai.des
+X
+X$(TDFILES):	Dat:Tourist.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:Tourist.des
+X
+X$(VDFILES):	Dat:Valkyrie.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:Valkyrie.des
+X
+X$(WDFILES):	Dat:Wizard.des NetHack:lev_comp
+X	NetHack:lev_comp Dat:Wizard.des
+X
+X
+XNetHack:dungeon:  Dat:dungeon.def NetHack:makedefs NetHack:dgn_comp
+X	NetHack:makedefs -e
+X	NetHack:dgn_comp Dat:dungeon.pdf
+X	copy Dat:dungeon NetHack:dungeon
+X	delete Dat:dungeon
+X
+XDATAFILES= \
+X	Dat:data Dat:rumors Dat:cmdhelp Dat:quest.dat
+XINSTDATAFILES= \
+X	NetHack:cmdhelp NetHack:data NetHack:help NetHack:hh NetHack:history \
+X	NetHack:license NetHack:logfile NetHack:opthelp NetHack:oracles \
+X	NetHack:perm NetHack:quest.dat NetHack:record NetHack:rumors \
+X	NetHack:wizhelp NetHack:HackWB.hlp NetHack:WBDefaults.def \
+X	NetHack:amii.hlp
+X
+Xinst-data: $(INSTDATAFILES)
+X
+XNetHack:amii.hlp: Amiga:amii.hlp
+X	copy Amiga:amii.hlp $@
+X
+XNetHack:data:  Dat:data
+X	copy Dat:data $@
+X
+XDat:data:  Dat:data.base Incl:config.h NetHack:makedefs
+X	NetHack:makedefs -d
+X
+XNetHack:rumors:  Dat:rumors
+X	copy Dat:rumors $@
+X
+XDat:rumors:  Dat:rumors.tru Dat:rumors.fal NetHack:makedefs
+X	NetHack:makedefs -r
+X
+XNetHack:cmdhelp:  Dat:cmdhelp
+X	copy Dat:cmdhelp $@
+X
+XNetHack:help:  Dat:help
+X	copy Dat:help $@
+X
+XNetHack:hh:  Dat:hh
+X	copy Dat:hh $@
+X
+XNetHack:HackWB.hlp: Amiga:HackWB.hlp
+X	copy Amiga:HackWB.hlp $@
+X
+XNetHack:history:  Dat:history
+X	copy Dat:history $@
+X
+XNetHack:license:  Dat:license
+X	copy Dat:license $@
+X
+XNetHack:opthelp:  Dat:opthelp
+X	copy Dat:opthelp $@
+X
+XNetHack:oracles:  Dat:oracles
+X	copy Dat:oracles $@
+X
+XNetHack:perm:
+X	echo to $@
+X
+XNetHack:logfile:
+X	echo to $@
+X
+XNetHack:record:
+X	echo to $@
+X
+XNetHack:wizhelp:
+X	copy Dat:wizhelp $@
+X
+X# Create the directories here because NetHack.cnf puts them there by default
+XNetHack:NetHack.cnf:  Amiga:NetHack.cnf
+X	copy Amiga:NetHack.cnf $@
+X	-makedir nethack:save
+X	-makedir nethack:levels
+X
+X# Unpack and install fonts
+X
+XINSTFONTFILES= \
+X	NetHack:hack.font NetHack:hack NetHack:hack/8
+Xinst-fonts: $(INSTFONTFILES)
+X
+XNetHack:hack/8:  Amiga:amifont8.uu NetHack:hack
+X	$(UUDEC) Amiga:amifont8.uu
+X	-rename 8 hack/8
+X
+XNetHack:hack.font:  Amiga:amifont.uu
+X	$(UUDEC) Amiga:amifont.uu
+X
+XNetHack:hack:
+X	makedir $@
+X
+XINSTICONFILES= \
+X	NetHack:default.icon NetHack:NetHack.info NetHack:NewGame.info \
+X	NetHack:HackWB.info
+X
+Xinst-icons: $(INSTICONFILES)
+X
+X# Unpack the icons into place
+X
+XNetHack:default.icon:  Amiga:dflticon.uu
+X	$(UUDEC) Amiga:dflticon.uu
+X
+XNetHack:NetHack.info:  Amiga:NHinfo.uu
+X	$(UUDEC) Amiga:NHinfo.uu
+X
+XNetHack:NewGame.info:  Amiga:NewGame.uu
+X	$(UUDEC) Amiga:NewGame.uu
+X
+XNetHack:HackWB.info:  Amiga:HackWB.uu
+X	$(UUDEC) Amiga:HackWB.uu
+X
+X# DO NOT DELETE THIS LINE
+X
+XOBJ:allmain.o:  NHS:allmain.c $(HDEP)
+XOBJ:alloc.o:  NHS:alloc.c Incl:config.h
+XOBJ:apply.o:  NHS:apply.c $(HDEP) Incl:edog.h
+X	$(CC) $(CFLAGS) $(CFLAGS2) $(OBJSPEC)$@ NHS:apply.c
+XOBJ:artifact.o:  NHS:artifact.c $(HDEP) Incl:artifact.h Incl:artilist.h
+XOBJ:attrib.o:  NHS:attrib.c $(HDEP)
+XOBJ:ball.o: NHS:ball.c $(HDEP)
+XOBJ:bones.o:  NHS:bones.c $(HDEP) Incl:lev.h
+XOBJ:botl.o:	NHS:botl.c $(HDEP)
+XOBJ:cmd.o:  NHS:cmd.c $(HDEP) Incl:func_tab.h
+XOBJ:dbridge.o:  NHS:dbridge.c $(HDEP)
+XOBJ:decl.o:  NHS:decl.c $(HDEP) Incl:quest.h
+XOBJ:detect.o: NHS:detect.c $(HDEP) Incl:artifact.h
+XOBJ:display.o:  NHS:display.c $(HDEP)
+XOBJ:do.o:  NHS:do.c $(HDEP) Incl:lev.h
+XOBJ:do_name.o:  NHS:do_name.c $(HDEP)
+XOBJ:do_wear.o:  NHS:do_wear.c $(HDEP)
+XOBJ:dog.o:  NHS:dog.c $(HDEP) Incl:edog.h
+XOBJ:dogmove.o:  NHS:dogmove.c $(HDEP) Incl:mfndpos.h Incl:edog.h
+XOBJ:dokick.o:  NHS:dokick.c $(HDEP) Incl:eshk.h
+XOBJ:dothrow.o:  NHS:dothrow.c $(HDEP)
+XOBJ:drawing.o:  NHS:drawing.c $(HDEP) Incl:termcap.h
+XOBJ:dungeon.o:  NHS:dungeon.c $(HDEP) Incl:dgn_file.h
+XOBJ:eat.o:  NHS:eat.c $(HDEP)
+XOBJ:end.o:  NHS:end.c $(HDEP) Incl:eshk.h
+XOBJ:engrave.o:  NHS:engrave.c $(HDEP) Incl:lev.h
+XOBJ:exper.o:  NHS:exper.c $(HDEP)
+XOBJ:explode.o:  NHS:explode.c $(HDEP)
+XOBJ:extralev.o:  NHS:extralev.c $(HDEP)
+XOBJ:files.o:  NHS:files.c $(HDEP)
+XOBJ:fountain.o:  NHS:fountain.c $(HDEP)
+XOBJ:hack.o:  NHS:hack.c $(HDEP)
+XOBJ:invent.o:  NHS:invent.c $(HDEP)
+XOBJ:lock.o:  NHS:lock.c $(HDEP)
+XOBJ:mail.o:  NHS:mail.c $(HDEP) Incl:mail.h
+XOBJ:makemon.o:  NHS:makemon.c $(HDEP) Incl:epri.h Incl:emin.h
+XOBJ:mcastu.o:  NHS:mcastu.c $(HDEP)
+XOBJ:mhitm.o:  NHS:mhitm.c $(HDEP) Incl:artifact.h Incl:edog.h
+XOBJ:mhitu.o:  NHS:mhitu.c $(HDEP) Incl:artifact.h Incl:edog.h
+XOBJ:minion.o:  NHS:minion.c $(HDEP) Incl:emin.h Incl:epri.h
+XOBJ:mklev.o:  NHS:mklev.c $(HDEP)
+XOBJ:mkmap.o:  NHS:mkmap.c $(HDEP)
+XOBJ:mkmaze.o:  NHS:mkmaze.c $(HDEP) Incl:sp_lev.h
+XOBJ:mkobj.o:  NHS:mkobj.c $(HDEP) Incl:artifact.h Incl:prop.h
+XOBJ:mkroom.o:  NHS:mkroom.c $(HDEP)
+XOBJ:mon.o:  NHS:mon.c $(HDEP) Incl:mfndpos.h
+XOBJ:mondata.o:  NHS:mondata.c $(HDEP) Incl:eshk.h Incl:epri.h
+XOBJ:monmove.o:  NHS:monmove.c $(HDEP) Incl:mfndpos.h Incl:artifact.h
+XOBJ:monst.o:  NHS:monst.c Incl:config.h Incl:permonst.h Incl:monsym.h Incl:eshk.h Incl:vault.h Incl:epri.h Incl:color.h
+XOBJ:monstr.o:  NHS:monstr.c $(HDEP)
+XOBJ:mplayer.o:	NHS:mplayer.c $(HDEP)
+XOBJ:mthrowu.o:  NHS:mthrowu.c $(HDEP)
+XOBJ:hacklib.o:  NHS:hacklib.c $(HDEP)
+XOBJ:muse.o:	NHS:muse.c $(HDEP)
+XOBJ:music.o:  NHS:music.c $(HDEP)
+XOBJ:o_init.o:  NHS:o_init.c $(HDEP)
+XOBJ:objects.o:  NHS:objects.c Incl:config.h Incl:obj.h Incl:objclass.h Incl:prop.h Incl:color.h
+X	$(CC) $(CFLAGS) $(INCLSPEC)NHS: $(OBJSPEC)$@ NHS:objects.c
+XOBJ:objnam.o:  NHS:objnam.c $(HDEP)
+XOBJ:options.o:  NHS:options.c $(HDEP) Incl:termcap.h
+XOBJ:pager.o:  NHS:pager.c $(HDEP)
+XOBJ:pickup.o:  NHS:pickup.c $(HDEP)
+XOBJ:pline.o:	NHS:pline.c $(HDEP) Incl:epri.h
+XOBJ:polyself.o:  NHS:polyself.c $(HDEP)
+XOBJ:potion.o:  NHS:potion.c $(HDEP)
+XOBJ:pray.o:  NHS:pray.c $(HDEP) Incl:epri.h
+XOBJ:priest.o:  NHS:priest.c $(HDEP) Incl:mfndpos.h Incl:eshk.h Incl:epri.h Incl:emin.h
+XOBJ:quest.o:	NHS:quest.c $(HDEP) Incl:quest.h Incl:qtext.h
+XOBJ:questpgr.o: NHS:questpgr.c $(HDEP) Incl:qtext.h
+XOBJ:read.o:  NHS:read.c $(HDEP)
+XOBJ:rect.o:	NHS:rect.c $(HDEP)
+XOBJ:restore.o:  NHS:restore.c $(HDEP) Incl:lev.h Incl:termcap.h Incl:quest.h
+XOBJ:rnd.o:  NHS:rnd.c $(HDEP)
+XOBJ:rumors.o:  NHS:rumors.c $(HDEP)
+XOBJ:save.o:  NHS:save.c $(HDEP) Incl:lev.h Incl:quest.h
+XOBJ:shk.o:  NHS:shk.c $(HDEP) Incl:eshk.h
+XOBJ:shknam.o:  NHS:shknam.c $(HDEP) Incl:eshk.h
+XOBJ:sit.o:  NHS:sit.c $(HDEP)
+XOBJ:sounds.o:  NHS:sounds.c $(HDEP) Incl:edog.h Incl:eshk.h
+XOBJ:sp_lev.o:  NHS:sp_lev.c $(HDEP) Incl:sp_lev.h Incl:rect.h
+XOBJ:spell.o:  NHS:spell.c $(HDEP)
+XOBJ:steal.o:  NHS:steal.c $(HDEP)
+XOBJ:timeout.o:  NHS:timeout.c $(HDEP)
+XOBJ:topten.o:  NHS:topten.c $(HDEP)
+XOBJ:track.o:  NHS:track.c $(HDEP)
+XOBJ:trap.o:  NHS:trap.c $(HDEP) Incl:edog.h
+XOBJ:u_init.o:  NHS:u_init.c $(HDEP)
+XOBJ:uhitm.o:  NHS:uhitm.c $(HDEP)
+XOBJ:vault.o:  NHS:vault.c $(HDEP) Incl:vault.h
+XOBJ:version.o:  NHS:version.c $(HDEP) Incl:date.h Incl:patchlevel.h
+XOBJ:vision.o:  NHS:vision.c $(HDEP)
+XOBJ:weapon.o:  NHS:weapon.c $(HDEP)
+XOBJ:were.o:  NHS:were.c $(HDEP)
+XOBJ:wield.o:  NHS:wield.c $(HDEP)
+XOBJ:wizard.o:  NHS:wizard.c $(HDEP) Incl:qtext.h
+XOBJ:windows.o:  NHS:windows.c $(HDEP)
+XOBJ:worm.o:  NHS:worm.c $(HDEP) Incl:lev.h
+XOBJ:worn.o:  NHS:worn.c $(HDEP)
+XOBJ:write.o:  NHS:write.c $(HDEP)
+XOBJ:zap.o:  NHS:zap.c $(HDEP)
+XIncl:config.h:  Incl:tradstdc.h Incl:global.h
+X	-setdate Incl:config.h
+X	-wait 2
+X# onames.h handled at onames.h target, pm.h
+XIncl:decl.h:  Incl:quest.h Incl:spell.h Incl:color.h Incl:obj.h Incl:you.h
+X	-setdate Incl:decl.h
+X	-wait 2
+XIncl:global.h:  Incl:coord.h Incl:pcconf.h Incl:amiconf.h
+X	-setdate Incl:global.h
+X	-wait 2
+X
+XIncl:hack.h:  Incl:config.h Incl:trap.h Incl:decl.h Incl:dungeon.h Incl:monsym.h Incl:mkroom.h Incl:objclass.h Incl:flag.h Incl:rm.h Incl:vision.h Incl:display.h Incl:wintype.h Incl:engrave.h Incl:rect.h Incl:trampoli.h
+X	-setdate Incl:hack.h
+X	-wait 2
+XIncl:permonst.h:  Incl:monattk.h Incl:monflag.h Incl:align.h
+X	-setdate Incl:permonst.h
+X	-wait 2
+XIncl:you.h:  Incl:align.h Incl:attrib.h Incl:monst.h Incl:youprop.h
+X	-setdate Incl:you.h
+X	-wait 2
+X# pm.h handled at target
+XIncl:youprop.h:  Incl:prop.h Incl:permonst.h Incl:mondata.h
+X	-setdate Incl:youprop.h
+X	-wait 2
+XIncl:display.h: Incl:vision.h Incl:mondata.h
+X	-setdate Incl:display.h
+X	-wait 2
+XIncl:dungeon.h: Incl:align.h
+X	-setdate Incl:dungeon.h
+X	-wait 2
+XIncl:emin.h: Incl:dungeon.h
+X	-setdate Incl:emin.h
+X	-wait 2
+XIncl:epri.h: Incl:dungeon.h Incl:align.h
+X	-setdate Incl:epri.h
+X	-wait 2
+XIncl:eshk: Incl:Inl:dungeon.h
+X	-setdate Incl:eshk.h
+X	-wait 2
+XIncl:engrave.h: Incl:trampoli.h Incl:rect.h
+X	-setdate Incl:engrave.h
+X	-wait 2
+XIncl:mondata.h: Incl:align.h
+X	-setdate Incl:mondata.h
+X	-wait 2
+XIncl:monst.h: Incl:align.h
+X	-setdate Incl:monst.h
+X	-wait 2
+XIncl:pcconf.h: Incl:micro.h Incl:system.h
+X	-setdate Incl:pcconf.h
+X	-wait 2
+XIncl:rm.h: Incl:align.h
+X	-setdate Incl:rm.h
+X	-wait 2
+XIncl:vault.h: Incl:dungeon.h
+X	-setdate Incl:vault.h
+X	-wait 2
+END_OF_FILE
+if test 32666 -ne `wc -c <'sys/amiga/Makefile.ami'`; then
+    echo shar: \"'sys/amiga/Makefile.ami'\" unpacked with wrong size!
+fi
+# end of 'sys/amiga/Makefile.ami'
+fi
+echo shar: End of archive 63 \(of 108\).
+cp /dev/null ark63isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
+41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 \
+61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 \
+81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 \
+101 102 103 104 105 106 107 108 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 108 archives.
+    echo "Now execute 'rebuild.sh'"
+    rm -f ark10[0-8]isdone ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

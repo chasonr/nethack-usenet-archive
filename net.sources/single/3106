@@ -1,0 +1,1184 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,59a59f58a402526b,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-08-05 19:16:37 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site decvax.UUCP
+Path: utzoo!linus!decvax!minow
+From: minow@decvax.UUCP (Martin Minow)
+Newsgroups: net.sources
+Subject: Mandelbrot Set computations
+Message-ID: <99@decvax.UUCP>
+Date: Mon, 5-Aug-85 22:16:37 EDT
+Article-I.D.: decvax.99
+Posted: Mon Aug  5 22:16:37 1985
+Date-Received: Wed, 7-Aug-85 02:30:08 EDT
+Lines: 1165
+
+This is a shar archive containing programs to compute and display
+the Mandelbrot Set.
+
+To unpack, remove everything before the line beginning with # and
+feed to sh (not csh).
+#!/bin/sh
+cat >readme.txt <<'------ EOF ------'
+This is a very quick hack to compute the Mandelbrot Set as described
+in Scientific American, August 1985.  The program is presented only
+as a stepping-stone for your own improvements.
+
+There are four source files:
+
+mancomp.c	Compute the Mandelbrot Set, writing a "pixel"
+		and "histogram" file.
+
+mandisp.c	Read the files produced by mancomp.c, displaying the
+		computed values.  This program is -- hopefully --
+		independent of the display hardware/firmware.
+
+manscreen.c	Screen I/O for operator interaction.  Assumes a
+		VT100 or similar terminal (with ANSI display controls),
+		but should be easy to adapt to other uses.  Used only
+		to get parameters and display program status.
+
+manregis.c	Display output routines for Regis terminals, such as
+		the VT125, VT241, and PRO-350.  Tested only on the
+		PRO-350.
+
+Note:
+
+The programs have had only minimal testing.  They are quite slow.
+You should redo the display routine (and adjust the size of the
+Mandelbrot set) to take best advantage of your display hardware.
+For example, you should compute an image that fills the screen.
+
+You can generate spectacular color images on the PRO if you do
+a little work.
+
+Someone with better graphics and numerical analysis skills should
+redo the computation in terms of scaled fixed-point arithmetic.
+
+Exploration of the Mandelbrot Set and its effective display would
+make a nice project for an introductory computer programming course.
+
+Martin Minow
+decvax!minow
+
+------ EOF ------
+ls -l readme.txt
+cat >Makefile <<'------ EOF ------'
+# Make mancomp and mandisp
+# The redefinition of strchr() and strrchr() is needed for
+# Ultrix-32, Unix 4.2 bsd (and maybe some other Unices).
+#
+BSDDEFINES = -Dstrchr=index -Dstrrchr=rindex
+#
+# On certain systems, such as Unix System III, you may need to define
+# $(LINTFLAGS) in the make command line to set system-specific lint flags.
+#
+
+CFLAGS = -O $(BSDDEFINES)
+
+all	: mancomp mandisp
+
+#
+# ** Compile mancomp and mandisp
+#
+MANCOMP_SRCS	=	mancomp.c manscreen.c
+MANCOMP_OBJS	=	mancomp.o manscreen.o
+mancomp:	$(MANCOMP_OBJS)
+		$(CC) $(CFLAGS) $(MANCOMP_OBJS) -o mancomp
+
+MANDISP_SRCS	=	mandisp.c manscreen.c manregis.c
+MANDISP_OBJS	=	mandisp.o manscreen.o manregis.o
+mandisp:	$(MANDISP_OBJS)
+		$(CC) $(CFLAGS) $(MANDISP_OBJS) -o mandisp
+
+#
+# ** Lint the code
+#
+lint:	$(MANCOMP_SRCS) $(MANDISPP_SRCS)
+	lint $(LINTFLAGS) $(DEFINES) $(MANCOMP_SRCS)
+	lint $(LINTFLAGS) $(DEFINES) $(MANDISP_SRCS)
+
+mancomp.o	:	mancomp.c
+
+mandisp.o	:	mandisp.c
+
+manscreen.o	:	manscreen.c
+
+manregis.o	:	manregis.c
+
+------ EOF ------
+ls -l Makefile
+cat >mancomp.c <<'------ EOF ------'
+
+/*
+ * Mandelzoom (from Scientific American, August 1985).
+ * Recommended places for exploration (according to the article):
+ *	 real  imaginary	side
+ *	-2.00	 -1.25		2.50	Entire Mandelbrot set
+ *	  .26	  0.00		 .01
+ *	 -.76	  0.01		 .02
+ *	-1.26	  0.01		 .02
+ *
+ * This program computes the Mandelbrot set, writing the pixels
+ * to xxx.pix and the parameters (origin, size, and a pixel density
+ * histogram to xxx.his).
+ *
+ * Option command line (for spawning):
+ * 	mandel origin_real origin_imag size npixel niter filename
+ * or	mandel xxx.cmd			read commands from a file.
+ * or	mandel				interactive
+ *
+ * Values are:
+ *  orig_real	(double) lower-left hand corner of the picture (real part)
+ *  orig_imag	(double) lower-left hand corner of the picture (imag part)
+ *  size	(double) size of a side (defines the view into the set
+ *  npixel	(int)    number of pixels on each side (max == 512)
+ *				default = 100
+ *  niter	(int)    number of iterations per point.
+ *				default = 100
+ *  file	(string) name of output file (no type)
+ *				default = mandel
+ *
+ * In "mandel file" format, each line generates a separate picture.
+ *
+ * Each picture causes two files to be written:
+ *   file.his	(readable text format) contains picture definition parameters
+ *		and a histogram of pixel values:
+ *	orig_real orig_imag side npixel niter \n
+ *	bottom top sum	(first non-zero histogram, last non-zero,
+ *			  sum of histogram values).
+ *	hist[bottom]	(number of pixels with count == bottom)
+ *	...		(etc.)
+ *	hist[top]	(number of pixels with specified count)
+ *  file.pix	(binary format) contains npixel rows, each containing npixel
+ *		integers, defining the count at each pixel location.
+ *
+ * Note: this program is very cpu intensive.  There are a maximum of
+ *	4 * niter * (npixel**2) floating-point multiplies
+ *     10 * niter * (npixel**2) other floating-point (add, compare, store)
+ * per picture.
+ *
+ * Decus C bug note:
+ *   all printf's that format floats must have only one floating-point
+ *   parameter, and it must be the last parameter in the argument list.
+ *   Also, Decus C doesn't support (double) x++.
+ */
+
+#include	<stdio.h>
+#include	<ctype.h>
+#ifdef decus
+#define W_BIN_MODE	"wn"		/* Write binary file in Decus C	*/
+#else
+#define W_BIN_MODE	"w"
+#endif
+#ifdef vms
+#include		errno
+#define	IO_ERROR	errno
+#define	IO_SUCCESS	1		/* SS$_NORMAL			*/
+#endif
+#define FALSE	0
+#define TRUE	1
+#define	EOS	'\0'
+#ifndef	IO_ERROR
+#define	IO_SUCCESS	0		/* Unix definitions		*/
+#define	IO_ERROR	1
+#endif
+
+#ifdef decus
+int		$$narg = 1;		/* Don't prompt for commands	*/
+#endif
+#define	MAX_NPIXEL	400		/* Forced by display format	*/
+#define	MAX_NITER	1000		/* Max. number of iterations	*/
+#define DEF_FILENAME	"mandel"	/* Default output filename	*/
+#define	DEF_NITER	100		/* Default number of iterations	*/
+#define	DEF_NPIXEL	100		/* Default number of pixels	*/
+#define	MAX_ARGS	8		/* Command line arguments	*/
+
+/*
+ * These values may be reset by the user.
+ */
+int		niter = DEF_NITER;	/* Number of iterations		*/
+int		npixel = DEF_NPIXEL;	/* Number of pixels/side	*/
+double		orig_real = -2.0;	/* South-West (i.e. lower-left)	*/
+double		orig_imag = -1.25;	/* corner of the picture	*/
+double		side = 2.5;
+
+int		pixel[MAX_NPIXEL];	/* Stores one pixel row		*/
+double		gap[MAX_NPIXEL];	/* Real axis position		*/
+double		hist[MAX_NITER];	/* Pixel density histogram	*/
+char		line[256];		/* General text work area	*/
+char		filename[81];		/* Output file name work area	*/
+char		*myargv[MAX_ARGS];	/* To build command arguments	*/
+int		myargc;			/* Index into myargv[]		*/
+FILE		*pixfd;			/* Pixel file (binary)		*/
+FILE		*hisfd;			/* Pixel histogram (text)	*/
+
+extern double	atof();
+extern char	*strchr();
+
+main(argc, argv)
+int		argc;
+char		*argv[];
+{
+	if (argc <= 1) {
+	    while (interactive()) {
+		doit();
+	    }
+	}
+	else if (argc == 2 && !isdigit(argv[1][0])) {
+	    if (freopen(argv[1], "r", stdin) == NULL) {
+		perror(argv[1]);
+		exit(IO_ERROR);
+	    }
+	    while (comfile()) {
+		getarguments(myargc, myargv);
+		doit();
+	    }
+	}
+	else {
+	    getarguments(argc, argv);
+	    doit();
+	}
+	exit(IO_SUCCESS);
+}
+
+doit()
+{
+	if (setup()) {
+	    process();
+	    finish();
+	}
+}
+
+process()
+/*
+ * Compute the Mandelbrot set.
+ */
+{
+	register double	z_real, z_imag;	/* Pixel accumulator		*/
+	register double	z2_real;	/* z_real ** 2			*/
+	register double z2_imag;	/* z_imag ** 2			*/
+	register int	count;		/* Inner-loop counter		*/
+	register int	j;		/* Column counter		*/
+	register int	i;		/* Row counter			*/
+	register double	c_real, c_imag;	/* Pixel position (constant)	*/
+	register double	float_pixels;	/* To computer pixel position	*/
+	register double	total;		/* For progress log		*/
+
+	/*
+	 * Precompute the position of each pixel on the real axis.
+	 * This loop should not be "unrolled" to a succession of
+	 * additions as that would lose accuracy.  Given what
+	 * follows, the cost isn't excessive.
+	 */
+	total = 0.0;			/* Progress log counter		*/
+	float_pixels = npixel;
+	for (j = 0; j < npixel; j++)	/* Precompute column (real) gap	*/
+	    gap[j] = orig_real + (side * ((double) j) / float_pixels);
+	for (i = 0; i < npixel; i++) {
+	    c_imag = orig_imag + (side * ((double) i) / float_pixels);
+	    for (j = 0; j < npixel; j++) {
+		/*
+	 	 * Compute one point (pixel) of the Mandelbrot set:
+		 * 1. Set z to 0 + 0i and
+		 *    set c to the pixel location (real, imag)
+		 * 2. Perform step 3 until either
+		 *    1. count reaches the selected number of iterations or
+		 *    2. the "size" of z exceeds 2.0, where size is
+		 *       defined as sqrt(z_real**2 + z_imag**2)
+		 *       (we don't bother with the square root.)
+		 * 3. z = z**2 + c;
+		 *    count = count + 1;
+		 *    size = size of z as defined above.
+		 * 4. Set pixel[i,j] to the number of iterations (count).
+		 */
+		c_real = gap[j];
+		z_real = c_real;
+		z_imag = c_imag;
+		for (count = 0; count < niter; count++) {
+		    if (((z2_real = (z_real * z_real))
+		       + (z2_imag = (z_imag * z_imag))) > 4.0)
+			break;
+		    z_imag = (z_real * z_imag * 2.0) + c_imag;
+		    z_real = z2_real - z2_imag + c_real;
+		}
+		pixel[j] = count;		/* Store the pixel	*/
+		hist[count] += 1.0;		/* Gray-scale histogram	*/
+		total += (double) count;	/* For progress log	*/
+		if (i == j && isatty(fileno(stdout))) {
+		    scr_move(7, 1);		/* Log progress @ diag.	*/
+		    printf("%3d %3d %4d %8.0f", i, j, count, total);
+		    scr_eol();
+		    fflush(stdout);
+		}
+	    }					/* All columns this row	*/
+	    fwrite(pixel, npixel * sizeof (pixel[0]), 1, pixfd);
+	    if (ferror(pixfd)) {
+		perror("pixel file write error");
+		return;
+	    }
+	}					/* All rows in picture	*/
+}
+
+int
+setup()
+/*
+ * Open the .pix and .his files.  Zero the vectors.
+ */
+{
+	register int		i;
+	extern FILE		*fcreate();
+
+	sprintf(line, "%s.pix", filename);
+	if ((pixfd = fopen(line, W_BIN_MODE)) == NULL) {
+	    perror(line);
+	    sleep(2);
+	    return (FALSE);
+	}
+	sprintf(line, "%s.his", filename);
+	if ((hisfd = fcreate(line)) == NULL) {
+	    perror(line);
+	    sleep(2);
+	    fclose(pixfd);
+	    return (FALSE);
+	}
+	fprintf(hisfd, "%f", orig_real);
+	fprintf(hisfd, " %f", orig_imag);
+	fprintf(hisfd, " %f", side);
+	fprintf(hisfd, " %d", npixel);
+	fprintf(hisfd, " %d\n", niter);
+	for (i = 0; i < niter; i++)
+	    hist[i] = 0.0;
+	return (TRUE);
+}
+
+finish()
+/*
+ * Compute a histogram of the counts.
+ */
+{
+	register int		bottom, top, i;
+	register double		sum;
+
+	fclose(pixfd);
+	for (bottom = 0; bottom < niter && hist[bottom] == 0.0; bottom++)
+	    ;
+	for (top = niter - 1; top > bottom  && hist[top] == 0.0; top--)
+	    ;
+	for (sum = 0.0, i = bottom; i <= top; i++)
+	    sum = sum + hist[i];
+	fprintf(hisfd, "%d %d %f\n", bottom, top, sum);
+	for (i = bottom; i <= top; i++)
+	    fprintf(hisfd, "%10.2f\n", hist[i]);
+	fclose(hisfd);	   
+}	
+
+getarguments(argcount, argstring)
+int		argcount;
+char		*argstring[];
+/*
+ * Process argv[] from command line or pseudo argv[] from a file.
+ */
+{
+	register int		i;
+
+	if (argcount < 5) {
+	    printf("Missing arguments, need at least\n");
+	    printf("orig_real, orig_imaginary, side\n");
+	}
+	else {
+	    orig_real	= atof(argstring[1]);
+	    orig_imag	= atof(argstring[2]);
+	    side	= atof(argstring[3]);
+	    strcpy(filename, DEF_FILENAME);
+	    niter	= DEF_NITER;
+	    npixel	= DEF_NPIXEL;
+	    switch (argcount) {
+	    default:
+		printf("Extra arguments ignored:\n");
+		for (i = 7; i < argcount; i++)
+		    printf(" arg[%d] = \"%s\"\n", i, argstring[i]);
+	    case 7:
+		strcpy(filename, argstring[6]);
+	    case 6:
+		if ((niter = atoi(argstring[5])) > MAX_NITER) {
+		    printf("%d iterations max.\n", MAX_NITER);
+		    niter = MAX_NITER;
+		}
+	    case 5:
+		npixel = atoi(argstring[4]);
+	    }
+	    if (npixel > MAX_NPIXEL)
+		npixel = MAX_NPIXEL;
+	    printf("corner = [%f,",	orig_real);
+	    printf("%f], ",		orig_imag);
+	    printf("side = %f, ",	side);
+	    printf("%d pixels, %d iterations\n", npixel, niter);
+	}
+}
+
+int
+interactive()
+/*
+ * Read commands from the terminal -- assumed to be a VT100 or similar.
+ */
+{
+	if (isatty(fileno(stdin)))
+	    scr_clear();
+	if (!getcomplex(1, "Lower-left Corner (real, imaginary)",
+		&orig_real, &orig_imag)
+	 || !getdouble(2,  "Side Length", &side)
+	 || !getint(3,"Number of pixels on a side",
+		&npixel, DEF_NPIXEL, MAX_NPIXEL)
+	 || !getint(4,	"Iterations",
+		&niter, DEF_NITER, MAX_NITER)
+	 || !getstring(5, "Output filename", filename, DEF_FILENAME))
+	    return (FALSE);
+#if 0
+/* Debug */
+	scr_move(2, 1);
+	printf("corner = [%f,",	orig_real);
+	printf("%f], ",		orig_imag);
+	printf("side = %f, ",	side);
+	printf("%d pixels, %d iterations\n", npixel, niter);
+	scr_eol();
+	sleep(2);
+#endif
+	return (TRUE);
+}
+
+int
+comfile()
+/*
+ * Read commands from an indirect command file.
+ */
+{
+	register char	*lp;
+
+	if (gets(line) == NULL)
+	    return (FALSE);
+	myargv[0] = "";
+	for (myargc = 1, lp = line; *lp != EOS && myargc < MAX_ARGS;) {
+	    while (isspace(*lp))
+		lp++;
+	    myargv[myargc++] = lp;
+	    while(!isspace(*lp))
+		lp++;
+	    if (*lp != EOS)
+		*lp++ = EOS;
+	}
+	return (TRUE);
+}
+------ EOF ------
+ls -l mancomp.c
+cat >mandisp.c <<'------ EOF ------'
+/*
+ * Display Mandelbrot set pixels.  (Gidis format)
+ *
+ * This version uses the Gidis display protocol (for DEC PRO/350)
+ * It should be "fairly" easy to adapt it for other displays.
+ */
+
+#include		<stdio.h>
+#include		<ctype.h>
+#ifdef vms
+#include		errno
+#define	IO_ERROR	errno
+#endif
+#define FALSE	0
+#define TRUE	1
+#define	EOS	'\0'
+#ifdef decus
+int		$$narg = 1;		/* Don't prompt for commands	*/
+#define R_BIN_MODE	"rn"		/* Read binary file in Decus C	*/
+#else
+#define R_BIN_MODE	"r"
+#endif
+#define	MAX_NITER	1000		/* Max. number of iterations	*/
+#define MAX_NPIXEL	 400
+#define DEF_FILENAME	"mandel"
+
+/*
+ * Screen coordinates (set by mangidis.c, manregis.c)
+ */
+extern int	max_npixel;
+extern int	smaxx;
+extern int	smaxy;
+extern int	xorigin;
+extern int	yorigin;
+extern int	gray_scale;
+extern int	tick;
+extern int	cxsize;
+extern int	cysize;
+
+/*
+ * These values are read from the .his file
+ */
+int		niter;			/* Number of iterations		*/
+int		npixel;			/* Number of pixels/side	*/
+double		orig_real;
+double		orig_imag;
+double		side;
+
+int		pixel[MAX_NPIXEL];	/* Holds one row		*/
+int		factor;			/* Scan lines per pixel		*/
+double		hist[MAX_NITER];	/* Pixel density histogram	*/
+int		density[MAX_NITER];	/* Initialization fills this in	*/
+double		hist_sum;		/* Sum of histogram values	*/
+char		line[81];
+char		filename[81];
+extern double	atof();
+extern char	*strchr();
+FILE		*pixfd;
+FILE		*hisfd;
+
+main(argc, argv)
+int		argc;
+char		*argv[];
+{
+	register int		i;
+
+/*	show_gray();			-- no longer needed		*/
+	if (argc <= 1) {
+	    while (interactive()) {
+		doit();
+	    }
+	}
+	else {
+	    for (i = 1; i < argc; i++) {
+		strcpy(filename, argv[i]);
+		doit();
+	    }
+	}
+	dsp_finis();
+	scr_clear();
+}
+
+doit()
+{
+	if (setup()) {
+	    dsp_init();
+	    boarder();
+	    process();
+	    finish();
+	}
+}
+
+process()
+{
+	register int		i, j;
+	int			value;
+	int			new_density, old_density;
+	int			oldx, newx;
+
+	set_gray_scale();
+	factor = max_npixel / npixel;		/* Scan lines/pixel	*/
+	for (i = 0; i < npixel; i++) {
+	    j = fread(pixel, npixel * sizeof (pixel[0]), 1, pixfd);
+	    if (feof(pixfd)) {
+		perror("pixel file");
+		dsp_done();
+		scr_move(5, 1);
+		printf("read error at scan row %d, expected %d, read %d\n",
+		    i, npixel, j);
+		sleep(2);
+		return;
+	    }
+	    /*
+	     * Position to Left edge of this scan line
+	     */
+	    dsp_move(xorigin, yorigin - (i * factor));
+	    old_density = -1;
+	    oldx = xorigin;;
+	    for (j = 0; j < npixel; j++) {
+		value = pixel[j];
+		new_density = density[value];
+		if (new_density != old_density) {
+		    newx = xorigin + (j * factor);
+		    /*
+		     * If the luminance has just changed,
+		     * write the vector from "old" to "new"
+		     */
+		    if (old_density >= 0) {
+			dsp_draw(old_density, newx - oldx);
+		    }
+		    old_density = new_density;
+		    oldx = newx;
+		}
+	    }
+	    /*
+	     * Write the last vector and reset display.
+	     */
+	    dsp_draw(old_density, xorigin + ((npixel - 1) * factor) - oldx);
+	    dsp_endline();
+	}
+	stall();
+}
+
+show_gray()
+/*
+ * Used to debug the gray scale, this routine prints each gray scale
+ * value in turn.
+ */
+{
+	register int		i;
+	register int		j;
+	register int		y;
+	int			lines_per_gray;
+
+	y = yorigin;
+	lines_per_gray = max_npixel / gray_scale;
+	scr_clear();
+	dsp_init();
+	for (i = 0; i < gray_scale; i++) {
+	    sprintf(line, "%2d", i);
+	    dsp_text(xorigin - (cxsize * 3), y - cysize, line);
+	    for (j = 0; j < lines_per_gray; j++, y--) {
+		dsp_move(xorigin, y);
+		dsp_draw(i, max_npixel);
+		dsp_endline();
+	    }
+	    y -= 2;			/* Spacing		*/
+	}
+	stall();
+}
+
+/*
+ * This is crude and should be replaced by something suitable to
+ * your (hopefully) color display.
+ */
+static int gray_select[] = {
+	0, 1, 2, 3, 4, 5, 6, 7
+};
+#define	NGRAY	(sizeof gray_select / sizeof (gray_select[0]))
+
+set_gray_scale()
+/*
+ * Take the density histogram and turn it into a gray scale.
+ * (should this be interactive or make better use of the
+ * histogram prepared by mancomp?)
+ */
+{
+	register int		i;
+
+	for (i = niter; i >= 0; --i) {
+	    density[i] = gray_select[i % NGRAY];
+	}
+}
+
+boarder()
+/*
+ * Draw a pretty boarder
+ */
+{
+	register int	i;
+	int		xleft, xright, ytop, ybottom;
+	int		tick_gap;
+	int		do_value;
+	double		temp;
+	double		offset;
+	double		gap;
+
+	xleft = xorigin - 2;
+	xright = xorigin + max_npixel + 2;
+	ytop = yorigin - max_npixel - 2;
+	ybottom = yorigin + 2;
+	tick_gap = max_npixel / 10;
+	gap = side / ((double) max_npixel);
+	dsp_draw(gray_scale - 1, 0);			/* White line	*/
+	dsp_line(xleft, ytop, xright, ytop);
+	dsp_line(xright, ytop, xright, ybottom);
+	dsp_line(xright, ybottom, xleft, ybottom);
+	dsp_line(xleft, ybottom, xleft, ytop);
+	do_value = TRUE;
+	offset = 0.0;
+	for (i = xorigin; i < xright; i += tick_gap) {
+	    dsp_line(i, ybottom, i, ybottom + tick);
+	    dsp_line(i, ytop,    i, ytop    - tick);
+	    if (do_value) {
+		temp = orig_real + (offset * gap);
+		sprintf(line, "%7.4f", temp);
+		dsp_text(i - (3 * cxsize), ybottom + (tick * 2), line);
+	    }
+	    do_value = !do_value;
+	    offset += ((double) tick_gap);
+	}
+	do_value = TRUE;
+	offset = 0.0;
+	for (i = yorigin; i > ytop; i -= tick_gap) {
+	    dsp_line(xleft,  i, xleft  - tick, i);
+	    dsp_line(xright, i, xright + tick, i);
+	    if (do_value) {
+		temp = orig_imag + (offset * gap);
+		sprintf(line, "%7.4f", temp);
+		dsp_text(xleft - (10 * cxsize), i - (cysize / 2), line);
+	    }
+	    do_value = !do_value;
+	    offset += ((double) tick_gap);
+	}
+}
+
+int
+setup()
+/*
+ * Open the .pix and .his files.  Zero the vectors.
+ */
+{
+	register int		i;
+	auto int		bottom, top;
+
+	sprintf(line, "%s.pix", filename);
+	if ((pixfd = fopen(line, R_BIN_MODE)) == NULL) {
+	    perror(line);
+	    goto nogood;
+	}
+	sprintf(line, "%s.his", filename);
+	if ((hisfd = fopen(line, "r")) == NULL) {
+	    perror(line);
+	    goto close_pix;
+	}
+	if (fgets(line, sizeof line, hisfd) == NULL) {
+	    perror("histogram file -- first line");
+	    goto close_both;
+	}
+	if (sscanf(line,
+#ifdef decus
+		"%lf %lf %lf %d %d",
+#else
+		"%f %f %f %d %d",
+#endif
+		&orig_real, &orig_imag, &side, &npixel, &niter) != 5) {
+	    printf("First hist line didn't scan\n\"%s\"\n",
+		line);
+	    goto close_both;
+	}
+	scr_clear();
+	scr_move(2, 1);
+	printf("Origin %f", orig_real); printf(", %f\n", orig_imag);
+	printf("side   %f\n", side);
+	printf("npixel %d\n", npixel);
+	printf("niter  %d\n", niter);
+	for (i = 0; i < MAX_NITER; i++)
+	    hist[i] = 0.0;
+	if (fgets(line, sizeof line, hisfd) == NULL) {
+	    perror("histogram file -- second line");
+	    goto close_both;
+	}
+	if (sscanf(line,
+#ifdef decus
+		"%d %d %lf",
+#else
+		"%d %d %f",
+#endif
+		&bottom, &top, &hist_sum) != 3) {
+	    printf("Second line didn't scan\n\"%s\"\n", line);
+	    goto close_both;
+	}
+	for (i = bottom; i <= top; i++) {
+	    if (fgets(line, sizeof line, hisfd) == NULL) {
+		perror("histogram file -- data");
+		goto close_both;
+	    }
+	    if (sscanf(line,
+#ifdef decus
+			"%lf",
+#else
+			"%f",
+#endif
+			&hist[i]) != 1) {
+		printf("Histogram[%d] didn't scan\n\"%s\"",
+		    i, line);
+		goto close_both;
+	    }
+	}
+	fclose(hisfd);	   
+	return (TRUE);
+
+/*
+ * Error exits
+ */
+close_both:
+	fclose(hisfd);
+close_pix:
+	fclose(pixfd);
+nogood:
+	if (isatty(fileno(stdin))) {
+	    printf("Press return to continue.\n");
+	    gets(line);
+	}
+	return (FALSE);
+}
+
+finish()
+{
+	fclose(hisfd);
+	fclose(pixfd);
+	hisfd = NULL;
+	pixfd = NULL;
+}
+
+int
+interactive()
+{
+	if (isatty(fileno(stdin)))
+	    scr_clear();
+	if (!getstring(1, "Input filename", filename, DEF_FILENAME))
+	    return (FALSE);
+	return (TRUE);
+}
+
+stall()
+{
+	dsp_draw(gray_scale - 1, 0);			/* Force white */
+	dsp_text(0, 0, "Press return to continue");
+	dsp_done();
+	gets(line);
+	dsp_finis();
+}
+------ EOF ------
+ls -l mandisp.c
+cat >manregis.c <<'------ EOF ------'
+/*
+ * Display Mandelbrot set pixels.
+ *
+ * This version uses the Regis display protocol (for Dec VT125,
+ * VT240, and PRO-350).  It should be "fairly" easy to adapt
+ * it for other displays.
+ */
+
+#include	<stdio.h>
+#include	<ctype.h>
+#ifdef vms
+#include	errno
+#define	IO_ERROR	errno
+#endif
+#define FALSE	0
+#define TRUE	1
+#define	EOS	'\0'
+
+/*
+ * The Regis screen is fixed at 767 horizontal by 479 vertical pixels.
+ * Although there is are relative coordinate system commands, we don't bother.
+ * XORIGIN and YORIGIN define the lower-left corner of the Mandelbrot display.
+ */
+
+#define	MAX_NPIXEL	400
+#define	SMAXX		768
+#define SMAXY		480
+#define XORIGIN		300
+#define YORIGIN		425
+#define GRAY_SCALE	13		/* Density ranges from 0 to 12	*/
+#define	TICK		8		/* Length of boarder tick-marks	*/
+#define	CXSIZE		8		/* Character width		*/
+#define	CYSIZE		10		/* Character height		*/
+/*
+ * Globalize these values for the main display code.
+ */
+int	max_npixel = MAX_NPIXEL;
+int	smaxx = SMAXX;
+int	smaxy = SMAXY;
+int	xorigin = XORIGIN;
+int	yorigin = YORIGIN;
+int	gray_scale = GRAY_SCALE;	/* Make known to mandisp.c	*/
+int	tick = TICK;
+int	cxsize = CXSIZE;
+int	cysize = CYSIZE;
+
+/*
+ * Display routines for the bit-map display.
+ *	dsp_init()		Initialize for bit-map writing, clear screen.
+ *	dsp_done()		Done writing to the bit-map (don't clear)
+ *	dsp_finis()		All done (about to exit to o.s., clear screen)
+ *	dsp_move(r,c)		Move bitmap cursor to to this row-column
+ *	dsp_endline()		Finish off a scanline
+ *	dsp_draw(d,len)		Draw a horizontal line of the selected density
+ *	dsp_text(r,c,t)		Write text string from this position
+ *	dsp_line(x,yf,xt,yt)	Draw line from [xf,yf] to [xt,yt]
+ */
+
+dsp_init()
+/*
+ * Start writing to the bitmap display.
+ */
+{
+	printf("\33P1pS[0,0]S(E)S(C0)");	/* Regis initialize	*/
+	printf("S(M0(L0)1(L25)2(L50)3(L75))");	/* Regis Luminance	*/
+}
+
+dsp_done()
+/*
+ * Stop writing to the bitmap (don't clear it).
+ */
+{
+	printf("\033\\");
+	fflush(stdout);
+}
+
+dsp_finis()
+/*
+ * Exiting, clear display.
+ */
+{
+	printf("\033P1pS(E)\033\\");
+	fflush(stdout);
+}
+
+dsp_move(row, col)
+int		row, col;
+/*
+ * Move bitmap cursor to this position.
+ */
+{
+	printf("P[%d,%d]", row, col);
+}
+
+dsp_endline()
+/*
+ * Executed at the end of a scan line.
+ */
+{
+	printf("W(I3)W(P1)");		/* Reset density to known state	*/
+	fflush(stdout);
+}
+
+char	*dens_command[GRAY_SCALE] = {	/* Regis display controls	*/
+	"W(I0)",			/*  0 == black			*/
+	"W(I1)W(P6)",			/*  1 == dim,  sparse dots	*/
+	"W(I1)W(P4)",			/*  2 == dim,  half-dense dots	*/
+	"W(I1)W(P5)",			/*  3 == dim,  dense dots	*/
+	"W(I1)W(P1)",			/*  4 == dim,  full line	*/
+	"W(I2)W(P6)",			/*  5 == mid,  sparse dots	*/
+	"W(I2)W(P4)",			/*  6 == mid,  half-dense dots	*/
+	"W(I2)W(P5)",			/*  7 == mid,  dense dots	*/
+	"W(I2)W(P1)",			/*  8 == mid,  full line	*/
+	"W(I3)W(P6)",			/*  9 == full, sparse dots	*/
+	"W(I3)W(P4)",			/* 10 == full, half-dense dots	*/
+	"W(I3)W(P5)",			/* 11 == full, dense dots	*/
+	"W(I3)W(P1)",			/* 12 == full, full line	*/
+};
+
+dsp_draw(density, length)
+int		density;
+int		length;
+/*
+ * Draw a line of this density.
+ * On entrance, cursor is at the left edge of the line.
+ * Leave the cursor at the end of the line.
+ */
+{
+	if (density < 0)
+	    density = 0;
+	else if (density >= GRAY_SCALE)
+	    density = GRAY_SCALE - 1;
+	printf("%sV[+%d]", dens_command[density], length);
+}
+
+
+dsp_text(row, col, text)
+int		row, col;
+char		*text;		/* Must not contain a single quote "'"	*/
+{
+	dsp_move(row, col);
+	printf("T'%s'", text);
+}
+
+dsp_line(xfrom, yfrom, xto, yto)
+int		xfrom, yfrom;
+int		xto,   yto;
+/*
+ * Draw a line
+ */
+{
+	dsp_move(xfrom, yfrom);
+	printf("V[%d,%d]", xto, yto);
+}
+------ EOF ------
+ls -l manregis.c
+cat >manscreen.c <<'------ EOF ------'
+/*
+ * (Textual) screen handling for Mandelbrot programs.
+ * Also prompt/input routines and some other junk.
+ */
+
+#include		<stdio.h>
+#include		<ctype.h>
+#ifdef vms
+#include		errno
+#define	IO_ERROR	errno
+#endif
+#define FALSE	0
+#define TRUE	1
+#define	EOS	'\0'
+
+extern char		line[];		/* General scratch (input line)	*/
+extern double		atof();
+extern char		*strchr();
+
+/*
+ * Prompt and read (integer/real/complex/string)
+ */
+
+getint(row, prompt, result, def_value, max_value)
+int		row;
+char		*prompt;
+int		*result;
+int		def_value;
+int		max_value;
+{
+again:	*result = def_value;
+	if (isatty(fileno(stdin))) {
+	    scr_move(row, 1);
+	    scr_eol();
+	    printf("%s (0:%d) <%d>: ",
+		prompt, max_value, def_value);
+	    fflush(stdout);
+	}
+	if (gets(line) == NULL)
+	    return (FALSE);
+	if (line[0] != EOS)
+	    *result = atoi(line);
+	if (*result < 0 || *result > max_value) {
+	    printf("\nvalue %d out of range 0 .. %d, try again",
+		*result, max_value);
+	    scr_eol();
+	    goto again;
+	}
+	return (TRUE);
+}
+
+int
+getdouble(row, prompt, result)
+int		row;
+char		*prompt;
+double		*result;
+{
+again:	if (isatty(fileno(stdin))) {
+	    scr_move(row, 1);
+	    scr_eol();
+	    printf("%s: ", prompt);
+	    fflush(stdout);
+	}
+	if (gets(line) == NULL)
+	    return (FALSE);
+	if (line[0] == EOS) {
+	    printf("No default permitted, try again\n");
+	    goto again;
+	}
+	*result = atof(line);
+	return (TRUE);
+}
+
+getcomplex(row, prompt, real, imag)
+int		row;
+char		*prompt;
+double		*real, *imag;
+{
+	register char	*lp;
+
+again:	if (isatty(fileno(stdin))) {
+	    scr_move(row, 1);
+	    scr_eol();
+	    printf("%s: ", prompt);
+	    fflush(stdout);
+	}
+	if (gets(line) == NULL)
+	    return (FALSE);
+	else if (line[0] == EOS) {
+	    printf("No default permitted, try again\n");
+	    goto again;
+	}
+	else if ((lp = strchr(line, ',')) == NULL) {
+	    printf("Need two values, separated by a comma\n");
+	    goto again;
+	}
+	*lp = EOS;
+	*real = atof(line);
+	*imag = atof(lp + 1);
+	return (TRUE);
+}
+
+getstring(row, prompt, result, def_value)
+int		row;
+char		*prompt;
+char		*result;
+char		*def_value;
+{
+	strcpy(result, def_value);
+	if (isatty(fileno(stdin))) {
+	    scr_move(row, 1);
+	    scr_eol();
+	    printf("%s <%s>: ", prompt, result);
+	    fflush(stdout);
+	}
+	if (gets(line) == NULL)
+	    return (FALSE);
+	if (line[0] != EOS)
+	    strcpy(result, line);
+	return (TRUE);
+}
+
+/*
+ * Display routines (text -- for commands)  These assume ANSI controls:
+ *	scr_clear()	Clear screen, Home cursor
+ *	scr_home()	Home cursor
+ *	scr_move(r,c)	Move to row r, column c (upper-left == 1,1)
+ *	scr_eol()	Clear to end of line
+ */
+
+scr_clear()
+{
+	scr_home();
+	printf("\033[2J");			/* ANSI Erase display	*/
+	printf("\033[?25h");			/* DEC force cursor on	*/
+}
+
+scr_home()
+{
+	scr_move(1, 1);
+}
+
+scr_move(row, col)
+{
+	printf("\033[%d;%dH", row, col);	/* ANSI Cursor Position	*/
+}
+
+scr_eol()
+{
+	printf("\033[K");			/* ANSI Erase Line	*/
+}
+
+FILE *
+fcreate(fname)
+char		*fname;
+/*
+ * Create a text file
+ */
+{
+	register FILE	*fd;
+#ifdef vms
+	/*
+	 * This creates files in vanilla RMS on VMS V2
+	 */
+	int		channel;
+	extern FILE *fdopen();
+
+	if ((channel = creat(fname, 0, "rat=cr", "rfm=var")) == -1
+	 || (fd = fdopen(channel, "w")) == NULL) {
+	    perror(fname);
+	    return (NULL);
+	}
+#else
+	if ((fd = fopen(fname, "w")) == NULL) {
+	    perror(fname);
+	    return (NULL);
+	}
+#endif
+	return (fd);
+}
+
+------ EOF ------
+ls -l manscreen.c
+
+

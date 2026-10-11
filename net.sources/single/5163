@@ -1,0 +1,1428 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,33d5d5305f2eabe,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-11-25 15:53:53 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!mnetor!seismo!mcvax!guido
+From: guido@mcvax.cwi.nl (Guido van Rossum)
+Newsgroups: net.sources
+Subject: undig(estify) -- a digest pager; saves/replies to each message
+Message-ID: <7179@boring.mcvax.cwi.nl>
+Date: Tue, 25-Nov-86 18:53:53 EST
+Article-I.D.: boring.7179
+Posted: Tue Nov 25 18:53:53 1986
+Date-Received: Wed, 26-Nov-86 03:54:01 EST
+Reply-To: guido@mcvax.cwi.nl
+Followup-To: net.sources.d
+Organization: CWI, Amsterdam
+Lines: 1407
+
+More public domain software from
+
+	Guido van Rossum, CWI, Amsterdam <guido@mcvax.uucp>
+
+: This is a shell archive.
+: Extract with 'sh this_file'.
+echo 'Start of pack.out, part 01 out of 01:'
+echo 'x - Makefile'
+sed 's/^X//' > 'Makefile' << 'EOF'
+XCFLAGS=	-O
+XLDFLAGS=
+XOBJS=	undig.o pager.o special.o io.o
+XFILES=	README Makefile undig.1 stuff.h undig.h undig.c pager.c special.c io.c
+XLIBS=	-ltermcap
+XDESTBIN=$$HOME/bin
+XDESTMAN=$$HOME/man
+X
+Xundig:	$(OBJS)
+X	$(CC) $(LDFLAGS) -o undig $(OBJS) $(LIBS)
+X
+Xall:	undig
+X
+Xinstall: undig undig.1
+X	cp undig $(DESTBIN)
+X	cp undig.1 $(DESTMAN)
+X
+Xcmp:	undig undig.1
+X	cmp undig $(DESTBIN)/undig
+X	cmp undig.1 $(DESTMAN)/undig.1
+X
+Xpack:	$(FILES)
+X	packmail $(FILES)
+EOF
+echo 'x - README'
+sed 's/^X//' > 'README' << 'EOF'
+XThis is a program to ease reading digests.  It was designed to be used
+Xfrom 'rn' when reading digestified newsgroups such as mod.computers.mac,
+Xbut could be applied to any message in digest format.
+X
+XFunctionality is a subset of 'more' (or paging mode in 'rn'), with one
+Ximportant extension: commands are provided to save individual messages
+Xto a file, pipe them to a command, or reply to them by mail.  Forward
+Xand backward movements are also geared towards the individual message as
+Xa basic unit.
+X
+XGenerally, the program should be much more parametrizable -- it has too
+Xmuch knowledge built in, like the set of 'uninteresting' mail/news
+Xheaders, how to recognize a new message in the digest.  But then, I
+Xdon't want to rewrite 'rn', do I?
+X
+XThe user interface issues could be a bit improved, but not much -- the
+Xprompt string could be more informative.
+X
+XPerformance shouldn't be a big issue, but the program certainly isn't
+Xbuilt for paging *huge* files -- althoug 1000-line digests should be
+Xhandled easily.  The basic problem is that the text of all messages is
+Xread in memory and never discarded, which makes for fast jumping around
+Xand simpler program logic, but could be a performance penalty for really
+Xbig digests.  Adaptation should be fairly easy, since the program has
+Xsome data structures that are prepared for throwing away the bulk data,
+Xand the seek address of each paragraph is already saved.  I doubt if
+Xit's worth the trouble, though.
+X
+XReal bugs: there is no check on exceeding of certain limits like the
+Xlist of blocks in mainloop, and maybe some string buffers.  Not all
+Xsystem calls are checked for errors; for example, write errors and ioctl
+Xcalls are unchecked (the latter may be a feature!).  Searching is a
+Xgross hack.
+EOF
+echo 'x - io.c'
+sed 's/^X//' > 'io.c' << 'EOF'
+X#include "undig.h"
+X
+XFILE *infp= NULL; /* Input file pointer. */
+X
+X/* Memory allocation. */
+X
+Xchar *
+Xgetmem(n)
+X	int n;
+X{
+X	char *p= malloc(n);
+X	if (p == NULL)
+X		fatal("out of memory");
+X	return p;
+X}
+X
+X/* Create a new line object. */
+X
+Xstruct line *
+Xgrabline(indent, text)
+X	int indent;
+X	char *text;
+X{
+X	struct line *p= (struct line *) getmem(sizeof(struct line));
+X	
+X	p->indent= indent;
+X	p->text= text;
+X	p->next= NULL;
+X	return p;
+X}
+X
+X/* Free the memory held by a line object and its followers. */
+X
+Xfreeline(p)
+X	struct line *p;
+X{
+X	struct line *q;
+X	
+X	while (p != NULL) {
+X		q= p->next;
+X		if (p->text != NULL)
+X			free(p->text);
+X		free((char *)p);
+X		p= q;
+X	}
+X}
+X
+X/* Input a text line, return a new struct line object. */
+X
+Xstruct line *
+Xgetline()
+X{
+X	struct line *p;
+X	char buf[BUFSIZ];
+X	char *cp, *cq;
+X	int i, len;
+X	
+X	if (fgets(buf, sizeof buf, infp) == NULL)
+X		return NULL;
+X	i= 0;
+X	for (cp= buf; *cp == ' ' || *cp == '\t'; ++cp) {
+X		if (*cp == '\t')
+X			i= (i/TABSTOP + 1) * TABSTOP;
+X		else /* *cp == ' ' */
+X			++i;
+X	}
+X	cq= index(cp, '\n');
+X	if (cq != NULL) {
+X		while (cq > cp && isspace(cq[-1]))
+X			--cq;
+X		len= cq-cp;
+X	}
+X	else {
+X		int c;
+X		len= strlen(cp);
+X		while ((c= getc(infp)) != '\n' && c != EOF)
+X			;
+X	}
+X	if (len > 0) {
+X		cp[len]= EOS;
+X		cq= getmem(len+1);
+X		strcpy(cq, cp);
+X	}
+X	else {
+X		i= 0;
+X		cq= NULL;
+X	}
+X	return grabline(i, cq);
+X}
+X
+X/* Read the next text block. */
+X
+Xgetblock(bp)
+X	struct block *bp;
+X{
+X	struct line *p;
+X	struct line **pp;
+X	
+X	bp->top= NULL;
+X	bp->lead= 0;
+X	pp= &bp->top;
+X	bp->class= EOF; /* Default */
+X	for (;;) {
+X		bp->seekaddr= ftell(infp);
+X		p= getline();
+X		if (p == NULL)
+X			return;
+X		if (p->text != 0)
+X			break;
+X		freeline(p);
+X		++bp->lead;
+X	}
+X	for (;;) {
+X		*pp= p;
+X		pp= &p->next;
+X		p= getline();
+X		if (p == NULL)
+X			break;
+X		if (p->text == NULL) {
+X			freeline(p);
+X			ungetc('\n', infp);
+X			break;
+X		}
+X	}
+X	bp->class= classify(bp->top);
+X}
+X
+X/* Classify a text block. */
+X
+Xint
+Xclassify(p)
+X	struct line *p;
+X{
+X	bool subject= NO;
+X	bool from= NO;
+X	
+X	if (p == NULL)
+X		return EOF;
+X	do {
+X		if (!isheader(p))
+X			return TEXT;
+X		if (strncmp("Subject:", p->text, 8) == 0)
+X			subject= YES;
+X		else if (strncmp("From:", p->text, 5) == 0)
+X			from= YES;
+X		do {
+X			p= p->next;
+X			if (p == NULL)
+X				break;
+X		} while (iscont(p));
+X	} while (p != NULL);
+X	if (from || subject)
+X		return HEADER;
+X	else
+X		return TEXT; /* Garbage conforming to header syntax. */
+X}
+X
+Xbool
+Xisheader(p)
+X	struct line *p;
+X{
+X	char *cp;
+X	
+X	if (p == NULL || p->indent != 0 || p->text == NULL)
+X		return NO;
+X	cp= p->text;
+X	while (isalnum(*cp) || *cp == '-' || *cp == '.')
+X		++cp;
+X	return *cp == ':' && isspace(cp[1]);
+X}
+X
+Xbool
+Xiscont(p)
+X	struct line *p;
+X{
+X	return p != NULL && p->indent > 0;
+X}
+X
+X/* Output routine. (Should skip uninteresting headers.) */
+X
+Xbool nospace= NO;
+X
+X/* Output a text block. */
+X
+Xbool
+Xputblock(bp)
+X	struct block *bp;
+X{
+X	int i;
+X	struct line *p;
+X	
+X	if (!nospace) {
+X		p= grabline(0, (char *) NULL);
+X		for (i= bp->lead; --i >= 0;) {
+X			if (!pageline(p))
+X				return NO;
+X		}
+X		freeline(p);
+X	}
+X	if (bp->class == HEADER) {
+X		for (p= bp->top; p != NULL; ) {
+X			bool ok= interesting(p);
+X			for (;;) {
+X				if (ok && !pageline(p))
+X					return NO;
+X				p= p->next;
+X				if (p == NULL || !iscont(p))
+X					break;
+X			}
+X		}
+X	}
+X	else {
+X		for (p= bp->top; p != NULL; p= p->next) {
+X			if (!pageline(p))
+X				return NO;
+X		}
+X	}
+X	return YES;
+X}
+X
+X/* Table giving headers that we want to skip. */
+X
+Xchar *uninteresting[]= {
+X	"Approved:",
+X	"Article-I.D.:",
+X	"Date-Received:",
+X	"Distribution:",
+X	"Lines:",
+X	"Message-ID:",
+X	"Newsgroups:",
+X	"Organization:",
+X	"Path:",
+X	"Posted:",
+X	"References:",
+X	"Relay-Version:",
+X	"Sender:",
+X	NULL
+X};
+X
+X/* Interesting headers are those not in the above list. */
+X
+Xbool
+Xinteresting(p)
+X	struct line *p;
+X{
+X	int i;
+X	
+X	for (i= 0; uninteresting[i] != NULL; ++i) {
+X		if (strncmp(uninteresting[i], p->text,
+X				strlen(uninteresting[i])) == 0)
+X			return NO;
+X	}
+X	return YES;
+X}
+EOF
+echo 'x - pager.c'
+sed 's/^X//' > 'pager.c' << 'EOF'
+X#include "undig.h"
+X
+X#include <sgtty.h>
+X#include <signal.h>
+X
+X/* Screen dimensions. */
+X
+Xint lines= 24;
+Xint cols= 80;
+X
+X/* Pager parameters */
+X
+Xbool pageclear= NO;
+Xbool messclear= NO;
+X
+Xint pagesize= 23; /* Normal paging amount */
+Xint halfsize= 11; /* Half paging amount */
+Xint startsize= 7; /* Paging amount for message start */
+X
+Xint left= 23; /* Number of lines left on current page. */
+Xbool needclear= NO; /* Should clear screen before next output line. */
+X
+Xchar clearhomestr[100]; /* How to clear the screen */
+X
+X/* Read screen size and clear/home sequence from termcap and ioctl. */
+X
+Xbool
+Xpreset()
+X{
+X	char tcbuf[1024];
+X	char *term= getenv("TERM");
+X	char *cp;
+X	int i;
+X	
+X	if (term == NULL || term[0] == EOS)
+X		return NO;
+X	if (tgetent(tcbuf, term) != 1)
+X		return NO;
+X	cp= clearhomestr;
+X	(void) tgetstr("cl", &cp);
+X	i= tgetnum("li");
+X	if (i > 0)
+X		lines= i;
+X	i= tgetnum("co");
+X	if (i > 0)
+X		cols= i;
+X#ifdef TIOCGWINSZ
+X	{
+X		struct winsize w;
+X		
+X		if (ioctl(fileno(stdout), TIOCGWINSZ, &w) == 0) {
+X			if (w.ws_row > 0)
+X				lines= w.ws_row;
+X			if (w.ws_col > 0)
+X				cols= w.ws_col;
+X		}
+X	}
+X#endif
+X	pagesize= lines-1;
+X	if (pagesize < 1)
+X		pagesize= 1;
+X	halfsize= pagesize/2;
+X	if (halfsize < 1)
+X		halfsize= 1;
+X	startsize= pagesize/3;
+X	if (startsize < 7)
+X		startsize= halfsize;
+X	return YES;
+X}
+X
+X/* TTY and signal handling. */
+X
+Xstruct sgttyb ttyold, ttynew;
+Xbool cbreak= NO;
+X
+Xhandler(sig)
+X	int sig;
+X{
+X	ttyreset();
+X	signal(sig, SIG_DFL); /* So the kill takes effect immediately */
+X	kill(getpid(), sig); /* Pretend we died of the signal after all */
+X	exit(1); /* If the kill doesn't work */
+X}
+X
+Xttyset()
+X{
+X	if (cbreak)
+X		return;
+X	signal(SIGINT, handler);
+X	signal(SIGTERM, handler);
+X	signal(SIGPIPE, handler);
+X	gtty(fileno(stdin), &ttyold);
+X	ttynew= ttyold;
+X	ttynew.sg_flags &= ~ECHO;
+X	ttynew.sg_flags |= CBREAK;
+X	cbreak= YES;
+X	stty(fileno(stdin), &ttynew);
+X}
+X
+Xttyreset()
+X{
+X	if (cbreak)
+X		stty(fileno(stdin), &ttyold);
+X	cbreak= NO;
+X}
+X
+Xclearhome()
+X{
+X	fputs(clearhomestr, stdout);
+X	needclear= NO;
+X}
+X
+X/* Input a line, echoing characters.
+X   Return YES if ok, NO if backspaced beyond begin of line. */
+X
+Xbool
+Xttygets(line, len)
+X	char *line;
+X	int len;
+X{
+X	int i= 0;
+X	bool ok= YES;
+X	int c;
+X	
+X	for (;;) {
+X		c= getc(stdin);
+X		switch (c) {
+X		
+X		case '\r':
+X		case '\n':
+X		case EOF:
+X			putchar('\n');
+X			line[i]= EOS;
+X			break;
+X			
+X		default:
+X			if (c == ttynew.sg_erase) {
+X				if (--i < 0) {
+X					ok= NO;
+X					break;
+X				}
+X				printf("\b \b");
+X			}
+X			else if (c == ttynew.sg_kill) {
+X				putchar('\n');
+X				i= 0;
+X			}
+X			else if (i < len-1) {
+X				putchar(c);
+X				line[i++]= c;
+X			}
+X			else
+X				putchar(CTL('G'));
+X			continue;
+X		}
+X		break;
+X	}
+X	return ok;
+X}
+X
+X/* Output a line, filtered through the pager.
+X   Return YES if output OK, NO if pager wants to stop. */
+X
+Xbool
+Xpageline(p)
+X	struct line *p;
+X{
+X	int need;
+X	
+X	need= needlines(p);
+X	if (left < need) {
+X		if (!pagecmd())
+X			return NO;
+X	}
+X	if (needclear)
+X		clearhome();
+X	left -= need;
+X	putline(p, stdout);
+X	if (p->text != NULL && index(p->text, '\014') != NULL)
+X		left= 0; /* Force pager prompt after ^L in a line. */
+X	return YES;
+X}
+X
+X/* Output a text line to a file. */
+X
+Xputline(p, fp)
+X	struct line *p;
+X	FILE *fp;
+X{
+X	int i;
+X	
+X	for (i= p->indent % cols; i >= TABSTOP; i -= TABSTOP)
+X		putc('\t', fp);
+X	while (--i >= 0)
+X		putc(' ', fp);
+X	if (p->text != NULL)
+X		fputs(p->text, fp);
+X	putc('\n', fp);
+X}
+X
+X/* Count the number of screen lines needed for a struct line. */
+X
+Xint
+Xneedlines(p)
+X	struct line *p;
+X{
+X	char *cp;
+X	int i;
+X	
+X	if (p == NULL)
+X		return 0;
+X	i= p->indent % cols;
+X	cp= p->text;
+X	if (cp != NULL) {
+X		for (; *cp != NULL; ++cp) {
+X			if (*cp == '\t')
+X				i= (i/TABSTOP + 1)*TABSTOP;
+X			else if (*cp == '\b') {
+X				if (i > 0)
+X					--i;
+X			}
+X			else
+X				++i;
+X		}
+X	}
+X	return i/cols + 1;
+X}
+X
+X/* Pager command input.  Returns YES if ok to output next line. */
+X
+Xint lastcmd= ' '; /* Passes char typed by user to higher levels. */
+Xchar cmdarg[256]; /* Parameter for cmds like 'w', '!' */
+X
+Xbool
+Xpagecmd()
+X{
+X	bool ok= YES;
+X	
+X	ttyset();
+X	for (;;) {
+X		printf("\r:");
+X		lastcmd= getc(stdin);
+X		switch (lastcmd) {
+X		
+X		case '/':
+X		case '?':
+X		case 's':
+X		case 'w':
+X		case '|':
+X		case '!':
+X			putchar(lastcmd);
+X			if (!ttygets(cmdarg, sizeof cmdarg)) {
+X				printf("\b \b");
+X				continue;
+X			}
+X			if (lastcmd == '!') {
+X				shell(cmdarg);
+X				continue;
+X			}
+X			/* Fall through (twice!) */
+X		case 'r':
+X		case 'R':
+X		case 'f':
+X		case 'F':
+X		case EOF:
+X		case 'q':
+X		case 'n':
+X		case 'N':
+X		case CTL('N'):
+X		case CTL('R'):
+X		case CTL('L'):
+X		case 'v':
+X		case 'p':
+X		case 'P':
+X		case CTL('P'):
+X		case '-':
+X		case 'b':
+X		case CTL('B'):
+X		case '^':
+X			ok= NO;
+X			/* Fall through */
+X		case ' ':
+X			left= pagesize;
+X			if (pageclear)
+X				needclear= YES;
+X			break;
+X
+X		case '\n':
+X		case '\r':
+X			left= 1;
+X			break;
+X
+X		case 'd':
+X		case CTL('D'):
+X			left= halfsize;
+X			break;
+X		
+X		case 'h':
+X			help();
+X			continue;
+X			
+X		default:
+X			putchar(CTL('G'));
+X			continue;
+X		
+X		}
+X		break;
+X	}
+X	printf("\r \r");
+X	fflush(stdout);
+X	return ok;
+X}
+X
+Xhelp()
+X{
+X	printf("\r...help for Undigestify...\n");
+X	printf("Paging commands:\n");
+X	printf("h\thelp\n");
+X	printf("SP\tdisplay next page\n");
+X	printf("d\tdisplay next half page\n");
+X	printf("CR\tdisplay next line\n");
+X	printf("!\tshell escape\n");
+X	printf("Message commands:\n");
+X	printf("n\tdisplay next unseen message\n");
+X	printf("N\tdisplay next message\n");
+X	printf("p\tdisplay previous message\n");
+X	printf("^R\tredisplay current message\n");
+X	printf("-\ttoggle between current and previously displayed message\n");
+X	printf("^\tdisplay first message\n");
+X	printf("/,?\tsearch forward, backward for string\n");
+X	printf("s,w,|\tsave, write to file, pipe to command\n");
+X	printf("r\treply by mail to current message\n");
+X	printf("q\tquit\n");
+X	printf("...end help...\n");
+X}
+X
+X/* Shell escape. */
+X
+Xshell(command)
+X	char *command;
+X{
+X	ttyreset();
+X	system(command);
+X	ttyset();
+X}
+X
+X/* Exit from the program. */
+X
+Xbye(status)
+X	int status;
+X{
+X	ttyreset();
+X	exit(status);
+X	/*NOTREACHED*/
+X}
+EOF
+echo 'x - special.c'
+sed 's/^X//' > 'special.c' << 'EOF'
+X#include "undig.h"
+X
+X#include <signal.h>
+X
+X/* The following routines assume that the message is contained in
+X   bp[0], bp[1], ..., bp[nblocks-1], and that bp[0] is the header. */
+X
+Xchar *mailer= "Rnmail -h %s %s";
+X
+X/* Save, write, pipe to command. */
+X
+Xbool
+Xsaveetc(bp, nblocks)
+X	struct block *bp;
+X	int nblocks;
+X{
+X	char *cp;
+X	FILE *fp;
+X	int i;
+X	bool pipe= lastcmd == '|';
+X	bool noheaders= lastcmd == 'w';
+X	int (*oldhandler)();
+X	
+X	cp= cmdarg;
+X	while (*cp != EOS && isspace(*cp))
+X		++cp;
+X	if (*cp == EOS)
+X		return NO;
+X	if (!pipe && *cp == '|') {
+X		pipe= YES;
+X		++cp;
+X	}
+X	if (pipe)
+X		fp= popen(cp, "w");
+X	else
+X		fp= fopen(cp, "a");
+X	if (fp == NULL) {
+X		perror(cp);
+X		return NO;
+X	}
+X	if (pipe)
+X		oldhandler= signal(SIGPIPE, SIG_IGN);
+X		/* Avoid dying of broken pipe */
+X	if (!pipe && ftell(fp) > 0)
+X		printf("Appending\n");
+X	i= 0 + noheaders;
+X	for (; i < nblocks; ++i) {
+X		int j;
+X		struct line *p;
+X		
+X		if (i > 0) {
+X			for (j= bp[i].lead; --j >= 0; )
+X				putc('\n', fp);
+X		}
+X		for (p= bp[i].top; p != NULL; p= p->next)
+X			putline(p, fp);
+X	}
+X	/* Append two blank lines, like rn does (why, though?) */
+X	putc('\n', fp);
+X	putc('\n', fp);
+X	fflush(fp);
+X	if (pipe) {
+X		pclose(fp);
+X		signal(SIGPIPE, oldhandler);
+X	}
+X	else
+X		fclose(fp);
+X	return YES;
+X}
+X
+X/* Reply and follow up. */
+X
+Xbool
+Xreplyetc(bp, nblocks)
+X	struct block *bp;
+X	int nblocks;
+X{
+X	char header[20];
+X	char command[100];
+X	FILE *fp;
+X	
+X	if (lastcmd == 'f' ||lastcmd == 'F') {
+X		printf("Sorry, follow up not implemented\n");
+X		return YES;
+X	}
+X	strcpy(cmdarg, "/tmp/@undigXXXXXX");
+X	mktemp(cmdarg);
+X	lastcmd= 's';
+X	if (!saveetc(bp, nblocks)) {
+X		unlink(cmdarg);
+X		return NO;
+X	}
+X	strcpy(header, "/tmp/@undigXXXXXX");
+X	mktemp(header);
+X	fp= fopen(header, "w");
+X	if (fp == NULL) {
+X		perror(header);
+X		unlink(cmdarg);
+X		return NO;
+X	}
+X	replyheader(bp->top, fp);
+X	fclose(fp);
+X	sprintf(command, mailer, header, cmdarg);
+X	printf("Executing: %s\n", command);
+X	shell(command);
+X	unlink(cmdarg);
+X	unlink(header);
+X	return YES;
+X}
+X
+X/* Header manipulation stuff */
+X
+X#define IsSubject(s) (strncmp(s, "Subject:", 8) == 0)
+X#define IsFrom(s) (strncmp(s, "From:", 5) == 0)
+X#define IsReplyTo(s) (strncmp(s, "Reply-To:", 9) == 0)
+X#define IsRe(s) (strncmp(s, "Re:", 3) == 0)
+X
+Xchar *
+Xstrip(s)
+X	char *s;
+X{
+X	while (*s != ':') {
+X		if (*s == EOS)
+X			return s;
+X		++s;
+X	}
+X	++s;
+X	while (*s != EOS && !isspace(*s))
+X		++s;
+X	return s;
+X}
+X
+X/* Construct a header suitable for a reply. */
+X
+Xreplyheader(p, fp)
+X	struct line *p;
+X	FILE *fp;
+X{
+X	char *subject= NULL;
+X	char *from= NULL;
+X	char *replyto= NULL;
+X	struct line *q;
+X	
+X	for (q= p; q != NULL; q= q->next) {
+X		if (q->indent != 0)
+X			continue;
+X		if (IsSubject(q->text))
+X			subject= q->text;
+X		else if (IsFrom(q->text))
+X			from= q->text;
+X		else if (IsReplyTo(q->text))
+X			replyto= q->text;
+X	}
+X	fprintf(fp, "To: ");
+X	if (replyto == NULL)
+X		replyto= from;
+X	if (replyto != NULL)
+X		fprintf(fp, "%s", strip(replyto));
+X	fprintf(fp, "\nSubject: ");
+X	if (subject != NULL) {
+X		subject= strip(subject);
+X		if (IsRe(subject))
+X			subject= strip(subject);
+X		fprintf(fp, "Re: %s", subject);
+X	}
+X	fprintf(fp, "\n\n\n");
+X}
+X
+X/* String search. */
+X
+Xchar pattern[256];
+X
+Xsearch(list, pnlist, pcur)
+X	struct block *list;
+X	int *pnlist;
+X	int *pcur;
+X{
+X	int nlist= *pnlist;
+X	int cur= *pcur;
+X	bool reverse= (lastcmd == '?');
+X	struct line *p, *found;
+X	char *cp;
+X	
+X	cp= cmdarg + strlen(cmdarg);
+X	if (cp > cmdarg && cp[-1] == lastcmd)
+X		*--cp= EOS;
+X	if (cmdarg[0] != EOS)
+X		strcpy(pattern, cmdarg);
+X	else if (pattern[0] == EOS) {
+X		printf("No previous search string\n");
+X		return NO;
+X	}
+X		
+X	if (list[cur].class == EOF) {
+X		if (reverse)
+X			--cur;
+X		else
+X			return NO;
+X	}
+X	
+X	for (;;) {
+X		found= NULL;
+X		for (p= list[cur].top; p != NULL; p= p->next) {
+X			if (match(p->text)) {
+X				found= p;
+X				if (!reverse)
+X					break;
+X			}
+X		}
+X		if (found != NULL)
+X			break;
+X		if (reverse) {
+X			if (--cur == 0)
+X				return NO;
+X		}
+X		else {
+X			if (++cur >= nlist) {
+X				getblock(&list[cur= *pnlist= nlist++]);
+X				if (list[cur].class == EOF)
+X					return NO;
+X			}
+X		}
+X	}
+X
+X	*pcur= cur;
+X	for (p= found; p != NULL; p= p->next) {
+X		if (!pageline(p))
+X			return NO;
+X	}
+X	return YES;
+X}
+X
+X/* String matcher, slow but secure.
+X   Line is case-folded; pattern is assumed to be all lower case. */
+X
+Xbool
+Xmatch(line)
+X	char *line;
+X{
+X	char *p, *q;
+X	char c1, c2;
+X	
+X	for (;; ++line) {
+X		for (p= line, q= pattern;; ++p, ++q) {
+X			c1= *p;
+X			c2= *q;
+X			if (c2 == EOS)
+X				return YES;
+X			if (c1 == EOS)
+X				return NO;
+X			if (c1 == c2 || isupper(c1) && tolower(c1) == c2)
+X				continue;
+X			break;
+X		}
+X	}
+X	/*NOTREACHED*/
+X}
+EOF
+echo 'x - stuff.h'
+sed 's/^X//' > 'stuff.h' << 'EOF'
+X#include <stdio.h>
+X#include <ctype.h>
+X
+Xtypedef int bool;
+X#define YES 1
+X#define NO  0
+X
+X#define EOS '\0'
+X#define EOL '\n'
+X
+X#define CTL(c) ((c)&037)
+X
+Xchar *malloc(), *realloc();
+Xchar *getenv();
+Xchar *tgetstr();
+Xchar *index(), *rindex();
+XFILE *popen();
+X
+Xextern char *optarg;
+Xextern int optind;
+EOF
+echo 'x - undig.1'
+sed 's/^X//' > 'undig.1' << 'EOF'
+X.TH UNDIG 1 local
+X.SH NAME
+Xundig \- undigestifying pager
+X.SH SYNOPSIS
+X.B undig
+X[
+X.B -{zhs}
+X.I size
+X] [
+X.B -m
+X.I mailer
+X] [
+X.B -p
+X] [
+X.B -P
+X] [
+X.I file
+X]
+X.SH DESCRIPTION
+X.I Undig
+Xis a modest paging program like
+X.IR more (1),
+Xwhich has one shining extension: it recognizes individial messages in an
+XARPA-net style digest (actually any concatenation of mail or news
+Xmessages with Subject intact).
+XIt is possible to skip to the next and previous message, to save a message
+Xto a file, pipe it through a command or reply to it by mail.
+X.PP
+XCommands are in
+X.IR rn (1)-style
+X(which itself implements an extension of a subset of the commands of
+X.IR more (1)).
+XType
+X.I h
+Xfor a command list.
+X.PP
+X.I Undig
+Xpages the file given as argument, or its standard input if no argument.
+XStandard input may come from a pipe without loss of functionality.
+XOptions recognized are the following:
+X.IP "\f3-z\fP \f2size\fP, \f3-h\fP \f2size\fP, \f3-s\fP \f2size\fP"
+XSet the number of lines for a full page (-z), a half page (-z) and the
+Xnumber of lines displayed at the start of a message.
+XThe defaults are the terminal's screen size minus 1, half that, and
+Xone third, respectively.
+X.IP "\f3-m\fP \f2mailer\f"
+XSets the command used to reply to a message.
+X.I Mailer
+Xshould be a printf format string with one or two %s escapes.
+XThe first is replaced by a file containing the proposed headers for the
+Xreply, the second by a file containing the oroginal message.
+XThe default is ``Rnmail -h %s %s''.
+X.IP \f3-p\fP
+XCauses the screen to be cleared before each new message is printed.
+X.IP \f3-P\fP
+XCauses the screen to be cleared before a full page is printed.
+X.SH FILES
+X/dev/tty
+X.br
+X/tmp/@undig*
+X.br
+XRnmail
+X.SH SEE ALSO
+Xrn(1), more(1), less(1), Rnmail(1), mail(1), mh(1)
+X.SH DIAGNOSTICS
+XComplaints about bad command line options and files it can't open.
+X.br
+XBeeps for unknown commands.
+X.SH BUGS
+XIt should have more parameters, notably in the area of message
+Xrecognition and header processing.
+X.br
+XSome internal buffers are not checked for overflow (but it is unlikely
+Xto hit the limits with ordinary digests).
+X.br
+XWrite errors and the like go undetected.
+X.br
+XOn terminals with certain kinds of `magic' in their line wrapping,
+Xthe space needed by lines that are multiple of the screen width long is
+Xcalculated wrong.
+XThis may cause the pager to prompt too early (never too late).
+X.br
+XControl characters in the file are not suppressed, so beware of escape
+Xsequences.
+X.br
+XMessages written to files have the leading white space of each line
+X`normalized', i.e., tabs are substituted for strings of spaces whenever
+Xpossible.
+X.br
+XString searching has various limitations and bugs which you should find
+Xout for yourself.
+EOF
+echo 'x - undig.c'
+sed 's/^X//' > 'undig.c' << 'EOF'
+X/* Undig(estify) -- a pager for digest articles.
+X   It has some knowledge about digest formats in it,
+X   and can skip forward and backward sections.
+X   BUGS:
+X	- no check on overflow of block list in mainloop!
+X   	- echoing of control characters in ttygets is dumb
+X   	- reverse searching findes the same string over and over
+X   TO DO:
+X   	- implement follow up?
+X   	- fix the logic for searching (rearrange main loop again...)
+X   	- searching should not headers it has skipped
+X   	- searching should show a few lines before the match
+X   	- output control characters as ^L etc.
+X   	- prompt with line number and/or percentage
+X   	- make more parametrizable (headers to skip, etc.)
+X   	- maybe add commands to:
+X   		- summarize subjects (a la '=') ?
+X   		- go to random messages in the digest ?
+X   		- change some parameters ?
+X   	- purge text blocks from memory and reread when necessary
+X*/
+X
+X#include "undig.h"
+X
+X/* Main program. */
+X
+Xmain(argc, argv)
+X	int argc;
+X	char **argv;
+X{
+X	preset();
+X	getargs(argc, argv);
+X	mainloop();
+X	bye(0);
+X}
+X
+X/* Process command line arguments.  Must be called before any I/O is done
+X   on stdin, since it may open another file on file descriptior 0. */
+X
+Xchar *progname= "undig";
+X
+Xgetargs(argc, argv)
+X	int argc;
+X	char **argv;
+X{
+X	int c;
+X	int i;
+X	
+X	if (argc > 0 && argv[0] != NULL && argv[0][0] != EOS) {
+X		progname= rindex(argv[0], '/');
+X		if (progname == NULL)
+X			progname= argv[0];
+X	}
+X	
+X	while ((c= getopt(argc, argv, "z:h:s:pPm:")) != EOF) {
+X		switch (c) {
+X		
+X		/* Pager size parameters */
+X		case 'z':
+X		case 'h':
+X		case 's':
+X			i= atoi(optarg);
+X			if (i <= 0)
+X				usage();
+X			switch (c) {
+X			case 'z': pagesize= i; break;
+X			case 'h': halfsize= i; break;
+X			case 's': startsize= i; break;
+X			}
+X			break;
+X		
+X		/* Set mailer */
+X		case 'm':
+X			mailer= optarg;
+X			break;
+X			
+X		/* Clear/home before new message */
+X		case 'p':
+X			messclear= YES;
+X			break;
+X			
+X		case 'P':
+X			pageclear= YES;
+X			break;
+X			
+X		/* Bad flag */
+X		default:
+X			usage();
+X			
+X		}
+X	}
+X
+X	if (pagesize >= lines)
+X		pagesize= lines-1;
+X	if (halfsize > pagesize)
+X		halfsize= pagesize;
+X	if (startsize > pagesize)
+X		startsize= pagesize;
+X		
+X	if (optind < argc) {
+X		if ((infp= fopen(argv[optind], "r")) == NULL) {
+X			perror(argv[optind]);
+X			exit(1);
+X		}
+X	}
+X	else {
+X		int fd= dup(0);
+X		
+X		if ((infp= fdopen(fd, "r")) == NULL)
+X			fatal("can't dup 0");
+X		close(0);
+X		if (open("/dev/tty", 0) != 0) {
+X			perror("/dev/tty");
+X			fatal("no tty");
+X		}
+X	}
+X}
+X
+X/* Command line error.  Print usage message and die. */
+X
+Xusage()
+X{
+X	fprintf(stderr,
+X		"usage: %s [-{zhs} size] [-m mailer] [-p] [-P] [file]\n",
+X		progname);
+X	exit(2);
+X}
+X
+X/* Fatal error.  Print message and die. */
+X
+Xfatal(message)
+X	char *message;
+X{
+X	fprintf(stderr, "%s: fatal error: %s\n", progname, message);
+X	bye(2);
+X}
+X
+X/* Main loop. */
+X
+Xmainloop()
+X{
+X	struct block list[1000];
+X	int nlist= 0;
+X	int cur= 0;
+X	int curhead= 0;
+X	int prevhead= 0;
+X	int lasthead= 0;
+X	bool prompt= NO;
+X	
+X	getblock(&list[cur= nlist++]);
+X	if (pageclear)
+X		needclear= YES;
+X	for (;;) {
+X		/* Page one message, until end or until stopped. */
+X		if (left > startsize)
+X			left= startsize;
+X		prevhead= curhead;
+X		curhead= cur;
+X		if (curhead > lasthead)
+X			lasthead= curhead;
+X		prompt= NO;
+X		if (messclear)
+X			needclear= YES;
+X horror:
+X		for (;;) {
+X			if (list[cur].class != EOF) {
+X				if (!putblock(&list[cur++]))
+X					break;
+X				if (cur >= nlist)
+X					getblock(&list[cur= nlist++]);
+X			}
+X			if (list[cur].class == EOF ||
+X					list[cur].class == HEADER) {
+X again:
+X				if (list[cur].class == EOF)
+X					printf("...end of digest...\n");
+X				else
+X					printf("...end of message...\n");
+X				(void) pagecmd();
+X				prompt= YES;
+X				if (cur > lasthead)
+X					lasthead= cur;
+X				break;
+X			}
+X			nospace= NO;
+X		}
+X		
+X		/* Move 'cur' to start of next message. */
+X		for (;;) {
+X			if (cur >= nlist)
+X				getblock(&list[cur= nlist++]);
+X			if (list[cur].class == EOF ||
+X					list[cur].class == HEADER)
+X				break;
+X			++cur;
+X		}
+X		
+X		/* Process the command that stopped the above loop. */
+X		switch (lastcmd) {
+X		
+X		/* Search for a string. */
+X		case '/':
+X		case '?':
+X			if (search(list, &nlist, &cur))
+X				goto horror;
+X			else
+X				goto again;
+X		
+X		/* Save or write message to file. */
+X		case 's':
+X		case 'w':
+X		case '|':
+X			saveetc(&list[curhead], cur-curhead);
+X			goto again;
+X			/* This command and the next differ from others
+X			   in that they want to stay at the end of the
+X			   current article.  The solution here is not quite
+X			   kosher, but it works... */
+X			
+X		/* Reply or follow up. */
+X		case 'r':
+X		case 'R':
+X		case 'f':
+X		case 'F':
+X			replyetc(&list[curhead], cur-curhead);
+X			goto again;
+X			
+X		/* To start of next message. */
+X		default: /* All forward paging commands, like SP, CR, ^D. */
+X		case 'N':
+X		case CTL('N'):
+X			if (prompt && list[cur].class == EOF)
+X				bye(0);
+X			if (!prompt)
+X				printf("...skipping...\n");
+X			break;
+X			
+X		/* Backup to begin of message. */
+X		case CTL('R'):
+X		case CTL('L'):
+X		case CTL('B'):
+X		case 'b':
+X			if (!prompt)
+X				printf("...same message...\n");
+X			cur= curhead;
+X			break;
+X			
+X		/* Backup to previous message. */
+X		case 'p':
+X		case 'P':
+X		case CTL('P'):
+X			if (curhead == 0) {
+X				printf("...begin of digest...\n");
+X				cur= 0;
+X			}
+X			else {
+X				if (!prompt)
+X					printf("...previous message...\n");
+X				cur= curhead-1;
+X				while (cur > 0 && list[cur].class != HEADER)
+X					--cur;
+X			}
+X			break;
+X			
+X		/* Quit. */
+X		case 'q':
+X		case EOF:
+X			bye(0);
+X			
+X		/* Toggle between current and previous message. */
+X		case '-':
+X			cur= prevhead;
+X			prevhead= curhead;
+X			curhead= cur;
+X			if (!prompt)
+X				printf("...alternate message...\n");
+X			break;
+X			
+X		/* Go to end of messages already seen. */
+X		case 'n':
+X			if (!prompt)
+X				printf("...next unseen message...\n");
+X			if (lasthead > curhead)
+X				cur= lasthead;
+X			break;
+X			
+X		/* Go to begin of digest. */
+X		case '^':
+X			if (!prompt)
+X				printf("...first message...\n");
+X			cur= 0;
+X			break;
+X		}
+X		nospace= YES;
+X	}
+X}
+EOF
+echo 'x - undig.h'
+sed 's/^X//' > 'undig.h' << 'EOF'
+X#include "stuff.h"
+X
+X#define TABSTOP		8	/* Size of a tab on the terminal. */
+X
+X/* List of text lines. */
+X
+Xstruct line {
+X	int indent;
+X	char *text;
+X	struct line *next;
+X};
+X
+X/* Storage for text blocks. */
+X
+Xstruct block {
+X	int lead;
+X	long seekaddr; /* Of first non-blank line! */
+X	struct line *top;
+X	int class;
+X};
+X
+X/* Text block classes. */
+X
+X#define HEADER		1
+X#define TEXT		2
+X
+X/* Global variables. */
+X
+Xextern int lastcmd;
+Xextern char cmdarg[];
+Xextern bool nospace;
+Xextern int left;
+Xextern int startsize;
+Xextern int halfsize;
+Xextern int pagesize;
+Xextern int lines;
+Xextern int cols;
+Xextern FILE *infp;
+Xextern bool messclear;
+Xextern bool pageclear;
+Xextern bool needclear;
+Xextern char *mailer;
+EOF
+echo 'Part 01 out of 01 of pack.out complete.'
+exit 0
+
+

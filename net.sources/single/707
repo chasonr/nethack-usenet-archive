@@ -1,0 +1,316 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,6f9e8faa7056409b,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-10-25 21:24:58 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site ut-sally.UUCP
+Path: utzoo!linus!decvax!harpo!floyd!clyde!ihnp4!ut-sally!riddle
+From: riddle@ut-sally.UUCP (Prentiss Riddle)
+Newsgroups: net.sources
+Subject: monitor.c -- a system status monitor
+Message-ID: <228@ut-sally.UUCP>
+Date: Wed, 26-Oct-83 00:24:58 EDT
+Article-I.D.: ut-sally.228
+Posted: Wed Oct 26 00:24:58 1983
+Date-Received: Fri, 21-Oct-83 06:23:31 EDT
+Organization: U. Texas CS Dept., Austin, Texas
+Lines: 296
+
+/*
+ *   monitor   831017   Prentiss Riddle
+ *
+ *   system status monitor
+ *
+ *   compilation:  "cc -o monitor monitor.c -lcurses -ltermlib"
+ *
+ *   * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ *
+ *   This routine is intended primarily to be used as an aid in debugging
+ *   multi-process systems, programs manipulating a lot of files in a direc-
+ *   tory, and the like.  I like to be running a program I'm working on at one
+ *   terminal while "monitor" is running on the next one to tell me what's
+ *   going on.  What it does is run a specified command over and over again,
+ *   displaying one screenful of the process's output at all times and using
+ *   cursor optimization to update the display with a minimum of distractions.
+ *
+ *   NOTE:  monitor runs in an infinite loop -- the only way to exit is with
+ *          the "break" key!
+ *
+ *
+ *   USAGE:   monitor [-] [-t] [-s sleep] [command]
+ *
+ *      -            yields a "usage" message.
+ *
+ *      -t           causes the clock time to appear in the upper right-
+ *                      hand corner of the display.
+ *
+ *      -s sleep     specifies the number of seconds to sleep between execu-
+ *                      tions of the "command".
+ *                      Default: 15.
+ *
+ *      command      command to be repeatedly executed.  If it contains
+ *                      pipes, semicolons or metacharacters it should be
+ *                      quoted.
+ *                      Default: 'ps -ua'
+ *
+ *
+ *   EXAMPLES:
+ *
+ *  The command
+ *
+ *       monitor -t -s 0 ps -aux
+ *
+ *  continuously displays the time of day and the first screenful of the
+ *  list of all processes on the system.  A more specialized command
+ *
+ *       monitor 'ls -aCF ; echo "" ; ps -u'
+ *
+ *   keeps me informed about the contents of my current working directory
+ *   and the status of all of my processes.
+ *
+ *   The program also has other potential applications.  People here at UT
+ *   who want to keep their terminals from being timed out often run shell
+ *   scripts equivalent to the following:
+ *
+ *       monitor -s 100 w
+ *
+ *   Finally, you can drive yourself crazy with:
+ *
+ *       monitor -t -s 5 'echo "" ; /usr/games/fortune'
+ *
+ *   * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ *
+ *   Address comments and complaints to:
+ *
+ *           Prentiss Riddle
+ *
+ *           1216-B W. 22nd
+ *           Austin, TX 78705
+ *
+ *           {ihnp4,kpno,ctvax}!ut-sally!riddle
+ *           riddle@ut-sally.UUCP
+ *
+ */
+
+#include <curses.h>
+#include <signal.h>
+
+#define   DEFTFLAG  FALSE    /* default "-t" option flag */
+#define   DEFSLEEP  15       /* default sleep time */
+#define   DEFCOM    "ps -u"  /* default command */
+#define   BIGSTRING 160      /* length of long strings */
+
+FILE *stream;                /* input stream from child process */
+
+main( argc, argv )
+
+    int  argc;
+    char *argv[];
+
+{
+ 
+    int  atoi();             /* ascii-to-integer function */
+    int  die();              /* function to die gracefully on interrupt */
+    FILE *popen();           /* (system) open a pipe to a child process */
+    long time();             /* (system) system time in seconds */
+    char *ctime();           /* (system) time and date as an ascii string */
+
+    long systime;            /* result from "time()" */
+    char *datetime;          /* result from "ctime()" */
+    char justtime[9];        /* clock time (without date) */
+    char c;                  /* current character */
+    int  i;                  /* counter */
+    int  x,y;                /* screen coordinates */
+    char line[BIGSTRING];    /* a line of output from the child proces */
+    int  tflag;              /* logical flag for the "-t" option */
+    int  sleepytime;         /* seconds to sleep between commands */
+    char command[BIGSTRING]; /* command to be executed */
+    char *usage = "usage:  monitor [-] [-t] [-s sleep] [command]\n";
+
+
+/*
+ *  Get arguments and flags.  Set defaults first.
+ */
+    tflag = DEFTFLAG;
+    sleepytime = DEFSLEEP;
+    strcpy ( command, DEFCOM );
+
+    for (i = 1; i < argc && argv[i][0] == '-'; i++) {
+        if ( strcmp(argv[i],"-t") == 0 ) {
+            tflag = !tflag;
+        } else if ( strcmp(argv[i],"-s") == 0 ) {
+            if ( i >= argc || ! atoi ( argv[++i], &sleepytime ) ) {
+                fprintf ( stderr,
+                          "monitor: missing sleep argument\n" );
+                fprintf ( stderr, "%s", usage );
+                exit(1);
+            }
+        } else if ( strcmp(argv[i],"-") == 0 ) {
+            printf ( "%s", usage );
+            exit(0);
+        } else {
+            fprintf ( stderr,
+                      "monitor: unknown argument %s\n", argv[i] );
+            fprintf ( stderr, "%s", usage );
+            exit(1);
+        }
+    }
+
+    /* collapse any remaining args into "command" */
+    if ( i < argc )
+        for ( command[0] = '\0'; i < argc; i++ ) {
+            append ( command, argv[i] );
+            append ( command, " " );
+        }
+
+    /* echo the settings */
+    fprintf (stderr, "monitor ");
+    if (tflag)  fprintf (stderr, "-t ");
+    fprintf (stderr, "-s %d %s\n", sleepytime, command);
+
+
+/*
+ *  Initialize things for "curses".
+ */
+    signal ( SIGINT, die );
+    initscr();
+    noecho();
+    nonl();
+    leaveok ( stdscr, FALSE );
+    scrollok ( stdscr, FALSE );
+
+
+/*
+ *  Infinite loop.
+ */
+    while ( TRUE ) {
+
+        /* perform the command and copy it to the screen. */
+        stream = popen ( command, "r" );
+        y = 0;
+        do {
+            x = 0;
+            while ( x < COLS-1 && (c = getc(stream)) != '\n'
+                               && c != EOF )
+                line[x++] = c;
+            line[x] = '\0';
+            while ( c != EOF && c != '\n' )
+                 c = getc(stream);
+            mvaddstr ( y++, 0, line );
+            clrtoeol();
+        } while ( y < LINES && c != EOF );
+        clrtobot();
+        pclose ( stream );
+
+        /* print the time */
+        if ( tflag ) {
+            systime = time(0);
+            datetime = ctime ( &systime );
+            substr ( datetime, 11, 18, justtime );
+            move ( 0, COLS-13 );
+            standout();
+            addstr ( justtime );
+            standend();
+        }
+        
+        /* flag it if the screen wouldn't hold everything */
+        if ( y >= LINES ) {
+            move ( 0, COLS-4 );
+            standout();
+            addstr ( "..." );
+            standend();
+        }
+
+        /* have "curses" refresh the screen and rest up for next time. */
+        refresh();
+        if (sleepytime > 0)
+            sleep ( sleepytime );
+    }
+}
+
+
+int  atoi ( a, i )
+/*
+ *  Ascii-to-integer converter.
+ *  Returns "1" if conversion successful, "0" if it fails.
+ */
+    char a[];
+    int  *i;
+{
+    int  j;
+    char c;
+
+    *i = 0;
+    for (j = 0; (c = a[j]) != '\0'; j++) {
+        if ( c >= '0' && c <= '9' )
+            *i = 10 * *i + c - '0';
+        else
+            return ( 0 );
+    }
+    return ( 1 );
+}
+
+
+append ( str1, str2 )
+/*
+ *  Copies str2 to the end of str1.
+ *  str2 had better be big enough!
+ */
+    char *str1,*str2;
+{
+    int  i,j;
+
+    /* find the end of str1 */
+    for ( i = 0 ; str1[i] != '\0' ; i++ ) ;
+
+    /* do the append */
+    for ( j = 0 ; (str1[i++] = str2[j++]) != '\0' ; ) ;
+}
+
+
+die() {
+/*
+ *  routine to die gracefully upon interrupt.
+ */
+    /* handle the interrupt */
+    signal ( SIGINT, SIG_IGN );
+
+    /* close curses */
+    move ( LINES-1, 0 );
+ /*DEBUG     addch ( ' ' );     DEBUG*/
+    refresh();
+    endwin();
+
+    /* close the "system" process */
+    pclose ( stream );
+
+    /* bye-bye */
+    exit(0);
+
+}
+
+
+substr ( str, f, t, sub )
+/*
+ *  Copies str[f..t] to sub[].  Copying stops if a '\0' is encountered.
+ *  If t < 0 it is assumed to be infinite.
+ *  There had better be enough space in sub[] for the result!
+ */
+    int  f, t;
+    char str[], sub[];
+{
+    char c;
+    int  i,j;
+
+    if (t < 0)  t = 32000;
+    i = f;
+    j = 0;
+    while ( i <= t && (c = str[i]) != '\0' ) {
+        sub[j] =c;
+        ++i;
+        ++j;
+    }
+    sub[j] = '\0';
+}
+
+

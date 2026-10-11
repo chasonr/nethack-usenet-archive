@@ -1,0 +1,2090 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,58fd75c568696fb4,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1987-08-04 16:42:52 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!mnetor!uunet!seismo!rochester!cornell!uw-beaver!tektronix!tekgen!tekred!games-request
+From: games-request@tekred.TEK.COM
+Newsgroups: comp.sources.games
+Subject: v02i021:  adl - Adventure Definition Language, Part04/11
+Message-ID: <1475@tekred.TEK.COM>
+Date: Tue, 4-Aug-87 19:42:52 EDT
+Article-I.D.: tekred.1475
+Posted: Tue Aug  4 19:42:52 1987
+Date-Received: Fri, 7-Aug-87 07:17:20 EDT
+Sender: billr@tekred.TEK.COM
+Lines: 2071
+Approved: billr@tekred.TEK.COM
+
+Submitted by: cunniff%hpda@hplabs.HP.COM (Ross Cunniff)
+Comp.sources.games: Volume 2, Issue 21
+Archive-name: adl/Part04
+
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 4 (of 11)."
+# Contents:  adlcomp/adlcomp.c samples/mpu/objects.adl
+#   samples/mpu/verbs.adl
+# Wrapped by billr@tekred on Tue Aug  4 16:27:39 1987
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f adlcomp/adlcomp.c -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"adlcomp/adlcomp.c\"
+else
+echo shar: Extracting \"adlcomp/adlcomp.c\" \(21519 characters\)
+sed "s/^X//" >adlcomp/adlcomp.c <<'END_OF_adlcomp/adlcomp.c'
+X	/***************************************************************\
+X	*								*
+X	*	adlcomp.c - ADL compiler.  See the ADL documentation	*
+X	*	for information about ADL.				*
+X	*		Copyright 1987 by Ross Cunniff			*
+X	*								*
+X	\***************************************************************/
+X
+X#include <stdio.h>
+X#include <fcntl.h>
+X#include <ctype.h>
+X
+X#include "adltypes.h"
+X
+X#if UNIX
+X#  include <signal.h>
+X#endif
+X
+X#include "adlprog.h"
+X#include "builtins.h"
+X#include "adldef.h"
+X#include "vstring.h"
+X#include "virtmem.h"
+X#include "adlcomp.h"
+X
+X#define MAXDIR 4			/* Maximum number of -i dirs	*/
+X
+X#if UNIX
+Xchar	*S_VAL = "adlsXXXXXX",		/* See below - patched		*/
+X	*CODE  = "adlcXXXXXX",		/* to use mktmp( 3 )		*/
+X	*tmpdir= "/tmp",		/* Default to /tmp		*/
+X	*PATH_SEPS = "/",		/* Set of path separators	*/
+X	*LAST_SEP = "/";		/* Final separator		*/
+X#endif
+X
+X#if MSDOS
+Xchar	*S_VAL = "adlsval.tmp",		/* Temporary string file	*/
+X	*CODE  = "adlcode.tmp",		/* Temporary code file		*/
+X	*tmpdir= "",			/* Default to current dir	*/
+X	*PATH_SEPS = ":/\\",		/* Set of path separators	*/
+X	*LAST_SEP = "\\";		/* Final separator		*/
+X#endif
+X
+X#if AMIGA
+Xchar
+X	*S_VAL = "adlsval.tmp",		/* Ditto above			*/
+X	*CODE  = "adlcode.tmp",		/* Ditto			*/
+X	*tmpdir= "RAM:",		/* Default to RAM:		*/
+X	*PATH_SEPS = ":/",		/* Set of path separators	*/
+X	*LAST_SEP = "/";		/* Final separator		*/
+X#endif
+X
+Xchar	tmp_s[ 256 ],			/* Combined path and base	*/
+X	tmp_c[ 256 ],			/*   of CODE and S_VAL		*/
+X	*outname = "adlcomp.out",	/* Default output file name	*/
+X	*dirnames[MAXDIR];		/* -i names			*/
+X
+Xextern	char	*calloc();		/* Memory allocator		*/
+X
+Xstruct	pagetab	codetab;		/* Structure for virtual code	*/
+X
+Xint16	NUM_VARS = 64,			/* Default # of ADL variables	*/
+X	NUM_ROUTS = 512,		/* Default # of ADL routines	*/
+X	NUM_OBJS = 256,			/* Default # of ADL objects	*/
+X	NUM_VERBS = 128,		/* Default # of ADL verbs	*/
+X	NUM_STR = 1024,			/* Default # of ADL strings	*/
+X	NUM_PREP = 8,			/* Default # of prep synonyms	*/
+X	NUM_VS = 8,			/* Default # of verb synonyms	*/
+X
+X	numprep,			/* Actual # of prep synonyms	*/
+X	header,				/* Produce a status line?	*/
+X	debugging,			/* Retain symbols?		*/
+X	filenum,			/* String index of file name	*/
+X	numdir;				/* Number of -i dirs specified	*/
+X
+Xint	S_VAL_F,			/* String paging file		*/
+X	CODE_F;				/* Code paging file		*/
+X
+X#if MSDOS
+Xunsigned
+X    _stack = 10000;			/* Large default stack size	*/
+X#endif
+X
+X	/***************************************************************\
+X	*								*
+X	*	main() - The main routine.  Opens files, initializes	*
+X	*	structures, compiles the code, writes the result.	*
+X	*	Pretty simple, no?					*
+X	*								*
+X	\***************************************************************/
+X
+Xmain( argc, argv )
+Xint	argc;
+Xchar	*argv[];
+X{
+X    getadlargs( argc, argv );		/* Get command line args	*/
+X    init();				/* Initialize structures	*/
+X
+X    /* Print the copyright message */
+X    fputs( "ADL compiler - Version 3.2 - June 7, 1987\n", stderr );
+X    fputs( "Copyright 1985, 1986, 1987 by Ross Cunniff\n", stderr );
+X    fputs( "All rights reserved\n", stderr );
+X    fflush( stderr );
+X
+X    adlcomp();				/* Compile the source		*/
+X    strcpy( token, "EOF" );		/* Indicate we're at EOF	*/
+X    write_code();			/* Write the code file		*/
+X    wrapup();				/* Close files			*/
+X    exit( numerr );			/* Return the number of errors	*/
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	getadlargs( argc, argv ) - extract meaning from		*
+X	*	the command line.  See the adlcomp man page for		*
+X	*	more information.					*
+X	*								*
+X	\***************************************************************/
+X
+Xgetadlargs( argc, argv )
+Xint	argc;
+Xchar	*argv[];
+X{
+X    int	i;
+X    char ch;
+X    char *getnext();
+X
+X#if MSDOS
+X    argv[ 0 ] = "adlcomp";		/* MSDOS has no notion of argv[ 0 ] */
+X#endif
+X
+X    if( argc < 2 )
+X	/* We must at least specify an input file */
+X	print_usage( argv[ 0 ] );
+X
+X    /* Check each argument */
+X    for( i = 1; i < argc; i++ ) {
+X	if( *argv[ i ] == '-' ) {
+X	    ch = *++argv[ i ];
+X	    if( isupper( ch ) )
+X		ch = tolower( ch );
+X	    switch( ch ) {
+X		case 'e' : maxerr	= atoi( getnext( argv, &i ) );	break;
+X		case 'g' : NUM_VARS	= atoi( getnext( argv, &i ) );	break;
+X		case 'm' : NUM_STR	= atoi( getnext( argv, &i ) );	break;
+X		case 'n' : NUM_OBJS	= atoi( getnext( argv, &i ) );	break;
+X		case 'p' : NUM_PREP	= atoi( getnext( argv, &i ) );	break;
+X		case 'r' : NUM_ROUTS	= atoi( getnext( argv, &i ) );	break;
+X		case 's' : NUM_VS	= atoi( getnext( argv, &i ) );	break;
+X		case 'v' : NUM_VERBS	= atoi( getnext( argv, &i ) );	break;
+X
+X		case 'i' : if( numdir >= MAXDIR )
+X			       fatal( "Too many -i options\n" );
+X			   dirnames[ numdir++ ] = getnext( argv, &i );
+X			   break;
+X		case 'o' : outname	=       getnext( argv, &i );	break;
+X		case 't' : tmpdir	=	getnext( argv, &i );	break;
+X
+X		case 'w' : wignore	= 1;				break;
+X		case 'd' : debugging	= 1;				break;
+X		case 'h' : header	= 1;				break;
+X
+X		default  : print_usage( argv[ 0 ] );
+X	    }
+X	}
+X	else if( *inname )
+X	    print_usage( argv[ 0 ] );
+X	else
+X	    strcpy( inname, argv[ i ] );
+X    }
+X    if( !*inname )
+X	print_usage( argv[ 0 ] );
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	print_usage( cname ) - print the USAGE error message	*
+X	*								*
+X	\***************************************************************/
+X
+Xprint_usage( cname )
+Xchar
+X    *cname;
+X{
+X    fprintf( stderr, "Usage: %s Infile (with any of the following)\n", cname );
+X    fprintf( stderr, "	-o Outfile		File for output\n" );
+X    fprintf( stderr, "	-i Dir			Directory for INCLUDEs\n" );
+X    fprintf( stderr, "	-t Dir			Directory for temp files\n" );
+X    fprintf( stderr, "	-d			Output debugging info\n" );
+X    fprintf( stderr, "	-w			Suppress warnings\n" );
+X    fprintf( stderr, "	-e N			Max # of errors\n" );
+X    fprintf( stderr, "	-g N			Max # of globals\n" );
+X    fprintf( stderr, "	-m N			Max # of strings\n" );
+X    fprintf( stderr, "	-n N			Max # of objects\n" );
+X    fprintf( stderr, "	-p N			Max # of prep phrases\n" );
+X    fprintf( stderr, "	-r N			Max # of routines\n" );
+X    fprintf( stderr, "	-s N			Max # of verb phrases\n" );
+X    fprintf( stderr, "	-v N			Max # of verbs\n" );
+X    exit( 1 );
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	getnext( argv, indx ) - get the next string from	*
+X	*	argv, whether it be the rest of the current arg		*
+X	*	or the next arg.  This is to allow arguments like	*
+X	*	"-ifoo" and "-i foo" to be equivalent.			*
+X	*								*
+X	\***************************************************************/
+X
+Xchar *
+Xgetnext( argv, indx )
+Xchar	*argv[];
+Xint	*indx;
+X{
+X    if( *++argv[ *indx ] )
+X	return argv[ *indx ];
+X    else
+X	return argv[ ++*indx ];
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	init() - initialize the structures and files.		*
+X	*								*
+X	\***************************************************************/
+X
+Xinit()
+X{
+X    /* Initialize the object sizes */
+X    hdr.nounindex.objsize	= sizeof( int16 );
+X    hdr.symindex.objsize	= sizeof( struct symbol );
+X    hdr.verbindex.objsize	= sizeof( struct verbrec );
+X    hdr.objindex.objsize	= sizeof( struct objrec );
+X    hdr.prepindex.objsize	= sizeof( struct preprec );
+X    hdr.vsindex.objsize		= sizeof( struct vp_syn );
+X    hdr.routindex.objsize	= sizeof( address );
+X    hdr.varindex.objsize	= sizeof( int16 );
+X    hdr.codeindex.objsize	= 512;
+X    hdr.strtabindex.objsize	= sizeof( int32 );
+X    hdr.strindex.objsize	= 512;
+X  
+X    /* Allocate space for the arrays */
+X    varspace	= (int16 *)	       calloc(hdr.varindex.objsize, NUM_VARS);
+X    routspace	= (address *)	       calloc(hdr.routindex.objsize,NUM_ROUTS);
+X    verbspace	= (struct verbrec *)   calloc(hdr.verbindex.objsize,NUM_VERBS);
+X    nounspace	= (int16 *)	       calloc(hdr.nounindex.objsize,NUM_OBJS);
+X    objspace	= (struct objrec *)    calloc(hdr.objindex.objsize, NUM_OBJS);
+X    prepspace	= (struct preprec *)   calloc(hdr.prepindex.objsize,NUM_PREP);
+X    verbsyn	= (struct vp_syn *)    calloc(hdr.vsindex.objsize,  NUM_VS);
+X    str_tab	= (int32 *)	       calloc(hdr.strtabindex.objsize,NUM_STR);
+X
+X    /* Check the memory allocation */
+X    if(		(varspace	== (int16 *)		0)		||
+X		(routspace	== (address *)		0)		||
+X		(verbspace	== (struct verbrec *)	0)		||
+X		(objspace	== (struct objrec *)	0)		||
+X		(nounspace	== (int16 *)		0)		||
+X		(prepspace	== (struct preprec *)	0)		||
+X		(verbsyn	== (struct vp_syn *)	0)		||
+X		(str_tab	== (int32 *)		0)		)
+X	fatal( "Out of memory.\n" );
+X
+X    /* Make the temporary names */
+X    mkpath( tmp_s, tmpdir, S_VAL );
+X    mkpath( tmp_c, tmpdir, CODE );
+X
+X    /* Initialize the virtual code & string routines */
+X#if UNIX
+X    mktemp( tmp_s );
+X    mktemp( tmp_c );
+X#endif
+X    S_VAL_F = open( tmp_s, WB );
+X    CODE_F = open( tmp_c, WB );
+X    if( (S_VAL_F < 0) || (CODE_F < 0) )
+X	fatal( "Unable to open temporary files.\n" );
+X
+X    vsinit( S_VAL_F, 0L, 0,(char *)NULL,(char *)NULL,(int16 *)NULL, str_tab );
+X    vm_init( CODE_F, 0L, &codetab, 1 );
+X
+X    /* Set up some initial values */
+X    NUMOBJ = 2;				/* .ALL and STRING */
+X    NUMNOUN = 1;			/* Skip the null noun */
+X    NUMVERB = 2;			/* TELLER and NOVERB */
+X    NUMROUT = 4;			/* NULL, DWIMD, DWIMI, and START */
+X    numprep = 1;			/* Skip the null preposition */
+X    objspace[ _ALL ].cont = _STRING;
+X
+X    /* Set up the input file */
+X    if( open_input( inname ) == 0 ) {
+X	fprintf( stderr, "Error opening input file %s\n", inname );
+X	exit( -1 );
+X    }
+X    filenum = newstr( inname );
+X
+X    /* Initialize the dictionary */
+X    init_predefs();
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	breaker() - handle a signal				*
+X	*								*
+X	\***************************************************************/
+X
+Xbreaker()
+X{
+X    printf( "***BREAK***\n" );
+X    close( S_VAL_F );	close( CODE_F );
+X    unlink( tmp_s );	unlink( tmp_c );
+X    exit( -1 );
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	adlcomp() - the heart of the compiler.  Reads tokens	*
+X	*	from the current input file, processing them until	*
+X	*	EOF or until the maximum number of errors has been	*
+X	*	exceeded.  Parsing is done with recursive descent.	*
+X	*								*
+X	\***************************************************************/
+X
+Xadlcomp()
+X{
+X    printf( "Reading from file %s\n", inname );
+X    fflush( stdout );
+X    while( 1 ) {
+X	lexer();			/* Read a token			*/
+X	if( t_type == EOF ) {
+X	    printf( "Done reading file %s\n", inname );
+X	    fflush( stdout );
+X	    return;
+X	}
+X
+X	if( (t_type >= MIN_D) && (t_type <= MAX_D) )
+X	    /* This is one of PREP, ADJEC, etc.  Handle them generically */
+X	    getlist( t_type );
+X	else {
+X	    /* We need to special case the declaration. */
+X	    switch( t_type ) {
+X		case VAR_D	: getvars();		break;
+X		case NOUN_D	: getnouns();		break;
+X		case UNDECLARED	: getassign( 1 );	break;
+X		case INCLUDE	: getfile();		break;
+X		case MESSAGE	: printmsg();		break;
+X		case VERB	: getverb();		break;
+X		case ADJEC	:
+X		case NOUN	:
+X		case NOUN_SYN	: nounassign( 1, 0 );	break;
+X		case '('	: globassign();		break;
+X		case ROUTINE	: routassign();		break;
+X		case PREP	: prepassign();		break;
+X		default		: error( ILLEGAL_SYMBOL );
+X				  eatuntil( ';' );
+X	    }	/* switch */
+X	}	/* else */
+X    }		/* while */
+X}		/* adlcomp */
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	printmsg() - executes the MESSAGE directive, and	*
+X	*	prints a message on the user's terminal.		*
+X	*								*
+X	\***************************************************************/
+X
+Xprintmsg()
+X{
+X    lexer();				/* Get a token.			*/
+X    if( t_type != STRING )
+X	_ERR_FIX( "Illegal compile time message.\n", ';' );
+X    fputs( token + 1, stderr );		/* Print the token.		*/
+X    fflush( stderr );
+X    lexer();
+X    if( t_type != ';' )			/* Expect a following semicolon	*/
+X	_ERR_FIX( SEMI_EXPECTED, ';' );
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	getfile() - handle the INCLUDE directive, reading	*
+X	*	from the appropriate file.				*
+X	*								*
+X	\***************************************************************/
+X
+Xgetfile()
+X{
+X    char *fsave;
+X    char msg[ 80 ], nsave[ 512 ], t_in[ 512 ], *sprintf();
+X    int16 lsave, numsave, i, found;
+X
+X    lexer();				/* Get a token.			*/
+X    if( t_type != STRING )
+X	_ERR_FIX( "File name expected for INCLUDE.\n", ';' );
+X    save_input( &fsave );		/* Save the current input file	*/
+X    strcpy( nsave, inname );		/* Save the current input name	*/
+X    lsave = numline;			/* Save the current line number	*/
+X    numsave = filenum;			/* Save the current file number	*/
+X    strcpy( inname, virtstr( t_val ) );	/* Get the rep. of the new name	*/
+X    filenum = t_val;			/* Get the new file number	*/
+X    numline = 1;			/* Set the new line number	*/
+X
+X    /* Try to find the file in the current directory. */
+X    found = 0;
+X    if( open_input( inname ) == 0 ) {
+X	/* Couldn't find it.  Try to find it in the -i directories */
+X	for( i = 0; i < numdir; i++ ) {
+X	    mkpath( t_in, dirnames[ i ], inname );
+X	    if( open_input( t_in ) != 0 ) {
+X		found = 1;
+X		break;
+X	    }
+X	}
+X	if( !found ) {
+X	    sprintf( msg, "Error opening file \"%s\".\n", inname );
+X	    fatal( msg );
+X	}
+X	strcpy( inname, t_in );
+X    }
+X    adlcomp();			/* Recursively compile the new file.	*/
+X    close_input();		/* Close the file			*/
+X    restore_input( fsave );	/* Restore the old input file		*/
+X    numline = lsave;		/* Restore the old line number		*/
+X    strcpy( inname, nsave );	/* Restore the old file name		*/
+X    filenum = numsave;		/* Restore the old file number		*/
+X    lexer();			/* Get a token.				*/
+X    if( t_type != ';' )		/* Expect a ';' after the INCLUDE	*/
+X	_ERR_FIX( SEMI_EXPECTED, ';' );
+X}
+X
+X
+Xmkpath( s, dir, base )
+Xchar
+X    *s,
+X    *dir,
+X    *base;
+X{
+X    int
+X	len,
+X	sep_found;
+X    char
+X	*check;
+X
+X    /* Copy the directory name into the string */
+X    strcpy( s, dir );
+X    len = strlen( s ) - 1;
+X
+X    /* Check to see if the name has a path separator at the end */
+X    check = PATH_SEPS;
+X    sep_found = 0;
+X    while( *check ) {
+X	if( s[ len ] == *check ) {
+X	    sep_found = 1;
+X	    break;
+X	}
+X	check++;
+X    }
+X    if( !sep_found )
+X	/* Add the separator */
+X	strcat( s, LAST_SEP );
+X
+X    /* Concatenate the base name onto the string */
+X    strcat( s, base );
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	check_predefs() - check to see whether DWIMI, DWIMD,	*
+X	*	START, STRING, and TELLER have been defined.  Also,	*
+X	*	check the current number of various things against	*
+X	*	their maximum.						*
+X	*								*
+X	\***************************************************************/
+X
+Xcheck_predefs()
+X{
+X    if( !routspace[ _START ] )
+X	error( "START undefined.\n" );
+X    if( !routspace[ _DWIMI ] )
+X	warning( "DWIMI undefined.\n" );
+X    if( !routspace[ _DWIMD ] )
+X	warning( "DWIMD undefined.\n" );
+X    if( !objspace[ _STRING ].props[ _ACTION - 17 ] )
+X	warning( "STRING undefined.\n" );
+X    if( !(verbspace[ _TELLER ].preact||verbspace[ _TELLER ].postact) )
+X	warning( "TELLER undefined.\n" );
+X    if( !(verbspace[ _NOVERB ].preact||verbspace[ _NOVERB ].postact) )
+X	warning( "NOVERB undefined.\n" );
+X    checkmax( NUMVAR, NUM_VARS, "VARs" );
+X    checkmax( NUMROUT, NUM_ROUTS, "routines" );
+X    checkmax( NUMOBJ, NUM_OBJS, "objects" );
+X    checkmax( NUMVERB, NUM_VERBS, "verbs" );
+X    checkmax( NUMSTR, NUM_STR, "strings" );
+X    checkmax( NUMPP, NUM_PREP, "prep synonyms" );
+X    checkmax( NUMVS, NUM_VS, "[verb prep] synonyms" );
+X}
+X
+X	/***************************************************************\
+X	*								*
+X	*	checkmax( n, max_n, name ) - checks n against max_n,	*
+X	*	and prints an appropriate message if n > max_n.		*
+X	*								*
+X	\***************************************************************/
+X
+Xcheckmax( n, max_n, name )
+Xint
+X    n, max_n;
+Xchar
+X    *name;
+X{
+X    printf( "%d out of %d %s used\n", n, max_n, name );
+X    fflush( stdout );
+X    if( n > max_n )
+X	error( "Number of %s is greater than %d!\n", name );
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	write_code() - write out the ADL executable.		*
+X	*								*
+X	\***************************************************************/
+X
+Xwrite_code()
+X{
+X    int outf;		/* The actual file being written		*/
+X    int32 temp;		/* Temporary area for long int calculations	*/
+X    int cmask;		/* Value of the umask call			*/
+X    int32 time();	/* Current time stamp.				*/
+X
+X    /* Flush out all dirty pages to disk. */
+X    vsflush();
+X    vm_flush( &codetab );
+X
+X    /* Tie up a few loose ends */
+X    hdr.strtabindex.numobjs = numstr();
+X    temp = currcode();
+X    hdr.codeindex.numobjs = (temp / 512L) + 1;
+X    temp = numchar();
+X    hdr.strindex.numobjs = (temp / 512L) + 1;
+X
+X    /* Make sure all is OK */
+X    check_predefs();
+X
+X    /* Don't write any code if errors were encountered. */
+X    if( numerr )
+X	return;
+X
+X    /* Set up the file pointers */
+X    hdr.symindex.ptr	= sizeof( struct header );
+X    count_symtab( debugging );
+X    hdr.verbindex.ptr	= hdr.symindex.ptr    +
+X   				hdr.symindex.objsize    * NUMSYM;
+X    hdr.objindex.ptr	= hdr.verbindex.ptr   +
+X				hdr.verbindex.objsize   * NUMVERB;
+X    hdr.nounindex.ptr	= hdr.objindex.ptr +
+X				hdr.objindex.objsize	* NUMOBJ;
+X    hdr.varindex.ptr	= hdr.nounindex.ptr   +
+X				hdr.nounindex.objsize    * NUMNOUN;
+X    hdr.prepindex.ptr	= hdr.varindex.ptr    +
+X				hdr.varindex.objsize    * NUMVAR;
+X    hdr.vsindex.ptr	= hdr.prepindex.ptr   +
+X				hdr.prepindex.objsize	* NUMPP;
+X    hdr.routindex.ptr	= hdr.vsindex.ptr   +
+X				hdr.vsindex.objsize	* NUMVS;
+X    hdr.codeindex.ptr	= hdr.routindex.ptr   +
+X				hdr.routindex.objsize   * NUMROUT;
+X    hdr.strtabindex.ptr	= hdr.codeindex.ptr   +
+X				hdr.codeindex.numobjs   * 512;
+X    hdr.strindex.ptr	= hdr.strtabindex.ptr +
+X				hdr.strtabindex.objsize * NUMSTR;
+X  
+X    /* Set the timestamp and the magic number */
+X    hdr.adlid = time( 0 );
+X    hdr.magic = M_ADL;
+X    sprintf( hdr.adlname, "#! %s%s%s\n", ADL_NAME,
+X		   (header?" -h":"\0"),
+X		   (debugging?" -d":"\0") );
+X
+X    /* Write the file */
+X    if( (outf = open( outname, WB )) < 0 )
+X	fatal( "Error writing to output file.\n" );
+X    adlstats();
+X    lseek( outf, 0L, 0 );
+X    write( outf, &hdr, sizeof( struct header ) );
+X    write_symtab( outf, debugging );
+X    writebuf( outf, verbspace,	&hdr.verbindex );
+X    writebuf( outf, objspace,	&hdr.objindex );
+X    writebuf( outf, nounspace,	&hdr.nounindex );
+X    writebuf( outf, varspace,	&hdr.varindex );
+X    writebuf( outf, prepspace,	&hdr.prepindex );
+X    writebuf( outf, verbsyn,	&hdr.vsindex );
+X    writebuf( outf, routspace,	&hdr.routindex );
+X    writestuff( CODE_F, outf,	&hdr.codeindex );
+X    writebuf( outf, str_tab, &hdr.strtabindex );
+X    writestuff( S_VAL_F, outf,	&hdr.strindex );
+X
+X    /* Close the file */
+X    close( outf );
+X
+X#if UNIX
+X    /* Make it executable */
+X    cmask = umask( 0 );
+X    (void)umask( cmask );
+X    chmod( outname, (0777 & (~cmask)) );
+X#endif
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	adlstats() - print some statistics about the		*
+X	*	compilation						*
+X	*								*
+X	\***************************************************************/
+X
+Xadlstats()
+X{
+X    int i;
+X    printf( "adlcomp %s -o %s ", inname, outname );
+X    printf( "-g %d -r %d ", NUMVAR+1, NUMROUT+1 );
+X    printf( "-v %d -n %d -m %d ", NUMVERB+1, NUMOBJ+1, NUMSTR+1 );
+X    printf( "-p %d -s %d%s%s", NUMPP, NUMVS,
+X		(wignore?" -w":""),(debugging?" -d":"") );
+X
+X    for( i = 0; i < numdir; i++ )
+X	printf( " -i %s", dirnames[ i ] );
+X    printf( "\nWriting %ld bytes\n",
+X		hdr.strindex.ptr + 512*hdr.strindex.numobjs );
+X    fflush( stdout );
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	writebuf( f, b, d ) - write the buffer b to the file	*
+X	*	f, given the information in the header structure d.	*
+X	*								*
+X	\***************************************************************/
+X
+X/*VARARGS 1*/
+Xwritebuf( f, b, d )
+Xint	f;
+Xchar	*b;
+Xstruct	adldir	*d;
+X{
+X    lseek( f, 0L, 2 );				/* Seek to EOF		*/
+X    write( f, b, d->numobjs * d->objsize );	/* Write the data	*/
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	writestuff( ifile, ofile, dir ) - Copy data from	*
+X	*	ifile to ofile, according to the information in dir.	*
+X	*								*
+X	\***************************************************************/
+X
+Xwritestuff( ifile, ofile, dir )
+Xint	ifile, ofile;
+Xstruct	adldir	*dir;
+X{
+X    int32 t, i, n, r;
+X    char buf[ 512 ];
+X
+X    t = dir->numobjs * dir->objsize;
+X    n = t / 512;			/* Write in 512 byte chunks	*/
+X    r = t % 512;			/* Number of remaining bytes	*/
+X    for( i = 0; i < n; i++ ) {
+X	lseek( ifile, (long)(i*512), 0 );
+X	read( ifile, buf, 512 );
+X	lseek( ofile, 0L, 2 );		/* Seek to EOF 			*/
+X	write( ofile, buf, 512 );
+X    }
+X    if( r ) {
+X	/* Write the remaining bytes */
+X	lseek( ifile, (long)(n*512), 0 );
+X	read( ifile, buf, 512 );
+X	lseek( ofile, 0L, 2 );		/* Seek to EOF			*/
+X	write( ofile, buf, 512 );
+X    }
+X    close( ifile );			/* Close the input file.	*/
+X}
+X
+X
+X	/***************************************************************\
+X	*								*
+X	*	wrapup() - clean up our mess and go home.		*
+X	*								*
+X	\***************************************************************/
+X
+Xwrapup()
+X{
+X    char *ep, *wp;
+X
+X    /* Remove the temporary files. */
+X    unlink( tmp_s ); unlink( tmp_c );
+X
+X    /* Print how many errors and warnings we've encountered. */
+X    ep = ( (numerr == 1) ? "" : "s" );
+X    wp = ( (numwarn == 1) ? "" : "s" );
+X    printf( "adlcomp complete. %d error%s, %d warning%s.\n", numerr, ep,
+X		numwarn, wp );
+X}
+X
+X/*** EOF adlcomp.c ***/
+END_OF_adlcomp/adlcomp.c
+if test 21519 -ne `wc -c <adlcomp/adlcomp.c`; then
+    echo shar: \"adlcomp/adlcomp.c\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f samples/mpu/objects.adl -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"samples/mpu/objects.adl\"
+else
+echo shar: Extracting \"samples/mpu/objects.adl\" \(26919 characters\)
+sed "s/^X//" >samples/mpu/objects.adl <<'END_OF_samples/mpu/objects.adl'
+XADJEC red,green,blue,clear;
+XADJEC glass, silver;
+X
+XNOUN red message(road2);        { It's red so there can be others elsewhere }
+Xred message(WEIGH) = CAPAC;
+Xred message(LDESC) = ($say "There is a message scratched in the dirt.\n");
+Xred message(SDESC) = ($say "a message in the dirt");
+Xred message(ACTION) =
+X    (IF ($or ($eq ($verb) read) ($eq ($verb) examine)) THEN
+X	($say "'in' is a preposition.  'enter' is a verb.\n")
+X	($exit 1)
+X    )
+X;
+X
+XNOUN keys (town4);
+Xkeys(WEIGH) = 2;
+Xkeys(LDESC) = ($say "There's a set of keys here.\n");
+Xkeys(SDESC) = ($say "a set of keys");
+XADJEC tool;
+X
+XNOUN tool box (farm5);
+Xtoolbox = tool box;
+Xtoolbox(WEIGH) = CAPAC;
+Xtoolbox(HOLDS) = 50;
+Xtoolbox(OPENS) = TRUE;
+Xtoolbox(LOCKS) = TRUE;
+Xtoolbox(LOCKED) = TRUE;
+Xtoolbox(LIGHT) = TRUE;
+Xtoolbox(LDESC) =
+X    (IF ($eq ($loc .ME) toolbox) THEN
+X	($say
+X"You are in a huge wooden structure, towering up at least 80 feet
+Xabove your head, with wooden walls formed of immense 10-foot by 50-foot
+Xboards.  Everything here, even the grains of dust which cover the wooden
+Xfloor, seems immense.  "
+X	)
+X	(IF ($prop toolbox OPENED) THEN
+X	    ($say
+X"Above your head, the top of the structure is open,
+Xand sunlight streams in.\n"
+X	    )
+X	 ELSE
+X	    ($say
+X"The structure is closed at the top, but
+Xenough light comes in from between the boards to enable you to see.\n"
+X	    )
+X	)
+X     ELSE
+X	($say "Against\nthe house is a heavy ")
+X	(IF ($prop toolbox OPENED) THEN
+X	    ($say "toolbox with the lid open.\n")
+X	 ELSEIF ($prop toolbox LOCKED) THEN
+X	    ($say
+X"toolbox with a rusty lock, painted with
+Xan insignia composed of blue and green squares, joined at
+Xtheir corners.\n"
+X	    )
+X	 ELSE
+X	    ($say "toolbox, the lid of which is ajar.\n")
+X	)
+X    )
+X;
+Xtoolbox(SDESC) =
+X    (IF ($eq ($loc .ME) toolbox) THEN
+X	($return (Sayer "Inside Huge Box" %0))
+X     ELSE
+X	($say "a toolbox")
+X    )
+X;
+Xtoolbox(ACTION) =
+X    (IF ($eq ($phase) 7) THEN
+X	{ This is the room action }
+X	(IF	($or	($eq ($verb) drop)
+X			($eq ($verb) throw)
+X		)
+X	 THEN
+X	    { We don't want to keep track of lots of small things }
+X	    ($say "You just lost ")
+X	    (($sdesc ($dobj)))
+X	    ($say " in a crack between the wooden floorboards!\n")
+X	    ($move ($dobj) .ALL)
+X	)
+X     ELSEIF ($eq ($verb) lock) THEN
+X	(IF ($prop toolbox OPENED) THEN
+X	    ($say "You must close it first.\n")
+X	    ($exit 1)
+X	 ELSEIF ($prop toolbox LOCKED) THEN
+X	    ($say "It's already locked!\n")
+X	    ($exit 1)
+X	 ELSEIF ($eq ($loc keys) .ME) THEN
+X	    ($say "The toolbox seals with a CLICK!\n")
+X	    ($setp toolbox LOCKED TRUE)
+X	    ($exit 1)
+X	)
+X     ELSEIF ($eq ($verb) unlock) THEN
+X	(IF ($not ($prop toolbox LOCKED)) THEN
+X	    ($say "It's already unlocked!\n")
+X	    ($exit 1)
+X	 ELSEIF ($eq ($loc keys) .ME) THEN
+X	    ($say "One of the keys fits!  The box is unlocked.\n")
+X	    ($setp toolbox LOCKED FALSE)
+X	    ($exit 1)
+X	)
+X     ELSEIF ($eq ($verb) examine) THEN
+X	(IF ($prop toolbox OPENED) THEN
+X	    ($say "The toolbox is open.\n")
+X	 ELSEIF ($prop toolbox LOCKED) THEN
+X	    ($say "The toolbox is locked.\n")
+X	 ELSE
+X	    ($say "The toolbox is ajar.\n")
+X	)
+X	($exit 1)
+X    )
+X;
+X
+XNOUN silver spoon(farm6);
+Xsilver spoon(POINT) = 25;
+Xsilver spoon(WEIGH) = 1;
+Xsilver spoon(LDESC) = ($say "There is a beautiful silver spoon here.\n");
+Xsilver spoon(SDESC) = ($say "a silver spoon");
+X
+X
+XNOUN wetsuit(cel15);
+XWORN = MISC1;
+Xwetsuit(LDESC) = ($say "There is a wetsuit here.\n");
+Xwetsuit(SDESC) =
+X    ($say "a wetsuit")
+X    (IF ($prop wetsuit WORN) THEN
+X	($say " (being worn)")
+X    )
+X;
+Xwetsuit(WEIGH) = 50;
+Xwetsuit(ACTION) =
+X    (IF ($eq ($verb) wear) THEN
+X	(IF ($ne ($loc wetsuit) .ME) THEN
+X	    ($say "You don't have the wetsuit!\n")
+X	    ($exit 1)
+X	 ELSEIF ($prop wetsuit WORN) THEN
+X	    ($say "You are already wearing it!\n")
+X	    ($exit 1)
+X	 ELSE
+X	    ($setp wetsuit WORN TRUE)
+X	    ($say "OK, you're wearing the wetsuit.\n")
+X	    ($exit 1)
+X	)
+X     ELSEIF ($eq ($verb) remove) THEN
+X	(IF ($prop wetsuit WORN) THEN
+X	    ($setp wetsuit WORN FALSE)
+X	    ($say "OK, you're no longer wearing the wetsuit.\n")
+X	    ($exit 1)
+X	 ELSE
+X	    ($say "You are not wearing the wetsuit!\n")
+X	    ($exit 1)
+X	)
+X     ELSEIF ($eq ($verb) drop) THEN
+X	(IF ($prop wetsuit WORN) THEN
+X	    ($say "You'll have to remove the wetsuit first.\n")
+X	    ($setg Skip TRUE)
+X	)
+X    )
+X;
+X
+XNOUN signpost(Roadx);
+Xsignpost(RDLOC)=10;
+Xsignpost(WEIGH)=CAPAC;
+Xsignpost(LDESC)=($say "There is a signpost by the side of the road.\n");
+Xsignpost(SDESC)=($say "a signpost");
+Xsignpost(ACTION) =
+X	(IF ($or ($eq ($verb) read) ($eq ($verb) examine)) THEN
+X		($say "Pointing east, it says: 'Unuchevala: 10 miles'\n")
+X		($exit 1)
+X	)
+X;
+X
+XNOUN globe(toolbox);
+Xglobe(WEIGH) = 20;
+Xglobe(LDESC) =
+X	(IF ($prop globe LIGHT) THEN
+X		($say "A globe of stone glows brightly here.\n")
+X	 ELSE
+X		($say "There is a strange globe of polished stone here.\n")
+X	)
+X;
+Xglobe(SDESC) =
+X	(IF ($prop globe LIGHT) THEN
+X		($say "a glowing globe of stone")
+X	 ELSE
+X		($say "a stone globe")
+X	)
+X;
+Xglobe(ACTION) =
+X    (IF ($eq ($verb) rub) THEN
+X	(IF ($prop globe LIGHT) THEN
+X	    ($say "The light from the stone globe fades away.\n")
+X	    ($setp globe LIGHT FALSE)
+X	 ELSE
+X	    ($say "The stone globe glows brightly!\n")
+X	    ($setp globe LIGHT TRUE)
+X	)
+X	($setg MyLoc -1)
+X	($exit 1)
+X     ELSEIF ($eq ($verb) examine) THEN
+X	(IF ($prop globe LIGHT) THEN
+X	    ($say "The globe is glowing.\n")
+X	    ($exit 1)
+X	)
+X    )
+X;
+X
+X
+XNOUN crowbar (town3);
+Xcrowbar(WEIGH) = 100;
+Xcrowbar(LDESC) = ($say "There is a long crowbar here.\n");
+Xcrowbar(SDESC) = ($say "a crowbar");
+X
+Xcrydie =
+X    ($say
+X"What POWER!  The magic crystal releases a flood of energy in
+Xa split-second!  Unfortunately, you were a little close...\n"
+X    )
+X    (die)
+X;
+X{ Dragon Stuff }
+XAWAKE=MISC1;
+X
+XNOUN dragon (cel06);
+X
+X
+Xwhite=clear;
+XNOUN green crystal(cel07);
+XNOUN red crystal(cel08);
+XNOUN blue crystal(cel10);
+XNOUN clear crystal(cel09);
+X
+Xdiamond = clear crystal;
+Xsapphire =  blue crystal;
+Xruby = red crystal;
+Xemerald = green crystal;
+X
+XWORKD = MISC1;
+X
+Xgreen crystal(WEIGH)=15;
+Xgreen crystal(POINT)=25;
+Xgreen crystal(LDESC) = ($say "There is a beautiful green crystal here!\n");
+Xgreen crystal(SDESC) = ($say "a green crystal");
+X
+Xgreen crystal(ACTION) =
+X    (IF ($eq ($verb) take) THEN
+X	(IF ($and ($not ($prop dragon KILLED)) ($eq ($loc .ME) cel07)) THEN
+X	    (IF ($not ($prop dragon AWAKE)) THEN
+X		($say "You hear a stirring nearby.\n")
+X		($setg Tempr ($plus @Tempr 2))
+X		($setp dragon AWAKE TRUE)
+X		($setp cel06 SEEN FALSE)
+X	     ELSE
+X		($setg Tempr 0)
+X	    )
+X	)
+X     ELSEIF ($eq ($verb) drop) THEN
+X	(IF ($and ($not ($prop dragon KILLED)) ($eq ($loc .ME) cel07)) THEN
+X	    ($setg Tempr ($minus @Tempr 2))
+X		(IF ($le @Tempr 0) THEN
+X		    ($setp dragon AWAKE FALSE)
+X		    ($say "You hear a deep  Y A W N  nearby.\n")
+X		)
+X		($setp cel06 SEEN FALSE)
+X	    )
+X     ELSEIF ($eq ($verb) touch) THEN
+X	(IF ($eq ($dobj) [red crystal]) THEN
+X	    (IF ($eq ($loc .ME) toolbox) THEN
+X		($say "The red and green crystals flare briefly!\n")
+X		(Grow)
+X		($move .ME cel01)
+X		($setg MyLoc -1)
+X	     ELSE
+X		($say "Nothing happens.\n")
+X	    )
+X	    ($exit 1)
+X	 ELSEIF ($eq ($dobj) [blue crystal]) THEN
+X	    (IF ($gt ($prop [green crystal] WORKD) 2) THEN
+X		($say "Nothing happens.\n")
+X	     ELSE
+X		($setp [green crystal] WORKD
+X			($plus ($prop [green crystal] WORKD) 1)
+X		)
+X		($say "The blue and green crystals flare briefly!\n")
+X		($move .ME toolbox)
+X		(Shrink)
+X		($setg MyLoc -1)
+X	    )
+X	    ($exit 1)
+X	 ELSEIF ($eq ($dobj) [clear crystal]) THEN
+X	    ($say "Nothing happens.\n")
+X	    ($exit 1)
+X	)
+X     ELSEIF ($eq ($verb) break) THEN
+X	(IF ($eq ($dobj) [green crystal]) THEN
+X	    (crydie)
+X	)
+X    )
+X;
+X
+Xred crystal(WEIGH)=15;
+Xred crystal(POINT)=25;
+Xred crystal(LDESC) = ($say "There is a beautiful red crystal here!\n");
+Xred crystal(SDESC) = ($say "a red crystal");
+Xred crystal(ACTION) =
+X    (IF ($eq ($verb) touch) THEN
+X	(IF ($eq ($dobj) [clear crystal]) THEN
+X	    (IF ($not ($prop [clear crystal] WORKD)) THEN
+X		($say "The red and clear crystals flare briefly!\n")
+X		($setp [clear crystal] WORKD TRUE)
+X		($setp [clear crystal] LIGHT TRUE)
+X		($say
+X"The clear crystal blazes forth with a magical incandescence brilliant
+Xenough to penetrate even the deepest darkness!!\n\n"
+X		)
+X		($move .ME cel04)
+X		($setg MyLoc -1)
+X		($sfus .ME CRout 7)
+X		($exit 1)
+X	     ELSE
+X		($say "Nothing happens.\n")
+X		($exit 1)
+X	    )
+X	 ELSEIF ($eq ($dobj) [green crystal]) THEN
+X	    (IF ($eq ($loc .ME) toolbox) THEN
+X		($say "The red and green crystals flare briefly!\n")
+X		(Grow)
+X		($move .ME cel01)
+X		($setg MyLoc -1)
+X	     ELSE
+X		($say "Nothing happens.\n")
+X	    )
+X	    ($exit 1)
+X	 ELSEIF ($eq ($dobj) [blue crystal]) THEN
+X	    (IF ($or ($eq ($loc .ME) desert) ($eq ($loc .ME) field)) THEN
+X		($say "The red and blue crystals flare briefly!\n")
+X		($move .ME cel08)
+X		($setg MyLoc -1)
+X	     ELSEIF ($not @RBTouch) THEN
+X		($say "The red and blue crystals flare briefly!\n")
+X		($setg RBTouch TRUE)
+X	     ELSE
+X		($say "Nothing happens.\n")
+X	    )
+X	    ($exit 1)
+X	)
+X     ELSEIF ($eq ($verb) break) THEN
+X	(IF ($eq ($dobj) [red crystal]) THEN
+X	    (crydie)
+X	)
+X    )
+X;
+X
+X
+Xblue crystal(WEIGH)=15;
+Xblue crystal(POINT)=25;
+Xblue crystal(LDESC) = ($say "There is a beautiful blue crystal here!\n");
+Xblue crystal(SDESC) = ($say "a blue crystal");
+Xblue crystal(ACTION) =
+X    (IF ($eq ($verb) touch) THEN
+X	(IF ($eq ($dobj) [red crystal]) THEN
+X	    (IF ($or ($eq ($loc .ME) desert) ($eq ($loc .ME) field)) THEN
+X		($say "The red and blue crystals flare briefly!\n")
+X		($setg RBTouch TRUE)
+X		($move .ME cel08)
+X		($setg MyLoc -1)
+X	     ELSEIF ($not @RBTouch) THEN
+X		($say "The red and blue crystals flare briefly!\n")
+X		($setg RBTouch TRUE)
+X	     ELSE
+X		($say "Nothing happens.\n")
+X	    )
+X	    ($exit 1)
+X	 ELSEIF ($eq ($dobj) [green crystal]) THEN
+X	    (IF ($gt ($prop [green crystal] WORKD) 2) THEN
+X		($say "Nothing happens.\n")
+X	     ELSE
+X		($say "The blue and green crystals flare briefly!\n")
+X		($move .ME toolbox)
+X		(Shrink)
+X		($setg MyLoc -1)
+X		($setp [green crystal] WORKD
+X				($plus ($prop [green crystal] WORKD) 1)
+X		)
+X	    )
+X	    ($exit 1)
+X	 ELSEIF ($eq ($dobj) [clear crystal]) THEN
+X	    ($say "Nothing happens.\n")
+X	    ($exit 1)
+X	)
+X     ELSEIF ($eq ($verb) break) THEN
+X	(IF ($eq ($dobj) [blue crystal]) THEN
+X	    (crydie)
+X	)
+X    )
+X;
+X
+XCRout =
+X    ($setp [clear crystal] LIGHT FALSE)
+X    ($say "The glowing magical crystal seems to have gone dark.\n")
+X;
+X
+Xclear crystal(WEIGH)=15;
+Xclear crystal(POINT)=25;
+Xclear crystal(LDESC) =
+X    ($say "There is a beautiful clear crystal here")
+X    (IF ($prop [clear crystal] LIGHT) THEN
+X	($say " (GLOWING!)")
+X    )
+X    ($say "!\n")
+X;
+Xclear crystal(SDESC) =
+X    ($say "a clear crystal")
+X    (IF ($prop [clear crystal] LIGHT) THEN
+X	($say " (GLOWING!)")
+X    )
+X;
+Xclear crystal(ACTION) =
+X    (IF ($eq ($verb) touch) THEN
+X	(IF ($eq ($dobj) [red crystal]) THEN
+X	    (IF ($not ($prop [clear crystal] WORKD)) THEN
+X		($say "The red and clear crystals flare briefly!\n")
+X		($setp [clear crystal] WORKD TRUE)
+X		($setp [clear crystal] LIGHT TRUE)
+X		($say
+X"The clear crystal blazes forth with a magical incandescence brilliant
+Xenough to penetrate even the deepest darkness!!\n\n"
+X		)
+X		($move .ME cel04)
+X		($setg MyLoc -1)
+X		($sfus .ME CRout 7)
+X		($exit 1)
+X	     ELSE
+X		($say "Nothing happens.\n")
+X		($exit 1)
+X	    )
+X	 ELSEIF ($eq ($dobj) [green crystal]) THEN
+X	    ($say "Nothing happens.\n")
+X	    ($exit 1)
+X	 ELSEIF ($eq ($dobj) [blue crystal]) THEN
+X	    ($say "Nothing happens.\n")
+X	    ($exit 1)
+X	)
+X     ELSEIF ($eq ($verb) break) THEN
+X	(IF ($eq ($dobj) [red crystal]) THEN
+X	    (crydie)
+X	)
+X    )
+X;
+X
+X
+XNOUN	wood(cel20);
+XROUTINE	KillDragon;
+XDRdem =			{ Dragon Daemon.  Increases temper in .my presence }
+X    (IF ($or ($prop dragon KILLED) ($not ($prop dragon AWAKE))) THEN
+X	(IF %1 THEN ($say "\n"))
+X	($return 0)
+X    )
+X    (IF ($eq ($loc .ME) ($loc dragon)) THEN
+X	(IF ($eq ($loc [green crystal]) .ME) THEN      { even worse! }
+X	    ($setg Tempr ($plus @Tempr 1))
+X	)
+X	($setg Tempr ($plus @Tempr 1))
+X	(IF ($and ($prop wood FLAME) ($eq ($loc wood) ($loc .ME))) THEN
+X	    (KillDragon)
+X	    ($return 0)
+X	)
+X    )
+X    (IF ($ge @Tempr 7) THEN
+X	($say
+X"Jeez, I didn't know ice dragons could reach their boiling point!
+XIn a final flare of rage, he opens his mouth and breathes his frigid
+Xbreath in a blast in your direction.  It's a bit much for you."
+X	)
+X	(die)
+X     ELSEIF ($ge @Tempr 6) THEN
+X	($say "Gee, he looks like he's really at the edge!")
+X     ELSEIF ($ge @Tempr 5) THEN
+X	($say "This is one upset dragon!  Be careful!")
+X     ELSEIF ($ge @Tempr 3) THEN
+X	($say "He's getting angrier...")
+X    )
+X    (IF %1 THEN ($say "\n"))
+X;
+X
+Xdragon(WEIGH)=CAPAC;
+Xdragon(LDESC)=
+X    (IF ($prop dragon AWAKE) THEN
+X	($say
+X"There is a fierce ice dragon glaring balefully in your direction.  "
+X	)
+X     ELSE
+X	($say
+X"There is a large white dragon sleeping peacefully in the middle
+Xof the cavern floor.  "
+X	)
+X    )
+X    (DRdem 1)
+X;
+Xdragon(SDESC)=
+X    (IF ($prop dragon AWAKE) THEN
+X	($say "a fierce dragon.  ")
+X     ELSE
+X	($say "a somnolent dragon.  ")
+X    )
+X    (IF ($ne @MyLoc ($loc .ME)) THEN
+X	(DRdem 0)
+X    )
+X;
+X
+Xdragon(ACTION) =			{ Man, the things you can try here... }
+X    (IF ($prop dragon AWAKE) THEN		{ This is the harder stuff }
+X	(IF ($eq ($verb) strike) THEN
+X	    ($say "This just seems to get him angrier!\n")
+X	    ($setg Tempr ($plus @Tempr 1))
+X	    ($exit 1)
+X	 ELSEIF ($eq ($verb) throw) THEN
+X	    (IF ($eq ($iobj) dragon) THEN
+X		(IF ($gt ($prop ($dobj) WEIGH) 75) THEN
+X		    ($say "This just bruises him!  Now he's getting mad!\n")
+X		    ($setg Tempr ($plus @Tempr 1))
+X		    ($exit 1)
+X		 ELSE
+X		    ($say "That object is just too light to hurt him.\n")
+X		    ($exit 1)
+X		)
+X	     ELSE { Dobj action }
+X		($say "This amuses the dragon no end!\n")
+X		($exit 1)
+X	    )
+X	)					{ end of Throw  case}
+X     ELSE					{ he's snoozing}
+X	(IF ($eq ($verb) wake) THEN
+X	    ($say "You manage to waken him.  He's not happy.\n")
+X	    ($setg Tempr 1)
+X	    ($setp dragon AWAKE TRUE)
+X	    (IF ($and ($eq ($loc wood) ($loc .ME)) ($prop wood FLAME)) THEN
+X		(KillDragon)
+X	    )
+X	    ($exit 1)
+X	 ELSEIF ($eq ($verb) strike) THEN
+X	    ($say "Now you woke him up!  He's upset, too!\n")
+X	    ($setg Tempr 2)
+X	    ($setp dragon AWAKE TRUE)
+X	    ($exit 1)
+X	 ELSEIF ($eq ($verb) throw) THEN
+X	    (IF ($eq ($iobj) dragon) THEN
+X		(IF ($gt ($prop ($dobj) WEIGH) 75) THEN
+X		    ($say
+X"It's just heavy enough to waken him.  The bruise doesn't help
+Xhis temper any either.\n"
+X		    )
+X		    ($setp dragon AWAKE TRUE)
+X		    ($setg Tempr 3)
+X		    ($exit 1)
+X		 ELSE
+X		    ($say "That object is just too light to wake him.\n")
+X		    ($exit 1)
+X		)
+X	     ELSE
+X		($say "Don't hurt yourself trying!\n")
+X		($exit 1)
+X	    )
+X	)					{ end of Throw  case}
+X    )
+X;
+X
+X
+XNOUN money;
+Xmoney(WEIGH) = 1;
+Xmoney(LDESC) = ($say "There is a stack of money here!\n");
+Xmoney(SDESC) = ($say "a stack of money");
+Xmoney(POINT) = 25;
+Xstack = money;
+XFOUND = MISC1;
+X
+X
+XNOUN bed (farm7);
+Xbed(WEIGH) = CAPAC;
+Xbed(SDESC) = ($say "an old, rickety bed");
+X
+Xbed(ACTION) =
+X    (IF ($eq ($verb) move) THEN
+X	(IF ($prop bed OPENED) THEN
+X	    ($say "Stop messing with the bed, it's fragile!\n")
+X	    ($exit 1)
+X	)
+X	($say
+X"Moving the bed seems to have loosened one of the wall panels
+Xon the west wall.\n"
+X	)
+X	($setp bed OPENED TRUE)
+X	($exit 1)
+X     ELSEIF ($and ($eq @Verb look) ($eq @Prep under) ($eq @Iobj bed)) THEN
+X	(IF ($eq @Prep under) THEN
+X	    (IF ($not ($prop money FOUND)) THEN
+X		($say "You find some money under the bed!\n")
+X		($move money ($loc .ME))
+X		($setp money FOUND TRUE)
+X		($exit 1)
+X	    )
+X	 ELSEIF ($prop bed OPENED) THEN
+X	    ($say "The bed has been moved.\n")
+X	    ($exit 1)
+X	)
+X    )
+X;
+X
+XNOUN panel (farm7);
+Xpanel(OPENS) = TRUE;
+Xpanel(WEIGH) = CAPAC;
+Xpanel(ACTION) =
+X    (IF ($or ($eq ($verb) open)
+X	     ($eq ($verb) pry) )
+X     THEN
+X	(IF ($and ($eq ($iobj) crowbar)
+X		  ($eq ($loc crowbar) .ME) )
+X	 THEN
+X	    (IF ($not ($prop bed OPENED)) THEN
+X		($say "There aren't any loose enough.\n")
+X		($exit 1)
+X	    )
+X	    ($say
+X"The loose panel comes away, revealing a secret stairway down, down...\n"
+X	    )
+X	    ($setp panel OPENED TRUE)
+X	 ELSE
+X	    ($say "You can't seem to get the panel open.\n")
+X	)
+X	($exit 1)
+X    )
+X;
+X
+X
+XNOUN bottle(town6);
+Xbottle (WEIGH) = 5;
+Xbottle (LDESC) = ($say "There is a bottle here.\n");
+Xbottle (SDESC) = ($say "a bottle");
+Xbottle (TRANS) = TRUE;
+Xbottle (ACTION) =
+X    (IF ($eq ($verb) open) THEN
+X	($say "Hm, the bottle is somehow sealed shut.\n")
+X	($exit 1)
+X     ELSEIF ($eq ($verb) break) THEN
+X	($say "Wow, is that heavy glass!  It won't break!\n")
+X	($exit 1)
+X     ELSEIF ($eq ($verb) strike) THEN
+X	(IF ($eq ($iobj) bottle) THEN
+X	    ($say "Weird thing to do with it.\n")
+X	 ELSE
+X	    ($say "Nice try, but it isn't even scratched.\n")
+X	)
+X	($exit 1)
+X    )
+X;
+X
+XNOUN ship(bottle);
+Xship (LDESC) = ($say "There is a golden model ship here!\n");
+Xship (SDESC) = ($say "a golden model ship");
+Xship (WEIGH) = 5;
+Xship (POINT) = 50;
+Xmodel = ship;
+X
+XNOUN well(town5);
+Xwell(NOTAKE) = TRUE;
+Xwell (ACTION) =
+X    (IF ($eq ($iobj) well) THEN
+X	(IF ($eq ($verb) drop) THEN
+X	    (TWN5y)
+X	)
+X    )
+X;
+X
+XNOUN painting(cel08);
+Xpainting(ACTION) =
+X    (IF ($eq @Verb take) THEN
+X	($say "You can't take the painting.\n")
+X	($setg Skip TRUE)
+X     ELSE
+X	($say "Fiddling with the painting is silly.\n")
+X	($exit 1)
+X    )
+X;
+X
+XNOUN grate(riverx);
+Xgrate(Loc21) = GRATELOC;
+Xgrate(ACTION) =
+X    (IF ($eq @Verb take) THEN
+X	($say "You can't take the grate.\n")
+X	($setg Skip TRUE)
+X     ELSE
+X	($say "Fiddling with the grate is useless.\n")
+X	($exit 1)
+X    )
+X;
+X
+XNOUN insignia;
+Xinsignia(NOTAKE) = TRUE;
+Xinsignia (WEIGH) = CAPAC;
+Xinsignia (ACTION) =
+X    (IF ($eq ($verb) examine) THEN
+X	(IF ($eq ($loc .ME) cel01) THEN
+X	    ($say
+X"The insignia consists of red and green squares joined at the corners.\n"
+X	    )
+X	 ELSEIF ($eq ($loc .ME) cel04) THEN
+X	    ($say
+X"The insignia consists of red and clear squares joined at the corners.\n"
+X	    )
+X	 ELSEIF ($eq ($loc .ME) cel08) THEN
+X	    ($say
+X"The insignia consists of red and blue squares joined at the corners.\n"
+X	    )
+X	 ELSEIF ($eq ($loc .ME) farm5) THEN
+X	    ($say
+X"The insignia consists of blue and green squares joined at the corners.\n"
+X	    )
+X	)
+X	($exit 1)
+X    )
+X    ($say "There's nothing useful to do with the insignia.\n")
+X    ($exit 1)
+X;
+Xsquare=insignia;
+X
+XNOUN glass box(cel08);
+Xglass box(HOLDS)=1;
+Xglass box(TRANS)=TRUE;
+Xglass box(OPENS)=TRUE;
+Xglass box(OPENED)=FALSE;
+Xglass box(SHRNK)=TRUE;          { First seen as a tiny box }
+Xglass box(LDESC) =
+X    (IF ($eq ($prop .ME SHRNK) ($prop [glass box] SHRNK)) THEN
+X	($say "There is a big glass case here.\n")
+X	($setp [glass box] WEIGH CAPAC)
+X	($setp [glass box] HOLDS 50)
+X     ELSE
+X	(IF ($prop .ME SHRNK) THEN
+X	    ($say
+X"Before you looms a huge glass wall, inscribed with the words,
+X	'program error!'\n"
+X	    )
+X	 ELSE
+X	    ($say "There is a tiny glass box with a snap lid here.\n")
+X	    ($setp [glass box] WEIGH 5)
+X	    ($setp [glass box] HOLDS 1)
+X	)
+X    )
+X;
+Xglass box(SDESC) =
+X   (IF ($eq ($prop .ME SHRNK) ($prop [glass box] SHRNK)) THEN
+X	($say "a glass case")
+X	($setp [glass box] WEIGH CAPAC)
+X	($setp [glass box] HOLDS 50)
+X     ELSE
+X	(IF ($prop .ME SHRNK) THEN
+X	    ($say
+X"a huge glass wall, inscribed with the words,
+X	'program error'"
+X	    )
+X	 ELSE
+X	    ($say "a tiny glass box")
+X	    ($setp [glass box] WEIGH 5)
+X	    ($setp [glass box] HOLDS 1)
+X	)
+X    )
+X;
+Xglass box(ACTION) =
+X    (IF ($eq ($verb) examine) THEN
+X	(IF ($prop [glass box] OPENED) THEN
+X	    ($say "The case is opened.\n")
+X	 ELSE
+X	    ($say "The case is closed (pun not intended).\n")
+X	)
+X	($exit 1)
+X    )
+X;
+Xcase=glass box;
+X
+XNOUN statue(glass box);
+Xsand = statue;
+Xsand(SHRNK)=TRUE;
+Xsand(WEIGH)=1;
+Xsand(LDESC)=
+X    (IF ($and ($prop sand SHRNK) ($not ($prop .ME SHRNK))) THEN
+X	($setp sand POINT 0)
+X	($say "There is a grain of sand here.\n")
+X     ELSE
+X	($say "There is a beautiful porcelain statue here!\n")
+X	($setp sand POINT 50)
+X    )
+X;
+Xsand(SDESC)=
+X    (IF ($and ($prop sand SHRNK) ($not ($prop .ME SHRNK))) THEN
+X	($setp sand POINT 0)
+X	($say "a grain of sand")
+X     ELSE
+X	($say "a porcelain statue")
+X	($setp sand POINT 50)
+X    )
+X;
+Xsand(ACTION)=
+X    (IF ($eq ($verb) take) THEN
+X	(IF ($and ($prop sand SHRNK) ($not ($prop .ME SHRNK))) THEN
+X	    ($say "You fumble the grain of sand and lose it on the ground.\n")
+X	    ($move sand .ALL)
+X	    ($setg Skip TRUE)
+X	)
+X    )
+X;
+X
+XNOUN hole;
+Xhole(NOTAKE) = TRUE;
+Xhole(ACTION) =
+X    ($say "You can't do anything useful with the hole.\n")
+X    ($exit 1)
+X;
+X
+XNOUN rock(road5);
+Xrock(LDESC)=($say "There is a plain-looking rock here.\n");
+Xrock(SDESC)=($say "an ordinary rock");
+Xrock(ACTION)=
+X    (IF ($and ($eq ($verb) take) ($eq ($dobj) rock)) THEN
+X	($say "Mmph!  Heavy!\n")
+X    )
+X;
+Xrock(WEIGH)=100;
+X
+XIFOUND = MISC1;
+XNOUN ivory(riverx);
+Xivory(WEIGH) = 5;
+Xivory(POINT) = 25;
+Xivory(Loc21) = GRATELOC;
+Xivory(LDESC) =
+X    ($say "There is a beautiful piece of ivory ")
+X    (IF ($not ($prop ivory IFOUND)) THEN
+X	($say "wedged in the grate.\n")
+X	($setp ivory IFOUND TRUE)
+X     ELSE
+X	($say "here.\n")
+X    )
+X;
+Xivory(SDESC) =
+X    ($say "a piece of ivory")
+X    (IF ($not ($prop ivory IFOUND)) THEN
+X	($say " (wedged in the grate)")
+X	($setp ivory IFOUND TRUE)
+X    )
+X;
+X
+X
+XNOUN matches(cel12);
+Xmatches(LDESC) = ($say "There is a book of waterproof matches here.\n");
+Xmatches(SDESC) = ($say "a book of matches");
+Xmatches(ACTION) =
+X    (IF ($and ($or ($eq @Verb light) ($eq @Verb burn)) ($eq @Dobj matches)) THEN
+X	($say "OK, you light a match, which quickly burns out.\n")
+X	($exit 1)
+X    )
+X;
+Xmatches(WEIGH) = 1;
+Xbook = matches;
+X
+XWoodBurn =
+X    (IF ($eq ($loc wood) ($loc .ME)) THEN
+X	($say "The wood burns down to a pile of ashes, which blows away.\n")
+X    )
+X    ($move wood .ALL)
+X    ($setp wood FLAME FALSE)
+X;
+X
+X
+X{ NOUN wood(cel20); }
+Xwood(LDESC) =
+X    ($say "There is a pile of ")
+X    (IF ($prop wood FLAME) THEN
+X	($say "burning ")
+X    )
+X    ($say "wood here.\n")
+X;
+Xwood(SDESC) =
+X    ($say "a pile of ")
+X    (IF ($prop wood FLAME) THEN
+X	($say "burning ")
+X    )
+X    ($say "wood")
+X;
+Xwood(WEIGH) = 100;
+Xwood(ACTION) =
+X    (IF ($prop wood FLAME) THEN
+X	($say "The wood is too hot to touch.\n")
+X	(IF ($or ($eq @Verb take) ($eq @Verb drop)) THEN
+X	    ($setg Skip TRUE)
+X	    ($return 0)
+X	 ELSE
+X	    ($exit 1)
+X	)
+X     ELSEIF ($or ($eq @Verb burn) ($eq @Verb light)) THEN
+X	(IF ($not @Iobj) THEN
+X	    ($say "You must tell me how to do that!\n")
+X	    ($exit 1)
+X	 ELSEIF ($ne @Iobj matches) THEN
+X	    ($say "That doesn't seem to work.\n")
+X	    ($exit 1)
+X	 ELSEIF ($eq ($loc wood) .ME) THEN
+X	    ($say "You can't manage that while you are holding the wood.\n")
+X	    ($exit 1)
+X	)
+X	($say
+X"You strike a match and apply it to the wood, which bursts into flames.\n"
+X	)
+X	(IF ($and ($prop dragon AWAKE) ($eq ($loc .ME) ($loc dragon))) THEN
+X	    (KillDragon)
+X	 ELSE
+X	    ($setp wood FLAME TRUE)
+X	    ($sfus .ME WoodBurn 3)
+X	)
+X	($exit 1)
+X    )
+X;
+X
+X
+XKillDragon =
+X    ($say
+X"The dragon, attracted by the bright flame of the burning wood, snaps it up in
+Xits jaws.  Suddenly, the dragon realizes what it has done!  It tries to spit
+Xout the wood, but it is too late!  The dragon evaporates with a deafening
+Xwhistle and a burst of steam!  "
+X    )
+X    (IF ($or ($eq ($loc bottle) ($loc .ME))
+X	     ($eq ($loc bottle) .ME)
+X	)
+X     THEN
+X	($say
+X"The sound of the whistle shatters the bottle,
+Xreleasing the golden ship model!  "
+X	)
+X	($move ship ($loc .ME))
+X	($move bottle .ALL)
+X    )
+X    ($say
+X"Upon the death of the dragon, the ice melts with astonishing speed.\n"
+X    )
+X    ($dfus .ME WoodBurn)
+X    ($move wood .ALL)
+X    ($setp dragon KILLED TRUE)
+X    ($move dragon .ALL)
+X    ($setg SCORE ($plus @SCORE 100))
+X    ($setp cel06 SEEN FALSE)
+X    ($setp cel05 SEEN FALSE)
+X    ($setp cel03 SEEN FALSE)
+X    ($setp cel10 SEEN FALSE)
+X    ($setp cel08 SEEN FALSE)
+X;
+X
+XNOUN goblet(cel19);
+XFREED = MISC1;
+Xgoblet(WEIGH) = 5;
+Xgoblet(POINT) = 25;
+Xgoblet(LDESC) =
+X    (IF ($not ($prop goblet FREED)) THEN
+X	($say "There is a beautiful golden goblet frozen in the ice!\n")
+X     ELSE
+X	($say "There is a beautiful golden goblet here!\n")
+X    )
+X;
+Xgoblet(SDESC) =
+X    ($say "a golden goblet")
+X    (IF ($not ($prop goblet FREED)) THEN
+X	($say " (frozen in the ice)")
+X    )
+X;
+Xgoblet(ACTION) =
+X    (IF ($not ($prop goblet FREED)) THEN
+X	($say
+X"There's not much you can do with the goblet while it's frozen
+Xin the ice.\n"
+X	)
+X	($exit 1)
+X    )
+X;
+X
+XNOUN newspaper(town2);
+Xpaper = newspaper;
+Xnewspaper(LDESC) =
+X    ($say "There is a newspaper fluttering in the breeze here.\n")
+X;
+Xnewspaper(SDESC) = ($say "a newspaper");
+Xnewspaper(ACTION) =
+X    (IF ($or ($eq ($verb) read) ($eq ($verb) examine)) THEN
+X	($say "		UNUCHEVALA NEWS -- VOLUME II NUMBER 1\n\n")
+X	($say
+X"VANDALS THREATEN COWLEY
+X
+X    Last night,  unknown vandals attacked the farm of Mr. Cowley,  north of
+Xtown.  They sprayed \"DIE, HEATHENS\" on  his front door (in reference to his
+Xadmittedly strange  beliefs).   Cowley says that this is not the first such
+Xthreat he has received. However, he says that he will deal with the vandals
+Xin his own way.   Unfortunately,  we have been unable to contact Mr. Cowley
+Xpersonally, since he has not been seen hereabouts since last night.\n\n"
+X	)
+X	($say
+X"DROUGHT IMMINENT, SAY LOCAL FARMERS
+X
+X     The  Unuchevala  River has recently  been  falling,  and little relief
+Xis in sight for our  local farmers.   \"I'm agonna  leave here, purty soon,\"
+Xsaid one farmer  (who chose  to  remain anonymous).   \"It's all that danged
+XCowley's fault,  messin'  about  with  things  that  ain't natrawl-like.  I
+Xcaint even raise 'nuff to feed myself, not mentionin' the resta the town.\"\n\n"
+X	)
+X	($say "WEATHER -- Continued dry, with no rain in sight.\n\n")
+X	($exit 1)
+X     ELSEIF ($or ($eq @Verb burn) ($eq @Verb light)) THEN
+X	(IF ($not @Iobj) THEN
+X	    ($say "You must tell me how to do that!\n")
+X	    ($exit 1)
+X	 ELSEIF ($ne @Iobj matches) THEN
+X	    ($say "That doesn't seem to work.\n")
+X	    ($exit 1)
+X	 ELSEIF ($eq ($loc newspaper) .ME) THEN
+X	    ($say "You can't manage to do that while holding the newspaper.\n")
+X	    ($exit 1)
+X	)
+X	($say
+X"The newspaper lights easily, burning down to ashes which blow away.\n"
+X	)
+X	(IF ($and ($eq ($loc .ME) ($loc dragon)) ($prop dragon AWAKE)) THEN
+X	{ give the player a hint }
+X	    ($say
+X"The dragon notices the flash and approaches the newspaper,
+Xbut the fire dies down before the dragon can reach it.\n"
+X	    )
+X	)
+X	($move newspaper .ALL)
+X	($exit 1)
+X    )
+X;
+X
+XNOUN ice;
+Xice(NOTAKE) = TRUE;
+Xice(ACTION) =
+X    (IF ($or ($eq @Verb break) ($eq @Verb hit)) THEN
+X	(IF ($eq @Dobj ice) THEN
+X	    (IF ($not @Iobj) THEN
+X		($say "You must tell me how to do that.\n")
+X		($exit 1)
+X	    )
+X	    (IF ($eq ($loc .ME) cel19) THEN
+X		(IF ($gt ($prop @Iobj WEIGH) 20) THEN
+X		    (IF ($not ($prop goblet FREED)) THEN
+X			($say "You manage to free the goblet.\n")
+X			($setp goblet FREED TRUE)
+X			($move goblet cel19)
+X			($exit 1)
+X		    )
+X		)
+X	     ELSEIF ($eq ($loc .ME) cel13) THEN
+X		(IF ($not ($prop cel13 HOLED)) THEN
+X		    (IF ($gt ($prop @Iobj WEIGH) 75) THEN
+X			($say
+X"You swing at the ice with the " ($name @Iobj)
+X", which breaks through and sinks into
+Xthe icy waters below!\n"
+X			)
+X			($move @Iobj .ALL)
+X			($setp cel13 HOLED TRUE)
+X			($exit 1)
+X		    )
+X		)
+X	    )
+X	    ($say "The ice chips a bit, but does not break.\n")
+X	    ($exit 1)
+X   	)
+X    )
+X    ($say "You can't do that!\n")
+X    ($exit 1)
+X;
+END_OF_samples/mpu/objects.adl
+if test 26919 -ne `wc -c <samples/mpu/objects.adl`; then
+    echo shar: \"samples/mpu/objects.adl\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f samples/mpu/verbs.adl -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"samples/mpu/verbs.adl\"
+else
+echo shar: Extracting \"samples/mpu/verbs.adl\" \(3506 characters\)
+sed "s/^X//" >samples/mpu/verbs.adl <<'END_OF_samples/mpu/verbs.adl'
+XVERB
+X  pry,  strike, wake,   say,
+X  beam, join,   opener, glow,
+X  grab, weigh,  rname,  score,
+X  debug;
+X
+Xfeel	= touch;
+Xshake	= wake;
+Xhit	= strike;
+Xkill	= strike;
+Xshut	= close;
+Xpush	= move;
+Xpull	= move;
+Xlift	= move;
+Xdestroy	= break;
+Xincant	= say;
+Xchant	= say;
+Xshout	= say;
+Xyell	= say;
+Xout	= exit;
+X
+X
+Xcg =
+X    ($say "You can't go that way.\n")
+X    ($setg MyLoc ($loc .ME))
+X;
+X
+Xdie =
+X    ($say "You are dead.  Better luck next time.\n")
+X    (IF ($not @Wizrd) THEN
+X 	($spec 3)
+X    )
+X;
+X
+X
+X
+XLooks =
+X    (IF ($dobj) THEN
+X	($say "Huh?\n")
+X	($exit 1)
+X    )
+X    ($setg GOVERB TRUE)
+X    ($setg MyLoc -1)
+X;
+X
+Xn (PREACT) = Looks;
+Xs (PREACT) = Looks;
+Xe (PREACT) = Looks;
+Xw (PREACT) = Looks;
+X
+Xnw(PREACT) = Looks;
+Xne(PREACT) = Looks;
+Xsw(PREACT) = Looks;
+Xse(PREACT) = Looks;
+X
+Xu (PREACT) = Looks;
+Xd (PREACT) = Looks;
+X
+Xout (PREACT) = Looks;
+Xenter (PREACT) = Looks;
+X
+Xsay (PREACT) =
+X    (Expect ($or NO_OBJ ONE_OBJ STR_OBJ PLAIN_OBJ) NO_OBJ)
+X    (IF ($not ($dobj)) THEN
+X	($say "Type just what you want to say: ")
+X	($setg Dobj ($read))
+X    )
+X    (IF ($ge ($dobj) 0) THEN
+X	($say "You want to make " ($name ($dobj)))
+X	($say " a linguistic artifact??  Strange!\n")
+X	($exit 1)
+X    )
+X;
+Xsay (ACTION) = 
+X    (IF ($eqst ($dobj) Shazm) THEN
+X	(WzTgl)
+X     ELSE
+X	($say "Very well.  '")
+X	($say ($dobj))
+X	($say "'.\n")
+X    )
+X;
+X
+X
+XDWIMD =
+X    ($return (Dwimmer %1))
+X;
+X
+XDWIMI =
+X    ($return (Dwimmer %1))
+X;
+X
+X
+Xwake(PREACT) = Preact;
+Xwake(ACTION) =
+X    ($say "I don't know how to wake " ($name ($dobj)) ".\n")
+X;
+X
+X
+Xstrike(PREACT) = Preact;
+Xstrike(ACTION) =
+X    ($say "Hitting the " ($name ($dobj)) " doesn't seem to do anything.")
+X;
+X
+X
+Xpry(PREACT) =
+X    (Expect ($or ONE_OBJ PLAIN_OBJ) ($or ONE_OBJ PLAIN_OBJ))
+X    (CheckAvail)
+X;
+Xpry(ACTION) =  ($say "I can't seem to manage that.\n");
+X
+X
+XTress =
+X    ($say "You were warned about trespassing! The fence is electrified!\n")
+X    (die)
+X;
+X
+X
+Xscore(ACTION) =
+X    (IF ($eq ($loc .ME) town5) THEN
+X 	($say
+X"A mysterious glowing network of lights appears, and you can
+Xjust make out the words:
+X   Your account is now at $" ($str @SCORE) ".
+X   Thank you for letting Arpa-Citizen's be your host.
+XThe network then disappears.\n"
+X	)
+X     ELSE
+X	($say "Hmm, you'll have to check at the local bank.\n")
+X    )
+X;
+X
+X
+XWizP =
+X    (IF ($not @Wizrd) THEN
+X	($say "Only a real Wizard can do that!\n")
+X	($exit 1)
+X    )
+X;
+X
+Xrname(PREACT) =
+X    (IF @Dobj THEN
+X	(WizP)
+X	(($sdesc @Dobj))
+X     ELSE
+X	(($sdesc ($loc .ME)))
+X    )
+X    ($exit 1)
+X;
+Xbeam(PREACT) = WizP;
+Xgrab(PREACT) = WizP;
+Xjoin(PREACT) = WizP;
+Xopener(PREACT) = WizP;
+Xglow(PREACT) = WizP;
+Xweigh(PREACT) = WizP;
+Xdebug(PREACT) = WizP;
+X
+Xbeam(ACTION) =
+X    (IF ($dobj) THEN
+X	($move .ME ($dobj))
+X	($setg MyLoc -1)
+X    )
+X;
+X
+Xjoin(ACTION) =
+X    (IF ($dobj) THEN
+X	($move .ME ($loc ($dobj)))
+X	($setg MyLoc -1)
+X    )
+X;
+X
+Xopener(ACTION) =
+X    (IF ($dobj) THEN
+X	($setp ($dobj) OPENED TRUE)
+X	($say "Opened.\n")
+X    )
+X;
+X
+Xglow(ACTION) =
+X    ($setp .ME LIGHT ($not ($prop .ME LIGHT)))
+X    (IF ($prop .ME LIGHT) THEN
+X	($say "Your body begins to radiate a strong but gentle white light!\n")
+X     ELSE
+X	($say "The light from your body fades away.\n")
+X    )
+X;
+X
+Xgrab(ACTION) =
+X    (IF ($dobj) THEN
+X	($say "You have the " ($name ($dobj)) ", Boss!\n")
+X	($move ($dobj) .ME)
+X	($setp .ME HAS ($plus ($prop .ME HAS) ($prop ($dobj) WEIGH)))
+X    )
+X;
+X
+Xweigh(ACTION) =
+X    (IF @Dobj THEN
+X	($say "The " ($name @Dobj) " weighs " ($str ($prop @Dobj WEIGH)))
+X     ELSE
+X	($say "You are carrying " ($str ($prop .ME HAS)))
+X    )
+X    ($say " pounds, Boss!\n")
+X;
+X
+Xdebug(ACTION) =
+X    ($spec 1)	{ Turn on debugging }
+X;
+END_OF_samples/mpu/verbs.adl
+if test 3506 -ne `wc -c <samples/mpu/verbs.adl`; then
+    echo shar: \"samples/mpu/verbs.adl\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+echo shar: End of archive 4 \(of 11\).
+cp /dev/null ark4isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 11 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+    echo Making adl.doc
+    (cd man; cat doc.aa doc.ab doc.ac >adl.doc; rm doc.a[a-c])
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell  - pX		($save na
+
+

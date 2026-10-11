@@ -1,0 +1,549 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,1142972c04d3c80a
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1987-04-15 07:52:21 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!utgpu!water!watmath!clyde!rutgers!uwvax!oddjob!mimsy!mark
+From: mark@mimsy.UUCP
+Newsgroups: net.sources
+Subject: Re: Magnifying glass for Sun3
+Message-ID: <6296@mimsy.UUCP>
+Date: Wed, 15-Apr-87 09:52:21 EST
+Article-I.D.: mimsy.6296
+Posted: Wed Apr 15 09:52:21 1987
+Date-Received: Fri, 17-Apr-87 00:35:25 EST
+References: <1038@carthage.UUCP>
+Organization: U of Maryland, Dept. of Computer Science, Coll. Pk., MD 20742
+Lines: 527
+Keywords: glass, magnifying, sun, toy
+Summary: Improved glass.
+
+Here is an improved version of the magnifying glass program for
+the Sun-3.  I have changed it to use the classic rasterop algorithm for
+magnifiying, which speed up magnifying quite a bit.  I also added
+panels to dynamically change the frequency of updating (so it doesn't eat all
+the cpu cycles) and the amount of magnification.
+
+Thanks to Scott Schwartz, who wrote the original, for making something to change!
+-mark
+Spoken: Mark Weiser 	ARPA:	mark@mimsy.umd.edu	Phone: +1-301-454-7817
+After May 15, 1987: weiser@parcvax.xerox.com
+-------cut here------------------------------
+PATH=/bin:/usr/bin:/usr/ucb:/etc:$PATH
+export PATH
+all=FALSE
+if [ x$1 = x-a ]; then
+	all=TRUE
+fi
+echo Extracting README
+sed 's/^X//' <<'//go.sysin dd *' >README
+
+This is about the magnifying glass for Sun3s.
+
+The program, glass, takes one argument, which quantifies the magnification it
+is to do. If no argument is supplied, glass assumes you mean no magnification.
+Glass opens it's own window to display the magnified image.  The image
+is a region to the upper left of the cursor, the direction the cursor points,
+with the lower right corner of the window corresponding to the tip of the
+cursor.
+
+To compile, use the makefile provided.
+
+If anyone decides to fix these, please mail me a copy of the changes.
+I, of course, will post any changes I make.
+
+			
+			-- Scott Schwartz
+				USmail: Swarthmore College
+					Swarthmore PA, 19081
+				UUCP: ...seismo!bpa!swatsun!schwartz
+
+//go.sysin dd *
+if [ `wc -c < README` != 716 ]; then
+	made=FALSE
+	echo error transmitting README --
+	echo length should be 716, not `wc -c < README`
+else
+	made=TRUE
+fi
+if [ $made = TRUE ]; then
+	chmod 644 README
+	echo -n '	'; ls -ld README
+fi
+echo Extracting Makefile
+sed 's/^X//' <<'//go.sysin dd *' >Makefile
+# Makefile to compile magnifying glass
+# by Scott Schwartz, Dec 1986
+
+# flags.  normally just -O
+CFLAGS=-g
+LIBS= -lsuntool -lsunwindow -lpixrect
+
+# dependencies for glass
+glass: glass.o 
+	cc $(CFLAGS) -o glass glass.o $(LIBS)
+
+glass.o: glass.c patchlevel.h Makefile
+	cc $(CFLAGS) -c glass.c
+
+# utility stuff
+clean:
+	rm -f glass glass.o
+lint:
+	lint -hx glass.c $(LIBS)
+shar:
+	makescript -o glass.shar README Makefile glass.c glass.icon patchlevel.h
+//go.sysin dd *
+if [ `wc -c < Makefile` != 448 ]; then
+	made=FALSE
+	echo error transmitting Makefile --
+	echo length should be 448, not `wc -c < Makefile`
+else
+	made=TRUE
+fi
+if [ $made = TRUE ]; then
+	chmod 755 Makefile
+	echo -n '	'; ls -ld Makefile
+fi
+echo Extracting glass.c
+sed 's/^X//' <<'//go.sysin dd *' >glass.c
+X/*
+ *  Magnifying glass		(for Sun-3 workstations)
+ *
+ *  Copyright 1986, 1987 by Scott Schwartz
+ *  Lots of changes by, but not Copyrighted by, Mark Weiser.
+ *  This program may be copied with the provision that this copyright 
+ *  message remains, and that further distribution of this code and it's 
+ *  derivatives is not subject to additional restrictions.
+ * 
+ *  compile with -lsuntool -lsunwindow -lpixrect
+ *
+ *  vi: set ts=8
+ *
+ *  revision history:
+ *  10 Nov 86	initial coding		 		Scott Schwartz 
+ *
+ *  version 1.0		25 Nov 86
+ *	modified to draw big pixels with raster-ops		ses
+ *
+ *  version 1.1		27 Jan 87
+ *	does magnification in memory, 				ses
+ *	to avoid screen access
+ *
+ *  version 1.2		27 Jan 87
+ *	flood destination with white, 				ses/af
+ *      then draw only black spots
+ *
+ *  version 2.0		15 Apr 87				mark weiser
+ *	vastly faster magnification algorithm using only 2k blits
+ *	instead of k**2 (where k is the height or width of the final).
+ *	Also added a panel for friendliness, and stopped using *all* the cpu!
+ */
+
+#include <stdio.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <suntool/sunview.h>
+#include <suntool/canvas.h>
+#include <suntool/panel.h>
+#include <pixrect/pixrect_hs.h>
+
+X/* useful macros */
+#define error(msg)  { fprintf(stderr, "%s: %s\n", argv[0], msg); exit(1); }
+
+X/* forward declarations */
+extern char *getenv(), *sprintf();
+extern Notify_error notify_dispatch();
+static Notify_value notice_destroy_event();
+extern void pw_mag();
+extern void view();
+void update();
+void glass_time_proc();
+Notify_value update_value_proc();
+
+X/* constants */
+static char frame_label[] = "Magnifying Glass 2.0";
+static short icon_image[] = {
+#include "glass.icon"
+};
+DEFINE_ICON_FROM_IMAGE(icon, icon_image);
+#define NILPR ((Pixrect *)0)
+#define screen_max_x  1152
+#define screen_max_y  900
+#define max_mag 100
+
+X/* global vars */
+typedef struct pixrect Pixrect;	/* for 3.2 compatibility. */
+static Pixrect	*tmpsrc; /* working space, to avoid screen access */ 
+static Pixrect	*tmpdst;
+static int done = 0;
+Pixrect *srcpr; /* the source pixrect, i.e. the whole screen */
+int rootfd;  /* file descriptor for root window, for cursor location */
+	Frame frame;	/* the actual window frame */
+Canvas canvas;	/* our particular canvas, filling the frame */
+int mag = 1;			/* magnification in output window */
+int delay = 1000;
+
+X/* 
+ *  main routine
+ */
+main(argc,argv)
+int argc;
+char **argv;
+{
+	/* externals */
+	extern Pixrect *tmpsrc, *tmpdst;
+
+	/* things to magnify */
+	char *parent; /* name of the parent window, usually win0 */
+
+	/* things to draw on */
+	Panel panel;
+
+	/* misc */
+	char *magstr = "x99999";	/* allocate space for actual string */
+	int retcode;
+
+	/* open rootwindow */
+	parent = getenv("WINDOW_PARENT");
+	if (parent==NULL) 
+		error("can't get WINDOW_PARENT from environment.")
+	rootfd = open(parent, O_RDONLY, 0);
+	if (rootfd<0)
+		perror(argv[0]); 
+
+	/* open frame buffer */
+	srcpr = pr_open("/dev/fb");
+	if (srcpr==NILPR)
+		perror(argv[0]);
+
+	/* create output window */
+	frame = window_create(NULL, FRAME, 
+			FRAME_LABEL, frame_label,
+			FRAME_ICON, &icon,
+			FRAME_ARGC_PTR_ARGV, &argc, argv,
+			0);
+
+	panel = window_create(frame, PANEL, 0);
+	(void) panel_create_item(panel, PANEL_SLIDER,
+		PANEL_LABEL_STRING, "Mag:",
+		PANEL_VALUE, 1,
+		PANEL_MIN_VALUE, 1,
+		PANEL_MAX_VALUE, 8,
+		PANEL_SHOW_RANGE, FALSE,
+		PANEL_SHOW_VALUE, TRUE,
+		PANEL_SLIDER_WIDTH, 100,
+		PANEL_NOTIFY_PROC, update_value_proc,
+		PANEL_CLIENT_DATA, &mag,
+		0);
+	(void) panel_create_item(panel, PANEL_SLIDER,
+		PANEL_LABEL_STRING, "Delay:",
+		PANEL_VALUE, 10000,
+		PANEL_MIN_VALUE, 1000,
+		PANEL_MAX_VALUE, 999999,
+		PANEL_SHOW_RANGE, FALSE,
+		PANEL_SHOW_VALUE, FALSE,
+		PANEL_SLIDER_WIDTH, 100,
+		PANEL_NOTIFY_PROC, update_value_proc,
+		PANEL_CLIENT_DATA, &delay,
+		PANEL_ITEM_X, ATTR_COL(0),
+		PANEL_ITEM_Y, ATTR_ROW(1),
+		0);
+
+	window_fit_height(panel);
+
+	/* handle arguments */		
+	if (argc > 1) {
+		retcode = sscanf(argv[1], "%d", &mag);
+		if (retcode <= 0) 
+			error("problem evaluating arguments\nUsage: glass magnification [suntools-options]");
+		mag = (mag > max_mag) ? max_mag : mag;
+	}
+
+	/* allocate static pixrects */
+	tmpsrc = mem_create(screen_max_x, screen_max_y, 1);
+	tmpdst = mem_create(screen_max_x, screen_max_y, 1);
+
+	/* gather data on output pixwin */
+	canvas = window_create(frame, CANVAS,
+			WIN_HEIGHT, 200,
+			WIN_WIDTH, 200,
+			0);
+
+	window_fit(frame);
+
+	/* set up an interposed event handler so we know when to quit */
+	(void)notify_interpose_destroy_func(frame, notice_destroy_event);
+	
+	/* start us in a second */
+	do_with_delay(glass_time_proc, 1, 0);
+
+	/* copy input to output forever */
+	window_main_loop(frame);
+	exit(0);
+}
+
+X/*
+ * Thing to do at intervals.
+ */
+void
+glass_time_proc()
+{
+	if (done) return;
+	view(rootfd, srcpr, canvas, mag);
+	if (window_get(frame, FRAME_CLOSED)) {
+		do_with_delay(glass_time_proc, 2, 0);
+	} else {
+		do_with_delay(glass_time_proc, 0, delay);
+	}
+}
+
+X/*
+ * view does the work of displaying the (possibly) magnified image
+ * at the location indicated by rootfd (mouse). view copies srcpr to dstpw.
+ */
+void view(rootfd, srcpr, canvas, mag)
+	int rootfd;		/* root window, for mouse data */	
+	Pixrect *srcpr;		/* screen source pixrect */
+	Canvas canvas;
+	int mag;
+{
+	/* constants */
+	int maxy = (srcpr->pr_size.y);
+	int maxx = (srcpr->pr_size.x);
+	Pixwin *dstpw = canvas_pixwin(canvas);
+
+	/* local vars */	
+	int x,y;
+	int w, h;
+
+	/* 
+	 * read mouse coords from vuid register.  sadly, the sunview
+	 * programmers guide is not clear on this.  appendix A tells some,
+	 * but you have to look at <sundev/vuid_event.h> to see what
+ 	 * virtual events you can find out about.  luckily, the mouse is
+	 * one of them.
+	 */
+	x = win_get_vuid_value(rootfd, LOC_X_ABSOLUTE);
+	y = win_get_vuid_value(rootfd, LOC_Y_ABSOLUTE);
+
+	/* 
+	 * find out how big our drawing surface is.
+	 */
+	w = (int) window_get(canvas, CANVAS_WIDTH);
+	h = (int) window_get(canvas, CANVAS_HEIGHT);
+
+	/*
+	 * draw on it.
+	 */
+	if (mag<=1) {
+		x = min(maxx-w, max(x-w, 0));
+		y = min(maxy-h, max(y-h, 0));
+		update(dstpw, 0, 0, w, h, PIX_SRC, srcpr, x, y);
+	}
+	else {
+		x = min(maxx-w/mag, max(x-w/mag, 0));
+		y = min(maxy-h/mag, max(y-h/mag, 0));
+		pw_mag(dstpw, 0, 0, w, h, mag, srcpr, x, y);
+	}
+}
+
+X/*
+ * pw_mag copies a magnified view of spr to dpw using pixel replication.
+ * the arguments are the same as those to the pw_rop library call, except
+ * that magnification is passed instead of raster-op.
+ */
+void pw_mag(dpw, dx, dy, w, h, mag, spr, sx, sy)
+	Pixwin *dpw;	/* destination pixwin */
+	int dx, dy;  	/* destination x,y */
+	int w, h;	/* width and height of block to copy */
+	int mag; 	/* magnification */
+	Pixrect *spr;	/* source pixrect */
+	int sx,sy;	/* location in source to copy from */
+{
+	/* locals */
+	register short si, sj;
+	register short di, dj;
+	register short jmax = h/mag + 1, imax = w/mag + 1;
+	register short x, y, delta;
+
+	Pixrect r;	/* holds the size of the drawing region when */
+			/* gaining access to the screen */
+	r.pr_size.x = w;
+	r.pr_size.y = h;
+
+	/* make off screen copy of source */
+	pr_rop(tmpsrc, 0, 0, w, h, PIX_SRC|PIX_DONTCLIP, spr, sx, sy);
+
+	for (x = 0; x < imax; x += 1) {
+		for (delta = 0; delta < mag; delta += 1) {
+			pr_rop(tmpdst, x*mag+delta, 0, 1, jmax, PIX_SRC|PIX_DONTCLIP, tmpsrc, x, 0);
+		}
+	}
+	for (y = jmax; y >= 0; y -= 1) {
+		for (delta = 0; delta < mag; delta += 1) {
+			pr_rop(tmpdst, 0, y*mag+delta, w, 1, PIX_SRC|PIX_DONTCLIP, tmpdst, 0, y);
+		}
+	}
+
+
+	/* draw */
+	update(dpw, dx, dy, w, h, PIX_SRC, tmpdst, 0, 0);
+}
+
+X/* for debugging purposes, mostly */
+void update(dpw, dx, dy, w, h, mag, spr, sx, sy)
+	Pixwin *dpw;	/* destination pixwin */
+	int dx, dy;  	/* destination x,y */
+	int w, h;	/* width and height of block to copy */
+	int mag; 	/* magnification */
+	Pixrect *spr;
+	/* source pixrect */
+	int sx,sy;	/* location in source to copy from */
+{
+pw_rop(dpw, dx, dy, w, h, mag, spr, sx, sy);
+}
+
+
+X/* 
+ * a service routine that gets called when the frame is destroyed
+ * by someone selecting 'quit'.  this is basically right out of the 
+ * manual.
+ */
+static Notify_value
+notice_destroy_event(frame, status)
+	Frame *frame;
+	Destroy_status status;
+{
+	if (status != DESTROY_CHECKING) {
+		done = 1;
+	}
+	return (notify_next_destroy_func(frame,status));
+}
+
+X/*
+ * The routines below I have found enormously handy when dispatching
+ * things via the notifier.  Use them in good health, or bad.  I do.
+ *		-mark weiser
+ */
+
+X/*
+ * Call procedure f in a little while.
+ */
+do_with_delay(f, secs, usecs)
+void (*f)();
+int secs, usecs;
+{
+	Notify_value do_the_call();
+	struct itimerval timer;
+
+	/* Sigh, so much work just to wait a bit before starting up. */
+	timer.it_interval.tv_usec = 0;
+	timer.it_interval.tv_sec = 0;
+	timer.it_value.tv_usec = usecs;
+	timer.it_value.tv_sec = secs;
+	notify_set_itimer_func(f, do_the_call,
+		ITIMER_REAL, &timer, NULL);
+}
+
+X/*
+ * Wrapper to make sure procedures from do_with_delay return good values
+ * to the notifier.
+ */
+Notify_value
+do_the_call(f, which)
+void (*f)();
+{
+	(*f)();
+	return NOTIFY_DONE;
+}
+
+Notify_value
+update_value_proc(item, value)
+Panel_item item;
+{
+	int *ptr;
+	ptr = (int *)panel_get(item, PANEL_CLIENT_DATA);
+	*ptr = value;
+	return NOTIFY_DONE;
+}
+//go.sysin dd *
+if [ `wc -c < glass.c` != 9192 ]; then
+	made=FALSE
+	echo error transmitting glass.c --
+	echo length should be 9192, not `wc -c < glass.c`
+else
+	made=TRUE
+fi
+if [ $made = TRUE ]; then
+	chmod 644 glass.c
+	echo -n '	'; ls -ld glass.c
+fi
+echo Extracting glass.icon
+sed 's/^X//' <<'//go.sysin dd *' >glass.icon
+X/* Format_version=1, Width=64, Height=64, Depth=1, Valid_bits_per_item=16
+ */
+	0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,
+	0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,
+	0x8888,0x8888,0x8888,0x8888,0x8888,0x8BF8,0x8888,0x8888,
+	0x2222,0x1CC7,0x2222,0x2222,0x2222,0x70C1,0xE222,0x2222,
+	0x8888,0xC0C0,0xE888,0x8888,0x888B,0xC0C0,0xF888,0x8888,
+	0x2226,0x0C0C,0x0E22,0x2222,0x2224,0x0C0C,0x0C22,0x2222,
+	0x888C,0x0C0C,0x0E88,0x8888,0x889C,0x0C0C,0x0F08,0x8888,
+	0x2230,0xC0C0,0xC122,0x2222,0x2230,0xC0C0,0xC1A2,0x2222,
+	0x88A0,0xC0C0,0xC088,0x8888,0x88A0,0xC0C0,0xC088,0x8888,
+	0x2240,0x0000,0x0062,0x2222,0x2246,0x0C0C,0x0C62,0x2222,
+	0x88C6,0x0C0C,0x0C48,0x8888,0x88C6,0x0C0C,0x0C48,0x8888,
+	0x2246,0x0C0C,0x0C62,0x2222,0x2240,0x0000,0x0062,0x2222,
+	0x88C0,0xC0C0,0xC1C8,0x8888,0x88A0,0xC0C0,0xC188,0x8888,
+	0x2220,0xC0C0,0xC1A2,0x2222,0x2230,0xC0C0,0xC1A2,0x2222,
+	0x8890,0x0000,0x0188,0x8888,0x8896,0x0C0C,0x0F88,0x8888,
+	0x222E,0x0C0C,0x0F22,0x2222,0x2226,0x0C0C,0x0FA2,0x2222,
+	0x888E,0x0C0C,0x0FC8,0x8888,0x888B,0xC0C0,0xFFC8,0x8888,
+	0x2222,0xC0C0,0xE7F2,0x2222,0x2222,0x70C1,0xE3F2,0x2222,
+	0x8888,0x9CCF,0x09F8,0x8888,0x8888,0x8BF8,0x88FC,0x8888,
+	0x2222,0x2222,0x227E,0x2222,0x2222,0x2222,0x223F,0x2222,
+	0x8888,0x8888,0x889F,0x8888,0x8888,0x8888,0x888F,0xC888,
+	0x2222,0x2222,0x2227,0xE222,0x2222,0x2222,0x2223,0xF222,
+	0x8888,0x8888,0x8889,0xF888,0x8888,0x8888,0x8888,0xF888,
+	0x2222,0x2222,0x2222,0x7A22,0x2222,0x2222,0x2222,0x3222,
+	0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,
+	0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,
+	0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,
+	0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,
+	0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,
+	0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,
+	0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,0x8888,
+	0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,0x2222,0x2222
+//go.sysin dd *
+if [ `wc -c < glass.icon` != 1933 ]; then
+	made=FALSE
+	echo error transmitting glass.icon --
+	echo length should be 1933, not `wc -c < glass.icon`
+else
+	made=TRUE
+fi
+if [ $made = TRUE ]; then
+	chmod 644 glass.icon
+	echo -n '	'; ls -ld glass.icon
+fi
+echo Extracting patchlevel.h
+sed 's/^X//' <<'//go.sysin dd *' >patchlevel.h
+#define PATCHLEVEL 2
+//go.sysin dd *
+if [ `wc -c < patchlevel.h` != 21 ]; then
+	made=FALSE
+	echo error transmitting patchlevel.h --
+	echo length should be 21, not `wc -c < patchlevel.h`
+else
+	made=TRUE
+fi
+if [ $made = TRUE ]; then
+	chmod 644 patchlevel.h
+	echo -n '	'; ls -ld patchlevel.h
+fi
+-- 
+Spoken: Mark Weiser 	ARPA:	mark@mimsy.umd.edu	Phone: +1-301-454-7817
+After May 15, 1987: weiser@parcvax.xerox.com
+
+

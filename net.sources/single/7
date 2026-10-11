@@ -1,0 +1,588 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,1b5208eaaf44ce55,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1982-04-19 19:45:39 PST
+Message-ID: <anews.Awe13.219>
+Newsgroups: net.sources
+Path: utzoo!decvax!harpo!floyd!vax135!lime!we13!rjk
+X-Path: utzoo!decvax!harpo!floyd!vax135!lime!we13!rjk
+From: we13!rjk
+Date: Mon Apr 19 19:45:39 1982
+Subject: MEMAP: 11/70 RealTime Memory Map
+X-Google-Info: Converted from the original A-News header
+
+/***********************************************************************
+ *	11/70 MEMAP - REAL TIME MEMORY MAP
+ *	FILE 1 of 5 - README
+ ***********************************************************************
+ */
+Memap is an active real-time (?) UNIX memory map.  It displays the
+locations of processes in memory, updating changes once per second.
+A DEC VT100 with advanced video option is required for this program.
+
+Memaptest is a little demo program for memap.  It is compiled with
+separate I/D space.
+
+Read the comment lines in the makefile; they tell you how to make
+the files.  When completed, type the following for a demonstration:
+
+	for X in 1 2 3
+	do	sleep 10
+		/etc/memaptest
+	done & /etc/memap
+
+This starts three of the demo programs so that the shared text segment
+can be seen.  When all but the last one dies, the shared text will
+start flashing, then it will disappear with the death of the last one.
+
+For more info:   Randy King WECo-Montgomery 8=392-4556  (we13!rjk)
+/***********************************************************************
+ *	11/70 MEMAP - REAL TIME MEMORY MAP
+ *	FILE 2 of 5 - Makefile
+ ***********************************************************************
+ */
+#
+#	Memap Makefile:  `Make' must be executed as root.
+#
+#	Specify your system maximum memory in the command line as:
+#		make MEMORY=XXXXXXX
+#	Where the X's are the decimal number of bytes of physical REAL
+#	memory (printed at boot time as:  real mem=XXXXXXX bytes).  The
+#	default size will be 11/70 maximum of 4 Megabytes.
+#
+#	NOTE:  Edit `memap.c' and set the define NPROC to at least the
+#	number of slots in your process table.  Default is 150.
+#
+#	INSDIR is the directory where memap will reside.  Normally, this
+#	is /etc to keep it out of the public eye, although the public
+#	can still use it.  If you change INSDIR, you might also change
+#	the SYNOPSIS in the manual page `memap.1'.
+#
+#						RJKing WECo-MG6565 Sep 1981
+#
+
+INSDIR=/etc
+MEMORY=4194304L
+MANDIR=/usr/man/local/man1
+
+all:	memap memaptest
+
+memap:
+	$(CC) -DOURM=$(MEMORY) -O -n -s memap.c -o memap
+	@if mv $(INSDIR)/memap $(INSDIR)/OLDmemap 2>/dev/null; \
+	then	echo $(INSDIR)/memap moved to $(INSDIR)/OLDmemap; \
+	fi
+	mv memap $(INSDIR)/memap
+	chown root $(INSDIR)/memap
+	chgrp bin $(INSDIR)/memap
+	chmod 4775 $(INSDIR)/memap
+	cp memap.1 $(MANDIR)/memap.1
+	chown bin $(MANDIR)/memap.1
+	chgrp bin $(MANDIR)/memap.1
+	chmod 664 $(MANDIR)/memap.1
+
+memaptest:
+	$(CC) -O -n -s memaptest.c -o memaptest
+	@if mv $(INSDIR)/memaptest $(INSDIR)/OLDmemaptest 2>/dev/null; \
+	then	echo $(INSDIR)/memaptest move to $(INSDIR)/OLDmemaptest; \
+	fi
+	mv memaptest $(INSDIR)/memaptest
+	chown bin $(INSDIR)/memaptest
+	chgrp bin $(INSDIR)/memaptest
+	chmod 775 $(INSDIR)/memaptest
+/***********************************************************************
+ *	11/70 MEMAP - REAL TIME MEMORY MAP
+ *	FILE 3 of 5 - memap.c
+ ***********************************************************************
+ */
+/*	Memap - Real time (?) UNIX memory map.  This program produces a
+ *	real time display of the active system memory as near as can be
+ *	obtained.  It is restricted to the VT100 terminal with advanced
+ *	video.		RJKing WECO-MG6565 Sep 1981
+ */
+
+#include	<stdio.h>
+#include	<fcntl.h>
+#include	<a.out.h>
+#include	<sys/utsname.h>
+#include	<sys/param.h>
+#include	<sys/types.h>
+#include	<sys/sysmacros.h>
+#include	<sys/text.h>
+#include	<sys/file.h>
+#include	<sys/inode.h>
+#include	<sys/proc.h>
+#include	<sys/tty.h>
+#include	<sys/dir.h>
+#include	<sys/signal.h>
+#include	<sys/user.h>
+#include	<sys/var.h>
+
+#define	NROW	23			/* # of rows in display */
+#define	NCOL	13			/* # of columns in display */
+#define	VOID	(char *)0		/* Char NULL pointer */
+#define	NPROC	150			/* MAIN: Dimension for proc slots */
+#define	MAXM	4194304L		/* MAIN: Max 11/70 MAIN memory */
+#ifndef OURM
+#define	OURM	3145728L		/* MAIN: Our maximum memory */
+#endif
+#define	CSIZ	(132 /NCOL)		/* SHOW: Column width */
+#define	NSIZ	(CSIZ -1)		/* SHOW: Max process name length */
+#define	DRAW	001			/* SHOW[what]: Draw grid ticks */
+#define	ERAS	002			/* SHOW[what]: Erase at [addr] */
+#define	PRNT	004			/* SHOW[what]: Print at [addr] */
+#define	KERN	010000			/* SHOW[mode]: This proc is kernel */
+#define	TEXT	020000			/* SHOW[slot]: This proc has sep I/D */
+#define	DATA	040000			/* UPDATE[what]: update non-text */
+#define	ENDM	0001			/* SHOW: Screen position is END mark */
+#define	PRCM	0002			/* SHOW: Screen position is process */
+#define	TXTM	0004			/* SHOW: Screen position is text */
+#define	PROC	0			/* MAIN: Index to nl struct */
+#define	SBUF	1			/* MAIN: Index to nl struct */
+#define	ENDT	2			/* MAIN: Index to nl struct */
+#define	UTXS	3			/* MAIN: Index to nl struct */
+#define	TXTT	4			/* MAIN: Index to nl struct */
+#define	VARA	5			/* MAIN: Index to nl struct */
+#define	USER	6			/* MAIN: Index to nl struct */
+#define	NNLE	7			/* MAIN: Number of namelist entries */
+
+int	tmem,catch();			/* Signal catching routine */
+char	position[NROW][NCOL];		/* "position occupied" flags */
+long	maxmem=OURM;			/* Default screen resolution */
+struct	nlist nl[] = {	{ "_proc" },
+			{ "_sabuf" },
+			{ "_etext" },
+			{ "tstart" },
+			{ "_text" },
+			{ "_v" },
+			{ "_u" },
+			{ "" }
+		     };
+struct	savp {	char	p_stat, p_flag;
+		short	p_pid;
+		ushort	p_addr, p_size;
+		ushort	x_size, x_caddr;
+		char	x_count;
+	     } savp[NPROC];
+struct	proc	newp;
+struct	text	newt;
+struct	var	var;
+struct	user	ub;
+
+char	*getenv(),*strcpy(),*malloc(),*strncpy(),*strcat(),*strncat(),*ctime();
+long	lseek(),atol(),time();
+unsigned sleep();
+extern	(*signal())();
+extern	optind,errno;
+extern	char *optarg;
+main(argc,argv)
+char *argv[];
+{	register int i,slot;
+	register char *tp;
+	int	smem,umem;
+	long	t,addr,size;
+	struct	utsname uts;
+	unsigned mode;
+
+	if(strcmp(getenv("TERM"), "vt100") != 0)
+	{	fprintf(stderr, "Term not vt100\n");
+		exit(1);
+	}
+	uname(&uts);
+	smem = open("/dev/mem", O_RDONLY);
+	umem = open("/dev/mem", O_RDONLY);
+	tmem = open("/dev/mem", O_RDONLY);
+	if(smem < 0 || umem < 0 || tmem < 0)
+	{	perror("/dev/mem");
+		exit(errno);
+	}
+	while((i = getopt(argc,argv,"t:m:")) != EOF)
+	{	switch(i)
+		{
+		case 't':	maxmem = atol(optarg) *(long)(NCOL *NROW);
+				break;
+		case 'm':	maxmem = atol(optarg);
+				break;
+		default:	fprintf(stderr,
+					"usage: %s [ -tTIKSIZ ] [ -mMEMSIZ ]\n",
+					argv[0]);
+				exit(1);
+		}
+		if(i == 't' || i == 'm')
+		{	i = strlen(optarg);
+			if(optarg[i-1] == 'm' || optarg[i-1] == 'M')
+				maxmem *= 1048576;
+			if(optarg[i-1] == 'k' || optarg[i-1] == 'K')
+				maxmem *= 1024;
+		}
+	}
+	argc -= (optind -1); argv += (optind -1);
+	if(maxmem > MAXM || maxmem < 1)
+	{	fprintf(stderr, "%d bytes out of range\n", maxmem);
+		exit(1);
+	}
+	for(i=1; i<=NSIG; ++i)
+		signal(i, catch);
+	nlist("/unix", nl);
+	for(i=0; i<NNLE; ++i)
+		if(nl[i].n_type == 0)
+		{	fprintf(stderr, "namelist error on %s\n", nl[i].n_name);
+			exit(1);
+		}
+	if(lseek(smem, (long)nl[VARA].n_value, 0) < 0)
+		fatalerr("seek to _v");
+	if(read(smem, (char *)&var, sizeof(var)) < 0)
+		fatalerr("read _v");
+	if(var.v_proc > NPROC)
+	{	fprintf(stderr, "NPROC define must be at least %d\n",
+			var.v_proc);
+		exit(1);
+	}
+	if(NPROC > var.v_proc +25)
+	{	fprintf(stderr,
+			"NPROC define wasting memory; should be around %d\n",
+				var.v_proc);
+		sleep(5);
+	}
+	show(DRAW, VOID, 0L, 0L, NULL);
+	show(PRNT, "Proctbl", (long)nl[PROC].n_value, 0L, KERN);
+	show(PRNT, "_sabufs", (long)nl[SBUF].n_value, 0L, KERN);
+	show(PRNT, "EndOfText", (long)nl[ENDT].n_value, 0L, KERN);
+	show(PRNT, uts.sysname, (long)nl[UTXS].n_value, 0L, KERN);
+	addr = (long)(nl[USER].n_value + USIZE *64);
+	show(PRNT, "Stack_Top", addr, 0L, KERN);
+	i = nice(0);
+	nice(-i);
+	for(;;)
+	{	if(lseek(smem, (long)nl[PROC].n_value, 0) < 0)
+			fatalerr("seek to process table");
+		for(slot=0; slot<var.v_proc; ++slot)
+		{
+			if(read(smem, (char *)&newp, sizeof(newp)) < 0)
+				fatalerr("read process table");
+			if(sameproc(slot))
+				continue;
+			if(savp[slot].p_addr)
+			{	addr = ctob((long)savp[slot].p_addr);
+				size = ctob((long)savp[slot].p_size);
+				show(ERAS, VOID, addr, size, NULL);
+				if((savp[slot].x_count == 1) &&
+				   (savp[slot].x_caddr >= 1))
+				{	addr = ctob((long)savp[slot].x_caddr);
+					size = ctob((long)savp[slot].x_size);
+					show(ERAS, VOID, addr, size, NULL);
+					savp[slot].x_count = 0;
+				}
+			}
+			if((newp.p_flag &SLOAD) == 0)
+			{	clearout(slot);
+				continue;
+			}
+			if(newp.p_addr)
+			{	addr = ctob((long)newp.p_addr);
+				size = ctob((long)newp.p_size);
+				mode = (unsigned)(newp.p_flag &0377);
+				mode |= ((newp.p_stat <<8) &07400);
+				if(lseek(umem, addr, 0) < 0)
+					fatalerr("seek to user block");
+				if(read(umem, (char *)&ub, sizeof(ub)) < 0)
+					fatalerr("read user block");
+				show(PRNT, ub.u_comm, addr, size, mode);
+				if(ub.u_tsize && getextdata())
+				{	addr = ctob((long)newt.x_caddr);
+					size = ctob((long)newt.x_size);
+					mode = TEXT;
+					show(PRNT, ub.u_comm, addr, size, mode);
+					update(TEXT, slot);
+				}
+			}
+			update(DATA, slot);
+		}
+		time(&t);
+		tp = ctime(&t);
+		*(tp+19) = NULL;
+		printf("\33[24;59H%s", tp+11);
+		sleep(1);
+	}
+}
+show(what, name, addr, size, mode)
+char	*name;
+long	addr, size;
+unsigned mode;
+{	register int i,swap=0;
+	static	int ticks;
+	int	srow, scol, erow, ecol, srpos, scpos, erpos, ecpos;
+	char	pnam[32],flag,stat;
+	long	check;
+
+	if(what &DRAW)
+	{	ticks = (int) (maxmem / ((long)(NCOL *NROW)));
+		printf("\33<\33[?3h");
+		sleep(1);
+		printf("\33[2J\33[24H\33#6");
+		printf("%d Bytes/Tick (%.2f Meg)  ",
+			ticks, (double)maxmem /1048576.0);
+		printf("\33[1;7mText\33[m \33[4mLocked\33[m ");
+		printf("\33[7mSpecial\33[m \33[1mRunnable\33[m\33(0");
+		for(scol=1; scol<=NCOL; ++scol)
+		{	printf("\33[1;%dH", (NCOL -3) *(scol -1) +1);
+			for(srow=1; srow<=NROW; ++srow)
+			{	if(srow == 1)
+					printf("l\b\33D");
+				else	if(srow == NROW)
+						printf("m");
+					else	printf("t\b\33D");
+			}
+		}
+		printf("\33(B\33[24H\33[m");
+	}
+	flag = (char)(mode &0377);
+	stat = (char)((mode &07400) >>8);
+	check = (addr /(long)ticks) +1L;
+	if(check > (long)(NROW *NCOL))
+		return;
+	srow = (int)check;
+	check = ((addr +size) /(long)ticks) +1L;
+	if(check > (long)(NROW *NCOL))
+		return;
+	erow = (int)check;
+	for(scol=0; srow>NROW; ++scol)
+		srow -= NROW;
+	srpos = srow -1;
+	scpos = scol;
+	scol = (scol *CSIZ) +2;
+	for(ecol=0; erow>NROW; ++ecol)
+		erow -= NROW;
+	erpos = erow -1;
+	ecpos = ecol;
+	ecol = (ecol *CSIZ) +2;
+	if(*name == NULL)
+	{	if(newp.p_pid == 0)
+			name = "swapper";
+		else
+		{	name = "SWAPPING";
+			++swap;
+		}
+	}
+	if(what &ERAS)
+	{	printf("\33[%d;%dH\33[%d;%dH", srow, scol, srow, scol);
+		for(i=0; i<NSIZ; ++i)
+			printf(" ");
+		position[srpos][scpos] = 0;
+		if(position[erpos][ecpos] == ENDM)
+		{	printf("\33[%d;%dH\33[%d;%dH",
+				erow, ecol, erow, ecol);
+			for(i=0; i<NSIZ; ++i)
+				printf(" ");
+			position[erpos][ecpos] = 0;
+		}
+	}
+	if(what &PRNT)
+	{	if((mode &TEXT) && position[srpos][scpos] == TXTM)
+			return;
+		*pnam = NULL;
+		if(flag &SLOCK)
+			strcat(pnam, "\33[4m");
+		if(stat == SRUN)
+			strcat(pnam, "\33[1m");
+		if((mode &KERN) || swap)
+			strcat(pnam, "\33[7m");
+		if(mode &TEXT)
+			strcat(pnam, "\33[1;7m");
+		strncat(pnam, name, NSIZ);
+		strcat(pnam, "\33[m");
+		for(i=strlen(name); i<NSIZ; ++i)
+			strcat(pnam, " ");
+		printf("\33[%d;%dH\33[%d;%dH%s", srow, scol, srow, scol, pnam);
+		position[srpos][scpos] = (mode &TEXT)?TXTM:PRCM;
+		if(position[erpos][ecpos] == 0)
+		{	printf("\33(0\33[%d;%dH\33[%d;%dH",
+				erow, ecol, erow, ecol);
+			if(stat == SRUN)
+				printf("\33[1m");
+			if((mode &KERN) || swap)
+				printf("\33[7m");
+			for(i=0; i<NSIZ; ++i)
+				printf("~");
+			printf("\33(B\33[m");
+			position[erpos][ecpos] = ENDM;
+		}
+	}
+}
+
+catch(sig)
+{	signal(sig, SIG_IGN);
+	printf("\33[?3l");
+	sleep(1);
+	exit(sig);
+}
+
+fatalerr(errms)
+char *errms;
+{	printf("\33[24H\33[2K");
+	perror(errms);
+	exit(errno);
+}
+
+sameproc(slot)
+{	if(newp.p_stat != SSLEEP && newp.p_stat != SRUN)
+	{	newp.p_addr = 0;
+		return(0);
+	}
+	if(newp.p_flag &(SSWAP |SSPART))
+	{	newp.p_addr = 0;
+		return(0);
+	}
+	if(newp.p_stat != savp[slot].p_stat)
+		return(0);
+	if(newp.p_flag != savp[slot].p_flag)
+		return(0);
+	if(newp.p_pid != savp[slot].p_pid)
+		return(0);
+	if(newp.p_addr != savp[slot].p_addr)
+		return(0);
+	if(newp.p_size != savp[slot].p_size)
+		return(0);
+	return(1);
+}
+
+getextdata()
+{	register int i;
+
+	if(lseek(tmem, (long)nl[TXTT].n_value, 0) < 0)
+		fatalerr("seek to text table");
+	for(i=0; i<var.v_text; ++i)
+	{	if(read(tmem, (char *)&newt, sizeof(newt)) < 0)
+			fatalerr("read text table");
+		/* Talk about SWAG: */
+		if(newt.x_count && newt.x_size == ub.u_tsize)
+			return(1);
+	}
+	return(0);
+}
+
+update(what,slot)
+{	if(what == DATA)
+	{	savp[slot].p_stat = newp.p_stat;
+		savp[slot].p_flag = newp.p_flag;
+		savp[slot].p_pid = newp.p_pid;
+		savp[slot].p_addr = newp.p_addr;
+		savp[slot].p_size = newp.p_size;
+	}
+	if(what == TEXT)
+	{	savp[slot].x_size = newt.x_size;
+		savp[slot].x_caddr = newt.x_caddr;
+		savp[slot].x_count = newt.x_count;
+	}
+}
+
+clearout(slot)
+{	savp[slot].p_stat = 0;
+	savp[slot].p_flag = 0;
+	savp[slot].p_pid = 0;
+	savp[slot].p_addr = 0;
+	savp[slot].p_size = 0;
+	savp[slot].x_size = 0;
+	savp[slot].x_caddr = 0;
+	savp[slot].x_count = 0;
+}
+/***********************************************************************
+ *	11/70 MEMAP - REAL TIME MEMORY MAP
+ *	FILE 4 of 5 - memap.1
+ ***********************************************************************
+ */
+.TH MEMAP 1 local
+.SH NAME
+.B memap\^
+- display active UNIX memory
+.SH SYNOPSIS
+/etc/memap [ -tTIKSIZE ] [ -mMEMSIZE ]
+.br
+Available ONLY on a DEC VT100 with advanced video option
+.SH DESCRIPTION
+Memap displays the swappable image of all processes
+residing in main memory, updating the display every second.
+.PP
+Default main memory size has been pre-defined by the system administrator.
+This value may be overridden in two ways as defined below:
+.TP 5
+.B -t\^
+TIKSIZE is the number of bytes that each scale tick mark will represent.
+This number may be suffixed with a `K' or `M' for Kilo and Mega,
+respectively.  Sorry, no floating point specification for TIKSIZE.
+.TP 5
+.B -m\^
+MEMSIZE is the number of bytes in main memory.  This number may be suffixed
+with a `K' or `M' for Kilo and Mega, respectively.  Sorry, no floating
+point specification for MEMSIZE.
+.PP
+The K and M conversions multiply the preceding value by 1024 and
+1048576, respectively.
+.PP
+Processes appearing BOLD are those made runnable.  Processes that are
+underscored are currently locked in memory; usually due to a fork(2)
+system call.  Processes that are reverse video are
+start locations of certain kernel symbols.
+Processes that are displayed in bold reverse video are the text
+segments of separate I/D space programs.
+The kernel symbols displayed are:
+.TP 15
+.B Proctbl\^
+(_proc) the process table
+.TP 15
+.B _sabufs\^
+(_sabuf) system addressable buffers
+.TP 15
+.B EndOfText\^
+(_etext) end of text symbol
+.TP 15
+.B {nodename}\^
+(tstart) start of kernel text
+.TP 15
+.B (TopOfStack)
+(_u + USIZE * CLICKS) top of kernel stack
+.PP
+Another type of process in reverse video called "SWAPPING"
+is displayed when a process is in "mid-swap", so to speak.
+.PP
+The small dots (sometimes) appearing mark the end of the process
+named above them.  These may be overwritten by another process and
+never appear again unless the process is swapped.
+.PP
+Text space is displayed only once, i.e. the first process in the
+process table with separate I/D space is the one whose name is used
+for text.  This can be confusing for linked processes such as
+"sh" and "rsh"; "ed" and "red"; etc.  The user must remember that
+the text for one is the text for the other.
+.SH BUGS
+Because the VT100 has been known to fail direct cursor addressing
+in the ANSI mode on occasion, each direct cursor address is sent
+twice.  These extra characters make their presence known only during
+high system activity and on slow ( below 2400 baud ) VT100's.
+.PP
+Just as is disclaimed by ps(1), things can change while memap is
+running.  Sometimes the display is incorrect for a moment or two.
+Case in point is the process that shows up as "SWAPPING".  It should
+have been caught earlier and not displayed, but that's the way it goes.
+/***********************************************************************
+ *	11/70 MEMAP - REAL TIME MEMORY MAP
+ *	FILE 5 of 5 - memaptest.c
+ ***********************************************************************
+ */
+char	*malloc();
+
+main(argc,argv)
+char *argv[];
+{	switch(fork())
+	{
+	case -1:	perror("fork");
+			exit(1);
+	case 0:		break;
+	default:	exit(0);
+	}
+	while(malloc(512) != 0)
+		sleep(1);
+	putchar(7);
+}
+
+

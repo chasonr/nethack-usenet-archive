@@ -1,0 +1,626 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,cae58f96a042dca,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-07-31 08:42:52 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site umcp-cs.UUCP
+Path: utzoo!linus!philabs!seismo!rlgvax!cvl!umcp-cs!chris
+From: chris@umcp-cs.UUCP
+Newsgroups: net.sources
+Subject: makescript
+Message-ID: <1305@umcp-cs.UUCP>
+Date: Sun, 31-Jul-83 11:42:52 EDT
+Article-I.D.: umcp-cs.1305
+Posted: Sun Jul 31 11:42:52 1983
+Date-Received: Mon, 1-Aug-83 10:51:03 EDT
+Organization: Univ. of Maryland, Computer Science Dept.
+Lines: 606
+
+The following is a revised version of makescript, and its manual
+entry.  Makescript is designed for mailing code to UUCP, CSNet,
+and ARPAnet sites.  It gets around the "."-at-beginning-of-line
+bug in many SMTP mailers, and around the file-contains-<<-marker
+problem (which isn't usually a problem, but...).
+
+This makescript generates shorter scripts than the earlier version
+I submitted, and also works on 4.1a/4.1c systems (thanks to Marshall
+Rose at UCI).
+
+				- Chris
+
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting makescript.c'
+sed 's/^X//' <<'//go.sysin dd *' >makescript.c
+#ifndef lint
+static char sccsid[] = "@(#)makescript.c	U of Maryland ACT 17-Dec-1982";
+#endif
+
+X/*
+ * Makescript - make a shell script which extracts files from itself
+ *
+ * Modified by Marshall Rose @ UCI to handle 4.1a directories using
+ * the directory library routines.
+ *
+ * Compilation command:
+ %  cc -O -s -o makescript makescript.c
+ */
+
+X/* #define	LIBNDIR	/* to use directory library */
+#define	max(a,b)	((a) > (b) ? (a) : (b))
+
+#include <stdio.h>
+#include <a.out.h>
+#include <pwd.h>
+#include <sys/types.h>
+#ifndef	LIBNDIR
+#include <sys/dir.h>
+#else	LIBNDIR
+#include <ndir.h>
+#endif	LIBNDIR
+#include <sys/stat.h>
+
+int	RootID, BinID, DaemonID;
+char	*progname;		/* Name of this program (argv[0]) */
+FILE	*outfile;		/* Script being built */
+int	Level;			/* Nest level */
+char	WDir[BUFSIZ];
+
+char	*Tail ();
+FILE	*popen ();
+
+main (argc, argv)
+register argc;
+register char **argv;
+{
+	int	Append = 0, existed, rflag = 1;
+	extern char _sobuf[];
+
+	setbuf (stdout, _sobuf);
+	--argc;
+	progname = *argv++;
+	while (argc > 1 && **argv == '-') {
+		argc--;
+		switch (argv++[0][1]) {
+		case 'a':
+			Append++;
+			break;
+		case 'p':
+			rflag = 0;
+			break;
+		default:
+			goto usage;
+		}
+	}
+	if (argc < 2) {
+usage:
+		printf ("Usage: %s [-a] [-p] <scriptname> file1 [ file2... ]\n",
+			progname);
+		exit (1);
+	}
+	existed = !access (*argv, 0);
+	if (existed && !Append) {	/* file exists... */
+		if (isatty (fileno (stdin))) {
+			char answer[20];
+			printf ("%s exists.  Overwrite? ", *argv);
+			fflush (stdout);
+			fgets (answer, sizeof answer, stdin);
+			if (*answer != 'y' && *answer != 'Y') {
+				printf ("Whatever you say.\n");
+				exit (1);
+			}
+		}
+	}
+	outfile = fopen (*argv, Append ? "a" : "w");
+	if (outfile == NULL) {
+		printf ("%s: Can't open %s: ", progname, *argv);
+		psyserr ();
+		exit (1);
+	}
+	GetIDs ();
+	if (rflag) {
+		register FILE *f = popen ("/bin/pwd", "r");
+		fread (WDir, 1, sizeof WDir, f);
+		WDir[strlen(WDir) - 1] = 0;
+		pclose (f);
+	}
+	if (!existed || !Append)
+		fprintf (outfile, "\
+: Run this shell script with \"sh\" not \"csh\"\n\
+PATH=:/bin:/usr/bin:/usr/ucb\n\
+export PATH\n\
+all=FALSE\n\
+if [ $1x = -ax ]; then\n\
+\tall=TRUE\n\
+fi\n");
+	printf ("%s:\n", existed && Append ? "Appending" : "Installing");
+	fflush (stdout);
+	++Level;
+	++argv;
+	while (--argc > 0)
+		if (rflag) {
+			register char *n = Tail (*argv++);
+			if (n)
+				Add (n);
+		}
+		else
+			Add (*argv++);
+	printf ("\nDone.\n");
+	exit (0);
+}
+
+X/* Return the trailing component of a pathname if it is absolute, sneakily
+   changing directories if necessary */
+char *
+Tail (n)
+register char *n;
+{
+	register char *p, *dir;
+
+	if (*n != '/') {	/* Then it isnt absolute */
+rel:
+		if (chdir (WDir)) {
+			printf ("\nCan't change to directory \"%s\"", WDir);
+			fflush (stdout);
+		}
+		return n;
+	}
+	dir = n;
+	for (p = n; *p;)
+		if (*p++ == '/' && *p)
+			n = p;	/* Find last slash */
+	if (n == dir)
+		goto rel;
+	n[-1] = 0;
+	if (chdir (dir)) {
+		printf ("\nCan't change to directory \"%s\"", dir);
+		fflush (stdout);
+		return 0;
+	}
+	return n;
+}
+
+X/* Set up the ID numbers for Root, Bin, and Daemon */
+GetIDs () {
+	register struct passwd *p;
+	struct passwd *getpwnam ();
+
+	/* RootID = 0; */	/* Already set */
+	if (p = getpwnam ("bin"))
+		BinID = p -> pw_uid;
+	if (p = getpwnam ("daemon"))
+		DaemonID = p -> pw_uid;
+	endpwent ();
+}
+	
+X/* Write, to stdout, the system error message associated with the system
+   error number errno */
+psyserr ()
+{
+	extern errno, sys_nerr;
+	extern char *sys_errlist[];
+	register char *c;
+
+	c = errno < sys_nerr ? sys_errlist[errno] : "Unknown error";
+	printf ("%s\n", c);
+	fflush (stdout);
+}
+
+X/* Add the named file into the script, performing the right actions depending
+   on the type of the file, and changing the owner/mode as appropriate. */
+Add (fn)
+register char *fn;
+{
+	struct exec test_exec;
+	struct stat st;
+	char *u;
+	register level = Level;
+
+	if (stat (fn, &st)) {
+		printf ("%s: Can't access \"%s\": ", progname, fn);
+		psyserr ();
+		return;
+	}
+	while (--level > 0)
+		putchar ('\t');
+	printf ("%s", fn);
+	fflush (stdout);
+	switch (st.st_mode & S_IFMT) {
+	case S_IFREG:
+		if (st.st_size >= sizeof test_exec) {
+			FILE *fp = fopen (fn, "r");
+			if (fp == 0) {
+				printf (": can't open\n");
+				fflush (stdout);
+				return;
+			}
+			if (fread (&test_exec, sizeof test_exec, 1, fp) == 1
+			    && !N_BADMAG (test_exec)) {
+				fclose (fp);
+				if (AddExec (fn, " (executable)"))
+					return;
+				break;
+			}
+			fclose (fp);
+		}
+		if (IsDataFile (fn) ? AddExec (fn, " (data)") : AddFile (fn))
+			return;
+		break;
+	case S_IFDIR:
+		if (AddDir (fn))
+			return;
+		break;
+	case S_IFCHR:
+		AddNode (fn, "character", st.st_dev);
+		break;
+	case S_IFBLK:
+		AddNode (fn, "block", st.st_dev);
+		break;
+#ifdef	S_IFMPC			/* not in 4.1a */
+	case S_IFMPC:
+	case S_IFMPB:
+		printf (" Multiplexed!\n");
+		fflush (stdout);
+		return;
+#endif	S_IFMPC
+	}
+	if (st.st_uid == RootID) {
+		u = "root";
+		goto changeown;
+	}
+	if (st.st_uid == BinID) {
+		u = "bin";
+		goto changeown;
+	}
+	if (st.st_uid == DaemonID) {
+		u = "daemon";
+changeown:
+		fprintf (outfile, "\
+if [ $all = TRUE ]; then\n\
+\t/bin/echo '\tChanging owner to \"%s\"'\n\
+\t/etc/chown %s %s\n\
+else\n\
+\t/bin/echo '\tOriginal owner was \"%s\"'\n\
+fi\n",
+		u, u, fn, u);
+	}
+	fprintf (outfile, "\
+if [ $made = TRUE ]; then\n\
+\t/bin/chmod %o %s\n\
+\t/bin/echo -n '\t'; /bin/ls -ld %s\n\
+fi\n",
+		st.st_mode & 07777, fn, fn);
+	if ((st.st_mode & S_IFMT) != S_IFDIR) {
+		putchar ('\n');
+		fflush (stdout);
+	}
+}
+
+X/* Add a character or block device */
+AddNode (fn, type, dev)
+register char *fn, *type;
+dev_t dev;
+{
+	register ma = major (dev), mi = minor (dev);
+
+	printf (" (%s special)", type);
+	fflush (stdout);
+	fprintf (outfile, "\
+if [ $all = TRUE ]; then\n\
+\t/bin/echo 'Making %s special device \"%s\" number (%d, %d)'\n\
+\t/etc/mknod %s %c %d %d\n\
+made=TRUE\n\
+else\n\
+\t/bin/echo 'Not making %s special device \"%s\" number (%d, %d)'\n\
+made=FALSE\n\
+fi\n",
+	type, fn, ma, mi, fn, *type, ma, mi, type, fn, ma, mi);
+}
+
+AddFile (fn)
+register char *fn;
+{
+	register c, wantx = 1;
+	register FILE *fp = fopen (fn, "r");
+
+	if (fp == NULL) {
+		printf (": can't open\n");
+		fflush (stdout);
+		return -1;
+	}
+	fprintf (outfile,
+	"/bin/echo 'Extracting %s'\nsed 's/^X//' <<'//go.sysin dd *' >%s\n",
+		fn, fn);
+	while ((c = getc (fp)) != EOF) {
+		if (wantx) {
+#ifndef	ALLX
+			if (c == 'X' || c == '.' || c == '/')
+#endif ALLX
+			putc ('X', outfile);
+			wantx = 0;
+		}
+		putc (c, outfile);
+		if (c == '\n')
+			wantx++;
+	}
+	fclose (fp);
+	fprintf (outfile, "//go.sysin dd *\nmade=TRUE\n");
+	return 0;
+}
+
+IsDataFile (fn)
+char *fn;
+{
+	int pipes[2];
+	char buf[200];
+	if (pipe (pipes)) return -1;/* call it data anyway */
+	fflush (stdout), fflush (stderr);
+	if (vfork () == 0) {
+		close (0);
+		dup2 (pipes[1], 1);
+		close (pipes[0]);
+		close (pipes[1]);
+		execl ("/usr/bin/file", "file", fn, 0);
+		fprintf (stderr, " can't exec /usr/bin/file");
+		printf ("%s: data", fn);
+		fflush (stdout), fflush (stderr);
+		_exit (0);
+	}
+	read (pipes[0], buf, sizeof buf);
+	close (pipes[0]);
+	close (pipes[1]);
+	while (wait (0) != -1)
+		;
+	if (strlen (buf) <= strlen (fn)) return 1;
+	return !contains (buf + strlen (fn), "text");
+}
+
+AddExec (fn, type)
+register char *fn;
+char *type;
+{
+	printf (type);
+	fflush (stdout);
+	fprintf (outfile,
+		"/bin/echo 'Decoding %s'\nuudecode << '//go.sysin dd *'\n",
+		fn);
+	fflush (outfile);
+	if (vfork () == 0) {
+		dup2 (fileno (outfile), 1);
+		execl ("/usr/ucb/uuencode", "uuencode", fn, fn, 0);
+		printf ("Help! Can't exec /usr/ucb/uuencode\n");
+		exit (0);
+	}
+	while (wait (0) != -1)
+		;
+	fprintf (outfile, "//go.sysin dd *\nmade=TRUE\n");
+	return 0;
+}
+
+X/* Compare function for qsort */
+DirCmp (d1, d2)
+register struct direct *d1, *d2;
+{
+#ifndef	LIBNDIR
+	return strncmp (d1 -> d_name, d2 -> d_name, DIRSIZ);
+#else	LIBNDIR
+	return strncmp (d1 -> d_name, d2 -> d_name,
+			max (d1 -> d_namlen, d2 -> d_namlen));
+#endif	LIBNDIR
+}
+
+X/* Add a directory: recursion time */
+#ifndef	LIBNDIR
+AddDir (fn)
+char *fn;
+{
+	int f;
+	struct stat st;
+	char nmbuf[BUFSIZ];
+	register char *cp;
+	struct direct *d;
+	register struct direct *p, *dp, *pp;
+
+	fprintf (outfile,
+		"/bin/echo 'Making directory \"%s\"'\nmkdir %s\n", fn, fn);
+	if ((f = open (fn, 0)) < 0) {
+		printf (": can't open\n");
+		fflush (stdout);
+		return -1;
+	}
+	printf (": directory");
+	fflush (stdout);
+	fstat (f, &st);
+	if (st.st_size == 0) {
+		printf (" (empty)");
+		fflush (stdout);
+		close (f);
+		return 0;
+	}
+	d = (struct direct *) malloc (st.st_size);
+	pp = dp = (struct direct *) malloc (st.st_size);
+	if (read (f, (char *) d, st.st_size) != st.st_size) {
+		printf (": read error\n");
+		fflush (stdout);
+		close (f);
+		return -1;
+	}
+	close (f);
+	putchar ('\n');
+	fflush (stdout);
+	Level++;
+	for (p = d; p < &d[st.st_size/sizeof *d]; p++) {
+		if (p -> d_name[0] == '.') {
+			if (p -> d_name[1] == 0)
+				continue;
+			if (p -> d_name[1] == '.' && p -> d_name[2] == 0)
+				continue;
+		}
+		if (p -> d_ino)
+			*pp++ = *p;
+	}
+	free (d);
+	qsort (dp, pp - dp, sizeof *dp, DirCmp);
+	for (cp = nmbuf; *cp++ = *fn++; )
+		;
+	cp[-1] = '/';
+	for (p = dp; p < pp; p++) {
+		strncpy (cp, p -> d_name, DIRSIZ);
+		cp[DIRSIZ] = 0;
+		Add (nmbuf);
+	}
+	Level--;
+	free (dp);
+	fprintf (outfile, "made=TRUE\n");
+	return 0;
+}
+#else	LIBNDIR
+AddDir (fn)
+char *fn;
+{
+    int     f,g;
+    char    nmbuf[BUFSIZ];
+    char   *cp;
+    struct direct  *d,
+                   *dp,
+                   *p;
+    DIR * dd;
+
+    fprintf (outfile,
+	    "/bin/echo 'Making directory \"%s\"'\nmkdir %s\n", fn, fn);
+    if ((dd = opendir (fn)) == NULL) {
+	printf (": can't open\n");
+	fflush (stdout);
+	return (-1);
+    }
+    printf (": directory");
+    fflush (stdout);
+    for (f = 0; p = readdir (dd); f++)
+	continue;
+    if (f == 0) {
+empty: 	;
+	printf (" (empty)");
+	fflush (stdout);
+	closedir (dd);
+	return 0;
+    }
+again: ;
+    f += 10;
+    d = (struct direct *) malloc ((unsigned) (f * sizeof (struct direct)));
+    rewinddir (dd);
+    for (dp = d, g = 0; p = readdir (dd);) {
+	if ((p -> d_namlen == 1 && !strcmp (p -> d_name, "."))
+		|| (p -> d_namlen == 2 && !strcmp (p -> d_name, "..")))
+	    continue;
+	if (f <= g++) {		/* directory grew!!! */
+	    for (f = g; p = readdir (dd); f++)
+		continue;
+	    goto again;
+	}
+	dp -> d_ino = p -> d_ino;
+	dp -> d_reclen = sizeof (struct direct);
+	dp -> d_namlen = p -> d_namlen;
+	strcpy (dp -> d_name, p -> d_name);
+	dp++;
+    }
+    if (d == dp) {
+	free (d);
+	goto empty;
+    }
+    closedir (dd);
+
+    putchar ('\n');
+    fflush (stdout);
+    Level++;
+    qsort (d, dp - d, sizeof *dp, DirCmp);
+    for (cp = nmbuf; *cp++ = *fn++;);
+    cp[-1] = '/';
+    for (p = d; p < dp; p++) {
+	strcpy (cp, p -> d_name);
+	Add (nmbuf);
+    }
+    Level--;
+
+    free (d);
+    fprintf (outfile, "made=TRUE\n");
+    return 0;
+}
+#endif	LIBNDIR
+
+X/* Return true if "little" is contained within "big" */
+contains (big, little)
+register char *big, *little;
+{
+	register char *bp, *lp;
+
+	while (*big) {
+		if (*big++ != *little) continue;
+		bp = big, lp = little + 1;
+		while (*lp)
+			if (*bp++ != *lp++)
+				goto cont;
+		return 1;
+cont:;
+	}
+	return 0;
+}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 makescript.c
+	/bin/echo -n '	'; /bin/ls -ld makescript.c
+fi
+/bin/echo 'Extracting makescript.1l'
+sed 's/^X//' <<'//go.sysin dd *' >makescript.1l
+X.TH MAKESCRIPT 1L 15-February-83
+X.SH NAME
+makescript \- make a self-extracting archive shell script
+X.SH SYNOPSIS
+X.I makescript
+[ -a ] [ -p ] scriptname file1 [ . . . filen ]
+X.SH DESCRIPTION
+X.I Makescript
+writes a shell script to
+X.I scriptname,
+which when executed, extracts the files which were given as arguments.
+It is intended for mailing sets of files to other systems.
+Non-text files will be
+X.I uuencode\c
+-ed.
+The
+X.I -a
+option causes
+X.I makescript
+to append to an existing script. The
+X.I -p
+option causes it to automatically use all full pathnames for files.  If not
+used, then all absolute filenames will be converted to their basenames only.
+X.SH AUTHORS
+Chris Torek, Fred Blonder
+X.SH FILES
+X/bin/ls, /bin/echo, /bin/sh, /bin/chmod, /usr/bin/sed, /usr/ucb/uuencode,
+X/usr/ucb/uudecode
+X.SH "SEE ALSO"
+uuencode(1)
+X.SH DIAGNOSTICS
+X.SH BUGS
+The programs: sh, echo, ls, sed, chmod and uudecode must exist on the receiving
+system.
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 makescript.1l
+	/bin/echo -n '	'; /bin/ls -ld makescript.1l
+fi
+-- 
+In-Real-Life:	Chris Torek, Univ of MD Comp Sci
+UUCP:		{seismo,allegra,brl-bmd}!umcp-cs!chris
+CSNet:		chris@umcp-cs
+ARPA:		chris.umcp-cs@UDel-Relay
+
+

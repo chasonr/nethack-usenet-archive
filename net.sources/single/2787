@@ -1,0 +1,354 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,3be3a8bcde2611c4,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-05-20 14:14:00 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: Notesfiles $Revision: 1.6.2.16 $; site mirror.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!think!mirror!rs
+From: rs@mirror.UUCP
+Newsgroups: net.sources
+Subject: A "better" system routine
+Message-ID: <12100003@mirror.UUCP>
+Date: Mon, 20-May-85 17:14:00 EDT
+Article-I.D.: mirror.12100003
+Posted: Mon May 20 17:14:00 1985
+Date-Received: Wed, 29-May-85 23:48:06 EDT
+Lines: 333
+Nf-ID: #N:mirror:12100003:000:8965
+Nf-From: mirror!rs    May 20 17:14:00 1985
+
+
+
+The four routines in this archive form the "command" and "scommand"
+routines from LibX, a local utility library.  Command is similar to
+the standard "system" routine, except it often can avoid the overhead
+of invoking a shell, and it can be used to explicitly run a command in
+the background.
+
+Command can internally handle most uses of the <, >, and | meta-characters.
+(Commands containing characters in the set {*, ?, !, ',  etc.} are passed
+off to csh (not, sh) to do the dirty work.)  There are two restrictions
+on the format of the commands, however:
+	1.  < and > must be immediately before the filename; i.e., no
+	    intervening spaces are allowed.
+	2.  | must stand alone, with one space between it and other
+	    elements of the string.
+
+Scommand is a "wrapper" around command that emulates shell "&"/CTRL-C
+handling.  If the command is run in the background, it is started with
+SIG_INT ignored.  If it is run in the foreground, the parent ignores
+SIG_INT until the child completes.
+
+The above paragraphs give a rough idea; you'll have to read the code
+In particular, look at cmndno and cmndclean.  Sorry that I don't have
+better text available; what I have is in a "hairy internal formatter"
+style.
+
+--------
+Rich $alz	{ mit-eddie, ihnp4!inmet, wjh12, cca, datacube } ! mirror!rs
+Mirror Systems
+2067 Massachusetts Ave.			"I've seen this happen
+Cambridge, MA, 02140			 in other people's lives
+617-661-0777				 and now it's happening in mine."
+# -------------------CUT HERE------------------------
+# This is a shell archive.  Remove anything before this line,
+# then unpack it by saving it in a file and typing "sh file".
+#
+# Wrapped by mirror!rs on Mon May 20 17:00:19 EDT 1985
+# Contents:  command.c scommand.c instr.c cmpstr.c
+ 
+echo x - command.c
+sed 's/^XX//' > "command.c" <<'@//E*O*F command.c//'
+XX/*$COMMAND:  FORK AND EXEC COMMAND STRING
+XX!l  Rev. 1.15, 06-Jan-85, R$:	Use dup2 directly.
+XX!l  Rev. 1.14, 28-Nov-84, R$:	Change names of cleanup utilities.
+XX!l  Rev. 1.13, 01-Nov-84, R$:	Collapse multiple spaces in string
+XX!l  Rev. 1.12, 17-Oct-84, R$:	Return pid if bgflag is TRUE.
+XX!l  Rev. 1.11, 16-Oct-84, R$:	Add cmndclean.
+XX!l  Rev. 1.10, 27-Jul-84, R$:	Flushed stdio.
+XX!l  Rev. 1.01, 08-Jun-84, R$:	Make status available in cmndno.
+XX!l  Rev. 1.00, 16-Feb-83, CNA:	Genesis.
+XX*/
+
+XX/*
+XX!d  DESCRIPTION:
+XX!d		doneok = command(string, inbackground)
+XX!d  This routine takes a full command string and executes it.  It's
+XX!d  different from "system" since no shell is required.  Redirection of
+XX!d  stdin/out is supported, but the >< must be the first char of the
+XX!d  argument that specifies the file name.  Simple pipes are also supported
+XX!d  with the condition that the pipe character must stand off from all other
+XX!d  arguments. If redirection is in conflict with piping, the piping takes
+XX!d  precedence.  Returns TRUE if execution returned 0, else FALSE; the
+XX!d  actual status is available in cmndno.
+XX!d  A user-supplied "cleanup" routine may be called after the first fork;
+XX!d  the default one resets signals and closes open file descriptors beyond
+XX!d  stdin{in,out,err}.
+XX*/
+
+XX/* LINTLIBRARY */
+XX#include <stdio.h>
+XX#include <errno.h>
+XX#include <sys/file.h>
+XX#include <sys/wait.h>
+
+XX/* Handy shorthands. */
+XX#define STDIN	0
+XX#define STDOUT  1
+XX#define STDERR	2
+
+XX/* Linked in later. */
+XXextern char		*malloc();
+XXextern int		 errno;
+
+XX/* Linked in now. */
+XXint			 cmndno;
+XXint		       (*cmndclean)(); /* = _stdclean; */
+XXstatic char		 SHELL[] = "/bin/csh";
+XX#define SH		 (&SHELL[sizeof SHELL - 3])
+XX/*+CODE
+XX */
+
+
+XXint
+XXcommand(p, bg)
+XX    register char	 *p;
+XX    int			  bg;
+XX{
+XX    register char	**ap;
+XX    register char	**avect;
+XX    register char	 *s;
+XX    register int	  pid;
+XX    register short	  i;
+XX    union wait		  w;
+XX    int			  dead;
+XX    int			  poop[2];
+
+XX    if ((pid = fork()) == 0)
+XX    {
+XX	if (cmndclean)
+XX	    (*cmndclean)();
+
+XX	if (p[instr(p, ";!~&?*\"\'`\\$(){}")])
+XX	{
+XX	    (void)execl(SHELL, SH, "-c", p, NULL);
+XX	    _exit(99);
+XX	}
+
+XX	/* Get number of words. */
+XX	for (s = p, i = 2; *s; )
+XX	    if (*s++ <= ' ')
+XX		i++;
+XX	avect = (char **)malloc((unsigned int)i * sizeof(char *));
+
+XX	while (*p <= ' ')
+XX	    p++;
+XX	for (ap = avect; *p; ++ap)
+XX	{
+XX	    for (*ap = p; *p; p++)
+XX		if (*p <= ' ')
+XX		{
+XX		    for (*p++ = '\0'; *p <= ' '; )
+XX			p++;
+XX		    break;
+XX		}
+
+XX	    if (**ap == '<')
+XX	    {
+XX		(void)close(STDIN);
+XX		(void)open(*ap-- + 1, O_RDONLY);
+XX	    }
+
+XX	    if (**ap == '>')
+XX	    {
+XX		(void)close(STDOUT);
+XX		(void)open(*ap-- + 1, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+XX	    }
+
+XX	    if (cmpstr(*ap, "|"))
+XX	    {
+XX		(void)pipe(poop);
+XX		if (fork() == 0)
+XX		{
+XX		    *ap = NULL;
+XX		    (void)close(poop[0]);
+XX		    (void)dup2(poop[1], STDOUT);
+XX		    (void)close(poop[1]);
+XX		    (void)execvp(avect[0], avect);
+XX		    _exit(99);
+XX		}
+XX		(void)close(poop[1]);
+XX		(void)dup2(poop[0], STDIN);
+XX		(void)close(poop[0]);
+XX		ap = avect - 1;
+XX	    }
+XX	}
+XX	*ap = NULL;
+XX	(void)execvp(avect[0], avect);
+XX	_exit(99);
+XX    }
+
+XX    if (bg)
+XX	return(pid);
+
+XX    while (1)
+XX    {
+XX	dead = wait(&w);
+XX	if ((dead < 0 && errno == ECHILD) || dead == pid)
+XX	    break;
+XX    }
+
+XX    return((cmndno = w.w_status) == 0);
+XX}
+@//E*O*F command.c//
+chmod u=rw,g=r,o=r command.c
+ 
+echo x - scommand.c
+sed 's/^XX//' > "scommand.c" <<'@//E*O*F scommand.c//'
+XX/*$SCOMMAND:  SET SIGNALS NICELY AND CALL COMMAND.
+XX!l  Rev. 2.00, 06-Jan-85, R$:	Add sigvec handling.
+XX!l  Rev. 1.00, 27-Nov-84, R$:	Genesis.
+XX*/
+
+XX/*
+XX!d  DESCRIPTION:
+XX!d		doneok = scommand(text, bgflag)
+XX!d  This routine is a wrapper around command for those who can't/won't
+XX!d  learn about signals.  It basically duplicates the csh/sh actions for
+XX!d  command execution:  if being done in the foreground, the parent ignores
+XX!d  interrupts until the child is done; if it's a background command, the
+XX!d  kid is told to ignore interrupts.
+XX*/
+
+XX/* LINTLIBRARY */
+XX#include <fcntl.h>
+XX#include <signal.h>
+XX#include <errno.h>
+XX#include <sys/wait.h>
+
+
+XX/* Linked in later. */
+XXextern int	 errno;
+XXextern int	 cmndno;
+
+XXint
+XXscommand(p, bg)
+XX    char	*p;
+XX    int		 bg;
+XX{
+XX    struct sigvec	 H;
+XX    struct sigvec	 Old;
+XX    int			 D;
+XX    int			 S;
+XX    union wait		 W;
+
+XX    /* If in background, kid ignores interrupts; foreground gets default. */
+XX    H.sv_handler = bg ? SIG_IGN : SIG_DFL;
+XX    H.sv_mask = 0;
+XX    H.sv_onstack = 0;
+XX    (void)sigvec(SIGINT, &H, &Old);
+
+XX    /* Run command in background. */
+XX    S = command(p, 1);
+
+XX    /* If in foreground, wait for kid with interrupts ignored. */
+XX    if (!bg)
+XX    {
+XX	H.sv_handler = SIG_IGN;
+XX	(void)sigvec(SIGINT, &H, (struct sigvec *)0);
+XX	while ((D = wait(&W)) != S)
+XX	    if (D < 0 && errno == ECHILD)
+XX		break;
+XX	cmndno = W.w_status;
+XX	S = cmndno == 0;
+XX    }
+
+XX    /* Restore old signal value, FOH. */
+XX    (void)sigvec(SIGINT, &Old, (struct sigvec *)0);
+XX    return(S);
+XX}
+@//E*O*F scommand.c//
+chmod u=rw,g=rw,o=r scommand.c
+ 
+echo x - instr.c
+sed 's/^XX//' > "instr.c" <<'@//E*O*F instr.c//'
+XX/*$INSTR:  FIND FIRST OCCURRENCE OF CHAR IN SET
+XX!l  Rev. 1.02, 10-Dec-84, R$:	More tweaking.
+XX!l  Rev. 1.01, 24-Oct-84, R$:	Slight tweaks.
+XX!l  Rev. 1.00, 16-Feb-83, CNA:	Genesis.
+XX*/
+
+XX/*
+XX!d  DESCRIPTION:
+XX!d		idx = instr(string, set)
+XX!d  Scans string for the first instance of a character in the given set.
+XX!d  Returns index in string to that character, or to the terminating
+XX!d  \0 if none found.
+XX*/
+
+XX/* LINTLIBRARY */
+
+XXint
+XXinstr(p, s)
+XX    register char	*p;
+XX    register char	*s;
+XX{
+XX    register char	*q;
+XX    register char	*t;
+
+XX    for (q = p; *q; q++)
+XX	for (t = s; *t; t++)
+XX	    if (*t == *q)
+XX		goto Done;
+XXDone:
+XX    return(q - p);
+XX}
+@//E*O*F instr.c//
+chmod u=rw,g=r,o=r instr.c
+ 
+echo x - cmpstr.c
+sed 's/^XX//' > "cmpstr.c" <<'@//E*O*F cmpstr.c//'
+XX/*$CMPSTR:  COMPARE STRINGS
+XX!l  Rev. 1.10, 23-Oct-84, R$:	Tweak for speed.
+XX!l  Rev. 1.00, 16-Feb-83, CNA:	Genesis.
+XX*/
+
+XX/*
+XX!d  DESCRIPTION:
+XX!d		equalflag = cmpstr(s1, s2)
+XX!d  Compares two strings, returns true if equal, else false.
+XX!d  Not quite the same as strcmp in libc.
+XX*/
+
+XX/* LINTLIBRARY */
+
+XXint
+XXcmpstr(a, b) 
+XX    register char *a;
+XX    register char *b;
+XX{
+XX    while (*a++ == *b++ && a[-1])
+XX	;
+XX    return(!(*--a || *--b));
+XX}
+@//E*O*F cmpstr.c//
+chmod u=rw,g=r,o=r cmpstr.c
+ 
+echo Inspecting for damage in transit...
+temp=/tmp/shar$$; dtemp=/tmp/.shar$$
+trap "rm -f $temp $dtemp; exit" 0 1 2 3 15
+cat > $temp <<\!!!
+     141     478    3230 command.c
+      62     226    1490 scommand.c
+      31     111     631 instr.c
+      23      70     428 cmpstr.c
+     257     885    5779 total
+!!!
+wc  command.c scommand.c instr.c cmpstr.c | sed 's=[^ ]*/==' | diff -b $temp - >$dtemp
+if [ -s $dtemp ]
+then echo "Ouch [diff of wc output]:" ; cat $dtemp
+else echo "No problems found."
+fi
+exit 0
+
+

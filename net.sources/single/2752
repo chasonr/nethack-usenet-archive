@@ -1,0 +1,465 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,adcd84e95223959f,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-05-08 08:26:44 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site imsvax.UUCP
+Path: utzoo!linus!philabs!cmcl2!seismo!umcp-cs!cvl!elsie!imsvax!leung
+From: leung@imsvax.UUCP (Aldrin Leung)
+Newsgroups: net.sources
+Subject: A new version of the old spell checker
+Message-ID: <328@imsvax.UUCP>
+Date: Wed, 8-May-85 11:26:44 EDT
+Article-I.D.: imsvax.328
+Posted: Wed May  8 11:26:44 1985
+Date-Received: Fri, 10-May-85 22:02:07 EDT
+Distribution: net
+Organization: IMS Inc, Rockville MD
+Lines: 444
+
+The following is a spelling checking program I usally use.  I get
+the program also from net.source a year ago.  It is written in C
+but utilize pipe mechanism which is slow.  I made some enhancement
+on the program.  Whoever want to benchmark this program and other
+equivalent program like spellfix, let me know the result.
+
+Aldrin W. Leung
+
+
+---------------------------cut right here----------------------------
+echo "creating manual"
+cat << !!Funny!! > correct.l
+.TH CORRECT 1L VAX/11
+.UC 4
+.SH NAME
+correct \- corrects spelling mistakes for ascii text files
+.SH SYNOPSIS
+.B correct
+[-d locdict] file1 [file2 file3 ...]
+.SH DESCRIPTION
+.PP
+Correct integrates system dictionary utilities
+such as spell and look to provide an interactive
+environment for spelling check and correct.  It takes each
+.I
+file
+as input, runs
+.I
+spell
+to find spelling errors and prompts for corrections.
+If the
+.B
+-d
+flag is specified,
+the file
+.I
+locdict
+will be used as a local dictionary in addition to the
+system dictionary.  Correct will
+filter prompts for those words
+contained in this file.  If
+.I
+locdict
+is not found, it will be created.
+.PP
+The prompt has the form:
+(?, CR, -, @, prefix?, or word).
+.PP
+.B
+?
+is the help command which prints the meaning of the prompt.
+.B
+CR
+(carriage return) indicates that the word is spelled correctly.
+If the
+.B
+-d
+option is used, the word is placed in the local dictionary.
+.PP
+.B
+-
+ignores the word.  The word is not placed in the local dictionary.
+.PP
+.B
+@
+runs
+.I
+grep
+to determine the context the word is used.
+.PP
+.I
+prefix
+.B
+?
+If the correct spelling
+is not known, typing the largest known prefix followed by a question
+mark will invoke
+.I
+look
+and output all words that begin with that prefix.
+.PP
+.B
+word
+is the correct spelling of the word.
+.PP
+At the end of making corrections, you will be prompted whether
+or not you want the corrections made.  A yes (or 'y') answer or
+simply CR (carriage return) will
+change all occurrences of the incorrect spellings to the new value
+you entered.  The file will not be modified before the user responses
+"yes" when the program asks the user whether to make the corrections.
+.SH SEE ALSO
+spell(1), grep(1), look(1), ex(1)
+.SH AUTHOR
+R. Alan Eustace (alan.ucf-cs@rand-relay or decvax!ucf-cs!alan).
+.SH MODIFIED
+Aldrin W. Leung (umcp-cs!eneevax!imsvax!leung). October 31, 1984.
+.SH BUGS
+Interrupt during spell, grep, look, and ex always kills the child
+processes.
+!!Funny!!
+echo "creating program file"
+cat << !!Funny!! > correct.c
+static char *sccsid = "@(#)correct.c (IMS) 10/31/84";
+static char *rcsid = "$Header: /u/leung/bin/src/correct.c,v1.2 84/11/13 Exp $";
+
+#include <stdio.h>
+#include <setjmp.h>
+#include <signal.h>
+
+/*#define DEBUG*/
+
+#define	SPELL	"/usr/bin/spell"
+#define	LOOK	"/usr/bin/look"
+#define	GREP	"/usr/ucb/grep"
+#define	EX	"/usr/ucb/ex"
+
+#define SYNTAX "usage: correct [-d locdict] file1 [file2 file3 ...]"
+#define STRLEN 100
+#define NOWORDS 100
+#define LocdictMAX 6000
+#define TRUE 	1
+#define FALSE 	0
+
+FILE *popen();
+FILE *fpspell;
+FILE *fplook;
+FILE *fpgrep;
+FILE *fpex;
+FILE *pfLdfile,*fopen();
+
+char command[STRLEN];
+char word[NOWORDS][STRLEN];
+char correct[NOWORDS][STRLEN];
+char asLocdict[LocdictMAX][STRLEN];
+char *psFile;
+char *psLdfile;
+char *index();
+char sDelim[] = "/%$#*[]";
+
+int iasLast;
+
+jmp_buf restore;
+
+main(argc, argv)
+int argc;
+char *argv[];
+{
+char *first;
+char try[STRLEN];
+char lookword[STRLEN];
+char psAns[STRLEN];
+int i,ips,ias,flag;
+int iNext;
+char bCorrflag,bLocdictflag;
+char sLine[STRLEN];
+int Compare(), onintr(), warnintr(), ontstp();
+char *pc;
+
+if (argc < 2) {
+    fprintf(stderr,"%s\n",SYNTAX);
+    exit(1);
+    }
+
+psFile = NULL;
+psLdfile = NULL;
+signal(SIGINT,warnintr);
+for(ips=1;ips<argc;ips++) {
+    if (argv[ips][0] == '-') {
+	switch (argv[ips][1]) {
+	    case 'd':
+		if (argc > ips+2) {
+		    psLdfile = argv[++ips];
+		    }
+		else Faterr(SYNTAX);
+		break;
+	    default :
+		Faterr(SYNTAX);
+		break;
+	    }
+	continue;
+	}
+    psFile = argv[ips];
+    if (psLdfile != NULL) InitasLocdict(psLdfile);
+
+    bCorrflag = bLocdictflag = 0;
+
+    sprintf(command,"%s %s",SPELL,psFile);
+    printf("Running spell for ASCII text file \"%s\"....\n",argv[ips]);
+    if ((fpspell = popen(command,"r")) == NULL)
+	{
+	fprintf(stderr,"Cannot open %s\n",argv[1]);
+	exit(1);
+	}
+    for (iNext=0;;)
+	{
+	if (fscanf(fpspell,"%s",word[iNext])==EOF) break;
+	if (psLdfile!=NULL &&
+	    SearchasLocdict(word[iNext])==TRUE) continue;
+	flag=TRUE;
+
+	while (TRUE) {
+	    if (flag == TRUE) {
+	    	signal(SIGINT,onintr);
+		flag=FALSE;
+	    	setjmp(restore);
+		}
+	    signal(SIGTSTP,ontstp);
+	    printf("\n%s\n(?, CR, -, @, prefix?, or word):",word[iNext]);
+	    while (gets(try)==NULL) {
+		clearerr(stdin);
+		fprintf(stderr,"Eof ignored!\n:");
+		}
+	    signal(SIGTSTP,SIG_DFL);
+	    if (strcmp(try,"?")==0) {
+		printf("\n?       - Help.\n");
+		printf("CR      - The word is correct.");
+		printf("  Add it to local dictionary, if any.\n");
+		printf("-       - The word is correct.  ignore it.\n");
+		printf("@       - Locate all occurrences of the word ");
+		printf("in the file.\n");
+		printf("prefix? - Look at the dictionary all words");
+		printf(" starting with prefix.\n");
+		printf("word    - Replace with this word.\n");
+		}
+	    else if ((first = index(try,'?')) != NULL) {
+		*first = '\0';
+		sprintf(command,"%s %s",LOOK,try);
+		if ((fplook = popen(command,"r")) == NULL)
+		    {
+		    fprintf(stderr,"look command failure..strange \n");
+		    exit(1);
+		    }
+		for(;;)
+		    {
+		    if(fscanf(fplook,"%s",lookword)==EOF) break;
+		    printf("%s\n",lookword);
+		    }
+		pclose(fplook);
+		}
+	    else if (strcmp(try,"@")==0) {
+		sprintf(command,"%s \"\\<%s\\>\" %s",
+		    GREP,word[iNext],psFile);
+#ifdef DEBUG
+		printf("%s\n",command);
+#endif
+		if ((fpgrep = popen(command,"r")) == NULL)
+		    {
+		    fprintf(stderr,"grep command failure..strange \n");
+		    exit(1);
+		    }
+		for(;;)
+		    {
+		    if(fgets(sLine,100,fpgrep) == NULL) break;
+		    fputs(sLine,stdout);
+		    }
+		pclose(fpgrep);
+		}
+	    else if (try[0] !='\0' && try[0] !='-') {
+		printf ("\"%s\" correct? y\b",try);
+		while (gets(psAns)==NULL) {
+		    clearerr(stdin);
+		    fprintf(stderr,"Eof ignored!\n? y\b");
+		    }
+		if (psAns[0]=='y' || psAns[0]=='\0')
+		    break;
+		}
+	    else break;
+	    }
+
+	signal(SIGINT,warnintr);
+	if (try[0] == '\0') {
+	    AddtoasLocdict(word[iNext]);
+	    bLocdictflag++;
+	    }
+	else if (try[0] != '-') {
+	    bCorrflag++;
+	    strcpy(correct[iNext],try);
+#ifdef DEBUG
+	printf("corr = %s\n",correct[iNext]);
+#endif
+	    if (++iNext > NOWORDS) {
+		printf("Warning: only the first %d words is checked\n",
+		    NOWORDS);
+		break;
+		}
+	    }
+	}
+    pclose(fpspell);
+
+    if (bCorrflag) {
+
+	for (;;) {
+	    printf("Do you want to correct the file \"%s\"? y\b",psFile);
+	    while (gets(psAns)==NULL) {
+	        clearerr(stdin);
+	        fprintf(stderr,"Eof ignored!\n? y\b");
+	        }
+	    if (psAns[0] != 'y' && psAns[0] != NULL) {
+		printf("Are you sure? n\b");
+		while (gets(psAns)==NULL) {
+		    clearerr(stdin);
+		    fprintf(stderr, "Eof ignored!\n? n\b");
+		    }
+		if (psAns[0] == 'y') {
+		    psAns[0] = 'n';
+		    break;
+		    }
+		}
+	    else
+		break;
+	    }
+
+	if (psAns[0] == 'y' || psAns[0] == '\0')
+	    {
+	    sprintf(command,"%s - %s",EX,psFile);
+#ifdef DEBUG
+	    printf("%s\n",command);
+#endif
+	    if ((fpex = popen(command,"w")) == NULL)
+		{
+		fprintf(stderr,"ex command failure..strange \n");
+		exit(1);
+		}
+	    for (i=0;i<=iNext-1;i++)
+		{
+		for(pc=sDelim;*pc!='\0';pc++) {
+		    if (index(correct[i],*pc)==NULL) break;
+		    }
+#ifdef DEBUG
+		printf("fin-char=%c\nstring=%s\n",*pc,correct[i]);
+#endif
+		if (*pc == '\0')
+		     Faterr("Corrected word contains all known delimeters");
+#ifdef DEBUG
+		printf("1,$s%c\\<%s\\>%c%s%cg\n",*pc,word[i],*pc,correct[i],*pc);
+#endif
+#ifndef DEBUG
+		fprintf(fpex,"1,$s%c\\<%s\\>%c%s%cg\n",*pc,
+			word[i],*pc,correct[i],*pc);
+#endif
+		}
+	    fprintf(fpex,"w\nq\n");
+	    pclose(fpex);
+	    }
+	}
+
+    if (psLdfile != NULL && bLocdictflag) {
+	printf("Do you want to update dictionary file \"%s\"? y\b",psLdfile);
+	while (gets(psAns)==NULL) {
+	    clearerr(stdin);
+	    fprintf(stderr,"Eof ignored!\n? y\b");
+	    }
+	if (psAns[0] == 'y' || psAns[0]=='\0')
+	    {
+	    qsort(asLocdict,iasLast,STRLEN,Compare);
+	    if ((pfLdfile = fopen(psLdfile,"w"))==NULL)
+		{
+		fprintf("%s\n",psLdfile);
+		Faterr("Local dictionary not found... see a wizard");
+		}
+
+	    for(ias=0;ias<=iasLast;ias++) {
+		fprintf(pfLdfile,"%s\n",asLocdict[ias]);
+		}
+	    fclose(pfLdfile);
+	    }
+	}
+    }
+exit(0);
+}
+
+Compare(ps1,ps2)
+char *ps1,*ps2;
+    {
+    return(strcmp(ps1,ps2));
+    }
+
+InitasLocdict(psLdfile)
+char *psLdfile;
+    {
+    int i;
+
+    iasLast = 0;
+    if ((pfLdfile = fopen(psLdfile,"r"))==NULL) {
+	fprintf(stderr,"Opening new local dictionary\n");
+	return;
+	}
+
+    for (i=0;;i++) {
+	if (i >= LocdictMAX)
+	    Faterr("Local Dictionary size exceeded(LocdictMAX)");
+	if (fscanf(pfLdfile,"%s",asLocdict[i])==EOF) break;
+	}
+    iasLast = i-1;
+    fclose(pfLdfile);
+    }
+
+Faterr(psErrmsg)
+char *psErrmsg;
+    {
+    fprintf(stderr,"%s\n",psErrmsg);
+    exit(1);
+    }
+
+SearchasLocdict(psWord)
+char *psWord;
+    {
+    int ias;
+    for(ias=0;ias<=iasLast;ias++) {
+	if (strcmp(asLocdict[ias],psWord)==0) return(TRUE);
+	}
+    return(FALSE);
+    }
+
+AddtoasLocdict(psWord)
+char *psWord;
+    {
+    if(iasLast++ >= LocdictMAX)
+	Faterr("Local dictionart size exceeded(LocdictMAX)");
+    strcpy(asLocdict[iasLast],psWord);
+    }
+
+
+onintr()
+{
+fflush(stdout);
+longjmp(restore,1);
+}
+
+warnintr()
+{
+fprintf(stderr,"\b\bUse \"quit\" to quit\n");
+}
+
+ontstp()
+{
+signal(SIGTSTP,SIG_DFL);
+sigsetmask(0);
+kill(0,SIGTSTP); /* pause */
+signal(SIGTSTP,ontstp);
+longjmp(restore,1);
+}
+!!Funny!!
+
+

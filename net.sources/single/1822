@@ -1,0 +1,169 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,a762828a7966f37d,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-10-12 11:21:18 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site brl-tgr.ARPA
+Path: utzoo!linus!philabs!cmcl2!seismo!brl-tgr!dpk
+From: dpk@brl-tgr.ARPA (Doug Kingston <dpk>)
+Newsgroups: net.sources
+Subject: Rlp.c - 4.2BSD Raw LP-11 driver
+Message-ID: <5240@brl-tgr.ARPA>
+Date: Fri, 12-Oct-84 14:21:18 EDT
+Article-I.D.: brl-tgr.5240
+Posted: Fri Oct 12 14:21:18 1984
+Date-Received: Sat, 13-Oct-84 08:49:38 EDT
+Organization: Ballistics Research Lab
+Lines: 149
+
+[ This is being forwarded to net.sources on Don Speck's behalf since he
+  is not directly connected to Usenet.  Thanks to Don for this work!
+
+				-Doug-  (a.k.a. Unix-Sources-Request) ]
+
+Rlp.c is a raw LP-11 driver for 4.2bsd with no features and overhead cut
+to the bone for raster plotting on a Printronix etc.  Uses less than 10%
+system time on VAX/780 at 5500 bytes/second (vs. 100% for lp.c).  Tested
+on Trilog Colorplot C100's with Datasystems Corp. DLP-11 interface.  For
+4.2bsd print spooler, use :if=/usr/lib/lpf: in /etc/printcap.
+    Don Speck	speck@cit-vax.arpa    Caltech 256-80, Pasadena CA 91125
+------------------------------------------------------------------------
+/* rlp.c	July 28, 1984
+ * Raw LP-11 printer/plotter driver; exclusive open, no options, ignores
+ * errors.  Has one 512-byte buffer (from buffer pool) which is refilled
+ * by rlpwrite() after rlpintr() has drained it and disabled interrupts.
+ * Some code is copied/adapted from lp.c (4.2bsd).
+ */
+
+#include "rlp.h"
+#if NRLP > 0
+
+#include "../h/param.h" 		/* Includes "../h/types.h" */
+#include "../h/errno.h"
+#include "../h/buf.h"
+#include "../h/uio.h"
+#include "../vaxuba/ubavar.h"
+
+struct lp11 {
+	u_short csr, xmt;		/* Control/Status & Data registers */
+};
+
+#define IENABLE 0000100 		/* CSR flag bits */
+#define DONE	0000200
+#define ERROR	0100000 		/* Offline, paper/ribbon out,...*/
+
+struct lp_state {
+	char *lp_ptr;			/* Next character to be output	*/
+	char *lp_lim;			/* Just beyond last char in buf */
+	struct buf *lp_buf;		/* One buffer => exclusive open */
+	struct lp11 *lp_reg;		/* Handy copy of device address */
+} rlp_state[NRLP];
+
+#define BUFSIZ	512
+#define LPPRI	(PZERO+8)		/* Let signals interrupt sleeps */
+
+struct uba_device *rlpinfo[NRLP];
+int rlpattach(), rlpprobe();
+u_short rlpstd[] = { 0177514, 0 };	/* Normal DEC LP-11 csr address */
+struct uba_driver rlpdriver =
+	{ rlpprobe, NULL, rlpattach, NULL, rlpstd, "rlp", rlpinfo };
+
+/* For a Datasystems DLP-11 Rev. C, turn on the "Unix" DIP-switch.  With
+ * earlier Rev.'s the probe routine drowns in interrupts which can't be
+ * stopped - one must remove IENABLE and "wire in" the vector & BR level.
+ */
+rlpprobe(reg) caddr_t reg; {
+	register int br, cvec;		/* value-result, must be r11, r10 */
+
+	((struct lp11 *)reg)->csr = IENABLE;
+	DELAY(5);
+	((struct lp11 *)reg)->csr = 0;
+	return (sizeof (struct lp11));
+}
+
+rlpattach(ui) struct uba_device *ui; {
+	rlp_state[ui->ui_unit].lp_reg = (struct lp11 *)ui->ui_addr;
+}
+
+rlpopen(dev,writeflag) dev_t dev; int writeflag; {
+	register int unit = minor(dev);
+	register struct lp_state *lp = &rlp_state[unit];
+
+	if ((unsigned)unit >= NRLP ||			/* Bad special file */
+		rlpinfo[unit] == NULL ||		/* Isn't configured */
+		! rlpinfo[unit]->ui_alive ||		/* Not found at boot*/
+		lp->lp_reg == NULL)			/* Wasn't attached  */
+			return(ENXIO);
+	if (! writeflag) return(ENODEV);		/* Opening for read */
+	if (lp->lp_buf != NULL) return(EBUSY);		/* Already in use   */
+	if (lp->lp_reg->csr&ERROR) return(EIO); 	/* Device not ready */
+
+	lp->lp_buf = geteblk(BUFSIZ);
+	lp->lp_ptr = lp->lp_lim = lp->lp_buf->b_un.b_addr;
+	return(0);
+}
+
+rlpwrite(dev,uio) dev_t dev; struct uio *uio; {
+	register struct lp_state *lp = &rlp_state[minor(dev)];
+	register int error, n;
+
+	while ((n=uio->uio_resid) > 0) {
+		if (n > BUFSIZ) n = BUFSIZ;
+		spl4();
+		while (lp->lp_ptr < lp->lp_lim) 	/* Let buffer drain */
+			sleep((caddr_t)lp, LPPRI);
+		lp->lp_ptr = lp->lp_lim = lp->lp_buf->b_un.b_addr;
+		spl0();
+		if (error = uiomove(lp->lp_ptr,n,UIO_WRITE,uio))
+			return(error);
+		spl4();
+		lp->lp_lim += n;
+		lp->lp_reg->csr |= IENABLE;
+		rlpintr(minor(dev));			/* Restart printing */
+		spl0();
+	}
+	return(0);
+}
+
+/* Busy-wait up to 10us/character to allow printer to handshake; if it's
+ * not enough, the printer's buffer is full, so quit til next interrupt.
+ */
+rlpintr(unit) int unit; {
+	register struct lp_state *lp = &rlp_state[unit];
+	register struct lp11 *lpaddr = lp->lp_reg;
+#define BUSY !(lpaddr->csr&DONE)
+
+	while (lp->lp_ptr < lp->lp_lim) {
+		if (BUSY && BUSY && BUSY && BUSY && BUSY) return;
+		lpaddr->xmt = *lp->lp_ptr++;
+	}
+	lpaddr->csr &= ~IENABLE;	/* Buffer empty - keep device quiet */
+	wakeup((caddr_t)lp);
+}
+
+rlpclose(dev,flag) dev_t dev; int flag; {
+	register struct lp_state *lp = &rlp_state[minor(dev)];
+
+	spl4();
+	while (lp->lp_ptr < lp->lp_lim)
+		sleep((caddr_t)lp, LPPRI);
+	spl0();
+	brelse(lp->lp_buf);
+	lp->lp_buf = NULL;			/* Indicate device is free  */
+	return(0);
+}
+
+rlpreset(uban) int uban; {
+	register int unit = NRLP;
+	while (--unit >= 0) {
+		register struct uba_device *ui = rlpinfo[unit];
+		if (ui != NULL && ui->ui_ubanum == uban && ui->ui_alive) {
+			((struct lp11 *)ui->ui_addr)->csr |= IENABLE;
+			printf(" rlp%d", unit);
+		}
+	}
+}
+#endif
+------------------------------------------------------------------------
+
+

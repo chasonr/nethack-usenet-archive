@@ -1,0 +1,573 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,8f32a86d99174c,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-01-07 10:23:43 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84 exptools; site ihlpg.UUCP
+Path: utzoo!linus!decvax!bellcore!petrus!sabre!zeta!epsilon!gamma!ulysses!mhuxr!mhuxt!houxm!ihnp4!ihlpg!jchvr
+From: jchvr@ihlpg.UUCP (VanRietschote)
+Newsgroups: net.sources
+Subject: DYNAKEY prgm to dynamically display info on function key labels
+Message-ID: <1534@ihlpg.UUCP>
+Date: Tue, 7-Jan-86 13:23:43 EST
+Article-I.D.: ihlpg.1534
+Posted: Tue Jan  7 13:23:43 1986
+Date-Received: Wed, 8-Jan-86 08:05:53 EST
+Distribution: net
+Organization: AT&T Bell Laboratories
+Lines: 552
+
+--
+dynakey will allow you to use a background process to dynamically
+change the contents of your programmable function key labels when
+certain events happen (example: arriving of mail, netnews, rje-stuff).
+
+As distributed it works only on hp2392 terminls but very little is needed
+to make it work on other terms. which have programmable function key labels.
+
+Feel free to use or abuse this program at your own risk.
+for more info see next newsitem with manual page.
+
+#-- cut here ---
+/* dynakey.c -*-update-version-*-
+** to activate background work and output to HP2392 labels
+** HFVR VERSION=Wed Dec 11 07:51:21 1985
+*/
+
+#include <stdio.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <string.h>
+#include <errno.h>
+
+#define MAXKEYS 8
+
+typedef enum {FALSE,TRUE} BOOL;
+typedef struct act			/* activity record */
+	       { char	*watch;		/* file to watch */
+		 char	*onmsg;		/* message if file is on */
+		 char	*offmsg;	/* msg if file is off */
+		 int	key;		/* key to display to */
+		 BOOL	beep;		/* TRUE then beep if changed */
+		 BOOL	BEEP;		/* TRUE then beep if diff. label */
+		 int	sleepfor;	/* length of sleep in sec */
+		 long	nexttime;	/* when to wake up */
+		 struct act *next;	/* ptr to next act */
+		 long	mtime;		/* modification time of file */
+	       } ACT;
+
+struct 	utimbuf *null = NULL; /* for setting read access time /dev/tty */
+char	terminal[32];	/* terminal name */
+int	minsleep;	/* minimum of all sleepfor */
+long	NOW;		/* start time of program */
+char	MAILFILE[100];
+char	NEWSFILE[100];
+char	NEWSRC[100];
+ACT	*root = NULL;	/* root of activities */
+char	forward[] = "Forward to "; /* used for mail */
+char	NAME[] = "dynakey";
+BOOL	dflag = FALSE;	/* debug flag */
+int	fflag = 1;	/* default function=1 */
+int	sflag = 60;	/* default seconds to wait=60 */
+char	*keys[MAXKEYS+1] = {"XXXXXXXXXXXXXXXX", /* key labels */
+			    "XXXXXXXXXXXXXXXX",
+			    "XXXXXXXXXXXXXXXX",
+			    "XXXXXXXXXXXXXXXX",
+			    "XXXXXXXXXXXXXXXX",
+			    "XXXXXXXXXXXXXXXX",
+			    "XXXXXXXXXXXXXXXX",
+			    "XXXXXXXXXXXXXXXX",
+			    "XXXXXXXXXXXXXXXX",
+			   };
+
+int min(i,j)
+{
+ if ( i < j) return (i);
+ return(j);
+}/*min*/
+
+int max(i,j)
+{
+ if ( i > j ) return (i);
+ return(j);
+}/*max*/
+
+/* fsize: return size of file or 0 if file not stat'able */
+long fsize(file)
+char	file[];
+{
+  struct stat filbuf; /* file desc */
+
+  /* treat special files first */
+  if ( strcmp(file,"NETNEWS") == 0 ) return(1L);
+  if ( strcmp(file,"TIME"   ) == 0 ) return(1L);
+  if ( strcmp(file,"MAIL"   ) == 0 ) file = MAILFILE;
+
+  if ( stat(file,&filbuf) == -1 ) return(0L);
+  return((long)filbuf.st_size);
+}/*fsize*/
+
+/* mtime: return mtime of file or 0 if file not stat'able */
+long mtime(file)
+char	file[];
+{ extern long time();
+  struct stat filbuf; /* file desc */
+
+  /* treat special files first */
+  if ( strcmp(file,"NETNEWS") == 0 ) file = NEWSFILE;
+  if ( strcmp(file,"TIME"   ) == 0 ) return(time(0));
+  if ( strcmp(file,"MAIL"   ) == 0 ) file = MAILFILE;
+
+  if ( stat(file,&filbuf) == -1 ) return(0L) ;/* file not exist or not read */
+  return((long)filbuf.st_mtime);
+}/*mtime*/
+
+/* TIME: return pointer to \0 terminated string with HH:MM in it */
+char *TIME()
+{ extern long time();
+  extern struct tm *localtime();
+  struct tm *local;
+  long seconds;
+  static char times[6];
+
+  seconds = time(0);
+  local = localtime(&seconds);
+  sprintf(times,"%2d:%.2d",local->tm_hour,local->tm_min);
+  return(times);
+}/*TIME*/
+
+/*SIZE: return \0 terminated string with size in it %ld */
+char *SIZE(file)
+char file[];
+{ static char sizes[12];
+
+  sprintf(sizes,"%8ld",fsize(file));
+  return(sizes);
+}/*SIZE*/
+
+/*MTIME: return \0 terminated string with mtime in it HH:MM */
+char *MTIME(file)
+char file[];
+{ static char times[6];
+  struct stat filbuf; /* file desc */
+  time_t mtime1;
+  extern struct tm *localtime();
+  struct tm *local;
+
+  /* treat special cases */
+  if ( strcmp(file,"TIME"    ) == 0 ) return(TIME());
+  if ( strcmp(file,"MAIL"    ) == 0 ) file = MAILFILE;
+  if ( strcmp(file,"NETNEWS" ) == 0 ) file = NEWSFILE;
+
+  if ( stat(file,&filbuf) == -1 ) {
+   strcpy(times,"??:??");
+   return(times);
+  }
+
+  mtime1 = filbuf.st_mtime;
+  local = localtime(&mtime1);
+  sprintf(times,"%2d:%.2d",local->tm_hour,local->tm_min);
+  return(times);
+}/*MTIME*/
+
+/* newactivity: returns ptr to new intialized activity record */
+ACT *newactivity()
+{ ACT	*ptr;
+  extern ACT *malloc();
+  static char EMPTY[] = "";	/* empty string */
+  extern long time();
+  
+  ptr = malloc(sizeof(ACT));
+  if ( ptr == NULL ) {
+   fprintf(stderr,"\007%s: Out of memory. Aborting.\n",NAME);
+   exit(1);
+  }
+  ptr->watch     = EMPTY;
+  ptr->onmsg     = EMPTY;
+  ptr->offmsg    = EMPTY;
+  ptr->key       = fflag;	/* default */
+  ptr->beep      = FALSE;
+  ptr->BEEP      = FALSE;
+  ptr->sleepfor  = sflag;
+  ptr->nexttime  = NOW;
+  ptr->next      = NULL;
+  ptr->mtime     = 0L;
+  return(ptr);
+}/*newactivity*/
+
+/* checkTERM: see if TERM=hp2392 */
+/* exit if not good */
+void checkTERM()
+{
+ if ( strcmp("hp2392",getenv("TERM")) != 0 ) {
+  fprintf(stderr,"\007%s : ERROR : you are not a hp2392 terminal\n",NAME);
+  exit(1);
+ }/*fi*/
+ strcpy(terminal,getenv("LOGTTY"));
+}/*checkTERM*/
+
+void init()
+{ extern long time();
+
+  checkTERM();
+  NOW = time(0);
+
+  /* MAILFILE=/usr/mail/$LOGNAME */
+  strcpy(MAILFILE,"/usr/mail/");
+  strcat(MAILFILE,getenv("LOGNAME"));
+
+  /* NEWSFILE=$TOOLS/lib/netnews/history */
+  strcpy(NEWSFILE,getenv("TOOLS"));
+  strcat(NEWSFILE,"/lib/netnews/history");
+
+  /* NEWSRC=$HOME/.newsrc */
+  strcpy(NEWSRC,getenv("HOME"));
+  strcat(NEWSRC,"/.newsrc");
+
+  root = NULL;
+}/*init*/
+
+/*usage: */
+void usage()
+{
+ fprintf(stderr,"\007Usage: %s { -w -l [-L] [-b] [-B] -f [-s] }* -dV\n",NAME);
+ fprintf(stderr,"Where: -w <file> to watch\n");
+ fprintf(stderr,"          Special watches are: TIME, MAIL, NETNEWS\n");
+ fprintf(stderr,"       -l <label> to display if file changed\n");
+ fprintf(stderr,"       -L <label> to display when file empty\n");
+ fprintf(stderr,"           Special in labels are %T (current time)\n");
+ fprintf(stderr,"                             and %M (modification time)\n");
+ fprintf(stderr,"       -b to beep twice if file changes\n");
+ fprintf(stderr,"       -B to beep twice if label changes\n");
+ fprintf(stderr,"       -f <key> to display output on\n");
+ fprintf(stderr,"       -s <seconds> to wait between checks\n");
+ fprintf(stderr,"       -d debug mode\n");
+ fprintf(stderr,"       -V display version and exit\n");
+}/*usage*/
+
+void debug()
+{
+ ACT	*ptr;
+ 
+ ptr = root;
+ while (ptr != NULL) {
+  printf("--ENTRY--\n");
+  printf("watch = %s\n",ptr->watch);
+  printf("onmsg = %s\n",ptr->onmsg);
+  printf("offmsg= %s\n",ptr->offmsg);
+  printf("key   = %d\n",ptr->key);
+  printf("beep  = %d\n",ptr->beep);
+  printf("BEEP  = %d\n",ptr->BEEP);
+  printf("sleep = %d\n",ptr->sleepfor);
+  printf("nxttim= %ld\n",ptr->nexttime);
+  printf("next  = %d\n",ptr->next);
+  printf("mtime = %d\n",ptr->mtime);
+  printf("\n");
+  ptr = ptr->next;
+ }
+}/*debug*/
+
+/* parseoptions: parses all command line options */
+parseoptions(argc,argv)
+int	argc;
+char	*argv[];
+{
+ int	ch;
+ extern char *optarg;
+ extern int optind;
+ int	err = 0;
+ ACT	*ptr;
+
+ while ((ch=getopt(argc,argv,"Vw:l:L:f:bBs:d")) != EOF) {
+  switch (ch) {
+   case 'V': printf("%s: version 1.01\n",NAME);
+   	     exit(0);
+	     break;
+   case 'w': ptr = root;
+   	     root = newactivity();
+	     root->next = ptr;
+	     root->watch = optarg;
+	     break;
+   case 'l': if (root == NULL) root = newactivity();
+	     root->onmsg = optarg;
+   	     break;
+   case 'L': if (root == NULL) root = newactivity();
+   	     root->offmsg = optarg;
+   	     break;
+   case 'f': if (root == NULL) root = newactivity();
+   	     sscanf(optarg,"%d",&fflag);
+	     if ( (fflag < 1) || (fflag > 8)) {
+	       fflag = 1;
+	       fprintf(stderr,"\007%s: -f must be in range 1-8\n",NAME);
+	       exit(1);
+	     }/*fi*/
+   	     root->key = fflag;
+	     break;
+   case 'b': if (root == NULL) root = newactivity();
+   	     root->beep = TRUE;
+   	     break;
+   case 'B': if (root == NULL) root = newactivity();
+   	     root->BEEP = TRUE;
+	     break;
+   case 's': sscanf(optarg,"%d",&sflag);
+   	     if ((sflag < 1)) {
+	       sflag = 60;
+	       fprintf(stderr,"\007%s: -s must be > 0\n",NAME);
+	       exit(1);
+	     }/*fi*/
+	     if (root == NULL) root = newactivity();
+	     root->sleepfor = sflag;
+	     break;
+   case 'd': dflag = TRUE;
+   	     break;
+   case '?': err++;
+   	     break;
+  }/*switch*/
+ }/*while*/
+
+ if (dflag) debug();
+ if (err) {
+  usage();
+  exit(1);
+ }
+}/*parseoptions*/
+
+/* chkparent: checks to see if parent process still alive
+** if not kills this process
+*/
+void chkparent()
+{
+ if ( getppid() == 1 ) {
+   exit(1);
+ }
+}/*chkparent*/
+
+/*beep: to beep twice with one second interval */
+beep()
+{
+ putc('\007',stderr); fflush(stderr);
+ sleep(1);	/* enjoy it */
+ putc('\007',stderr); fflush(stderr);
+}/*beep*/
+
+/*command: return ptr to string with result of cmd */
+char *command(cmd)
+char cmd[];
+{ static char result[18];
+  extern FILE	 *popen();
+  	 FILE    *input;	/* pipe for comd */
+  
+  input = popen(cmd,"r");
+  fgets(result,sizeof result,input);
+  pclose(input);
+  result[max(0,strlen(result)-1)] = '\0'; /* take of CR */
+  return(result);
+}/*command*/
+
+/*msg: format txt string */
+char *msg(txt,file)
+char	*txt;
+char	file[];
+{ static char out[1024];
+  char cmd[1024];
+  int i;
+  int j;
+  int k;
+  int ptr;
+
+  i = 0;
+  j = 0;
+  out[i] = '\0';
+  while (txt[j] != '\0') {
+   switch (txt[j]) {
+    case '`': j++;	/* skip past ` */
+	      k = 0;	/* copy until ` */
+	      while ( (txt[j] != '`') && (txt[j] != '\0') ) {
+               cmd[k] = txt[j] ;
+	       k++; j++;
+	      }
+	      cmd[k] = '\0';
+	      strcat(out,command(cmd));
+    	      i = strlen(out); if (txt[j] != '\0') j++;
+              break;
+    case '%': j++;
+    	      switch(txt[j]) {
+	       case 'T': strcat(out,TIME());
+	            	 i = strlen(out);  j++;
+		         out[i] = '\0';
+		         break;
+	       case 'M': strcat(out,MTIME(file));
+	       		 i = strlen(out); j++;
+			 out[i] = '\0';
+			 break;
+	       case 'S': strcat(out,SIZE(file));
+	       		 i = strlen(out); j++;
+			 out[i] ='\0';
+			 break;
+	       case '\0': break;
+	       default:  out[i] = txt[j];
+	       	         i++; j++;
+			 out[i] = '\0';
+			 break;
+	      }/*switch*/ 
+    	      break;
+    default : out[i] = txt[j];
+    	      i++; j++;
+	      out[i] = '\0';
+    	      break;
+   }/*switch*/
+  }/*while*/
+  return(out);
+}/*msg*/
+
+/* setread: changes last read access time of terminal 
+** figure this one out Sikke
+*/
+setread()
+{
+ utime(terminal,null);
+}/*setread*/
+
+/*setkey: will set key label if not already set */
+/* setting label to EMPTY means do not change */
+setkey(ptr,key,txt)
+ACT	*ptr;
+int	key;
+char	*txt;
+{ char output[128];
+
+ txt[16] = '\0';	/* truncate at 16 char */
+ if ( txt[0] == '\0' ) return(0); /* empty means do not change */
+ if ( strcmp(keys[key],txt) == 0) return(0);
+ strcpy(keys[key],txt);
+ if (ptr->BEEP) beep();	/* beep if diff label */
+ sprintf(output,"\033&f%dk%dd0L%s\033&jB", key,
+ 				           strlen(txt),
+				           txt);
+ write(2,output,strlen(output));
+ setread(); /* to change last read access on terminal */
+}/*setkey*/
+
+/*netnews: return true if netnews */
+BOOL netnews()
+{
+  if ( mtime(NEWSRC) < mtime(NEWSFILE) ) return(TRUE);
+  return(FALSE);
+}/*netnews*/
+
+/* mail: return TRUE if mail is waiting */
+BOOL mail()
+{ char line[sizeof(forward)];
+  int f1;	/* to read mailfile */
+ 
+ if (fsize(MAILFILE) == 0) return(FALSE);
+
+/* so it exists now check if not forwarded */
+  f1 = open(MAILFILE,0);
+  if ( f1 == -1 ) return(TRUE);
+  line[0] = '\0';
+  read(f1, line, sizeof(line) );
+  line[sizeof(line)-1] = '\0';
+  close(f1);
+  if ( strncmp(line,forward,sizeof(forward)) == 0 ) {
+   return(FALSE);
+  } else {
+   return(TRUE);
+  }
+}/*mail*/
+
+/*changed: return TRUE if file has changed and size > 0 */
+BOOL changed(ptr)
+ACT *ptr;
+{ long mtime1;
+  long oldmtime;
+
+  /* update mtime nad beep if need be */
+  oldmtime = ptr->mtime;
+  mtime1 = mtime(ptr->watch);
+  ptr->mtime = mtime1;
+  if ((mtime1 != oldmtime) && (fsize(ptr->watch) > 0L) && (ptr->beep)) beep();
+
+  /* check on special files first */
+  if ( strcmp(ptr->watch,"TIME") == 0 ) return(TRUE);
+  if ( strcmp(ptr->watch,"NETNEWS") == 0 ) return(netnews());
+  if ( strcmp(ptr->watch,"MAIL") == 0 ) return(mail());
+
+  if ( (mtime1 != oldmtime) && (fsize(ptr->watch) > 0L) ) return(TRUE);
+
+  return(FALSE);
+}/*changed*/
+
+/*workon: to work on one activity */
+void workon(ptr)
+ACT *ptr;
+{
+  if (changed(ptr)) {
+   setkey(ptr,ptr->key,msg(ptr->onmsg,ptr->watch));
+  } else {
+   setkey(ptr,ptr->key,msg(ptr->offmsg,ptr->watch));
+  }
+}/*workon*/
+
+/* doit: actual loop that does all work */
+void doit()
+{ ACT *ptr;
+  extern long time();
+
+  NOW = time(0);
+  ptr = root;
+  while (ptr != NULL) {	/* workon if slept enough */
+   if ( ptr->nexttime <= NOW ) {
+    workon(ptr);	/* and then update nexttime */
+    ptr->nexttime = ptr->nexttime + ptr->sleepfor;
+   }
+   ptr = ptr->next;
+  }/*while*/
+}/*doit*/
+
+/*minsleep: compute minsleep= min of all sleepfor */
+void setminsleep()
+{ ACT *ptr;
+
+  minsleep = sflag;
+  ptr = root;
+  while ( ptr != NULL ) {
+   minsleep = min(minsleep,ptr->sleepfor);
+   ptr = ptr->next;
+  }
+}/*setminsleep*/
+
+/*setmtime: to init mtime fields first time around */
+setmtime()
+{ ACT *ptr;
+ 
+  ptr = root;
+  while ( ptr != NULL) {
+   ptr->mtime = mtime(ptr->watch);
+   ptr = ptr->next;
+  }
+}/*setmtime*/
+
+main(argc,argv)
+int	argc;
+char	*argv[];
+{ long sec;
+  extern long time();
+  long i;
+  long nexttime;
+
+ init();
+ parseoptions(argc,argv);
+ setminsleep();
+ setmtime();
+ for (;;) {	/* FOR EVER */
+  sec = time(0);
+  chkparent();
+  doit();
+  i = sec + minsleep - time(0);
+  sleep (max(0,i));
+ }
+}/*main*/
+
+

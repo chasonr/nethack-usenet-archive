@@ -1,0 +1,2461 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,b6d965a942fd3c1d,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-08-04 11:14:26 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site umich.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!gamma!epsilon!mb2c!umich!doug
+From: doug@umich.UUCP (Douglas Orr)
+Newsgroups: net.sources
+Subject: shell for MS-DOS (part 2)
+Message-ID: <203@umich.UUCP>
+Date: Sun, 4-Aug-85 14:14:26 EDT
+Article-I.D.: umich.203
+Posted: Sun Aug  4 14:14:26 1985
+Date-Received: Tue, 6-Aug-85 12:18:52 EDT
+Distribution: net
+Organization: University of Michigan, EECS Dept., Ann Arbor, MI
+Lines: 2440
+
+
+Here is part 2 of the Unix-like shell for DOS.  This part contains
+the actual Microsoft C sources for the program.
+
+	-Doug
+	{ihnp4,mb2c,pur-ee}!umich!textset!doug
+	doug%textset@umich.csnet
+
+#	This is a shell archive.
+#	Remove everything above and including the cut line.
+#	Then run the rest of the file through sh.
+-----cut here-----cut here-----cut here-----cut here-----
+#!/bin/sh
+# shar:	Shell Archiver
+#	Run the following text with /bin/sh to create:
+#	sh.c
+#	cmds.c
+#	builtin.c
+#	wildcard.c
+#	gen.h
+#	sh.h
+# This archive created: Sun Aug  4 14:03:53 1985
+cat << \SHAR_EOF > sh.c
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <fcntl.h>
+
+#include "gen.h"
+#include "sh.h"
+
+Public char * * dissect();
+Public char * smalloc();
+
+Local bool escflg = True;	/*  interpret \ as "escape" character */
+
+/*
+ *	sh:  a Unix(tm) like command interpreter for MS-DOS.
+ *
+ *  by  Douglas Orr
+ *      Textset Inc.
+ *      Ann Arbor, Michigan
+ *
+ *  Copyright (c) 1985 Textset.   All rights reserved.
+ *
+ *  This program may be freely distributed, but not sold for profit.
+ *
+ */
+
+main(argc,argv,envp)
+int	argc;
+char	* argv[];
+char	* envp[];
+	{
+
+	/*  arguments processing */
+	while( --argc )
+	if( (*++argv)[0] == '-' )
+		{
+		switch( (*argv)[1] )
+			{
+			case 'e':
+				escflg = !escflg;
+				break;
+			default:
+				fprintf( stderr, "sh: invalid argument %s\n", 
+					*argv );
+				break;
+			}
+		}
+
+	/*  real stuff  */
+	init();
+	sh();
+
+	}
+
+
+/*  Environment Stuff  */
+
+/*
+ *   for now, just use the uSoft environment stuff.  This could probably
+ *  be improved
+ */
+char *
+l_getenv( name )
+char * name;
+	{
+	return( getenv(name) );
+	}
+
+l_setenv( name, val )
+char * name;
+char * val;
+	{
+
+	char * str;
+
+	str = smalloc( strlen(name) + strlen(val) + 2 );
+
+	strcpy( str, name );
+	strcat( str, "=" );
+	strcat( str, val );
+
+	return( putenv( str ) );
+
+	}
+
+l_printenv()
+	{
+
+	char * * ep;
+
+	putchar( '\n' );
+	for( ep=environ; *ep; ep++ )
+		printf( "%s\n", *ep );
+	putchar( '\n' );
+
+	return( 0 );
+
+	}
+
+
+init()
+	{
+
+	char * path;
+
+	/*  ignore interrupts */
+	signal( SIGINT, SIG_IGN );
+
+	/*   default values  */
+	if( (path = l_getenv( "PATH" )) == NULL )
+		{
+		l_setenv( "PATH", "\;\bin" );
+		path = l_getenv( "PATH" );
+		}
+
+	setbuf( stdin, NULL );
+	setbuf( stdout, NULL );
+	setbuf( stderr, NULL );
+
+	rehash( path );
+
+	/*   read in the profile  */
+	if( access( "/profile", F_ROK ) == 0 )
+		source( "/profile" );
+
+	/*  set important variables  */
+	if( l_getenv( "PROMPT" ) == NULL )
+		l_setenv( "PROMPT", "% " );
+	if( l_getenv( "PS1" ) == NULL )
+		l_setenv( "PS1", "> " );
+
+	}
+
+
+/*
+ *	iiiiit's SHOWTIME
+ */
+sh()
+	{
+	char buf[256];
+	bool intr;
+
+	while( !feof(stdin) )
+		{
+
+		/*  prompt  */
+		if( Interactive() )
+			fprintf( stderr, "%s", l_getenv("PROMPT") );
+
+		/*  input  */
+		if( getbuf( buf, sizeof buf, stdin ) )
+			{
+			/*  execute  */
+			(void)sys( buf, sizeof buf );
+			}
+
+		}
+
+	}
+
+/*
+ *  Do initial input processing.  Turn the high bit on to
+ * prevent escaped characters and special characters within single
+ * quotes from being interpreted
+ */
+
+#define	ChNorm (0)
+#define	ChDquote (1)
+#define	ChSquote (2)
+
+#define	Escape(x) (x|0x80)
+
+getbuf( buf, bufsize, fd )
+char * buf;
+int bufsize;
+FILE * fd;
+	{
+	char * ptr = buf;
+	int ch_state;
+	Reg int ch;
+
+	ch_state = ChNorm;
+	while( (ch = getc(fd)) != EOF )
+		{
+		if( (ch == '\\') && escflg )
+			ch = Escape(getc(fd));
+		else
+		if( ch == '\'' )
+			{
+			if( ch_state == ChSquote )
+				ch_state = ChNorm;
+			else
+			if( ch_state == ChNorm )
+				ch_state = ChSquote;
+			else
+			/*  state == dquote */
+				ch = Escape(ch);
+			}
+		else
+		if( ch == '"' )
+			{
+			if( ch_state == ChDquote )
+				ch_state = ChNorm;
+			else
+			if( ch_state == ChNorm )
+				ch_state = ChDquote;
+			else
+			/*  state == squote */
+				ch = Escape(ch);
+			}
+
+		/* ?!  include other wildcards here, as added  */
+		if( ((ch_state == ChSquote) &&  ((ch == '$') || (ch == '*')))
+		||  ((ch_state == ChDquote) &&  (ch == '*')) )
+			ch = Escape(ch);
+
+		*ptr++ = ch;
+		if( ptr-buf >= bufsize-1 ) 
+			break;
+		/*
+		 *  !! This isn't exactly how Unix does quote processing ...
+		 *   my current opinion is that it's not worth the trouble
+		 */
+		if( ch == '\n' )
+			{
+			if( ch_state == ChNorm )
+				break;
+			else
+			if( Interactive() )
+				fprintf( stderr, "%s ", l_getenv( "PS1" ) );
+			}
+
+		}
+
+	*ptr = '\0';
+
+	/*  eof */
+	if( ptr == buf )
+		return( False );
+
+	/*  screw up  */
+	if( ch_state != ChNorm )
+		{
+		fprintf( stderr, "error: mismatched quotes\n" );
+		return( False );
+		}
+
+	return( True );
+
+	}
+
+
+/*
+ *	Keep a stack of fds.  Push our current I/O environment before
+ *  executing commands so that we have someplace to go back to after
+ *  I/O redirections
+ */
+#define FMax (20)
+Local int fdstk[FMax];
+Local int ftop = 0;
+
+push_fd(fd)
+int fd;
+	{
+	if( ftop >= FMax )
+		return( -1 );
+	else
+		fdstk[ftop++] = fd;
+	}
+
+pop_fd()
+	{
+	if( ftop == 0 )
+		return( -1 );
+	else
+		return( fdstk[--ftop] );
+	}
+
+
+save_fds()
+	{
+	push_fd( dup(0) );
+	push_fd( dup(1) );
+	push_fd( dup(2) );
+	}
+
+restore_fds()
+	{
+	int fd;
+
+	fflush(stderr);
+	fflush(stdout);
+
+	dup2( (fd = pop_fd()), 2 );
+	close(fd);
+	dup2( (fd = pop_fd()), 1 );
+	close(fd);
+	dup2( (fd = pop_fd()), 0 );
+	close(fd);
+
+	setbuf( stdin, NULL );
+	clearerr(stdin);
+	clearerr(stdout);
+	clearerr(stderr);
+
+	}
+
+
+/*
+ *   Use as source input the indicated file
+ */
+source( file )
+char * file;
+	{
+	int fd;
+
+
+	if( (fd = open( file, 0 )) >= 0 )
+		{
+
+		/*   save current input  */
+		if( push_fd( dup(0) ) == -1 )
+			{
+			fprintf( stderr, "source files nested too deeply\n" );
+			return;
+			}
+		dup2( fd, 0 );
+		close(fd);
+
+		/*  loop on new input  */
+		sh();
+
+		/*  restore old input  */
+		dup2( (fd = pop_fd()), 0 );
+		clearerr(stdin);
+		close(fd);
+
+		}
+	else
+		perror( file );
+
+	}
+
+
+/*
+ *	execute the given command
+ */
+sys( pgm, pgmlen )
+char * pgm;
+int pgmlen;
+	{
+
+	int rc;
+	char * * argv;
+
+	/*  set up I/O environment  */
+	save_fds();
+
+	/*  slice into an argv  */
+	if( (argv = dissect( pgm, pgmlen )) )
+		{
+		/*  doit  */
+		rc = cmd( argv, environ );
+
+		/*  !! Assertion:  all args are malloc'd */
+		while( *argv )
+			free( *argv++ );
+		}
+
+	/*  restore  */
+	restore_fds();
+
+	return( rc );
+
+	}
+SHAR_EOF
+cat << \SHAR_EOF > cmds.c
+/*  yow  */
+#include <dos.h>
+#include <stdio.h>
+#include <direct.h>
+#include <string.h>
+#include <process.h>
+#include <ctype.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <setjmp.h>
+
+#include "gen.h"
+#include "sh.h"
+
+
+/*
+ *	sh:  a Unix(tm) like command interpreter for MS-DOS.
+ *
+ *  by  Douglas Orr
+ *      Textset Inc.
+ *      Ann Arbor, Michigan
+ *
+ *  Copyright (c) 1985 Textset.   All rights reserved.
+ *
+ *  This program may be freely distributed, but not sold for profit.
+ *
+ */
+
+/*   declare built-in functions  */
+Public b_ls(), b_echo(), b_pushd(), b_popd();
+Public b_pwd(), b_cd(), b_mkdir(), b_rmdir(), b_rm();
+Public b_history(), b_exit(), b_dirs(), b_rehash();
+Public b_set(), b_fgrep(), b_source();
+
+Public int fcmp();
+
+/*  disk transfer area  */
+typedef	union dta
+	{
+	struct {
+		char dt_dos[21];
+#define DosSub (0x10)
+#define	DosHid (0x02)
+		byte dt_attr;
+		short dt_time;
+		short dt_date;
+		unsigned short dt_size_low;
+		unsigned short dt_size_high;
+		char  dt_name[13];
+		} d;
+	short buf[128];
+	} Dta;
+Local Dta dta;
+
+/*
+ *	give us an easily addressable disk transfer area 
+ */
+set_dta()
+	{
+
+	union REGS regs;
+	union SREGS segregs;
+	Dta far * dta_addr = &dta;
+
+	regs.h.ah = 0x1a;	/* set dta */
+	regs.x.dx = FP_OFF(dta_addr);
+	segregs.ds = FP_SEG(dta_addr);
+	intdosx( &regs, &regs, &segregs );
+
+	}
+
+
+/*
+ *	set our disk transfer area and match the first file in the given
+ *  path.  
+ *  !! Warning:  uSoft routines that do disk accesses reset the
+ *  disk transfer area.  Don't call in between directory reads
+ *  examples: open, stat, etc.
+ *
+ *  ?! add flags to allow optionally getting hidden/volume file names
+ */
+
+char *
+open_dir( ptr )
+char	* ptr;
+	{
+
+	char far * fptr;
+	union REGS regs;
+	union SREGS segregs;
+
+	set_dta();
+
+	fptr = ptr;
+	regs.h.ah = 0x4e;	/* find first entry */
+	regs.x.dx = FP_OFF(fptr);
+	segregs.ds = FP_SEG(fptr);
+	regs.x.cx = DosSub;	/* look for normal files & subdirectories*/
+
+	intdosx( &regs, &regs, &segregs );
+
+	if( regs.x.cflag )
+		return( NULL );
+	else
+		/*  name of the current file in the dta  */
+		return( dta.d.dt_name );
+
+	}
+
+char *
+nxt_entry( ptr )
+char	* ptr;
+	{
+
+	union REGS regs;
+
+	regs.h.ah = 0x4f;	/* find next entry */
+	regs.x.cx = DosSub;	/* look for normal files & subdirs */
+
+	intdos( &regs, &regs );
+
+	if( regs.x.cflag )
+		return( NULL );
+	else
+		return( dta.d.dt_name );
+
+	}
+
+
+/*		extract fields from dta		*/
+dta_mode()
+	{
+
+	char * ptr;
+	int	mode = 0;
+
+	if( (ptr = strrchr( dta.d.dt_name, '.' )) )
+		{
+		if( (strcmpi( ptr, ".bat" ) == 0)
+		||  (strcmpi( ptr, ".exe" ) == 0) 
+		||  (strcmpi( ptr, ".com" ) == 0) )
+			mode |= S_IEXEC;
+		}
+
+	if( dta.d.dt_attr & DosSub )
+		mode |= S_IFDIR;
+
+	return( mode );
+
+	}
+
+/*
+ *	return most of the time info provided in struct tm
+ */
+struct tm *
+dta_time()
+	{
+
+	Local struct tm dta_time;
+
+	dta_time.tm_hour = (dta.d.dt_time >> 11) & 0x1f;
+	dta_time.tm_min = (dta.d.dt_time >> 5) & 0x3f;
+	dta_time.tm_sec = (dta.d.dt_time & 0x1f) * 2;
+	dta_time.tm_year = ((dta.d.dt_date >> 9) & 0x7f) + 80;
+	dta_time.tm_mon = ((dta.d.dt_date >> 5) & 0xf);
+	dta_time.tm_mday = (dta.d.dt_date & 0x1f);
+
+	if( dta_time.tm_mon > 12 || dta_time.tm_mon < 1 )
+		dta_time.tm_mon = 0;
+
+	return( &dta_time );
+
+	}
+
+long
+dta_size()
+	{
+	return( (((long)dta.d.dt_size_high) << 16) + dta.d.dt_size_low );
+	}
+
+
+/*	"disk" operations	*/
+
+/* 
+ *   change the current disk 
+ */
+chdsk( disk )
+int	disk;
+	{
+
+	union REGS regs;
+
+	if( isupper(disk) )
+		disk -= 'A';
+	else
+		disk -= 'a';
+
+	if( disk < 0 || disk > 25 )
+		{
+		fprintf( stderr, "invalid drive\n" );
+		return( -1 );
+		}
+
+	regs.h.ah = 0x0e;	/* change disk */
+	regs.h.dl = disk;	/* to this value */
+
+	intdos( &regs, &regs );
+	return( 0 );
+
+	}
+
+bool
+isdev( disk )
+char * disk;
+	{
+	return( (strlen(disk) == 2) && (disk[1] == ':') );
+	}
+
+getcdsk()
+	{
+
+	union REGS regs;
+
+	regs.h.ah = 0x19;	/* get current disk */
+	intdos( &regs, &regs );
+
+	return( regs.h.al + 'a' );
+
+	}
+
+
+#define	MaxCmdLen (15)
+#define Cm_Builtin (0x01)
+#define Cm_Batch (0x02)
+
+typedef	struct cmds
+	{
+	char cm_name[MaxCmdLen];
+	char * cm_path;
+	short cm_flags;
+	int (* cm_rtne)();
+	} Cmds;
+
+#define	MaxCmds (256)
+Local Cmds cmds[MaxCmds];
+
+
+/*   built-in commands  */
+Local struct bi {
+	char * bi_name;
+	int (* bi_rtne)();
+	} 
+builtins[] =
+	{
+	"ls", b_ls,
+	"echo", b_echo,
+	"cd", b_cd,
+	"pwd", b_pwd,
+	"pushd", b_pushd,
+	"pd", b_pushd,
+	"popd", b_popd,
+	"rm", b_rm,
+	"mkdir", b_mkdir,
+	"rmdir", b_rmdir,
+	"history", b_history,
+	"exit", b_exit,
+	"dirs", b_dirs,
+	"rehash", b_rehash,
+	"set", b_set,
+	"fgrep", b_fgrep,		/* msdos sucks */
+	"source", b_source,		/* just like on MTS */
+	NULL, NULL,
+	};
+Local int cmdcnt = 0;
+
+
+
+/*	Command Parsing Stuff	*/
+
+add_cmd( cmd, path, flags, rtne )
+char * cmd;
+char * path;
+short flags;
+int (* rtne)();
+	{
+
+	if( cmdcnt >= MaxCmds )
+		{
+		fprintf( stderr, "error: hash table overflow\n" );
+		return;
+		}
+
+	/*	?! make this into a real hash table, eventually  */
+	strcpy( cmds[cmdcnt].cm_name, cmd );
+	if( path )
+		cmds[cmdcnt].cm_path = strdup(path);
+	else
+		cmds[cmdcnt].cm_path = NULL;
+	cmds[cmdcnt].cm_flags = flags;
+	cmds[cmdcnt].cm_rtne = rtne;
+	cmdcnt++;
+
+	}
+
+/*
+ * ... ok ... so we're not really hashing anything
+ */
+rehash( path )
+char * path;
+	{
+
+	char mypath[128];
+	char buf[128];
+	char cbuf[128];
+	Reg char * pptr;
+	char * ptr;
+	char * extptr;
+	char * cur_path;
+	int flags;
+	int i;
+
+
+	/*	?! make this into a real hash table, eventually  */
+	for( i=0; i<cmdcnt; i++ )
+		{
+		if( cmds[i].cm_path )
+			free( cmds[i].cm_path );
+		}
+	cmdcnt = 0;
+
+
+	/*   add "built in" commands  */
+	for( i=0; builtins[i].bi_name; i++ )
+		add_cmd( builtins[i].bi_name, NULL, Cm_Builtin,
+			builtins[i].bi_rtne );
+
+	/*  add the stuff in the path  */
+	for( pptr=path; *pptr; )
+		{
+
+		if( *pptr == ';' )
+			++pptr;
+
+		cur_path = pptr++;
+		while( (*pptr != ';') && (*pptr != '\0') )
+			++pptr;
+
+		strncpy( mypath, cur_path, pptr-cur_path );
+		mypath[pptr-cur_path] = '\0';
+
+		/*	open the directory	*/
+		strcat( mypath, "\\*.*" );
+		ptr = open_dir( mypath );
+		mypath[ strlen(mypath)-4 ] = '\0';
+
+		/*  find everything that looks executeable  */
+		for( ; ptr; ptr = nxt_entry() )
+			{
+
+			strlwr( ptr );
+
+			if( !(extptr = strrchr(ptr, '.'))
+			||  (strcmp(extptr, ".exe") != 0  
+			  && strcmp(extptr, ".bat") != 0
+			  && strcmp(extptr, ".com") != 0) )
+				continue;
+
+			flags = 0;
+
+			strncpy( cbuf, ptr, extptr-ptr );
+			cbuf[extptr-ptr] = '\0';
+			sprintf( buf, "%s\\%s", mypath, ptr );
+
+			if( strcmp( extptr, ".bat" ) == 0 )
+				flags |= Cm_Batch;
+
+			add_cmd( cbuf, buf, flags, NULL );
+
+			}
+
+		}
+
+	}
+
+
+#define MaxArgs (128)
+Local char * argv[MaxArgs];
+
+/*
+ *	duplicate arg string, turning off all high bits
+ */
+char *
+astrdup(str)
+char * str;
+	{
+	Reg char * ptr;
+	char * val;
+
+	val = ptr = strdup(str);
+	while( *ptr )
+		*ptr++ &= 0x7f;
+
+	return( val );
+
+	}
+
+/*
+ *	dissect breaks the command into arguments
+ *
+ * !! ASSUME getbuf "escape"s all quotes within quotes, so quote
+ *    processing is trivial at this point
+ */
+
+char * * 
+dissect( buf, bufsize )
+char * buf;
+int bufsize;
+	{
+
+	int	done = False;
+	int argc = 0;
+	int i;
+	char * bufend;
+	char * wordend;
+
+	/* ?! it might be better to store history as argv lists, and
+	 *        do substitution after initial arg breakup
+	 */
+
+	i = strlen(buf);
+	if( i && buf[i-1] == '\n' )
+		buf[i-1] = '\0';
+
+	if( !sub_hist( buf, bufsize ) )
+		return( NULL );
+
+	/*  plant this stuff, for batch and mystery commands  */
+	argv[argc++] = "\\command";
+	argv[argc++] = "/c";
+
+	bufend = buf+bufsize;
+
+	while( !done )
+		{
+
+		while( isspace(*buf) )
+			buf++;
+
+		if( *buf ) {
+
+		if( argc == MaxArgs )
+			{
+			fprintf(stderr, "error: too many arguments\n");
+			return( NULL );
+			}
+
+
+		if( *buf == '\'' || *buf == '"' )
+			{
+			/*  word starts on next character */
+			i = *buf++;
+			wordend = buf;
+			while( (*wordend != i) && *wordend )
+				wordend++;
+			}
+		else
+			{
+			/*  normal space delimited word */
+			wordend = buf;
+			while( (!isspace(*wordend)) && *wordend )
+				wordend++;
+			}
+
+
+		if( !*wordend )
+			done = True;
+
+		/*  !! assuming at least one space between args */
+		*wordend = '\0';
+
+		/*  can we do a wildcard substitution on this? */
+		if( iswild( buf ) )
+			{
+			if( (i = do_wildcard( buf, argv, argc )) == 0)
+				{
+				fprintf( stderr, "couldn't match %s\n",
+					buf );
+				return( NULL );
+				}
+			else
+				argc += i;
+			}
+		else
+			argv[argc++] = astrdup(buf);
+
+		buf = wordend+1;
+
+		}
+		else
+			done = True;
+
+		}
+
+	argv[argc] = NULL;
+
+	/*  make with the I/O redirections  */
+	if( (argc = do_redirect( argc, argv )) < 0 )
+		{
+		fprintf( stderr, "redirection error\n" );
+		return( NULL );
+		}
+
+	if( argc == 2 )
+		return( NULL );
+
+	return( argv+2 );
+
+	}
+
+
+/* ?!  Add []{} eventually  */
+iswild( buf )
+char * buf;
+	{
+
+	while( *buf )
+		{
+		if( *buf++ == '*' )
+			return( True );
+		}
+
+	return( False );
+	}
+
+
+/* ?!  Add []{} eventually  */
+do_wildcard( pat, argv, argc )
+char *  pat;
+char *  * argv;
+int argc;
+	{
+	char * * av;
+	char * ptr;
+	char * cwd;
+	char tmp[128];
+	char * endpat;
+	int tmpch;
+	int wargc;
+	int dev = -1;
+
+	av = argv + argc;
+
+	cwd = NULL;
+
+	/*
+	 * ?! currently only handle one level of wildcard  - FIXIT
+	 *    UGLY ALERT
+	 */
+	if( (ptr = strrchr( pat, '/' )) 
+	 || (ptr = strrchr( pat, '\\' )) )
+		{
+
+		/*
+		 * save the directory spec, with which to rebuild file 
+		 * names later 
+		 */
+		strncpy( tmp, pat, ptr-pat+1 );
+		endpat = tmp + (ptr-pat) + 1;
+		tmpch = *ptr;
+		*ptr = '\0';
+
+		if( pat[1] == ':' )
+			{
+			dev = getcdsk();
+			if( chdsk( pat[0] ) == -1 )
+				goto bad_end;
+			pat += 2;
+			}
+
+		/*  go to the directory you wish to examine  */
+		if( (cwd = getcwd( NULL, 128 )) == NULL )
+			goto bad_end;
+
+		if( ptr != pat )
+			{
+			if( chdir( pat ) == -1 )
+				{
+				fprintf( "%s: no such directory\n", pat );
+				goto bad_end;
+				}
+			}
+		else
+			chdir( "/" );
+
+		*ptr = tmpch;	/* back the way they were */
+		pat = ptr+1;
+
+		}
+	else
+		endpat = tmp;
+
+
+	/*  save the pattern, and delete it from the buffer  */
+
+	for( ptr=open_dir( "*.*" ); ptr; ptr = nxt_entry() )
+		{
+		strlwr(ptr);
+		if( ismatch( pat, ptr ) )
+			{
+			if( av-argv >= MaxArgs )
+				{
+				fprintf( stderr, "%d: too many arguments\n", 
+					av-argv );
+				goto bad_end;
+				}
+			if( ptr[0] == '.' && pat[0] != '.' )
+				continue;
+			strcpy( endpat, ptr );
+			*av++ = strdup(tmp);
+			}
+		}
+	*av = NULL;
+
+	if( cwd )
+		{
+		chdir( cwd );
+		free( cwd );
+		}
+
+	/*  sort the wildcarded arguments arguments  */
+	/*  !!  this can overflow your stack if you are unlucky  */
+	wargc = av - (argv+argc);
+	if( wargc > 1 )
+		qsort( (char *)(argv+argc), wargc, sizeof(char *), fcmp );
+
+	if( dev != -1 )
+		chdsk(dev);
+	return( wargc );
+
+	/*  he was a bad boy, and he came to a bad end */
+bad_end:
+	if( dev != -1 )
+		chdsk(dev);
+	return( 0 );
+
+	}
+
+/*	perform I/O redirections  */
+do_redirect( argc, argv )
+int argc;
+char * * argv;
+	{
+
+	int i, j;
+	int skip;
+	char * file;
+	char * mode;
+	FILE * fd;
+	int direct;
+	int mod;
+
+	/*
+	 *  moderate UGLY ALERT
+	 */
+	for( i=2; i<argc; )
+		{
+		if( ((direct = argv[i][0]) == '>') || (direct == '<') )
+			{
+			skip=1;
+			file = argv[i]+1;
+			mod = '\0';
+
+			if( (*file == '>') || (*file == '&') )
+				mod = *file++;
+
+			/*  is file name in the second argument? */
+			if( *file == '\0' )
+				{
+				if( i == argc-1 )
+					return( -1 );
+				skip=2;
+				file = argv[i+1];
+				}
+
+			if( direct == '<' )
+				{
+				mode = "r";
+				fd = stdin;
+				}
+			else
+				{
+				mode = "w";
+				fd = stdout;
+				if( mod == '>' )
+					mode = "a";
+				}
+
+			if( freopen( file, mode, fd ) == NULL )
+				return( -1 );
+
+			/*  >& gets stderr & stdout  */
+			if( mod == '&' )
+				dup2( 1, 2 );
+
+			/*  UGLY part  */
+			for( j=i; j+skip <= argc ; j++ )
+				argv[j] = argv[j+skip];
+			argc -= skip;
+
+			}
+		else
+			i++;
+		}
+
+	return( argc );
+
+	}
+
+
+/*
+ *	perform history substitutions
+ */
+
+/*  ?!  add  :modifiers, and ^^^ substitutions  */
+#define HistMax (50)
+short	hindex[HistMax];
+char	* history[HistMax] = { NULL, };
+short	hind = 0;
+short	hmax = HistMax;
+short	hcount = 0;
+
+sub_hist( buf, bufsize )
+char * buf;
+int bufsize;
+	{
+
+	char * hptr;
+	char * hend;
+	char * sub = NULL;
+	int ind;
+	int hval;
+	char tmpchr;
+	int i;
+	char * to, * from;
+	int sublen;
+	int cmdlen;
+
+	for( hptr=buf; (hptr = strchr( hptr, '!' )); )
+		{
+
+		sub = NULL;
+		ind = hind-1;
+		if( ind < 0 )
+			ind = hmax-1;
+
+		if( *(hptr+1) == '!' )
+			hend = hptr+2;
+		else
+			{
+			for( hend=hptr+1; 
+			     *hend && !(isspace(*hend) || ispunct(*hend)); 
+			     hend++)
+				/* find end of history spec */;
+			}
+
+		/*   case !!  */
+		if( *(hptr+1) == '!' )
+			{
+			/* !! -> insert previous command  */
+			if( (sub = history[ind]) == NULL )
+				goto noevent;
+			}
+		else
+		/*   case !num  */
+		if( isdigit(*(hptr+1)) )
+			{
+			/* !## -> insert command ## */
+			tmpchr = *hend;
+			*hend = '\0';
+			hval = atoi( hptr+1 );
+			*hend = tmpchr;
+
+			for( i=0; i<hmax; i++ )
+				{
+				if( ind < 0 )
+					ind = hmax-1;
+
+				if( history[ind] == NULL ) break;
+
+				if( hindex[ind] == hval )
+					{
+					sub = history[ind];
+					break;
+					}
+				ind--;
+				}
+			}
+		else
+		/* !str -> insert history string starting with "str" */
+			{
+			for( i=0; i<hmax; i++ )
+				{
+				if( ind < 0 )
+					ind = hmax-1;
+
+				if( history[ind] == NULL ) break;
+
+				if( strncmp( hptr+1, history[ind], (hend-hptr)-1 ) == 0 )
+					{
+					sub = history[ind];
+					break;
+					}
+				ind--;
+				}
+			}
+
+		if( sub == NULL )
+			{
+			noevent:
+				fprintf(stderr,"%.*s: event not found\n", 
+					hend-hptr-1, hptr+1);
+				return( False );
+			}
+		else
+			{
+
+			/*  perform substitution  */
+			sublen = strlen(sub);
+			cmdlen = strlen(buf);
+			if( (cmdlen - (hend-hptr) + sublen) > bufsize )
+				{
+				fprintf( stderr, "event too large\n" );
+				return( False );
+				}
+
+			/*  make a null terminated string out of this  */
+			tmpchr = *hend;
+			*hend = '\0';
+
+			if( cmdlen - (hend-hptr) + sublen > bufsize )
+				{
+				fprintf( stderr, "substitution too large\n" );
+				return( False );
+				}
+
+			/*	do the substitution  */
+			insert(hptr,hend-hptr,(buf+cmdlen)-hptr,sub,sublen);
+
+			/*  replace the original character  */
+			*(hptr+sublen) = tmpchr;
+
+			}
+
+		}
+
+
+	/*  retire old buffer if we have wrapped around  */
+	if( history[hind] )
+		free( history[hind] );
+
+	/*  record this buffer for future histories */
+	hindex[hind] = ++hcount;
+	history[hind++] = astrdup( buf );
+	if( hind >= hmax )
+		hind = 0;
+
+	/*  echo substituted string */
+	if( sub )
+		fprintf( stderr, "%s\n", buf );
+
+	return( True );
+
+	}
+
+/*   UGLY ALERT  */
+insert( old, oldlen, totlen, new, newlen )
+char * old;	/*  history string  */
+int oldlen;	/*  size of history string */
+int totlen;	/*  length from start of history to end of command */
+char * new;	/*  replacement string  */
+int newlen;	/*  size of replacement string */
+	{
+
+	Reg char * from, * to;
+	int i;
+
+	/*  do the substitution  */
+
+	if( newlen < oldlen )
+		{
+		/*  shift left  */
+		to = old+newlen;
+		from = old+oldlen;
+		while( (*to++ = *from++) )
+			/* shift, shift, shift, shift */;
+		}
+	else
+	if( newlen > oldlen )
+		{
+		/*  shift right  */
+		from = old+totlen;  /* start with trailing null */
+		to = from + (newlen - oldlen);
+		for( i = (newlen-oldlen); i-- >= 0; )
+			*to-- = *from--;
+		}
+
+	/*  stick in the new command  */
+	from = new;
+	to = old;
+	for( i=0; i<newlen; i++ )
+		*to++ = *from++;
+
+	}
+
+
+jmp_buf sbuf;
+sig_handle()
+	{
+	/*  reset the interrupt signal */
+	signal( SIGINT, SIG_IGN );
+	/*  bounce back  */
+	longjmp( sbuf, True );
+	}
+
+/*   locate the appropriate executable command and doit */
+cmd( argv, envp )
+char	* * argv;
+char	* * envp;
+	{
+
+	Reg int len;
+	Reg int i;
+	char * cmdptr;
+	char * ptr;
+	int rc;
+	int batch;
+	struct stat statb;
+
+	cmdptr = NULL;
+	batch = False;
+
+	/*   is this a specific path reference  */
+	if( strchr( argv[0], '/' )  == NULL 
+	&&  strchr( argv[0], '\\' ) == NULL )
+		{
+
+		len = strlen( argv[0] );
+
+		/*  is this really a drive selection? */
+		if( (len == 2) && (argv[0][1] == ':') )
+			return( chdsk( argv[0][0] ) );
+
+		/*
+		 * check . first  ... UGLY ALERT  (a real hashing scheme
+		 * could take care of this a little more nicely)
+		 */
+		if( stat( argv[0], &statb ) == -1
+		||  (statb.st_mode & S_IEXEC) == 0 )
+		{
+
+		/*  not in .  is it in the "hash" table?  */
+		for( i=0; i<cmdcnt; i++ )
+			{
+			if( len == strlen( cmds[i].cm_name )
+			&&  (strncmp( cmds[i].cm_name, argv[0], len ) == 0 ))
+				break;
+			}
+
+		if( i < cmdcnt )
+			{
+			cmdptr = cmds[i].cm_path;
+
+			/*   a built in command? */
+			if( cmds[i].cm_flags & Cm_Builtin )
+				{
+
+				if( setjmp(sbuf) )
+					{
+					fprintf( stderr, "SH: interrupt\n" );
+					return( -1 );
+					}
+				signal( SIGINT, sig_handle );
+
+				rc = (*cmds[i].cm_rtne)(argv,envp);
+
+				signal( SIGINT, SIG_IGN );
+				return( rc );
+				}
+			else
+				batch = (cmds[i].cm_flags & Cm_Batch);
+
+			}
+		}
+
+		}
+	else
+		{
+
+		/*  some sort of a specific path invocation  */
+		cmdptr = argv[0];
+
+		/*  reality check */
+		if( (ptr = strrchr( cmdptr, '.' )) )
+			{
+			if( strcmp( ptr, ".bat" ) == 0 )
+				batch = True;
+			}
+
+		}
+
+	if( cmdptr && !batch )
+		{
+		/*  invoke the specific command  */
+		if( (rc = spawnve( P_WAIT, cmdptr, argv, envp )) < 0)
+			perror( argv[0] );
+		return( rc );
+		}
+	else
+		{
+		/* 
+		 * let DOS take a crack at it - this is not in the true Unix
+		 * tradition, but pragmatically, it works out well for
+		 * stuff like "mode," etc.
+		 * 
+		 * !! IMPORTANT - argv always has arguments "\command" "/c" 
+		 *    as argv[-2,-1]
+		 */
+		if( (rc = spawnve( P_WAIT, "\command", argv-2, envp )) < 0)
+			perror( argv[0] );
+		return( rc );
+		}
+
+	}
+SHAR_EOF
+cat << \SHAR_EOF > builtin.c
+#include <dos.h>
+#include <stdio.h>
+#include <string.h>
+#include <process.h>
+#include <time.h>
+
+#include <ctype.h>
+#include <sys\types.h>
+#include <sys\stat.h>
+#include <malloc.h>
+#include <direct.h>
+
+#include "gen.h"
+#include "sh.h"
+
+
+/*
+ *	sh:  a Unix(tm) like command interpreter for MS-DOS.
+ *
+ *  by  Douglas Orr
+ *      Textset Inc.
+ *      Ann Arbor, Michigan
+ *
+ *  Copyright (c) 1985 Textset.   All rights reserved.
+ *
+ *  This program may be freely distributed, but not sold for profit.
+ *
+ */
+
+
+Public char * history[];
+Public short  hindex[];
+Public short hind, hmax;
+
+Local char * mons[] =
+	{
+	"Inv", 
+	"Jan", "Feb", "Mar",
+	"Apr", "May", "Jun",
+	"Jul", "Aug", "Sep",
+	"Oct", "Nov", "Dec",
+	};
+
+char *
+smalloc( size )
+unsigned size;
+	{
+	char	* addr;
+
+	if( !(addr = malloc(size)) )
+		{
+		/*  death with honor */
+		fprintf( stderr, "out of space\n" );
+		exit( 1 );
+		}
+	return( addr );
+
+	}
+
+char *
+strdup( str )
+Reg char * str;
+	{
+	return( strcpy( smalloc( strlen(str)+1 ), str ) );
+	}
+
+
+
+
+fcmp( file1, file2 )
+char * * file1;
+char * * file2;
+	{
+	return( strcmp( *file1, *file2 ) );
+	}
+
+
+/*		Built-in  commands		*/
+
+/*	toy ls  */
+
+struct  fs {
+	char * fs_name;
+	struct tm fs_time;
+	unsigned short fs_mode;
+	off_t fs_size;
+	};
+
+
+#define	Set(flag) (flags |= (1 << flag))
+#define	Reset(flag) (flags &= ~(1 << flag))
+#define Test(flag) (flags & (1 << flag))
+#define	Recurse (0)
+#define	Lflag (1)
+#define	Sflag (2)
+#define	Rflag (3)
+#define	Aflag (4)
+#define	Cflag (5)
+
+
+Local
+fscmp( file1, file2 )
+struct fs * file1;
+struct fs * file2;
+	{
+	return( strcmp( file1->fs_name, file2->fs_name ) );
+	}
+
+Local long ls_size;
+Local int ls_cnt;
+
+b_ls( argv, envp )
+char * * argv;
+char * * envp;
+	{
+	char * ptr;
+	short flags = 0;
+	int rc;
+
+#ifdef	correct
+	/*
+	 * !! as near as I can tell, ls is the only built-in that allocates
+	 *    storage.  If you interrupt, that storage doesn't get freed,
+	 *    currently.  One way around this is the following, which isn't
+	 *    very satisfactory.  Another is to just ignore it and hope you
+	 *    don't run out of storage.  Yet another would be to set another
+	 *    interrupt which frees the storage before leaving which is more
+	 *    of a hassle than I have time for today.  Caveat user.
+	 */
+	signal( SIGINT, SIG_IGN );
+#endif	correct
+
+
+	ls_size = 0;
+	ls_cnt = 0;
+
+	Set(Recurse);		/* list subdirectories */
+
+	if( !Interactive() )
+		Set(Cflag);	/* print out one column */
+
+	while( (*++argv)[0] == '-' )
+		{
+		for( ptr=(*argv)+1; *ptr; ptr++ )
+		switch( *ptr )
+			{
+			case 'l':
+				Set(Lflag);
+				Reset(Cflag);
+				break;
+			case 's':
+				Set(Sflag);
+				break;
+			case 'R':
+				Set(Rflag);
+				break;
+			case 'a':
+				Set(Aflag);
+				break;
+			default:
+				fprintf( stderr, "ls: illegal option %s\n", 
+					*argv );
+				return( -1 );
+
+			}
+		}
+
+	rc = ls( argv, flags );
+
+	if( Test(Sflag) )
+		fprintf( stdout, "%ld total.  %d file%s.\n", ls_size, ls_cnt,
+		ls_cnt == 1 ? "" : "s" );
+
+	return( rc );
+	}
+
+
+
+/*
+ *   UGLY ALERT  ... since I couldn't find any good way to do what I
+ *   would do on Unix, were I to be building a program to recursively
+ *   search directories - that being open the damn things like files,
+ *   I debased myself (a frequent occurance in dosville) and issue "cd"s
+ *   to move around.  My apologies.  I do know better, in the global
+ *   sense.
+ */
+
+Local
+lstatus( file, flags, maxlen, nl )
+struct	fs * file;
+short flags;
+int maxlen;
+bool nl;
+	{
+
+	/*   UGLY ALERT   recurse on directories if appropriate  */
+	/*  (Jaayynnnee ... how do you stop this crazy thing?) */
+	if( (file->fs_mode & S_IFDIR) && Test(Recurse) )
+		{
+		int dev = -1;
+		char * auxlist[1];
+		char * cwd = NULL;
+		char * newd;
+		char * dir = file->fs_name;
+
+		/*   cheat   */
+		if( !Test(Rflag) )
+			Reset(Recurse);	/* only recurse one level, by default  */
+
+		auxlist[0] = NULL;
+
+		if( dir[1] == ':' )
+			{
+			dev = getcdsk();
+			if( chdsk( dir[0] ) == -1)
+				{
+				fprintf( stderr, "couldn't access %c:\n",  dir[0] );
+				return( -1 );
+				}
+			dir += 2;
+			if( dir[0] == '\0' )
+				dir = "/";
+			}
+
+		cwd = getcwd(NULL,128);
+		if( (cwd == NULL) || chdir(dir) == -1)
+			{
+			fprintf( stderr, "! couldn't cd to %s\n",  file->fs_name );
+			return( -1 );
+			}
+
+		if( (newd = getcwd(NULL,128)) != NULL )
+			{
+			fprintf( stdout, "%s\n%s:\n", (nl) ? "" : "\n", strlwr(newd) );
+			free(newd);
+			}
+
+		/*  do a list of the place to which we just attached  */
+		ls( auxlist, flags );
+		putc( '\n', stdout );
+
+		if( dev != -1 )
+			chdsk( dev );
+		if( cwd )
+			{
+			chdir( cwd ); free( cwd );
+			}
+
+		nl = True;
+
+		}
+	else
+		{
+		if( Test(Lflag) )
+			{
+			/* ?! doesn't always line up right  */
+			fprintf( stdout, "%-8ld  %2d:%02d   %3s-%02d-%02d    %-13s\n", 
+				file->fs_size,  file->fs_time.tm_hour,
+			 	file->fs_time.tm_min, 
+				mons[file->fs_time.tm_mon], 
+				file->fs_time.tm_mday,
+				file->fs_time.tm_year, file->fs_name );
+			nl = True;
+			}
+		else
+			{
+			fprintf( stdout, "%s", file->fs_name );
+
+			if( Test(Aflag) )
+				{
+				if( file->fs_mode & S_IFDIR )
+					fprintf( stdout, "\\" );
+				else
+				if( file->fs_mode & S_IEXEC )
+					fprintf( stdout, "*" );
+				else
+					printf( " " );
+				}
+
+			fprintf( stdout, "%*s", maxlen-strlen(file->fs_name), 
+				"" );
+			nl = False;
+			}
+		}
+
+	return( nl );
+
+	}
+
+Local
+ls( list, flags )
+char * * list;
+short flags;
+	{
+
+	int argc;
+	struct  fs * files;
+	char * * filelist;
+
+	int cnt;
+	int maxlen;
+	Reg int i, j;
+	Reg int r;
+	int cols;
+	char * ptr;
+
+	Local struct stat statb;
+	int nl;
+
+	/*  initialize  */
+
+	for( argc=0, filelist=list ; *filelist; filelist++ )
+		argc++;
+
+	maxlen = 0;
+	files = NULL;
+	cnt = 0;
+
+	/*   implicitly ls of current directory  */
+	if( argc == 0 )
+		{
+		int ac;
+		files = (struct fs *)smalloc( (ac=20) * sizeof(struct fs) );
+
+		if( !Test(Rflag) )
+			Reset(Recurse);
+
+		for( ptr=open_dir("*.*"); ptr; ptr=nxt_entry() )
+			{
+
+			if( cnt == ac )
+				{
+				ac += 20;
+				files = (struct fs *)realloc( files, ac*sizeof(struct fs) );
+				if( files == NULL )
+					{
+					/*  cut your losses */
+					fprintf( stderr, "ls: out of space\n" );
+					return(-1);
+					}
+				}
+
+			/* degenerate */
+			if( strcmp( ptr, "." ) == 0 || strcmp( ptr, ".." ) == 0 )
+				continue;
+
+			files[cnt].fs_mode = dta_mode();
+			files[cnt].fs_time = *dta_time();
+			files[cnt].fs_size = dta_size();
+			files[cnt++].fs_name = strlwr(strdup(ptr));
+
+			if( strlen(ptr) > maxlen )
+					maxlen = strlen( ptr );
+
+			}
+
+		}
+	else
+		{
+
+		files = (struct fs *)smalloc( (argc+1) * sizeof(struct fs) );
+		filelist = list;
+
+		while( *filelist )
+			{
+
+			if( (stat( *filelist, &statb ) == -1) )
+				{
+				if( isdev(*filelist)
+				|| (strcmp(*filelist, "/")==0 
+				||  strcmp(*filelist,"\\")==0))
+					{
+					statb.st_mode = S_IFDIR;
+					statb.st_size = 0;
+					statb.st_mtime = 0;
+					}
+				else
+					{
+					fprintf( stderr, "%s: no such file\n", 
+						*filelist );
+					return( -1 );
+					}
+				}
+
+			files[cnt].fs_name = strlwr(strdup(*filelist));
+			files[cnt].fs_mode = statb.st_mode;
+			files[cnt].fs_time = *localtime( &statb.st_mtime );
+			files[cnt].fs_time.tm_mon += 1;    /* relative to 1 */
+			files[cnt++].fs_size = statb.st_size;
+
+			if( strlen(*filelist) > maxlen )
+					maxlen = strlen( *filelist );
+
+			filelist++;	  /* very important  */
+
+			}
+		}
+
+	/*  !!  this can overflow stack if the list is too large  */
+	if( cnt )
+		qsort( (char *)files, cnt, sizeof(struct fs), fscmp );
+
+
+	/*  formatting considerations  */
+	maxlen++;
+	if( Test(Aflag) )
+		cols = 79 / (maxlen+1);
+	else
+		cols = 79 / maxlen;
+
+	if( cols < 0 )
+		cols = 1;
+
+	if( Test(Lflag) )
+		{
+		for( i=0; i<cnt; i++ )
+			(void)lstatus( &files[i], flags, maxlen, True );
+		}
+	else
+	if( Test(Cflag) )
+		{
+		for( i=0; i<cnt; i++ )
+			fprintf( stdout, "%s\n", files[i].fs_name );
+		}
+	else
+		{
+		int ind;
+
+		/* print out by rows */
+		nl = True;
+		for( r=0; r < ((cnt+cols-1)/cols); r++ )
+			{
+
+			for( ind=r, i=0; i<cols; i++ )
+				{
+
+				/*  have we seen everything? */
+				if( ((r*cols) + i) >= cnt )
+					break;
+
+				nl = lstatus( &files[ind], flags, maxlen, nl );
+
+				/* add the size of a column */
+				ind += cnt/cols;  
+				if( i < (cnt % cols) ) 
+					ind++;
+
+				}
+
+			/*  nl flag indicates if a new line is desired */
+			if( !nl )
+				{
+				putc( '\n', stdout );
+				nl = True;
+				}
+
+			}
+		}
+
+	/*  free up the storage you have used, run some totals */
+	ls_cnt += cnt;
+
+	for( i=0; i<cnt; i++ )
+		{
+		ls_size += files[i].fs_size;
+		free( files[i].fs_name );
+		}
+
+	if( files )
+		free( files );
+
+	return( 0 );
+
+	}
+
+
+b_echo( argv, envp )
+char * * argv;
+char * * envp;
+	{
+
+	int	cnt = 0;
+
+	argv++;
+	while( *argv )
+		{
+		if( cnt++ != 0 )
+			fprintf( stdout, " " );
+		fprintf( stdout, "%s", *argv );
+		argv++;
+		}
+
+	putc( '\n', stdout );
+	return( 0 );
+
+	}
+
+b_cd( argv, envp )
+char * * argv;
+char * * envp;
+	{
+
+	argv++;
+
+	if( strlen(*argv) == 2
+	&&  (*argv)[1] == ':' )
+		return( chdsk( *argv ) );
+
+	if( chdir( *argv ) == -1 )
+		perror( "chdir" );
+	return( 0 );
+
+	}
+
+b_pwd( argv, envp )
+char * * argv;
+char * * envp;
+	{
+
+	char * dirp;
+
+	if( (dirp = getcwd(NULL,128)) == NULL )
+		{
+		perror( "getcwd" );
+		return( -1 );
+		}
+	else
+		{
+		fprintf( stdout, "%s\n", strlwr(dirp) );
+		free( dirp );
+		return( 0 );
+		}
+
+	}
+
+
+#define	MaxDirs (10)
+Local char * dirs[MaxDirs];
+Local int dircnt = 0;
+
+b_dirs( argv, envp )
+char * * argv;
+char * * envp;
+	{
+
+	Reg int i;
+	char * cwd;
+
+	if( (cwd = getcwd( NULL, 128 )) )
+		{
+		fprintf( stdout, "%s ", strlwr(cwd) );
+		free( cwd );
+		}
+
+	for( i=dircnt-1; i >= 0; i-- )
+		fprintf( stdout, "%s ", dirs[i] );
+	putc( '\n', stdout );
+
+	return( 0 );
+
+	}
+
+b_pushd( argv, envp )
+char * * argv;
+char * * envp;
+	{
+
+	char * dirp;
+	char * cwd;
+
+	if( *++argv == NULL )
+		{
+		if( dircnt == 0 )
+			{
+			fprintf( stderr, "no directory specified\n" );
+			return( -1 );
+			}
+		else
+			dirp = dirs[--dircnt];
+		}
+	else
+		dirp = *argv;
+
+	if( dircnt < MaxDirs )
+		{
+
+		if( (cwd = getcwd( NULL, 128 )) == NULL )
+			{
+			perror( "chdir" );
+			return( -1 );
+			}
+
+		if( dirp[1] == ':' )
+			{
+			if( chdsk(dirp[0]) == -1 )
+				perror( "chdisk" );
+			dirp += 2;
+			if( dirp[0] == '\0' )
+				dirp = "/";
+			}
+
+		if ( chdir( dirp ) == -1 )
+			{
+			perror( "chdir" );
+			free(cwd);
+			}
+		else
+			dirs[dircnt++] = strlwr(cwd);
+
+		b_dirs( NULL, NULL );
+		return( 0 );
+
+		}
+	else
+		fprintf( stderr, "stack overflow\n" );
+
+	return( -1 );
+
+	}
+
+
+b_popd( argv, envp )
+char * * argv;
+char * * envp;
+	{
+
+	char * cwd;
+	char * dir;
+
+	if( dircnt == 0 )
+		{
+		fprintf( stderr, "stack empty\n" );
+		return( -1 );
+		}
+	else
+		{
+		dir = cwd = dirs[--dircnt];
+		if( dir[1] == ':' )
+			{
+			if( chdsk(dir[0]) == -1 )
+				perror( "chdisk" );
+			dir += 2;
+			}
+
+		if( chdir( dir )  == -1)
+			perror( "chdir:" );
+		else
+			b_dirs( NULL, NULL );
+
+		free( cwd );
+		}
+	return( 0 );
+
+	}
+
+b_mkdir( argv, envp )
+char * * argv;
+char * * envp;
+	{
+
+	int error = 0;
+	int rc;
+
+	while( *++argv )
+		{
+		if( (rc = mkdir( *argv )) != 0 )
+			perror( "mkdir" );
+		error |= rc;
+		}
+	return( error );
+
+	}
+
+
+b_rmdir( argv, envp )
+char * * argv;
+char * * envp;
+	{
+
+	int error = 0;
+	int rc;
+
+	while( *++argv )
+		{
+		if( (rc = rmdir( *argv )) != 0 )
+			perror( "rmdir" );
+		error |= rc;
+		}
+	return( error );
+
+	}
+
+
+b_rm( argv, envp )
+char * * argv;
+char * * envp;
+	{
+
+	int	error = 0;
+	int rc;
+
+	while( *++argv )
+		{
+		if( (rc = unlink( *argv )) != 0 )
+			perror( "rm" );
+		error |= rc;
+		}
+	return( error );
+
+	}
+
+b_history( argv, envp )
+char * * argv;
+char * * envp;
+	{
+
+	int count;
+	int i;
+	int ind;
+
+	if( *++argv == NULL )
+		count = hmax;
+	else
+		{
+		count = atoi( *argv );
+		if( count > hmax ) count = hmax;
+		}
+
+	ind = hind-1;
+	for( i=0; i<count; i++ )
+		{
+		if( ind < 0 )
+			ind = hmax-1;
+
+		if( history[ind] == NULL )
+			break;
+
+		fprintf( stdout, "%d: %s\n", hindex[ind], history[ind] );
+		ind--;
+		}
+
+	return( 0 );
+
+	}
+
+/* ahhbedee ahhbedee ahhba  That's All Folks  */
+b_exit(argv, envp)
+char * * argv;
+char * * envp;
+	{
+	if( *++argv )
+		exit( atoi(*argv) );
+	else
+		exit(0);
+	}
+
+b_rehash( argv, envp )
+char * * argv;
+char * * envp;
+	{
+
+	rehash( l_getenv( "PATH" ) );
+	return( 0 );
+
+	}
+
+b_set( argv, envp )
+char * * argv;
+char * * envp;
+	{
+	char * vptr;
+
+	if( *++argv == NULL )
+		l_printenv( envp );
+	else
+		{
+		while( *argv )
+			{
+			if( (vptr = strchr( *argv, '=' )) == NULL )
+				{
+				fprintf( stderr, "set: syntax error\n" );
+				return( -1 );
+				}
+
+			*vptr++ = '\0';
+			if( l_setenv( *argv, vptr ) == -1 )
+				{
+				perror( "set" );
+				return( -1 );
+				}
+			argv++;
+			}
+		return( 0 );
+		}
+
+	}
+
+
+b_source( argv, envp )
+char * * argv;
+char * * envp;
+	{
+	while( *++argv )
+		source( *argv );
+	}
+
+
+/*
+ *   If you're wondering what fgrep is doing here, it's because the
+ *  goddamn msdos arg list is so small.  Anything that I do frequently
+ *  is a builtin command, since you can't adequately wildcard expand
+ *  on large file lists.  Every day, in every way, msdos sucks.
+ */
+
+Local
+fgrep( file, pattern, fd )
+char	* file;
+char	* pattern;
+FILE *	fd;
+	{
+
+	char line[BUFSIZ];
+	int rc;
+
+	rc = 0;
+	while( fgets( line, sizeof(line), fd ) != NULL )
+		if( rc = match( pattern, line ) )
+			fprintf( stdout, "%s: %s", 
+				(file) ? file : "stdin", line );
+
+	return( rc );
+
+	}
+
+Local
+match( pattern, line )
+char	* pattern;
+char	* line;
+	{
+
+	/*  !? not a great algorithm  */
+	char	* ptr;
+	char	* end;
+	int	plen = strlen(pattern);
+	int llen = strlen(line);
+
+	if( plen > llen )
+		return( 0 );
+
+	end = line+(llen-plen);
+
+	for( ptr=line; ptr < end; ptr++ )
+		{
+		/*   ... actually, pretty mediocre  */
+		if( strncmp( pattern, ptr, plen ) == 0 )
+			return( 1 );
+		}
+
+	return( 0 );
+
+	}
+
+b_fgrep( argv, envp )
+char * argv[];
+char * * envp;
+	{
+
+	FILE *  fd;
+	int rc;
+	char * pattern;
+
+	pattern = *++argv;
+	argv++;
+
+	rc = 0;
+	if( *argv == NULL )
+		{
+		rc = fgrep( NULL, pattern, stdin );
+		return( 0 );
+		}
+	else
+	while( *argv )
+		{
+		if( (fd = fopen( *argv, "r" )) == NULL )
+			fprintf( stderr, "couldn't open %s\n", *argv );
+		else
+			{
+			rc |= fgrep( *argv, pattern, fd );
+			fclose( fd );
+			}
+		argv++;
+		}
+
+	return( !rc );
+
+	}
+SHAR_EOF
+cat << \SHAR_EOF > wildcard.c
+#include "gen.h"
+
+
+
+/*	toy pattern matching ... recognize '*' only, for now */
+
+/*
+ *	sh:  a Unix(tm) like command interpreter for MS-DOS.
+ *
+ *  by  Douglas Orr
+ *      Textset Inc.
+ *      Ann Arbor, Michigan
+ *
+ *  Copyright (c) 1985 Textset.   All rights reserved.
+ *
+ *  This program may be freely distributed, but not sold for profit.
+ *
+ */
+
+
+ismatch( pattern, filename )
+char * pattern;
+char * filename;
+	{
+
+	char	* pat;
+	char	* fn;
+
+	pat = pattern;
+	fn = filename;
+
+	while( *pat ) 
+		{
+
+		if( *pat == '*' )
+			{
+
+			++pat;
+			while( *fn )
+				{
+				if( ismatch( pat, fn ) )
+					return( True );
+				else
+					++fn;
+				}
+			break;
+
+			}
+		else
+		if( *pat == *fn )
+			{
+			pat++;
+			fn++;
+			}
+		else
+			return( False );
+
+		}
+
+	return( *pat == *fn );
+
+	}
+
+
+SHAR_EOF
+cat << \SHAR_EOF > gen.h
+#define	Reg register
+#define	Local static
+#define	Public extern
+
+#define	True (1)
+#define	False (!True)
+
+/*  access types  */
+#define	F_OK (0)
+#define	F_ROK (4)
+
+
+typedef	unsigned char byte;
+typedef byte bool;
+
+
+Public char * l_getenv();
+Public l_setenv();
+
+SHAR_EOF
+cat << \SHAR_EOF > sh.h
+
+/*	sh definitions	*/
+
+#define	Interactive() (isatty(fileno(stdin)) && isatty(fileno(stdout)))
+
+
+Public char * open_dir();
+Public char * nxt_entry();
+Public char * l_getenv();
+
+Public struct tm * dta_time();
+Public long dta_size();
+
+SHAR_EOF
+#	End of shell archive
+exit 0
+
+

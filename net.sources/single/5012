@@ -1,0 +1,848 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,df30634ede5cc3a8,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-10-25 15:06:03 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!watmath!clyde!rutgers!sri-spam!sri-unix!hplabs!pyramid!ucat!pesnta!valid!markp
+From: markp@valid.UUCP (Mark P.)
+Newsgroups: net.sources
+Subject: kd, a keyed database desk manager (sort of)
+Message-ID: <736@valid.UUCP>
+Date: Sat, 25-Oct-86 17:06:03 EST
+Article-I.D.: valid.736
+Posted: Sat Oct 25 17:06:03 1986
+Date-Received: Mon, 27-Oct-86 01:23:35 EST
+Distribution: net
+Organization: Valid Logic, San Jose, CA
+Lines: 828
+
+-
+Some time back, someone posted a program called 'kb', a quick keyed
+database manager.  I looked it over and tried to use it, but found it
+rather awkward and non-intuitive.  This is my first attempt at this
+problem, called 'kd'.  (short, home-row, and vaguely 'keyed database.'
+Essentially, it allows you to enter, index, query, and delete text
+files using one or more keys.  I use it to store ideas, phone messages,
+my current calendar, lists of things I have to do, and other things which
+are too easily lost when just written down.  For instance, my calendar
+file has the keys 'calendar' and 'events', so I say 'kd -Q events' or
+'kd -Q calendar' to look at it, and 'kd -e events' or 'kd -e calendar' to
+edit it.  If I want to see what's cooking with a particular vendor that
+I am dealing with (like phone number of rep, verbal specifications), I
+say 'kd -Q vendor', or just 'kd -x vendor' for a list of entries with
+all the other keywords.
+
+Advantages of kd:
+	'friendly' user interface
+	single program
+	allows simple editing of text and keywords
+	fairly 'robust' database-- key file can be fully reconstructed from
+	  data files, all ASCII files with obvious format
+
+Disadvantages of kd:
+	only does 'AND' keyword search (I haven't found this to be a
+	  significant limitation yet)
+	requires explicit specification of keywords (in some ways a bonus,
+	  since you don't get keys you didn't want and you always get the
+	  ones you thought you were going to get)
+	not excruciatingly fast (but neither was kb, for that matter)
+
+To install, unroll the shar file using /bin/sh, modify the first line
+of the Makefile to match your home directory, and type:
+	make			(compiles kd)
+	make initialize		(makes null key file and data file directory)
+
+As currently written, kd will create a file called .keys in your home
+directory and a subdirectory called .kd in your home directory.  Each
+entry is a separate file in .kd.  When editing a new entry, it creates a
+temporary file in /tmp.  The program uses the <sys/dir.h> directory functions,
+which I believe are BSD 4.1c and beyond-specific.  It should be fairly
+straightforward to construct equivalent functions for other Unixes.  It also
+refers to "/usr/ucb/vi" explicitly.  If you prefer a different editor, or your
+vi is located elsewhere, you should change these occurrences.  Yes, I know
+I should have checked getenv("EDITOR"), but I didn't.
+
+Usage is explained in the header comment of kd.c, and most of this
+information is given when kd is invoked with no arguments.  No attempts
+have been made to instill great robustness to the program, but it has
+behaved fairly well so far for me.  I would appreciate any bugs, fixes or
+improvements (since some of you undoubtedly have more time than me for
+dabbling in these things *sigh*).  Thanks and have fun.
+
+	Mark Papamarcos
+	Valid Logic
+	hplabs!ridge!valid!markp
+
+(no warranty, either express or implied, and all that other legal stuff--
+ if you use this program to maintain anything important, BACKUP YOUR
+ DATABASE OCCASIONALLY!-- simply copying the .kd directory to somewhere
+ else is sufficient)
+
+------------------------- cut here -------------------------------
+: This is a shar archive.
+: Remove everything above this line.
+: Run the file through sh, not csh.
+: (type `sh this_file')
+echo extracting - Makefile
+sed 's/^X//' > Makefile << 'SHAR_EOF'
+XHOME=/u1/markp
+XKEYFILE=$(HOME)/.keys
+XDATADIR=$(HOME)/.kd
+X
+Xkd: kd.c
+X	cc -o kd kd.c
+X
+Xinitialize:
+X	-mkdir $(DATADIR)
+X	cp /dev/null $(KEYFILE)
+SHAR_EOF
+echo extracting - kd.c
+sed 's/^X//' > kd.c << 'SHAR_EOF'
+X/*
+X   Mark P.'s keyed database manager for miscellaneous notes and stuff
+X
+X		October 25, 1986
+X		uucp: hplabs!ridge!valid!markp
+X
+X   kd [-h]
+X		Prints help message
+X
+X   kd -R
+X		Rebuilds the key database
+X
+X   kd -x [key ...]
+X		Prints index of all stuff, or corresponding to keys
+X
+X   kd -a [-f file] key ...
+X		Adds more stuff.  The given keys are attached to the entry.
+X		more keys may be added by prepending the special lines to
+X		the input.  If no file is specified, goes into vi.
+X
+X   kd -q key ...
+X		Queries the database for the given keys (logical AND).
+X
+X   kd -Q key ...
+X		Queries the database.  Prints full text of database entries.
+X
+X   kd -e key ...
+X		Queries the database.  Enters vi on only 1 entry.
+X		Alters name of entry.
+X
+X   kd -E key ...
+X		Queries the database.  Enters vi on several entries.
+X		Alters names of entries.
+X
+X   kd -D key ...
+X		Deletes things (with confirmation).
+X*/
+X
+X#include <stdio.h>
+X#include <sgtty.h>
+X#include <sys/types.h>
+X#include <sys/dir.h>
+X
+Xstruct	sgttyb tty;	/* Tty information */
+Xint	ttyflags;	/* Tty flag image */
+Xint	goodtty;	/* What it was upon entering */
+Xint	iocount;	/* Characters read */
+Xint	ospeed;		/* Baud rate */
+X
+X#define savetty() (gtty(ttyflags,&tty), goodtty = tty.sg_flags)
+X#define fixtty() (tty.sg_flags = goodtty, stty(ttyflags,&tty))
+X#define cbreak() (tty.sg_flags |= CBREAK, stty(ttyflags,&tty))
+X#define nocbreak() (tty.sg_flags &= ~CBREAK, stty(ttyflags,&tty))
+X
+X#define usage() \
+X   {fprintf(stderr, "\007usage: kd -R|-x [key ...]|-a [-f file] [key ...]|-{e|E|q|Q|D} key ...\n"); \
+X    exit(1);}
+X
+X#define MAX_FN_LEN	40
+X#define KEYSTRING	"<$>"
+X#define KEYSTRING_LEN	3
+X#define KEY_FN		".keys"
+X#define NEW_KEY_FN	".keys.tmp"
+X#define BACKUP_KEY_FN	".keys.old"
+X#define KD_DIR		".kd"
+X
+Xtypedef struct hts
+X{
+X   char *fn;
+X   struct hts *next;
+X} matchstruct;
+X
+Xint Rebuildflag = 0;		/* Command-line options */
+Xint queryflag = 0;
+Xint addflag = 0;
+Xint fileflag = 0;
+Xint indexflag = 0;
+Xint printflag = 0;
+Xint editflag = 0;
+Xint editmanyflag = 0;
+Xint Deleteflag = 0;
+Xint allflags;
+X
+Xchar *homedir;			/* HOME environment */
+Xchar keyfn[MAX_FN_LEN];		/* Key file name */
+Xchar newkeyfn[MAX_FN_LEN];	/* Newly generated key file name */
+Xchar backupkeyfn[MAX_FN_LEN];	/* Backup of old key file name */
+Xchar datadn[MAX_FN_LEN];	/* Data directory name */
+Xchar cshcommand[80];		/* Buffer for system() */
+Xchar addfn[MAX_FN_LEN];		/* File name for add */
+Xmatchstruct *basematch = NULL;	/* Beginning of list of matches */
+X
+X/*
+X   Main program (finally)
+X*/
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X   int i;
+X
+X   argc--;			/* Process command-line arguments */
+X   argv++;
+X   while ((argc > 0) && (**argv == '-'))
+X   {
+X      (*argv)++;
+X      while (**argv)
+X	 switch (*(*argv)++)
+X	 {
+X	    case 'R' : Rebuildflag= 1; break;
+X	    case 'Q' : printflag= 1;
+X	    case 'q' : queryflag= 1; break;
+X	    case 'f' : fileflag= 1; break;
+X	    case 'a' : addflag= 1; break;
+X	    case 'x' : indexflag= 1; break;
+X	    case 'E' : editmanyflag= 1;
+X	    case 'e' : editflag= 1; break;
+X	    case 'D' : Deleteflag= 1; break;
+X	    case 'h' : break;
+X	    default:
+X	       usage();
+X	 }
+X      argc--;
+X      argv++;
+X   }
+X
+X   /* Check consistency of command-line arguments */
+X
+X   if (fileflag)
+X   {
+X      if (argc == 0)
+X      {
+X	 fprintf(stderr, "\007kd: no file specified with -f\n");
+X	 exit(1);
+X      }
+X      if (!addflag)
+X      {
+X	 fprintf(stderr, "\007kd: can only specify file with -a\n");
+X	 exit(1);
+X      }
+X      strcpy(addfn, *argv);
+X      argc--;
+X      argv++;
+X   }
+X
+X   allflags= Rebuildflag+addflag+queryflag+indexflag+editflag+Deleteflag;
+X   if (allflags == 0)
+X   {
+X      Help();
+X      exit(0);
+X   }
+X
+X   if (allflags != 1)
+X      usage();
+X
+X   if (Rebuildflag && (argc > 0))
+X      usage();
+X
+X   if ((queryflag || editflag || Deleteflag) && (argc == 0))
+X      usage();
+X
+X   /* Generate constant file names */
+X
+X   if ((homedir= (char *)getenv("HOME")) == (char *)NULL)
+X   {
+X      fprintf(stderr, "\007kd: can't get HOME environment\n");
+X      exit(1);
+X   }
+X
+X   sprintf(keyfn, "%s/%s", homedir, KEY_FN);
+X   sprintf(newkeyfn, "%s/%s", homedir, NEW_KEY_FN);
+X   sprintf(backupkeyfn, "%s/%s", homedir, BACKUP_KEY_FN);
+X   sprintf(datadn, "%s/%s", homedir, KD_DIR);
+X
+X   /* Dispatch the appropriate procedure */
+X
+X   if (Rebuildflag)
+X      Rebuild();
+X
+X   if (addflag)
+X      Add(argc, argv);
+X
+X   if (queryflag)
+X      Query(argc, argv);
+X
+X   if (indexflag)
+X      Index(argc, argv);
+X
+X   if (editflag)
+X      Edit(argc, argv);
+X
+X   if (Deleteflag)
+X      Delete(argc, argv);
+X}
+X
+X/*
+X   outputxlate(string)
+X   Takes file name of a data file, and prints it out in an understandable
+X   form.  Conveniently, the file name is just the ASCII version of time(0),
+X   which is readily converted to ASCII date and time of entry/last change
+X   of this datum.
+X*/
+Xoutputxlate(s)
+Xchar *s;
+X{
+X   long val;
+X
+X   val= atoi(s);
+X   printf("%.24s", ctime(&val));
+X}
+X
+X/*
+X   Rebuild()
+X   Rebuilds the key file out of all the data files.  This is not necessarily
+X   the most efficient way to do this, but it is extremely robust.  The new
+X   key file is built in a separate file, then the old key file is moved to
+X   a backup, and the new key file is moved to its place.  Directory
+X   operations here are 4.1c/4.2-specific.  Each line in the key file is
+X   just a file name, space, and one key.
+X*/
+XRebuild()
+X{
+X   DIR *dirp;			/* Directory stream */
+X   struct direct *dirent;	/* Directory entry for current data file */
+X   char datafn[MAX_FN_LEN];	/* Data file name */
+X   FILE *dataf;
+X   FILE *newkeyf;
+X   char c;
+X   int i;
+X
+X   fprintf(stderr, "Rebuilding...");
+X
+X   /* Create the new key file */
+X
+X   if ((newkeyf= fopen(newkeyfn, "w")) == NULL)
+X   {
+X      fprintf(stderr, "kd: can't create %s\n", newkeyfn);
+X      exit(1);
+X   }
+X
+X   /* Open up the data file directory */
+X
+X   if ((dirp= opendir(datadn)) == NULL)
+X   {
+X      fprintf(stderr, "kd: can't open directory %s\n", datadn);
+X      exit(1);
+X   }
+X
+X   /* Find keys in each file in directory, excluding . and .. */
+X
+X   while ((dirent= readdir(dirp)) != NULL)
+X   {
+X      if (dirent->d_name[0] != '.')
+X      {
+X	 sprintf(datafn, "%s/%s", datadn, dirent->d_name);
+X	 if ((dataf= fopen(datafn, "r")) == NULL)
+X	 {
+X	    fprintf(stderr, "kd: can't open %s\n", datafn);
+X	    exit(1);
+X	 }
+X	 else
+X	 {
+X	    for(;;)
+X	    {
+X	       for (i= 0; i < KEYSTRING_LEN; i++)
+X		  if (getc(dataf) != KEYSTRING[i])
+X		     goto endloop;
+X	       fprintf(newkeyf, "%s", dirent->d_name);
+X	       while ((c= getc(dataf)) != '\n')
+X		  putc(c, newkeyf);
+X	       putc('\n', newkeyf);
+X	    }
+Xendloop:    fclose(dataf);
+X	 }
+X      }
+X   }
+X   closedir(dirp);
+X   fclose(newkeyf);
+X   unlink(backupkeyfn);			/* May or may not incur error */
+X   link(keyfn, backupkeyfn);		/* Make backup */
+X   unlink(keyfn);			/* Kill old key file */
+X   link(newkeyfn, keyfn);		/* Brand new one now */
+X   unlink(newkeyfn);			/* Kill temporary */
+X   putc('\n', stderr);
+X}
+X
+X/*
+X   Add(integer, array of strings)
+X   The arguments are as argc and argv, and are interpreted as a list
+X   of keys.  If a user-specified file exists (i.e. -f file), then
+X   write the keys to the new data file and append the user's file.
+X   If the user didn't specify a file, then write the keys to a temporary
+X   file, call up vi on this file, and copy the result to the new data
+X   file (deleting temporary when done).  Finally, rebuild the key file.
+X*/
+XAdd(ac, av)
+Xint ac;
+Xchar *av[];
+X{
+X   FILE *f;				/* User file or temporary */
+X   char datafn[MAX_FN_LEN];		/* Data file name */
+X   FILE *dataf;
+X   int i;
+X   int charsread;			/* Number of characters from read() */
+X   char buf[1024];			/* Buffer for copying */
+X
+X   if (!fileflag)			/* No user-specified file */
+X   {
+X      sprintf(addfn, "/tmp/kd%010d.tmp", time(0));
+X      if ((f= fopen(addfn, "a")) == NULL)
+X      {
+X	 fprintf(stderr, "\007kd: couldn't create %s\n", addfn);
+X	 exit(1);
+X      }
+X      for (i= 0; i < ac; i++)		/* Make header and call up vi */
+X      {
+X	 fprintf(f, "%s %s\n", KEYSTRING, *av);
+X	 av++;
+X      }
+X      fprintf(f, "*** Replace this line with your text ***\n");
+X      fclose(f);
+X      sprintf(cshcommand, "/usr/ucb/vi +%d %s", ac+1, addfn);
+X      system(cshcommand);
+X   }
+X
+X   /* In either case, addfn should be the user's file now */
+X
+X   if ((f= fopen(addfn, "r")) == NULL)
+X   {
+X      fprintf(stderr, "\007kd: %s not found\n", addfn);
+X      exit(1);
+X   }
+X
+X   /* Magically generate the new data file name using time(0) */
+X
+X   sprintf(datafn, "%s/%010d", datadn, time(0));
+X
+X   if ((dataf= fopen(datafn, "w")) == NULL)
+X   {
+X      fprintf(stderr, "\007kd: couldn't create %s\n", datafn);
+X      exit(1);
+X   }
+X
+X   /* Write header if user-specified file */
+X
+X   if (fileflag)
+X      for (i= 0; i < ac; i++)
+X      {
+X	 fprintf(dataf, "%s %s\n", KEYSTRING, *av);
+X	 av++;
+X      }
+X
+X   /* Copy textual stuff to file */
+X
+X   while ((charsread= read(fileno(f), buf, 1024)) == 1024)
+X      write(fileno(dataf), buf, 1024);
+X
+X   write(fileno(dataf), buf, charsread);
+X   fclose(f);
+X   fclose(dataf);
+X
+X   /* Remove temporary */
+X
+X   if (!fileflag)
+X      unlink(addfn);
+X
+X   /* And rebuild... */
+X
+X   Rebuild();
+X}
+X
+X/*
+X   int search(integer, array of strings, integer)
+X   Does most of the work.  Passed the keys and a flag which selects either
+X   silent lookup (for query) or a report (for index).  Compares keys against
+X   the entries in the central key file.  Matches occur on exact compares
+X   or when the specified key is a shortened version of the stored key.  A
+X   linked list of matches is built, consisting solely of the file names
+X   which contained matches.  If indexstyle is off, search() does no
+X   reporting.  If it is on, search() prints one line for each file that
+X   matched with all the keys occurring in that file.  If there are no keys
+X   specified and indexstyle is on, then the entire index is printed.  This
+X   is really just a nicer way of looking at the key file.  At any rate,
+X   search() returns a value equal to the number of files which contained
+X   matches.
+X*/
+Xint
+Xsearch(ac, av, indexstyle)
+Xint ac;
+Xchar *av[];
+Xint indexstyle;
+X{
+X   FILE *keyf;
+X   int i;
+X   char currentfn[MAX_FN_LEN];
+X   char fnread[MAX_FN_LEN];
+X   char keyread[MAX_FN_LEN];
+X   char c;
+X   int matches;
+X   int lengths[MAX_FN_LEN];
+X   matchstruct *oldbasematch;
+X   int foundcount;
+X   int firstline;
+X   char datafn[MAX_FN_LEN];
+X   FILE *dataf;
+X   int keysinthisfile;
+X
+X   /* Initialize some things */
+X
+X   strcpy(currentfn, " ");
+X   matches= 0;
+X   foundcount= 0;
+X   firstline= 1;
+X   keysinthisfile= 0;
+X   for (i= 0; i < ac; i++)
+X      lengths[i]= strlen(av[i]);
+X
+X   /* Open up the key file */
+X
+X   if ((keyf= fopen(keyfn, "r")) == NULL)
+X   {
+X      fprintf(stderr, "\007kd: can't find %s\n", keyfn);
+X      exit(1);
+X   }
+X
+X   /* For each line in the key file, get the file name and key. */
+X   /* Keep a count of the number of matches for each given file name, */
+X   /* and add that file name to the list of matches if the count is */
+X   /* equal to the number of user-specified keys.  Also, report in */
+X   /* the appropriate fashion if indexstyle is on. */
+X
+X   while ((c= getc(keyf)) != EOF)
+X   {
+X      ungetc(c, keyf);
+X      fscanf(keyf, "%s %s", fnread, keyread);
+X
+X      /* Check to see if we have advanced to a new file name */
+X
+X      if (strcmp(fnread, currentfn))
+X      {
+X	 /* Indexstyle is on and no keys- every file matches */
+X
+X	 if (indexstyle && (ac == 0))
+X	 {
+X	    if (firstline)
+X	       firstline= 0;
+X	    else
+X	       putc('\n', stdout);
+X	    outputxlate(fnread);
+X	    printf(" - ");
+X	    foundcount++;
+X	 }
+X
+X	 /* Perfect match?  Add to list and report if indexstyle */
+X
+X	 if (matches == ac)
+X	 {
+X	    oldbasematch= basematch;
+X	    basematch= (struct hts *)malloc(sizeof(matchstruct));
+X	    basematch->fn= (char *)malloc(strlen(currentfn)+1);
+X	    strcpy(basematch->fn, currentfn);
+X	    basematch->next= oldbasematch;
+X	    foundcount++;
+X	    if (indexstyle && (ac > 0))
+X	    {
+X	       outputxlate(currentfn);
+X	       printf(" - ");
+X	       sprintf(datafn, "%s/%s", datadn, currentfn);
+X	       if ((dataf= fopen(datafn, "r")) == NULL)
+X	       {
+X		  fprintf(stderr, "\007kd: can't find %s\n", datafn);
+X		  exit(1);
+X	       }
+X	       for (i= 0; i < keysinthisfile; i++)
+X	       {
+X		  while ((c= getc(dataf)) != ' ')
+X		     ;
+X		  do
+X		  {
+X		     putc(c, stdout);
+X		     c= getc(dataf);
+X		  }  while (c != '\n');
+X	       }
+X	       putc('\n', stdout);
+X	       fclose(dataf);
+X	    }
+X	 }
+X	 if (matches > ac)
+X	 {
+X	    fprintf(stderr, "\007:kd duplicate keys in %s\n", currentfn);
+X	    exit(1);
+X	 }
+X	 strcpy(currentfn, fnread);
+X	 matches= 0;
+X	 keysinthisfile= 0;
+X      }
+X      keysinthisfile++;
+X      if (indexstyle && (ac == 0))
+X	 printf(" %s", keyread);
+X
+X      /* Do the actual key comparisons */
+X
+X      for (i= 0; i < ac; i++)
+X      {
+X	 if (!strncmp(keyread, av[i], lengths[i]))
+X	    matches++;
+X      }
+X
+X      /* Get rest of line from key file */
+X
+X      while ((c= getc(keyf)) != '\n')
+X	 ;
+X   }
+X   if (indexstyle && (ac == 0))
+X      putc('\n', stdout);
+X   if (matches == ac)
+X   {
+X      oldbasematch= basematch;
+X      basematch= (struct hts *)malloc(sizeof(matchstruct));
+X      basematch->fn= (char *)malloc(strlen(currentfn)+1);
+X      strcpy(basematch->fn, currentfn);
+X      basematch->next= oldbasematch;
+X      foundcount++;
+X      if (indexstyle && (ac > 0))
+X      {
+X	 outputxlate(currentfn);
+X	 printf(" - ");
+X	 sprintf(datafn, "%s/%s", datadn, currentfn);
+X	 if ((dataf= fopen(datafn, "r")) == NULL)
+X	 {
+X	    fprintf(stderr, "\007kd: can't find %s\n", datafn);
+X	    exit(1);
+X	 }
+X	 for (i= 0; i < keysinthisfile; i++)
+X	 {
+X	    while ((c= getc(dataf)) != ' ')
+X	       ;
+X	    do
+X	    {
+X	       putc(c, stdout);
+X	       c= getc(dataf);
+X	    } while (c != '\n');
+X	 }
+X	 putc('\n', stdout);
+X	 fclose(dataf);
+X      }
+X   }
+X   if (matches > ac)
+X   {
+X      fprintf(stderr, "\007kd: duplicate keys in %s\n", currentfn);
+X      exit(1);
+X   }
+X   fclose(keyf);
+X   return(foundcount);
+X}
+X
+X/*
+X   Query(integer, array of strings)
+X   Does the -q (terse) or -Q command.  Calls search() with the number of
+X   keys and the keys, and either summarizes its results or dumps the full
+X   contents of all the files that matched.
+X*/
+XQuery(ac, av)
+Xint ac;
+Xchar *av[];
+X{
+X   char matchfn[MAX_FN_LEN];
+X   FILE *dataf;
+X   int i;
+X   int found;
+X   matchstruct *traverse;
+X   char buf[1024];
+X   int charsread;
+X
+X   found= search(ac, av, 0);
+X   if (found == 0)
+X   {
+X      printf("No matches found\n");
+X      exit(0);
+X   }
+X   if (!printflag)
+X   {
+X      printf("%d %s found:\n", found,
+X	 (found == 1) ? "match" : "matches");
+X      for (traverse= basematch; traverse != NULL; traverse= traverse->next)
+X	 printf("   %s\n", traverse->fn);
+X   }
+X   else
+X   {
+X      for (traverse= basematch; traverse != NULL; traverse= traverse->next)
+X      {
+X	 printf("---------- %s ----------\n", traverse->fn);
+X	 sprintf(matchfn, "%s/%s", datadn, traverse->fn);
+X	 if ((dataf= fopen(matchfn, "r")) == NULL)
+X	    fprintf(stderr, "\007kd: can't find %s\n", matchfn);
+X	 else
+X	 {
+X	    while ((charsread= read(fileno(dataf), buf, 1024)) == 1024)
+X	       write(fileno(stdout), buf, 1024);
+X	    write(fileno(stdout), buf, charsread);
+X	 }
+X	 fclose(dataf);
+X      }
+X   }
+X}
+X
+X/*
+X   Index(integer, array of strings)
+X   Prints a synopsis of the key file, either the whole thing if no keys
+X   are specified, or reducing it by matching the specified keys.  The
+X   search() function does all the work for us.
+X*/
+XIndex(ac, av)
+Xint ac;
+Xchar *av[];
+X{
+X   int found;
+X
+X   found= search(ac, av, 1);
+X   if (found == 0)
+X   {
+X      printf("No matches found\n");
+X      exit(0);
+X   }
+X}
+X
+X/*
+X   Edit(integer, array of strings)
+X   Implements -e and -E.  Matches the keys against the key file.  If
+X   -e was specified and there is exactly one match, calls up vi on that
+X   file.  If -E was specified, calls up vi on each matching file in
+X   turn.  Each file edited has its name changed to correspond to the
+X   current date and time.  Notice the sleep(1) hack to prevent the
+X   not-particularly-nice possibility of two data files being created
+X   with the same name.  Rebuilds the key file when done.
+X*/
+XEdit(ac, av)
+Xint ac;
+Xchar *av[];
+X{
+X   int found;
+X   matchstruct *traverse;
+X
+X   found= search(ac, av, 0);
+X   if (found == 0)
+X   {
+X      printf("No matches found\n");
+X      exit(0);
+X   }
+X
+X   if ((found != 1) && (!editmanyflag))
+X   {
+X      fprintf(stderr, "\007kd: -e specified but %d matches\n", found);
+X      exit(1);
+X   }
+X
+X   for (traverse= basematch; traverse != NULL; traverse= traverse->next)
+X   {
+X      sprintf(cshcommand, "/usr/ucb/vi %s/%s", datadn, traverse->fn);
+X      system(cshcommand);
+X      sprintf(cshcommand, "/bin/mv %s/%s %s/%010d",
+X	 datadn, traverse->fn, datadn, time(0));
+X      system(cshcommand);
+X      sleep(1);
+X   }
+X
+X   Rebuild();
+X}
+X
+X/*
+X   Delete(integer, array of strings)
+X   Deletes all data files which match the specified keys.  Each deletion
+X   is confirmed before executing.  Rebuilds the key file when done.
+X   Note that, in event of an interrupt, the user's terminal will be left
+X   in cbreak mode.
+X*/
+XDelete(ac, av)
+Xint ac;
+Xchar *av[];
+X{
+X   int i;
+X   int found;
+X   char matchfn[MAX_FN_LEN];
+X   FILE *dataf;
+X   matchstruct *traverse;
+X   int charsread;
+X   char buf[1024];
+X   char c;
+X
+X   found= search(ac, av, 0);
+X   if (found == 0)
+X   {
+X      printf("No matches found\n");
+X      exit(0);
+X   }
+X   for (traverse= basematch; traverse != NULL; traverse= traverse->next)
+X   {
+X      printf("---------- %s ----------\n", traverse->fn);
+X      sprintf(matchfn, "%s/%s", datadn, traverse->fn);
+X      if ((dataf= fopen(matchfn, "r")) == NULL)
+X	 fprintf(stderr, "\007kd: can't find %s\n", matchfn);
+X      else
+X      {
+X	 while ((charsread= read(fileno(dataf), buf, 1024)) == 1024)
+X	    write(fileno(stdout), buf, 1024);
+X	 write(fileno(stdout), buf, charsread);
+X      }
+X      fclose(dataf);
+X      fprintf(stderr, "\nDo you really want to delete this <y/n>? ");
+X      savetty();
+X      ospeed= tty.sg_ospeed;
+X      cbreak();
+X      while (c= getc(stdin), (c != 'y') && (c != 'n'))
+X	 ;
+X      fixtty();
+X      fprintf(stderr, "\n");
+X      if (c == 'y')
+X      {
+X	 unlink(matchfn);
+X	 fprintf(stderr, "Deleted.\n");
+X      }
+X      else
+X	 fprintf(stderr, "Left alone.\n");
+X   }
+X   Rebuild();
+X}
+X
+X/*
+X   Help()
+X   Prints help information.
+X*/
+XHelp()
+X{
+X   fprintf(stderr, "kd -a key ... : add a new entry with optional keys\n");
+X   fprintf(stderr, "                '-f file' after -a for existing file\n");
+X   fprintf(stderr, "kd -x         : prints index of whole database\n");
+X   fprintf(stderr, "kd -x key ... : prints index of selected items\n");
+X   fprintf(stderr, "kd -q key ... : quick query of selected items\n");
+X   fprintf(stderr, "kd -Q key ... : full print of selected items\n");
+X   fprintf(stderr, "kd -e key ... : edit a single selected item\n");
+X   fprintf(stderr, "kd -E key ... : edit many selected items\n");
+X   fprintf(stderr, "kd -D key ... : deletes selected items (confirms) \n");
+X   fprintf(stderr, "kd -R         : rebuilds the key database\n");
+X   fprintf(stderr, "kd [-h]       : this message\n");
+X}
+SHAR_EOF
+
+

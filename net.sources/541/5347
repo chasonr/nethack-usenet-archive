@@ -1,0 +1,2317 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,d71a3038871d9829
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1987-01-15 19:13:25 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!watmath!clyde!rutgers!ames!ucbcad!ucbvax!decvax!tektronix!reed!omen!caf
+From: caf@omen.UUCP
+Newsgroups: net.sources
+Subject: Unix X/Y/ZMODEM programs w/32 bit CRC 2 of 2
+Message-ID: <457@omen.UUCP>
+Date: Thu, 15-Jan-87 22:13:25 EST
+Article-I.D.: omen.457
+Posted: Thu Jan 15 22:13:25 1987
+Date-Received: Sat, 17-Jan-87 15:51:55 EST
+References: <456@omen.UUCP>
+Reply-To: caf@.UUCP (PUT YOUR NAME HERE)
+Organization: Omen Technology, Portland
+Lines: 2296
+
+#	This is a shell archive.
+#	Remove everything above and including the cut line.
+#	Then run the rest of the file through sh.
+-----cut here-----cut here-----cut here-----cut here-----
+#!/bin/sh
+# shar:	Shell Archiver
+#	Run the following text with /bin/sh to create:
+#	rz.c
+#	rbsb.c
+#	rz.1
+#	sz.1
+#	gz
+# This archive created: Thu Jan 15 17:36:09 1987
+echo shar: extracting rz.c '(23972 characters)'
+cat << \SHAR_EOF > rz.c
+#define VERSION "1.14 01-15-87"
+#define PUBDIR "/usr/spool/uucppublic"
+
+/*% cc  -DNFGVMIN -DCRCTABLE -K -O -i % -o rz; size rz
+ *
+ * rz.c By Chuck Forsberg
+ *
+ *	cc -O rz.c -o rz		USG (3.0) Unix
+ * 	cc -O -DV7  rz.c -o rz		Unix V7, BSD 2.8 - 4.3
+ *
+ *	ln rz rb			For either system
+ *
+ *	ln rz /usr/bin/rzrmail		For remote mail.  Make this the
+ *					login shell. rzrmail then calls
+ *					rmail(1) to deliver mail.
+ *
+ *		define CRCTABLE to use table driven CRC
+ *
+ *  Unix is a trademark of Western Electric Company
+ *
+ * A program for Unix to receive files and commands from computers running
+ *  Professional-YAM, PowerCom, YAM, IMP, or programs supporting XMODEM.
+ *  rz uses Unix buffered input to reduce wasted CPU time.
+ *
+ * Iff the program is invoked by rzCOMMAND, output is piped to 
+ * "COMMAND filename"
+ *
+ *  Some systems (Venix, Coherent, Regulus) may not support tty raw mode
+ *  read(2) the same way as Unix. ONEREAD must be defined to force one
+ *  character reads for these systems. Added 7-01-84 CAF
+ *
+ *  Alarm signal handling changed to work with 4.2 BSD 7-15-84 CAF 
+ *
+ *  NFGVMIN Added 1-13-85 CAF for PC-AT Xenix systems where c_cc[VMIN]
+ *  doesn't seem to work (even though it compiles without error!).
+ *
+ *  HOWMANY should be tuned for best performance
+ *
+ *  USG UNIX (3.0) ioctl conventions courtesy  Jeff Martin
+ */
+#define LOGFILE "/tmp/rzlog"
+#define zperr vfile
+
+#include <stdio.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <ctype.h>
+FILE *popen();
+
+#define OK 0
+#define FALSE 0
+#define TRUE 1
+#define ERROR (-1)
+
+/*
+ * Max value for HOWMANY is 255.
+ *   A larger value reduces system overhead but may evoke kernel bugs.
+ *   133 corresponds to a XMODEM/CRC sector
+ */
+#ifndef HOWMANY
+#define HOWMANY 133
+#endif
+
+int Zmodem=0;		/* ZMODEM protocol requested */
+int Nozmodem = 0;	/* If invoked as "rb" */
+unsigned Baudrate;
+#include "rbsb.c"	/* most of the system dependent stuff here */
+
+char *substr();
+FILE *fout;
+
+/*
+ * Routine to calculate the free bytes on the current file system
+ *  ~0 means many free bytes (unknown)
+ */
+long getfree()
+{
+	return(~0L);	/* many free bytes ... */
+}
+
+/* Ward Christensen / CP/M parameters - Don't change these! */
+#define ENQ 005
+#define CAN ('X'&037)
+#define XOFF ('s'&037)
+#define XON ('q'&037)
+#define SOH 1
+#define STX 2
+#define EOT 4
+#define ACK 6
+#define NAK 025
+#define CPMEOF 032
+#define WANTCRC 0103	/* send C not NAK to get crc not checksum */
+#define TIMEOUT (-2)
+#define RCDO (-3)
+#define ERRORMAX 5
+#define RETRYMAX 5
+#define WCEOT (-10)
+#define SECSIZ 128	/* cp/m's Magic Number record size */
+#define PATHLEN 257	/* ready for 4.2 bsd ? */
+#define KSIZE 1024	/* record size with k option */
+#define UNIXFILE 0x8000	/* happens to the the S_IFREG file mask bit for stat */
+
+int Lastrx;
+int Crcflg;
+int Firstsec;
+int Eofseen;		/* indicates cpm eof (^Z) has been received */
+int errors;
+int Restricted=0;	/* restricted; no /.. or ../ in filenames */
+#ifdef ONEREAD
+/* Sorry, Regulus and some others don't work right in raw mode! */
+int Readnum = 1;	/* Number of bytes to ask for in read() from modem */
+#else
+int Readnum = HOWMANY;	/* Number of bytes to ask for in read() from modem */
+#endif
+
+#define DEFBYTL 2000000000L	/* default rx file size */
+long Bytesleft;		/* number of bytes of incoming file left */
+long Modtime;		/* Unix style mod time for incoming file */
+short Filemode;		/* Unix style mode for incoming file */
+char Pathname[PATHLEN];
+char *Progname;		/* the name by which we were called */
+
+int Batch=0;
+int Wcsmask=0377;
+int Topipe=0;
+int MakeLCPathname=TRUE;	/* make received pathname lower case */
+int Verbose=0;
+int Quiet=0;		/* overrides logic that would otherwise set verbose */
+int Nflag = 0;		/* Don't really transfer files */
+int Rxbinary=FALSE;	/* receive all files in bin mode */
+int Rxascii=FALSE;	/* receive files in ascii (translate) mode */
+int Thisbinary;		/* current file is to be received in bin mode */
+int Blklen;		/* record length of received packets */
+char secbuf[KSIZE];
+char linbuf[HOWMANY];
+int Lleft=0;		/* number of characters in linbuf */
+time_t timep[2];
+char Lzmanag;		/* Local file management request */
+char zconv;		/* ZMODEM file conversion request */
+char zmanag;		/* ZMODEM file management request */
+char ztrans;		/* ZMODEM file transport request */
+
+jmp_buf tohere;		/* For the interrupt on RX timeout */
+
+#include "zm.c"
+
+int tryzhdrtype=ZRINIT;	/* Header type to send corresponding to Last rx close */
+
+alrm()
+{
+	longjmp(tohere, -1);
+}
+
+/* called by signal interrupt or terminate to clean things up */
+bibi(n)
+{
+	if (Zmodem)
+		zmputs(Attn);
+	canit(); mode(0);
+	fprintf(stderr, "rz: caught signal %d; exiting", n);
+	exit(128+n);
+}
+
+main(argc, argv)
+char *argv[];
+{
+	register char *cp;
+	register npats;
+	char *virgin, **patts;
+	char *getenv();
+	int exitcode;
+
+	Rxtimeout = 100;
+	setbuf(stderr, NULL);
+	if ((cp=getenv("SHELL")) && (substr(cp, "rsh") || substr(cp, "rksh")))
+		Restricted=TRUE;
+
+	chkinvok(virgin=argv[0]);	/* if called as [-]rzCOMMAND set flag */
+	npats = 0;
+	while (--argc) {
+		cp = *++argv;
+		if (*cp == '-') {
+			while( *++cp) {
+				switch(*cp) {
+				case '+':
+					Lzmanag = ZMAPND; break;
+				case '1':
+					iofd = 1; break;
+				case '7':
+					Wcsmask = 0177;
+				case 'a':
+					Rxascii=TRUE;  break;
+				case 'b':
+					Rxbinary=TRUE; break;
+				case 'c':
+					Crcflg=TRUE; break;
+				case 'D':
+					Nflag = TRUE; break;
+				case 'p':
+					Lzmanag = ZMPROT;  break;
+				case 'q':
+					Quiet=TRUE; Verbose=0; break;
+				case 't':
+					if (--argc < 1) {
+						usage();
+					}
+					Rxtimeout = atoi(*++argv);
+					if (Rxtimeout<10 || Rxtimeout>1000)
+						usage();
+					break;
+				case 'u':
+					MakeLCPathname=FALSE; break;
+				case 'v':
+					++Verbose; break;
+				default:
+					usage();
+				}
+			}
+		}
+		else if ( !npats && argc>0) {
+			if (argv[0][0]) {
+				npats=argc;
+				patts=argv;
+			}
+		}
+	}
+	if (npats > 1)
+		usage();
+	if (Verbose) {
+		if (freopen(LOGFILE, "a", stderr)==NULL) {
+			printf("Can't open log file %s\n",LOGFILE);
+			exit(0200);
+		}
+		setbuf(stderr, NULL);
+		fprintf(stderr, "argv[0]=%s Progname=%s\n", virgin, Progname);
+	}
+	if (fromcu() && !Quiet) {
+		if (Verbose == 0)
+			Verbose = 2;
+	}
+	mode(1);
+	if (signal(SIGINT, bibi) == SIG_IGN) {
+		signal(SIGINT, SIG_IGN); signal(SIGKILL, SIG_IGN);
+	}
+	else {
+		signal(SIGINT, bibi); signal(SIGKILL, bibi);
+	}
+	if (wcreceive(npats, patts)==ERROR) {
+		exitcode=0200;
+		canit();
+	}
+	mode(0);
+	if (exitcode && !Zmodem)	/* bellow again with all thy might. */
+		canit();
+	exit(exitcode);
+}
+
+
+usage()
+{
+	fprintf(stderr,"%s %s for %s by Chuck Forsberg\n",
+	  Progname, VERSION, OS);
+	fprintf(stderr,"Usage:	rz [-1abuv]		(ZMODEM Batch)\n");
+	fprintf(stderr,"or	rb [-1abuv]		(YMODEM Batch)\n");
+	fprintf(stderr,"or	rz [-1abcv] file	(XMODEM or XMODEM-1k)\n");
+	fprintf(stderr,"	  -1 For cu(1): Use fd 1 for input\n");
+	fprintf(stderr,"	  -a ASCII transfer (strip CR)\n");
+	fprintf(stderr,"	  -b Binary transfer for all files\n");
+	fprintf(stderr,"	  -v Verbose more v's give more info\n");
+	fprintf(stderr,"	  -c Use 16 bit CRC	(XMODEM)\n");
+	exit(1);
+}
+/*
+ *  Debugging information output interface routine
+ */
+/* VARARGS1 */
+vfile(f, a, b, c)
+register char *f;
+{
+	if (Verbose > 1) {
+		fprintf(stderr, f, a, b, c);
+		fprintf(stderr, "\n");
+	}
+}
+
+/*
+ * Let's receive something already.
+ */
+
+char *rbmsg =
+"%s ready. To begin transfer, type \"%s file ...\" to your modem program\r\n";
+
+wcreceive(argc, argp)
+char **argp;
+{
+	register c;
+
+	if (Batch || argc==0) {
+		Crcflg=(Wcsmask==0377);
+		if ( !Quiet)
+			fprintf(stderr, rbmsg, Progname, Nozmodem?"sb":"sz");
+		if (c=tryz()) {
+			if (c == ZCOMPL)
+				return OK;
+			if (c == ERROR)
+				goto fubar;
+			c = rzfiles();
+			if (c)
+				goto fubar;
+		} else {
+			for (;;) {
+				if (wcrxpn(secbuf)== ERROR)
+					goto fubar;
+				if (secbuf[0]==0)
+					return OK;
+				if (procheader(secbuf) == ERROR)
+					goto fubar;
+				if (wcrx()==ERROR)
+					goto fubar;
+			}
+		}
+	} else {
+		Bytesleft = DEFBYTL; Filemode = 0; Modtime = 0L;
+
+		strcpy(Pathname, *argp);
+		checkpath(Pathname);
+		fprintf(stderr, "\nrz: ready to receive %s\r\n", Pathname);
+		if ((fout=fopen(Pathname, "w")) == NULL)
+			return ERROR;
+		if (wcrx()==ERROR)
+			goto fubar;
+	}
+	return OK;
+fubar:
+	canit();
+	if (Topipe && fout) {
+		pclose(fout);  return ERROR;
+	}
+	if (fout)
+		fclose(fout);
+	if (Restricted) {
+		unlink(Pathname);
+		fprintf(stderr, "\r\nrz: %s removed.\r\n", Pathname);
+	}
+	return ERROR;
+}
+
+
+/*
+ * Fetch a pathname from the other end as a C ctyle ASCIZ string.
+ * Length is indeterminate as long as less than Blklen
+ * A null string represents no more files (YMODEM)
+ */
+wcrxpn(rpn)
+char *rpn;	/* receive a pathname */
+{
+	register c;
+
+#ifdef NFGVMIN
+	readline(1);
+#else
+	purgeline();
+#endif
+
+et_tu:
+	Firstsec=TRUE;  Eofseen=FALSE;
+	sendline(Crcflg?WANTCRC:NAK);
+	Lleft=0;	/* Do read next time ... */
+	while ((c = wcgetsec(rpn, 100)) != 0) {
+		log( "Pathname fetch returned %d\n", c);
+		if (c == WCEOT) {
+			sendline(ACK);
+			Lleft=0;	/* Do read next time ... */
+			readline(1);
+			goto et_tu;
+		}
+		return ERROR;
+	}
+	sendline(ACK);
+	return OK;
+}
+
+/*
+ * Adapted from CMODEM13.C, written by
+ * Jack M. Wierda and Roderick W. Hart
+ */
+
+wcrx()
+{
+	register int sectnum, sectcurr;
+	register char sendchar;
+	register char *p;
+	int cblklen;			/* bytes to dump this block */
+
+	Firstsec=TRUE;sectnum=0; Eofseen=FALSE;
+	sendchar=Crcflg?WANTCRC:NAK;
+
+	for (;;) {
+		sendline(sendchar);	/* send it now, we're ready! */
+		Lleft=0;	/* Do read next time ... */
+		sectcurr=wcgetsec(secbuf, (sectnum&0177)?50:130);
+		report(sectcurr);
+		if (sectcurr==(sectnum+1 &Wcsmask)) {
+			sectnum++;
+			cblklen = Bytesleft>Blklen ? Blklen:Bytesleft;
+			if (putsec(secbuf, cblklen)==ERROR)
+				return ERROR;
+			if ((Bytesleft-=cblklen) < 0)
+				Bytesleft = 0;
+			sendchar=ACK;
+		}
+		else if (sectcurr==(sectnum&Wcsmask)) {
+			log( "Received dup Sector\n");
+			sendchar=ACK;
+		}
+		else if (sectcurr==WCEOT) {
+			if (closeit())
+				return ERROR;
+			sendline(ACK);
+			Lleft=0;	/* Do read next time ... */
+			return OK;
+		}
+		else if (sectcurr==ERROR)
+			return ERROR;
+		else {
+			log( "Sync Error\n");
+			return ERROR;
+		}
+	}
+}
+
+/*
+ * Wcgetsec fetches a Ward Christensen type sector.
+ * Returns sector number encountered or ERROR if valid sector not received,
+ * or CAN CAN received
+ * or WCEOT if eot sector
+ * time is timeout for first char, set to 4 seconds thereafter
+ ***************** NO ACK IS SENT IF SECTOR IS RECEIVED OK **************
+ *    (Caller must do that when he is good and ready to get next sector)
+ */
+
+wcgetsec(rxbuf, maxtime)
+char *rxbuf;
+int maxtime;
+{
+	register checksum, wcj, firstch;
+	register unsigned short oldcrc;
+	register char *p;
+	int sectcurr;
+
+	for (Lastrx=errors=0; errors<RETRYMAX; errors++) {
+
+		if ((firstch=readline(maxtime))==STX) {
+			Blklen=KSIZE; goto get2;
+		}
+		if (firstch==SOH) {
+			Blklen=SECSIZ;
+get2:
+			sectcurr=readline(1);
+			if ((sectcurr+(oldcrc=readline(1)))==Wcsmask) {
+				oldcrc=checksum=0;
+				for (p=rxbuf,wcj=Blklen; --wcj>=0; ) {
+					if ((firstch=readline(1)) < 0)
+						goto bilge;
+					oldcrc=updcrc(firstch, oldcrc);
+					checksum += (*p++ = firstch);
+				}
+				if ((firstch=readline(1)) < 0)
+					goto bilge;
+				if (Crcflg) {
+					oldcrc=updcrc(firstch, oldcrc);
+					if ((firstch=readline(1)) < 0)
+						goto bilge;
+					oldcrc=updcrc(firstch, oldcrc);
+					if (oldcrc & 0xFFFF)
+						log("CRC=0%o\n", oldcrc);
+					else {
+						Firstsec=FALSE;
+						return sectcurr;
+					}
+				}
+				else if (((checksum-firstch)&Wcsmask)==0) {
+					Firstsec=FALSE;
+					return sectcurr;
+				}
+				else
+					log( "Checksum Error\n");
+			}
+			else
+				log("Sector number garbled 0%o 0%o\n",
+				 sectcurr, oldcrc);
+		}
+		/* make sure eot really is eot and not just mixmash */
+#ifdef NFGVMIN
+		else if (firstch==EOT && readline(1)==TIMEOUT)
+			return WCEOT;
+#else
+		else if (firstch==EOT && Lleft==0)
+			return WCEOT;
+#endif
+		else if (firstch==CAN) {
+			if (Lastrx==CAN) {
+				log( "Sender CANcelled\n");
+				return ERROR;
+			} else {
+				Lastrx=CAN;
+				continue;
+			}
+		}
+		else if (firstch==TIMEOUT) {
+			if (Firstsec)
+				goto humbug;
+bilge:
+			log( "Timeout\n");
+		}
+		else
+			log( "Got 0%o sector header\n", firstch);
+
+humbug:
+		Lastrx=0;
+		while(readline(1)!=TIMEOUT)
+			;
+		if (Firstsec) {
+			sendline(Crcflg?WANTCRC:NAK);
+			Lleft=0;	/* Do read next time ... */
+		} else {
+			maxtime=40; sendline(NAK);
+			Lleft=0;	/* Do read next time ... */
+		}
+	}
+	/* try to stop the bubble machine. */
+	canit();
+	return ERROR;
+}
+
+/*
+ * This version of readline is reasoably well suited for
+ * reading many characters.
+ *  (except, currently, for the Regulus version!)
+ *
+ * timeout is in tenths of seconds
+ */
+readline(timeout)
+int timeout;
+{
+	register n;
+	static char *cdq;	/* pointer for removing chars from linbuf */
+
+	if (--Lleft >= 0) {
+		if (Verbose > 8) {
+			fprintf(stderr, "%02x ", *cdq&0377);
+		}
+		return (*cdq++ & Wcsmask);
+	}
+	n = timeout/10;
+	if (n < 2)
+		n = 3;
+	if (Verbose > 3)
+		fprintf(stderr, "Calling read: n=%d ", n);
+	if (setjmp(tohere)) {
+#ifdef TIOCFLUSH
+/*		ioctl(iofd, TIOCFLUSH, 0); */
+#endif
+		Lleft = 0;
+		if (Verbose>1)
+			fprintf(stderr, "Readline:TIMEOUT\n");
+		return TIMEOUT;
+	}
+	signal(SIGALRM, alrm); alarm(n);
+	Lleft=read(iofd, cdq=linbuf, Readnum);
+	alarm(0);
+	if (Verbose > 3) {
+		fprintf(stderr, "Read returned %d bytes\n", Lleft);
+	}
+	if (Lleft < 1)
+		return TIMEOUT;
+	--Lleft;
+	if (Verbose > 8) {
+		fprintf(stderr, "%02x ", *cdq&0377);
+	}
+	return (*cdq++ & Wcsmask);
+}
+
+
+
+/*
+ * Purge the modem input queue of all characters
+ */
+purgeline()
+{
+	Lleft = 0;
+#ifdef USG
+	ioctl(iofd, TCFLSH, 0);
+#else
+	lseek(iofd, 0L, 2);
+#endif
+}
+
+
+/*
+ * Process incoming file information header
+ */
+procheader(name)
+char *name;
+{
+	register char *openmode, *p, **pp;
+
+	/* set default parameters and overrides */
+	openmode = "w";
+	Thisbinary = Rxbinary || !Rxascii;
+	if (Lzmanag)
+		zmanag = Lzmanag;
+
+	/*
+	 *  Process ZMODEM remote file management requests
+	 */
+	if (!Rxbinary && zconv == ZCNL)	/* Remote ASCII override */
+		Thisbinary = 0;
+	if (zconv == ZCBIN)	/* Remote Binary override */
+		++Thisbinary;
+	else if (zmanag == ZMAPND)
+		openmode = "a";
+	/* ZMPROT check for existing file */
+	if (zmanag == ZMPROT && (fout=fopen(name, "r"))) {
+		fclose(fout);  return ERROR;
+	}
+
+	Bytesleft = DEFBYTL; Filemode = 0; Modtime = 0L;
+
+	p = name + 1 + strlen(name);
+	if (*p) {	/* file coming from Unix or DOS system */
+		sscanf(p, "%ld%lo%o", &Bytesleft, &Modtime, &Filemode);
+		if (Filemode & UNIXFILE)
+			++Thisbinary;
+		if (Verbose) {
+			fprintf(stderr,  "Incoming: %s %ld %lo %o\n",
+			  name, Bytesleft, Modtime, Filemode);
+		}
+	}
+	else {		/* File coming from CP/M system */
+		for (p=name; *p; ++p)		/* change / to _ */
+			if ( *p == '/')
+				*p = '_';
+
+		if ( *--p == '.')		/* zap trailing period */
+			*p = 0;
+	}
+
+	if (!Zmodem && MakeLCPathname && !IsAnyLower(name))
+		uncaps(name);
+	if (Topipe) {
+		sprintf(Pathname, "%s %s", Progname+2, name);
+		if (Verbose)
+			fprintf(stderr,  "Topipe: %s %s\n",
+			  Pathname, Thisbinary?"BIN":"ASCII");
+		if ((fout=popen(Pathname, "w")) == NULL)
+			return ERROR;
+	} else {
+		strcpy(Pathname, name);
+		if (Verbose) {
+			fprintf(stderr,  "Receiving %s %s %s\n",
+			  name, Thisbinary?"BIN":"ASCII", openmode);
+		}
+		checkpath(name);
+		if (Nflag)
+			name = "/dev/null";
+		if ((fout=fopen(name, openmode)) == NULL)
+			return ERROR;
+	}
+	return OK;
+}
+
+/*
+ * Putsec writes the n characters of buf to receive file fout.
+ *  If not in binary mode, carriage returns, and all characters
+ *  starting with CPMEOF are discarded.
+ */
+putsec(buf, n)
+char *buf;
+register n;
+{
+	register char *p;
+
+	if (Thisbinary) {
+		for (p=buf; --n>=0; )
+			putc( *p++, fout);
+	}
+	else {
+		if (Eofseen)
+			return OK;
+		for (p=buf; --n>=0; ++p ) {
+			if ( *p == '\r')
+				continue;
+			if (*p == CPMEOF) {
+				Eofseen=TRUE; return OK;
+			}
+			putc(*p ,fout);
+		}
+	}
+	return OK;
+}
+
+/*
+ *  Send a character to modem.  Small is beautiful.
+ */
+sendline(c)
+{
+	char d;
+
+	d = c;
+	if (Verbose>4)
+		fprintf(stderr, "Sendline: %x\n", c);
+	write(1, &d, 1);
+}
+
+xsendline(c)
+{
+	sendline(c);
+}
+
+flushmo() {}
+
+
+
+
+/* make string s lower case */
+uncaps(s)
+register char *s;
+{
+	for ( ; *s; ++s)
+		if (isupper(*s))
+			*s = tolower(*s);
+}
+/*
+ * IsAnyLower returns TRUE if string s has lower case letters.
+ */
+IsAnyLower(s)
+register char *s;
+{
+	for ( ; *s; ++s)
+		if (islower(*s))
+			return TRUE;
+	return FALSE;
+}
+
+/*
+ * substr(string, token) searches for token in string s
+ * returns pointer to token within string if found, NULL otherwise
+ */
+char *
+substr(s, t)
+register char *s,*t;
+{
+	register char *ss,*tt;
+	/* search for first char of token */
+	for (ss=s; *s; s++)
+		if (*s == *t)
+			/* compare token with substring */
+			for (ss=s,tt=t; ;) {
+				if (*tt == 0)
+					return s;
+				if (*ss++ != *tt++)
+					break;
+			}
+	return NULL;
+}
+
+/*
+ * Log an error
+ */
+/*VARARGS1*/
+log(s,p,u)
+char *s, *p, *u;
+{
+	if (!Verbose)
+		return;
+	fprintf(stderr, "error %d: ", errors);
+	fprintf(stderr, s, p, u);
+}
+
+/* send cancel string to get the other end to shut up */
+canit()
+{
+	static char canistr[] = {
+	 24,24,24,24,24,24,24,24,24,24,8,8,8,8,8,8,8,8,8,8,0
+	};
+
+	printf(canistr);
+	Lleft=0;	/* Do read next time ... */
+	fflush(stdout);
+}
+
+
+/*
+ * Return 1 iff stdout and stderr are different devices
+ *  indicating this program operating with a modem on a
+ *  different line
+ */
+fromcu()
+{
+	struct stat a, b;
+	fstat(1, &a); fstat(2, &b);
+	return (a.st_rdev != b.st_rdev);
+}
+
+report(sct)
+int sct;
+{
+	if (Verbose>1)
+		fprintf(stderr,"%03d%c",sct,sct%10? ' ' : '\r');
+}
+
+/*
+ * If called as [-][dir/../]vrzCOMMAND set Verbose to 1
+ * If called as [-][dir/../]rzCOMMAND set the pipe flag
+ * If called as rb use YMODEM protocol
+ */
+chkinvok(s)
+char *s;
+{
+	register char *p;
+
+	p = s;
+	while (*p == '-')
+		s = ++p;
+	while (*p)
+		if (*p++ == '/')
+			s = p;
+	if (*s == 'v') {
+		Verbose=1; ++s;
+	}
+	Progname = s;
+	if (s[0]=='r' && s[1]=='b')
+		Nozmodem = TRUE;
+	if (s[2] && s[0]=='r' && s[1]=='b')
+		Topipe=TRUE;
+	if (s[2] && s[0]=='r' && s[1]=='z')
+		Topipe=TRUE;
+}
+
+/*
+ * Totalitarian Communist pathname processing
+ */
+checkpath(name)
+char *name;
+{
+	if (Restricted) {
+		if (fopen(name, "r") != NULL) {
+			canit();
+			fprintf(stderr, "\r\nrz: %s exists\n", name);
+			bibi();
+		}
+		/* restrict pathnames to current tree or uucppublic */
+		if ( substr(name, "../")
+		 || (name[0]== '/' && strncmp(name, PUBDIR, strlen(PUBDIR))) ) {
+			canit();
+			fprintf(stderr,"\r\nrz:\tSecurity Violation\r\n");
+			bibi();
+		}
+	}
+}
+
+/*
+ * Initialize for Zmodem receive attempt, try to activate Zmodem sender
+ *  Handles ZSINIT frame
+ *  Return ZFILE if Zmodem filename received, -1 on error,
+ *   ZCOMPL if transaction finished,  else 0
+ */
+tryz()
+{
+	register c, n;
+	register cmdzack1flg;
+
+	if (Nozmodem)		/* Check for "rb" program name */
+		return 0;
+
+
+	for (n=Zmodem?10:5; --n>=0; ) {
+		/* Set buffer length (0) and capability flags */
+		stohdr(0L);
+#ifdef CANBREAK
+		Txhdr[ZF0] = CANFC32|CANFDX|CANOVIO|CANBRK;
+#else
+		Txhdr[ZF0] = CANFC32|CANFDX|CANOVIO;
+#endif
+		zshhdr(tryzhdrtype, Txhdr);
+again:
+		switch (zgethdr(Rxhdr, 0)) {
+		case ZRQINIT:
+			continue;
+		case ZEOF:
+			continue;
+		case TIMEOUT:
+			continue;
+		case ZFILE:
+			zconv = Rxhdr[ZF0];
+			zmanag = Rxhdr[ZF1];
+			ztrans = Rxhdr[ZF2];
+			tryzhdrtype = ZRINIT;
+			if (zrdata(secbuf, KSIZE) == GOTCRCW)
+				return ZFILE;
+			zshhdr(ZNAK, Txhdr);
+			goto again;
+		case ZSINIT:
+			if (zrdata(Attn, ZATTNLEN) == GOTCRCW) {
+				zshhdr(ZACK, Txhdr);
+				goto again;
+			}
+			zshhdr(ZNAK, Txhdr);
+			goto again;
+		case ZFREECNT:
+			stohdr(getfree());
+			zshhdr(ZACK, Txhdr);
+			goto again;
+		case ZCOMMAND:
+			cmdzack1flg = Rxhdr[ZF0];
+			if (zrdata(secbuf, KSIZE) == GOTCRCW) {
+				if (cmdzack1flg & ZCACK1)
+					stohdr(0L);
+				else
+					stohdr((long)sys2(secbuf));
+				purgeline();	/* dump impatient questions */
+				do {
+					zshhdr(ZCOMPL, Txhdr);
+				}
+				while (++errors<10 && zgethdr(Rxhdr,1) != ZFIN);
+				ackbibi();
+				if (cmdzack1flg & ZCACK1)
+					exec2(secbuf);
+				return ZCOMPL;
+			}
+			zshhdr(ZNAK, Txhdr); goto again;
+		case ZCOMPL:
+			goto again;
+		default:
+			continue;
+		case ZFIN:
+			ackbibi(); return ZCOMPL;
+		case ZCAN:
+			return ERROR;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Receive 1 or more files with ZMODEM protocol
+ */
+rzfiles()
+{
+	register c;
+
+	for (;;) {
+		switch (c = rzfile()) {
+		case ZEOF:
+		case ZSKIP:
+			switch (tryz()) {
+			case ZCOMPL:
+				return OK;
+			default:
+				return ERROR;
+			case ZFILE:
+				break;
+			}
+			continue;
+		default:
+			return c;
+		case ERROR:
+			return ERROR;
+		}
+	}
+}
+
+/*
+ * Receive a file with ZMODEM protocol
+ *  Assumes file name frame is in secbuf
+ */
+rzfile()
+{
+	register c, n;
+	long rxbytes;
+
+	Eofseen=FALSE;
+	if (procheader(secbuf) == ERROR) {
+		return (tryzhdrtype = ZSKIP);
+	}
+
+	n = 10; rxbytes = 0l;
+
+	for (;;) {
+		stohdr(rxbytes);
+		zshhdr(ZRPOS, Txhdr);
+nxthdr:
+		switch (c = zgethdr(Rxhdr, 0)) {
+		default:
+			vfile("rzfile: zgethdr returned %d", c);
+			return ERROR;
+		case ZNAK:
+		case TIMEOUT:
+			if ( --n < 0) {
+				vfile("rzfile: zgethdr returned %d", c);
+				return ERROR;
+			}
+		case ZFILE:
+			zrdata(secbuf, KSIZE);
+			continue;
+		case ZEOF:
+			if (rclhdr(Rxhdr) != rxbytes) {
+				continue;
+			}
+			if (closeit()) {
+				tryzhdrtype = ZFERR;
+				vfile("rzfile: closeit returned <> 0");
+				return ERROR;
+			}
+			vfile("rzfile: normal EOF");
+			return c;
+		case ERROR:	/* Too much garbage in header search error */
+			if ( --n < 0) {
+				vfile("rzfile: zgethdr returned %d", c);
+				return ERROR;
+			}
+			zmputs(Attn);
+			continue;
+		case ZDATA:
+			if (rclhdr(Rxhdr) != rxbytes) {
+				if ( --n < 0) {
+					return ERROR;
+				}
+				zmputs(Attn);  continue;
+			}
+moredata:
+			switch (c = zrdata(secbuf, KSIZE)) {
+			case ZCAN:
+				vfile("rzfile: zgethdr returned %d", c);
+				return ERROR;
+			case ERROR:	/* CRC error */
+				if ( --n < 0) {
+					vfile("rzfile: zgethdr returned %d", c);
+					return ERROR;
+				}
+				zmputs(Attn);
+				continue;
+			case TIMEOUT:
+				if ( --n < 0) {
+					vfile("rzfile: zgethdr returned %d", c);
+					return ERROR;
+				}
+				continue;
+			case GOTCRCW:
+				n = 10;
+				putsec(secbuf, Rxcount);
+				rxbytes += Rxcount;
+				stohdr(rxbytes);
+				zshhdr(ZACK, Txhdr);
+				goto nxthdr;
+			case GOTCRCQ:
+				n = 10;
+				putsec(secbuf, Rxcount);
+				rxbytes += Rxcount;
+				stohdr(rxbytes);
+				zshhdr(ZACK, Txhdr);
+				goto moredata;
+			case GOTCRCG:
+				n = 10;
+				putsec(secbuf, Rxcount);
+				rxbytes += Rxcount;
+				goto moredata;
+			case GOTCRCE:
+				n = 10;
+				putsec(secbuf, Rxcount);
+				rxbytes += Rxcount;
+				goto nxthdr;
+			}
+		}
+	}
+}
+
+/*
+ * Send a string to the modem, processing for \336 (sleep 1 sec)
+ *   and \335 (break signal)
+ */
+zmputs(s)
+char *s;
+{
+	register c;
+
+	while (*s) {
+		switch (c = *s++) {
+		case '\336':
+			sleep(1); continue;
+		case '\335':
+			sendbrk(); continue;
+		default:
+			sendline(c);
+		}
+	}
+}
+
+/*
+ * Close the receive dataset, return OK or ERROR
+ */
+closeit()
+{
+	if (Topipe) {
+		if (pclose(fout)) {
+			return ERROR;
+		}
+		return OK;
+	}
+	if (fclose(fout)==ERROR) {
+		fprintf(stderr, "file close ERROR\n");
+		return ERROR;
+	}
+	if (Modtime) {
+		timep[0] = time(NULL);
+		timep[1] = Modtime;
+		utime(Pathname, timep);
+	}
+	if (Filemode)
+		chmod(Pathname, (07777 & Filemode));
+	return OK;
+}
+
+/*
+ * Ack a ZFIN packet, let byegones be byegones
+ */
+ackbibi()
+{
+	register n;
+
+	vfile("ackbibi:");
+	Readnum = 1;
+	stohdr(0L);
+	for (n=4; --n>=0; ) {
+		zshhdr(ZFIN, Txhdr);
+		for (;;) {
+			switch (readline(100)) {
+			case 'O':
+				readline(1);	/* Discard 2nd 'O' */
+				/* ***** FALL THRU TO ***** */
+			case TIMEOUT:
+				vfile("ackbibi complete");
+				return;
+			default:
+				break;
+			}
+		}
+	}
+}
+
+/*
+ * Local console output simulation
+ */
+bttyout(c)
+{
+	if (Verbose || fromcu())
+		putc(c, stderr);
+}
+
+/*
+ * Strip leading ! if present, do shell escape. 
+ */
+sys2(s)
+register char *s;
+{
+	if (*s == '!')
+		++s;
+	return system(s);
+}
+/*
+ * Strip leading ! if present, do exec.
+ */
+exec2(s)
+register char *s;
+{
+	if (*s == '!')
+		++s;
+	mode(0);
+	execl("/bin/sh", "sh", "-c", s);
+}
+
+SHAR_EOF
+echo shar: extracting rbsb.c '(14112 characters)'
+cat << \SHAR_EOF > rbsb.c
+/*% shar -v zmodem.h zm.c sz.c>/tmp/rzsz1.sh;shar -v rz.c rbsb.c rz.1 sz.1 gz>/tmp/rzsz2.sh; shar -v zmodem.h zm.c sz.c rz.c rbsb.c rz.1 sz.1 gz>/tmp/rzsz1et2.sh
+ *
+ * -rev 01-01-87
+ *  This file contains Unix specific stuff for setting terminal modes,
+ *  very little is specific to ZMODEM or YMODEM per se (that stuff is in
+ *  sz.c and rz.c).  The CRC-16 routines used by XMODEM, YMODEM, and ZMODEM
+ *  are also in this file, an iterative version, and a fast table driven macro
+ *  version, selected by #define CRCTABLE
+ *
+ *   This file is #included so the main file can set parameters such as HOWMANY.
+ *   See the main files (rz.c/sz.c) for compile instructions.
+ */
+
+#ifdef V7
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sgtty.h>
+#define OS "V7/BSD"
+#endif
+
+#ifndef OS
+#ifndef USG
+#define USG
+#endif
+#endif
+
+#ifdef USG
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <termio.h>
+#include <sys/ioctl.h>
+#define OS "SYS III/V"
+#endif
+
+#if HOWMANY  > 255
+Howmany must be 255 or less
+#endif
+
+struct {
+	unsigned baudr;
+	int speedcode;
+} speeds[] = {
+	110,	B110,
+	300,	B300,
+	600,	B600,
+	1200,	B1200,
+	2400,	B2400,
+	4800,	B4800,
+	9600,	B9600,
+	19200,	EXTA,
+	9600,	EXTB,
+	0,
+};
+
+int Twostop;		/* Use two stop bits */
+
+static unsigned
+getspeed(code)
+{
+	register n;
+
+	for (n=0; speeds[n].baudr; ++n)
+		if (speeds[n].speedcode == code)
+			return speeds[n].baudr;
+	return 0;
+}
+
+
+
+#ifdef ICANON
+struct termio oldtty, tty;
+#else
+struct sgttyb oldtty, tty;
+struct tchars oldtch, tch;
+#endif
+
+int iofd = 0;		/* File descriptor for ioctls & reads */
+
+/*
+ * mode(n)
+ *  2: set a cbreak, XON/XOFF control mode if using Pro-YAM's -g option
+ *  1: save old tty stat, set raw mode 
+ *  0: restore original tty mode
+ */
+mode(n)
+{
+	static did0 = FALSE;
+
+	vfile("mode:%d", n);
+	switch(n) {
+#ifdef USG
+	case 2:	/* Cbreak mode used by sb when -g detected */
+		if(!did0)
+			(void) ioctl(iofd, TCGETA, &oldtty);
+		tty = oldtty;
+
+		tty.c_iflag = BRKINT|IXON;
+
+		tty.c_oflag = 0;	/* Transparent output */
+
+		tty.c_cflag &= ~PARENB;	/* Disable parity */
+		tty.c_cflag |= CS8;	/* Set character size = 8 */
+		if (Twostop)
+			tty.c_cflag |= CSTOPB;	/* Set two stop bits */
+
+#ifdef XCLUDE
+		tty.c_lflag = XCLUDE | ISIG;
+#else
+		tty.c_lflag = ISIG;
+#endif
+
+		tty.c_cc[VINTR] = Zmodem ? 03:030;	/* Interrupt char */
+		tty.c_cc[VMIN] = 1;
+
+		(void) ioctl(iofd, TCSETAW, &tty);
+		did0 = TRUE;
+		return OK;
+	case 1:
+		if(!did0)
+			(void) ioctl(iofd, TCGETA, &oldtty);
+		tty = oldtty;
+
+		tty.c_iflag = IGNBRK;
+
+		 /* No echo, crlf mapping, INTR, QUIT, delays, no erase/kill */
+		tty.c_lflag &= ~(ECHO | ICANON | ISIG);
+#ifdef XCLUDE
+		tty.c_lflag |= XCLUDE;
+#endif
+
+		tty.c_oflag = 0;	/* Transparent output */
+
+		tty.c_cflag &= ~PARENB;	/* Same baud rate, disable parity */
+		tty.c_cflag |= CS8;	/* Set character size = 8 */
+		if (Twostop)
+			tty.c_cflag |= CSTOPB;	/* Set two stop bits */
+		tty.c_cc[VMIN] = HOWMANY; /* This many chars satisfies reads */
+		tty.c_cc[VTIME] = 1;	/* or in this many tenths of seconds */
+		(void) ioctl(iofd, TCSETAW, &tty);
+		did0 = TRUE;
+		Baudrate = getspeed(tty.c_cflag & CBAUD);
+		return OK;
+#endif
+#ifdef V7
+	case 2:	/*  This doesn't work ... */
+		printf("No mode(2) in V7/BSD!"); bibi(99);
+		if(!did0) {
+			ioctl(iofd, TIOCEXCL, 0);
+			ioctl(iofd, TIOCGETP, &oldtty);
+			ioctl(iofd, TIOCGETC, &oldtch);
+		}
+		tty = oldtty;
+		tch = oldtch;
+		tch.t_intrc = Zmodem ? 03:030;	/* Interrupt char */
+		tty.sg_flags |= (ODDP|EVENP|CBREAK);
+		tty.sg_flags &= ~(ALLDELAY|CRMOD|ECHO|LCASE);
+		ioctl(iofd, TIOCSETP, &tty);
+		ioctl(iofd, TIOCSETC, &tch);
+		did0 = TRUE;
+		return OK;
+	case 1:
+		if(!did0) {
+			ioctl(iofd, TIOCEXCL, 0);
+			ioctl(iofd, TIOCGETP, &oldtty);
+			ioctl(iofd, TIOCGETC, &oldtch);
+		}
+		tty = oldtty;
+		tty.sg_flags |= RAW;
+		tty.sg_flags &= ~ECHO;
+		ioctl(iofd, TIOCSETP, &tty);
+		did0 = TRUE;
+		Baudrate = getspeed(tty.sg_ospeed);
+		return OK;
+#endif
+	case 0:
+		if(!did0)
+			return ERROR;
+#ifdef USG
+		(void) ioctl(iofd, TCSBRK, 1);	/* Wait for output to drain */
+		(void) ioctl(iofd, TCFLSH, 1);	/* Flush input queue */
+		(void) ioctl(iofd, TCSETAW, &oldtty);	/* Restore original modes */
+		(void) ioctl(iofd, TCXONC,1);	/* Restart output */
+#endif
+#ifdef V7
+		ioctl(iofd, TIOCSETP, &oldtty);
+		ioctl(iofd, TIOCSETC, &oldtch);
+		ioctl(iofd, TIOCNXCL, 0);
+#endif
+		return OK;
+	default:
+		return ERROR;
+	}
+}
+
+sendbrk()
+{
+#ifdef V7
+#ifdef TIOCSBRK
+#define CANBREAK
+	sleep(1);
+	ioctl(iofd, TIOCSBRK, 0);
+	sleep(1);
+	ioctl(iofd, TIOCCBRK, 0);
+#endif
+#endif
+#ifdef USG
+#define CANBREAK
+	ioctl(iofd, TCSBRK, 0);
+#endif
+}
+
+#ifdef FIONREAD
+#define READCHECK
+/*
+ *  Return non 0 iff something to read from io descriptor f
+ */
+rdchk(f)
+{
+	static long lf;
+
+	ioctl(f, FIONREAD, &lf);
+	return ((int) lf);
+}
+#endif
+#ifdef SVR2
+#define READCHECK
+#include <fcntl.h>
+
+char checked = '\0' ;
+/*
+ * Nonblocking I/O is a bit different in System V, Release 2
+ */
+rdchk(f)
+{
+	int lf, savestat = fcntl(f, F_GETFL) ;
+
+	fcntl(f, F_SETFL, savestat | O_NDELAY) ;
+	lf = read(f, &checked, 1) ;
+	fcntl(f, F_SETFL, savestat) ;
+	return(lf) ;
+}
+#endif
+
+
+#ifdef CRCTABLE
+/* crctab calculated by Mark G. Mendel, Network Systems Corporation */
+static unsigned short crctab[256] = {
+    0x0000,  0x1021,  0x2042,  0x3063,  0x4084,  0x50a5,  0x60c6,  0x70e7,
+    0x8108,  0x9129,  0xa14a,  0xb16b,  0xc18c,  0xd1ad,  0xe1ce,  0xf1ef,
+    0x1231,  0x0210,  0x3273,  0x2252,  0x52b5,  0x4294,  0x72f7,  0x62d6,
+    0x9339,  0x8318,  0xb37b,  0xa35a,  0xd3bd,  0xc39c,  0xf3ff,  0xe3de,
+    0x2462,  0x3443,  0x0420,  0x1401,  0x64e6,  0x74c7,  0x44a4,  0x5485,
+    0xa56a,  0xb54b,  0x8528,  0x9509,  0xe5ee,  0xf5cf,  0xc5ac,  0xd58d,
+    0x3653,  0x2672,  0x1611,  0x0630,  0x76d7,  0x66f6,  0x5695,  0x46b4,
+    0xb75b,  0xa77a,  0x9719,  0x8738,  0xf7df,  0xe7fe,  0xd79d,  0xc7bc,
+    0x48c4,  0x58e5,  0x6886,  0x78a7,  0x0840,  0x1861,  0x2802,  0x3823,
+    0xc9cc,  0xd9ed,  0xe98e,  0xf9af,  0x8948,  0x9969,  0xa90a,  0xb92b,
+    0x5af5,  0x4ad4,  0x7ab7,  0x6a96,  0x1a71,  0x0a50,  0x3a33,  0x2a12,
+    0xdbfd,  0xcbdc,  0xfbbf,  0xeb9e,  0x9b79,  0x8b58,  0xbb3b,  0xab1a,
+    0x6ca6,  0x7c87,  0x4ce4,  0x5cc5,  0x2c22,  0x3c03,  0x0c60,  0x1c41,
+    0xedae,  0xfd8f,  0xcdec,  0xddcd,  0xad2a,  0xbd0b,  0x8d68,  0x9d49,
+    0x7e97,  0x6eb6,  0x5ed5,  0x4ef4,  0x3e13,  0x2e32,  0x1e51,  0x0e70,
+    0xff9f,  0xefbe,  0xdfdd,  0xcffc,  0xbf1b,  0xaf3a,  0x9f59,  0x8f78,
+    0x9188,  0x81a9,  0xb1ca,  0xa1eb,  0xd10c,  0xc12d,  0xf14e,  0xe16f,
+    0x1080,  0x00a1,  0x30c2,  0x20e3,  0x5004,  0x4025,  0x7046,  0x6067,
+    0x83b9,  0x9398,  0xa3fb,  0xb3da,  0xc33d,  0xd31c,  0xe37f,  0xf35e,
+    0x02b1,  0x1290,  0x22f3,  0x32d2,  0x4235,  0x5214,  0x6277,  0x7256,
+    0xb5ea,  0xa5cb,  0x95a8,  0x8589,  0xf56e,  0xe54f,  0xd52c,  0xc50d,
+    0x34e2,  0x24c3,  0x14a0,  0x0481,  0x7466,  0x6447,  0x5424,  0x4405,
+    0xa7db,  0xb7fa,  0x8799,  0x97b8,  0xe75f,  0xf77e,  0xc71d,  0xd73c,
+    0x26d3,  0x36f2,  0x0691,  0x16b0,  0x6657,  0x7676,  0x4615,  0x5634,
+    0xd94c,  0xc96d,  0xf90e,  0xe92f,  0x99c8,  0x89e9,  0xb98a,  0xa9ab,
+    0x5844,  0x4865,  0x7806,  0x6827,  0x18c0,  0x08e1,  0x3882,  0x28a3,
+    0xcb7d,  0xdb5c,  0xeb3f,  0xfb1e,  0x8bf9,  0x9bd8,  0xabbb,  0xbb9a,
+    0x4a75,  0x5a54,  0x6a37,  0x7a16,  0x0af1,  0x1ad0,  0x2ab3,  0x3a92,
+    0xfd2e,  0xed0f,  0xdd6c,  0xcd4d,  0xbdaa,  0xad8b,  0x9de8,  0x8dc9,
+    0x7c26,  0x6c07,  0x5c64,  0x4c45,  0x3ca2,  0x2c83,  0x1ce0,  0x0cc1,
+    0xef1f,  0xff3e,  0xcf5d,  0xdf7c,  0xaf9b,  0xbfba,  0x8fd9,  0x9ff8,
+    0x6e17,  0x7e36,  0x4e55,  0x5e74,  0x2e93,  0x3eb2,  0x0ed1,  0x1ef0
+};
+
+/*
+ * updcrc macro derived from article Copyright (C) 1986 Stephen Satchell. 
+ *  NOTE: First srgument must be in range 0 to 255.
+ *        Second argument is referenced twice.
+ * 
+ * Programmers may incorporate any or all code into their programs, 
+ * giving proper credit within the source. Publication of the 
+ * source routines is permitted so long as proper credit is given 
+ * to Stephen Satchell, Satchell Evaluations and Chuck Forsberg, 
+ * Omen Technology.
+ */
+
+#define updcrc(cp, crc) ( crctab[((crc >> 8) & 255)] ^ (crc << 8) ^ cp)
+
+#else
+
+unsigned short updcrc();
+
+/* update CRC */
+unsigned short
+updcrc(c, crc)
+register c;
+register unsigned crc;
+{
+	register count;
+
+	for (count=8; --count>=0;) {
+		if (crc & 0x8000) {
+			crc <<= 1;
+			crc += (((c<<=1) & 0400)  !=  0);
+			crc ^= 0x1021;
+		}
+		else {
+			crc <<= 1;
+			crc += (((c<<=1) & 0400)  !=  0);
+		}
+	}
+	return crc;	
+}
+#endif
+
+/*
+ * Copyright (C) 1986 Gary S. Brown.  You may use this program, or
+ * code or tables extracted from it, as desired without restriction.
+ *
+ *   Need an unsigned type capable of holding 32 bits;
+ */
+typedef unsigned long int UNS_32_BITS;
+
+/* First, the polynomial itself and its table of feedback terms.  The  */
+/* polynomial is                                                       */
+/* X^32+X^26+X^23+X^22+X^16+X^12+X^11+X^10+X^8+X^7+X^5+X^4+X^2+X^1+X^0 */
+/* Note that we take it "backwards" and put the highest-order term in  */
+/* the lowest-order bit.  The X^32 term is "implied"; the LSB is the   */
+/* X^31 term, etc.  The X^0 term (usually shown as "+1") results in    */
+/* the MSB being 1.                                                    */
+
+/* Note that the usual hardware shift register implementation, which   */
+/* is what we're using (we're merely optimizing it by doing eight-bit  */
+/* chunks at a time) shifts bits into the lowest-order term.  In our   */
+/* implementation, that means shifting towards the right.  Why do we   */
+/* do it this way?  Because the calculated CRC must be transmitted in  */
+/* order from highest-order term to lowest-order term.  UARTs transmit */
+/* characters in order from LSB to MSB.  By storing the CRC this way,  */
+/* we hand it to the UART in the order low-byte to high-byte; the UART */
+/* sends each low-bit to hight-bit; and the result is transmission bit */
+/* by bit from highest- to lowest-order term without requiring any bit */
+/* shuffling on our part.  Reception works similarly.                  */
+
+/* The feedback terms table consists of 256, 32-bit entries.  Notes:   */
+/*                                                                     */
+/*     The table can be generated at runtime if desired; code to do so */
+/*     is shown later.  It might not be obvious, but the feedback      */
+/*     terms simply represent the results of eight shift/xor opera-    */
+/*     tions for all combinations of data and CRC register values.     */
+/*                                                                     */
+/*     The values must be right-shifted by eight bits by the "updcrc"  */
+/*     logic; the shift must be unsigned (bring in zeroes).  On some   */
+/*     hardware you could probably optimize the shift in assembler by  */
+/*     using byte-swap instructions.                                   */
+
+static UNS_32_BITS crc_32_tab[] = { /* CRC polynomial 0xedb88320 */
+0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f, 0xe963a535, 0x9e6495a3,
+0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988, 0x09b64c2b, 0x7eb17cbd, 0xe7b82d07, 0x90bf1d91,
+0x1db71064, 0x6ab020f2, 0xf3b97148, 0x84be41de, 0x1adad47d, 0x6ddde4eb, 0xf4d4b551, 0x83d385c7,
+0x136c9856, 0x646ba8c0, 0xfd62f97a, 0x8a65c9ec, 0x14015c4f, 0x63066cd9, 0xfa0f3d63, 0x8d080df5,
+0x3b6e20c8, 0x4c69105e, 0xd56041e4, 0xa2677172, 0x3c03e4d1, 0x4b04d447, 0xd20d85fd, 0xa50ab56b,
+0x35b5a8fa, 0x42b2986c, 0xdbbbc9d6, 0xacbcf940, 0x32d86ce3, 0x45df5c75, 0xdcd60dcf, 0xabd13d59,
+0x26d930ac, 0x51de003a, 0xc8d75180, 0xbfd06116, 0x21b4f4b5, 0x56b3c423, 0xcfba9599, 0xb8bda50f,
+0x2802b89e, 0x5f058808, 0xc60cd9b2, 0xb10be924, 0x2f6f7c87, 0x58684c11, 0xc1611dab, 0xb6662d3d,
+0x76dc4190, 0x01db7106, 0x98d220bc, 0xefd5102a, 0x71b18589, 0x06b6b51f, 0x9fbfe4a5, 0xe8b8d433,
+0x7807c9a2, 0x0f00f934, 0x9609a88e, 0xe10e9818, 0x7f6a0dbb, 0x086d3d2d, 0x91646c97, 0xe6635c01,
+0x6b6b51f4, 0x1c6c6162, 0x856530d8, 0xf262004e, 0x6c0695ed, 0x1b01a57b, 0x8208f4c1, 0xf50fc457,
+0x65b0d9c6, 0x12b7e950, 0x8bbeb8ea, 0xfcb9887c, 0x62dd1ddf, 0x15da2d49, 0x8cd37cf3, 0xfbd44c65,
+0x4db26158, 0x3ab551ce, 0xa3bc0074, 0xd4bb30e2, 0x4adfa541, 0x3dd895d7, 0xa4d1c46d, 0xd3d6f4fb,
+0x4369e96a, 0x346ed9fc, 0xad678846, 0xda60b8d0, 0x44042d73, 0x33031de5, 0xaa0a4c5f, 0xdd0d7cc9,
+0x5005713c, 0x270241aa, 0xbe0b1010, 0xc90c2086, 0x5768b525, 0x206f85b3, 0xb966d409, 0xce61e49f,
+0x5edef90e, 0x29d9c998, 0xb0d09822, 0xc7d7a8b4, 0x59b33d17, 0x2eb40d81, 0xb7bd5c3b, 0xc0ba6cad,
+0xedb88320, 0x9abfb3b6, 0x03b6e20c, 0x74b1d29a, 0xead54739, 0x9dd277af, 0x04db2615, 0x73dc1683,
+0xe3630b12, 0x94643b84, 0x0d6d6a3e, 0x7a6a5aa8, 0xe40ecf0b, 0x9309ff9d, 0x0a00ae27, 0x7d079eb1,
+0xf00f9344, 0x8708a3d2, 0x1e01f268, 0x6906c2fe, 0xf762575d, 0x806567cb, 0x196c3671, 0x6e6b06e7,
+0xfed41b76, 0x89d32be0, 0x10da7a5a, 0x67dd4acc, 0xf9b9df6f, 0x8ebeeff9, 0x17b7be43, 0x60b08ed5,
+0xd6d6a3e8, 0xa1d1937e, 0x38d8c2c4, 0x4fdff252, 0xd1bb67f1, 0xa6bc5767, 0x3fb506dd, 0x48b2364b,
+0xd80d2bda, 0xaf0a1b4c, 0x36034af6, 0x41047a60, 0xdf60efc3, 0xa867df55, 0x316e8eef, 0x4669be79,
+0xcb61b38c, 0xbc66831a, 0x256fd2a0, 0x5268e236, 0xcc0c7795, 0xbb0b4703, 0x220216b9, 0x5505262f,
+0xc5ba3bbe, 0xb2bd0b28, 0x2bb45a92, 0x5cb36a04, 0xc2d7ffa7, 0xb5d0cf31, 0x2cd99e8b, 0x5bdeae1d,
+0x9b64c2b0, 0xec63f226, 0x756aa39c, 0x026d930a, 0x9c0906a9, 0xeb0e363f, 0x72076785, 0x05005713,
+0x95bf4a82, 0xe2b87a14, 0x7bb12bae, 0x0cb61b38, 0x92d28e9b, 0xe5d5be0d, 0x7cdcefb7, 0x0bdbdf21,
+0x86d3d2d4, 0xf1d4e242, 0x68ddb3f8, 0x1fda836e, 0x81be16cd, 0xf6b9265b, 0x6fb077e1, 0x18b74777,
+0x88085ae6, 0xff0f6a70, 0x66063bca, 0x11010b5c, 0x8f659eff, 0xf862ae69, 0x616bffd3, 0x166ccf45,
+0xa00ae278, 0xd70dd2ee, 0x4e048354, 0x3903b3c2, 0xa7672661, 0xd06016f7, 0x4969474d, 0x3e6e77db,
+0xaed16a4a, 0xd9d65adc, 0x40df0b66, 0x37d83bf0, 0xa9bcae53, 0xdebb9ec5, 0x47b2cf7f, 0x30b5ffe9,
+0xbdbdf21c, 0xcabac28a, 0x53b39330, 0x24b4a3a6, 0xbad03605, 0xcdd70693, 0x54de5729, 0x23d967bf,
+0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94, 0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d
+};
+
+#define UPDC32(octet, crc) (crc_32_tab[((crc) ^ (octet)) & 0xff] ^ ((crc) >> 8))
+
+/* End of rbsb.c */
+
+SHAR_EOF
+echo shar: extracting rz.1 '(6427 characters)'
+cat << \SHAR_EOF > rz.1
+'\" Revision Level 
+'\" Last Delta     01-15-87
+.TH RZ 1 OMEN
+.SH NAME
+rb, rz \- XMODEM, YMODEM, ZMODEM (Batch) file receive
+.SH SYNOPSIS
+.B rz
+.RB [\- "\ +1abpqtuv" ]
+.br
+.B rb
+.RB [\- "\ +1abqtuv" ]
+.br
+.B rz
+.RB [\- "\ 1abcqtuv" ]
+.I file
+.br
+.B gz
+.I "file ..."
+.br
+.RB [ \- ][ v ] rzCOMMAND
+.SH DESCRIPTION
+This program uses error correcting protocol to receive
+files over a serial port from a variety of programs running under
+PC-DOS, CP/M,
+.SM Unix,
+and other operating systems.
+
+The first form of
+.I rz
+(Receive ZMODEM)
+receives files with the ZMODEM batch protocol.
+If the sending program does not support ZMODEM,
+.I rz
+steps down to YMODEM protocol
+after 50 seconds.
+This delay can be eliminated by calling the program as
+.I rb .
+
+When receiving with XMODEM or YMODEM,
+.I Rz
+accepts either standard 128 byte sectors or
+1024 byte sectors
+(YAM
+.B -k
+option).
+The user should determine when
+the longer block length
+actually improves throughput without causing problems.
+
+If extended file information (file length, etc.)
+is received,
+the file length controls the number of bytes written to
+the output dataset (YMODEM only),
+and the modify time and file mode
+(iff non zero)
+are set accordingly.
+
+If no extended file information is received,
+slashes in the pathname are changed to underscore,
+and any trailing period in the pathname is eliminated.
+This conversion is useful for files received from CP/M systems.
+With YMODEM, each file name is converted to lower case
+unless it contains one or more lower case letters.
+
+
+The second form of
+.I rz
+receives a single
+.I file
+with XMODEM protocol.
+The user must supply the file name to both sending and receiving programs.
+
+.I Gz
+is a shell script which calls
+.I sz
+to command a Pro-YAM or compatible program to transmit the specified files.
+Pathnames used with
+.I gz
+must be escaped if they have special significance to the Unix shell.
+.br
+EXAMPLE:
+gz "-1 C:*.c D:*.h"
+
+
+The third form of
+.I rz
+is invoked as
+.B rzCOMMAND
+(with an optional leading \- as generated by login(1)).
+For each received file,
+rz will pipe the file to ``COMMAND filename''
+where filename is the name of the transmitted file
+with the file contents as standard input.
+
+Each file transfer is acknowledged when COMMAND exits with 0 status.
+A non zero exit status terminates transfers.
+
+A typical use for this form is
+.I rzrmail
+which calls rmail(1)
+to post mail to the user specified by the transmitted file name.
+For example, sending the file "caf" from a PC-DOS system to
+.I rzrmail
+on a
+.SM Unix
+system
+would result in the contents of the DOS file "caf" being mailed to user "caf".
+
+On some
+.SM Unix
+systems, the login directory must contain a link to
+COMMAND as login sets SHELL=rsh which disallows absolute
+pathnames.
+If invoked with a leading ``v'',
+.I rz
+will report progress to /tmp/rzlog.
+The following entry works for
+.SM Unix
+3.0:
+.ce
+rzrmail::5:1::/bin:/usr/local/rzrmail
+If the SHELL environment variable includes
+.I "rsh"
+or
+.I "rksh"
+(restricted shell),
+rz will not accept absolute pathnames
+or references to a parent directory,
+will not modify an existing file, and
+removes any files received in error.
+
+If
+.B rz
+is invoked with stdout and stderr to different datasets,
+Verbose is set to 2, causing frame by frame progress reports
+to stderr.
+This may be disabled with the
+.B q
+option.
+
+.PP
+The meanings of the available options are:
+.PP
+.PD 0
+.TP
+.B 1
+Use file descriptor 1 for ioctls and reads (Unix only).
+By default, file descriptor 0 is used.
+This option allows
+.I rz
+to be used with the
+.I cu
+~$
+command.
+If the calling program has spawned a separate process to
+read characters from the modem,
+that process 
+must be disabled for
+.I rz
+to operate properly.
+.TP
+.B a
+Convert files to
+.SM Unix
+conventions by stripping carriage returns and all characters
+beginning with the first Control Z (CP/M end of file).
+.TP
+.B b
+Binary
+(tell it like it is)
+file transfer override.
+.TP
+.B c
+Request 16 bit CRC.
+XMODEM file transfers default to 8 bit checksum.
+YMODEM and ZMODEM normally use 16 bit CRC.
+.TP
+.B D
+Output file data to /dev/null; for testing.
+.TP
+.B p
+(ZMODEM) Protect: skip file if destination file exists.
+.TP
+.B q
+Quiet suppresses verbosity.
+.TP
+.B "t tim"
+Change timeout to
+.I tim
+tenths of seconds.
+.TP
+.B v
+Verbose
+causes a list of file
+names to be appended to
+/tmp/rzlog .
+More v's generate more output.
+.PD
+.ne 6
+.SH EXAMPLES
+.RE
+(Pro-YAM command)
+.RS
+.I <ALT-2>
+.br
+Pro-YAM Command:
+.I "sz *.h *.c"
+.br
+(This automatically invokes
+.I rz
+on the connected system.)
+.RE
+.SH SEE ALSO
+ZMODEM.DOC,
+YMODEM.DOC,
+IMP(CP/M),
+cu(1),
+Professional-YAM manual,
+sz(omen),
+usq(omen),
+undos(omen)
+
+Compile time options required
+for various operating systems are described in the
+source file.
+.SH NOTES
+The Unix "ulimit" parameter must be set high enough
+to permit large file transfers.
+
+The TTY input buffering on some systems may not allow long blocks
+or streaming input, especially at high baud rates.
+The Pro-YAM
+.B "zmodem l"
+numeric parameter may be set to a value between 64 and 1024 to limit the
+burst length ("zmodem pl100").
+
+32 bit CRC code courtesy Gary S. Brown.
+.SH BUGS
+Pathnames are restricted to 127 characters.
+In XMODEM single file mode, the pathname given on the command line
+is still processed as described above.
+The ASCII option\'s CR/LF to NL translation merely deletes CR\'s;
+undos(omen) performs a more intelligent translation.
+
+Some versions of Unix cu(1) do not operate properly with this program.
+.SH "VMS VERSION"
+Some of the #includes with file names enclosed with angle brackets <>
+may need to have the angle brackets changed to "", or vice versa.
+
+The VMS version does not set binary mode according to the incoming
+file type.
+Non binary file processing consists of stripping all characters beginning
+with CPMEOF (^Z).
+
+The VMS version does not set the file time.
+
+At high speeds,
+VMS sometimes loses incoming characters, resulting in retries
+and degradation of throughput.
+
+The mysterious
+VMS C Standard I/O Package and RMS may interact to modify
+file contents unexpectedly.
+
+The VMS version does not support invocation as
+.B rzCOMMAND .
+ZMODEM has not yet been implemented on the VMS version.
+.SH "ZMODEM CAPABILITIES"
+.I Rz
+supports incoming ZMODEM binary (-b), ASCII (-a),
+protect (-p),
+and append (-+)
+requests, and ZMODEM command execution.
+.SH FILES
+rz.c, rbsb.c, zm.c, zmodem.h source files.
+
+/tmp/rzlog stores debugging output generated with -vv option.
+SHAR_EOF
+echo shar: extracting sz.1 '(10163 characters)'
+cat << \SHAR_EOF > sz.1
+'\" Revision Level 
+'\" Last Delta     01-15-87
+.TH SZ 1 OMEN
+.SH NAME
+sz \- XMODEM, YMODEM, ZMODEM Batch file Send
+.SH SYNOPSIS
+sz
+.RB [\- +1abdefkLlNnopqTtuvy ]
+.I file ...
+.br
+sz -X
+.RB [\- 1kqtuv ]
+.I file
+.br
+sz
+.RB [\- 1oqtv ]
+.B "-c COMMAND"
+.br
+sz
+.RB [\- 1oqtv ]
+.B "-i COMMAND"
+.SH DESCRIPTION
+.B Sz
+uses the ZMODEM, YMODEM or XMODEM error correcting protocol to send
+one or more files over a serial port to a variety of programs running under
+PC-DOS, CP/M, Unix, VMS, and other operating systems.
+
+
+The first form of
+.B sz
+sends one or more files with ZMODEM or YMODEM batch protocol.
+Normally, only the file name part of the pathname is transmitted.
+On
+.SM Unix
+systems, additional information about the file is transmitted.
+If the receiving program uses this information,
+the transmitted file length controls the exact number of bytes written to
+the output dataset,
+and the modify time and file mode
+are set accordingly.
+
+Output from another program may be piped to
+.B sz
+for transmission by specifying the
+.B -1
+option and denoting standard input by "-":
+.ce
+ps -ef | sz -
+The program output is transmitted with the filename sPID.sz
+where PID is the process ID of the
+.B sz
+program.
+If the environment variable
+.B ONAME
+is set, that is used instead.
+In this case, the Unix command:
+.ce
+ONAME=con ps -ef|sz -ay -
+will send a "file" to the PC-DOS console display.
+The
+.B -y
+option instructs the receiver to open the file for writing unconditionally.
+The
+.B -a
+option
+causes the receiver to convert Unix newlines to PC-DOS carriage returns
+and linefeeds.
+
+Unix
+.B sz
+supports
+.B YMODEM-g
+with "cbreak" tty mode, XON/XOFF flow control,
+and the interrupt character set to CAN.
+.B YMODEM-g
+(Professional-YAM
+.B g
+option)
+increases throughput over error free channels
+(direct connection, X.PC, etc.)
+by not acknowledging each transmitted sector.
+
+
+The second form of
+.B sz
+uses the
+.B -X
+flag to send a single
+.I file
+with
+.B XMODEM
+or
+.B XMODEM-1k
+protocol.
+The user must supply the file name to both sending and receiving programs.
+
+Iff
+.B sz
+is invoked with $SHELL set and iff that variable contains the
+string
+.I "rsh"
+or
+.I "rksh"
+(restricted shell), sz operates in restricted mode.
+Restricted mode restricts pathnames to the current directory and
+PUBDIR (usually /usr/spool/uucppublic) and/or subdirectories
+thereof.
+
+
+The third form sends a single COMMAND to the receiver for execution.
+.B Sz
+exits with the COMMAND return value.
+If COMMAND includes spaces or characters special to the shell,
+it must be quoted.
+
+
+The fourth form sends a single COMMAND to the receiver for execution.
+.B Sz
+exits as soon as the receiver has correctly received the command,
+before it is executed.
+
+
+If sz is invoked with stdout and stderr to different datasets,
+Verbose is set to 2, causing frame by frame progress reports
+to stderr.
+This may be disabled with the
+.B q
+option.
+.PP
+The meanings of the available options are:
+.PP
+.PD 0
+.TP
+.B +
+Instruct the receiver to append transmitted data to an existing file
+(ZMODEM only).
+.TP
+.B 1
+Use file descriptor 1 for ioctls and reads (Unix only).
+By default, file descriptor 0 is used.
+This option allows
+.B sz
+to be used with the
+.I cu
+~$
+command.
+If the calling program has spawned a separate process to
+read characters from the modem,
+that process 
+must be disabled for
+.I rz
+to operate properly.
+.TP
+.B a
+Convert NL characters in the transmitted file to CR/LF.
+This is done by the sender for XMODEM and YMODEM, by the receiver
+for ZMODEM.
+.TP
+.B b
+(ZMODEM) Binary override: transfer file without any translation.
+.TP
+.B "c COMMAND"
+Send COMMAND to the receiver for execution, return with COMMAND\'s exit status.
+.TP
+.B d
+Change all instances of "." to "/" in the transmitted pathname.
+Thus, C.omenB0000 (which is unacceptable to MSDOS or CP/M)
+is transmitted as C/omenB0000.
+If the resultant filename has more than 8 characters in the stem,
+a "." is inserted to allow a total of eleven.
+.TP
+.B E
+Escape only Ctrl-X control characters;
+normally XON, XOFF, CR-@-CR, and Ctrl-X are escaped.
+.TP
+.B e
+Escape all control characters;
+normally XON, XOFF, CR-@-CR, and Ctrl-X are escaped.
+.TP
+.B f
+Send Full pathname.
+Normally directory prefixes are stripped from the transmitted
+filename.
+.TP
+.B "i COMMAND"
+Send COMMAND to the receiver for execution, return Immediately
+upon the receiving program's successful recption of the command.
+.TP
+.B k
+(XMODEM/YMODEM) Send files using 1024 byte blocks
+rather than the default 128 byte blocks.
+1024 byte packets speed file transfers at high bit rates.
+(ZMODEM streams the data for the best possible throughput.)
+.TP
+.B "L N"
+Use ZMODEM sub-packets of length N.
+A larger N (32 <= N <= 1024) gives slightly higher throughput,
+a smaller N speeds error recovery.
+The default is 128 below 300 baud, 256 above 300 baud, or 1024 above 2400 baud.
+.TP
+.B "l N"
+Wait for the receiver to acknowledge correct data every
+.B N
+(32 <= N <= 1024)
+characters.
+This may be used to avoid network overrun when XOFF flow control is lacking.
+.TP
+.B n
+(ZMODEM) Send each file if
+destination file does not exist.
+Overwrite destination file if
+source file is newer or longer than the destination file.
+.TP
+.B N
+(ZMODEM) Send each file if
+destination file does not exist.
+Overwrite destination file if
+source file has different length or date.
+.TP
+.B o
+(ZMODEM) Disable automatic selection of 32 bit CRC.
+.TP
+.B p
+(ZMODEM) Protect existing destination files by skipping transfer if the
+destination file exists.
+.TP
+.B q
+Quiet suppresses verbosity.
+.TP
+.B r
+Resume interrupted file transfer.
+If the source file is longer than the destination file,
+the transfer commences at the offset in the source file that equals
+the length of the destination file.
+.TP
+.B "t tim"
+Change timeout to
+.I tim
+tenths of seconds.
+.TP
+.B u
+Unlink the file after successful transmission.
+.TP
+.B v
+Verbose
+causes a list of file
+names to be appended to
+/tmp/szlog .
+More v's generate more output.
+.TP
+.B X
+Send a single file with
+.B XMODEM
+or
+.B XMODEM-1k
+protocol.
+.TP
+.B y
+Instruct a ZMODEM receiving program to overwrite any existing file
+with the same name.
+.PD
+.SH EXAMPLES
+.ne 7
+.B "ZMODEM File Transfer"
+.br
+.B "$ sz -a *.c"
+.br
+This single command transfers all .c files in the current Unix directory
+with conversion
+.RB ( -a )
+to end of line conventions appropriate to the receiving environment.
+With ZMODEM AutoDownload enabled, Professional-YAM automatically recieves
+the files after performing a security challenge.
+
+.B "ZMODEM Command Download"
+.br
+ cpszall:all
+    sz -c "c:;cd /yam/dist"
+    sz -ya $(YD)/*.me
+    sz -yqb y*.exe
+    sz -c "cd /yam"
+    sz -i "!insms"
+.br
+This Makefile fragment uses
+.B sz
+to issue commands to Professional-YAM to change current disk and directory.
+Next,
+.B sz
+transfers the
+.I .me
+files from the $YD directory, commanding the receiver to overwrite the old files
+and to convert from Unix end of line conventions to PC-DOS conventions.
+The third line transfers some
+.I .exe
+files.
+The fourth and fifth lines command Pro-YAM to
+change directory and execute a PC-DOS batch file
+.I insms .
+Since the batch file takes considerable time, the
+.B "-i"
+form is used to allow
+.B sz
+to exit immediately.
+
+.B "XMODEM File Transfer"
+.br
+$
+.B "sz -Xa foo.c"
+.br
+.B "ESC"
+.br
+.B "rx foo.c"
+.br
+The above three commands transfer a single file
+from Unix to a PC and Crosstalk XVI 3.6,
+translating Unix newlines to DOS CR/LF.
+
+.SH SEE ALSO
+rz(omen),
+ZMODEM.DOC,
+YMODEM.DOC,
+Professional-YAM manual,
+IMP(CP/M),
+cu(1),
+sq(omen),
+todos(omen),
+tocpm(omen),
+tomac(omen),
+yam(omen)
+
+Compile time options required for various operating systems are described in
+the source file.
+.SH "VMS VERSION"
+The VMS version does not transmit the file date.
+The VMS version calculates the file length by reading the file
+and counting the bytes.
+
+The VMS version does not support YMODEM-g or ZMODEM.
+
+When VMS is lightly loaded, the response time may be too quick for MODEM7
+unless the MODEM7
+.B "q"
+modifier is used.
+
+The VMS C standard i/o package and RMS sometimes interact to modify
+file contents unexpectedly.
+.SH FILES
+sz.c, rbsb.c, zm.c, zmodem.h source files
+
+/tmp/szlog stores debugging output (sz -vv)
+.SH "TESTING FEATURE"
+The command "sz -T file"
+exercises the
+.B Attn
+sequence error recovery by commanding
+errors with unterminated packets.
+The receiving program should complain five times about
+binary data packets being too long.
+Each time
+.B sz
+is interrupted,
+it should send a ZDATA header followed by another defective packet.
+If the receiver does not detect five long data packets,
+the
+.B Attn
+sequence is not interrupting the sender, and the
+.B Myattn
+string in
+.B sz.c
+must be modified.
+
+After 5 packets,
+.B sz
+stops the "transfer" and
+prints the total number of characters "sent" (Tcount).
+The difference between Tcount and 5120 represents the number of characters
+stored in various buffers when the Attn sequence is generated.
+.SH BUGS
+XMODEM transfers add up to 127 garbage bytes per file (1023 bytes with
+XMODEM-k).
+Most YMODEM programs use the file length transmitted at the beginning of the
+transfer to prune the file to the correct length; this may cause problems with
+source files that grow during the course of the transfer.
+This problem does not pertain to ZMODEM transfers, which preserve the exact
+file length unconditionally.
+
+Most ZMODEM options are merely passed to the receiving program;
+some do not implement all these options.
+
+Circular buffering and a ZMODEM sliding window should be used
+when input is from pipes instead of acknowledging frames each 1024 bytes.
+If no files can be opened,
+.B sz
+sends a ZMODEM command to echo a suitable complaint;
+perhaps it should check for the presence of at least one accessible file before
+getting hot and bothered.
+The test mode leaves a zero length file on the receiving system.
+
+Some high speed modems have a firmware bug that drops characters when the
+direction of high speed transmissson is reversed.
+The environment variable ZNULLS may be used to specify the number of nulls to
+send before a ZDATA frame.
+Values of 101 for a 4.77 mHz PC and 124 for an AT are typical.
+
+Some versions of Unix cu(1) do not operate properly with this program.
+SHAR_EOF
+echo shar: extracting gz '(14 characters)'
+cat << \SHAR_EOF > gz
+sz -c "sz $*"
+SHAR_EOF
+#	End of shell archive
+exit 0
+
+

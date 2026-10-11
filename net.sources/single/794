@@ -1,0 +1,2713 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,832aa182a493e094,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-11-28 12:58:08 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site philabs.UUCP
+Path: utzoo!linus!philabs!crh
+From: crh@philabs.UUCP (Charlie Hill)
+Newsgroups: net.sources
+Subject: new version of dired
+Message-ID: <27372@philabs.UUCP>
+Date: Mon, 28-Nov-83 15:58:08 EST
+Article-I.D.: philabs.27372
+Posted: Mon Nov 28 15:58:08 1983
+Date-Received: Mon, 28-Nov-83 23:21:57 EST
+Organization: Philips Labs, Briarcliff Manor, NY
+Lines: 2693
+
+
+# Here is the enhanced version of dired I promised. (I got 16 requests).
+# Note that this is in "shar" format, i.e. one giant script which when run,
+# will generate all the required files.(i.e. makefile, man page, source,
+# etc.).
+
+# The rest of this file is a shell script which will extract:
+# README makefile cshsystem.c dired.c dired.hlp dired.1
+echo x - README
+cat >README <<'!Funky!Stuff!'
+11/22/83
+
+These files represent a version of dired (the interactive directory editing
+program written by Stuart Cracraft and enhanced by Jay Lepreau, posted over a
+year ago) in which I've made a number of enhancements:
+
+1) A command (E) to go UP from any node, including the starting node
+2) "/" command, with reg expr pattern matching
+3) Use of C shell in shell escapes
+4) Ability to quit dired and be "pushd'd" to the current node ("Q").
+5) Commands to print the full pathname of the current file and the current
+   node.  This is also done automatically on startup of any node.
+6) A command to abort all levels at once. ("A").
+7) A visual indication of what fraction of the total files the current
+   window represents.
+8) Command to toggle between full and split screen modes. 
+9) Command to re-read the directory (R).
+10) Can now be used on any terminal with random cursor addressing.
+11) Several bug fixes. 
+
+This version has been stable and in use for over a year at our
+installation.  
+
+NOTES:
+
+ 1) It runs best on Berkeley 4.1 Unix, because the default shell for escapes
+ is the "c" shell, and the "Q" command generates a "pushd" to the current dir
+ node. If you don't have 4.1, remove the "Q" command", and signals to
+ SIGTSTP.  If you don't have the "c" shell, omit the file "cshsystem.c", and
+ change shell references back to "sh".
+
+ These exists a 4.2 version which I may post soon.
+
+ 2) It runs best on terminals which have "clear to end of line" and/or "clear
+    to end of page", but will work, albeit poorly,
+    on terminals w/o these functions, as long as the terminals have random
+    cursor addressing. This version, like its predecessor, does not use
+    "curses".
+
+ 3) Some known bugs: ^Z stuff does needs to be improved. Occasionally
+    "t" ing out binary files will mess up the display, but this is less
+    likely than before.
+
+4)  These are some path names embedded in the dired source code (see ifdef
+    DEBUG); modify these to suit local needs (as well as those mentioned in
+    the manual page).
+
+5)  I have been contacted by Jay Lepreau (utah-cs!lepreau) who also has a
+    number of additional enhancements.  Some of you may want to wait for a
+    reconciled version (which is not being promised, however) or produce one.
+
+Charles Hill
+Philips Labs
+345 Scarborough Rd.
+Briarcliff Manor, N.Y. 10510
+
+[allegra,decvax,sdcsvax]!philabs!crh
+
+!Funky!Stuff!
+echo x - makefile
+cat >makefile <<'!Funky!Stuff!'
+# makefile for dired
+
+dired: dired.o cshsystem.o
+	cc -o dired dired.o cshsystem.o -ltermcap
+install: dired
+	 strip dired
+	 mv dired /usr/local/bin/dired
+clean:
+	 rm *.o
+.c.o:  ;cc -O -c $*.c
+!Funky!Stuff!
+echo x - cshsystem.c
+cat >cshsystem.c <<'!Funky!Stuff!'
+/* @(#)system.c	4.1 (Berkeley) 12/21/80 */
+#include	<signal.h>
+
+cshsystem(s)
+char *s;
+{
+	int status, pid, w;
+	register int (*istat)(), (*qstat)();
+
+	if ((pid = vfork()) == 0) {
+		execl("/bin/csh", "csh", "-c", s, 0);
+		_exit(127);
+	}
+	istat = signal(SIGINT, SIG_IGN);
+	qstat = signal(SIGQUIT, SIG_IGN);
+	while ((w = wait(&status)) != pid && w != -1)
+		;
+	if (w == -1)
+		status = -1;
+	signal(SIGINT, istat);
+	signal(SIGQUIT, qstat);
+	return(status);
+}
+!Funky!Stuff!
+echo x - dired.c
+cat >dired.c <<'!Funky!Stuff!'
+/*
+ **********************************************************************
+ *                                                                    *
+ * dired [][dir][files]  Stuart Cracraft (mclure@sri-unix) Sept 1980  *
+ *								      *
+ *      Directory editor.					      *
+ *		edit/delete files in a directory or a file list	      *
+ *              compile with the berkeley termlib archive             *
+ *              and don't forget to change the 'helpfile' and         *
+ *              'dirednam' strings to reflect your own setup.         *
+ *                                                                    *
+ *      Note: if you make improvements, I'd like to get them too.     *
+ *                      Stuart Cracraft mclure@sri-unix,              *
+ *				ucbvax!menlo70!sri-unix!mclure	      *
+ *	so would I:	Jay Lepreau 	lepreau@utah-20,	      *
+ *			decvax!{harpo,randvax}!utah-cs!lepreau	      *
+ **********************************************************************
+*/
+
+/*
+ *	Enhanced by J.Lepreau, Univ of Utah, 8-10/81:
+ *	      --bunch of stuff, including more cmds, 2 window mode,
+ *		bufering output, pathname substition in !escapes,
+ *		initial sort options, ^G escape from sorts, ^U escape
+ *		from !escapes, empty dir check.
+ */
+
+#ifdef COMMENT
+
+Modified 12/81 by Lepreau:
+1. Fix up aborting of command escapes, with mildy tricky re-display.
+2. Make default window size be half-screen (2 window mode).
+   Added option -wf to get full screen.
+3. Add check for too many files to avoid core-dump.
+4. Fix bug in cmd escapes: must reset caught signals before invocation.
+
+Modified 6/82 by Charles Hill (crh) 
+		 Philips Labs
+		 345 Scarborough Rd.
+                 Briarcliff Manor, N.Y. 10510  
+		 philabs!crh
+
+1. Eliminated need for terminal home capability. (Many termcap entries
+   leave this out when there is cm). Changed body of home ()
+   routine to a call to curxy(0,0).
+2. Made default editor "vi".
+3. On exit, screen is not blanked; cursor moves to last line. Line is
+   cleared
+4. In "type", only outputs 79 chars/line so terms with automatic margins
+   will work ok.
+5. Changed type () to handle tabs better.
+6. Changed ceol to work for terms w/o clear to eoln. Single call to ceod
+   eliminated. If no clear to eod, this is simulated. But it's better to
+   use full screen on such terminals.
+7. Changed type () to check if a file is a text file first. On some
+   terminals, outputting arbitrary binary can put them in a weird mode,
+   and screw up the display.
+
+Additional enhancements 8/82 crh 
+1. Added pattern matching in the form of /, n, and N commands.
+2. Added toggle split-screen command \.
+3. Added p command to print path name.
+4. Change to "c" shell for ! command.
+5. Fixed bug for single file arg when not a dir.
+6. Added 'A', 'Q' commands and "linear window indicator".
+7. Added counts to <up>, <down>, f, and b commands.
+8. Added "G" as in "vi".
+9. Added "E" command to go up a dir, and code to print node name.
+10.Added "R" command to re-read dir.
+
+
+#endif COMMENT
+
+/*
+   things to consider
+   -    perhaps should be able to edit protection field and
+		be able to change protection instantly at the
+		touch of a key (or queue the change for later exit)
+
+   --	Would be nice if there were cmds (e.g. 'c') which would update
+		1) the file-info & re-display it, & 2) update whole
+		display's info.
+*/
+
+
+#ifdef vax				/* this does for now */
+# define VFORK
+#endif
+
+#ifndef VFORK
+# define vfork fork
+#endif
+
+#define	FALSE		0
+#define	TRUE		1
+#define	NOTDELETED	0
+#define	DELETED		1
+
+/*	Sort Orders */
+#define NAME		0
+#define	SIZE		1
+#define	WRITE		2
+#define	READ		3
+char sortstr[] = "nswr";	/* must be in order by above */
+
+#define ESC         '\033'
+#define CURSOR          48	/* X-coord of cursor, just b4 file */
+#define CTRL(c)		('c' & 037)
+typedef	char		bool;
+#define	eq(a, b)	(strcmp(a, b) == 0)
+
+
+#include <stdio.h>
+#include <signal.h>
+#include <sgtty.h>
+#include <sys/ioctl.h>
+#include <sys/param.h>
+#include <sys/stat.h>
+#include <sys/dir.h>
+#include <whoami.h>
+
+#ifdef	DEBUG
+char   *dirednam = "dired2 ";    /* Where dired lives - need blnk */
+char   *helpfile = "dired.hlp";	/* Where helpfile lives */
+#else
+char   *dirednam = "/usr/local/bin/dired ";    /* Where dired lives - need blnk */
+char   *helpfile = "/usr/local/src/dired/dired.hlp";	/* Where helpfile lives */
+#endif
+
+char   divider[132], newdivider[132];	/* divides the windows */
+int    LW;         /* the last pos of the linear window */
+#define DIVCHAR	'-'	/* makes up the divider */
+
+#define MOREPGM	"/usr/ucb/more "	/* program to page thru a file */
+
+#ifndef MAXFILES /* This way can override on the cmd line for a huge version */
+	
+#ifndef vax
+#define MAXFILES	500	/* Max number of files we can handle */
+#else
+#define MAXFILES	1000	/* Probably should be even bigger */
+#endif
+
+#endif
+	
+
+#define ISDIGIT(C)	(C <= '9') && (C >= '0')
+#define ABORTSTAT	69
+int diredstat;
+
+
+struct lbuf
+{
+    union
+    {
+	char    lname[30];
+	char   *namep;
+    } ln;
+    short   deleted;
+    char    ltype;
+    short   lnum;
+    short   lflags;
+    short   lnl;
+    short   luid;
+    short   lgid;
+    long    lsize;
+    long    latime;
+    long    lctime;
+    long    lmtime;
+};
+
+struct lbuf file[MAXFILES];
+
+struct stat	statbuf;
+struct sgttyb   ioctlb;
+
+#define	ISARG	0100000
+
+#define FNAME(N)	(arglist ? file[N].ln.namep : file[N].ln.lname)
+int     gflg,
+        iflg,
+        lflg,
+        sflg;			/* Random flags */
+int	splitflg;		/* Split screen? */
+int     sortyp;			/* Key to sort on */
+int     errcode;		/* Error variable used by rm */
+int     rflg = 1;		/* Reverse sort flag */
+int     totfiles = 0;		/* Total files */
+int     flags;			/* Gets flags */
+int     blurb;			/* 1=>thing in echo area,0 otherwise  */
+int     numdeleted;		/* Number of files marked deleted */
+long    ttime;			/* Temp time variable */
+long    year;			/* Six months ago */
+long    totblocks = 0;		/* Total blocks */
+int     lastuid = -1;		/* Last uid/gid we handled */
+	char    tempbuf[256];		/* Random temporary buffer */
+	char    tempbuf2[256];
+char    *cp;
+char    userbuf[35];		/* Temporary buffer for user name */
+FILE 	*pwdf, *dirf;		/* Password/group file and directory files */
+
+int     curfile = 0;		/* Current file */
+int     topfile;        	/* File at top of screen */
+int     curline = 0;		/* Line that we're on */
+	int     scrlen = 999;	/* Default length of dired index part of screen: */
+			/* 999 ==> 2 windows (half size), 0 ==> 1 window (full size) */
+int	Worklen = 0;		/* Length of 'working window', the other part*/
+int	Worktop = 0;		/* Top of    " " */
+int     Tscrlen;		/*Total length of screen,minus 1 for cmd line*/
+int     scrwid = 79;		/* Width of screen */
+char   *CL,
+       *UP,			/* Termcap strings we'll use */
+       *HO,
+       *CM,
+       *CD,			/* clear to end of display */
+       *CE,
+       *AL;			/* insert line */
+char    PC;
+char    tbuf[1024],
+	        tcapbuf[256];
+char   *tgetstr (), *tgoto ();
+char   *getenv ();
+int     compar ();
+char   *ctime ();
+char   *index();
+char   *makename ();
+char   *catargs();
+char   *bldnam();
+long    nblock ();
+int	catchint();
+int	sigint;
+char    command;		/* Holds last command */
+int	intype=0;
+int     onctlz ();
+
+int asswin = -1;
+int arglist=0;
+char *rindex(), *re_comp();
+char fullpath[256];
+char *getfullpath();
+char startfile[256], startarg[256];
+int  wasstartfile = 0;
+int quitok = 1;
+int countarg;
+int camedown = 0;
+int     wasspecial;
+int     specialcc;
+int	numarg;
+char    nambuf[256];
+char bufout[BUFSIZ];
+
+main (argc, argv)
+int     argc;
+char   *argv[];
+{
+    register	int     i,
+    	    		cc;
+    int     
+	    special,		/* flag says had % or # in cmd */
+            status;
+	    char    combuf[256];	/* Holds last ! command */
+    char   **oldargv;
+    register char   *t,
+    	   	    *tt;
+
+ /* Get terminal type */
+
+    setbuf(stdout, NULL);	/* for v7 speed up, vax compatibility -fjl */
+    getcap ();
+
+
+ /* Process arg flags. They must be first! */
+    for (i=1; i<argc; i++) {
+	if (argv[i][0] != '-')
+	    break;
+	switch (cc = argv[i][1]) {
+	  case 'w':			/* Window size */
+	    if (argv[i][2] == 'h')
+		scrlen = 999;		/* Half */
+	    else if (argv[i][2] == 'f')
+		scrlen = 0;		/* Full */
+	    else {
+		scrlen = atoi(&argv[i][2]);
+		asswin = scrlen;
+	    }
+	    break;
+	  case 's':			/* Initial sort order */
+	  case 'r':
+	    sortyp = index(sortstr, argv[i][2]) - sortstr;
+	    rflg = (cc == 's') ? 1 : -1;
+	    break;
+
+	  case 'd': camedown = TRUE;
+		    break;
+	  case 'F':
+	  case 'f':   /* get the start file */
+		    strcpy(startfile,&argv[i][2]);
+		    wasstartfile=TRUE;
+		    if (cc == 'F') quitok=FALSE;
+		    break;
+	  default:
+	    fprintf(stderr, "Unknown option %s, ignored.\n", argv[i]);
+	    break;
+	 }
+    }
+    argc -= (i - 1);
+    oldargv = argv;
+    argv += (i - 1);
+
+    windsize ();                 /* replaced by proc call 8/82 crh */
+
+    tt = divider + scrwid + 1;
+    LW = scrwid;   /* last position in the linear window */
+    for (t = divider; t < tt;)	/* arbitrary length */
+    	*t++ = DIVCHAR;
+    *t = '\0';
+
+    signal (SIGINT, SIG_IGN);
+    signal (SIGQUIT, SIG_IGN);
+
+    setdpy ();
+    printf ("Reading");
+
+    time (&ttime);
+    year = ttime - 6L * 30L * 24L * 60L * 60L;/* 6 months ago */
+
+    lflg = 1;
+    gflg = iflg = sflg = 0;
+    if (lflg)
+    {
+	t = "/etc/passwd";
+	if (gflg)
+	    t = "/etc/group";
+	pwdf = fopen (t, "r");
+    }
+    
+    
+    numarg = argc;
+    getfiles (argc,argv);
+
+    /* extract the full path name */
+    if (!arglist) {
+      if (argc==1) cp=getfullpath(".");
+      else if (argv[1][0] != '/')  cp=getfullpath(argv[1]);
+      else cp=argv[1];
+      dcanon(cp);
+      strcpy(fullpath,cp);
+    }
+
+    qsort (file, totfiles, sizeof (struct lbuf), compar);
+    if (wasstartfile) locstart(startfile); 
+    else  displaywindow(0);
+
+restart:
+
+    signal (SIGTSTP, onctlz);
+    if (!arglist) printpath(fullpath,TRUE);
+    countarg = 0;
+startup: 
+    while ((command = getchar ()) != 'q')
+    {
+	if (blurb)
+	{
+	    telluser ("");
+	    blurb = 0;
+	}
+	if (ISDIGIT(command)) getcountarg();
+	switch (command)
+	{
+	    case ESC: break;
+	    case ' ': 
+		       if (splitflg) prtsplitstr(""); /* clear lower screen */
+                       if (!arglist) printpath(fullpath,TRUE);
+		       break;
+
+	    case 'a': 		/* Abort completely */
+		curxy(0,Tscrlen); 
+		ceol (0,Tscrlen);
+		unsetdpy ();
+		exit (1);
+		break;
+	    case 'Q':    /* abort all the direds and pushd to the
+			    dir of the current file */
+	       { char *cp; char bldbuf[256];
+
+	           bldbuf[0]='\0';
+	           bldnam(bldbuf, numarg,curfile,argv);
+	           cp=rindex(bldbuf,'/');
+		   curxy(0,Tscrlen); 
+		   ceol (0,Tscrlen);
+		   unsetdpy ();
+		   if (cp) {
+		      *cp='\0';
+		      typein("pushd ");
+		      typein(bldbuf);
+		      typein("\n");
+	           }
+		   exit(ABORTSTAT);
+	       }
+	    case 'A':           /* Abort the chain of direds  ***crh */
+		curxy(0,Tscrlen); 
+		ceol (0,Tscrlen);
+		unsetdpy ();
+		exit(ABORTSTAT);
+		break;
+	    case 'P': 		/* Print a file */
+		if (file[curfile].ltype == 'd')
+		{
+		    telluser ("?Can only print files");
+		    break;
+		}
+		tempbuf[0] = '\0';
+		bldnam(tempbuf, numarg, curfile, argv);
+		telluser ("Printing...");
+		while ((i = vfork ()) == -1)
+		    sleep (3);
+		if (i == 0) {
+		    	execlp ("print", "print", tempbuf, 0);
+		    telluser ("?Can't find program to list file.\n");
+		    _exit(1);
+		}
+		wait (&status);
+		break;
+
+	    case 'p': 
+	       { char bldbuf[256];
+	       strcpy(bldbuf,FNAME(curfile));
+	       expandpath(bldbuf);
+	       printpath(bldbuf,FALSE);
+	       }
+	       break;
+
+
+	    case '/':
+	       {  char *s;
+		  char buff[256]; int len;
+		  telluser(" ");
+		  curxy(0,Tscrlen);
+		  putchar('/');
+		  if (!getline(buff)){
+		    telluser("?pattern too long");
+		    break;
+		  }
+		  if ((s=re_comp(buff)) != 0) telluser("%s",s);
+		  else findfile(1);
+		  break;
+	       }
+
+	    case '\\' :  /* toggle split screen */
+
+		     if (splitflg) scrlen = Tscrlen;
+		     else {
+		       if (asswin != -1) scrlen = asswin;
+		       else scrlen = 999;
+		     }
+		     windsize();
+		     topfile = curfile/(scrlen - 1) * (scrlen - 1);
+		     blank();
+		     showscreen();
+		     curline= curfile - topfile;
+		     curxy(CURSOR,curline);
+		     break;
+
+
+	    case 'n': findfile(1);
+		      break;
+
+	    case 'N': findfile(0);
+		      break;
+
+
+	    case '!': 		/* Execute a system command */
+		    case '.':		/* repeat the previous ! command */
+		telluser ("");
+		curxy (0, Tscrlen);
+		unsetdpy ();
+		printf ("Command: ");
+		tempbuf[0] = 'x';	/* dummy kludge */
+			if ((command == '!' ? gets(tempbuf) : strcpy(tempbuf, combuf))
+					      != NULL && tempbuf[0] != '\0') {
+		    extern   char *skipto();
+		    register char *op,		/* old ptr */
+				  *np;		/* new ptr */
+			    char     bldbuf[256];
+
+			    strcpy(combuf, tempbuf);	/* remember the command */
+		    bldbuf[0] = '\0';	
+		    op = tempbuf;
+		    special = 0;
+		    while (cc = *(np = skipto(op, "%#"))) {
+			special++;		/* set flag */
+			*np++ = '\0';	     /* zap the %/# and bump past it */
+			strcat(bldbuf, op);	/* 1st part */
+			if (cc == '%')	/* complete file name */
+			    bldnam(bldbuf, numarg, curfile, argv);
+			else {		/* Had # sign, trailing comp only */
+			    if (numarg <= 2)
+				strcat (bldbuf, file[curfile].ln.lname);
+			    else
+			        strcat (bldbuf, file[curfile].ln.namep);
+			}
+			    
+			op = np;
+		    }
+		    strcat(bldbuf, op);
+
+		    blank ();
+		    if (special) {		/* display expanded command */
+			printf( "%s\n", bldbuf);
+		    }	/* "system" takes long enuf for him to see it */
+		    signal(SIGINT, SIG_DFL);	/* temp kludge here... */
+		    signal(SIGQUIT, SIG_DFL);	/* should not use 'system' */
+		    signal(SIGTSTP, SIG_DFL);
+		    cshsystem (bldbuf);
+		    signal(SIGTSTP, onctlz);
+		    signal (SIGINT, SIG_IGN);
+		    signal (SIGQUIT, SIG_IGN);
+		    printf ("\nCR to return...");
+		    setdpy ();
+		    getchar ();
+		    blank ();
+		    showscreen ();
+		    telluser ("");
+		}
+		else {			/* CR only, or EOF, or error */
+	       /* 
+	        * He changed his mind, skip it.  Since we were in
+	        * cooked mode, the CR ending the gets is echoed and
+	        * we lost the first line of the display.  So we
+	        * re-insert it.
+		*/
+		    setdpy();
+	            if (tempbuf[0] == 'x')	/* means EOF */
+			telluser("");
+		/* null entry, normal case */
+		    else if (AL == 0) {		/* no insert line capability */
+		        blank();
+			showscreen();
+		    }
+		    else {			/* be a little sneakier */
+			curxy(0, Tscrlen-1);	/* go back to where prompt */
+			ceol(0, Tscrlen-1);  	/*  is now, and blank it */
+			home();
+			insline();		/* make some room */
+			pentry(topfile);
+			putchar('\n');
+		    }
+		    curxy(CURSOR, curline);
+		}
+		break;
+              case 'R':  /* re-read the directory */
+		     {
+		       int num;
+
+		     /* remember the name of the current file */
+		       strcpy(tempbuf,FNAME(curfile));
+		     deletefiles (argc,argv);  /* delete marked files */
+		     if (numdeleted) goto startup; /* undeleted - restart */
+		     totfiles = 0;
+		     signal(SIGTSTP,SIG_DFL);
+		     curxy(0,Tscrlen);
+		     ceol (0,Tscrlen);
+		     printf("Reading");
+		     getfiles (argc,argv); 
+                     qsort (file, totfiles, sizeof (struct lbuf), compar);
+		     /* try to pos cursor where we were */
+		     if (findfilename(tempbuf,&num)) 
+		       displaywindow(num);
+		     else 
+		       displaywindow(0);
+		     goto restart;
+		     }
+
+	    
+	    case 'r': 		/* Reverse sort */
+		curxy (0, Tscrlen);
+		printf ("reverse ");
+		rflg = -1;
+
+	    case 's': 		/* Normal sort */
+		if (command == 's')
+		{
+		    curxy (0, Tscrlen);
+		    rflg = 1;
+		}
+		printf ("sort by [s,n,r,w]: ");
+		command = getchar ();
+		while ((command == '?') || !((command == 'n') ||
+		    (command == 'r') || (command == 'w') || (command == 's') ||
+		    (command == ESC)))
+		{
+		    curxy (0, Tscrlen);
+		    ceol (0, Tscrlen);
+		    if (rflg == -1)
+			printf ("reverse ");
+		    printf ("sort by size, name, read or write date: ");
+		    command = getchar ();
+		}
+		
+		if (command == ESC) {		/* abort */
+		    telluser("");
+		    curxy(CURSOR, curline);
+		    break;
+		}
+		
+		if (command == 's')
+		    sortyp = SIZE;
+		else
+		    if (command == 'w')
+			sortyp = WRITE;
+		    else
+			if (command == 'r')
+			    sortyp = READ;
+			else
+			    sortyp = 0;
+		printf ("%c", command);
+		qsort (file, totfiles, sizeof (struct lbuf), compar);
+		topfile = 0;
+		curfile = 0;
+		curline = 0;
+		blank ();
+		showscreen ();
+		curxy (CURSOR, 0);
+		break;
+
+	    case 'e': 		/* Edit a file or directory */
+	    case 'E':           /* go up a dir */
+		if ((file[curfile].ltype == 'd') || (command == 'E')){
+		    strcpy (tempbuf, dirednam);
+		    catargs(tempbuf, oldargv);
+		}
+		else {
+		    if ((t = getenv("EDITOR")) != NULL && strlen(t) > 0){
+			strcat(strcpy(tempbuf, t), " ");
+		    }
+		    else
+			strcpy (tempbuf, "vi ");     /***** ex -> vi crh ***/
+		}
+	        strcpy(tempbuf2,FNAME(curfile));
+	        expandpath(tempbuf2);
+		if (command == 'E') {
+		   /* if we got where we are by going down, then 'E'
+		      should just quit    */
+		   if (camedown) goto quit; 
+
+		   /* otherwise form the full path name of the upper node */
+		   cp=rindex(tempbuf2,'/');
+		   if (cp) {
+		      *cp = '\0';
+		      formstartarg(tempbuf2);
+		      strcat(tempbuf2,"/..");
+		   }
+		   else break; /* something would be wrong! */
+		   dcanon(tempbuf2);
+		   if (eq(tempbuf2,fullpath)) {
+		      if (eq(tempbuf2,"/")) telluser("?already at '/'");
+		      else telluser("?can't go up");
+		      break;
+		   }
+		   strcat(tempbuf,startarg);
+		}
+		else /* 'e' */ {
+		  if (file[curfile].ltype == 'd') {
+		    if (wasstartfile && eq(startfile,FNAME(curfile)) && quitok) 
+		       /* we came up this path; just quit */   
+		       goto quit;
+		    strcat(tempbuf, "-d "); /* indicate we're going down */
+		  }
+		}
+		strcat(tempbuf,tempbuf2);
+		blank ();
+		unsetdpy ();
+		signal(SIGTSTP, SIG_DFL);
+		diredstat =system (tempbuf);
+	        if ((diredstat>>8)==ABORTSTAT) exit(ABORTSTAT);
+		signal(SIGTSTP, onctlz);
+		setdpy ();
+		if (diredstat != 0) {
+		  printf("\n type <cr> to continue");
+		  getchar();
+		}
+		blank ();
+		showscreen ();
+		if (arglist) telluser ("");
+		else printpath(fullpath,TRUE);
+		break;
+
+	    case 'm': 		/* 'more' a file */
+		if (file[curfile].ltype == 'd')
+		{
+		    telluser ("?Can only page thru files");
+		    break;
+		}
+		strcpy (tempbuf, MOREPGM);
+		bldnam(tempbuf, numarg, curfile, argv);
+		blank ();
+		unsetdpy ();
+		signal(SIGTSTP, SIG_DFL);
+		system (tempbuf);
+		signal(SIGTSTP, onctlz);
+/*		if (!sigint) {	*/
+		printf ("\nCR to return...");
+/*  		}		*/
+		setdpy ();
+ 	   	getchar ();
+		blank ();
+		showscreen ();
+		telluser ("");
+		break;
+
+	    case 'T':	/* don't wait at page end */
+	    case 't':	/* quickly type the file -- added 5/81, J.Lepreau */ 
+		if (file[curfile].ltype == 'd')
+		{
+		    telluser ("?Can only type files");
+		    break;
+		}
+		tempbuf[0] = '\0';
+		bldnam(tempbuf, numarg, curfile, argv);
+		if (type(tempbuf, command == 't')) {   /* little t means wait */
+		    blank ();
+		    showscreen ();
+		    telluser("");
+		}
+		curxy (CURSOR, curline);
+		break;
+
+	    case 'l': 		/* Refresh screen */
+	    case CTRL(l):	/* added for editor compatibility -fjl */
+		blank ();
+		showscreen ();
+		telluser ("");
+		break;
+	    case 'c': 		/* Refresh current line */
+		curxy (0, curline);
+		pentry (curfile);
+		curxy (CURSOR, curline);
+		break;
+	    case CTRL(v):
+	    case 'f': 		/* forward window */
+		fscreen (countarg);
+		break;
+				/* wish we could do meta-v */
+	    case 'b': 		/* backward window */
+		bscreen (countarg);
+		break;
+	    case CTRL(n):
+	    case '\r': 
+	    case 'j' :   /***crh***/
+	    case '\n': 		/* next file */
+		if (curfile == totfiles - 1)
+		    telluser ("?At end of files");
+		else {
+                   if (countarg < 1) countarg = 1;
+		   curfile = curfile + countarg;
+		   if (curfile > totfiles - 1) {
+		      curfile = totfiles - 1;
+		      displayfile(curfile);
+		      shortcountmess();
+		      break;
+		   }
+		   displayfile(curfile);
+	         }
+		 break;
+	    case '^': 		/* previous file */
+	    case CTRL(h):		/* backspace */
+	    case 'k':            /****crh****/
+	    case '-':
+	    case CTRL(p):
+		if (curfile == 0)
+		    telluser ("?At start of files");
+		else {
+		    if (countarg < 1) countarg = 1;
+		    curfile = curfile - countarg;
+		    if (curfile < 0) {
+		       curfile=0;
+		       displayfile(curfile);
+		       shortcountmess();
+		       break;
+		    }
+		    displayfile(curfile);
+		}
+	        break;
+
+	    /* ^G info as in vi  */
+	    case CTRL(G): sprintf(tempbuf,"file %d of %d --%d%%--",
+	                    curfile + 1,totfiles, (curfile+1)*100/totfiles);
+			  telluser("%s",tempbuf);
+			  break;
+
+	    /* line number addressing as in vi */
+	    case 'G': if (countarg < 1) displayfile(totfiles-1);
+		      else if (countarg > totfiles) {
+			displayfile(totfiles - 1);
+			shortcountmess();
+		      }
+		      else displayfile(countarg-1);
+		      break;
+
+	    case 'h': 		/* Help */
+	    case '?': 
+		if (type(helpfile, 1)) {	/* wait */
+		    blank ();
+		    showscreen ();
+		    telluser("");
+		}
+		curxy (CURSOR, curline);
+		break;
+	    case 'd': 		/* delete file */
+		    if (file[curfile].deleted != DELETED) {
+		        numdeleted++;
+		        file[curfile].deleted = DELETED;
+		        printf ("D");
+		    }
+		    if (curline + 1 == scrlen)
+		    {
+			fscreen (1);
+			downline ();
+		    }
+		    else
+			if (curfile != totfiles - 1)
+			    downline ();
+		    break;
+
+	    case 'u': 		/* undelete file */
+		    if (file[curfile].deleted == DELETED) {
+		        numdeleted--;
+		        file[curfile].deleted = NOTDELETED;
+		        printf (" ");
+		    }
+		    if (curline + 1 == scrlen)
+		    {
+			fscreen (1);
+			downline ();
+		    }
+		    else
+			if (curfile != totfiles - 1)
+			    downline ();
+		    break;
+
+	    default: 
+		if (command != -1) /* get around ^Z sending EOF? */
+		  telluser ("Unknown command. Type ? or h for help ");
+		break;
+	}
+	countarg = 0;
+    }
+ quit:
+    deletefiles (argc,argv); 
+    if (numdeleted) goto startup;
+    curxy(0,Tscrlen);  /*** crh ***/ 
+    ceol (0,Tscrlen);
+    unsetdpy();
+    exit(0); 
+}
+
+/*** new routines crh 8/82 ***/
+
+
+getcountarg()
+{
+  countarg = 0;
+  while (ISDIGIT(command)) {
+    countarg = 10 * countarg + command - (int)'0';
+    command = getchar();
+  }
+}
+
+typein(argv)
+/* puts arg chars into input buffer, i.e., fakes typing them in */
+	char *argv;
+{
+	struct sgttyb stb, stb2;
+	int pendin = LPENDIN;
+
+	ioctl(2, TIOCGETP, &stb);
+	stb2 = stb;
+	stb.sg_flags &= ~ECHO;
+	ioctl(2, TIOCSETN, &stb);
+	for (;; argv++) {
+		  if (*argv == '\0') break;
+			else ioctl(2, TIOCSTI, argv);
+	}
+	ioctl(2, TIOCSETN, &stb2);
+	ioctl(2, TIOCLBIS, &pendin);
+}
+
+
+
+onctlz ()
+{
+  curxy (0, Tscrlen);
+  ceol (0,Tscrlen);
+  unsetdpy();
+  signal(SIGTSTP,SIG_DFL);
+  kill(0,SIGTSTP); /*re-send ^z */
+  signal(SIGTSTP,onctlz);  /* wake up here ... */
+  setdpy();
+  blank();
+  showscreen();
+  if (!intype) telluser("");
+  else {
+    curxy (0, Tscrlen);
+    ceol (0,Tscrlen);
+  }
+}
+
+match(filenum)
+int filenum;
+{
+int re_exec();
+char *strp;
+ 
+  if (file[filenum].lflags & ISARG) strp = file[filenum].ln.namep;
+  else strp = file[filenum].ln.lname;
+  return ( re_exec(strp));
+}
+
+displayfile(fnum)
+/* move to the indicated file number */
+int fnum;
+{
+ 
+  /* redraw if file not already on screen */
+  if ((fnum< topfile) || (fnum >=topfile+scrlen)) {
+     topfile = fnum/(scrlen - 1) * (scrlen - 1);
+     blank();
+     showscreen();
+  }
+  curfile=fnum;
+  curline= fnum - topfile;
+  curxy(CURSOR,curline);
+}
+
+findfile (down)
+int down;
+{
+int i,stat;
+  stat=0;
+  if (down) {
+    for (i=curfile+1; i <= totfiles; i++) {
+      stat = match(i);
+      if (stat != 0) break;
+    }
+  }
+  else {
+    for (i=curfile-1; i>= 0 ; i--) {
+      stat = match(i);
+      if (stat != 0) break;
+    }
+  }
+  if (stat == -1) {
+     telluser("botched regular expression");
+     return;
+  }
+  if (stat) displayfile(i);
+  else telluser("no match");
+}
+
+getline(s)
+char s[];
+{
+ int stat,c,i;
+ i=0;
+ s[0]='\0';
+ stat=1;
+ while ( ((c=getchar()) != EOF) && (c != '\n')) {
+   if (c == ioctlb.sg_kill) {
+      i=0;
+      curxy(1,Tscrlen);
+      ceol(1,Tscrlen);
+      continue;
+   }
+   if (c != ioctlb.sg_erase) {
+       if (i < scrwid - 1) {
+	 s[i++]=c;
+         putchar(c);
+       }
+       else stat=0;
+   }
+   else {
+     if (i > 0) {
+       i--;
+       putchar(c);
+       putchar(' '); putchar(c);
+     }
+   }
+ }
+ s[i]='\0';
+ return(stat);
+}
+
+windsize ()
+{
+    if (scrlen == 0)			/* full screen */
+	scrlen = Tscrlen;
+    else if (scrlen == 999)		/* means split in half */
+        scrlen = (Tscrlen - 1) >> 1;	
+    if (scrlen < 2)
+	scrlen = 2;
+    if (Tscrlen < scrlen)
+	scrlen = Tscrlen;
+    splitflg = (Tscrlen > scrlen+1);	/* 1 extra line for separator */
+    if (splitflg) {
+	Worklen = Tscrlen - (scrlen+1);	/* size of 'working' window */
+	Worktop = scrlen + 1;		/* bottom half for now */
+    }
+    else
+	Worklen = 0;
+    
+}
+
+locstart(startfile)
+char startfile[];
+{
+int startfilenum;
+
+       if (findfilename(startfile,&startfilenum))
+	 displaywindow(startfilenum);
+       else {
+	 /* if we cant find it, we cant use it */
+	 wasstartfile=FALSE;
+	 displaywindow(0);
+       }
+
+}
+
+findfilename(filename,num)
+char filename[];
+int  *num;
+{
+  int i;
+       for (i=0; i<=totfiles; i++) {
+	 if eq(FNAME(i),filename) {
+	   *num = i;
+	   return(TRUE);
+	 }
+       }
+       return(FALSE);
+}
+
+formstartarg(name)
+/* form start file arg */
+char *name;
+{
+char tempbuf[256];
+
+ if (arglist) strcpy(startarg," -F");
+ else strcpy(startarg," -f");
+ strcpy(tempbuf,name);
+ dcanon(tempbuf);
+ cp=rindex(tempbuf,'/'); 
+ if (cp) strcat(startarg,cp+1);
+ else strcat(startarg,tempbuf);
+ strcat(startarg," ");
+}
+
+/*
+ * dcanon - canonicalize the pathname, removing excess ./ and ../ etc.  */
+dcanon(cp)
+	char *cp;
+{
+	register char *p, *sp;
+	register int slash;
+
+	/* assume name begins with a '/' */
+
+	for (p = cp; *p; ) {		/* for each component */
+		sp = p;			/* save slash address */
+		while(*++p == '/')	/* flush extra slashes */
+			;
+		if (p != ++sp)
+			strcpy(sp, p);
+		p = sp;			/* save start of component */
+		slash = 0;
+		while(*++p)		/* find next slash or end of path */
+			if (*p == '/') {
+				slash = 1;
+				*p = 0;
+				break;
+			}
+		if (*sp == '\0')	/* if component is null */
+			if (--sp == cp)	/* if path is one char (i.e. /) */
+				break;
+			else
+				*sp = '\0';
+		else if (eq(".", sp)) {
+			if (slash) {
+				strcpy(sp, ++p);
+				p = --sp;
+			} else if (--sp != cp)
+				*sp = '\0';
+		} else if (eq("..", sp)) {
+			if (--sp != cp)
+				while (*--sp != '/')
+					;
+			if (slash) {
+				strcpy(++sp, ++p);
+				p = --sp;
+			} else if (cp == sp)
+				*++sp = '\0';
+			else
+				*sp = '\0';
+		} else if (slash)
+			*p = '/';
+	}
+}
+
+
+char	wd[256];
+int	off;
+char	name[BUFSIZ];
+
+char *getfullpath(start)
+char *start;
+{
+/*  return the full path name */
+ 
+char	dot[500];
+char	dotdot[500];
+char	temp[500];
+int	file;
+struct	stat	d, dd;
+struct	direct	dir;
+
+	int rdev, rino;
+
+	off	= -1;
+        strcpy(dot,start);
+	strcpy(dotdot,start);
+	strcat(dotdot,"/..");
+	stat("/", &d);
+	rdev = d.st_dev;
+	rino = d.st_ino;
+	for (;;) {
+		stat(dot, &d);
+		if (d.st_ino==rino && d.st_dev==rdev){
+			prname();
+			return(wd);
+		}
+		if ((file = open(dotdot,0)) < 0) {
+			telluser("pwd: cannot open ..\n");
+			exit(1);  
+		}
+		fstat(file, &dd);
+		strcat(dotdot,"/..");
+		strcat(dot,"/..");
+		if(d.st_dev == dd.st_dev) {
+			if(d.st_ino == dd.st_ino){
+				prname();
+				return(wd);
+			}
+			do
+				if (read(file, (char *)&dir, sizeof(dir)) < sizeof(dir)) {
+					telluser("read error in ..\n");
+					printf(dir.d_name); /***/
+					exit(1);  
+				}
+			while (dir.d_ino != d.st_ino);
+		}
+		else do {
+				if(read(file, (char *)&dir, sizeof(dir)) < sizeof(dir)) {
+					telluser("read error in ..\n");
+					printf(dir.d_name); /***/
+					exit(1);  
+				}
+				strcpy(temp,dot);
+				strcat(temp,"/");
+				strcat(temp,dir.d_name);
+				stat(temp, &dd);
+			} while(dd.st_ino != d.st_ino || dd.st_dev != d.st_dev);
+		close(file);
+                {
+	          register i, j;
+          
+	          i = -1;
+	          while (dir.d_name[++i] != 0);
+	          if ((off+i+2) > BUFSIZ-1){
+		          prname();
+		          return(wd);
+	          }
+	          for(j=off+1; j>=0; --j)
+		          name[j+i+1] = name[j];
+	          off=i+off+1;
+	          name[i] = '/';
+	          for(--i; i>=0; --i)
+		          name[i] = dir.d_name[i];
+	       } 
+	 }
+}
+
+prname()
+{
+	strcpy(wd,"/");
+	if (off<0)
+		off = 0;
+	name[off] = '\0';
+	strcat(wd,name);
+}
+
+prtsplitstr(str)
+char str[];
+{
+int top,cur_scrl;
+
+      cur_scrl = totfiles - topfile + 1;	/* topfile starts at 0 */
+      top = ((cur_scrl < scrlen) ? cur_scrl : scrlen) + 1;
+      curxy(0,top);
+      if (CD != 0) putpad(CD);
+      printf(str);
+      curxy (CURSOR, curline);
+}
+  
+printpath(str,printbottom)
+char str[];
+int printbottom;
+{
+static char error[] = "path too long - use split screen to display it";
+
+if (printbottom) {
+  if (strlen(str) < scrwid) telluser(str);
+  else if (splitflg) prtsplitstr(str);
+  else telluser(error);
+}
+else if (splitflg) prtsplitstr(str);
+else if (strlen(str) < scrwid) telluser(str);
+else telluser(error);
+}
+    
+expandpath(name)
+char name[];
+{
+char temp[256];
+
+  if (name[0]!= '/') {
+     if (arglist)
+	strcpy(temp,getfullpath("."));
+     else strcpy(temp,fullpath);
+     strcat(temp,"/");
+     strcat(temp,name);
+     strcpy(name,temp);
+  }
+  dcanon(name);
+}
+
+
+/* end 8/82 routines */
+
+getfiles (argc,argv)
+int argc;
+char *argv[];
+{
+   if (argc == 1)
+	readdir (".");
+   else {
+	struct stat stbuf;
+        arglist=1;
+	if (argc == 2) {
+	    if (stat(argv[1],&stbuf)==-1) {
+	      printf ("\nSorry, %s unreadable.\n", argv[1]);
+	      unsetdpy ();
+	      exit(1);
+	    }
+	    if ((stbuf.st_mode & S_IFMT) == S_IFDIR) {
+	       readdir (argv[1]);
+	       arglist=0;
+	    }
+	}
+	if (arglist) 
+	{
+	    while (--argc > 0)
+	    {
+		if (totfiles == MAXFILES)
+		    overflow();
+		if ((totfiles % 10) == 0)
+		    putchar ('.');
+		if (gstat(*++argv) == 0) {
+		    file[totfiles].ln.namep = *argv;
+		    file[totfiles].lflags |= ISARG;
+		    totfiles++;
+		}
+	    }
+	}
+    }
+    if (totfiles == 0) {
+		printf("\n?Empty directory\007\n");
+	unsetdpy();
+	sleep(1);		/* So user can see it - don't worry if less */
+	exit(0);
+    }
+    
+}
+
+deletefiles (argc,argv)
+int argc;
+char *argv[];
+{
+  int i;
+
+    if (numdeleted)
+    {
+	blank ();
+	printf ("The following %s marked for deletion:\n",
+		(numdeleted == 1) ? "is" : "are");
+	typefiles ();
+	printf ("\nShall I delete %s? ",
+		(numdeleted == 1) ? "this" : "these");
+	if ((command = getchar ()) != 'y')
+	{
+	    blank ();
+	    showscreen ();
+	    curxy (0, Tscrlen);
+	    ceol (0, Tscrlen);
+	    curxy (CURSOR, curline);
+	    return;
+	}
+	else
+	{
+	  int failures;
+
+	    failures=0;
+	    printf ("y\n");
+	    for (i = 0; i < totfiles; i++)
+		if (file[i].deleted == DELETED) {
+		    nambuf[0] = '\0';
+		    bldnam(nambuf, numarg, i, argv);
+		    if (file[i].ltype == 'd')
+			rm (nambuf, 0);
+		    else
+		    	if (unlink (nambuf) < 0) {
+			    printf ("Delete of %s failed.\n", nambuf);
+			    failures++;
+			}
+		}
+		if (failures) {
+		  printf("<CR> to continue");
+		  getchar();
+		}
+	}
+    }
+    numdeleted = 0;
+}
+
+typefiles ()
+{
+    int     longsiz,
+            i,
+            j,
+            maxperln,
+            numout,
+            longthis;
+    longsiz = numout = 0;
+    for (i = 0; i < totfiles; i++)
+	if (file[i].deleted == DELETED)
+	    if (file[i].lflags & ISARG)
+	    {
+		if (strlen (file[i].ln.namep) > longsiz)
+		{
+		    longsiz = strlen (file[i].ln.namep);
+		}
+	    }
+	    else
+	    {
+		if (strlen (file[i].ln.lname) > longsiz)
+		{
+		    longsiz = strlen (file[i].ln.lname);
+		}
+	    }
+    maxperln = scrwid / (longsiz + 3);
+    for (i = 0; i < totfiles; i++)
+	if (file[i].deleted == DELETED)
+	{
+	    if (file[i].lflags & ISARG)
+	    {
+		printf ("%s", file[i].ln.namep);
+		longthis = strlen (file[i].ln.namep);
+	    }
+	    else
+	    {
+		printf ("%.14s", file[i].ln.lname);
+		longthis = strlen (file[i].ln.lname);
+	    }
+	    numout++;
+	    if ((numout % maxperln) == 0)
+		putchar ('\n');
+	    else if (numout != numdeleted)
+		for (j = 0; j < (longsiz + 3 - longthis); j++)
+		    putchar (' ');
+	}
+}
+
+rm (arg, level)
+char    arg[];
+{
+    struct stat buf;
+    struct direct   direct;
+    char    name[100];
+    int     d;
+
+    if (stat (arg, &buf))
+    {
+	return;
+    }
+    if ((buf.st_mode & S_IFMT) == S_IFDIR)
+    {
+	if (access (arg, 02) < 0)
+	{
+	    printf ("%s not deleted.\n", arg);
+	    return;
+	}
+	if ((d = open (arg, 0)) < 0)
+	{
+	    printf ("rm: %s: cannot read\n", arg);
+	    return;
+	}
+	while (read (d, (char *) & direct, sizeof (direct)) == sizeof (direct))
+	{
+	    if (direct.d_ino != 0 && !dotname (direct.d_name))
+	    {
+		sprintf (name, "%s/%.14s", arg, direct.d_name);
+		rm (name, level + 1);
+	    }
+	}
+	close (d);
+	errcode += rmdir (arg);
+	return;
+    }
+
+    if (unlink (arg))
+    {
+	++errcode;
+	printf ("%s not deleted.\n", arg);
+    }
+}
+
+dotname (s)
+char   *s;
+{
+    if (s[0] == '.')
+	if (s[1] == '.')
+	    if (s[2] == '\0')
+		return (1);
+	    else
+		return (0);
+	else
+	    if (s[1] == '\0')
+		return (1);
+    return (0);
+}
+
+rmdir (f)
+char   *f;
+{
+    int     status,
+            i;
+
+    if (dotname (f))
+	return (0);
+    while ((i = vfork ()) == -1)
+	sleep (3);
+    if (i == 0) {
+    	execl ("/bin/rmdir", "rmdir", f, 0);
+    	execl ("/usr/bin/rmdir", "rmdir", f, 0);
+    	printf ("rm: can't find rmdir\n");
+    	_exit(1);
+    }
+    wait (&status);
+    return (status);
+}
+
+shortcountmess()
+{
+  telluser("used shortened count");
+}
+
+displaywindow(filenum)
+/* forces a new window */
+int filenum;
+{
+  topfile = -999;  /* force a redraw */
+  displayfile(filenum);
+}
+
+fscreen (count)
+int count;
+{
+  if (topfile + scrlen - 1 > totfiles - 1) {
+      telluser ("?No remaining windows");
+      return;
+  }
+  if (count <= 1) count=1;
+  else if ((topfile + count*(scrlen-1)) > totfiles - 1)
+  {
+     displaywindow(totfiles - 1);
+     shortcountmess();
+     return;
+  }
+ displaywindow(topfile + count*(scrlen-1));
+}
+
+bscreen (count)
+int count;
+{
+  if (topfile - scrlen + 1 < 0) {
+      telluser ("?No previous windows");
+      return;
+  }
+  if (count <= 1) count=1;
+  else if ((topfile -count*(scrlen-1)) < 0) {
+    displaywindow(0);
+    shortcountmess();
+    return;
+  }
+  displaywindow(topfile - count*(scrlen-1));
+}
+
+showscreen ()
+{
+    int     i,
+	    x1,x2,
+            numprint;
+    home ();
+    setbuf(stdout, bufout);	/* buffered output here, faster! --fjl */
+    numprint = 0;
+    for (i = topfile; (numprint < scrlen) && (i < totfiles); i++)
+    {
+	numprint++;
+	pentry (i);
+	putchar ('\n');
+    }
+    if (splitflg) {
+	strcpy(newdivider,divider);
+	x1 = (topfile * LW) / totfiles;
+	x2 = ((topfile+scrlen-1)*LW)/totfiles;
+	if (x1==x2) newdivider[x1]='o';
+	else {
+	  if ((x1==0) && (topfile==0)) newdivider[0]='[';
+	  else newdivider[x1]='(';
+	  if (x2>=LW || topfile+scrlen >= totfiles) newdivider[LW]=']';
+	  else newdivider[x2]=')';
+	}
+    	printf ("%s\n", newdivider);
+    }
+    fflush(stdout);		/* reset for display functions */
+    setbuf(stdout, NULL);
+}
+
+readdir (dir)			/* Reads directory dir */
+char   *dir;
+{
+    static struct direct    dentry;
+    register int    j;
+
+    if ((dirf = fopen (dir, "r")) == NULL)
+    {
+	printf ("\nSorry, %s unreadable.\n", dir);
+	unsetdpy ();
+	exit(1);
+    }
+    for (;;)
+    {
+	if (fread ((char *) & dentry, sizeof (dentry), 1, dirf) != 1)
+	    break;
+	if (dentry.d_ino == 0
+		|| dentry.d_name[0] == '.' && (dentry.d_name[1] == '\0'
+		    || dentry.d_name[1] == '.' && dentry.d_name[2] == '\0'))
+	    continue;
+
+	if (totfiles == MAXFILES)
+	    overflow();			/* abort, too may files */
+	/* Just ignore if can't find the file, dir may be changing */
+	if (gstat (makename (dir, dentry.d_name)) == 0) {	/* 0 == Ok */
+	    file[totfiles].lnum = dentry.d_ino;
+	    for (j = 0; j < DIRSIZ; j++)
+	        file[totfiles].ln.lname[j] = dentry.d_name[j];
+	    totfiles++;
+	    if (totfiles % 10 == 0)
+	        putchar ('.');
+	}
+    }
+    fclose (dirf);
+}
+
+gstat (name)			/* Stats the file with name */
+char   *name;
+{
+
+    file[totfiles].lflags = 0;
+    file[totfiles].lnum = 0;
+    file[totfiles].ltype = '-';
+
+    if (stat (name, &statbuf) < 0)
+    {
+	return(-1);
+    }
+    file[totfiles].lnum = statbuf.st_ino;
+    file[totfiles].lsize = statbuf.st_size;
+    switch (statbuf.st_mode & S_IFMT)
+    {
+	case S_IFDIR: 
+	    file[totfiles].ltype = 'd';
+	    break;
+	case S_IFBLK: 
+	    file[totfiles] .ltype = 'b';
+	    file[totfiles].lsize = statbuf.st_rdev;
+	    break;
+	case S_IFCHR: 
+	    file[totfiles].ltype = 'c';
+	    file[totfiles].lsize = statbuf.st_rdev;
+	    break;
+    }
+    file[totfiles].deleted = NOTDELETED;
+    file[totfiles].lflags = statbuf.st_mode & ~S_IFMT;
+    file[totfiles].luid = statbuf.st_uid;
+    file[totfiles].lgid = statbuf.st_gid;
+    file[totfiles].lnl = statbuf.st_nlink;
+    file[totfiles].latime = statbuf.st_atime;
+    file[totfiles].lctime = statbuf.st_ctime;
+    file[totfiles].lmtime = statbuf.st_mtime;
+    totblocks += nblock (statbuf.st_size);
+    return(0);
+}
+
+char *
+makename (dir, filen)
+char   *dir,
+       *filen;
+{
+    static char dfile[100];
+    register char  *dp,
+                   *fp;
+    register int    i;
+
+    dp = dfile;
+    fp = dir;
+    while (*fp)
+	*dp++ = *fp++;
+    *dp++ = '/';
+    fp = filen;
+    for (i = 0; i < DIRSIZ; i++)
+	*dp++ = *fp++;
+    *dp = 0;
+    return (dfile);
+}
+
+long
+nblock (size)
+long    size;
+{
+    return ((size + 511) >> 9);
+}
+
+pentry (whichone)
+int     whichone;
+{
+    struct
+    {
+	char    dminor,
+	        dmajor;
+    };
+    register    t;
+    register char  *cp;
+
+    if (file[whichone].lnum == -1)
+	return;
+    if (iflg)
+	printf ("%5u ", file[whichone].lnum);
+    if (sflg)
+	printf ("%4D ", nblock (file[whichone].lsize));
+    if (lflg)
+    {
+	putchar (file[whichone].ltype);
+	pmode (file[whichone].lflags);
+	printf ("%2d ", file[whichone].lnl);
+	t = file[whichone].luid;
+	if (gflg)
+	    t = file[whichone].lgid;
+	if (getname (t, userbuf) == 0)
+	    printf ("%-14.14s", userbuf);
+	else
+	    printf ("%-14d", t);
+	if (file[whichone].ltype == 'b' || file[whichone].ltype == 'c')
+	    printf ("%3d,%3d", major ((int) file[whichone].lsize),
+		    minor ((int) file[whichone].lsize));
+	else
+	    printf ("%7ld", file[whichone].lsize);
+	if ((sortyp == WRITE) || (sortyp == 0) || (sortyp == SIZE))
+	{
+	    cp = ctime (&file[whichone].lmtime);
+	    if (file[whichone].lmtime < year)
+		printf (" %-7.7s %-4.4s ", cp + 4, cp + 20);
+	    else
+		printf (" %-12.12s ", cp + 4);
+	}
+	else
+	    if (sortyp == READ)
+	    {
+		cp = ctime (&file[whichone].latime);
+		if (file[whichone].latime < year)
+		    printf (" %-7.7s %-4.4s ", cp + 4, cp + 20);
+		else
+		    printf (" %-12.12s ", cp + 4);
+	    }
+    }
+    printf ("%c", file[whichone].deleted ? 'D' : ' ');
+    if (file[whichone].lflags & ISARG)
+	printf (" %.30s", file[whichone].ln.namep);
+    else
+	printf (" %.14s", file[whichone].ln.lname);
+}
+
+getname (uid, buf)
+int     uid;
+char    buf[];
+{
+    int     j,
+            c,
+            n,
+            i;
+
+    if (uid == lastuid)
+	return (0);
+    if (pwdf == NULL)
+	return (-1);
+    rewind (pwdf);
+    lastuid = -1;
+    do
+    {
+	i = 0;
+	j = 0;
+	n = 0;
+	while ((c = fgetc (pwdf)) != '\n')
+	{
+	    if (c == EOF)
+		return (-1);
+	    if (c == ':')
+	    {
+		j++;
+		c = '0';
+	    }
+	    if (j == 0)
+		buf[i++] = c;
+	    if (j == 2)
+		n = n * 10 + c - '0';
+	}
+    } while (n != uid);
+    buf[i++] = '\0';
+    lastuid = uid;
+    return (0);
+}
+
+int     m1[] =
+{
+    1, S_IREAD >> 0, 'r', '-'
+};
+int     m2[] =
+{
+    1, S_IWRITE >> 0, 'w', '-'
+};
+int     m3[] =
+{
+    2, S_ISUID, 's', S_IEXEC >> 0, 'x', '-'
+};
+int     m4[] =
+{
+    1, S_IREAD >> 3, 'r', '-'
+};
+int     m5[] =
+{
+    1, S_IWRITE >> 3, 'w', '-'
+};
+int     m6[] =
+{
+    2, S_ISGID, 's', S_IEXEC >> 3, 'x', '-'
+};
+int     m7[] =
+{
+    1, S_IREAD >> 6, 'r', '-'
+};
+int     m8[] =
+{
+    1, S_IWRITE >> 6, 'w', '-'
+};
+int     m9[] =
+{
+    2, S_ISVTX, 't', S_IEXEC >> 6, 'x', '-'
+};
+
+int    *m[] =
+{
+    m1, m2, m3, m4, m5, m6, m7, m8, m9
+};
+
+pmode (aflag)
+{
+    register int  **mp;
+
+    flags = aflag;
+    for (mp = &m[0]; mp < &m[sizeof (m) / sizeof (m[0])];)
+	select (*mp++);
+}
+
+select (pairp)
+register int   *pairp;
+{
+    register int    n;
+
+    n = *pairp++;
+    while (--n >= 0 && (flags & *pairp++) == 0)
+	pairp++;
+    putchar (*pairp);
+}
+
+compar (pp1, pp2)
+struct lbuf *pp1,
+           *pp2;
+{
+    register struct lbuf   *p1,
+                           *p2;
+
+    p1 = pp1;
+    p2 = pp2;
+    if (p1 -> lflags & ISARG && p1 -> ltype == 'd')
+    {
+	if (!(p2 -> lflags & ISARG && p2 -> ltype == 'd'))
+	    return (1);
+    }
+    else
+    {
+	if (p2 -> lflags & ISARG && p2 -> ltype == 'd')
+	    return (-1);
+    }
+    if (sortyp == SIZE)
+    {
+	if (p2 -> lsize == p1 -> lsize)
+	    return (0);
+	if (p2 -> lsize > p1 -> lsize)
+	    return (rflg);
+	return (-rflg);
+    }
+    else
+	if (sortyp == WRITE)
+	{
+	    if (p2 -> lmtime == p1 -> lmtime)
+		return (0);
+	    if (p2 -> lmtime > p1 -> lmtime)
+		return (rflg);
+	    return (-rflg);
+	}
+	else
+	    if (sortyp == READ)
+	    {
+		if (p2 -> latime == p1 -> latime)
+		    return (0);
+		if (p2 -> latime > p1 -> latime)
+		    return (rflg);
+		return (-rflg);
+	    }
+    return (rflg * strcmp (p1 -> lflags & ISARG ? p1 -> ln.namep : p1 -> ln.lname,
+		p2 -> lflags & ISARG ? p2 -> ln.namep : p2 -> ln.lname));
+}
+
+ceod()
+{
+}
+
+ceol (x,y)
+int x,y;
+{
+    int i;
+    if (CE != 0) putpad (CE);
+    else {  /***crh for terms w/o ce, put blanks & restore cursor **/
+      for (i=x; i <  scrwid ; i++ ) putchar(' ');
+      curxy(x,y);
+    }
+}
+blank ()
+{
+    putpad (CL);
+}
+home () 
+{
+     curxy(0,0);   /* crh putpad (HO); */
+}
+insline ()
+{
+    putpad (AL);
+}
+
+/* Yes, folks, we use direct cursor addressing to get to next line!
+   Before you mumble "What sort of cretin would do this?" here's
+   the reason. We don't use \n since that obviously won't work.
+   We don't use \012 since virgin version 7 makes that into a crlf.
+   We don't use raw mode since we type out help files efficently,
+   and we don't want to switch modes all the time. So enjoy. -- SMC */
+
+downline ()
+{
+    curxy (CURSOR, ++curline);
+    curfile++;
+}
+upline ()
+{
+    putpad (UP);
+    curline--;
+    curfile--;
+}
+
+/*VARARGS1*/
+telluser (msg, args)
+char   *msg;
+{
+    curxy (0, Tscrlen);
+    ceol (0,Tscrlen);
+    printf (msg, args);
+    curxy (CURSOR, curline);
+    blurb++;
+}
+curxy (col, lin)
+{
+    char   *cmstr = tgoto (CM, col, lin);
+    putpad (cmstr);
+}
+
+char *fgets();
+
+
+nottext(fn)
+/** routine to try to determine whether the file is obviously not a text
+file. Adapted from "more".   *** crh ***/
+
+char fn[];
+{
+int c;
+FILE *f;
+
+if ((f=fopen(fn, "r")) == NULL) return(FALSE);
+c = getc(f);
+
+/* Try to see whether it is an ASCII file */
+
+switch ((c | *f->_ptr << 8) & 0177777) {
+    case 0405:
+    case 0407:
+    case 0410:
+    case 0411:
+    case 0413:
+    case 0177545:
+	fclose (f);
+	return (TRUE);
+    default:
+	fclose (f);
+	return(FALSE);
+    }
+ }
+
+getch(fd)
+FILE    *fd;
+{
+  if (wasspecial) {
+     wasspecial = FALSE;
+     return (specialcc);
+  }
+  else return (getc(fd));
+}
+
+type (filestr, waitflg)    /* Modified to type help file & others. fjl 5/81 */
+char *filestr;			/* Kludgy now with split screen stuff! */
+{
+    int     helpfd = 5;
+    FILE    *fd = stdin;
+    char    *eof;
+    register int     i,j, n;
+    register int     cc = 0;
+    int	    cur_scrl;		/* current screen length */
+    char    helpbuf[512];
+    
+    if (nottext(filestr)) {
+       telluser("?Not a text file:%s", filestr);
+       return (FALSE);
+    }
+    if (!splitflg)
+	helpfd = open(filestr, 0);
+    else
+    	fd = fopen(filestr, "r");
+    if (helpfd < 0 || fd == NULL) {
+    	telluser("?Unable to open %sfile",strcmp(filestr,helpfile)?"":"help ");
+	return (FALSE);
+    }
+    
+    signal(SIGINT, catchint);
+    sigint = 0;
+    intype=1;
+
+    if (!splitflg) {
+    	blank();
+    	while ((i = read (helpfd, helpbuf, 512)) > 0 && !sigint)
+	    write (1, helpbuf, i);
+	close(helpfd);
+    }
+    else {
+	setbuf(stdout, bufout);		/* to speed it up */
+	cur_scrl = totfiles - topfile + 1;	/* topfile starts at 0 */
+	Worktop = ((cur_scrl < scrlen) ? cur_scrl : scrlen) + 1;
+	if (!splitflg) {
+	   blank();
+	   Worktop=0;
+	}
+	do {
+	    curxy(0, Worktop);
+	    /**** crh  replace call to ceod()  ****/
+	    if (CD != 0)  putpad(CD);
+	    else if (!splitflg) blank();  
+	    wasspecial = FALSE;
+	    for (i = Worktop; (i < Tscrlen) && !sigint && (cc != EOF); i++) {
+		n = 0;
+		while ((cc = getch(fd)) != EOF) {
+		    if (cc == '\t') n= (n/8) * 8 + 8;
+chklen:
+		    if (n >= scrwid  /*+1 */ ) { /* Use only 79 cols crh***/
+			if (cc != '\n') {
+			    if (!wasspecial) ungetc(cc, fd);
+			       else specialcc=cc;
+			    cc = '\n';
+			}
+		    }
+		    if (cc >= 127) {
+			putchar('^');
+			cc = '?';
+			n++;
+			wasspecial = TRUE;
+			goto chklen;
+		    }
+		    else
+		    if ( (cc>=0) && (cc<=31) && (cc != '\t') && (cc != '\n') ) {
+			 /* form the graphic of the control char */
+			putchar('^');
+			cc = cc + 64;
+			n++;
+			wasspecial = TRUE;
+			goto chklen;
+		    }
+		    if (cc != '\n') {
+		       putchar(cc);
+		       wasspecial = FALSE;
+		    }
+		    else {
+		       if ((CD==0) & splitflg)
+			  ceol(n,i);
+		       putchar('\n');
+		       break;
+		    }
+		    if (cc != '\t') n++;
+		}
+	    }
+	       if (CD==0 && splitflg)
+	         for (j= i; j < Tscrlen;j++ ) {
+		    curxy(0, j);
+		    ceol (0,j);
+	         }
+	    fflush(stdout);
+	} while (!sigint && (cc != EOF) && waitchk(waitflg));
+	
+	if (feof(fd))	
+	    printf("===== End-of-File =====\n");
+	fflush(stdout);
+	setbuf(stdout, NULL);
+	fclose(fd);
+	return(FALSE);	/* needs no re-display */
+    }
+	    
+    if (!splitflg) {		/* redundant now... */
+    	if (!sigint) {
+	    curxy(0, Tscrlen);
+	    printf ("CR to return...");
+    	    getchar ();
+    	}
+    	blank ();
+	return (TRUE);
+    }
+}
+
+waitchk(waitflg)
+{
+	if (!waitflg)
+	    return(1);
+	fflush(stdout);
+	setbuf(stdout, NULL);
+	curxy(0, Tscrlen);
+	ceol(0,Tscrlen);
+	printf ("---Continue---");
+	curxy(0, Tscrlen);
+		if (getchar() == 'q')
+		    sigint = 1;		/* simulate interrupt */
+	ceol(0,Tscrlen);
+	setbuf(stdout, bufout);
+	if (sigint)
+	    return(0);		/* avoids clear of screen */
+	return(1);
+}
+
+setdpy ()
+{
+    ioctl (0, TIOCGETP, &ioctlb);
+    ioctlb.sg_flags |= CBREAK;
+    ioctlb.sg_flags &= ~ECHO;
+    ioctl (0, TIOCSETP, &ioctlb);
+}
+
+unsetdpy ()
+{
+    ioctlb.sg_flags &= ~CBREAK;
+    ioctlb.sg_flags |= ECHO;
+    ioctl (0, TIOCSETP, &ioctlb);
+}
+
+getcap ()
+{
+    char   *ap;
+    char   *term;
+    char   *xPC;
+
+    term = getenv ("TERM");
+    if (term == 0)
+    {
+	fprintf (stderr, "No TERM in environment\n");
+	exit(1);
+    }
+
+    switch (tgetent (tbuf, term))
+    {
+	case -1: 
+	    fprintf (stderr, "Cannot open termcap file\n");
+	    exit (2);
+	case 0: 
+	    fprintf (stderr, "%s: unknown terminal", term);
+	    exit (3);
+    }
+
+    ap = tcapbuf;
+
+    Tscrlen = tgetnum ("li") - 1;
+    scrwid = tgetnum ("co") - 1;/* lose 1 so won't scroll in last line */
+
+    UP = tgetstr ("up", &ap);
+    CD = tgetstr ("cd", &ap);
+    CE = tgetstr ("ce", &ap);
+    HO = tgetstr ("ho", &ap);
+    CL = tgetstr ("cl", &ap);
+    CM = tgetstr ("cm", &ap);
+    AL = tgetstr ("al", &ap);		/* insert line, optional */
+
+    xPC = tgetstr ("pc", &ap);
+    if (xPC)
+	PC = *xPC;
+
+    /*** crh changed error test ***/
+    if ((CM == 0) || (CL == 0) || (UP == 0)  )
+    {
+	fprintf (stderr, "Tty must have cursor addr, clear, and 4 cursor motions.\n");
+	exit (1);
+    }
+    if (Tscrlen <= 0 || scrwid <= 0)
+    {
+	fprintf (stderr, "Must know the screen size\n");
+	exit (1);
+    }
+}
+
+outch (c)
+{
+    putchar (c);
+}
+
+putpad (str)
+char   *str;
+{
+    if (str)
+	tputs (str, 0, outch);
+}
+
+catchint(sig)
+{
+	signal(SIGINT, SIG_IGN);	/* reset it */
+	sigint = 1;
+}
+
+char *
+bldnam(str, numarg, filidx, argv)
+char *str;
+char *argv[];
+{
+	
+	if (numarg == 1)
+	    strcat (str, file[filidx].ln.lname);
+	else
+	    if (numarg == 2) {
+		if (arglist) 
+		   strcat (str, file[filidx].ln.namep);
+		else {
+		   strcat (str, argv[1]);
+		   strcat (str, "/");
+		   strcat (str, file[filidx].ln.lname);
+		}
+	    }
+	    else
+		strcat (str, file[filidx].ln.namep);
+	return(str);
+}
+
+char *
+catargs(str, argv)
+char *str;
+char *argv[];
+{
+	register int i;
+	char *cp;
+
+	for (++argv; *argv; argv++) {
+		if (**argv == '-') {
+		  cp = &(**argv) + 1;
+		  if (*cp != 'f' && *cp != 'F' && *cp != 'd') {
+			strcat(str, *argv);
+			strcat(str, " ");
+		  }
+		}
+	}
+	return(str);
+}
+
+overflow()
+{
+    printf("\n?Too many files\007\n");
+    unsetdpy();
+    sleep(1);		/* So user can see it - don't worry if less */
+    exit(1);
+}
+
+char *skipto (string,charset)
+char *charset,*string;
+{
+	register char *setp,*strp;
+	register int found;
+
+	found = 0;			/* not found yet */
+	strp = string;			/* start at first char */
+
+	while (*strp && !found) {	/* until null or found */
+		/* find first char in charset matching *strp */
+		for (setp=charset; (*setp) && (*setp != *strp); setp++) ;
+		if (*setp)	found = 1;	/* matches a char */
+		else		strp++;		/* else keep looking */
+	}
+
+	return (strp);
+}
+
+!Funky!Stuff!
+echo x - dired.hlp
+cat >dired.hlp <<'!Funky!Stuff!'
+Dired commands:
+	ESC		cancel count or sort
+	<space>		clear bottom half of screen, show dir name
+	<crlf>, ^N, j	go to next entry (may be preceded by a count)
+	^, -,k,<bs>,^P 	go to previous entry (may be preceded by a count)
+	! cmd		execute 'cmd', replacing % by full pathname, # by tail
+	.		executes last '!' cmd, substituting current filename
+	\		toggle split-screen mode
+	/		select file matching regular expression
+	a		aborts out of current directory
+	A		aborts out completely
+	b		backward a window (may be preceded by a count)
+	c		refresh current line
+	d		mark current entry for deletion
+	e		edit current entry via editor or via dired if directory
+	E		goes up to parent dir
+	f		forward a window (may be preceded by a count)
+	^G		display file number, total # of files.
+	G		goto last file. When preceded by a count, goes
+			to that file number as in "vi".
+	h, ?		display this help blurb
+	l, ^L	     	refresh current window
+	m		Use 'more' to display the current entry.
+	n		next instance matching the pattern prev defined
+	N		same as 'n' except going up
+	P		print current entry on line printer 
+	p		display full pathname of current selection
+	q		exit.  Prompts for deletion of marked files
+	Q		exit, pushd's you into the dir of the current
+			file
+	r [n,r,s,w]	reverse sort by name/read date/size/write date
+	R		re-read dir. Prompts for deletion of marked files
+	s		same as r but normal sort
+	t		type current entry on terminal; pause in 2 window mode,
+			abort with 'q' or interrupt (^C).
+	T		type current entry on terminal, no pause.
+	u		undelete current entry
+!Funky!Stuff!
+echo x - dired.1
+cat >dired.1 <<'!Funky!Stuff!'
+.TH DIRED LOCAL
+.SH NAME
+dired \- directory editor
+.SH SYNOPSIS
+.B dired
+.nf
+[ \-[s|r][nsrw] ] [ \-w[f|h|number] ] [ [dir-name|file-list] ]
+.fi
+.SH DESCRIPTION
+Dired displays a long-form ls directory listing
+on the screen
+of a display terminal and allows you to 'edit' and peruse that listing by
+moving up and down it, deleting, editing, and displaying entries.
+Your shell TERM variable should be set to the standard
+string which the Berkeley termcap library uses for distinguishing
+terminals.
+With no argument, the connected directory is used. With only one
+argument, if that argument is a directory, it is used.
+With multiple arguments, (or a single non-directory argument) the argument(s)
+are interpreted as filenames.
+Dired then types 'Reading' and gets information about the various
+files/directories in your specification. This may take a short while
+(depending on how many you give it), so it types one period (.) after
+the word 'reading' for
+every 10 files it has gathered information about. With this, you
+can keep track of its progress. Interrupts, hangups, and the like
+are disabled since your terminal is put into a special mode that
+is only changed when you quit with the 'q' command.
+.PP
+Options, which are inherited by recursive invocations of dired:
+.TP
+.B \-[sr][n|s|r|w]
+Sort or reverse sort by Name, Size, Read date, or Write date respectively.
+"Normal sort" is the order you are most likely to desire, so is largest first
+for size, and most recent for read and write date sorts.  Default is to
+sort by name.
+.TP
+.B \-w[f|h|number]
+Use 
+.B number
+lines for the directory index window, reserving the other half for quick
+file display.
+.B f
+means use the full screen for the index.
+.B h
+means use half of the screen for the index.
+.B h
+is the default.
+.PP
+The format of the screen is as follows: each line represents a file (or
+directory), the name of which is right-most. From left the fields
+are: mode, link count, owner, size, write date and name. See ls(1)
+for a description of what each of these mean. You move up and down
+the column immediately left to the filename.  The bottom
+half of the screen is used for displaying files via the 't'ype command.
+If there are too many files to all fit on one window, more windows
+are allocated. The 'f' and 'b' commands can be used for stepping forward
+and backward windows.
+The last screen line is used as an 'echo' line for displaying error messages
+and reading arguments.
+It also displays the full directory name if 'direding' a directory.
+When in split screen mode, the divider serves also as a 'linear indicator'
+showing where the
+current window is relative to the entire list of files.
+The symbols '(' and ')' denote the window. Square brackets replace 
+ '(' and/or ')' when the window is the first and/or last window.
+A single 'o' is used to represent the window when the window size is small 
+compared to the total number of
+files.
+
+Commands consist of single characters, with any necessary arguments
+prompted for, and echoed in the 'echo' line. The only commands which
+take arguments are '!' (exclamation point), 'r', and 's'.
+The commands 'G', 'f, 'b', and the commands for moving up and down (e.g. <cr>
+and '-') may be preceded by a count as in 'vi'.
+
+Command list:
+.TP 5
+.RB <space>
+re-prints the dir path name.
+.TP 5
+.RB <ESC>
+cancels a sort or a count.
+.br
+.ns
+.TP 5
+.RB <lf>
+.br
+.ns
+.TP 5
+.RB ^N
+.br
+.ns
+.TP 5
+.RB j
+.br
+.ns
+steps to the next file. If this crosses a window boundary, the
+next window is displayed with a one line overlap. May be preceded by
+a count.
+.TP 5
+.RB ^
+.br
+.ns
+.TP 5
+.RB -
+.br
+.ns
+.TP 5
+.RB k
+.br
+.ns
+.TP 5
+.RB <backspace>
+.br
+.ns
+.TP 5
+.RB ^P
+steps to previous file. If this crosses a window boundary, the
+previous window is displayed with a one line overlap. May be preceded by
+a count
+.TP 5
+.RB !
+prompts for a system command to invoke. The command is executed,
+and confirmation is required before returning to the display.  
+All
+.B %
+characters in the command are replaced with the full pathname of the current
+entry, and all
+.B #
+chars are replaced with just the trailing filename component
+(what you see on the screen).
+.TP 5
+.RB .
+Repeats the previous
+.B !
+shell command, substituting the current entry for any special chars (%#)
+in the original command.
+.TP 5
+.RB \e
+changes from split-screen mode to full-screen mode, or vice-versa.
+.TP 5
+.RB /
+locates a file matching the given regular expression, where the
+expressions are as defined for re_comp(3) and re_exec(3). The search
+occurs in the forward direction. 
+.TP 5
+.RB a
+aborts out of the current directory. No deletions are done.
+.TP 5
+.RB A
+aborts completely out of dired, with no deletions.
+.TP 5
+.RB b
+goes backward a window, leaving a one line overlap. May be preceded by a
+count.
+.TP 5
+.RB c
+refreshes the current line.
+.TP 5
+.RB d
+marks for deletion the current entry. Upon exit and confirmation
+(or re-reading using the 'R' command), this entry will be deleted.  WARNING: 
+this includes directories!
+If it is a directory, everything in it and underneath it will be
+removed.
+.TP 5
+.RB e
+runs the editor defined in your EDITOR environment variable
+upon the current file.  If EDITOR is not defined, 'vi' is used.
+However, if the current
+file is a directory it is not edited, but rather, dired forks
+a copy of itself upon that directory. In this manner, you can
+examine the contents of that directory and thus move down
+the directory hierarchy.
+.TP 5
+.RB E
+goes up to the next higher level directory. In the case of an
+argument list of files to dired, it goes to the parent of the directory which
+contains the current file.
+.TP 5
+.RB f
+goes forward a window, leaving a one line overlap.  May be preceded by a
+count.
+.TP 5
+.RB <control G>
+shows the current file number, the total number of files, and the
+percentage through the file. Useful in full screen mode when there is no
+linear indicator.
+.TP 5
+.RB G
+goes to the file number given by the preceding count. With no count,
+goes to the last file as in 'vi'.
+.br
+.ns
+.TP 5
+.RB ?
+displays a help file.
+.TP 5
+.RB l
+.br
+.ns
+.TP 5
+.RB ^L
+refreshes the current window.
+.TP 5
+.RB m
+runs Berkeley's
+.B more
+program on the current entry.
+.TP 5
+.RB n
+find the next instance of the previously defined reg expression,
+searching in the forward direction.
+.TP 5
+.RB N
+find the next instance of the previously defined reg expression,
+searching in the reverse direction.
+.TP 5
+.RB p
+prints the full path name of the current file.
+.TP 5
+.RB P
+prints the current file on the line-printer.
+.TP 5
+.RB q
+exits the program, displaying files marked for deletion and requiring
+confirmation before deleting them. If no confirmation is given
+(typing anything other than y), dired goes back to its display.
+.TP 5
+.RB R
+re-reads the directory or file list. If files are marked for deletion,
+will first ask for confirmation and then delete them before re-reading.
+Useful after operations done during shell escapes (e.g. chmod).
+.TP 5
+.RB Q
+quits dired, with no deletions, pushd's you into the dir of the current
+file.
+.TP 5
+.RB r
+.br
+.ns
+.TP 5
+.RB s
+sorts the file list by various fields: name, read date, size, write
+date. Only the first letter (e.g. n, r, s, or w) is required after
+giving the r and s commands. s sorts in increasing alphabetic, decreasing
+size, newest to oldest dates. r reverses the sense of s. For the
+n, s, and w subcommands, the date field is the write date. For
+the r subcommand, the date field is the read date. Whenever a sort
+is done, you are positioned at the top of the list afterwards.
+A sort can be aborted via <ESC>.
+.TP 5
+.RB t
+types the file out to the terminal, which is
+considerably faster than firing up an editor on the file. If
+in two-window mode, the bottom window is used, pausing after
+each screenful.
+The type-out may be interrupted by Ctrl-C or 'q'.
+.TP 5
+.RB T
+same as 't' but without any pauses.
+.TP 5
+.RB u
+undeletes the current entry, if it was previously marked for deletion.
+.SH FILES
+ /usr/local/dired
+ /usr/local/src/dired.c      source file
+ /usr/local/dired.hlp    help file for ? and h
+.SH SEE ALSO
+ls(1)
+.SH DIAGNOSTICS
+The error messages are basically self-explanatory.
+.SH AUTHOR
+Stuart Mclure Cracraft
+.br
+Enhancements by Jay Lepreau
+.br
+Fixes and enhancements by Charles Hill
+.SH BUGS
+Long lines sometimes screw up the 't' display.
+.br
+!Funky!Stuff!
+
+

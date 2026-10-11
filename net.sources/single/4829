@@ -1,0 +1,438 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,56b1e525eda8a300,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-09-05 08:26:15 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!mnetor!seismo!caip!clyde!burl!ulysses!mhuxr!mhuxt!houxm!ihnp4!icom!andy
+From: andy@icom.UUCP (Andrew H. Marrinson)
+Newsgroups: net.sources
+Subject: cmail a small program to crack headers
+Message-ID: <683@icom.UUCP>
+Date: Fri, 5-Sep-86 11:26:15 EDT
+Article-I.D.: icom.683
+Posted: Fri Sep  5 11:26:15 1986
+Date-Received: Sat, 6-Sep-86 20:27:16 EDT
+Distribution: net
+Organization: ICOM Sys., Arlington Hts, IL
+Lines: 418
+
+This is the program I use to do the header cracking for smail.  Smail as
+written relies on sendmail for this.  I do not run sendmail, nor would I
+want to.  This program gives me the small part of sendmail that I do want.
+Note that I have not read the RFC's involved.  My knowledge of headers was
+gleaned from such semi-reliable places as the Usenet documentation.
+
+Anyway, the README describes how to set it up on your system.  Hope someone
+finds this useful.  I would be interested in hearing about any
+hacks/changes/improvements.
+
+--------------------- cut here, run through sh --------------------------
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#	README
+#	cmail.c
+# This archive created: Fri Sep  5 10:21:27 1986
+export PATH; PATH=/bin:$PATH
+echo shar: extracting "'README'" '(1595 characters)'
+if test -f 'README'
+then
+	echo shar: will not over-write existing file "'README'"
+else
+sed 's/^	X//' << \SHAR_EOF > 'README'
+	XThis little program reads a mail message from the standard input and parses
+	Xthe headers as follows:
+	X
+	X	To, Cc - parsed into command line arguments for smail, and copied
+	X		 to the output
+	X	Bcc - parsed into command line arguments, not copied to the output
+	X	From - copied to standard output
+	X	Message-ID, Date, Sender - deleted from the message
+	X
+	XAnything else that looks like a header is copied to the output without being
+	Xprocessed in any way.  Cmail recognizes the end of the headers when it sees
+	Xa completely blank line.  It also assumes that anything that doesn't look
+	Xlike a header (i.e., that doesn't match the RE '^[^ \t]*:' ends the headers,
+	Xbut it prints a warning in this case.  Before copying the first non-header
+	Xline, it outputs Message-ID, and Date headers.  If a From header was found
+	Xin the input it outputs a Sender header, otherwise it outputs a From header.
+	X
+	XTo install this program on your system:
+	X
+	X1) Edit the SMAIL, FULLHOSTNAME, and HOSTDOMAIN defines near the beginning
+	X   of the program appropriately for your system.
+	X
+	X2) Compile with "cc -O -o cmail cmail.c".
+	X
+	X3) Copy it to an executable directory (e.g. /usr/local/bin or /usr/bin).
+	X
+	XThe program was written for use with a hacked up Gosling mailer.  This
+	Xmailer is not available as it is an embarrasment to mankind, and includes
+	Xcopyrighted code from the emacs distribution.  It can also be used from vi
+	X(I am told) using the !! command.
+	X
+	XGood Luck and Have Fun!
+	X
+	X	andy@icom.UUCP
+	X	Or for those of		Andrew H. Marrinson
+	X	you who wish to		ICOM Systems, Inc.
+	X	play it the hard	Arlington Heights, IL 60005
+	X	way: ihnp4!icom!andy
+SHAR_EOF
+if test 1595 -ne "`wc -c < 'README'`"
+then
+	echo shar: error transmitting "'README'" '(should have been 1595 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'cmail.c'" '(10064 characters)'
+if test -f 'cmail.c'
+then
+	echo shar: will not over-write existing file "'cmail.c'"
+else
+sed 's/^	X//' << \SHAR_EOF > 'cmail.c'
+	X/* system include files */
+	X#include <stdio.h>
+	X#include <pwd.h>
+	X#include <sys/utsname.h>
+	X#include <string.h>
+	X#include <time.h>
+	X#include <fcntl.h>
+	X#include <ctype.h>
+	X
+	X
+	X/* local parameters */
+	X#ifdef DEBUG
+	X#define SMAIL "../smail"
+	X#else
+	X#define SMAIL "/bin/smail"
+	X#endif
+	X#define FULLHOSTNAME "Icom Systems, Inc."
+	X#define HOSTDOMAIN "UUCP"
+	X
+	X
+	X/* external routines */
+	Xchar *mktemp();
+	Xint umask();
+	Xint getpid();
+	Xint getuid();
+	Xstruct passwd *getpwuid();
+	Xint uname();
+	Xvoid endpwent();
+	Xlong time();
+	Xstruct tm *gmtime();
+	Xchar *malloc();
+	Xvoid free();
+	Xvoid exit();
+	X
+	X
+	X/* global variables */
+	Xchar *tfn = "/tmp/cmXXXXXX";	/* temporary file name (filled in with
+	X				   mktemp(3)) */
+	XFILE *ofile;			/* temp. file in which the mail is stored */
+	Xint pid;			/* process id for use in message-id header */
+	Xchar *name;			/* user name for use in from or sender header
+	X				   */
+	Xchar *fname;			/* full user name for use in from or sender
+	X				   header */
+	Xchar *hname;			/* host name for use in from or sender header
+	X				   */
+	Xchar *hdom;			/* host domain for use in from or sender
+	X				   header */
+	Xchar *fhname;			/* full host name for use in from or sender
+	X				   header */
+	Xlong now;			/* current date and time (numeric) */
+	Xstruct tm *nows;		/* broken out date and time (GMT) for use in
+	X				   date header */
+	Xint forged = 0;			/* this flag will be set if from line is
+	X				   encountered in the input */
+	Xchar *cvec[100] = {		/* command to be executed, addresses will */
+	X    SMAIL			/* be filled in as they are parsed */
+	X#ifdef DEBUG
+	X    , "-d"			/* run smail in debugging mode */
+	X#endif
+	X};
+	X#ifdef DEBUG
+	Xint nextvec = 2;		/* next location in cvec to be filled */
+	X#else
+	Xint nextvec = 1;		/* next location in cvec to be filled */
+	X#endif
+	X
+	X
+	X/* forward declarations */
+	Xint hparse();			/* parse header & determine type */
+	Xvoid address();			/* parse and save addresses */
+	Xvoid doheads();			/* print system supplied headers */
+	Xvoid error();			/* print error message and exit */
+	Xvoid warn();			/* print warning message */
+	X
+	X
+	Xmain()
+	X
+	X{
+	X    int cmask;			/* holds umask while we change it */
+	X    int uid;			/* user id field to find password entry */
+	X    struct passwd *pwent;	/* password entry, for info to use in
+	X				   from or sender header */
+	X    struct utsname uts;		/* uname structure to get host name */
+	X    int inhead;			/* flag, non-zero if still in headers */
+	X    static char buf[4096];	/* line buffer */
+	X    char *field;		/* points to field parsed by hparse (just
+	X				   past :[ \t]+) */
+	X#ifdef DEBUG
+	X    char **cpp;			/* used to display the command used */
+	X#endif
+	X
+	X    /* create the temporary file */
+	X    (void) mktemp(tfn);		/* create temporary file name */
+	X    cmask = umask(0077);	/* no one else should be able to read it */
+	X    ofile = fopen(tfn, "w");	/* open it for writing */
+	X    (void) umask(cmask);	/* restore old mask */
+	X
+	X    /* get relevant system info */
+	X    pid = getpid();		/* process id for use in the message id */
+	X    uid = getuid();		/* now get the users name */
+	X    if ((pwent = getpwuid(uid)) == NULL)
+	X	error("unable to determine user name");
+	X    endpwent();			/* close password file */
+	X    name = pwent->pw_name;	/* save user name */
+	X    fname = pwent->pw_gecos;	/* this may be his long name */
+	X    if (*fname == '\0' || strpbrk(fname, "()="))
+	X	fname = name;		/* use short name, if it is empty or gecos */
+	X    (void) uname(&uts);		/* get uname structure */
+	X    hname = uts.nodename;	/* save hostname */
+	X    fhname = FULLHOSTNAME;	/* sadly, there is no system location */
+	X    hdom = HOSTDOMAIN;		/* for these two fields */
+	X    (void) time(&now);		/* get current numeric time for mesg id */
+	X    nows = gmtime(&now);	/* get structure with greenwich mean time */
+	X
+	X    /* copy the mail to the temp. file, fixing up the headers
+	X	and keeping track of the addresses */
+	X    inhead = 1;			/* yes, we are reading headers now */
+	X    while (fgets(buf, sizeof(buf), stdin)) {
+	X
+	X	/* handle headers */
+	X	if (inhead) {
+	X	    switch (hparse(buf, &field)) {
+	X		case 'T':	/* To: and Cc: fields, parse addresses */
+	X		case 'C':	/* and copy to output */
+	X		    address(field);
+	X		    break;
+	X		case 'B':	/* Bcc: field, parse addr., do not copy */
+	X		    address(field);
+	X		    continue;	/* skip the copy at end of while */
+	X		case 'F':	/* From:, set forged flag & copy */
+	X		    ++forged;
+	X		    break;
+	X		case 'M':	/* Message-ID:, Date:, Sender:, must */
+	X		case 'D':	/* never bes specified by the user */
+	X		case 'S':	/* ignore them */
+	X		    continue;
+	X		case 'X':	/* any other header will be copied */
+	X		    break;
+	X		case '?':	/* This is returned when something that
+	X				   doesnt look like a header is found. We
+	X				   print a warning, and output a newline to
+	X				   seperate the headers from what we assume
+	X				   is the body */
+	X		    warn("non-header line in header, end of headers assumed");
+	X		    inhead = 0;	/* mark it, and copy the line */
+	X		    doheads();	/* generate the remaining headers */
+	X		    putc('\n', ofile);
+	X		    break;	/* print the first body line after the extra
+	X				   newline */
+	X		case 'Z':	/* we have found the end of the headers */
+	X		    inhead = 0;	/* mark it, and copy the line */
+	X		    doheads();	/* generate the remaining headers */
+	X		    break;	/* don't forget to print the first body line */
+	X	    }
+	X	}
+	X	/* copy line to temp. file */
+	X	fputs(buf, ofile);
+	X    }
+	X
+	X    /* pass the resulting file to smail */
+	X    fclose(ofile);		/* close it */
+	X    if (nextvec == 1)		/* if no addresses, give error mesg. */
+	X	error("no addresses specified");
+	X#ifdef DEBUG
+	X    cpp = cvec;			/* echo the command we will use */
+	X    do
+	X	printf("%s%s", *cpp ? *cpp : "\n", *cpp ? " " : "-------\n");
+	X    while (*cpp++);
+	X#endif
+	X    close(0);			/* close std. input, so we can redirect */
+	X    (void) open(tfn, O_RDONLY);	/* now temp. file is standard input */
+	X    (void) unlink(tfn);		/* unlink, file will be removed when closed */
+	X    cvec[nextvec] = NULL;	/* finish off the argv list for exec */
+	X    execv(cvec[0], cvec);	/* exec smail, with temp. file as stdin */
+	X    error("unable to exec smail");
+	X    /* NOTREACHED */
+	X}
+	X
+	X
+	Xint hparse(line, field)
+	X
+	Xchar *line;
+	Xchar **field;
+	X
+	X{
+	X    static char lasthead = '?';	/* last header seen, return assumed end of
+	X				   header if first line starts with white */
+	X    static struct ht {		/* table of recognized headers */
+	X	int hlen;		/* length of header including ':' */
+	X	char *hstr;		/* header string, e.g. "From:" */
+	X    } htable[] = {
+	X	 3, "To:",
+	X	 3, "Cc:",
+	X	 4, "Bcc:",
+	X	 5, "From:",
+	X	11, "Message-ID:",
+	X	 5, "Date:",
+	X	 7, "Sender:",
+	X	 0, NULL
+	X    };
+	X    struct ht *p;		/* pointer to cycle through the above table */
+	X    char *cp;			/* aux. char pointer for guessing about
+	X				   unknown headers */
+	X
+	X    /* if line starts with white space, return last header type */
+	X    if (*line == ' ' || *line == '\t')
+	X	return lasthead;
+	X
+	X    /* cycle through table looking for a match */
+	X    for (p = htable; p->hlen != 0; ++p) {
+	X	if (strncmp(p->hstr, line, p->hlen) != 0)
+	X	    continue;		/* no match, try next */
+	X
+	X	/* we have matched headers, return a pointer to first non-space
+	X	   past ':' in field */
+	X	line += p->hlen;	/* point past ':' */
+	X	*field = line+strspn(line, " \t");
+	X	return lasthead = *p->hstr;
+	X    }
+	X
+	X    /* if no match was found, see if it looks like a header, note that
+	X       we need not set field in this case */
+	X    if ((cp = strpbrk(line, " \t:")) != NULL && *cp == ':')
+	X	return lasthead = 'X';	/* yep, it appears to be a header */
+	X
+	X    /* otherwise, return whether or not we are sure this is end of headers */
+	X    return (*line == '\n') ? 'Z' : '?';
+	X}
+	X
+	X
+	Xvoid address(alist)
+	X
+	Xchar *alist;
+	X
+	X{
+	X    char *p;			/* pointer used to cycle through addresses */
+	X    char *cp;			/* auxilliary pointer used to further parse
+	X				   the indivual addresses */
+	X
+	X    /* make a copy of the address list so we can split it with strtok(3) */
+	X    p = malloc((unsigned) (strlen(alist)+1));
+	X    alist = strcpy(p, alist);	/* copy the address list */
+	X
+	X    /* cycle through the list, splitting on commas */
+	X    for (p = strtok(alist, ",\n"); p != NULL; p = strtok(NULL, ",\n")) {
+	X
+	X	/* addresses take two general forms:
+	X		addr [ (comment) ], and
+	X		[ comment ] < addr >
+	X	   The following code deletes the comments.  It makes the
+	X	   simplifying assumption that there will be nothing valid
+	X	   following a '(' even outside the corresponding ')' */
+	X	if ((cp = strchr(p, '(')) != NULL)
+	X	    *cp = '\0';		/* ignore comment */
+	X	else if ((cp = strchr(p, '<')) != NULL) {
+	X	    p = cp+1;		/* change starting point to after '<' */
+	X	    if ((cp = strchr(p, '>')) != NULL)
+	X		*cp = '\0';	/* change end to before '>' */
+	X	}
+	X
+	X	/* now strip leading and trailing blanks, and turn all others into
+	X	   '.'s */
+	X	while (isspace(*p))
+	X	    ++p;		/* skip leading space */
+	X	for (cp = p; *cp != '\0'; ++cp) {
+	X	    if (isspace(*cp))
+	X		*cp = '.';	/* convert spaces to dots */
+	X	}
+	X	while (*--cp == '.') ;	/* back up to first no-dot */
+	X	*++cp = '\0';		/* and there is the end of the address */
+	X
+	X	/* now make a copy of the string using malloc and store it in
+	X	   list */
+	X	if ((cp = malloc((unsigned) (cp-p+1))) == NULL)
+	X	    error("out of memory");
+	X	cvec[nextvec++] = strcpy(cp, p);
+	X    }
+	X    free(alist);		/* return copied alist to heap */
+	X}
+	X
+	X
+	Xvoid doheads()
+	X
+	X{
+	X    static char *month[] = {
+	X	"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+	X	"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+	X    };
+	X    static char *day[] = {
+	X	"Sun", "Mon", "Tue", "Wed",
+	X	"Thu", "Fri", "Sat"
+	X    };
+	X
+	X    /* print the from or sender header (depending on the forged flag) */
+	X    fprintf(ofile, "%s: %s@%s.%s (%s at %s)\n", forged ? "Sender" : "From",
+	X		name, hname, hdom, fname, fhname);
+	X
+	X    /* print the date header */
+	X    fprintf(ofile, "Date: %.2d %s %.2d %.2d:%.2d:%.2d GMT (%s)\n",
+	X		nows->tm_mday, month[nows->tm_mon], nows->tm_year%100,
+	X		nows->tm_hour, nows->tm_min, nows->tm_sec,
+	X		day[nows->tm_wday]);
+	X
+	X    /* print the message ID header */
+	X    fprintf(ofile, "Message-ID: <%lu%.5u@%s.%s>\n", now, pid, hname, hdom);
+	X}
+	X
+	X
+	Xvoid error(s)
+	X
+	Xchar *s;
+	X
+	X{
+	X    fprintf(stderr, "cmail: %s\n", s);
+	X    (void) unlink(tfn);		/* unlink the temporary file */
+	X    exit(1);
+	X}
+	X
+	X
+	Xvoid warn(s)
+	X
+	Xchar *s;
+	X
+	X{
+	X    fprintf(stderr, "cmail: warning: %s\n", s);
+	X}
+SHAR_EOF
+if test 10064 -ne "`wc -c < 'cmail.c'`"
+then
+	echo shar: error transmitting "'cmail.c'" '(should have been 10064 characters)'
+fi
+fi # end of overwriting check
+#	End of shell archive
+exit 0
+-- 
+
+	andy@icom.UUCP
+	Or for those of		Andrew H. Marrinson
+	you who wish to		ICOM Systems, Inc.
+	play it the hard	Arlington Heights, IL 60005
+	way: ihnp4!icom!andy
+
+

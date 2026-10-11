@@ -1,0 +1,2052 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,1d3347df469e677a,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1992-09-08 06:28:42 PST
+Path: sparky!uunet!zephyr.ens.tek.com!master!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v14i081:  okbridge2 - computer-mediated bridge game, Part03/14
+Message-ID: <3520@master.CNA.TEK.COM>
+Date: 7 Sep 92 21:41:15 GMT
+Sender: news@master.CNA.TEK.COM
+Lines: 2036
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: mclegg@cs.UCSD.EDU (Matthew Clegg)
+Posting-number: Volume 14, Issue 81
+Archive-name: okbridge2/Part03
+Supersedes: okbridge: Volume 13, Issue 16-22
+Environment: BSD-derived Unix, NeXT, curses, sockets
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 14)."
+# Contents:  bridge.c
+# Wrapped by billr@saab on Mon Sep  7 14:33:36 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'bridge.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'bridge.c'\"
+else
+echo shar: Extracting \"'bridge.c'\" \(51146 characters\)
+sed "s/^X//" >'bridge.c' <<'END_OF_FILE'
+X/* bridge.c
+X *
+X ! Copyright (C) 1990-1992 by Matthew Clegg.  All Rights Reserved
+X ! 
+X ! OKbridge is made available as a free service to the Internet.
+X ! Accordingly, the following restrictions are placed on its use:
+X ! 
+X ! 1.  OKbridge may not be modified in any way without the explicit 
+X !     permission of Matthew Clegg.  
+X ! 
+X ! 2.  OKbridge may not be used in any way for commercial advantage.
+X !     It may not be placed on for-profit networks or on for-profit
+X !     computer systems.  It may not be bundled as part of a package
+X !     or service provided by a for-profit organization.
+X ! 
+X ! If you have questions about restrictions on the use of OKbridge,
+X ! write to mclegg@cs.ucsd.edu.
+X ! 
+X ! DISCLAIMER:  The user of OKbridge accepts full responsibility for any
+X ! damage which may be caused by OKbridge.
+X *
+X * This file contains an implementation of a computer-moderated
+X * bridge program.  The program serves as a mediator allowing
+X * four people on separate systems to cooperate in a bridge game.
+X * The game is screen oriented and interactive, although the display
+X * is very simple.  The program handles the shuffling and dealing
+X * of the cards, and it prompts each player for input when it is
+X * his turn.  The lower area of the screen is a dialog box, where
+X * players may enter comments that will be seen by the others.
+X *
+X *
+X */
+X 
+X#define _BRIDGE_
+X 
+X#define random(n) ((rand()/64) % (n))
+X#include <sys/time.h>
+X#include <sys/resource.h>
+X#include <setjmp.h>
+X#include <signal.h>
+X#include <stdio.h>
+X#include <sys/types.h>
+X
+X#ifdef AIX
+X#include <time.h>
+X#endif
+X#include <string.h>
+X
+X#include "state.h"
+X#include "parser.h"
+X#include "display.h"
+X#include "input.h"
+X#include "terminal.h"
+X#include "conversation.h"
+X
+X#include "cs.h"
+X#include "help.h"
+X#include "gps.h"
+X#include "scoring.h"
+X#include "rc.h"
+X#include "log.h"
+X
+X#define  VISIBLE(table) 1
+Xextern int errno;
+Xextern char *sys_errlist[];
+Xextern char *getenv ();
+Xextern void srand ();
+Xextern int  atoi ();
+Xextern void exit ();
+X/* extern void kill (); */
+X
+X#ifdef GCC
+Xextern int  getpid ();
+Xextern time_t time ();
+Xextern fclose (), fflush (), printf (), fprintf (), strcasecmp (), 
+X  gettimeofday ();
+X#endif
+X
+X#ifdef DEBUG
+Xextern getrlimit (), setrlimit ();
+X#endif
+X
+X
+Xextern int network_port;
+Xextern int server_mode;
+Xextern int claim_in_progress;
+Xextern int pause_mode;
+X
+Xint server_mode_requested = 0; /* TRUE if user has requested server mode. */
+Xint client_mode_requested = 0; /* TRUE if user has requested client mode. */
+X
+Xint save_defaults = 1;         /* TRUE if we should save some of the 
+X				  flags controlling the program in a 
+X				  defaults file. */
+X
+Xlong startup_time;             /* The time in seconds at which the program
+X				  was first started. */
+X
+X#ifdef LOGFILE
+X  extern FILE *net_log;
+X#endif
+X
+Xextern char *strdup ();
+Xextern void Broadcast_Comment ();
+X
+Xextern char *autoload_file, *autosave_file;
+X
+XFILE *logfile = NULL;  /* The file where we log the hands that have
+X			. been played. */
+XFILE *zhang_logfile = NULL; 
+X                       /* The file where we log hands that are written
+X			  in Zhang's format. */
+Xint table_no = -1;     /* Table number printed in Szhang format log files. */
+X
+Xhand saved_hands [4];  /* The cards as they were dealt. */
+Xhand saved_plays [4];  /* The cards as they were played. */
+Xint  leading_play [14];/* The leading player for each trick. */
+X
+Xstatic int prompt_before_hand = 1;
+X        /* A flag which indicates that the server should be given
+X           the opportunity to delay the beginning of the hand. */
+X
+Xstatic jmp_buf error_return;
+Xstatic jmp_buf reset_buf;
+X
+Xstatic int     abort_flag;
+X 
+Xstatic void randomize ()
+X{
+X  srand (time(NULL));
+X}
+X
+Xint bidding_code (bid_type, level, suit)
+X    int bid_type, level, suit;
+X/* Given the bidding type, as above, and the level and suit if it is
+X * a contract bid, returns a unique integer in the range 0-37 associated
+X * with the bid.  Contract bids are ordered in increasing order, so that
+X * 1C is the smallest and 7NT is the largest.
+X */
+X{
+X  switch (bid_type) {
+X  case BID_PASS:     return (BID_PASS);
+X  case BID_DOUBLE:   return (BID_DOUBLE);
+X  case BID_REDOUBLE: return (BID_REDOUBLE);
+X  case BID_SUIT:     return (5 * (level - 1) + suit + 3);
+X  default:	   ;
+X  }
+X  return (-1);
+X}
+X
+Xstatic void Initiate_Skip_Mode (t)
+X     Table t;
+X{
+X  int i;
+X
+X  Send_skipack (t);
+X
+X  if (!server_mode) {
+X    t->game_mode = STARTUP_MODE;
+X    return;
+X  }
+X
+X  for (i = 0; i < 4; i++)
+X    if (OCCUPIED(t, i))
+X      t->Seats[i].skipping = 1;
+X
+X}
+X
+Xstatic int Handle_event_in_Skip_Mode (t, c)
+X     Table t;
+X     player_command c;
+X{
+X  int i;
+X
+X  switch (c->command) {
+X  case CMD_SKIPACK:
+X    t->Seats[c->player_no].skipping = 0;
+X    for (i = 0; i < 4; i++)
+X      if (OCCUPIED(t, i) && t->Seats[i].skipping)
+X	return (0);
+X    t->game_mode = STARTUP_MODE;
+X    return (1);
+X    break;
+X
+X  default:
+X    break;
+X  }
+X  return (0);
+X}
+X
+Xstatic void Initiate_Deal_Mode_if_Appropriate (t)
+X     Table t;
+X{
+X  int i, n;
+X  int ready_to_deal = 0;
+X
+X  if (!server_mode)
+X    return;
+X
+X  for (i = n = 0; i < 4; i++)
+X    if (t->Seats[i].occupied)
+X      n++;
+X
+X  if ((t->playing_mode == PRACTICE_PLAYING_MODE) && (n > 0))
+X    ready_to_deal = 1;
+X  else if (n == 4)
+X    ready_to_deal = 1;
+X  else 
+X    ready_to_deal = 0;
+X
+X  if (ready_to_deal && VISIBLE(t)) {
+X    if (prompt_before_hand) {
+X      Pause
+X	( (hands_played == 0)?
+X	 "PRESS <ESC> TO DEAL THE FIRST HAND ..." :
+X	 "PRESS <ESC> FOR THE NEXT HAND ..."   );
+X
+X      for (i = n = 0; i < 4; i++)
+X	if (t->Seats[i].occupied)
+X	  n++;
+X    }
+X
+X    if ((t->playing_mode == PRACTICE_PLAYING_MODE) && (n > 0))
+X      ready_to_deal = 1;
+X    else if (n == 4)
+X      ready_to_deal = 1;
+X    else 
+X      ready_to_deal = 0;
+X
+X    prompt_before_hand = prompt_before_hand && !ready_to_deal &&
+X      IS_PLAYER(local_player) && prompt_dummy;
+X
+X  } else if (!ready_to_deal)
+X    prompt_before_hand = IS_PLAYER(local_player) && prompt_dummy;
+X
+X  if (ready_to_deal)
+X    Send_deal (t);
+X}
+X
+Xstatic void Sequencing_Error (s)
+X     char *s;
+X{
+X  char buf[100];
+X
+X  sprintf (buf, "SEQUENCING ERROR: %s", s);
+X  Moderator_Comment (buf);
+X}
+X
+Xstatic void Initiate_Startup_Mode (t)
+X     Table t;
+X/* Perform setup processing when we first enter startup mode. */
+X{
+X  t->game_mode = STARTUP_MODE;
+X  Local_Player_Connection->spectator = 0;
+X  spectator_mode = 0;
+X  Clear_Spectators (t);
+X  Initiate_Deal_Mode_if_Appropriate (t);
+X}
+X
+Xstatic int Handle_event_in_Startup_Mode (t, b, p, c)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X     player_command c;
+X/* Handles an event while we are in startup mode.  Returns 0 if the event
+X   causes us to remain in startup mode, and 1 if we advance to bidding mode.
+X*/
+X{
+X  switch (c->command) {
+X
+X  case CMD_HELLO:
+X  case CMD_SEAT:
+X  case CMD_ACK:
+X  case CMD_SEATPOS:
+X    Initiate_Deal_Mode_if_Appropriate (t);
+X    return (t->game_mode != STARTUP_MODE);
+X    break;
+X
+X  case CMD_DEAL:
+X    t->game_mode = DEALING_MODE;
+X    return (1);
+X    break;
+X
+X  default:
+X    break;
+X  }
+X  return (0);
+X}
+X
+Xstatic void Initiate_Deal_Mode (t)
+X     Table t;
+X/* Perform setup processing when we enter deal mode. */
+X{
+X  Board *b;
+X  Play_record *p;
+X
+X
+X  if (!server_mode) {
+X    t->board = NULL;
+X    t->play_record = NULL;
+X    return;
+X  }
+X
+X  /* If we are the server, then it is our responsibility to shuffle
+X     and deal the cards. */
+X  b = NULL;
+X  if (t->playing_mode == PRACTICE_PLAYING_MODE) {
+X    if (gps_duplicate_mode)
+X      GPS_Dup ("END");
+X    gps_duplicate_mode = 0;
+X  }
+X
+X  if (gps_duplicate_mode) {
+X    b = GPS_Get_Next_Board ();
+X    if ((b != NULL) && (b->scoring_mode == MP_SCORING))
+X      Broadcast_Comment ("WE ARE PLAYING MATCH POINT DUPLICATE BRIDGE.");
+X    else if (b != NULL)
+X      Broadcast_Comment ("WE ARE PLAYING IMP DUPLICATE BRIDGE.");
+X  }
+X  
+X  if (b == NULL) {
+X    if (gps_duplicate_mode)
+X      GPS_Dup ("END");
+X    gps_duplicate_mode = 0;
+X    if (Board_is_Available())
+X      b = Next_Unplayed_Board();
+X    else if (scoring_mode == RUBBER_SCORING) {
+X      if ((t->below_line[0] >= 100) || (t->below_line[1] >= 100)) {
+X	t->above_line[0] += t->below_line[0];
+X	t->above_line[1] += t->below_line[1];
+X	t->below_line[0] = t->below_line[1] = 0;
+X      }
+X      if ((t->board != NULL) && (t->board->scoring_mode == RUBBER_SCORING))
+X	b = Generate_Random_Rubber_Board (t->board, t->play_record);
+X      else
+X	b = Generate_Random_Rubber_Board (NULL, NULL);
+X    } else {
+X      b = Generate_Random_Match_Board (scoring_mode, t->board);
+X    }
+X  }
+X
+X  Send_board (t, b);
+X  for (p = b->play_records; p != NULL; p = p->next)
+X    Send_record (t, b, p);
+X
+X  t->play_record = Locate_play_record_by_foursome
+X    (b, PLAYER_NAME(t,PLAYER_NORTH), PLAYER_NAME(t, PLAYER_EAST),
+X     PLAYER_NAME(t,PLAYER_SOUTH),  PLAYER_NAME(t, PLAYER_WEST));
+X  if ((p = t->play_record) != NULL) {
+X    Send_userec (t, 
+X		 p->player_names[PLAYER_NORTH], p->player_names[PLAYER_EAST], 
+X		 p->player_names[PLAYER_SOUTH], p->player_names[PLAYER_WEST]);
+X  }
+X
+X  Send_score (t, t->above_line, t->below_line);
+X  Send_mode  (t, t->playing_mode);
+X  Send_begin (t);
+X}
+X
+Xstatic int Handle_event_in_Deal_Mode (t, b, p, c)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X     player_command c;
+X/* Handles an event in deal mode.  Returns 0 if the event causes us to
+X   remain in deal mode, and 1 otherwise.  If we exit deal mode, then
+X   the board and play record to be used are stored in the corresponding
+X   fields of the table record t.
+X*/
+X{
+X  switch (c->command) {
+X  case CMD_BEGIN:
+X    t->game_mode = BIDDING_MODE;
+X    if (t->play_record == NULL) {
+X      t->play_record = Allocate_play_record 
+X	(PLAYER_NAME(t,PLAYER_NORTH), PLAYER_NAME(t, PLAYER_EAST),
+X	 PLAYER_NAME(t,PLAYER_SOUTH),  PLAYER_NAME(t, PLAYER_WEST));
+X      Append_play_record (b, t->play_record);
+X    }
+X
+X    t->play_record->next_player = b->dealer;
+X    Compute_contract (t->board, t->play_record);
+X    if (t->play_record->hand_completed)
+X      t->game_mode = SCORING_MODE;
+X    else if (t->play_record->bidding_completed)
+X      t->game_mode = PLAYING_MODE;
+X    return (1);
+X    break;
+X
+X  case CMD_BOARD:
+X    t->board = c->data.board.record;
+X    t->play_record = NULL;
+X    break;
+X
+X  case CMD_MODE:
+X    t->playing_mode = c->data.mode;
+X    break;
+X
+X  case CMD_RECORD:
+X    p = c->data.record.play;
+X    if (p->bidding_completed)
+X      Compute_contract (t->board, p);
+X    if (p->hand_completed)
+X      Compute_MIMP_points (t->board, p);
+X    if (!server_mode)
+X      Append_play_record (t->board, c->data.record.play);
+X    break;
+X
+X  case CMD_SCORE:
+X    t->above_line[0] = c->data.score.above[0];
+X    t->above_line[1] = c->data.score.above[1];
+X    t->below_line[0] = c->data.score.below[0];
+X    t->below_line[1] = c->data.score.below[1];
+X    break;
+X
+X  case CMD_USEREC:
+X    t->play_record = Locate_play_record_by_foursome 
+X      (t->board, c->data.userec.north, c->data.userec.east,
+X       c->data.userec.south, c->data.userec.west);
+X    break;
+X
+X  default:
+X    return (0);
+X    break;
+X  }
+X  return (0);
+X}
+X
+Xstatic int Handle_event_in_Bidding_Mode (t, b, p, c)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X     player_command c;
+X/* Handles an event while we are in bidding mode.  Returns 0 if the event
+X   causes us to remain in bidding mode, and 1 otherwise.  If we exit
+X   bidding mode, then the final contract is recorded in the play record.
+X   If the contract is a game contract, then the game mode is advanced to
+X   playing mode.  Otherwise, the mode is advanced to scoring mode.
+X*/
+X{
+X  int n = p->no_bids;
+X  int i;
+X  char message_buf[80];
+X
+X  if (c->command == CMD_ALERT) {
+X    if ((local_player == player_partner[c->player_no]) && !c->data.alert)
+X      return (0);
+X
+X    i = Index_of_Last_Bid (b, p, player_partner[c->player_no]);
+X    if (i < 0)
+X      Sequencing_Error ("Illegal Alert Received");
+X    p->alerts[i] = 1;
+X    return (0);
+X  }
+X
+X  if (c->command != CMD_BID) {
+X    return (0);
+X  } else if (c->player_no != p->next_player) {
+X    sprintf (message_buf, "Sequence Error: BID %s received from %s (%d).",
+X	     bid_names[c->data.bid.level], c->player_name, c->player_no);
+X    Sequencing_Error (message_buf);
+X    return (0);
+X  }
+X
+X  p->bids[p->no_bids] = c->data.bid.level;
+X  p->alerts[p->no_bids++] = c->data.bid.alert;
+X  Compute_contract (b, p);
+X  p->next_player = player_next[p->next_player];
+X  if (p->no_bids < 4)
+X    return (0);
+X  else if ((p->bids[n-2] != BID_PASS) || (p->bids[n-1] != BID_PASS) ||
+X	   (p->bids[n] != BID_PASS))
+X    return (0);
+X
+X  p->bidding_completed = 1;
+X  if (p->contract == BID_PASS) {
+X    t->game_mode = SCORING_MODE;
+X    p->hand_completed = 1;
+X  } else
+X    t->game_mode = PLAYING_MODE;
+X  p->next_player = player_next[p->declarer];
+X  return (1);
+X}
+X
+Xstatic void Record_Player_Names (t, b, p)
+X     Table t; Board *b; Play_record *p;
+X/* Records the names of the players at the local table into the play
+X   record p.  
+X */
+X{
+X  int i;
+X
+X  for (i = 0; i < 4; i++) {
+X    if (p->player_names[i] != NULL)
+X      free (p->player_names[i]);
+X    p->player_names[i] = strdup(PLAYER_NAME(t,i));
+X  }
+X}
+X
+Xstatic void Compute_Result (p)
+X     Play_record *p;
+X/* Uses the tricks[] and contract fields of the play record to compute the
+X   result of play.
+X*/
+X{
+X  p->hand_completed = 1;
+X  if (p->tricks[side_of(p->declarer)] >= 6 + p->contract)
+X    p->result = p->tricks[side_of(p->declarer)] - 6;
+X  else
+X    p->result = p->tricks[side_of(p->declarer)] - p->contract - 6;
+X}
+X
+Xstatic int Handle_event_in_Playing_Mode (t, b, p, c)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X     player_command c;
+X/* Handles an event while we are in playing mode.  Returns 0 if the event
+X   causes us to remain in playing mode, and 1 otherwise.  If we exit
+X   playing mode, then the result of play is recorded in the play record.
+X*/
+X{
+X  int n, w, card;
+X  char buf[80];
+X
+X  if ((c->command != CMD_CLAIM) && (c->command != CMD_PLAY) &&
+X      (c->command != CMD_PLAYREQ))
+X    return (0);
+X
+X  if (c->command == CMD_CLAIM) {
+X    p->tricks[side_of(p->declarer)] += c->data.claim.no_tricks;
+X    p->tricks[1 - side_of(p->declarer)] = 
+X      13 - p->tricks[side_of(p->declarer)];
+X    Compute_Result (p);
+X    t->game_mode = SCORING_MODE;
+X    Display_Tricks_Taken ();
+X    return (1);
+X  }
+X
+X  if (c->command == CMD_PLAYREQ) {
+X    if (!server_mode)
+X      return;
+X    if (c->data.playreq.play_no != p->no_plays) {
+X      sprintf (buf, "WARNING! DUPLICATE PLAY (%s) RECEIVED FROM %s.",
+X	       card_names[c->data.play], c->player_name);
+X      Broadcast_Comment (buf);
+X      return;
+X    } else {
+X      card = c->data.playreq.card;
+X      Send_play (Local_table, card);
+X    }
+X  } else
+X    card = c->data.playreq.card;
+X
+X  pause_mode = 0;
+X  p->play_list[p->no_plays++] = card;
+X  p->next_player = player_next[p->next_player];
+X  if (p->no_plays % 4 == 0) {
+X    n = p->no_plays - 4;
+X    w = Winning_card (trumpsuit_of(p->contract), p->next_player,
+X		      p->play_list[n], p->play_list[n+1], 
+X		      p->play_list[n+2], p->play_list[n+3]);
+X    p->tricks[side_of(w)] += 1;
+X    p->next_player = w;
+X    Display_Tricks_Taken ();
+X  }
+X
+X  if (p->no_plays == 52) {
+X    Compute_Result (p);
+X    t->game_mode = SCORING_MODE;
+X    return (1);
+X  }
+X
+X  return (0);
+X}
+X
+Xstatic int Honors_Point_Bonus (b, p)
+X     Board *b;
+X     Play_record *p;
+X/* Returns the number of bonus points awarded in a rubber contract
+X   for holding many honors in one hand. */
+X{
+X  int i;
+X  int dummy = player_partner [p->declarer];
+X  int trumps = trumpsuit_of (p->contract);
+X  int decl_honors = 0;   /* no of honors held by declarer. */
+X  int dummy_honors = 0;  /* no of honors held by dummy. */
+X
+X  if (trumps != SUIT_NOTRUMP) {
+X
+X    for (i = RANK_TEN; i <= RANK_ACE; i++)
+X      if (b->deal[card_code(trumps, i)] == p->declarer) 
+X	decl_honors++;
+X      else if (b->deal[card_code(trumps, i)] == dummy)
+X	dummy_honors++;
+X
+X    if ((decl_honors == 5) || (dummy_honors == 5))
+X      return (150);
+X    else if ((decl_honors == 4) || (dummy_honors == 4))
+X      return (100);
+X
+X  } else {
+X    /* In the case of a no trump contract, we count the total number of aces */
+X    for (i = 0; i < 4; i++)
+X      if (b->deal[card_code(i, RANK_ACE)] == p->declarer)
+X	decl_honors++;
+X      else if (b->deal[card_code(i, RANK_ACE)] == dummy)
+X	dummy_honors++;
+X
+X    if ((decl_honors == 4) || (dummy_honors == 4))
+X      return (150);
+X  }
+X  return (0);
+X  
+X}
+X
+Xstatic void Initiate_Scoring_Mode (t, b, p)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X/* Initiates scoring mode for the current board.  This consists of computing
+X   the score for the board based upon scoring mode and result.
+X*/
+X{
+X  int contractor = side_of (p->declarer);
+X  int defender   = 1 - contractor;
+X  int vul        = b->vulnerable[contractor];
+X  int level      = level_of (p->contract);
+X  int trumpsuit  = trumpsuit_of (p->contract);
+X
+X  if (server_mode) {
+X    spectator_mode = 0;
+X    Clear_Spectators (t);
+X  }
+X
+X  if (Local_table->playing_mode != PRACTICE_PLAYING_MODE)
+X    hands_played += 1;
+X
+X  if (p->contract == BID_PASS)
+X    p->result = 0;
+X  else if (p->tricks[contractor] >= level + 6)
+X    p->result = p->tricks[contractor] - 6;
+X  else
+X    p->result = p->tricks[contractor] - level - 6;
+X
+X  p->above_line[SIDE_NS] = p->below_line[SIDE_NS] = 0;
+X  p->below_line[SIDE_EW] = p->below_line[SIDE_EW] = 0;
+X
+X  Compute_MIMP_points (b, p);
+X
+X  switch (b->scoring_mode) {
+X  case RUBBER_SCORING:
+X    if (p->result != 0)
+X      p->above_line[contractor] =  Honors_Point_Bonus (b, p);
+X    if (p->result > 0) {
+X      p->below_line[contractor] = Rubber_score_below 
+X	(vul, level, trumpsuit, p->doubled, p->result);
+X
+X      p->above_line[contractor] += Rubber_score_above 
+X	(vul, level, trumpsuit, p->doubled, p->result);
+X
+X      if (p->below_line[contractor] + b->part_score[contractor] > 100) {
+X	if (b->vulnerable[contractor])
+X	  p->above_line[contractor] += b->vulnerable[defender]? 500: 700;
+X      }
+X    } else if (p->result < 0) {
+X      p->above_line[defender] += Rubber_score_set 
+X	(vul, level, trumpsuit, p->doubled, p->result);
+X    }
+X    break;
+X
+X  case DUPLICATE_SCORING:
+X  case IMP_SCORING:
+X  case MP_SCORING:
+X    if (p->result >= 0)
+X      p->below_line[contractor] = Duplicate_score_made
+X	(vul, level, trumpsuit, p->doubled, p->result);
+X    else if (p->result < 0)
+X      p->below_line[defender] = Duplicate_score_set
+X	(vul, level, trumpsuit, p->doubled, p->result);
+X    break;
+X  }
+X
+X  Compute_Intl_Matchpoints (b);
+X  Compute_Matchpoints (b);
+X
+X  Record_Played_Board (b);
+X
+X  if (!server_mode)
+X    return;
+X
+X  switch (b->scoring_mode) {
+X  case RUBBER_SCORING:
+X    t->above_line[SIDE_NS] += p->above_line[SIDE_NS];
+X    t->above_line[SIDE_EW] += p->above_line[SIDE_EW];
+X    t->below_line[SIDE_NS] += p->below_line[SIDE_NS];
+X    t->below_line[SIDE_EW] += p->below_line[SIDE_EW];
+X    break;
+X
+X  case DUPLICATE_SCORING:
+X    t->above_line[SIDE_NS] += t->below_line[SIDE_NS];
+X    t->above_line[SIDE_EW] += t->below_line[SIDE_EW];
+X    t->below_line[SIDE_NS] =  p->below_line[SIDE_NS];
+X    t->below_line[SIDE_EW] =  p->below_line[SIDE_EW];
+X    break;
+X
+X  case IMP_SCORING:
+X    t->above_line[SIDE_NS] += t->below_line[SIDE_NS];
+X    t->above_line[SIDE_EW] += t->below_line[SIDE_EW];
+X    t->below_line[SIDE_NS] =  (int) (100.0 * p->imatch_points[SIDE_NS]);
+X    t->below_line[SIDE_EW] =  (int) (100.0 * p->imatch_points[SIDE_EW]);
+X    break;
+X
+X  case MP_SCORING:
+X    t->above_line[SIDE_NS] += t->below_line[SIDE_NS];
+X    t->above_line[SIDE_EW] += t->below_line[SIDE_EW];
+X    t->below_line[SIDE_NS] =  (int) (100.0 * p->match_points[SIDE_NS]);
+X    t->below_line[SIDE_EW] =  (int) (100.0 * p->match_points[SIDE_EW]);
+X    break;
+X  }
+X
+X  Send_score (t, t->above_line, t->below_line);
+X  Send_end (t);
+X  
+X}
+X
+Xstatic int Handle_event_in_Scoring_Mode (t, b, p, c)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X     player_command c;
+X/* Handles an event while we are in scoring mode.  Returns 0 if the
+X   event causes us to remain in scoring mode, and 1 otherwise.
+X*/
+X{
+X  switch (c->command) {
+X  case CMD_END:
+X    t->game_mode = STARTUP_MODE;
+X    return (1);
+X
+X  case CMD_SCORE:
+X    t->above_line[0] = c->data.score.above[0];
+X    t->above_line[1] = c->data.score.above[1];
+X    t->below_line[0] = c->data.score.below[0];
+X    t->below_line[1] = c->data.score.below[1];
+X    break;
+X
+X  case CMD_RECORD:
+X    if (!server_mode)
+X      Append_play_record (t->board, c->data.record.play);
+X    break;
+X
+X  default:
+X    break;
+X  }
+X  return (0);
+X}
+X
+Xstatic void Setup_Startup_Display ()
+X{
+X/*
+X  Set_Display_Mode (TALK_DISPLAY);
+X  Set_Input_Mode (TALK_INPUT);
+X*/
+X  Begin_timer_for_hand ();
+X}
+X
+Xstatic void Display_event_in_Startup_Mode 
+X  (t, b, p, c)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X     player_command c;
+X{
+X  ;
+X}
+X
+Xstatic void Setup_Deal_Display ()
+X{
+X  ;
+X}
+X
+Xstatic void Display_event_in_Deal_Mode
+X  (t, b, p, c)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X     player_command c;
+X{
+X  int i;
+X
+X  switch (c->command) {
+X
+X  case CMD_BEGIN:
+X    Local_table = t;
+X    Local_board = t->board;
+X    Local_play  = t->play_record;
+X
+X    spectator_mode = 0;
+X    for (i = 0; i < 4; i++)
+X      revealed_hands[i] = 0;
+X
+X    if (Local_play->bidding_completed) {
+X      Set_Display_Mode (BIDDING_DISPLAY);
+X      Set_Input_Mode (TALK_INPUT);
+X      if (!server_mode || prompt_dummy || IS_PLAYER(local_player))
+X	Pause ("");
+X    }
+X    break;
+X
+X  default:
+X    break;
+X  }
+X}
+X
+Xstatic void Prepare_for_input_during_bidding (t)
+X     Table t;
+X{
+X
+X  Board *b;
+X  Play_record *p;
+X  char buf[80];
+X
+X  b = t->board;
+X  p = t->play_record;
+X
+X  Display_Bidder (p->next_player);
+X  if (p->next_player == local_player)
+X    Begin_timer_for_play ();
+X
+X  if ((p->next_player == local_player) && !p->bidding_completed) {
+X    ring_bell ();
+X    if (Talking())
+X      Status ("PRESS <TAB> TO ENTER YOUR BID.");
+X  }
+X
+X  if ((t->playing_mode == PRACTICE_PLAYING_MODE) && server_mode)
+X    if (VACANT(t, p->next_player) && autopass_mode) {
+X      sprintf (buf, "%s %s BID PASS", seat_names[p->next_player],
+X	       seat_names[p->next_player]);
+X      loopback_message_unformatted (Local_table, Local_Player_Connection, buf);
+X    }
+X
+X}
+X
+Xstatic void Setup_Bidding_Display (t, b, p)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X/* Initializes the bidding display and global variables which are
+X   pertinent to the bidding.
+X*/
+X{
+X
+X  Begin_timer_for_hand ();
+X  Set_Display_Mode (BIDDING_DISPLAY);
+X  if (IS_PLAYER(local_player))
+X    Set_Input_Mode (BID_INPUT);
+X  else
+X    Set_Input_Mode (TALK_INPUT);
+X
+X  switch (p->no_bids % 4) {
+X  case 0: p->next_player = b->dealer; break;
+X  case 1: p->next_player = player_next[b->dealer]; break;
+X  case 2: p->next_player = player_partner[b->dealer]; break;
+X  case 3: p->next_player = player_prev[b->dealer]; break;
+X  }
+X
+X  pause_mode = 0;
+X  Prepare_for_input_during_bidding (t);
+X
+X}
+X
+Xstatic void Display_event_in_Bidding_Mode
+X  (t, b, p, c)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X     player_command c;
+X{
+X  int i;
+X
+X  if (c->command == CMD_ALERT) {
+X    if ((local_player == player_partner[c->player_no]) && !c->data.alert)
+X      return;
+X
+X    i = Index_of_Last_Bid (b, p, player_partner[c->player_no]);
+X    if (i >= 0) {
+X      Display_Bid (i);
+X      Moderator_Comment ("ALERT!");
+X      ring_bell ();
+X    }
+X  } else if (c->command == CMD_BID) {
+X    if (c->player_no == local_player)
+X      End_timer_for_play ();
+X    Display_timer ();
+X    Display_Bid (p->no_bids - 1);
+X    Prepare_for_input_during_bidding (t);
+X  }
+X}
+X
+Xstatic void Setup_Playing_Display (t, b, p)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X{
+X  int i, j, player;
+X
+X  Set_Display_Mode (PLAYING_DISPLAY);
+X  if (t->playing_mode == PRACTICE_PLAYING_MODE) {
+X    if (IS_PLAYER(local_player))
+X      Set_Input_Mode (PLAY_INPUT);
+X    else
+X      Set_Input_Mode (TALK_INPUT);
+X    for (i = 0; i < 4; i++)
+X      revealed_hands[i] = 1;
+X  } else if (IS_PLAYER(local_player) && 
+X	     (local_player != player_partner[p->declarer]))
+X    Set_Input_Mode (PLAY_INPUT);
+X  else
+X    Set_Input_Mode (TALK_INPUT);
+X  Clear_Plays ();
+X
+X  if (IS_PLAYER(local_player))
+X    revealed_hands[local_player] = 1;
+X
+X  if (local_player == p->declarer)
+X    revealed_hands[player_partner[local_player]] = 1;
+X  else if (local_player == player_partner[p->declarer])
+X    revealed_hands[p->declarer] = 1;
+X
+X  /* If we are replaying a hand which has already been (partially) played,
+X     then display the plays up to this point:
+X  */
+X  player = player_next[p->declarer];
+X  for (i = 0; i < p->no_plays; i++) {
+X    if (i % 4 == 0)
+X      Clear_Plays ();
+X    Display_Play (player, p->play_list[i]);
+X    player = player_next[player];
+X    revealed_hands[player_partner[p->declarer]] = 1;
+X    if (i % 4 == 3) {
+X      for (j = 0; j < 4; j++)
+X	if (revealed_hands[j])
+X	  Display_Partial_Hand (j, i);
+X
+X      if (prompt_dummy)
+X	Press_Return_to_Continue ("");
+X
+X      player = Winning_card(trumpsuit_of(p->contract), player,
+X			    p->play_list[i-3], p->play_list[i-2],
+X			    p->play_list[i-1], p->play_list[i]);
+X    }
+X  }
+X  p->next_player = player;
+X
+X  for (j = 0; j < 4; j++)
+X    if (revealed_hands[j])
+X      Display_Hand (j);
+X
+X  Display_Player (p->next_player);
+X
+X  if ((Next_Player (p) == local_player) || 
+X      (Local_table->playing_mode == PRACTICE_PLAYING_MODE))
+X    Compute_Default_Play ();
+X  else
+X    Clear_Default_Play ();
+X
+X  if (Next_Player (p) == local_player) {
+X    Begin_timer_for_play ();
+X    ring_bell ();
+X    if (Talking())
+X      Status ("PRESS <TAB> TO ENTER YOUR PLAY.");
+X  }
+X}
+X
+Xstatic void Display_event_in_Playing_Mode
+X  (t, b, p, c, player)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X     player_command c;
+X     int player;
+X{
+X  int i;
+X
+X  if (c->command != CMD_PLAY)
+X    return;
+X
+X  if (p->no_plays % 4 == 1)
+X    Clear_Plays ();
+X
+X  Display_Play (player, c->data.play);
+X  if (c->player_no == local_player)
+X    End_timer_for_play ();
+X  Display_timer ();
+X
+X  for (i = 0; i < 4; i++)
+X    if (revealed_hands[i])
+X      Display_Hand (i);
+X
+X  Clear_Default_Play ();
+X  if ((p->no_plays % 4 == 0) && prompt_dummy) {
+X    Pause ("");
+X    Clear_Plays ();
+X  }
+X
+X  if (p->no_plays == 1)
+X    Display_Hand (player_partner[p->declarer]);
+X
+X  Display_Player (p->next_player);
+X
+X  if ((Next_Player (p) == local_player) || 
+X      (Local_table->playing_mode == PRACTICE_PLAYING_MODE))
+X    Compute_Default_Play ();
+X
+X  if (Next_Player (p) == local_player) {
+X    Begin_timer_for_play ();
+X    ring_bell ();
+X    if (Talking())
+X      Status ("PRESS <TAB> TO ENTER YOUR PLAY.");
+X  }
+X}
+X
+Xstatic void Setup_Scoring_Display (t, b, p)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X{
+X  char message_buf[100];
+X
+X  int contractor = side_of (p->declarer);
+X  int honors;
+X  int i, below[2], hcp;
+X
+X  End_timer_for_play ();
+X  End_timer_for_hand ();
+X  Display_timer ();
+X
+X  if (IS_PLAYER(local_player) && 
+X      (side_of(local_player) == contractor) &&
+X      (level_of (p->contract) >= 6) &&
+X      (p->result > 0)) {
+X    Set_Display_Mode (HELP_DISPLAY);
+X    Set_Input_Mode (TALK_INPUT);
+X    display_help ("slam");
+X  }
+X
+X  if (display_mode != PLAYING_DISPLAY)
+X    Set_Display_Mode (PLAYING_DISPLAY);
+X  Set_Input_Mode (TALK_INPUT);
+X
+X  for (i = 0; i < 4; i++)
+X    Display_Partial_Hand (i, 0);
+X
+X  switch (b->scoring_mode) {
+X  case RUBBER_SCORING:
+X    if (p->result == 0)
+X      break;
+X
+X    honors = Honors_Point_Bonus (b, p);
+X    if (honors == 100)
+X      Moderator_Comment 
+X	("100 POINT BONUS FOR 4 HONORS IN ONE HAND");
+X    else if ((honors == 150) && (trumpsuit_of(p->contract) != SUIT_NOTRUMP))
+X      Moderator_Comment
+X	("150 POINT BONUS FOR ALL 5 HONORS IN ONE HAND");
+X    else if (honors == 150)
+X      Moderator_Comment
+X	("150 POINT BONUS FOR ALL 4 ACES IN ONE HAND");
+X
+X    below[0] = b->part_score[0] + p->below_line[0];
+X    below[1] = b->part_score[1] + p->below_line[1];
+X    if (below[contractor] >= 100) {
+X      if (b->vulnerable[contractor]) {
+X	if (contractor == SIDE_NS)
+X	  sprintf (message_buf, "%s AND %s HAVE WON THE RUBBER.",
+X		   PLAYER_NAME(Local_table, PLAYER_NORTH), 
+X		   PLAYER_NAME(Local_table, PLAYER_SOUTH));
+X	else
+X	  sprintf (message_buf, "%s AND %s HAVE WON THE RUBBER.",
+X		   PLAYER_NAME(Local_table, PLAYER_EAST), 
+X		   PLAYER_NAME(Local_table, PLAYER_WEST));
+X	Moderator_Comment (message_buf);
+X      }
+X    }
+X    break;
+X
+X  case DUPLICATE_SCORING:
+X  case MP_SCORING:
+X  case IMP_SCORING:
+X    hcp = Highcard_points (b, contractor);
+X    sprintf 
+X      (message_buf,
+X       "HCP %d, EXPECTED SCORE: %d, ACTUAL SCORE: %d, MONO-IMPS: %5.1f",
+X       hcp,
+X       b->vulnerable[contractor] ?
+X         MIMP_scoring_vuln[hcp]: MIMP_scoring_nonvuln[hcp],
+X       (p->result >= 0)?
+X         Duplicate_score_made 
+X           (b->vulnerable[contractor], level_of (p->contract),
+X	    trumpsuit_of (p->contract), p->doubled, p->result):
+X         -Duplicate_score_set
+X           (b->vulnerable[contractor], level_of (p->contract),
+X	    trumpsuit_of (p->contract), p->doubled, p->result),
+X       ((float) p->mimp_points[contractor]) * 0.5);
+X    Display_Player_Comment (COMMENT_PUBLIC, "SCORE", message_buf);
+X    break;
+X  }
+X
+X  Display_Above_Line_Points ();
+X  Display_Below_Line_Points ();
+X  Display_Vulnerabilities ();
+X}
+X
+Xstatic void Display_event_in_Scoring_Mode
+X  (t, b, p, c)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X     player_command c;
+X{
+X  switch (c->command) {
+X  case CMD_SCORE:
+X    Display_Above_Line_Points ();
+X    Display_Below_Line_Points ();
+X    break;
+X
+X  default:
+X    break;
+X  }
+X}
+X
+Xstatic void Display_Summary_of_Hand (t, b, p)
+X     Table t;
+X     Board *b;
+X     Play_record *p;
+X{
+X  FILE *fp;
+X  char buf[80];
+X
+X  Compute_Matchpoints (b);
+X  Compute_Intl_Matchpoints (b);
+X
+X  Clear_Plays ();
+X
+X  if (logfile != NULL)
+X    Write_hand (logfile, b, p);
+X
+X  if (zhang_logfile != NULL)
+X    Write_hand_compactly (zhang_logfile, t->table_no, b, p);
+X
+X  if (server_mode && gps_duplicate_mode) {
+X    GPS_Upload_Play_Record (Local_play);
+X    if (b->play_records->next == NULL)
+X      Broadcast_Comment 
+X	("THIS BOARD HAS NOT BEEN PLAYED AT ANY OTHER TABLES.");
+X  }
+X
+X  if (replay_mode && !Board_is_Available()) {
+X    replay_mode = 0;
+X    fp = fopen (email_filename, "w");
+X    if (fp == NULL) {
+X      sprintf (buf, "ERROR RE-OPENING EMAIL FILE %s: %s", email_filename,
+X	       sys_errlist[errno]);
+X      Status (buf);
+X    } else {
+X      Write_Email_Duplicate_File (fp);
+X      sprintf (buf, "WROTE EMAIL BOARDS TO %s.", email_filename);
+X      Moderator_Comment (buf);
+X      fclose (fp);
+X    }
+X  }
+X
+X  if (b->play_records->next != NULL) {
+X    switch (b->scoring_mode) {
+X    case RUBBER_SCORING:
+X    case DUPLICATE_SCORING:
+X    case MP_SCORING:
+X      Sort_play_records_by_matchpoints (b);
+X      break;
+X    case IMP_SCORING:
+X      Sort_play_records_by_imps (b);
+X      break;
+X    }
+X
+X    if (!server_mode || prompt_dummy || IS_PLAYER(local_player)) {
+X      Pause ("PRESS <ESC> TO SEE THE RESULTS OF PLAY BY OTHER TABLES ...");
+X      Display_First_Page_of_Scores (b);
+X      while (More_Scores_to_Display()) {
+X	Pause ("PRESS <ESC> TO SEE MORE RESULTS ...");
+X	Display_More_Scores ();
+X      }
+X    }
+X  }
+X  
+X  if (!server_mode || prompt_dummy || IS_PLAYER(local_player))
+X    Pause ("PRESS <ESC> FOR THE NEXT HAND ...");
+X}
+X
+Xstatic void main_event_loop ()
+X{
+X  Table t;
+X  Board *b;
+X  Play_record *p;
+X  Message m;
+X  player_command c;
+X  int transition, player;
+X  int prev_mode;
+X
+X  do {
+X    Refresh_Input_Buffers ();
+X    t = Wait_for_game_message ();
+X    b = t->board;
+X    p = t->play_record;
+X    m = dequeue_message (t->game_queue);
+X    c = &(m->p);
+X/*    Network_Comment (m->p.command_text); */
+X
+X    if (c->command == CMD_SKIP) {
+X      t->game_mode = SKIP_MODE;
+X      pause_mode = claim_in_progress = 0;
+X      transition = 1;
+X    } else {
+X      switch (t->game_mode) {
+X      case SKIP_MODE:
+X	transition = Handle_event_in_Skip_Mode (t, c);
+X	break;
+X
+X      case STARTUP_MODE:
+X	transition = Handle_event_in_Startup_Mode (t, b, p, c);
+X	if (VISIBLE(t))
+X	  Display_event_in_Startup_Mode (t, b, p, c);
+X	break;
+X	
+X      case DEALING_MODE:
+X	transition = Handle_event_in_Deal_Mode (t, b, p, c);
+X	if (VISIBLE(t))
+X	  Display_event_in_Deal_Mode (t, b, p, c);
+X	break;
+X	
+X      case BIDDING_MODE:
+X	transition = Handle_event_in_Bidding_Mode (t, b, p, c);
+X	if (VISIBLE(c))
+X	  Display_event_in_Bidding_Mode (t, b, p, c);
+X	if (transition && VISIBLE (c)) {
+X	  Clear_Default_Play ();
+X	  if (!server_mode || prompt_dummy || IS_PLAYER(local_player)) {
+X	    if (t->game_mode == PLAYING_MODE)
+X	      Pause ("ALL PASS -- PRESS <ESC> TO BEGIN PLAY ...");
+X	    else if (t->game_mode == SCORING_MODE)
+X	      Pause ("THROWING IN THE HAND -- PRESS <ESC> TO CONTINUE ...");
+X	  }
+X	}
+X	break;
+X	
+X      case PLAYING_MODE:
+X	player = p->next_player;
+X	transition = Handle_event_in_Playing_Mode (t, b, p, c);
+X	if (VISIBLE(t))
+X	  Display_event_in_Playing_Mode (t, b, p, c, player);
+X	break;
+X	
+X      case SCORING_MODE:
+X	transition = Handle_event_in_Scoring_Mode (t, b, p, c);
+X	if (VISIBLE(t))
+X	  Display_event_in_Scoring_Mode (t, b, p, c);
+X	if (transition && VISIBLE(t)) {
+X	  prev_mode = Local_table->game_mode;
+X	  Local_table->game_mode = SCORING_MODE;
+X	  Display_Summary_of_Hand (t, b, p);
+X	  Local_table->game_mode = prev_mode;
+X	}
+X	break;
+X      }
+X    }
+X
+X    if (transition)
+X      switch (t->game_mode) {
+X      case SKIP_MODE:
+X	Initiate_Skip_Mode (t);
+X	if (VISIBLE(t)) {
+X	  prompt_before_hand = 1;
+X	  Set_Display_Mode (TALK_DISPLAY);
+X	  Set_Input_Mode (TALK_INPUT);
+X	}
+X	break;
+X
+X      case STARTUP_MODE:
+X	Initiate_Startup_Mode (t);
+X	if (VISIBLE(t))
+X	  Setup_Startup_Display (b, p);
+X	break;
+X
+X      case DEALING_MODE:
+X	Initiate_Deal_Mode (t);
+X	if (VISIBLE(t))
+X	  Setup_Deal_Display (b, p);
+X	break;
+X
+X      case BIDDING_MODE:
+X	if (VISIBLE(t))
+X	  Setup_Bidding_Display (t, t->board, t->play_record);
+X	break;
+X
+X      case PLAYING_MODE:
+X	Record_Player_Names (t, t->board, t->play_record);
+X	if (VISIBLE(t))
+X	  Setup_Playing_Display (t, t->board, t->play_record);
+X	break;
+X
+X      case SCORING_MODE:
+X	Initiate_Scoring_Mode (t, t->board, t->play_record);
+X	if (VISIBLE(t))
+X	  Setup_Scoring_Display (t, t->board, t->play_record);
+X	break;
+X      }
+X    deallocate_message (m);
+X  } while (1);
+X}
+X
+Xlong Seconds ()
+X/* Returns current time in seconds. */
+X{
+X  struct timeval tp;
+X
+X  gettimeofday (&tp, NULL);
+X  return (tp.tv_sec);
+X}
+X
+Xvoid Record_playing_time ()
+X{
+X  long current_time = Seconds ();
+X  long playing_time = current_time - startup_time;
+X  GPS_Send_Playing_Time (playing_time);
+X}
+X
+Xint Terminate_Program (termination_message)
+X     char *termination_message;
+X{
+X  if (!abort_flag) {
+X    abort_flag = 1;
+X    if ((Local_table->game_mode == PLAYING_MODE) || 
+X	(Local_table->game_mode == BIDDING_MODE)) {
+X      if (logfile != NULL)
+X	Write_hand (logfile, Local_board, Local_play);
+X      if (zhang_logfile != NULL)
+X	Write_hand_compactly (zhang_logfile, Local_table->table_no,
+X			      Local_board, Local_play);
+X    }
+X    if (save_defaults)
+X      Write_Initialization_File (".okdefaults");
+X    Record_playing_time ();
+X    if (server_mode) {
+X      GPS_End_Server_Mode ();
+X      server_mode = 0;
+X    }
+X    Refresh_Display ();
+X    Send_quit (Local_table);
+X    Press_Return_to_Continue (termination_message);
+X  }
+X  clear_screen ();
+X  Reset_Terminal ();
+X  exit (0);
+X  return (0);
+X}
+X
+Xint recovery_routine (parm)
+X	int parm;
+X{
+X  Terminate_Program ("PROGRAM ABORT");
+X  return (0);
+X}
+X
+Xint Hangup_recovery_routine ()
+X{
+X  FILE *fp;
+X
+X  if (!abort_flag) {
+X    abort_flag = 1;
+X    if ((Local_table->game_mode == PLAYING_MODE) || 
+X	(Local_table->game_mode == BIDDING_MODE)) {
+X      if (logfile != NULL)
+X	Write_hand (logfile, Local_board, Local_play);
+X      if (zhang_logfile != NULL)
+X	Write_hand_compactly (zhang_logfile, Local_table->table_no,
+X			      Local_board, Local_play);
+X    }
+X    if (save_defaults)
+X      Write_Initialization_File (".okdefaults");
+X    Record_playing_time ();
+X    if (server_mode) {
+X      GPS_End_Server_Mode ();
+X      server_mode = 0;
+X    }
+X    if (Local_table->board != NULL)
+X      Record_Played_Board (Local_table->board);
+X    fp = fopen ("okbridge.hands", "w");
+X    if (fp != NULL) {
+X      Write_Email_Duplicate_File (fp);
+X      fclose (fp);
+X    }
+X    Send_quit (Local_table);
+X  }
+X  clear_screen ();
+X  Reset_Terminal ();
+X  exit (0);
+X  return (0);
+X}
+X
+Xint Quit_program ()
+X{
+X  Clear_Status ();
+X  Continue_Comment_Display ();
+X  Refresh_Display ();
+X  if (Ask("ARE YOU SURE YOU WISH TO QUIT? ")) {
+X    abort_flag = 1;
+X    Record_playing_time ();
+X    if (server_mode) {
+X      GPS_End_Server_Mode ();
+X      server_mode = 0;
+X    }
+X    if (save_defaults)
+X      Write_Initialization_File (".okdefaults");
+X    clear_screen ();
+X    Reset_Terminal ();
+X    Send_quit (Local_table);
+X    exit (0);
+X  }
+X  return (0);
+X}
+X
+Xint quit_error_routine ()
+X{
+X  if (!abort_flag) {
+X    abort_flag = 1;
+X#ifdef LOGFILE
+X    fflush (net_log);
+X#endif
+X    if (server_mode) {
+X      GPS_End_Server_Mode ();
+X      server_mode = 0;
+X    }
+X    clear_screen ();
+X    Reset_Terminal ();
+X  }
+X  kill (getpid(), SIGTRAP);
+X  exit (0);
+X  return (0);
+X}
+X
+Xint socket_recovery_routine (parm)
+X     int parm;
+X{
+X  if (!abort_flag) {
+X    abort_flag = 1;
+X    Record_playing_time ();
+X    if (server_mode) {
+X      GPS_End_Server_Mode ();
+X      server_mode = 0;
+X    }
+X#ifdef LOGFILE
+X    fflush (net_log);
+X#endif
+X    Moderator_Comment
+X      ("NETWORK ERROR!!  YOU HAVE FOUND A BUG IN THE PROGRAM.");
+X    Moderator_Comment ( "PROGRAM TERMINATING");
+X    Send_quit (Local_table);
+X    Pause ("");
+X  }
+X  clear_screen ();
+X  Reset_Terminal ();
+X  kill (getpid(), SIGTRAP);
+X
+X/*
+X  access_error_routine ();
+X  Terminate_Program ("THE NETWORK CONNECTIONS HAVE BEEN BROKEN!");  
+X*/
+X  return (0);
+X}
+X
+Xint system_call_error_routine (parm)
+X     int parm;
+X{
+X  if (!abort_flag) {
+X    abort_flag = 1;
+X#ifdef LOGFILE
+X    fflush (net_log);
+X#endif
+X    if (server_mode) {
+X      GPS_End_Server_Mode ();
+X      server_mode = 0;
+X    }
+X    Moderator_Comment ( "INTERRUPTED SYSTEM CALL");
+X  }
+X  Terminate_Program ("PROGRAM TERMINATING");
+X  return (0);
+X}
+X
+Xint access_error_routine (parm)
+X     int parm;
+X{
+X  if (!abort_flag) {
+X    abort_flag = 1;
+X    Record_playing_time ();
+X    if (server_mode) {
+X      GPS_End_Server_Mode ();
+X      server_mode = 0;
+X    }
+X    Send_quit (Local_table);
+X#ifdef LOGFILE
+X    fflush (net_log);
+X#endif
+X    Moderator_Comment
+X      ("ACCESS VIOLATION!!  YOU HAVE FOUND A BUG IN THE PROGRAM.");
+X    Moderator_Comment ( "PROGRAM TERMINATING");
+X/*    input_acknowledgment (-1); */
+X  }
+X  clear_screen ();
+X  Reset_Terminal ();
+X  kill (getpid(), SIGTRAP);
+X  return (0);
+X}
+X
+X
+Xvoid Generate_reset (reset_type)
+X     int reset_type;
+X{
+X  longjmp (reset_buf, reset_type);
+X}
+X
+Xvoid Handle_reset (reset_status)
+X     int reset_status;
+X{
+X  int seat;
+X  Table t;
+X  Connection c;
+X
+X  if (reset_status == 0)
+X    return;
+X
+X  spectator_mode = 0;
+X  for (t = Table_List; t != NULL; t = t->next) {
+X    clear_all_message_queues (t);
+X    t->game_mode = STARTUP_MODE;
+X  }
+X
+X  FOREACH_CONNECTION (c)
+X    c->spectator = 0;
+X  for (seat = 0; seat < 4; seat++)
+X    Local_table->Seats[seat].skipping = 0;
+X
+X  prompt_before_hand = 1;
+X  claim_in_progress = 0;
+X  Local_table->above_line[SIDE_NS] = Local_table->above_line[SIDE_EW] = 0;
+X  Local_table->below_line[SIDE_NS] = Local_table->below_line[SIDE_EW] = 0;
+X  Local_table->playing_mode = CLUB_PLAYING_MODE;
+X  Reset_Status ();
+X  Continue_Comment_Display ();
+X  Reinitialize_Input ();
+X  Set_Display_Mode (TALK_DISPLAY);
+X  Set_Input_Mode (TALK_INPUT);
+X
+X  if (gps_duplicate_mode)
+X    GPS_Dup ("END");
+X  gps_duplicate_mode = 0;
+X
+X  switch (reset_status) {
+X  case RESET_FULL:
+X    Set_Display_Mode (TALK_DISPLAY);
+X    Set_Input_Mode (TALK_INPUT);
+X    if (server_mode)
+X      FOREACH_CONNECTION (c)
+X	c->state = CSTATE_CONNECTED;
+X    GPS_Reset ();
+X    Clear_All_Boards ();
+X    if (gps_duplicate_mode)
+X      GPS_Dup ("END");
+X    replay_mode = 0;
+X    if (client_mode) {
+X      seat = local_player;
+X      local_player = PLAYER_OBS;
+X      Send_hello (Local_table, major_revision_level, local_player_name, seat);
+X    }
+X    break;
+X
+X  case RESET_CONNECT:
+X    Close_all_connections ();
+X/*    Attempt_to_connect (local_player); */
+X    Attempt_to_connect (PLAYER_OBS);
+X    break;
+X
+X  case RESET_SERVE:
+X    Close_all_connections ();
+X    Setup_server ();
+X    hands_played = 0;
+X    break;
+X
+X  case RESET_DISCONNECT:
+X    Close_all_connections ();
+X    break;
+X  }
+X
+X}
+X
+Xvoid parameter_error (error_msg)
+X     char *error_msg;
+X{
+X  printf ("Okbridge %s%s:: Error: %s\n", 
+X	  major_revision_level, minor_revision_level, error_msg);
+X  printf ("First player starts the program on his machine with\n");
+X  printf ("   okbridge [-c] [-d] [-e] [-i] [-R] <seat> <name> \n%s\n%s\n",
+X	  "        [-P portno] [-r replay-file] [-l load-file] [-L log-file]",
+X	  "        [-z# [zlog-file]]");
+X  printf ("Others connect with\n");
+X  printf ("   okbridge [-c] [-d] [-e] [-i] [-R] %s\n%s\n",
+X	  "<seat> <name> <host>","        [ ... additional parameters ... ]");
+X  printf ("<seat> is one of the characters n, s, e, w\n");
+X  printf ("<name> is your identifying name (ex. 'steve')\n");
+X  printf ("<host> is the internet name of the first player's machine\n\n");
+X  printf ("-c     is for Chicago scoring\n");
+X  printf ("-d     is for Duplicate scoring\n");
+X  printf ("-e     is for Email duplicate scoring\n");
+X  printf ("-i     is for simulated IMP scoring\n");
+X  printf ("-m     is for Modern IMP scoring\n");
+X  printf ("  NOTE: Only the server can choose the scoring option.\n\n");
+X  printf ("-P portno specifies the internet port number for communications\n");
+X  printf ("-r replay-file specifies an email duplicate file for replay\n");
+X  printf ("-l load-file specifies an email duplicate file for loading\n");
+X  printf ("-L log-file specifies a logfile file saving the results of play\n");
+X  printf ("-z# zlog-file specifies a table number & Zhang-format log file\n");
+X  exit (1);
+X}
+X
+Xstatic void parse_position_parameter (position_string)
+X     char *position_string;
+X{
+X  char ch, error_buf[80];
+X
+X  if (strlen(position_string) == 1) {
+X    ch = *position_string;
+X    switch (ch) {
+X    case 'n': 
+X    case 'N': 
+X      local_player = PLAYER_NORTH;
+X      return;
+X    case 'e': 
+X    case 'E': 
+X      local_player = PLAYER_EAST;
+X      return;
+X    case 's': 
+X    case 'S': 
+X      local_player = PLAYER_SOUTH;
+X      return;
+X    case 'w': 
+X    case 'W': 
+X      local_player = PLAYER_WEST;
+X      return;
+X    }
+X  }
+X  sprintf (error_buf, "Error -- unrecognized <seat> name: %s\n", 
+X	   position_string);
+X  parameter_error (error_buf);
+X}
+X
+Xtypedef  void (*signal_handler) ();
+X
+X#ifdef SUNOS
+Xvoid Change_display_size (parm, code, scp, addr)
+X     int parm, code; struct sigcontext *scp; char *addr;
+X/* Computes the current dimensions of the display and updates the size of
+X . the talk window appropriately.
+X */
+X{
+X  char msg_buf[80];
+X
+X  Reinitialize_Terminal ();
+X  Reinitialize_Display ();
+X  Reinitialize_Input ();
+X  Refresh_Display ();
+X
+X  sprintf (msg_buf, "THE CURRENT DIMENSIONS APPEAR TO BE: %d x %d\n",
+X	   terminal_lines, terminal_cols);
+X  Display_Player_Comment (COMMENT_PRIVATE, "SIGWINCH", msg_buf);
+X/*
+X  restore_cursor ();
+X*/
+X}
+X#endif SUNOS
+X
+X
+Xvoid main (argc, argv)
+X     int argc; char **argv;
+X{
+X        int error_value;   /* error return from setjmp/signal */
+X	int argi;          /* index of current argument being processed */
+X	int posi;          /* index of next positional parameter to process */
+X	char *filename;    /* filename specified for log file on command line*/
+X        char filename_buf[80], error_buf[80];
+X        FILE *fp;          /* used only for checking the existence of files */
+X	int need_to_save_context;
+X	int reset_in_progress;
+X	int status;
+X
+X	/* Various signal handlers: */
+X	int recovery_routine (), Quit_program (), socket_recovery_routine (),
+X		quit_error_routine (), access_error_routine (),
+X		system_call_error_routine (), Hangup_recovery_routine();
+X
+X#define current_arg  (argv[argi])
+X#define next_arg     argi++
+X#define more_args    (argi < argc)
+X
+X#ifdef DEBUG
+X#ifndef HPUX
+X/* In earlier versions of the program, we have been having some problems
+X   with occasional segmentation faults during the bidding.  This code
+X   asks the system to create a core file if there is a segmentation fault.
+X */
+X	struct rlimit rlp;
+X
+X	getrlimit (RLIMIT_CORE, &rlp);
+X	rlp.rlim_cur = rlp.rlim_max;
+X	setrlimit (RLIMIT_CORE, &rlp);
+X#endif
+X#endif
+X
+X#ifdef MDEBUG
+X	malloc_debug (2);
+X#endif
+X
+X	local_player = PLAYER_OBS;
+X	server_name = NULL;
+X	Read_Initialization_File (".okbridgerc");
+X	Read_Initialization_File (".okdefaults");
+X
+X	if (server_name != NULL) {
+X	  client_mode_requested = 1;
+X	  server_mode_requested = 0;
+X	}
+X	  
+X	argi = 1;
+X	posi = 1;
+X	while (more_args) {
+X	  if(*current_arg == '-') {
+X	    /* process a position-independent parameter. */
+X	    if (!strcmp(current_arg, "-d")) {
+X	      scoring_mode = DUPLICATE_SCORING;
+X	    } else if (!strcmp(current_arg, "-i")) {
+X              scoring_mode = IMP_SCORING;
+X	    } else if (!strcmp(current_arg, "-m")) {
+X              scoring_mode = MP_SCORING;
+X	    } else if (!strcmp(current_arg, "-R")) {
+X	      scoring_mode = RUBBER_SCORING;
+X	    } else if ((*current_arg == '-') && (*(current_arg+1) == 'p')) {
+X	      parse_position_parameter (current_arg+2);
+X	      if (posi == 1) posi++;
+X	    } else if (!strcmp(current_arg, "-n")) {
+X	      next_arg;
+X	      if (!more_args)
+X		parameter_error 
+X		  ("-n parameter requires player name to follow");
+X	      local_player_name = strdup (current_arg);
+X	      if (posi == 2) posi++;
+X	    } else if (!strcmp(current_arg, "-s")) {
+X	      next_arg;
+X	      if (!more_args)
+X		parameter_error 
+X		  ("-s parameter requires server name or 'ME' to follow");
+X	      if (!strcasecmp(current_arg, "me")) {
+X		client_mode_requested = 0;
+X		server_mode_requested = 1;
+X	      } else {
+X		server_name = strdup (current_arg);
+X		client_mode_requested = 1;
+X		server_mode_requested = 0;
+X	      }
+X	      if (posi == 3) posi++;
+X	    } else if (!strcmp(current_arg, "-P")) {
+X	      next_arg;
+X	      if (!more_args)
+X		parameter_error 
+X			("Error -- port number must follow -P parameter");
+X	      network_port = atoi (current_arg);
+X	      if (!network_port) {
+X		sprintf (error_buf, "Error: %s\n", 
+X			"-P parameter requires a positive port number");
+X		parameter_error (error_buf);
+X	      }
+X	    } else if (!strcmp(current_arg, "-G")) {
+X	      Use_GPS = 0;
+X	    } else if (!strcmp(current_arg, "-b")) {
+X	      next_arg;
+X	      if (!more_args)
+X		parameter_error
+X		  ("Error -- boards filename must follow -b parameter");
+X	      if ((fp = fopen(current_arg,"r")) == NULL) {
+X		sprintf (error_buf, 
+X			 "Error -- could not open boards file %s", 
+X			 current_arg);
+X		parameter_error (error_buf);
+X	      }
+X	      email_filename = strdup(current_arg);
+X	      status = Load_Email_Duplicate_File (fp);
+X	      if (status == -1) {
+X		sprintf (error_buf, "%s is not an email duplicate file.",
+X			 email_filename);
+X		parameter_error (error_buf);
+X	      } else if (status) {
+X		sprintf (error_buf, "Error accessing email duplicate file %s",
+X			 email_filename);
+X		parameter_error (error_buf);
+X	      }
+X	      fclose (fp);
+X	    } else if (!strcmp(current_arg, "-L")) {
+X	      if (logfile != NULL) fclose (logfile);
+X	      next_arg;
+X	      if (!more_args)
+X		parameter_error
+X		  ("Error -- logfile filename must follow -L parameter");
+X	      if (current_arg[0] == '+') {
+X		filename = current_arg + 1;
+X		logfile = fopen (filename, "a");
+X	      } else {
+X		filename = current_arg;
+X		logfile = fopen (filename, "w");
+X	      }
+X	      if (logfile == NULL) {
+X                sprintf (error_buf,
+X			 "Error -- Could not open log file %s: %s\n", 
+X			 filename, sys_errlist[errno]);
+X		parameter_error (error_buf);
+X	      }
+X	    } else if ((current_arg[0] == '-') && (current_arg[1] == 'z')) {
+X	      table_no = atoi (current_arg+2);
+X	      if (table_no == 0) {
+X		sprintf (error_buf, 
+X			"Error in table number for Zhang mode: %s",
+X			current_arg+2);
+X		parameter_error (error_buf);
+X	      }
+X	      if ((argi < argc-1) && (argv[argi+1][0] != '-')) {
+X		next_arg;
+X		if (current_arg[0] == '+') {
+X		  filename = current_arg+1;
+X		  zhang_logfile = fopen (filename, "a");
+X		} else {
+X		  filename = current_arg;
+X		  zhang_logfile = fopen(filename, "w");
+X		}
+X	      } else {
+X		sprintf (filename_buf, "okb_%s_rec", current_arg+2);
+X		filename = filename_buf;
+X		zhang_logfile = fopen (filename, "a");
+X	      }
+X	      if (zhang_logfile == NULL) {
+X                sprintf (error_buf,
+X			 "Error -- Could not open zhang log file %s: %s", 
+X			filename, sys_errlist[errno]);
+X		parameter_error (error_buf);
+X	      }
+X            } else {
+X	      sprintf (error_buf,
+X		      "Error -- unrecognized parameter: %s", current_arg);
+X	      parameter_error (error_buf);
+X	    }
+X	  } else {
+X	    /* Process a positional parameter. */
+X	    switch (posi) {
+X	    case 1: 
+X	      parse_position_parameter (current_arg);
+X	      break;
+X	    case 2:
+X	      local_player_name = strdup(current_arg);
+X	      break;
+X	    case 3:
+X	      server_name = strdup(current_arg);
+X	      server_mode_requested = 0;
+X	      client_mode_requested = 1;
+X	      break;
+X	    default:
+X	      parameter_error("Error -- too many parameters given.");
+X	    }
+X	    posi++;
+X	  }
+X	  next_arg;
+X	}
+X        if (local_player_name == NULL) {
+X	  filename = getenv("USER");
+X	  if (filename != NULL)
+X	    local_player_name = strdup (filename);
+X	  else
+X	    parameter_error
+X	      ("Error -- you must specify your name to play.");
+X	}
+X
+X	if (strlen(local_player_name) > 8)
+X	  local_player_name[8] = '\0';
+X 
+X	/* Initialize the state of the email duplicate variables: */
+X
+X	abort_flag = 0;
+X#ifdef SIGABRT
+X	signal (SIGABRT, (signal_handler) recovery_routine);
+X#endif
+X	signal (SIGHUP,  (signal_handler) Hangup_recovery_routine);
+X	signal (SIGINT,  (signal_handler) Quit_program);
+X	signal (SIGPIPE, (signal_handler) socket_recovery_routine);
+X	signal (SIGURG,  (signal_handler) socket_recovery_routine);
+X
+X	signal (SIGQUIT, (signal_handler) quit_error_routine);
+X	signal (SIGFPE,  (signal_handler) access_error_routine);
+X	signal (SIGILL,  (signal_handler) access_error_routine);
+X	signal (SIGBUS,  (signal_handler) access_error_routine);
+X	signal (SIGSEGV, (signal_handler) access_error_routine);
+X	signal (SIGSYS,  (signal_handler) system_call_error_routine);
+X
+X#ifdef SUNOS
+X	signal (SIGWINCH, (signal_handler) Change_display_size);
+X#endif SUNOS
+X
+X	startup_time = Seconds ();
+X
+X	error_value = setjmp (error_return);
+X	if (error_value != 0)
+X	        Terminate_Program ("SIGNAL RECEIVED");
+X 
+X	randomize ();
+X
+X	/* The order of the following initialization calls should not
+X           be changed. */
+X	Initialize_Network ();
+X	Initialize_Terminal ();
+X	Initialize_Display ();
+X	Initialize_Input ();
+X	initialize_help_system ();
+X
+X	Moderator_Comment
+X	  ("WELCOME TO OKBRIDGE.");
+X	Moderator_Comment
+X	  ("COPYRIGHT (C) 1990-1992 BY MATTHEW CLEGG.  ALL RIGHTS RESERVED.");
+X	Moderator_Comment
+X	  ("TYPE /HELP FOR INSTRUCTIONS ABOUT THIS PROGRAM");
+X
+X	setjmp (reset_buf);
+X
+X	if (Use_GPS)
+X	  GPS_Get_Message_of_the_Day ();
+X
+X#ifdef DEBUG	
+X        Moderator_Comment
+X	  ("WARNING!! THIS VERSION OF OKBRIDGE IS UNSTABLE AND MAY CRASH!!");
+X#endif
+X
+X/*
+X	sprintf (error_buf, "%d Username = %s", strlen(User_name), User_name);
+X	Moderator_Comment (error_buf);
+X	sprintf (error_buf, "%d Fullname = %s", strlen(User_fullname),
+X		 User_fullname);
+X	Moderator_Comment (error_buf);
+X*/
+X
+X	if (server_mode_requested)
+X	  Setup_server ();
+X	else if (client_mode_requested)
+X	  Attempt_to_connect (local_player);
+X	else if (Use_GPS) {
+X	  if (!GPS_unavailable) {
+X	    Pause ("PRESS ESC TO SEE THE CURRENTLY PLAYING TABLES.");
+X	    Clear_Status ();
+X	    GPS_List_Tables ();
+X	  }
+X	}
+X
+X	hands_played = 0;
+X	need_to_save_context = 1;
+X
+X	Initiate_Startup_Mode (Local_table);
+X	Begin_timer_for_hand ();
+X
+X	while (1) {
+X	  do {
+X	    reset_in_progress = setjmp (reset_buf);
+X	    if (reset_in_progress)
+X	      Handle_reset (reset_in_progress);
+X	  } while (reset_in_progress);
+X	  main_event_loop ();
+X	}
+X}
+X 
+END_OF_FILE
+if test 51146 -ne `wc -c <'bridge.c'`; then
+    echo shar: \"'bridge.c'\" unpacked with wrong size!
+fi
+# end of 'bridge.c'
+fi
+echo shar: End of archive 3 \(of 14\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 14 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

@@ -1,0 +1,793 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,23729959209bc91f,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-01-02 09:36:17 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site ut-ngp.UUCP
+Path: utzoo!linus!decvax!decwrl!pyramid!ut-sally!ut-ngp!clyde
+From: clyde@ut-ngp.UUCP (Head UNIX Hacquer)
+Newsgroups: net.sources
+Subject: SWS, a window size setting program
+Message-ID: <2749@ut-ngp.UUCP>
+Date: Thu, 2-Jan-86 12:36:17 EST
+Article-I.D.: ut-ngp.2749
+Posted: Thu Jan  2 12:36:17 1986
+Date-Received: Fri, 3-Jan-86 04:21:50 EST
+Distribution: net
+Organization: UTexas Computation Center, Austin, Texas
+Lines: 772
+
+#	This is a shell archive.
+#	Remove everything above and including the cut line.
+#	Then run the rest of the file through sh.
+-----cut here-----cut here-----cut here-----cut here-----
+#!/bin/sh
+# shar:	Shell Archiver
+#	Run the following text with /bin/sh to create:
+#	sws.1
+#	sws.c
+# This archive created: Thu Jan  2 11:25:58 1986
+# By:	Clyde Hoover (Head UNIX Hacquer)
+cat << \SHAR_EOF > sws.1
+.TH SWS 1 "20 December 85"
+.SH NAME
+sws \- set window size
+.SH SYNOPSIS
+.B sws
+[
+.B \-c
+] [
+.B \-h
+] [
+.B \-i
+] [
+.B \-n
+] [
+.B \-s
+] [ \fBlines columns\fP ] [ \fBdimension\fP ]
+.SH DESCRIPTION
+.I Sws
+resizes terminal emulator windows,
+using escape sequences if possible.  It also
+generates a termcap entry reflecting
+the new window size. 
+.SH OPTIONS
+.TP
+.B -c
+Output termcap environment setting commands for
+.IR csh (1).
+This mode is the default.
+.TP
+.B -h
+Output a help message.
+.TP
+.B -i
+Don't print error messages.
+.TP
+.B -n
+Output straight termcap entry (not in shell command form).
+.TP
+.B -s
+Output termcap environment setting commands for
+.IR sh (1).
+.TP
+.B "lines cols"
+The desired window size in lines and columns.  If either 
+.B lines
+or
+.B cols
+is zero, then that component of the current window size (if it can
+be determined) is used.
+.TP
+.B dimension
+A screen dimension name.
+The list of known dimension names can be obtained by using the
+.B \-h
+option.
+.PP
+Without any options,
+.I sws
+attempts to determine the current window size and produce a termcap entry
+which reflects this size.  This termcap entry is written to standard output,
+screen control and error messages are written to the standard error.
+.PP
+.I Sws
+exits with 0 if successful.
+.SH EXAMPLES
+.sp 2
+eval `sws 34 80`
+.br
+.in +5
+Sets the window size to 34 lines by 80 columns and change the TERMCAP
+environment entry to reflect this size (for the C shell).
+.in -5
+.sp
+eval `sws 40 0`
+.br
+.in +5
+Resets the window height to 40 lines, and leaves the window width unchanged.
+.in -5
+.sp
+alias SWS       eval \\`sws \\!*\\`
+.br
+.in +5
+Establishes a C shell alias to reset window size.
+.in -5
+.SH BUGS
+Must be run from a login shell to be effective, and any suspended children
+will not get the changed termcap.
+For the C shell, "set noglob" may be needed to turn off metacharacter
+strangeness.
+.PP
+.I Sws
+supports only SunTools version 2.0 (and above), but can be made to
+work on any
+window system (or terminal) as long as the host can query window
+size and can set window size using escape sequences.
+.SH "SEE ALSO"
+tset(1), suntools(1)
+.SH AUTHOR
+Clyde Hoover, Computation Center, The University of Texas at Austin
+SHAR_EOF
+cat << \SHAR_EOF > sws.c
+#include <stdio.h>
+#include <sgtty.h>
+#include <ctype.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <sys/time.h>
+/* #include <debug.h> */
+/*
+ *	sws - set window size.  Uses escape sequences to set window
+ *		dimensions and outputs a termcap that reflects the actual
+ *		window size.  Can be used with any window system or
+ *		terminal that can change window size.
+ *
+ *	Usage:	sws nlines nchars	Change window dimensions
+ *		sws 0	   nchars	Change window width only
+ *		sws nlines 0		Change window height only
+ *		sws dimension	Change window to <dimension> (see below)
+ *		sws		Output changed TERMCAP entry
+ *		sws [-s]  	Output sh(1) format TERMCAP entry
+ *		sws [-c]	Output csh(1) format TERMCAP entry
+ *		sws [-n]	Output straight TERMCAP entry
+ *		sws [-i]	Don't print error messages
+ *		sws [-h]	Print help message
+ *
+ *
+ *	Written by Clyde Hoover, Compuation Center,
+ *	The University of Texas at Austin, Austin, Texas 
+ */
+extern char	*getenv();
+extern char	*tgetent();
+extern char	*rindex();
+
+#define	LC	0		/* Escape sequences use 'lines, columns' */
+#define	CL	1		/* Escape sequences use 'columns, lines' */
+
+typedef struct {		/* Terminal information table */
+	char	*t_TermName,	/* Terminal name */
+		*t_UserMsg,	/* User help message */
+		*t_GetWSize,	/* Get size sequence */
+		*t_WSizeReply,	/* Form of reply */
+		*t_SetWSize;	/* Size setting sequence */
+
+	int	t_LCOrder,	/* Order of lines/columns in reply */
+		t_SetTty,	/* Set terminal modes */
+		t_ClearBits,	/* Terminal modes to clear for reply read */
+		t_SetBits;	/* Terminal modes to set for reply read */
+} termtype;
+
+/*
+ *	Terminal types that we know how to change the window size.
+ */
+termtype KnownTerms[] = {
+	/* Sun windows */
+	{	"sun",
+		"Terminal emulator window under SunTools V2.0 or greater",
+		"\033[18t",
+		"\033[8;%d;%dt",
+		"\033[8;%d;%dt",
+		LC, 1,
+		CBREAK, ECHO
+	},
+
+	{ 0 }
+};
+
+/*
+ *	Known dimension names.  A dimension is a shorthand
+ *	for a window size pair.
+ */
+typedef struct {		/* Named window sizes table */
+	char	*d_Name;	/* Size name */
+	short	d_NLines,	/* # of lines */
+		d_NCols;	/* # of columns */
+	char	*d_UserMsg;	/* Help message */
+} dimension;
+
+dimension DimensionNames[] = {
+	{ "std",	24,	80,	"Standard 24 by 80 page" },
+	{ "normal",	24,	80,	"Standard 24 by 80 page" },
+	{ "sun",	34,	80,	"Default SunTools window size" },
+	{ "wide",	0,	132,	"Wide (132 columns) page" },
+	{ "thin",	0,	80,	"Normal (80 columns) page" },
+	{ "narrow",	0,	40,	"Skinny (40 columns) page" },
+	{ "half",	12,	0,	"Half-height (12 lines) page" },
+	{ "full",	52,	80,	"'Full' size (52 lines) page" },
+	{ 0 }
+};
+
+struct timeval timeout = { 1, 0 };	/* Reply read timeout */
+
+char		*GetTermCap();
+termtype	*IsKnownTerminal();
+char		**split();
+int		catchint();
+
+char	tcap[1024];		/* Termcap buffer */
+char	*term;			/* Terminal name */
+char	**termcap;		/* Splitted out termcap entry */
+char	*program;		/* Program name for messages */
+char	*usage = "Usage: %s [-s] [-c] [-n] [-h] [-i] [width height] [dimension]\n";
+int	debug;			/* Debug trace on */
+jmp_buf	reset;			/* Signal reset point */
+
+main(argc, argv)
+int	argc;			/* Argument count */
+char	**argv;			/* Argument vector */
+{
+	int	li,		/* # of lines in window */
+		co;		/* # of columns in window */
+	int	uli = -1,	/* user-specified # of lines */
+		uco = -1,	/* user-specified # of columns */
+		changesize = 0,	/* Window size to change */
+		shellmode = 0,	/* sh or csh output format */
+		complain = 1;	/* Don't generate output messages */
+	char	*tname;		/* Terminal termcap name */
+	termtype	*tinfo;	/* Terminal info table pointer */
+
+	if (program = rindex(*argv, '/'))
+		program++;
+	else
+		program = *argv;
+	/*
+ 	 * Process arguments
+	 */
+	argc--;
+	argv++;
+	while (argc) {
+		if (**argv == '-') {
+			switch (*++*argv) {
+			case 'd':	debug = 1;	/* debug verbose */
+					break;
+
+			case 'i':	complain = 0;	/* don't complain about  errors */
+					break;
+
+			case 'h':	help();		/* Help */
+					exit(0);
+
+			case 'n':	shellmode = 2;	/* no shell mode */
+					break;
+
+			case 's':	shellmode = 1;	/* sh mode */
+					break;
+
+			case 'c':	shellmode = 0;	/* csh mode */
+					break;
+			default:
+				fprintf(stderr, usage, program);
+				exit(1);
+			}
+		}
+		if (isdigit(**argv)) {	/* Window sizes */
+			if (uli < 0) uli = atoi(*argv), changesize++;
+			else
+			if (uco < 0) uco = atoi(*argv), changesize++;
+		}
+		else {
+			if (!IsDimension(*argv, &uli, &uco)) {
+				if (complain)
+					fprintf(stderr,
+						"%s: Unknown dimension '%s'\n",
+						program, *argv);
+				exit(1);
+			}
+			changesize++;
+		}
+		argc--;
+		argv++;
+	}
+
+	/*
+	 * Get terminal type
+	 */
+	term = getenv("TERM");
+	if (term == (char *)0) {
+		if (complain)
+			fprintf(stderr, "%s: Terminal type unknown\n", program);
+		exit(1);
+	}
+	/*
+	 * Get TERMCAP info
+	 */
+	if ((tname = GetTermCap(term)) == (char *)0) {
+		if (complain)
+			fprintf(stderr, "%s: Cannot get termcap info\n",
+				program);
+		exit(1);
+	}
+	/*
+ 	 * See if we can do windows here
+	 */
+	if ((tinfo = IsKnownTerminal(tname)) == (termtype *)0) {
+		if (complain)
+			fprintf(stderr,
+				"%s: Don't know about terminal type %s\n",
+				program, term);
+		exit(1);
+	}
+
+	/*
+ 	 * Get the current window size
+	 */
+	if (tinfo->t_GetWSize) {
+		if (GetWindowSize(tinfo, &li, &co) != 2) {
+		/*
+		 * Should not really be an error under all circumstances
+		 */
+			if (complain)
+				fprintf(stderr, "%s: Cannot get window size\n",
+					program);
+			exit(1);
+		}
+	}
+
+	/*
+	 * If user specified window sizes, use them
+	 */
+	if (uli > 0)
+		li = uli;
+	if (uco > 0)
+		co = uco;
+
+	if (li == 0 || co == 0) {
+		if (complain)
+			fprintf(stderr, "%s: Missing window size arguments\n",
+				program);
+		exit(1);
+	}
+
+	/*
+	 * Fix lines and columns entries in termcap
+	 */
+	FixTermCap(termcap, li, co);
+
+	/*
+	 * If user specified new size, change the window
+	 */
+	if (changesize)
+		SetWindowSize(tinfo, li, co);
+	/*
+	 * Output modified termcap entry
+	 */
+	PutTermCap(termcap, shellmode);
+
+	exit(0);
+}
+
+/*
+ *	GetTermCap - get termcap info
+ *
+ *	Returns: Termcaps string of term names
+ *	Side Effects: Sets global <termcap> to the split-up termcap entry
+ */
+char	*
+GetTermCap(term)
+char	*term;		/* Term type to get termcap for */
+{
+	char	*tc;
+
+	tc = getenv("TERMCAP");
+	if (tc == (char *)0 || *tc == '/') {	/* No termcap or is a file */
+		if (tgetent(term, tcap) <= 0)	/* From termcap file */
+			return(0);
+		tc = tcap;
+	}
+	termcap = split(tc, ':');		/* Split up */
+	return(*termcap);
+}
+
+/*
+ *	IsKnownTerminal - lookup window change information
+ *
+ *	Returns: Pointer into <KnownTerms> that contains the terminal
+ *		info or NULL.
+ */
+termtype *
+IsKnownTerminal(tname)
+char	*tname;
+{
+	register termtype *t = KnownTerms;
+	register char	**tn;
+	char	**tnames;
+
+	tnames = split(tname, '|');	/* Split up term name list */
+	while (t->t_TermName) {		/* For each table entry */
+		tn = tnames;		/* For each term name */
+		while (*tn) {
+			if (strcmp(*tn, t->t_TermName) == 0)
+				return(t);
+			tn++;
+		}
+		t++;
+	}
+	return(0);
+}
+
+/*
+ *	GetWindowSize - get the current size of the terminal window
+ *
+ *	Returns: >1 if size was gotten sucessfully
+ *		<=0 if not
+ *	Side effects: # of lines stored in *lip,
+ *		      # of columns stored in *cop;
+ */
+GetWindowSize(ti, lip, cop)
+termtype	*ti;		/* Terminal information */
+int		*lip,		/* Where to store line count */
+		*cop;		/* Where to store column count */
+{
+	struct sgttyb	oldmode,	/* Old tty mode */
+			newmode;	/* New tty mode */
+	char	reply[80];		/* Size query reply */
+	register char	*r;		/* Temp */
+
+	signal(SIGINT, catchint);
+	signal(SIGQUIT, catchint);
+	if (setjmp(reset)) {
+		if (ti->t_SetTty)
+			(void) ioctl(0, TIOCSETP, &oldmode);
+		exit(1);
+	}
+	if (ti->t_SetTty) {	/* If tty modes need changing */
+		(void) ioctl(0, TIOCGETP, &oldmode);
+		newmode = oldmode;
+		newmode.sg_flags &= ~ti->t_SetBits;
+		newmode.sg_flags |= ti->t_ClearBits;
+		(void) ioctl(0, TIOCSETP, &newmode);
+	}
+#ifdef	DEBUG
+	pstr("query string ",ti->t_GetWSize);
+#endif
+	/* Send size query escape sequence */
+	write(fileno(stderr), ti->t_GetWSize, strlen(ti->t_GetWSize));
+	/*
+	 * Read reply.  This is not very pleasant way to do things,
+	 * but since the reply does not end with a newline, there is
+	 * no other way.
+	 */
+	r = reply;
+	for (;;) {
+		int	mask;		/* Select input mask */
+
+		mask = 1;
+		if (select(32, &mask, (int *)0, (int *)0, &timeout) == 0)
+			break;
+		if (read(0, r, 1) <= 0) {
+			if (ti->t_SetTty)
+				(void) ioctl(0, TIOCSETP, &oldmode);
+			return(-1);
+		}
+		r++;
+	}
+	*r = '\0';
+	if (ti->t_SetTty)
+		(void) ioctl(0, TIOCSETP, &oldmode);	/* Return old mode */
+	signal(SIGINT, SIG_DFL);
+	signal(SIGQUIT, SIG_DFL);
+#ifdef	DEBUG
+	pstr("reply ", reply);
+#endif
+	/*
+	 * Crack reply string
+	 */
+	if (ti->t_LCOrder == LC)
+		return(sscanf(reply, ti->t_WSizeReply, lip, cop));
+	else
+		return(sscanf(reply, ti->t_WSizeReply, cop, lip));
+}
+
+/*
+ *	catchint - Interrupt signal catcher
+ */
+catchint()
+{
+	longjmp(reset, 1);
+}
+
+#ifdef	DEBUG
+/*
+ *	pstr - print string for debugging
+ */
+pstr(l, s)
+char	*l,	/* Label string */
+	*s;	/* String to print */
+{
+	printf(l);
+	while (*s) {
+		if (*s < ' ')
+			printf("<%x> ", *s++ & 0x7f);
+		else
+			printf("%c ", *s++);
+	}
+	printf("\n");
+}
+#endif
+
+/*
+ *	SetWindowSize - set window size
+ */
+SetWindowSize(ti, li, co)
+termtype *ti;		/* Terminal info */
+int	li,		/* # of lines */
+	co;		/* # of columns */
+{
+	if (ti->t_SetWSize == (char *)0)	/* If can't change window */
+		return;
+	if (ti->t_LCOrder == LC)
+		fprintf(stderr, ti->t_SetWSize, li, co);
+	else
+		fprintf(stderr, ti->t_SetWSize, co, li);
+	fflush(stderr);
+}
+
+/*
+ *	FixTermCap - change termcap entry to reflect current window size
+ *
+ *	Side effects: Parts of <termcap> changed to reflect new window size
+ */
+FixTermCap(tv, li, co)
+register char	**tv;		/* Termcap entry (split) */
+int	li,			/* New # of lines */
+	co;			/* New # of columns */
+{
+	static char	newli[10],	/* New 'li#' entry */
+			newco[10];	/* New 'co#' entry */
+
+	sprintf(newli, "li#%d", li);
+	sprintf(newco, "co#%d", co);
+
+	while (*tv) {
+		if (strncmp(*tv, "li#", 3) == 0)
+			*tv = newli;
+		if (strncmp(*tv, "co#", 3) == 0)
+			*tv = newco;
+		tv++;
+	}
+}
+
+/*
+ *	PutTermCap - output new termcap
+ */
+PutTermCap(tv, style)
+register char	**tv;	/* Termcap entry */
+int	style;		/* Shell style (0 = csh , 1 = sh, 2 = no shell) */
+{
+	switch (style) {
+	case 0:		/* csh format */
+		printf("setenv TERMCAP '");
+		while(*tv)
+			printf("%s:", *tv++);
+		printf("'\n");
+		break;
+
+	case 1:		/* sh format */
+		printf("TERMCAP='");
+		while(*tv)
+			printf("%s:", *tv++);
+		printf("'\nexport TERMCAP\n");
+		break;
+
+	default:
+	case 2:		/* not in shell format */
+		while(*tv)
+			printf("%s:", *tv++);
+		printf("\n");
+		break;
+	}
+	fflush(stdout);
+}
+
+#define	NULLT	(token *)0
+
+typedef	struct tkstr	token;
+
+struct	tkstr {
+	char	*t_argloc;
+	token	*t_next;
+};
+
+extern char	*malloc();
+
+/*
+ *	split - split command line into arguments.
+ *
+ *	Returns: Address of (char *) vector containing
+ *		pointers to the split up <cbuf>
+ *		(char **)0 if error or empty line
+ */
+char **
+split(cbuf, sep)
+char	*cbuf;		/* Command line string */
+char	sep;		/* Token seperator */
+{
+	token	*T;		/* Token tree traverser */
+	register char	*pp,	/* Start of token */
+			*p,	/* End of token */
+			**a;	/* For copying into c_argv */
+	int	i;		/* Temp */
+	int	c_argc;		/* Number of tokens in command line */
+	static token	*c_head = NULLT;	/* Head of token tree */
+
+	char	*c_args,	/* Argument storage */
+		**c_argv;	/* Arg pointers */
+
+	/*
+	 * Initialize
+	 */
+	c_argc = 0;
+
+	/*
+	 * Initialize token tree if first time through
+	 */
+	if (c_head == NULLT) {
+		T = (token *)malloc(sizeof (token));
+		if (T == NULLT)
+			return((char **)0);
+		c_head = T;
+		c_head->t_next = NULLT;
+		c_head->t_argloc = (char *)0;
+	}
+
+	/*
+	 * If no string or null string, do nothing more
+	 */
+	if (cbuf == (char *)0) {
+		return((char **)0);
+	}
+
+	/*
+	 * Copy input to argument parsing buffer
+	 */
+	if ((c_args = malloc(strlen(cbuf)+1)) == (char *)0) {
+		return((char **)0);
+	}
+
+	(void) strcpy (c_args, cbuf);
+
+	/*
+	 * Scan input string, breaking into 'tokens'
+	 * (whitespace used as delimiters), and store them in
+	 * the token tree.
+	 */
+	pp = p = c_args;
+	T = c_head;
+	while (*pp) {
+		if (!sep)
+			while (*p && *p <= ' ')	/* to start of next field */
+				p++;
+		/*
+		 * End of input string.
+		 */
+		if (!*p)
+			break;
+		pp = p;		/* pp = start of token */
+		/*
+		 * Scan to end of this token
+		 */
+		if (sep)
+			while (*p && *p != sep) *p++;	/* p = end of token */
+		else
+			while (*p && *p > ' ') *p++;	/* p = end of token */
+		*p++ = '\0';
+
+		/*
+		 * Store this token in the token tree
+		 */
+		T->t_argloc = pp;
+		if (T->t_next == NULLT) {	/* Extend token tree */
+			token	*N;
+
+			N = (token *)malloc(sizeof (token));
+			if (N == NULLT)
+				break;
+
+			N->t_next = NULLT;
+			N->t_argloc = (char *)0;
+			T->t_next = N;
+		}
+		T = T->t_next;
+		c_argc++;
+	}
+
+	/*
+	 * Allocate c_argv and fill with string addresses from the
+	 * token tree
+	 */
+	c_argv = (char **)malloc((c_argc+2) * sizeof (char *));
+	if (c_argv == (char **)0)
+		return((char **)0);
+
+
+	*c_argv++ = c_args;	/* Stash raw arg memory address */
+	for (i = c_argc, a = c_argv, T = c_head ;
+		i > 0 && T->t_argloc != (char *)0 ;
+		T = T->t_next, i--) {
+			*a++ = T->t_argloc;
+			T->t_argloc = (char *)0;
+		}
+
+	*a = (char *)0;
+	return(c_argv);
+}
+
+/*
+ *	IsDimension - check for dimension name and set sizes
+ *
+ *	Returns: 1 if <str> is a dimension name
+ *		 0 if not
+ */
+IsDimension(str, lip, cop)
+char	*str;			/* Dimension name */
+int	*lip,			/* Where to store #lines */
+	*cop;			/* Where to store #columns */
+{
+	register dimension *d = DimensionNames;
+	register int l = strlen(str);
+
+	while (d->d_Name) {
+		if (strncmp(str, d->d_Name, l) == 0) {
+			*cop = d->d_NCols;
+			*lip = d->d_NLines;
+			return(1);
+		}
+		d++;
+	}
+	return(0);
+}
+
+/*
+ *	help - output help messages
+ */
+help()
+{
+	register dimension	*t = DimensionNames;
+	register termtype	*tt = KnownTerms;
+
+	fprintf(stderr, usage, program);
+	fprintf(stderr, "\nScreen dimension names:\n");
+	while (t->d_Name) {
+		fprintf(stderr, "%8s -- %s\n", t->d_Name, t->d_UserMsg);
+		t++;
+	}
+	fprintf(stderr, "\nSupported terminals:\n");
+	while (tt->t_TermName) {
+		fprintf(stderr, "%8s -- %s\n", tt->t_TermName, tt->t_UserMsg);
+		tt++;
+	}
+	fflush(stderr);
+}
+SHAR_EOF
+#	End of shell archive
+exit 0
+-- 
+Shouter-To-Dead-Parrots @ Univ. of Texas Computation Center; Austin, Texas  
+
+"All life is a blur of Republicans and meat." -Zippy the Pinhead
+
+	clyde@ngp.UTEXAS.EDU, clyde@sally.UTEXAS.EDU
+	...!ihnp4!ut-ngp!clyde, ...!allegra!ut-ngp!clyde
+
+

@@ -1,0 +1,340 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,79c3f15f1f9cef4,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-01-23 18:36:54 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site jove.UUCP
+Path: utzoo!linus!security!genrad!grkermit!masscomp!clyde!floyd!harpo!seismo!hao!cires!boulder!jove!dwight
+From: dwight@jove.UUCP
+Newsgroups: net.sources
+Subject: driver for printer port of DMF32 (4.2bsd)
+Message-ID: <103@jove.UUCP>
+Date: Mon, 23-Jan-84 21:36:54 EST
+Article-I.D.: jove.103
+Posted: Mon Jan 23 21:36:54 1984
+Date-Received: Fri, 27-Jan-84 08:27:21 EST
+Organization: University of Colorado, Boulder
+Lines: 320
+
+I'm supplying 'ed' diffs because I thought the context
+diffs were too big and a nuisance to implement.
+have fun!
+Dwight Melcher
+Univ. of Colorado at Boulder
+(303) 492-7919
+
+
+------------------------------------------------------------------
+apply this to distributed dmf.c
+-----------------------------------------------------------------
+
+708c
+
+.
+697a
+/* dmflopen -- open the line printer port on a dmf32
+ *
+ */
+dmflopen(dev,flag)
+dev_t dev;
+int flag;
+{
+	register int dmf;
+	register struct dmfl_softc *sc;
+	register struct uba_device *ui;
+	register struct dmfdevice *addr;
+
+
+	dmf = minor(dev) & 07 ;
+	if(((sc= &dmfl_softc[dmf])->dmfl_state & OPEN) ||
+		((ui=dmfinfo[dmf]) == 0) || ui->ui_alive == 0)
+			return(ENXIO);
+	addr = (struct dmfdevice *)ui->ui_addr;
+	if((addr->dmfl[0] & DMFL_OFFLINE))
+	{
+		/*printf("dmf: line printer offline/jammed\n");*/
+		return(EIO);
+	}
+	if((addr->dmfl[0]&DMFL_CONV))
+	{
+		printf("dmf:line printer disconnected\n");
+		return(EIO);
+	}
+
+	addr->dmfl[0] = 0;
+	sc->dmfl_state |= OPEN;
+	return 0;
+}
+
+dmflclose(dev,flag)
+dev_t dev;
+int flag;
+{
+	register int dmf= minor(dev) & 07;
+	register struct dmfl_softc *sc = &dmfl_softc[dmf];
+
+	dmflout(dev,"\f",1);
+	sc->dmfl_state = 0;
+	if(sc->dmfl_info != 0)
+		ubarelse((struct dmfdevice *)(dmfinfo[dmf])->ui_ubanum,
+			&(sc->dmfl_info));
+
+	((struct dmfdevice *)(dmfinfo[dmf]->ui_addr))->dmfl[0]=0;
+	return 0;
+}
+
+dmflwrite(dev,uio)
+dev_t dev;
+struct uio *uio;
+{
+	register unsigned int n;
+	register int error;
+	register struct dmfl_softc *sc;
+
+	sc = &dmfl_softc[minor(dev)&07];
+	if(sc->dmfl_state&ERROR) return(EIO);
+	while(n=min(DMFL_BUFSIZ,(unsigned)uio->uio_resid))
+	{
+		if(error=uiomove(&sc->dmfl_buf[0],(int)n,
+			UIO_WRITE,uio))
+		{
+			printf("uio move error\n");
+			return(error);
+		}
+		if(error=dmflout(dev,&sc->dmfl_buf[0],n))
+		{
+			return(error);
+		}
+	}
+	return 0;
+}
+
+
+/* dmflout -- start io operation to dmf line printer
+ *		cp is addr of buf of n chars to be sent.
+ *
+ *	-- dmf will be put in formatted output mode, this will
+ *		be selectable from an ioctl if the
+ *		need ever arises.
+ */
+dmflout(dev,cp,n)
+dev_t dev;
+char *cp;
+int n;
+{
+	register struct dmfl_softc *sc;
+	register int dmf;
+	register struct uba_device *ui;
+	register struct dmfdevice *d;
+	register unsigned info;
+	register unsigned i;
+
+	dmf = minor(dev) & 07 ;
+	sc= &dmfl_softc[dmf];
+	if(sc->dmfl_state&ERROR) return(EIO);
+	ui= dmfinfo[dmf];
+	/* allocate unibus resources, will be released when io
+	 * operation is done
+	 */
+	sc->dmfl_info=
+	info=
+		uballoc(ui->ui_ubanum,cp,n,0);
+	d= (struct dmfdevice *)ui->ui_addr;
+	d->dmfl[0] = (2<<8) | DMFL_FORMAT; /* indir reg 2 */
+	/* indir reg auto increments on r/w */
+	/* SO DON'T CHANGE THE ORDER OF THIS CODE */
+	d->dmfl[1] = 0; /* prefix chars & num */
+	d->dmfl[1] = 0; /* suffix chars & num */
+	d->dmfl[1] = info; 	/* dma lo 16 bits addr */
+
+	/* NOT DOCUMENTED !! */
+	d->dmfl[1] = -n;		/* number of chars */
+	/* ----------^-------- */
+
+	d->dmfl[1] = ((info>>16)&3) /* dma hi 2 bits addr */
+		| (1<<8) /* auto cr insert */
+		| (1<<9) /* use real ff */
+		| (1<<15); /* no u/l conversion */
+	d->dmfl[1] = sc->dmfl_lines 	/* lines per page */
+		| (sc->dmfl_cols<<8);	/* carriage width */
+	sc->dmfl_state |= ASLP;
+	i=spl5();
+	d->dmfl[0] |= DMFL_PEN|DMFL_IE;
+	while(sc->dmfl_state & ASLP)
+	{
+		sleep(&sc->dmfl_buf[0],(PZERO+8));
+		while(sc->dmfl_state&ERROR)
+		{
+			timeout(dmflint,dmf,10*hz);
+			sleep(&sc->dmfl_state,(PZERO+8));
+		}
+		/*if(sc->dmfl_state&ERROR) return (EIO);*/
+	}
+	splx(i);
+	return(0);
+}
+/* dmflint -- handle an interrupt from the line printer part of the dmf32
+ *
+ */
+
+dmflint(dmf)
+int dmf;
+{
+
+	register struct uba_device *ui;
+	register struct dmfl_softc *sc;
+	register struct dmfdevice *d;
+
+	ui= dmfinfo[dmf];
+	sc= &dmfl_softc[dmf];
+	d= (struct dmfdevice *)ui->ui_addr;
+
+	d->dmfl[0] &= ~DMFL_IE;
+
+	if(sc->dmfl_state&ERROR)
+	{
+		printf("dmfl: intr while in error state \n");
+		if((d->dmfl[0]&DMFL_OFFLINE) == 0)
+			sc->dmfl_state &= ~ERROR;
+		wakeup(&sc->dmfl_state);
+		return;
+	}
+	if(d->dmfl[0]&DMFL_DMAERR)
+	{
+		printf("dmf:NXM\n");
+	}
+	if(d->dmfl[0]&DMFL_OFFLINE)
+	{
+		printf("dmf:printer error\n");
+		sc->dmfl_state |= ERROR;
+	}
+	if(d->dmfl[0]&DMFL_PDONE)
+	{
+#ifdef notdef
+		printf("bytes= %d\n",d->dmfl[1]);
+		printf("lines= %d\n",d->dmfl[1]);
+#endif
+	}
+	sc->dmfl_state &= ~ASLP;
+	wakeup(&sc->dmfl_buf[0]);
+	if(sc->dmfl_info != 0)
+		ubarelse(ui->ui_ubanum,&sc->dmfl_info);
+	sc->dmfl_info = 0;
+
+}
+
+.
+308a
+	if(unit & 0200) return (ENOTTY);
+.
+214a
+	if(minor(dev)&0200)
+		return(dmflwrite(dev,uio));
+.
+204a
+	if(minor(dev)&0200) return(ENXIO);
+.
+190a
+	if(unit & 0200)
+		return(dmflclose(dev,flag));
+		
+.
+122a
+	if(unit & 0200)
+		return(dmflopen(dev,flag));
+.
+103c
+	dmfsoftCAR[ui->ui_unit] = ui->ui_flags & 0xff;
+	dmfl_softc[ui->ui_unit].dmfl_cols = cols==0?DMFL_DEFCOLS:cols;
+	dmfl_softc[ui->ui_unit].dmfl_lines = lines==0?DMFL_DEFLINES:lines;
+.
+101a
+	register int cols = (ui->ui_flags>>8) & 0xff;
+	register int lines = (ui->ui_flags>>16) & 0xff;
+.
+91c
+	dmfaddr->dmfccsr0 = (cvec >> 2) ;
+	a = (dmfaddr->dmfccsr0>>12) & 0xf;
+	for(i=0;a != 0;++i,a >>= 1)
+	{
+		if(a&1)
+			printf("\t(%s)\n",dmfdevs[i]);
+	}
+	dmfaddr->dmfl[0] = DMFL_RESET;
+.
+82a
+	register int i;
+	register unsigned int a;
+	static char *dmfdevs[]=
+		{"parallel","line printer","synch","asynch"};
+.
+55a
+
+struct dmfl_softc
+{
+	unsigned dmfl_state; 		/* soft state bits */
+	unsigned dmfl_info;		/* uba info */
+	unsigned short dmfl_lines;	/* lines per page (66 def.) */
+	unsigned short dmfl_cols; 	/* cols per line (132 def.) */
+	char dmfl_buf[DMFL_BUFSIZ];
+} dmfl_softc[NDMF];
+
+#define ASLP 1		/* waiting for interrupt from dmf */
+#define OPEN 2		/* line printer is open */
+#define ERROR 4		/* error while printing, driver
+			 refuses to do anything till closed */
+
+.
+42c
+int	dmfprobe(), dmfattach(), dmfrint(), dmfxint() ;
+int	dmflint();
+.
+33a
+#include "../h/kernel.h"
+.
+16a
+ ****************************
+ * DMF32 line printer driver
+ *
+ * the line printer on dmfx is indicated by a minor device code of 128+x
+ *
+ * the flags field of the config file is interpreted like so:
+ * bits		meaning
+ * ----		-------
+ * 0-7		soft carrier bits for ttys part of dmf32
+ * 8-15		number of cols/line on the line printer
+ *			if 0, 132 will be used.
+ * 16-23	number of lines/page on the line printer
+ *			if 0, 66 will be used.
+ *
+.
+7a
+ *
+.
+
+---------------------------------------------------------------
+apply this to the distributed dmfreg.h
+---------------------------------------------------------------
+
+115a
+
+/* dmf line printer csr def */
+#define DMFL_PEN	(1<<0)		/* print enable */
+#define DMFL_RESET	(1<<1)		/* master reset */
+#define DMFL_FORMAT	(1<<2)		/* format control */
+#define DMFL_UNUSED	(3<<3)
+#define DMFL_MAINT	(1<<5)		/* mainenance mode on */
+#define DMFL_IE		(1<<6)		/* intr enable */
+#define DMFL_PDONE	(1<<7)		/* print done bit */
+#define DMFL_INDIR	(7<<8)		/* indirect reg */
+#define DMFL_UNUSED2	(1<<11)
+#define DMFL_CONV	(1<<12)		/* connect verify */
+#define	DMFL_DAVRDY	(1<<13)		/* davfu ready */
+#define DMFL_OFFLINE	(1<<14)		/* printer offline */
+#define DMFL_DMAERR	(1<<15)		/* dma error bit */
+#define DMFL_BUFSIZ	512		/* max chars per dma */
+#define DMFL_DEFCOLS	132		/* default # of cols/line <=255 */
+#define DMFL_DEFLINES	66		/* default # of lines/page <=255 */
+.
+
+

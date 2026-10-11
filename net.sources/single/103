@@ -1,0 +1,464 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,eec2bd252567270,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1982-10-21 22:49:20 PST
+Message-ID: <bnews.phonlab.486>
+Newsgroups: net.sources
+Path: utzoo!decvax!harpo!floyd!cmcl2!philabs!sdcsvax!sdccsu3!sdcatta!phonlab!donn
+X-Path: utzoo!decvax!harpo!floyd!cmcl2!philabs!sdcsvax!sdccsu3!sdcatta!phonlab!donn
+From: phonlab!donn
+Date: Fri Oct 22 01:49:15 1982
+Subject: DEVF Font-making Program
+X-Google-Info: Converted from the original B-News header
+Posted: Wed Oct 20 00:25:25 1982
+Received: Fri Oct 22 01:49:15 1982
+
+/*
+ * devf.c
+ *
+ * Purpose:	Edit vtroff fonts in an expanded (ASCII) format.
+ * Usage:	devf < infile > fontfile
+ *	The input file contains an ASCII version of a fontfile in the format
+ *	of "vfontinfo -z0 -v", suitable for hand editing.  Actually,
+ *		/usr/lib/vfontinfo -v -z0 [font] | devf > [font]
+ *	is a very tedious no-op and a good test of the program.
+ * Date:	7/18/82
+ * Author:	Donn Seeley  UCSD Linguistics Dept.
+ * Remarks:
+ */
+
+# include	<stdio.h>
+
+# include	<vfont.h>
+
+# define	LEFT		0
+# define	RIGHT		1
+
+# define	MAXINT		0x7fffffff
+
+# define	LINESIZE	256
+# define	GLYPHSIZE	4096
+
+
+
+struct header	header;
+struct dispatch	dispatch[256];
+struct dispatch	*getdisp();
+char           *bitmap[256];
+char		glyphbuf[GLYPHSIZE];
+
+
+
+/*
+ * Macro for identifying dispatch info lines.
+ */
+# define	DISP(x)		((x) != NULL && strlen(x) > 5 \
+				&& (x)[4] >= '0' && (x)[4] <= '9')
+
+
+
+main()
+{
+	register char  *pg	= &glyphbuf[0];
+	char           *startg, *endg;
+	register int	n;
+	register int	nlines, nblanks;
+	int		addr	= 0;
+	int		left_offset, right_offset, top_offset, bottom_offset;
+	register struct dispatch *pd;
+
+
+
+	/*
+	 * Get initial header information.
+	 */
+	if ( fgets( pg, LINESIZE, stdin ) == NULL ) {
+		fprintf( stderr, "Can't read input\n" );
+		exit( 1 );
+	}
+	if ( ! gethead( pg ) ) {
+		fprintf( stderr, "Input is not vfontinfo format\n" );
+		exit( 1 );
+	}
+
+
+
+	/*
+	 * Read the first dispatch description line.
+	 */
+	fgets( pg, LINESIZE, stdin );
+	fgets( pg, LINESIZE, stdin );
+	if ( fgets( pg, LINESIZE, stdin ) == NULL ) {
+		fprintf( stderr, "Can't read input\n" );
+		exit( 1 );
+	}
+
+
+
+	/*
+	 * Loop on glyphs.
+	 */
+	while ( (pd = getdisp( pg )) != NULL ) {
+
+		left_offset	= MAXINT;
+		right_offset	= 0;
+		top_offset	= -1;
+		bottom_offset	= 0;
+		pg		= &glyphbuf[0];
+		startg		= pg;
+		endg		= pg;
+		nlines		= 0;
+		nblanks		= 0;
+
+		/*
+		 * Fetch a glyph.
+		 */
+		fgets( pg, LINESIZE, stdin );
+		while( ! DISP( pg ) ) {
+			
+			/*
+			 * Eat extra blank lines at the tops of glyphs.
+			 */
+			++nlines;
+			if ( blank( pg ) )
+				++nblanks;
+			else {
+				if ( top_offset == -1 ) {
+					top_offset	= nblanks;
+					startg		= pg;
+				}
+				nblanks		= 0;
+				endg		= pg;
+			}
+
+			/*
+			 * Eat extra rows on left and right margins.
+			 */
+			if ( (n = margin( pg, LEFT )) < left_offset )
+				left_offset	= n;
+			if ( (n = margin( pg, RIGHT )) >= right_offset )
+				right_offset	= n + 1;
+
+			/*
+			 * Read next line, test for end.
+			 */
+			pg		+= strlen( pg ) + 1;
+			if ( fgets( pg, LINESIZE, stdin ) == NULL ) {
+# ifdef DEBUG
+		fprintf(stderr, "END OF FILE\n");
+		fwrite( glyphbuf, 1, pg-glyphbuf, stderr );
+		fprintf( stderr, "%s", pg );
+# endif
+				pg		= NULL;
+				break;
+			}
+		}
+
+		bottom_offset	= nblanks;
+
+		/*
+		 * Adjust dispatch values.
+		 */
+		pd->down	= (nlines - pd->up) - bottom_offset;
+		pd->up		-= top_offset;
+		n		= pd->right;
+		pd->right	= right_offset - pd->left;
+		pd->left	-= left_offset;
+		pd->width	+= pd->right - n;
+		pd->nbytes	=
+			((pd->left + pd->right + 7) / 8) * (pd->up + pd->down);
+		pd->addr	= addr;
+		addr		+= pd->nbytes;
+
+		/*
+		 * Make raster data.
+		 */
+		do_bitmap( pd, startg, endg, left_offset, right_offset );
+	}
+
+	/*
+	 * Output the file.
+	 */
+	header.size	= addr;
+	fwrite( &header, sizeof (struct header), 1, stdout );
+	fwrite( &dispatch[0], sizeof (struct dispatch), 256, stdout );
+	for ( n = 0; n < 256; ++n )
+		if ( dispatch[n].nbytes > 0 && bitmap[n] != NULL )
+			fwrite( bitmap[n], sizeof (char), dispatch[n].nbytes, stdout );
+	exit( 0 );
+}
+
+
+
+/*
+ * gethead( buf ) -- Read ascii vfontinfo information out of buf into a header.
+ * Sample: "Font S.10, raster size 4334, max width 96, max height 96, xtend 21"
+ */
+int
+gethead( buf )
+    char   *buf;
+{
+	register int	n;
+
+	header.magic	= 0436;
+	n		= 
+		sscanf( buf, "%*s %*s %*s %*s %hd, %*s %*s %hd, %*s %*s %hd, %*s %hd",
+		    &header.size, &header.maxx, &header.maxy, &header.xtend );
+	return ( n == 4 );
+}
+
+
+
+/*
+ * getdisp( buf ) -- Read ascii dispatch information out of buf, store it in
+ *	the right dispatch structure and return a pointer to the structure.
+ *           ASCII     offset    size  left    right   up     down    width 
+ * Sample: "    1 ^A        0     24     -3     20     12     -4      21"
+ */
+struct dispatch *
+getdisp( buf )
+    char   *buf;
+{
+	register struct dispatch       *pd;
+	int				n, l, r, u, d, w, count;
+
+	if ( buf == NULL )
+		return ( NULL );
+
+	count		=
+		sscanf( buf, " %o %*s %*d %*d %d %d %d %d %d",
+			       &n,            &l,&r,&u,&d,&w );
+	if ( count != 6 ) {
+# ifdef DEBUG
+		fprintf(stderr, "BAD INPUT\n");
+		fwrite( glyphbuf, 1, buf-glyphbuf, stderr );
+		fprintf( stderr, "%s", buf );
+# endif
+		return ( NULL );
+	}
+
+	pd		= &dispatch[n];
+	pd->addr	= 0;
+	pd->nbytes	= 0;
+	pd->left	= l;
+	pd->right	= r;
+	pd->up		= u;
+	pd->down	= d;
+	pd->width	= w;
+
+	return ( pd );
+}
+
+
+
+/*
+ * blank( buf ) -- True if the line in buf is empty or contains only blanks.
+ */
+int
+blank( buf )
+    register char *buf;
+{
+	if ( buf == NULL )
+		return ( 1 );
+
+	while ( *buf >= ' ' )
+		if ( *buf++ != ' ' )
+			return ( 0 );
+	return ( 1 );
+}
+
+
+
+/*
+ * margin( buf, side ) -- Return distance from left margin of the data point
+ *	nearest the indicated side using vfontinfo data in buf.
+ *	Return MAXINT for left, 0 for right if the line is blank.
+ */
+int
+margin( buf, side )
+    char   *buf;
+    int     side;
+{
+	register char  *pb	= buf;
+	register char  *lastp	= buf;
+
+	while ( *pb >= ' ' ) {
+		
+		if ( *pb > ' ' ) {
+			if ( side == LEFT )
+				return ( (pb - buf) >> 1 );
+			lastp		= pb;
+		}
+
+		if ( *++pb < ' ' )
+			break;
+		++pb;
+	}
+
+	if ( side == RIGHT )
+		return ( (lastp - buf) >> 1 );
+	else
+		return ( MAXINT );
+}
+
+
+
+/*
+ * do_bitmap( pd, start, end, left, right ) -- Read vfontinfo format buffer from
+ *	line start up to line end and fill a bitmap buffer associated with
+ *	dispatch structure *pd with data from left margin to right margin.
+ */
+do_bitmap( pd, start, end, left, right )
+    struct dispatch *pd;
+    char            *start;
+    char            *end;
+    int              left;
+    int              right;
+{
+	register char  *pb;
+	register char  *pg	= start;
+	register int	i, j;
+
+	if ( pd->nbytes == 0 )
+		return;
+
+	/*
+	 * Make a bitmap buffer.
+	 */
+	i		= pd - &dispatch[0];
+	pb		= (char *) calloc( pd->nbytes, sizeof (char) );
+	if ( pb == NULL ) {
+		fprintf( stderr, "Out of memory\n" );
+		exit( 1 );
+	}
+	bitmap[i]	= pb;
+
+	/*
+	 * Loop on glyph lines.
+	 */
+	while ( pg <= end ) {
+		/*
+		 * Skip left margin.
+		 */
+		for ( i = 0; i < 2 * left && *pg >= ' '; ++i, ++pg );
+
+		/*
+		 * Map data points to bits.
+		 * Note that bits in a byte are arranged so that the most
+		 * significant bit prints in the leftmost position... sigh.
+		 * An inelegant decision on the part of Versatec, given
+		 * that *bytes* of *least* significance print leftmost on
+		 * a plotted line.
+		 */
+		i		= 0;
+		j		= 0;
+		while ( i < right - left ) {
+			if ( *pg > ' ' )
+				*pb		|= 1 << 7-j;
+			++i, ++j;
+			if ( j >= 8 ) {
+				j		= 0;
+				++pb;
+			}
+			if ( *pg >= ' ' && *++pg >= ' ' )
+				++pg;
+		}
+
+		/*
+		 * Pad out raster rows to byte multiples.
+		 */
+		if ( j > 0 )
+			++pb;
+
+		/*
+		 * Get next line.
+		 */
+		while ( *pg >= ' ' )
+			++pg;
+		while ( *pg < ' ' )
+			++pg;
+	}
+}
+
+==============================================================================
+
+.TH DEVF 1
+.SH NAME
+devf \- fontfile converter for vtroff
+.SH SYNOPSIS
+.B devf
+< input_file > fontfile
+.SH DESCRIPTION
+.I Devf
+is the inverse program to
+.I vfontinfo(1).
+.I Devf
+will take an input file of the sort produced by
+`/usr/lib/vfontinfo -v -z0 < fontfile > input_file'
+and make a `fontfile'.
+Files like `input_file' may be edited to produce
+bitmaps for new characters which will appear in
+the fontfile which
+.I devf
+makes, which you can then use with
+.I vtroff.
+The basic information on how to use this program
+is given in the manual entry for
+.I makefont(1)
+(q.v.); read on only if you like esoteric stuff.
+.PP
+Every character in the font is represented in the expanded fontfile
+as a header containing useful information and a diagram.
+There are several numbers in the header for each letter;
+the names of columns are
+given in a main header at the very top.
+The first field is an octal number which uniquely
+identifies a character.
+If you create a new character be sure that its number is distinct.
+The left, right, up, down and
+width parameters describe distances in relation to a fixed point of
+reference for a character.  You can visualize this reference point as
+being vertically on the line on which you would write the character on
+ruled paper, and horizontally near the left edge of the character.  If
+you don't manipulate the numbers in the header then
+when you edit a character this point stays
+fixed with respect to the top and left margins.  In particular if you
+add rows on top or columns on the left this has the effect of translating
+the character down or right with respect to the fixed reference
+point.  To prevent this sliding you must increment the ``left'' parameter
+for every column added on the left and increment the ``up'' parameter for
+every row added on top, changing the position of the reference point.
+The ``right'', ``down'' and ``width'' parameters are handled automatically by
+.I devf.
+You may sometimes want to tune the ``width'' parameter though --
+this represents the distance to go to the right in order to reach the
+reference point of the next letter in the text and thus it ultimately
+determines proportional character spacing.
+.PP
+The diagram is a representation of the bitmap for the character.
+Every raster position occupies two horizontal screen positions and
+one vertical screen position.
+Printing bits are indicated by a pair of matching square brackets: `[]'.
+Nonprinting bits are simply left blank,
+or omitted altogether if they lie on the right margin.
+To change the bitmap for a character
+you merely change the distribution of the square brackets and blanks.
+Replacing a pair of brackets by a pair of blanks (or trimming them
+from the right margin) turns off a printing bit;
+similarly, replacing blanks with brackets (or adding onto the right margin)
+turns on a printing bit.
+The rules are actually fairly lax:
+.I devf
+assumes that a raster position is nonprinting
+if the first screen position in a pair is a blank or is unoccupied,
+otherwise it assumes that it is printing.
+.SH AUTHOR
+Donn Seeley, UCSD Linguistics Dept.
+.SH BUGS
+Probably lots of them.
+
+This version of ``devf'' depends on
+your having the latest version of ``vfontinfo'',
+with the `-z' option; older versions will require some retooling.
+
+

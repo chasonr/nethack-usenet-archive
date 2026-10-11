@@ -1,0 +1,439 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,58b949e889dc5bbe,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-01-05 17:28:54 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site utcsrgv.UUCP
+Path: utzoo!utcsrgv!dave
+From: dave@utcsrgv.UUCP (Dave Sherman)
+Newsgroups: net.sources
+Subject: source for switching a phone line between dialin and dialout
+Message-ID: <3043@utcsrgv.UUCP>
+Date: Thu, 5-Jan-84 20:28:54 EST
+Article-I.D.: utcsrgv.3043
+Posted: Thu Jan  5 20:28:54 1984
+Date-Received: Thu, 5-Jan-84 21:39:50 EST
+Organization: The Law Society of Upper Canada, Toronto
+Lines: 419
+
+I have had a number of requests to post my source to the programs
+for flipping a telephone line from dialin to dialout and vice versa.
+It's a little more sophisticated (and faster) than a shell file which
+edits /etc/ttys. Below are two files, originate.c and answer.c.
+
+Some limitations to note:
+1. The programs assume you have only one telephone line. You'll
+   have to change the #define from tty7 to whatever you need.
+2. SIGINT is assumed to be the signal to restart init. Some
+   versions of UNIX use SIGHUP. Also, some systems have a
+   different name for the file than /etc/ttys.
+3. **IMPORTANT** The programs assume that the phone line is the
+   first entry in ttys. If you have no reason not to, edit your
+   ttys by hand and move the phone line to the top. (The only
+   noticeable effect will be that a login on the phone line
+   will be the first one shown when you run "who".) Otherwise,
+   change the programs to search for the correct line.
+4. By convention, anyone who uses the line for dialout should
+   ioctl it to TIOCEXCL (exclusive use). Although root can break
+   through, originate and answer fork off and setuid(1) to inhibit
+   this, so the TIOCEXCL setting will stop any attempts at switching
+   the line. You might want to check that your version of cu, tip
+   or whatever you use to call-out-as-a-terminal does the ioctl.
+   Uucico does it properly.
+
+That's it. Compile the programs and make them setuid to root.
+
+=================================================================
+/*
+ *      ORIGINATE
+ *
+ *      Set the telephone line for dial-out
+ *
+ *      Dave Sherman, April 1983
+ *      The Law Society of Upper Canada
+ *      utcsrgv!lsuc!dave       (also utcsrgv!dave at U of Toronto)
+ */
+
+#define TTYS "/etc/ttys"
+#define UTMP "/etc/utmp"
+#define INIT 1          /* process ID of /etc/init process */
+
+char dialout[] = "tty7";
+
+#define SOMEONE_ON      1
+#define NOONE_ON        0
+
+#include <signal.h>
+#include <stdio.h>
+#include <utmp.h>
+#include <sgtty.h>
+
+
+main()
+{
+        register ttys;
+        char c;
+
+        /* first look at /etc/ttys, to see if the
+         * line is already in originate mode. Convention
+         * is that anyone who changes ttys should run
+         * the "kill -2 1" immediately.
+         * By convention, the telephone line should be the
+         * first one in the ttys file.
+         * Once we see it was in answer mode, check that
+         * that line isn't being used. Then send it a
+         * "stty hup" to kick off any modem that's sitting
+         * on the line, update /etc/ttys and send the
+         * /etc/init process (PID 1) the reinitialization
+         * signal, so it will kick getty off the line
+         */
+
+        ttys = open(TTYS, 2);
+        if(ttys < 0)
+        {
+                perror("originate: open ttys");
+                exit(1);
+        }
+
+        if(read(ttys, &c, 1) != 1)
+        {
+                perror("originate: read from ttys");
+                exit(1);
+        }
+
+        switch(c)
+        {
+        case '0':
+                printf("line is already in originate mode\n");
+                return(0);
+        case '1':
+                checkout(ttys);
+                if(checkline(dialout) == SOMEONE_ON)
+                {
+                        printf("Can't originate - someone is logged in on %s!\n", dialout);
+                        exit(1);
+                }
+                sendhup(dialout);
+                orig(ttys);
+                close(ttys);
+                if(kill(INIT, SIGINT))  /* non-zero */
+                {
+                        perror("originate: couldn't kill process 1");
+                        exit(1);
+                }
+                return(0);
+        default:
+                printf("ttys file (%s) has bad format\n", TTYS);
+                exit(1);
+        }
+}
+
+checkout(fd)
+        register fd;
+{
+        /* check that the next few chars of the /etc/ttys
+         * file match the "dialout" string. Skip the first
+         * char, which is the speed code and irrelevant.
+         */
+
+        char buf1[30], buf2[30];
+        register n;
+
+        /* read the speed code and the newline, too */
+        n = strlen(dialout) + 2;
+
+        if(read(fd, buf1, n) != n)
+        {
+                perror("originate: read from /etc/ttys");
+                exit(1);
+        }
+
+        buf1[n] = 0;    /* mark end of string */
+
+        sprintf(buf2, "%s\n", dialout);
+
+        /* now compare the strings */
+        if(strcmp(buf1+1, buf2))
+        {
+                printf("First line in /etc/ttys ('1%s') doesn't match dialout line ('%s')\n", buf1, buf2);
+                exit(1);
+        }
+        /* just return happily */
+}
+
+checkline(dialout)
+        register char *dialout;
+{
+        char buf[30];
+
+        /* check that the line doesn't have anyone logged in
+         * at the moment, so we can use it for originating
+         * a call
+         */
+
+        struct utmp utmp;
+        register FILE *fp;
+
+        fp = fopen(UTMP, "r");
+        if(fp == NULL)
+        {
+                perror("can't open utmp");
+                exit(1);
+        }
+
+
+        while(!feof(fp) && !ferror(fp))
+        {
+                fread(&utmp, sizeof utmp, 1, fp);
+                if(utmp.ut_name[0] && !strcmp(utmp.ut_line, dialout))
+                        return(SOMEONE_ON);
+        }
+        return(NOONE_ON);
+}
+
+sendhup(line)
+        register char *line;
+{
+        char buf[30];
+        register fd;
+        register pid;
+        int status;
+
+        sprintf(buf, "/dev/%s", line);
+        chmod(buf, 0666);
+
+        /* go through some contortions here. We have to check
+         * for TIOCEXCL while we are not root, since root is
+         * allowed to break in. But we have to keep running later
+         * as root. So fork off a copy of ourselves to do the
+         * checking.
+         */
+        if((pid=fork()) == -1)
+        {
+                perror("can't fork");
+                exit(1);
+        }
+        if(pid == 0)    /* child */
+        {
+                setuid(1);      /* ==daemon, non-root */
+                if((fd = open(buf, 1)) < 0)
+                {       
+                        printf("can't open %s to send hangup signal\n", buf);
+                        exit(1);
+                }
+                ioctl(fd, TIOCHPCL, NULL);
+                exit(0);
+        }
+        wait(&status);
+        if(status)      /* exit(1) above */
+                exit(1);
+}
+
+orig(fd)
+        register fd;
+{
+        /* change the first byte in the file to be a '0',
+         * so getty won't start up a login for that line
+         */
+
+        long lseek();
+
+        if(lseek(fd, 0L, 0) != 0L)
+        {
+                perror("originate: lseek failed");
+                exit(1);
+        }
+
+        if(write(fd, "0", 1) != 1)
+        {
+                perror("originate: writing to /etc/ttys");
+                exit(1);
+        }
+}
+=================================================================
+/*
+ *      ANSWER
+ *
+ *      Set the telephone line for dial-in
+ *
+ *      Dave Sherman, April 1983
+ *      The Law Society of Upper Canada
+ *      utcsrgv!lsuc!dave       (also utcsrgv!dave at U of Toronto)
+ */
+
+#define TTYS "/etc/ttys"
+#define INIT 1          /* process ID of /etc/init process */
+
+char dialout[] = "tty7";
+
+#include <signal.h>
+#include <stdio.h>
+#include <sgtty.h>
+
+
+main()
+{
+        register ttys;
+        char c;
+
+        /* first look at /etc/ttys, to see if the
+         * line is already in answer mode. Convention
+         * is that anyone who changes ttys should run
+         * the "kill -2 1" immediately.
+         * By convention, the telephone line should be the
+         * first one in the ttys file.
+         * Once we see it was in originate mode, check that
+         * that line isn't being used. Then send it a
+         * "stty hup" to kick off any modem that's sitting
+         * on the line, update /etc/ttys and send the
+         * /etc/init process (PID 1) the reinitialization
+         * signal, so it will put a getty on the line
+         */
+
+        ttys = open(TTYS, 2);
+        if(ttys < 0)
+        {
+                perror("answer: open ttys");
+                exit(1);
+        }
+
+        if(read(ttys, &c, 1) != 1)
+        {
+                perror("answer: read from ttys");
+                exit(1);
+        }
+
+        switch(c)
+        {
+        case '1':
+                printf("line is already in answer mode\n");
+                return(0);
+        case '0':
+                checkout(ttys);
+                if(lineopen(dialout))
+                {
+                        printf("Can't answer - someone is using line %s!\n", dialout);
+                        exit(1);
+                }
+                sendhup(dialout);
+                answ(ttys);
+                close(ttys);
+                if(kill(INIT, SIGINT))  /* non-zero */
+                {
+                        perror("answer: couldn't kill process 1");
+                        exit(1);
+                }
+                return(0);
+        default:
+                printf("ttys file (%s) has bad format\n", TTYS);
+                exit(1);
+        }
+}
+
+checkout(fd)
+        register fd;
+{
+        /* check that the next few chars of the /etc/ttys
+         * file match the "dialout" string. Skip the first
+         * char, which is the speed code and irrelevant.
+         */
+
+        char buf1[30], buf2[30];
+        register n;
+
+        /* read the speed code and the newline, too */
+        n = strlen(dialout) + 2;
+
+        if(read(fd, buf1, n) != n)
+        {
+                perror("answer: read from /etc/ttys");
+                exit(1);
+        }
+
+        buf1[n] = 0;    /* mark end of string */
+
+        sprintf(buf2, "%s\n", dialout);
+
+        /* now compare the strings */
+        if(strcmp(buf1+1, buf2))
+        {
+                printf("First line in /etc/ttys ('0%s') doesn't match buf2 line ('%s')\n", buf1, dialout);
+                exit(1);
+        }
+        /* just return happily */
+}
+
+sendhup(line)
+        register char *line;
+{
+        char buf[30];
+        register fd;
+
+        sprintf(buf, "/dev/%s", line);
+        chmod(buf, 0666);
+
+        if((fd = open(buf, 1)) < 0)
+        {       
+                printf("can't open %s to send hangup signal\n", buf);
+                return;
+        }
+        ioctl(fd, TIOCHPCL, NULL);
+}
+
+answ(fd)
+        register fd;
+{
+        /* change the first byte in the file to be a '1',
+         * so getty will start up a login for that line
+         */
+
+        long lseek();
+
+        if(lseek(fd, 0L, 0) != 0L)
+        {
+                perror("answer: lseek failed");
+                exit(1);
+        }
+
+        if(write(fd, "1", 1) != 1)
+        {
+                perror("answer: writing to /etc/ttys");
+                exit(1);
+        }
+}
+
+
+lineopen(line)
+        register char *line;
+{
+        register fd;
+        register pid;
+        int status;
+        char buffer[30];
+        sprintf(buffer, "/dev/%s", line);
+        /* see if we can open the line - programs that use it
+         * will ioctl(line, TIOCEXCL, 0) by convention
+         */
+        if((pid=fork()) == -1)
+        {
+                printf("can't fork");
+                exit(1);
+        }
+        if(pid == 0)
+        {
+                setuid(1);      /* so TIOCEXCL will work */
+                if((fd=open(buffer, 0))< 0)
+                        exit(1);
+                close(fd);
+                exit(0);
+        }
+        wait(&status);
+        if(status)
+                return(1);      /* bad */
+        return(0);      /* good */
+}
+
+-- 
+ {allegra,cornell,decvax,ihnp4,linus,utzoo}!utcsrgv!dave
+
+

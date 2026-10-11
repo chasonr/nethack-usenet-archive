@@ -1,0 +1,979 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,1f7df4ea0eccd94d,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-04-27 15:52:17 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site ubc-vision.UUCP
+Path: utzoo!utcsri!ubc-vision!majka
+From: majka@ubc-vision.UUCP (Marc Majka)
+Newsgroups: net.sources
+Subject: Super Plot  (6 of 8)
+Message-ID: <123@ubc-vision.UUCP>
+Date: Sun, 27-Apr-86 18:52:17 EDT
+Article-I.D.: ubc-visi.123
+Posted: Sun Apr 27 18:52:17 1986
+Date-Received: Mon, 28-Apr-86 04:10:45 EDT
+Organization: UBC Computational Vision Lab, Vancouver, B.C., Canada
+Lines: 959
+
+
+- - - CUT - - - CUT - - - CUT - - - CUT - - - CUT - - - CUT - - - CUT - - -
+#!/bin/sh
+#
+# shell archive - extract with /bin/sh
+#
+echo Plot archive part 6 of 8
+echo
+echo extracting file rplfns.c
+sed 's/^X//' > rplfns.c <<'!FUNKY!STUFF!'
+X/*************************************************************/
+X/*                                                           */
+X/*  Copyright (c) 1986                                       */
+X/*  Marc S. Majka - UBC Laboratory for Computational Vision  */
+X/*                                                           */
+X/*  Permission is hereby granted to copy all or any part of  */
+X/*  this program for free distribution.   The author's name  */
+X/*  and this copyright notice must be included in any copy.  */
+X/*                                                           */
+X/*************************************************************/
+X
+X/*************************************************************/
+X/*                                                           */
+X/*   NOTE: The code for the vector generator (DDA) and the   */
+X/*   bspline generator is based on those published in:       */
+X/*                                                           */
+X/*   [1] Newman, W.M. and Sproull, R.F., "Principles of      */
+X/*       Interactive Computer Graphics", McGraw-Hill,        */ 
+X/*       New York, 1979.                                     */
+X/*                                                           */
+X/*************************************************************/
+X
+X#include <stdio.h>
+X#define GMAX 512  /* Max grid size */
+X#define FPMAX 32
+X#define MAXPATS 128
+X#define BPPMAX 16
+X#define STACKSIZE 65536
+X
+X/* Plot structure: contains the raster (grid), min and max defined co-ords,
+X   x and y ranges, current point and current gray level, a line-generator
+X   mask and a pointer for that mask, image file pointer and annotation
+X   record, and max row and col. */
+X
+Xstruct implstruct {
+X    int grid[GMAX][GMAX];       /* image raster         */
+X    double x1, y1, x2, y2;      /* min and max points   */
+X    double xr, yr;              /* x and y range        */
+X    double xc, yc;              /* current point        */
+X    int uhv;                    /* user space hv        */
+X    int ubpp;                   /* user bits per pixel  */
+X    double ubppr;               /* user bpp range       */
+X    int bx1, by1, bx2, by2;     /* polygon bounding box */
+X    int patc;                   /* current fill pattern */
+X    long gray;                  /* current gray level   */
+X    long lgray, ogray;          /* temp grays for fill  */
+X    char linemask[100];         /* line generator mask  */
+X    int lmp;                    /* mask pointer         */
+X    FILE *ifp;                  /* image file pointer   */
+X    int r1, c1, r2, c2;         /* image max & min      */
+X    int rc, cc;                 /* current row and col  */
+X    int rr, cr;                 /* row and col range    */
+X    int dhv;                    /* image is hv          */
+X    int dbpp;                   /* image bits per pixel */
+X    double dbppr;               /* image bpp range      */
+X    int nrows, ncols, bpp       /* image size & bpp     */
+X};
+X
+Xstruct implstruct impl;
+X
+Xstruct fpstruct {
+X    char grid[FPMAX][FPMAX];
+X    int nr, nc;
+X};
+X
+Xstruct fpstruct fpat[MAXPATS];
+X
+Xstatic int stack[STACKSIZE][2], top, knotk, knotn;
+X
+X/************************************************************************/
+X/* plotopen: open an image file for output, initialize plot structure   */
+X/************************************************************************/
+X
+Xplotopen(fname)
+Xchar *fname;
+X{
+X    FILE *fopen();
+X    int r,c;
+X    
+X    if (fname[0] == '\0') impl.ifp = stdout;
+X    else impl.ifp = fopen(fname,"w");
+X
+X    if (impl.ifp == NULL) {
+X        fprintf(stderr,"plotopen: can't open output file %s\n",fname);
+X        exit(1);
+X    }
+X    
+X    /* defaults */
+X    frame(0,0,255,255,0);
+X    space(0,0,255,255,0);
+X    bppout(8);
+X    bppin(8);
+X    move(0,0);
+X    gray(255);
+X    linemod("1");
+X    fillpat(0,1,1,"1");
+X    font("sr");
+X    fspec(1.0,1.0,0.0);
+X    
+X    for (r = 0; r < GMAX; r++) 
+X        for (c = 0; c < GMAX; c++) impl.grid[r][c] = 0;
+X}
+X
+X/************************************************************************/
+X/* frame: initialize number of x and y divisions in the output image    */
+X/************************************************************************/
+X
+Xframe(x1,y1,x2,y2,hv)
+Xint x1,y1,x2,y2,hv;
+X{
+X    impl.r1 = x1; impl.c1 = y1;
+X    impl.r2 = x2; impl.c2 = y2;
+X    impl.rr = x2 - x1; impl.cr = y2 - y1;
+X    impl.nrows = 1 + abs((int)(x2-x1));
+X    impl.ncols = 1 + abs((int)(y2-y1));
+X
+X    if (impl.nrows > GMAX) {
+X        fprintf(stderr,"frame: nrows (%d) > max (%d)\n",
+X            impl.nrows,GMAX);
+X        exit(1);
+X    }
+X    if (impl.ncols > GMAX) {
+X        fprintf(stderr,"frame: ncols (%d) > max (%d)\n",
+X            impl.ncols,GMAX);
+X        exit(1);
+X    }
+X}
+X
+X/************************************************************************/
+X/* bppout: set number of bits per pixel for output                      */
+X/************************************************************************/
+X
+Xbppout(b)
+Xint b;
+X{
+X    if ((b < 1) || (b > BPPMAX)) {
+X        fprintf(stderr,"bpp: %d BPP exceeds %d maximum\n",b,BPPMAX);
+X        exit(1);
+X    }
+X        
+X    impl.bpp = b;
+X    impl.dbpp = b;
+X    impl.lgray = 1 + (1 << b);
+X    impl.dbppr = (1 << b) - 1;
+X}
+X
+X/************************************************************************/
+X/* bppin: set number of bits per pixel for input                        */
+X/************************************************************************/
+X
+Xbppin(b)
+Xint b;
+X{
+X    impl.ubpp = b;
+X    impl.ubppr = (1 << b) - 1;
+X}
+X
+X/************************************************************************/
+X/* plotclose: write the image                                           */
+X/************************************************************************/
+X
+Xplotclose()
+X{
+X    int i, j, p, bytes;
+X    
+X    bytes = impl.dbpp / 8;
+X    if (bytes == 0) bytes = 1;
+X    
+X    impl.nrows = impl.nrows;
+X    impl.ncols = impl.ncols;
+X
+X    for (i = 0; i < impl.nrows; i++)
+X        for (j = 0; j < impl.ncols; j++) {
+X            p = impl.grid[i][j];
+X            fwrite(&p,bytes,1,impl.ifp);
+X        }
+X    
+X    fclose(impl.ifp);
+X}
+X
+X/************************************************************************/
+X/* space: define x and y max and min. set x and y range                 */
+X/************************************************************************/
+X
+Xspace(x1,y1,x2,y2,hv)
+Xint x1, y1, x2, y2, hv;
+X{
+X    impl.x1 = x1; impl.y1 = y1;
+X    impl.x2 = x2; impl.y2 = y2;
+X    impl.xr = x2 - x1; 
+X    impl.yr = y2 - y1; 
+X    impl.uhv = hv;
+X    move(x1,y1);
+X    impl.bx1 = impl.x1; impl.by1 = impl.y1;
+X    impl.bx2 = impl.x2; impl.by2 = impl.y2;
+X    if (impl.xr == 0) impl.xr = 1;
+X    if (impl.yr == 0) impl.yr = 1;
+X}
+X
+Xhvmatch()
+X{
+X    if (impl.uhv == impl.dhv) return(1);
+X    return(0);
+X}
+X
+X/************************************************************************/
+X/* erase: fill the grid with current gray level                         */
+X/************************************************************************/
+X
+Xerase()
+X{
+X    int x, y, pc;
+X    
+X    pc = impl.patc;
+X    
+X    for (x = 0; x < impl.nrows; x++)
+X        for (y = 0; y < impl.ncols; y++)
+X            if (fpat[pc].grid[x % fpat[pc].nr][y % fpat[pc].nc])
+X                impl.grid[x][y] = impl.gray;
+X}
+X
+X/************************************************************************/
+X/* move: change the current point to (x, y).                            */
+X/************************************************************************/
+X
+Xmove(x,y)
+Xint x, y;
+X{
+X    dblmove((double)x,(double)y);
+X}
+X
+Xdblmove(x,y)
+Xdouble x,y;
+X{
+X    impl.xc = x; impl.yc = y;
+X    
+X    if (impl.uhv != impl.dhv) {
+X        impl.cc = impl.c1 + (impl.xc - impl.x1) * (impl.cr / impl.xr);
+X        impl.rc = impl.r1 + (impl.yc - impl.y1) * (impl.rr / impl.yr);
+X    }
+X    else {
+X        impl.rc = impl.r1 + (impl.xc - impl.x1) * (impl.rr / impl.xr);
+X        impl.cc = impl.c1 + (impl.yc - impl.y1) * (impl.cr / impl.yr);
+X    }
+X
+X    if (impl.xc < impl.bx1) impl.bx1 = impl.xc;
+X    if (impl.yc < impl.by1) impl.by1 = impl.yc;
+X    if (impl.xc > impl.bx2) impl.bx2 = impl.xc;
+X    if (impl.yc > impl.by2) impl.by2 = impl.yc;
+X}
+X
+X/************************************************************************/
+X/* point: plot a point                                              */
+X/************************************************************************/
+X
+Xpoint(x,y)
+Xint x, y;
+X{
+X    move(x,y);
+X    if ((impl.rc>=0)&&(impl.rc<=GMAX)&&(impl.cc>=0)&&(impl.cc<=GMAX))
+X        impl.grid[impl.rc][impl.cc] = impl.gray;
+X}
+X
+X/************************************************************************/
+X/* cont: line generator. Draws a line from current point to (x, y)  */
+X/*         uses the line mask to decide when to set pixels.             */
+X/************************************************************************/
+X
+Xcont(x,y)
+Xint x, y;
+X{
+X    dblcont((double)x,(double)y);
+X}
+X
+Xdblcont(x,y)
+Xdouble x,y;
+X{
+X    double r1, c1, r2, c2, rinc, cinc, length, tlen, r, c, fabs();
+X    int i;
+X    
+X    /* Based on the simple DDA from Newmann and Sproull[1] */
+X
+X    r1 = impl.rc; c1 = impl.cc; 
+X    dblmove(x,y);
+X    r2 = impl.rc; c2 = impl.cc; 
+X
+X    length = fabs(r2-r1);
+X    tlen = fabs(c2-c1);
+X    if (tlen > length) length = tlen;
+X    if (length != 0.0) {
+X        rinc = (r2 - r1)/length;
+X        cinc = (c2 - c1)/length;
+X        r = r1;
+X        c = c1;
+X        
+X        for (i = 0; i < length; i++) {
+X            if (impl.linemask[impl.lmp] == '\0') impl.lmp = 0;
+X            if (impl.linemask[impl.lmp++] == '1')
+X                if ((r>=0)&&(r<=GMAX)&&(c>=0)&&(c<=GMAX))
+X                    impl.grid[(int)r][(int)c] = impl.gray;
+X            r += rinc;
+X            c += cinc;
+X        }
+X        if ((r != r2) || (c != c2)) {
+X            if (impl.linemask[impl.lmp] == '\0') impl.lmp = 0;
+X            if (impl.linemask[impl.lmp++] == '1')
+X                if ((r2>=0)&&(r2<=GMAX)&&(c2>=0)&&(c2<=GMAX))
+X                    impl.grid[(int)r2][(int)c2] = impl.gray; 
+X        }
+X    }
+X}
+X
+X/************************************************************************/
+X/* line: draw a line                                                    */
+X/************************************************************************/
+X
+Xline(x1,y1,x2,y2)
+Xint x1, y1, x2, y2;
+X{
+X    move(x1,y1);
+X    cont(x2,y2);
+X}
+X
+X/************************************************************************/
+X/* chain: polyline                                                      */
+X/************************************************************************/
+X
+Xchain(n,v)
+Xshort n, *v;
+X{
+X    int i, p;
+X    short x, y;
+X
+X    p = 0;
+X    x = v[p++]; y = v[p++];
+X    move(x,y);
+X    
+X    for (i = 1; i < n; i++) {
+X        x = v[p++]; y = v[p++];
+X        cont(x,y);
+X    }
+X}
+X
+X/************************************************************************/
+X/* bspline: order k spline from Newmann & Sproull[1]                    */
+X/************************************************************************/
+X
+Xbspline(k,n,v)
+Xshort k,n,*v;
+X{
+X    double u, du, ufin, x, y;
+X    short nn;
+X    
+X    nn = n - 1;
+X    ufin = (double)(nn - k + 2);
+X    du = ufin / (500.0 + (double)nn);
+X    
+X    u = 0.0;
+X    Bpoint(&x,&y,0.0,nn,k,v);
+X    move((int)x,(int)y);
+X    
+X    while (u <= ufin) {
+X        u = u + du;
+X        Bpoint(&x,&y,u,n,k,v);
+X        cont((int)x,(int)y);
+X    }
+X    x = v[nn*2];
+X    y = v[nn*2 + 1];
+X    cont((int)x,(int)y);
+X}
+X
+XBpoint(x,y,u,n,k,v)
+Xdouble *x,*y,u;
+Xint n,k;
+Xshort *v;
+X{
+X    int i, m;
+X    double b, Bnblend();
+X    
+X    *x = 0.0; *y = 0.0;
+X    m = 0;
+X    knotk = k;
+X    knotn = n;
+X
+X    for (i = 0; i <= n; i++) {
+X        b = Bnblend(i,k,u);
+X        *x = *x + (double)(v[m]) * b;
+X        *y = *y + (double)(v[m+1]) * b;
+X        m += 2;
+X    }
+X}
+X
+XBknot(i)
+Xint i;
+X{
+X    if (i < knotk) return(0);
+X    else if (i > knotn) return(knotn - knotk + 2);
+X    else return(i - knotk + 1);
+X}
+X
+Xdouble Bnblend(i,k,u)
+Xint i,k;
+Xdouble u;
+X{
+X    double v, v1, v2, t1, t2;
+X    
+X    v1 = 0.0; v2 = 0.0; t1 = 0.0; t2 = 0.0;
+X    
+X    if (k == 1) {
+X        if ((Bknot(i) <= u) && (u < Bknot(i+1))) v = 1.0;
+X        else v = 0.0;
+X    }
+X    else {
+X        t1 = Bknot(i+k-1) - Bknot(i);
+X        if (t1 != 0) v1 = (u - Bknot(i)) * Bnblend(i,k-1,u) / t1;
+X
+X        t2 = Bknot(i+k) - Bknot(i+1);
+X        if (t2 != 0) v2 = (Bknot(i+k) - u) * Bnblend(i+1,k-1,u) / t2;
+X        
+X        v = v1 + v2;
+X    }
+X    return(v);
+X}
+X
+Xpolygon(n,v)
+Xshort n, *v;
+X{
+X    int i, p;
+X    short x, y;
+X
+X    startp();
+X    p = 0;
+X    x = v[p++]; y = v[p++];
+X    move(x,y);
+X    
+X    for (i = 1; i < n; i++) {
+X        x = v[p++]; y = v[p++];
+X        cont(x,y);
+X    }
+X    endp();
+X}
+X
+X/************************************************************************/
+X/* moverel: relative move                                               */
+X/************************************************************************/
+X
+Xmoverel(x,y)
+Xint x, y;
+X{
+X    int newx, newy;
+X    
+X    newx = impl.xc + x;
+X    newy = impl.yc + y;
+X    move(newx,newy);
+X
+X}
+X
+Xdblmoverel(x,y)
+Xdouble x, y;
+X{
+X    double newx, newy;
+X    
+X    newx = impl.xc + x;
+X    newy = impl.yc + y;
+X    dblmove(newx,newy);
+X
+X}
+X
+X/************************************************************************/
+X/* contrel: relative cont                                               */
+X/************************************************************************/
+X
+Xcontrel(x,y)
+Xint x, y;
+X{
+X    int newx, newy;
+X    
+X    newx = impl.xc + x;
+X    newy = impl.yc + y;
+X    cont(newx,newy);
+X}
+X
+Xdblcontrel(x,y)
+Xdouble x, y;
+X{
+X    double newx, newy;
+X    
+X    newx = impl.xc + x;
+X    newy = impl.yc + y;
+X    dblcont(newx,newy);
+X
+X}
+X
+X/************************************************************************/
+X/* gray: set the current gray level                                     */
+X/************************************************************************/
+X
+Xgray(g)
+Xint g;
+X{
+X    impl.gray = (double)g * impl.dbppr/impl.ubppr;
+X}
+X
+X/************************************************************************/
+X/* colour: set the current colour                                       */
+X/************************************************************************/
+X
+Xcolour(r,g,b)
+Xint r,g,b;
+X{
+X    gray((int)((double)(r + g + b) / 3.0));
+X}
+X
+X/************************************************************************/
+X/* linemod: change the line generator mask                          */
+X/*            this mask should be a string of 1s and 0s. The line       */
+X/*            generator (cont) will set the pixels under a "1".     */ 
+X/************************************************************************/
+X
+Xlinemod(str)
+Xchar *str;
+X{
+X    strcpy(impl.linemask,str);
+X    impl.lmp = 0;
+X}
+X
+X/************************************************************************/
+X/* startp: start filled polygon                                         */
+X/************************************************************************/
+X
+Xstartp()
+X{
+X    impl.ogray = impl.gray;
+X    impl.gray = impl.lgray;
+X    impl.bx1 = impl.xc; impl.by1 = impl.yc;
+X    impl.bx2 = impl.xc; impl.by2 = impl.yc;
+X}
+X
+X/************************************************************************/
+X/* endp: end filled polygon                                         */
+X/************************************************************************/
+X
+Xendp()
+X{
+X    impl.gray = impl.ogray;
+X    pfill(impl.bx1,impl.by1,impl.bx2,impl.by2,impl.lgray);
+X}
+X
+X/************************************************************************/
+X/* arc: draw an arc from x1 y1 to x2 y2, with center at xc xy       */
+X/************************************************************************/
+X
+Xarc(xc,yc,x1,y1,x2,y2)
+Xint xc,yc,x1,y1,x2,y2;
+X{
+X    double fabs(), hypot(),acos(), cos(), sin();
+X    double dt, a1, a2, theta, rad, pi, pi2, up, dn, bup, bdn;
+X    double cx, cy;
+X    int catch;
+X    
+X    pi = acos(-1.0);
+X    pi2 = 2.0 * pi;
+X
+X    /* Algorithm: move to x1 y1. The angle between x1 y1 and the x axis is a1.
+X        The angle to x2 y2 is a2. Set theta = a1, and move to x1 y1.
+X        Sweep anti-clockwise to a2, incrementing theta by dt. At each step,
+X        find the point on the arc at angle theta. Use cont to draw a line
+X        to that point.
+X    */
+X
+X    rad = hypot((double)(x1-xc),(double)(y1-yc));
+X    
+X    /* find the angles a1 and a2 */
+X    
+X    if (y1 >= yc) a1 = acos((x1-xc)/rad);
+X    else a1 = pi + acos((xc-x1)/rad);
+X
+X    if (y2 >= yc) a2 = acos((x2-xc)/rad);
+X    else a2 = pi + acos((xc-x2)/rad);
+X
+X    dt = 0.1 / rad;
+X    theta = a1;
+X    up = a2+dt;
+X    dn = a2-dt;
+X    bup = up + pi2;
+X    bdn = dn + pi2;
+X    catch = 0; /* safety chain */
+X
+X    /* step around the arc until within range of a2 */
+X    while (!((catch > 1) && (((theta < up) && (theta > dn)) ||
+X        ((theta < bup) && (theta > bdn))))) {
+X
+X        impl.xc = xc + rad * cos(theta);
+X        impl.yc = yc + rad * sin(theta);
+X
+X        if (impl.uhv != impl.dhv) {
+X            impl.cc = impl.c1 + (impl.xc - impl.x1) * (impl.cr / impl.xr);
+X            impl.rc = impl.r1 + (impl.yc - impl.y1) * (impl.rr / impl.yr);
+X        }
+X        else {
+X            impl.rc = impl.r1 + (impl.xc - impl.x1) * (impl.rr / impl.xr);
+X            impl.cc = impl.c1 + (impl.yc - impl.y1) * (impl.cr / impl.yr);
+X        }
+X
+X        if (impl.xc < impl.bx1) impl.bx1 = impl.xc;
+X        if (impl.yc < impl.by1) impl.by1 = impl.yc;
+X        if (impl.xc > impl.bx2) impl.bx2 = impl.xc;
+X        if (impl.yc > impl.by2) impl.by2 = impl.yc;
+X        
+X        if (impl.linemask[impl.lmp] == '\0') impl.lmp = 0;
+X        if (impl.linemask[impl.lmp++] == '1')
+X            if ((impl.rc>=0)&&(impl.rc<=GMAX)&&(impl.cc>=0)&&(impl.cc<=GMAX))
+X                    impl.grid[impl.rc][impl.cc] = impl.gray;
+X        theta+=dt;
+X        
+X        /* safety check to catch runaway loops */
+X        if (catch++ > 1000000) {
+X            fprintf(stderr,"arc: runaway loop caught: inform a wizard!\n");
+X            fprintf(stderr,"  xc=%lf yc=%lf x1=%lf y1=%lf x1=%lf y1=%lf\n",
+X                xc,yc,x1,y1,x2,y2);
+X            fprintf(stderr,"  angle1=%lf angle2=%lf dtheta=%lf\n",a1,a2,dt);
+X            exit(1);
+X        }
+X    }
+X
+X    /* finish up */
+X    cont(x2,y2);
+X    point(x2,y2);
+X}
+X
+X/************************************************************************/
+X/* circle: simple incremental circle generator                      */
+X/************************************************************************/
+X
+Xcircle(x1,y1,r)
+Xint x1,y1,r;
+X{
+X    arc (x1, y1, x1-r, y1, x1-r, y1);
+X}
+X
+X/************************************************************************/
+X/* fillpat: set fill pattern                                            */
+X/************************************************************************/
+X
+Xfillpat(n,r,c,str)
+Xint n, r, c;
+Xchar *str;
+X{
+X    int i, j, p;
+X
+X    if (n >= MAXPATS) {
+X        fprintf(stderr,"fillpat: pattern number %d > max %d\n",n,MAXPATS-1);
+X        exit(1);
+X    }
+X    
+X    impl.patc = n;
+X    fpat[n].nr = r;
+X    fpat[n].nc = c;
+X    p = 0;
+X    
+X    for (i = 0; i < r; i++)
+X        for (j = 0; j < c; j++) {
+X            if (str[p++] == '1') fpat[n].grid[i][j] = 1;
+X            else fpat[n].grid[i][j] = 0;
+X            if (str[p] == '\0') p = 0;
+X        }
+X}
+X
+X/************************************************************************/
+X/* setpat: set current fill pattern                                     */
+X/************************************************************************/
+X
+Xsetpat(n)
+Xint n;
+X{
+X    impl.patc = n;
+X}
+X
+X/************************************************************************/
+X/* pensize: set pensize                                                 */
+X/************************************************************************/
+X
+Xpensize(p)
+Xint p;
+X{
+X/* PENSIZE NOT IMPLEMENTED */
+X}
+X
+X/************************************************************************/
+X/* area: fill area from seed point - boundary is non-current value  */
+X/************************************************************************/
+X
+Xarea(x,y)
+Xint x, y;
+X{
+X    int nx, ny, nxm, nym, nxp, nyp, aminx, aminy, amaxx, amaxy, pc;
+X    long seedv, mark;
+X    
+X    pc = impl.patc;
+X    
+X    /* stack the seed point */
+X    move(x,y);
+X    seedv = impl.grid[impl.rc][impl.cc];
+X    mark = impl.lgray;
+X    aminx = impl.rc; aminy = impl.cc;
+X    amaxx = aminx; amaxy = aminy;
+X    
+X    top = 0;
+X    if (fpat[pc].grid[impl.rc%fpat[pc].nr][impl.cc%fpat[pc].nc]) 
+X        impl.grid[impl.rc][impl.cc] = impl.gray;
+X    else impl.grid[impl.rc][impl.cc] = mark;
+X    stack[top][0] = impl.rc; stack[top++][1] = impl.cc;
+X
+X
+X    /* stack any 4-connected neighbours of the top of the stack, which
+X        have the seed value at that pixel. */
+X
+X    while (top > 0) {
+X        top--;
+X        nx = stack[top][0]; ny = stack[top][1];
+X        nxm = nx - 1; nym = ny - 1;
+X        nxp = nx + 1; nyp = ny + 1;
+X
+X        if (nx > 0)
+X            if (impl.grid[nxm][ny] == seedv) {
+X                if (nxm < aminx) aminx = nxm;
+X                if (fpat[pc].grid[nxm%fpat[pc].nr][ny%fpat[pc].nc]) 
+X                    impl.grid[nxm][ny] = impl.gray;
+X                else impl.grid[nxm][ny] = mark;
+X                stack[top][0] = nxm; stack[top++][1] = ny;
+X            }
+X        
+X        if (nx < impl.r2)
+X            if (impl.grid[nxp][ny] == seedv) {
+X                if (nxp > amaxx) amaxx = nxp;
+X                if (fpat[pc].grid[nxp%fpat[pc].nr][ny%fpat[pc].nc]) 
+X                    impl.grid[nxp][ny] = impl.gray;
+X                else impl.grid[nxp][ny] = mark;
+X                stack[top][0] = nxp; stack[top++][1] = ny;
+X            }
+X
+X        if (ny > 0)
+X            if (impl.grid[nx][nym] == seedv) {
+X                if (nym < aminy) aminy = nym;
+X                if (fpat[pc].grid[nx%fpat[pc].nr][nym%fpat[pc].nc]) 
+X                    impl.grid[nx][nym] = impl.gray;
+X                else impl.grid[nx][nym] = mark;
+X                stack[top][0] = nx; stack[top++][1] = nym;
+X            }
+X        
+X        if (ny < impl.c2)
+X            if (impl.grid[nx][nyp] == seedv) {
+X                if (nyp > amaxy) amaxy = nyp;
+X                if (fpat[pc].grid[nx%fpat[pc].nr][nyp%fpat[pc].nc]) 
+X                    impl.grid[nx][nyp] = impl.gray;
+X                else impl.grid[nx][nyp] = mark;
+X                stack[top][0] = nx; stack[top++][1] = nyp;
+X            }
+X    }
+X    for (nx = aminx; nx <= amaxx; nx++)
+X        for (ny = aminy; ny <= amaxy; ny++)
+X            if (impl.grid[nx][ny] == mark) impl.grid[nx][ny] = seedv;
+X}
+X
+X
+X/************************************************************************/  
+X/* pfill: fill a polygon in the bounding box x1, y1, x2, y2,            */
+X/*          the polygon boundary must have been drawn with gray = fill  */
+X/*          NOTE: fill cannot be 0.                                     */
+X/************************************************************************/  
+X
+Xpfill(x1,y1,x2,y2,fill)
+Xint x1, y1, x2, y2, fill;
+X{
+X
+X    int i, j, r, c, nr, nc, pc;
+X    int r1, c1, r2, c2, rt, ct;
+X    int negfill;
+X
+X    pc = impl.patc;
+X    
+X    /* 
+X       Algorithm: 
+X       Visit the border of the box. 
+X         Set 0 pixels to -fill and stack them. 
+X         Set non-fill pixels negative and stack them.
+X
+X       Run a filling algorithm inside the box and outside the polygon
+X         Set 0 pixels to -fill.
+X         Set non-fill pixels  negative.
+X
+X       Scan the box. 
+X         Set 0 or positive to fill.
+X         Set -fill to 0.
+X         Set negatives to positive
+X    */
+X    
+X    if (fill == 0) {
+X        fprintf(stderr,"pfill: can't fill a polygon with 0 boundary.\n");
+X        return(0);
+X    }
+X    
+X    move(x1,y1); r1 = impl.rc; c1 = impl.cc;
+X    move(x2,y2); r2 = impl.rc; c2 = impl.cc;
+X    if (r1 > r2) { rt = r1; r1 = r2; r2 = rt; }
+X    if (c1 > c2) { ct = c1; c1 = c2; c2 = ct; }
+X
+X    negfill = -1 * fill;
+X    top = 0;
+X    
+X    /* Visit the border */
+X    
+X    for (i = r1; i <= r2; i++) {
+X        if (impl.grid[i][c1] == 0) {
+X            impl.grid[i][c1] = negfill;
+X            stack[top][0] = i; stack[top++][1] = c1;
+X        };
+X        if ((impl.grid[i][c1] != fill) && (impl.grid[i][c1] > 0)) {
+X            impl.grid[i][c1] *= -1;
+X            stack[top][0] = i; stack[top++][1] = c1;
+X        };
+X        
+X        if (impl.grid[i][c2] == 0) {
+X            impl.grid[i][c2] = negfill;
+X            stack[top][0] = i; stack[top++][1] = c2;
+X        };
+X        if ((impl.grid[i][c2] != fill) && (impl.grid[i][c2] > 0)) {
+X            impl.grid[i][c2] *= -1;
+X            stack[top][0] = i; stack[top++][1] = c2;
+X        };
+X
+X        if (top > STACKSIZE) {
+X            fprintf(stderr,"pfill: fill stack overflow\n");
+X            exit(1);
+X        };
+X    };
+X
+X    for (i = c1; i <= c2; i++) {
+X        if (impl.grid[r1][i] == 0) {
+X            impl.grid[r1][i] = negfill;
+X            stack[top][0] = r1; stack[top++][1] = i;
+X        };
+X        if ((impl.grid[r1][i] != fill) && (impl.grid[r1][i] > 0)) {
+X            impl.grid[r1][i] *= -1;
+X            stack[top][0] = r1; stack[top++][1] = i;
+X        };
+X
+X        if (impl.grid[r2][i] == 0) {
+X            impl.grid[r2][i] = negfill;
+X            stack[top][0] = r2; stack[top++][1] = i;
+X        };
+X        if ((impl.grid[r2][i] != fill) && (impl.grid[r2][i] > 0)) {
+X            impl.grid[r2][i] *= -1;
+X            stack[top][0] = r2; stack[top++][1] = i;
+X        };
+X        if (top > STACKSIZE) {
+X            fprintf(stderr,"pfill: fill stack overflow\n");
+X            exit(1);
+X        };
+X    }
+X    
+X    /* fill the rest of the outside zeros with negfill */
+X    
+X    while (top > 0) {
+X        top--;
+X        r = stack[top][0]; c = stack[top][1];
+X        
+X        nr = r-1;
+X        if ((nr >= r1) && (nr <= r2)) {
+X            if (impl.grid[nr][c] == 0) {
+X                impl.grid[nr][c] = negfill;
+X                stack[top][0] = nr; stack[top++][1] = c;
+X            };
+X            if ((impl.grid[nr][c] > 0) && 
+X                (impl.grid[nr][c] != fill)) {
+X                impl.grid[nr][c] *= -1;
+X                stack[top][0] = nr; stack[top++][1] = c;
+X            }
+X        }
+X        
+X        nr = r+1;
+X        if ((nr >= r1) && (nr <= r2)) {
+X            if (impl.grid[nr][c] == 0) {
+X                impl.grid[nr][c] = negfill;
+X                stack[top][0] = nr; stack[top++][1] = c;
+X            };
+X            if ((impl.grid[nr][c] > 0) && 
+X                (impl.grid[nr][c] != fill)) {
+X                impl.grid[nr][c] *= -1;
+X                stack[top][0] = nr; stack[top++][1] = c;
+X            }
+X        }
+X
+X        nc = c-1;
+X        if ((nc >= c1) && (nc <= c2)) {
+X            if (impl.grid[r][nc] == 0) {
+X                impl.grid[r][nc] = negfill;
+X                stack[top][0] = r; stack[top++][1] = nc;
+X            };
+X            if ((impl.grid[r][nc] > 0) && 
+X                (impl.grid[r][nc] != fill)) {
+X                impl.grid[r][nc] *= -1;
+X                stack[top][0] = r; stack[top++][1] = nc;
+X            }
+X        }
+X                
+X        nc = c+1;
+X        if ((nc >= c1) && (nc <= c2)) {
+X            if (impl.grid[r][nc] == 0) {
+X                impl.grid[r][nc] = negfill;
+X                stack[top][0] = r; stack[top++][1] = nc;
+X            };
+X            if ((impl.grid[r][nc] > 0) && 
+X                (impl.grid[r][nc] != fill)) {
+X                impl.grid[r][nc] *= -1;
+X                stack[top][0] = r; stack[top++][1] = nc;
+X            }
+X        }
+X        if (top > STACKSIZE) {
+X            fprintf(stderr,"pfill: fill stack overflow\n");
+X            exit(1);
+X        }
+X    }
+X    
+X                
+X    /* scan the box */
+X    for (i = r1; i <= r2; i++)
+X        for (j = c1; j <= c2; j++) 
+X            if (impl.grid[i][j] >= 0) {
+X                if (fpat[pc].grid[i%fpat[pc].nr][j%fpat[pc].nc])
+X                    impl.grid[i][j] = impl.gray;
+X                else if (impl.grid[i][j] == fill)
+X                    impl.grid[i][j] = impl.gray;
+X            }
+X            else if (impl.grid[i][j] == negfill) impl.grid[i][j] = 0;
+X            else if (impl.grid[i][j] < 0) impl.grid[i][j] *= -1;
+X}
+X
+Xcomment(str)
+Xchar *str;
+X{
+X}
+X
+Xdonelabel()
+X{
+X}
+!FUNKY!STUFF!
+echo
+echo finished part 6 of 8
+
+

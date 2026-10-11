@@ -1,0 +1,954 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,19d0e8b2243eccb6,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-04-10 02:38:48 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 5/3/83; site ukc.UUCP
+Path: utzoo!linus!philabs!cmcl2!seismo!mcvax!ukc!sk
+From: sk@ukc.UUCP (S.Kenyon)
+Newsgroups: net.sources
+Subject: jerq code (Part 1 of 4)
+Message-ID: <5037@ukc.UUCP>
+Date: Wed, 10-Apr-85 05:38:48 EST
+Article-I.D.: ukc.5037
+Posted: Wed Apr 10 05:38:48 1985
+Date-Received: Fri, 12-Apr-85 06:24:47 EST
+Organization: Computing Laboratory, U of Kent at Canterbury, UK
+Lines: 934
+
+Well, when I got back from Paris (very enjoyable) there were 30
+requests for this, so here it is. I hope it is of use.
+----------------------shar archive-----------------------------
+#!/bin/sh
+echo 'Start of jerq layers code, part 01 of 04:'
+echo 'x - src/bitblt.c'
+sed 's/^X//' > src/bitblt.c << '/'
+X
+X/*
+X *  File:        bitblt.c
+X *
+X *  Sccs-id:     @(#)bitblt.c  1.4  85/03/24
+X *
+X *  Description: This file contains the one routine bitblt which
+X *               copies the source rectangle r in a bitmap sb to the
+X *               corresponding rectangle with origin p in the destination
+X *               bitmap db using the optional halftone bitmap hb.
+X *
+X *  Author:      Simon Kenyon.
+X *
+X *  History:     SCK  1.1  83/10/03  Created.
+X *               SCK  1.2  84/11/29  Made it work.
+X *               SCK  1.3  85/03/04  Tidied up for release.
+X *               SCK  1.4  85/03/24  Changed the include files around.
+X */
+X
+X#include "../h/layers.h"
+X
+Xunsigned short  RightMasks[] = {
+X    0x0000,
+X    0x0001, 0x0003, 0x0007, 0x000F,
+X    0x001F, 0x003F, 0x007F, 0x00FF,
+X    0x01FF, 0x03FF, 0x07FF, 0x0FFF,
+X    0x1FFF, 0x3FFF, 0x7FFF, 0xFFFF
+X};
+Xunsigned short  AllOnes = 0xFFFF;
+X
+X/*
+X *  Name:        bitblt
+X *
+X *  Description: Copy the source rectangle r in a bitmap sb to the
+X *               corresponding rectangle with origin p in the destination
+X *               bitmap db using the optional halftone bitmap hb.
+X *               (Algorithm snarfed from the 1st Smalltalk-80 book)
+X *
+X *  Synopsis:    bitblt (sb, r, db, p, hb, f)
+X *               struct Bitmap  *sb;
+X *               struct Rectangle    r;
+X *               struct Bitmap  *db;
+X *               struct Point    p;
+X *               struct Bitmap  *hb;
+X *               int     f;
+X *
+X *  Globals:     RightMasks  (r)
+X *               AllOnes     (r)
+X *
+X *  Calls:       merge  (merge.c)
+X *
+X *  Called by:   addobs      (addobs.c)
+X *               screenswap  (screenswap.c)
+X *               newlayer    (newlayer.c)
+X *               background  (background.c)
+X *               LBblt       (LBblt.c)
+X *               rectf       (rectf.c)
+X */
+Xbitblt (sb, r, db, p, hb, f)
+Xstruct Bitmap  *sb;                    /* source bitmap */
+Xstruct Rectangle    r;                 /* source rectangle */
+Xstruct Bitmap  *db;                    /* destination bitmap */
+Xstruct Point    p;                     /* point in destination bitmap to start
+X                                          operation */
+Xstruct Bitmap  *hb;                    /* halftone bitmap */
+Xint     f;                             /* operation to perform */
+X{
+X    int     sourceIndex;
+X    int     destIndex;
+X    int     sourceDelta;
+X    int     destDelta;
+X    boolean preload;
+X    int     sx;
+X    int     sy;
+X    int     dx;
+X    int     dy;
+X    int     w;
+X    int     h;
+X    int     startBits;
+X    int     endBits;
+X    int     word;
+X    int     skew;
+X    int     nWords;
+X    int     vDir;
+X    int     hDir;
+X    int     i;
+X    unsigned short  merge ();
+X    unsigned short  t;                 /* temp for exchanging masks */
+X    unsigned short  prevWord;
+X    unsigned short  thisWord;
+X    unsigned short  skewWord;
+X    unsigned short  mergeMask;
+X    unsigned short  mergeWord;
+X    unsigned short  destWord;
+X    unsigned short  mask1;
+X    unsigned short  mask2;
+X    unsigned short  skewMask;
+X    unsigned short  halftoneWord;
+X
+X /*
+X  * set w and h
+X  */
+X    w = r.corner.x - r.origin.x;
+X    h = r.corner.y - r.origin.y;
+X    if ((w <= 0) || (h <= 0))
+X        return;                        /* null range */
+X /*
+X  * calculate sx, sy, dx and dy
+X  */
+X    sx = r.origin.x;
+X    sy = r.origin.y;
+X    dx = p.x;
+X    dy = p.y;
+X /*
+X  * calculate skew and edge masks
+X  */
+X    skew = (sx - dx) % WORDSIZE;
+X    if (skew < 0)
+X        skew += WORDSIZE;
+X /*
+X  * how many bits source gets skewed to right
+X  */
+X    startBits = WORDSIZE - (dx % WORDSIZE);
+X /*
+X  * how many bits in first word
+X  */
+X    mask1 = RightMasks[startBits];
+X    endBits = WORDSIZE - ((dx + w - 1) % WORDSIZE + 1);
+X /*
+X  * how many bits in last word
+X  */
+X    mask2 = ~RightMasks[endBits];
+X    skewMask = (skew == 0 ? 0 : RightMasks[WORDSIZE - skew]);
+X /*
+X  * determine number of words stored per line
+X  * merge masks if necessary
+X  */
+X    if (w <= startBits) {              /* I think this should be <=, not < */
+X        mask1 = mask1 & mask2;
+X        mask2 = 0;
+X        nWords = 1;
+X    }
+X    else
+X        nWords = (w - startBits - 1) / WORDSIZE + 2;
+X /*
+X  * check for possible overlap of source and destination
+X  */
+X    hDir = vDir = 1;                   /* default for no overlap */
+X    if ((sb == db) && (dy >= sy)) {
+X        if (dy > sy) {                 /* have to start at bottom */
+X            vDir = -1;
+X            sy = sy + h - 1;
+X            dy = dy + h - 1;
+X        }
+X        else {
+X            if (dx > sx) {
+X            /*
+X             * y's are equal, but x's are backwards
+X             */
+X                hDir = -1;
+X                sx = sx + w - 1;
+X            /*
+X             * start at right
+X             */
+X                dx = dx + w - 1;
+X            /*
+X             * and fix up masks
+X             */
+X                skewMask = ~skewMask;
+X                t = mask1;
+X                mask1 = mask2;
+X                mask2 = t;
+X            }
+X        }
+X    }
+X /*
+X  * check if need to reload buffer (i.e., two words of
+X  * source needed for first word of destination)
+X  */
+X    preload = ((sb != NULL) && ((skew != 0) &&
+X                ((dx % WORDSIZE) <= (sx % WORDSIZE))));
+X    if (hDir < 0)
+X        preload = !preload;
+X /*
+X  * calculate starting offsets
+X  */
+X    if (sb != NULL)
+X        sourceIndex = (sy - sb -> rect.origin.y) * sb -> width +
+X            (sx / WORDSIZE) -
+X            (sb -> rect.origin.x / WORDSIZE);
+X    else
+X        sourceIndex = 0;
+X    destIndex = (dy - db -> rect.origin.y) * db -> width +
+X        (dx / WORDSIZE) -
+X        (db -> rect.origin.x / WORDSIZE);
+X /*
+X  * calculate increments from end of one line to start of next
+X  */
+X    if (sb != NULL)
+X        sourceDelta = (sb -> width * vDir) - ((nWords + (preload ? 1 : 0)) * hDir);
+X    else
+X        sourceDelta = 0;
+X    destDelta = (db -> width * vDir) - (nWords * hDir);
+X /*
+X  * perform the data transfer
+X  */
+X    for (i = 1; i <= h; i++) {         /* this is the vertical loop */
+X        if (hb != NULL) {
+X            halftoneWord = *(hb -> base + (dy % WORDSIZE));
+X            dy = dy + vDir;
+X        }
+X        else
+X            halftoneWord = AllOnes;
+X        skewWord = halftoneWord;
+X        if (preload) {
+X            prevWord = *(sb -> base + sourceIndex);
+X        /*
+X         * load the 32-bit shifter (will also work with 32-bit ints,
+X         * so this might be a 64-bit shifter)
+X         */
+X            sourceIndex = sourceIndex + hDir;
+X        }
+X        else
+X            prevWord = 0;
+X        mergeMask = mask1;
+X    /*
+X     * here is the inner horizontal loop
+X     */
+X        for (word = 1; word <= nWords; word++) {
+X            if (sb != NULL) {
+X                prevWord = prevWord & skewMask;
+X            /*
+X             * pick up next word
+X             */
+X                thisWord = *(sb -> base + sourceIndex);
+X                skewWord = prevWord | (thisWord & ~skewMask);
+X                prevWord = thisWord;
+X            /*
+X             * 16-bit rotate (actually, this code will work on 32-bit ints as well)
+X             */
+X                skewWord = (skewWord << skew) | (skewWord >> (WORDSIZE - skew));
+X            }
+X            destWord = *(db -> base + destIndex);
+X            mergeWord = merge ((skewWord & halftoneWord), destWord, f);
+X            *(db -> base + destIndex) = ((mergeMask & mergeWord) |
+X                    (~mergeMask & destWord));
+X            sourceIndex = sourceIndex + hDir;
+X            destIndex = destIndex + hDir;
+X            if (word == (nWords - 1))
+X                mergeMask = mask2;
+X            else
+X                mergeMask = AllOnes;
+X        }
+X        sourceIndex = sourceIndex + sourceDelta;
+X        destIndex = destIndex + destDelta;
+X    }
+X}
+/
+echo 'x - src/newlayer.c'
+sed 's/^X//' > src/newlayer.c << '/'
+X
+X/*
+X *  File:        newlayer.c
+X *
+X *  Sccs-id:     @(#)newlayer.c  1.4  85/03/24
+X *
+X *  Description: This file contains the function newlayer which
+X *               creates a new layer in rectangle r of bitmap *bp
+X *               and either fills the layer with optional halftone hb
+X *               or clears it. It returns a pointer to the new layer.
+X *
+X *  Author:      Simon Kenyon.
+X *
+X *  History:     SCK  1.1  83/10/03  Created.
+X *               SCK  1.2  84/11/29  Made it work.
+X *               SCK  1.3  85/03/04  Tidied up for release.
+X *               SCK  1.4  85/03/24  Changed the include files around.
+X */
+X
+X#include "../h/layers.h"
+X
+Xextern struct Layer *TopLayer;
+Xextern struct Layer *BottomLayer;
+Xextern struct Bitmap   *display;
+X
+Xstruct Obscured *obs;
+Xstruct Obscured *endobs;
+X
+X/*
+X *  Name:        newlayer
+X *
+X *  Description: Create a new layer in rectangle r of bitmap *bp
+X *               and either fill the layer with optional halftone hb
+X *               or clear it. Return a pointer to the new layer.
+X *
+X *  Synopsis:    struct Layer   *newlayer (bp, r, hb)
+X *               struct Bitmap  *bp;
+X *               struct Rectangle    r;
+X *               struct Bitmap  *hb;
+X *
+X *  Globals:     obs          (r/w)
+X *               endobs       (r/w)
+X *               addpiece ()  (addpiece.c)
+X *               TopLayer     (r/w)
+X *               BottomLayer  (r/w)
+X *               display      (r/w)
+X *
+X *  Calls:
+X *               rectXrect  (rectxrect.c)
+X *               addobs     (addobs.c)
+X *               bfree      (bfree.c)
+X *               free       (libc)
+X *               malloc     (libc)
+X *               layerop    (layerop.c)
+X *               balloc     (balloc.c)
+X *               upfront    (upfront.c)
+X *               bitblt     (bitblt.c)
+X *               rectf      (rectf.c)
+X *
+X *  Called by:   This is a top level function.
+X */
+Xstruct Layer   *newlayer (bp, r, hb)
+Xstruct Bitmap  *bp;
+Xstruct Rectangle    r;
+Xstruct Bitmap  *hb;                    /* optional half tone to fill layer */
+X{
+X    struct Layer   *lp;
+X    struct Layer   *newlp;
+X    struct Obscured *op;
+X    struct Obscured *nop;
+X
+X    int     addpiece ();
+X    struct Bitmap  *balloc ();
+X    char   *malloc ();
+X
+X /*
+X  * first build, in obs, a list of all obscured rectangles that
+X  * will be obscured by the new layer, doing subdivision with
+X  * addobs()
+X  */
+X    obs = NULL;
+X    endobs = NULL;
+X    for (lp = TopLayer; lp != NULL; lp = lp -> back) {
+X    /* lp = each layer from front to back */
+X        for (op = lp -> obs; op != NULL;) {
+X        /* op = each obscured portion of lp */
+X            nop = op;
+X            op = op -> next;
+X            if (rectXrect (r, nop -> rect) &&
+X                    addobs (nop, nop -> rect, r, lp)) {
+X            /*
+X             * unlink nop from lp -> obs
+X             */
+X                if (nop -> prev != NULL)
+X                    nop -> prev -> next = nop -> next;
+X                else
+X                    lp -> obs = nop -> next;
+X                if (nop -> next != NULL)
+X                    nop -> next -> prev = nop -> prev;
+X                else
+X                    lp -> endobs = nop -> prev;
+X                (void) bfree (nop -> bmap);
+X                free ((char *) nop);
+X            }
+X        }
+X    }
+X /*
+X  * now add the rectangles not currently obscured, but that will
+X  * be obscured by the new layer, by building the layer and
+X  * calling layerop()
+X  */
+X /*
+X  * newlp = new layer
+X  */
+X    newlp = (struct Layer  *) malloc ((unsigned) sizeof (struct Layer));
+X /*
+X  * bitmap part of newlp = bp
+X  */
+X    newlp -> base = bp -> base;        /* to be perfectly frank,  */
+X    newlp -> width = bp -> width;      /* I don't understand what */
+X                                       /* these are used for      */
+X    newlp -> rect = r;
+X    newlp -> obs = obs;                /* currently obscured ... */
+X    newlp -> endobs = endobs;
+X    for (lp = TopLayer; lp != NULL; lp = lp -> back)
+X                                       /* lp = each layer from front to back */
+X        (void) layerop (newlp, addpiece, lp -> rect, lp, NULL, NULL, NULL);
+X    newlp -> obs = obs;                /* ... and soon to be */
+X    newlp -> endobs = endobs;
+X    for (op = obs; op != NULL; op = op -> next)/* op = each element of obs */
+X        op -> bmap = balloc (op -> rect);
+X /*
+X  * link newlp into back of layer list
+X  */
+X    if (BottomLayer != NULL)
+X        BottomLayer -> back = newlp;
+X    else                               /* first layer */
+X        TopLayer = newlp;
+X    newlp -> front = BottomLayer;
+X    newlp -> back = NULL;
+X    BottomLayer = newlp;
+X    (void) upfront (newlp);
+X    if (hb != NULL)
+X        (void) bitblt (NULL, newlp -> rect, display, newlp -> rect.origin, hb, S);
+X    else
+X        (void) rectf (display, newlp -> rect, CLR);
+X /* clear the screen rectangle */
+X    return (newlp);
+X}
+/
+echo 'x - test/sierpinski.c'
+sed 's/^X//' > test/sierpinski.c << '/'
+X
+X/*
+X *  File:        sierpinski.c
+X *
+X *  Sccs-id:     @(#)sierpinski.c  1.3  85/03/24
+X *
+X *  Description: This file contains code to plot sierpinski curves
+X *               as described in
+X *               Algorithms + Data Structures = Programs
+X *               by N. Wirth.
+X *
+X *  Author:      Simon Kenyon.
+X *
+X *  History:     SCK  1.1  85/03/15  Created.
+X *               SCK  1.2  85/03/22  Tidied up for release.
+X *               SCK  1.3  85/03/24  Changed the include files around.
+X */
+X
+X#include "../h/layers.h"
+X
+Xstruct Layer   *drawP;
+X
+X/*
+X *  Name:        sierpinski
+X *
+X *  Description: Control routine for drawing sierpinski curves.
+X *
+X *  Synopsis:    sierpinski (depth, grid)
+X *               int     depth;
+X *               int     grid;
+X *
+X *  Globals:     None.
+X *
+X *  Calls:       a        (sierpinski.c)
+X *               do_plot  (sierpinski.c)
+X *               b        (sierpinski.c)
+X *               c        (sierpinski.c)
+X *               d        (sierpinski.c)
+X *
+X *  Called by:   test  (test.c)
+X */
+Xsierpinski (depth, grid)
+Xint     depth;                         /* draw sierpinski curves of orders 1 to
+X                                          depth */
+Xint     grid;                          /* size to draw them */
+X{
+X    struct Point    home;
+X    struct Point    old;
+X    struct Point    cur;
+X    int     i;
+X    int     h;
+X
+X    h = grid / 4;
+X    home.x = 2 * h;
+X    home.y = 3 * h;
+X    for (i = 1; i <= depth; i++) {
+X        home.x -= h;
+X        h = h / 2;
+X        home.y += h;
+X        cur = old = home;
+X        a (i, h, &old, &cur);
+X        cur.x += h;
+X        cur.y -= h;
+X        do_plot (&old, &cur);
+X        b (i, h, &old, &cur);
+X        cur.x -= h;
+X        cur.y -= h;
+X        do_plot (&old, &cur);
+X        c (i, h, &old, &cur);
+X        cur.x -= h;
+X        cur.y += h;
+X        do_plot (&old, &cur);
+X        d (i, h, &old, &cur);
+X        cur.x += h;
+X        cur.y += h;
+X        do_plot (&old, &cur);
+X    }
+X}
+X
+X/*
+X *  Name:        do_plot
+X *
+X *  Description: Draw a line from old to cur.
+X *
+X *  Synopsis:    do_plot (old, cur)
+X *               struct Point   *old;
+X *               struct Point   *cur;
+X *
+X *  Globals:     drawP  (r/w)
+X *
+X *  Calls:       lline  (lline.c)
+X *
+X *  Called by:   sierpinski  (sierpinski.c)
+X *               a           (sierpinski.c)
+X *               b           (sierpinski.c)
+X *               c           (sierpinski.c)
+X *               d           (sierpinski.c)
+X */
+Xdo_plot (old, cur)
+Xstruct Point   *old;
+Xstruct Point   *cur;
+X{
+X    lline (drawP, *old, *cur, S);
+X    *old = *cur;
+X}
+X
+X/*
+X *  Name:        a
+X *
+X *  Description: Recursive procedure used to draw sierpinski curves.
+X *
+X *  Synopsis:    a (i, h, old, cur)
+X *               int     i;
+X *               int     h;
+X *               struct Point   *cur;
+X *               struct Point   *old;
+X *
+X *  Globals:     None.
+X *
+X *  Calls:       a        (sierpinski.c)
+X *               do_plot  (sierpinski.c)
+X *               b        (sierpinski.c)
+X *               d        (sierpinski.c)
+X *
+X *  Called by:   sierpinski  (sierpinski.c)
+X *               a           (sierpinski.c)
+X *               b           (sierpinski.c)
+X *               d           (sierpinski.c)
+X */
+Xa (i, h, old, cur)
+Xint     i;
+Xint     h;
+Xstruct Point   *cur;
+Xstruct Point   *old;
+X{
+X    if (i > 0) {
+X        a (i - 1, h, cur, old);
+X        old -> x += h;
+X        old -> y -= h;
+X        do_plot (cur, old);
+X        b (i - 1, h, cur, old);
+X        old -> x += 2 * h;
+X        do_plot (cur, old);
+X        d (i - 1, h, cur, old);
+X        old -> x += h;
+X        old -> y += h;
+X        do_plot (cur, old);
+X        a (i - 1, h, cur, old);
+X    }
+X}
+X
+X/*
+X *  Name:        b
+X *
+X *  Description: Recursive procedure used to draw sierpinski curves.
+X *
+X *  Synopsis:    b (i, h, old, cur)
+X *               int     i;
+X *               int     h;
+X *               struct Point   *cur;
+X *               struct Point   *old;
+X *
+X *  Globals:     None.
+X *
+X *  Calls:       b        (sierpinski.c)
+X *               do_plot  (sierpinski.c)
+X *               c        (sierpinski.c)
+X *               a        (sierpinski.c)
+X *
+X *  Called by:   sierpinski  (sierpinski.c)
+X *               a           (sierpinski.c)
+X *               b           (sierpinski.c)
+X *               c           (sierpinski.c)
+X */
+Xb (i, h, old, cur)
+Xint     i;
+Xint     h;
+Xstruct Point   *cur;
+Xstruct Point   *old;
+X{
+X    if (i > 0) {
+X        b (i - 1, h, cur, old);
+X        old -> x -= h;
+X        old -> y -= h;
+X        do_plot (cur, old);
+X        c (i - 1, h, cur, old);
+X        old -> y -= 2 * h;
+X        do_plot (cur, old);
+X        a (i - 1, h, cur, old);
+X        old -> x += h;
+X        old -> y -= h;
+X        do_plot (cur, old);
+X        b (i - 1, h, cur, old);
+X    }
+X}
+X
+X/*
+X *  Name:        c
+X *
+X *  Description: Recursive procedure used to draw sierpinski curves.
+X *
+X *  Synopsis:    c (i, h, old, cur)
+X *               int     i;
+X *               int     h;
+X *               struct Point   *cur;
+X *               struct Point   *old;
+X *
+X *  Globals:     None.
+X *
+X *  Calls:       c        (sierpinski.c)
+X *               do_plot  (sierpinski.c)
+X *               d        (sierpinski.c)
+X *               b        (sierpinski.c)
+X *
+X *  Called by:   sierpinski  (sierpinski.c)
+X *               b           (sierpinski.c)
+X *               c           (sierpinski.c)
+X *               d           (sierpinski.c)
+X */
+Xc (i, h, old, cur)
+Xint     i;
+Xint     h;
+Xstruct Point   *cur;
+Xstruct Point   *old;
+X{
+X    if (i > 0) {
+X        c (i - 1, h, cur, old);
+X        old -> x -= h;
+X        old -> y += h;
+X        do_plot (cur, old);
+X        d (i - 1, h, cur, old);
+X        old -> x -= 2 * h;
+X        do_plot (cur, old);
+X        b (i - 1, h, cur, old);
+X        old -> x -= h;
+X        old -> y -= h;
+X        do_plot (cur, old);
+X        c (i - 1, h, cur, old);
+X    }
+X}
+X
+X/*
+X *  Name:        d
+X *
+X *  Description: Recursive procedure used to draw sierpinski curves.
+X *
+X *  Synopsis:    d (i, h, old, cur)
+X *               int     i;
+X *               int     h;
+X *               struct Point   *cur;
+X *               struct Point   *old;
+X *
+X *  Globals:     None.
+X *
+X *  Calls:       d        (sierpinski.c)
+X *               do_plot  (sierpinski.c)
+X *               a        (sierpinski.c)
+X *               c        (sierpinski.c)
+X *
+X *  Called by:   sierpinski  (sierpinski.c)
+X *               a           (sierpinski.c)
+X *               c           (sierpinski.c)
+X *               d           (sierpinski.c)
+X */
+Xd (i, h, old, cur)
+Xint     i;
+Xint     h;
+Xstruct Point   *cur;
+Xstruct Point   *old;
+X{
+X    if (i > 0) {
+X        d (i - 1, h, cur, old);
+X        old -> x += h;
+X        old -> y += h;
+X        do_plot (cur, old);
+X        a (i - 1, h, cur, old);
+X        old -> y += 2 * h;
+X        do_plot (cur, old);
+X        c (i - 1, h, cur, old);
+X        old -> x -= h;
+X        old -> y += h;
+X        do_plot (cur, old);
+X        d (i - 1, h, cur, old);
+X    }
+X}
+/
+echo 'x - test/test.c'
+sed 's/^X//' > test/test.c << '/'
+X
+X/*
+X *  File:        test.c
+X *
+X *  Sccs-id:     @(#)test.c  1.3  85/03/24
+X *
+X *  Description: This file contains the one routine test which
+X *               calls the various jerq routines in an attempt to test them.
+X *
+X *  Author:      Simon Kenyon.
+X *
+X *  History:     SCK  1.1  85/03/08  Created.
+X *               SCK  1.2  85/03/21  Tidied up for release.
+X *               SCK  1.3  85/03/24  Changed the include files around.
+X */
+X
+X#include "../h/layers.h"
+X
+Xextern struct Bitmap   *display;
+X
+Xunsigned short  spiral[] = {
+X    0xFFFF, 0x8001, 0xBFFD, 0xA005,
+X    0xAFF5, 0xA815, 0xABD5, 0xAA55,
+X    0xAA55, 0xABD5, 0xA815, 0xAFF5,
+X    0xA005, 0xBFFD, 0x8001, 0xFFFF,
+X    0x0000
+X};
+Xunsigned short  pattern[] = {
+X    0x3333, 0xCCCC, 0x3333, 0xCCCC,
+X    0x3333, 0xCCCC, 0x3333, 0xCCCC,
+X    0x3333, 0xCCCC, 0x3333, 0xCCCC,
+X    0x3333, 0xCCCC, 0x3333, 0xCCCC,
+X    0x0000
+X};
+Xunsigned short  ht1[] = {
+X    0x5555, 0x5555, 0x5555, 0x5555,
+X    0x5555, 0x5555, 0x5555, 0x5555,
+X    0x5555, 0x5555, 0x5555, 0x5555,
+X    0x5555, 0x5555, 0x5555, 0x5555,
+X    0x0000
+X};
+Xunsigned short  ht2[] = {
+X    0xFFFF, 0x0000, 0xFFFF, 0x0000,
+X    0xFFFF, 0x0000, 0xFFFF, 0x0000,
+X    0xFFFF, 0x0000, 0xFFFF, 0x0000,
+X    0xFFFF, 0x0000, 0xFFFF, 0x0000,
+X    0x0000
+X};
+Xunsigned short  ht3[] = {
+X    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+X    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+X    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+X    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+X    0x0000
+X};
+X
+Xstruct Point    tp1 = {20, 42};
+Xstruct Point    tpa = {22, 22};
+Xstruct Point    tpb = {22, 02};
+Xstruct Point    tpc = {42, 02};
+Xstruct Point    tpd = {42, 22};
+Xstruct Point    tpe = {42, 42};
+Xstruct Point    tpf = {22, 42};
+Xstruct Point    tpg = {02, 42};
+Xstruct Point    tph = {02, 22};
+Xstruct Point    tpi = {02, 02};
+Xstruct Point startp = {10, 10};
+Xstruct Point   endp = {60, 60};
+X
+Xstruct Rectangle    trx = {{00, 00}, {256, 256}};
+Xstruct Rectangle    try = {{00, 00}, {256, 256}};
+Xstruct Rectangle    trz = {{00, 00}, {256, 256}};
+X
+Xstruct Rectangle     tr = {{16, 32}, {32, 48}};
+Xstruct Rectangle    tr1 = {{05, 10}, {40, 50}};
+Xstruct Rectangle    tr2 = {{10, 40}, {50, 60}};
+Xstruct Rectangle    tr3 = {{25, 30}, {60, 55}};
+Xstruct Rectangle   trla = {{01, 01}, {60, 60}};
+Xstruct Rectangle    tra = {{22, 22}, {38, 38}};
+Xstruct Rectangle    trb = {{22, 02}, {38, 18}};
+Xstruct Rectangle    trc = {{42, 02}, {58, 18}};
+Xstruct Rectangle    trd = {{42, 22}, {58, 38}};
+Xstruct Rectangle    tre = {{42, 42}, {58, 58}};
+Xstruct Rectangle    trf = {{22, 42}, {38, 58}};
+Xstruct Rectangle    trg = {{02, 42}, {18, 58}};
+Xstruct Rectangle    trh = {{02, 22}, {18, 38}};
+Xstruct Rectangle    tri = {{02, 02}, {18, 18}};
+X
+Xstruct Bitmap testb = {pattern, 1, {{16, 32}, {32, 48}}, 0};
+Xstruct Bitmap   hb1 = {ht1, 1, {{ 0, 0}, {WORDSIZE, WORDSIZE}}, 0};
+Xstruct Bitmap   hb2 = {ht2, 1, {{ 0, 0}, {WORDSIZE, WORDSIZE}}, 0};
+Xstruct Bitmap   hb3 = {ht3, 1, {{ 0, 0}, {WORDSIZE, WORDSIZE}}, 0};
+Xstruct Bitmap   hba = {spiral, 1, {{ 0, 0}, {WORDSIZE, WORDSIZE}}, 0};
+X
+Xstruct Layer   *drawP;
+X
+Xstruct Layer   *tl1;
+Xstruct Layer   *tl2;
+Xstruct Layer   *tl3;
+Xstruct Layer   *tla;
+X
+X/*
+X *  Name:        test
+X *
+X *  Description: Test the layer code.
+X *
+X *  Synopsis:    test (testno, size)
+X *               int     testno;
+X *               int     size;
+X *
+X *  Globals:     None.
+X *
+X *  Calls:       layers      (layers.c)
+X *               newlayer    (newlayer.c)
+X *               lline       (lline.c)
+X *               hilbert     (hilbert.c)
+X *               sierpinski  (sierpinski.c)
+X *               plot        (plot.c)
+X *               lblt        (lblt.c)
+X *               lbitblt     (lbitblt.c)
+X *               upfront     (upfront.c)
+X *               dellayer    (dellayer.c)
+X *
+X *  Called by:   main  (jerq.c)
+X */
+Xtest (testno, size)
+Xint     testno;
+Xint     size;
+X{
+X    int     i;
+X
+X    struct Layer   *newlayer ();
+X
+X    layers ();
+X    switch (testno) {
+X        default:
+X        case 1:
+X            tl1 = newlayer (display, trx, NULL);
+X            plot (display, display -> rect, size);
+X            startp.x = 110;
+X            startp.y = 110;
+X            for (i = 10; i <= 210; i += 5) {
+X                endp.x = i;
+X                endp.y = 10;
+X                lline (tl1, startp, endp, S);
+X            }
+X            for (i = 10; i <= 210; i += 5) {
+X                endp.x = 210;
+X                endp.y = i;
+X                lline (tl1, startp, endp, S);
+X            }
+X            for (i = 10; i <= 210; i += 5) {
+X                endp.x = i;
+X                endp.y = 210;
+X                lline (tl1, startp, endp, S);
+X            }
+X            for (i = 10; i <= 210; i += 5) {
+X                endp.x = 10;
+X                endp.y = i;
+X                lline (tl1, startp, endp, S);
+X            }
+X            plot (display, display -> rect, size);
+X            break;
+X        case 2:
+X            drawP = newlayer (display, try, NULL);
+X            plot (display, display -> rect, size);
+X            hilbert (4, 128);
+X            break;
+X        case 3:
+X            drawP = newlayer (display, trz, NULL);
+X            plot (display, display -> rect, size);
+X            sierpinski (4, 128);
+X            break;
+X        case 4:
+X            plot (display, display -> rect, size);
+X            tl1 = newlayer (display, tr1, &hb1);
+X            plot (display, display -> rect, size);
+X            tl2 = newlayer (display, tr2, &hb2);
+X            plot (display, display -> rect, size);
+X            tl3 = newlayer (display, tr3, &hb3);
+X            plot (display, display -> rect, size);
+X            lblt (tl1, &testb, tr, NULL, tr.origin, S);
+X            plot (display, display -> rect, size);
+X            lbitblt (tl1, tr, tl2, tp1, NULL, S);
+X            plot (display, display -> rect, size);
+X            upfront (tl1);
+X            plot (display, display -> rect, size);
+X            upfront (tl2);
+X            plot (display, display -> rect, size);
+X            upfront (tl3);
+X            plot (display, display -> rect, size);
+X            dellayer (tl2);
+X            plot (display, display -> rect, size);
+X            dellayer (tl1);
+X            plot (display, display -> rect, size);
+X            dellayer (tl3);
+X            plot (display, display -> rect, size);
+X            break;
+X        case 5:
+X            tla = newlayer (display, trla, NULL);
+X            plot (display, display -> rect, size);
+X            lblt (tla, &hba, hba.rect, NULL, tpa, S);
+X            plot (display, display -> rect, size);
+X            lbitblt (tla, tra, tla, tpb, NULL, S);
+X            plot (display, display -> rect, size);
+X            lbitblt (tla, tra, tla, tpc, NULL, S);
+X            plot (display, display -> rect, size);
+X            lbitblt (tla, tra, tla, tpd, NULL, S);
+X            plot (display, display -> rect, size);
+X            lbitblt (tla, tra, tla, tpe, NULL, S);
+X            plot (display, display -> rect, size);
+X            lbitblt (tla, tra, tla, tpf, NULL, S);
+X            plot (display, display -> rect, size);
+X            lbitblt (tla, tra, tla, tpg, NULL, S);
+X            plot (display, display -> rect, size);
+X            lbitblt (tla, tra, tla, tph, NULL, S);
+X            plot (display, display -> rect, size);
+X            lbitblt (tla, tra, tla, tpi, NULL, S);
+X            plot (display, display -> rect, size);
+X            break;
+X    }
+X}
+/
+echo 'Part 01 of jerq layers code complete.'
+exit
+--
+Simon Kenyon
+
+

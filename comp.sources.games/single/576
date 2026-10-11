@@ -1,0 +1,2398 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,77618cb2762bb626,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1989-04-27 12:23:29 PST
+Path: utzoo!attcan!uunet!tektronix!tekgen!tekred!games
+From: games@tekred.CNA.TEK.COM
+Newsgroups: comp.sources.games
+Subject: v06i064:  cubes2 - a networked dice game (version 5.1), Part06/08
+Message-ID: <3905@tekred.CNA.TEK.COM>
+Date: 27 Apr 89 19:23:29 GMT
+Sender: billr@tekred.CNA.TEK.COM
+Lines: 2382
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: gmp@rayssdb.RAY.COM (Gregory M. Paris)
+Posting-number: Volume 6, Issue 64
+Archive-name: cubes2/Part06
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 6 (of 8)."
+# Contents:  actions.c cubeserv2.c history.c
+# Wrapped by billr@saab on Thu Apr 27 12:13:39 1989
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'actions.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'actions.c'\"
+else
+echo shar: Extracting \"'actions.c'\" \(15195 characters\)
+sed "s/^X//" >'actions.c' <<'END_OF_FILE'
+X/*	vi:set sw=4 ts=4: */
+X#ifndef	lint
+Xstatic char	sccsid[] = "@(#)actions.c 5.1 (G.M. Paris) 89/01/22";
+X#endif	lint
+X
+X/*
+X**
+X**	cubes 5.1  Copyright 1989 Gregory M. Paris
+X**		Permission granted to redistribute on a no charge basis.
+X**		All other rights are reserved.
+X**
+X*/
+X
+X#include	<stdio.h>
+X#include	<signal.h>
+X#include	<strings.h>
+X#include	<ctype.h>
+X#include	<sys/types.h>
+X#include	<sys/time.h>
+X#include	<sys/file.h>
+X#include	<sys/socket.h>
+X#include	<sys/ioctl.h>
+X#include	<netdb.h>
+X#include	<netinet/in.h>
+X#include	<pwd.h>
+X#include	"cubes.h"
+X
+Xplayer				plr[PLAYERS];		/* player status */
+Xdiceset				dice;				/* the status of the dice */
+Xcstat				mystat	= Inactive;	/* our playing status */
+Xboolean				jokermode= False;	/* jokers on the dice */
+Xboolean				inprogress= False;	/* game in progress */
+Xint					winscore= 0;		/* game win score */
+Xint					mypnum	= -1;		/* my player number */
+Xint					turnnum	= 0;		/* current turn number */
+Xint					nobs	= 0;		/* number of observers */
+Xint					beats	= 0;		/* number of heartbeats */
+Xextern boolean		quiet;				/* in background */
+Xextern enterlate	watch;				/* what to do about late entry */
+Xextern enterlate	spider;				/* what to do about waiting */
+Xextern winpref		preference;			/* gametype/winscore preference */
+Xextern char		   *cubename;			/* player name */
+Xextern char		   *cubehist;			/* personal ranking history file */
+Xextern int			ssock;				/* server socket */
+X
+Xextern int			errno;
+Xextern char		   *sys_errlist[];
+Xextern boolean		active;				/* True while active */
+Xextern char		   *index();
+Xextern char		   *getenv();
+Xstruct passwd	   *getpwuid();
+X
+X/*
+X**	respond: send a reply to the server adding "\r\n"
+X*/
+Xrespond(reply)
+Xchar   *reply;
+X{
+X	char	repbuf[BUFSIZ];
+X
+X	strcpy(repbuf, reply);
+X	strcat(repbuf, "\r\n");
+X
+X	return write(ssock, repbuf, strlen(repbuf)) < 0 ? -1 : 0;
+X}
+X
+X/*
+X**	dispact: display an informative message to the player
+X*/
+X/*ARGSUSED*/
+Xdispact(t,m)
+Xchar *m;
+X{
+X	return infomesg(m+4);
+X}
+X
+X/*
+X**	heloact: respond to the M_HELO message by giving player name.
+X*/
+X/*ARGSUSED*/
+Xheloact(t,m)
+Xchar *m;
+X{
+X	return respond(cubename);
+X}
+X
+X/*
+X**	rqidact: respond to the M_RQID message by giving player identity
+X**		and gametype preference.
+X*/
+X/*ARGSUSED*/
+Xrqidact(t,m)
+Xchar *m;
+X{
+X	char			idbuf[IDLEN];
+X	char			host[256];
+X	int				uid;
+X	struct passwd  *pw;
+X	char			pchar;
+X
+X	(void) gethostname(host, sizeof host);
+X
+X	switch(preference) {
+X	case Standard:	pchar = 's'; break;
+X	case Fstand:	pchar = 'S'; break;
+X	case Blitz:		pchar = 'b'; break;
+X	case Fblitz:	pchar = 'B'; break;
+X	default:		pchar = 'n'; break;
+X	}
+X
+X	/*
+X	**	Look up login name in the password file.  If it's not there,
+X	**	just use the user id number.
+X	*/
+X	uid = getuid();
+X	if((pw = getpwuid(uid)) == 0)
+X		sprintf(idbuf, "%c;%d@%.*s", pchar, uid, IDLEN-12, host);
+X	else
+X		sprintf(idbuf, "%c;%s@%.*s", pchar, pw->pw_name, IDLEN-12, host);
+X
+X	return respond(idbuf);
+X}
+X
+X/*
+X**	worpact: respond to the M_WORP message by saying play or watch
+X*/
+Xworpact(t,m)
+Xchar *m;
+X{
+X	switch(watch) {
+X	case Watch:	return respond("watch");
+X	case Play:	return respond("play");
+X	default:	return rfstact(t,m);
+X	}
+X}
+X
+X/*
+X**	sorpact: respond to the M_SORP message by saying wait or play
+X*/
+Xsorpact(t,m)
+Xchar *m;
+X{
+X	switch(spider) {
+X	case Wait:	return respond("wait");	/* be a spider */
+X	case Play:	return respond("play");
+X	default:	return rfstact(t,m);
+X	}
+X}
+X
+X/*
+X**	actvact: respond to the M_ACTV message by alerting the player
+X*/
+X/*ARGSUSED*/
+Xactvact(t,m)
+Xchar *m;
+X{
+X	cstat	oldstat;
+X
+X	oldstat = mystat;
+X	mystat = Active, beats = 0;
+X	if(quiet == True)
+X		mybeep(2);
+X
+X	switch(oldstat) {
+X	case Computer:
+X		(void) infomesg("You've regained control of the dice.");
+X		break;
+X	case Watching:
+X		if(turnnum > 1)
+X			(void) infomesg("You've joined the game in progress.");
+X		break;
+X	default:
+X/*		(void) infomesg(m+4);	/* don't need this chatter */
+X		break;
+X	}
+X
+X	return 0;
+X}
+X
+X/*
+X**	autoact: respond to the M_AUTO message by alerting the player
+X*/
+X/*ARGSUSED*/
+Xautoact(t,m)
+Xchar *m;
+X{
+X	mystat = Computer, beats = 0;
+X	(void) infomesg(m+4);
+X	return 0;
+X}
+X
+X/*
+X**	waitact: respond to the M_WAIT message by notifying the player
+X*/
+X/*ARGSUSED*/
+Xwaitact(t,m)
+Xchar *m;
+X{
+X	if(mystat == Spider || mystat == Watching)
+X		(void) infomesg(m+4);
+X	mystat = Waiting, beats = 0;
+X	return 0;
+X}
+X
+X/*
+X**	voyract: respond to the M_VOYR message by notifying the player
+X*/
+X/*ARGSUSED*/
+Xvoyract(t,m)
+Xchar *m;
+X{
+X	mystat = Watching, beats = 0;
+X	return infomesg(m+4);
+X}
+X
+X/*
+X**	spdract: respond to the M_SPDR message by entering spider mode
+X**		We could suspend here, but that makes this mode
+X**		unusable in shells without job control.
+X*/
+X/*ARGSUSED*/
+Xspdract(t,m)
+Xchar *m;
+X{
+X	mystat = Spider, beats = 0;
+X	(void) infomesg(m+4);
+X#ifdef	notdef
+X	sleep(2);
+X	(void) kill(0, SIGTSTP);	/* suspend process group */
+X#endif	notdef
+X	return 0;
+X}
+X
+X/*
+X**	noopact: no operation (really heartbeat action)
+X**		Assumes that heartbeats come one per minute.
+X*/
+X/*ARGSUSED*/
+Xnoopact(t,m)
+Xchar *m;
+X{
+X	char	msgbuf[MESGLEN];
+X
+X	++beats;
+X	sprintf(msgbuf, "You've been a spider for %d minute%s...",
+X		beats, beats == 1 ? "" : "s");
+X	return infomesg(msgbuf);
+X}
+X
+X/*
+X**	infoact: display an informational message
+X*/
+X/*ARGSUSED*/
+Xinfoact(t,m)
+Xchar *m;
+X{
+X	return infomesg(m+4);
+X}
+X
+X/*
+X**	helpact: display a help message
+X*/
+X/*ARGSUSED*/
+Xhelpact(t,m)
+Xchar *m;
+X{
+X	return helpmesg(m+4);
+X}
+X
+X/*
+X**	playact: display a play-by-play message (not used)
+X*/
+X/*ARGSUSED*/
+Xplayact(t,m)
+Xchar *m;
+X{
+X	return 0;
+X}
+X
+X/*
+X**	rfstact: respond to "roll first?" message
+X*/
+X/*ARGSUSED*/
+Xrfstact(t,m)
+Xchar *m;
+X{
+X	char	answer[BUFSIZ];
+X
+X	switch(prompt(m+4, answer, False)) {
+X	case -2:	/* timeout */
+X		return 0;
+X	case -1:	/* error */
+X		return -1;
+X	}
+X	if(respond(answer) < 0)
+X		return -1;
+X	return 0;
+X}
+X
+X/*
+X**	keepact: respond to "%d points:" message
+X*/
+Xkeepact(t,m)
+Xchar *m;
+X{
+X	return rfstact(t,m);
+X}
+X
+X/*
+X**	anogact: respond to "another game?" message
+X*/
+Xanogact(t,m)
+Xchar *m;
+X{
+X	return rfstact(t,m);
+X}
+X
+X/*
+X**	downact: print the shutdown message and exit gracefully
+X*/
+X/*ARGSUSED*/
+Xdownact(t,m)
+Xchar *m;
+X{
+X	for(m += 4;*m == ' ';++m)
+X		;
+X	if(*m == '\0')
+X		m = "Server said goodbye (no reason given).";
+X	(void) infomesg(m);
+X	sleep(2);
+X	cleanup(0, "");
+X	return -1;
+X}
+X
+X/*
+X**	turnact: cause turn indicator to advance
+X*/
+X/*ARGSUSED*/
+Xturnact(t,m)
+Xchar *m;
+X{
+X	int		pnum;
+X
+X	if(sscanf(m+4, "Turn %d: player %d", &turnnum, &pnum) != 2)
+X		return -1;
+X	--pnum;
+X
+X	return nowup(pnum);
+X}
+X
+X/*
+X**	cplract: clear player roster
+X*/
+X/*ARGSUSED*/
+Xcplract(t,m)
+Xchar *m;
+X{
+X	register int	c;
+X
+X	mypnum = -1;
+X	for(c = 0;c < PLAYERS;++c) {
+X		plr[c].p_stat = Inactive;
+X		plr[c].p_name[0] = '\0';
+X		plr[c].p_score = plr[c].p_squander = 0;
+X	}
+X
+X	return clearscores();
+X}
+X
+X/*
+X**	uareact: setup this player
+X*/
+X/*ARGSUSED*/
+Xuareact(t,m)
+Xchar *m;
+X{
+X	int		pnum;
+X	char   *s;
+X
+X	if(sscanf(m+4, "You are player %d", &pnum) < 1)
+X		return -1;
+X	--pnum;
+X
+X	mypnum = pnum;
+X	plr[pnum].p_score = plr[pnum].p_squander = 0;
+X	plr[pnum].p_stat = Active;
+X	plr[pnum].p_name[0] = '\0';
+X	if((s = index(m+20, ' ')) == 0)	/* mmm You are player n */
+X		return -1;
+X	strncat(plr[pnum].p_name, s+1, sizeof plr[pnum].p_name);
+X
+X	return showplr(pnum);
+X}
+X
+X/*
+X**	pnumact: setup another player
+X*/
+X/*ARGSUSED*/
+Xpnumact(t,m)
+Xchar *m;
+X{
+X	int		pnum;
+X	char   *s;
+X
+X	if(sscanf(m+4, "player %d", &pnum) < 1)
+X		return -1;
+X	--pnum;
+X
+X	plr[pnum].p_score = plr[pnum].p_squander = 0;
+X	plr[pnum].p_stat = Active;
+X	plr[pnum].p_name[0] = '\0';
+X	if((s = index(m+12, ' ')) == 0)	/* mmm player n */
+X		return -1;
+X	strncat(plr[pnum].p_name, s+1, sizeof plr[pnum].p_name);
+X
+X	return showplr(pnum);
+X}
+X
+X/*
+X**	fareact: clean up when a player leaves
+X*/
+X/*ARGSUSED*/
+Xfareact(t,m)
+Xchar *m;
+X{
+X	static struct timeval	halfsec	= { 0L, 500000L };
+X	int						pnum;
+X	char					msgbuf[MESGLEN];
+X	char					name[NAMELEN];
+X
+X	if(sscanf(m+4, "farewell %d %[^\r\n]", &pnum, name) < 2)
+X		return -1;
+X	--pnum;
+X
+X	sprintf(msgbuf, "%s has left the game.", name);
+X	plr[pnum].p_score = plr[pnum].p_squander = 0;
+X	plr[pnum].p_stat = Inactive;
+X	plr[pnum].p_name[0] = '\0';
+X	(void) clearplr(pnum);
+X	(void) infomesg(msgbuf);
+X	(void) select(32, NOSEL, NOSEL, NOSEL, &halfsec);
+X
+X	return 0;
+X}
+X
+X/*
+X**	nobsact: update number of observers
+X*/
+X/*ARGSUSED*/
+Xnobsact(t,m)
+Xchar *m;
+X{
+X	if(sscanf(m+4, "%d", &nobs) < 1)
+X		return -1;
+X	return 0;
+X}
+X
+X/*
+X**	mscoact: update my score
+X*/
+X/*ARGSUSED*/
+Xmscoact(t,m)
+Xchar *m;
+X{
+X	int		score, squander;
+X
+X	if(sscanf(m+4,
+X		"You now have %d points (squandered %d).", &score, &squander) < 2)
+X		return -1;
+X	if(mypnum < 0)
+X		return -1;
+X
+X	plr[mypnum].p_score = score, plr[mypnum].p_squander = squander;
+X	return showplr(mypnum);
+X}
+X
+X/*
+X**	oscoact: update other player score
+X*/
+X/*ARGSUSED*/
+Xoscoact(t,m)
+Xchar *m;
+X{
+X	int		pnum, score, squander;
+X
+X	if(sscanf(m+4,
+X	  "Player %d now has %d points (squandered %d).",
+X	  &pnum, &score, &squander) < 3)
+X		return -1;
+X	--pnum;
+X
+X	plr[pnum].p_score = score, plr[pnum].p_squander = squander;
+X	return showplr(pnum);
+X}
+X
+X/*
+X**	nwin: no winner message
+X*/
+X/*ARGSUSED*/
+Xnwinact(t,m)
+Xchar *m;
+X{
+X	inprogress = False;
+X	(void) infomesg(m+4);
+X	return cleardice();
+X}
+X
+X/*
+X**	overact: game over with winner
+X*/
+X/*ARGSUSED*/
+Xoveract(t,m)
+Xchar *m;
+X{
+X	inprogress = False;
+X	(void) infomesg(m+4);
+X	return cleardice();
+X}
+X
+X/*
+X**	rankact: save ranking info
+X*/
+X/*ARGSUSED*/
+Xrankact(t,m)
+Xchar *m;
+X{
+X	static FILE	   *frec	= 0;
+X	int				omask;
+X
+X	/*
+X	**	If cubehist is null then we aren't recording history.
+X	*/
+X	if(cubehist == 0 || *cubehist == '\0')
+X		return 0;
+X
+X	/*
+X	**	Open the cubehist file for append.
+X	*/
+X	if(frec == 0) {
+X		omask = umask(022);
+X		(void) umask(omask|022);	/* ensure write protection */
+X		if((frec = fopen(cubehist, "a")) == 0) {
+X			char	err[MESGLEN];
+X			sprintf(err, "Can't open %s: %s.", cubehist, sys_errlist[errno]);
+X			(void) umask(omask);
+X			return infomesg(err);
+X		}
+X		(void) umask(omask);
+X	}
+X
+X	/*
+X	**	Write the info supplied by the server.
+X	*/
+X	fprintf(frec, "%s\n", m+4);
+X	(void) fflush(frec);
+X
+X	return 0;
+X}
+X
+X/*
+X**	diceact: parse the dice status message and redisplay the dice
+X*/
+X/*ARGSUSED*/
+Xdiceact(t,m)
+Xchar *m;
+X{
+X	register int	d;
+X	char			stats[NDICE+1];
+X	char			faces[NDICE+1];
+X	char			combs[NDICE+1];
+X	int				c;
+X
+X	dice.d_mesg[0] = '\0';
+X	if(sscanf(m+4, "%d %s %s %s %d %d %d %d%*1c%[^\n]",
+X	  &c, stats, faces, combs,
+X	  &dice.d_pts_roll, &dice.d_pts_dice, &dice.d_pts_turn, &dice.d_pts_max,
+X	  dice.d_mesg) < 8) {
+X		fprintf(stderr, "dieact: couldn't parse dice status\n");
+X		return -1;
+X	}
+X	
+X	for(d = 0;d < NDICE;++d) {
+X		switch(stats[d]) {
+X		case 'f':	dice.d_stat[d] = Free; break;
+X		case 'h':	dice.d_stat[d] = Held; break;
+X		case 't':	dice.d_stat[d] = Taken; break;
+X		case 'r':	dice.d_stat[d] = Rolled; break;
+X		default:	dice.d_stat[d] = Free; break;
+X		}
+X		dice.d_face[d] = isdigit(faces[d]) ? (faces[d] - '0') : BADFACE;
+X		switch(combs[d]) {
+X		case 'p':	dice.d_comb[d] = Previous; break;
+X		case 'n':	dice.d_comb[d] = Nothing; break;
+X		case 'j':	dice.d_comb[d] = Joker; break;
+X		case '5':	dice.d_comb[d] = Five; break;
+X		case '1':	dice.d_comb[d] = Ace; break;
+X		case 't':	dice.d_comb[d] = Three_of_a_kind; break;
+X		case 'l':	dice.d_comb[d] = Small_straight; break;
+X		case 'f':	dice.d_comb[d] = Four_of_a_kind; break;
+X		case 'b':	dice.d_comb[d] = Asm_straight; break;
+X		case 's':	dice.d_comb[d] = Straight; break;
+X		case 'a':	dice.d_comb[d] = All_of_a_kind; break;
+X		default:	dice.d_comb[d] = Nothing; break;
+X		}
+X	}
+X
+X	return drawdice();
+X}
+X
+X/*
+X**	parmact: read game parameters winscore and jokermode
+X*/
+X/*ARGSUSED*/
+Xparmact(t,m)
+Xchar *m;
+X{
+X	int		n;
+X	char	word[64];
+X
+X	if((n = sscanf(m+4, "This is a %d point game with %s",
+X	  &winscore, word)) < 1)
+X		return -1;
+X	
+X	/*
+X	**	This message happens at game startup.  If we're suspended
+X	**	we want to alert the player, so send a bunch of beeps.
+X	*/
+X	if(quiet == True)
+X		mybeep(3);
+X	
+X	inprogress = True;
+X	jokermode = (n == 2 && word[0] == 'j') ? True : False;
+X
+X	(void) infomesg(m+4);
+X	(void) defhelpmesg();
+X	return drawdice();
+X}
+X
+X/*
+X**	argeact: argument error, display error message
+X*/
+X/*ARGSUSED*/
+Xargeact(t,m)
+Xchar *m;
+X{
+X	if(quiet != True)
+X		mybeep(1);
+X	(void) infomesg(m+4);
+X	sleep(2);
+X	return 0;
+X}
+X
+X/*
+X**	badmact: alert player to bad message
+X*/
+Xbadmact(t,m)
+Xchar *m;
+X{
+X	return (dispact(t,"Bad message follows:") < 0 || dispact(t,m) < 0) ? -1 : 0;
+X}
+X
+X/*
+X**	unktact: alert player to unknown type message
+X*/
+Xunktact(t,m)
+Xchar *m;
+X{
+X	return (dispact(t,"Unknown message follows:") < 0 || dispact(t,m) < 0)
+X		? -1 : 0;
+X}
+X
+X/*
+X**	actmap: relates message types to actions
+X*/
+Xtypedef struct {
+X	m_num	a_type;			/* message type M_???? */
+X	int	  (*a_action)();	/* action to take */
+X} actmap;
+X
+X/*
+X**	atable: action table
+X*/
+Xstatic actmap	atable[]	= {
+X	{ M_NOOP,	noopact },			/* no operation (usually heartbeat) */
+X	{ M_INFO,	infoact },			/* informational or status messages */
+X	{ M_HELP,	helpact },			/* help messages */
+X	{ M_DICE,	diceact },			/* dice status */
+X	{ M_PARM,	parmact },			/* game parameters */
+X	{ M_PLAY,	playact },			/* play-by-play on other players */
+X	{ M_KEEP,	keepact },			/* %d points: */
+X	{ M_HELO,	heloact },			/* hello message (and name query) */
+X	{ M_DOWN,	downact },			/* shutdown message */
+X	{ M_RQID,	rqidact },			/* id request */
+X	{ M_WORP,	worpact },			/* play or watch? */
+X	{ M_SORP,	sorpact },			/* wait (spider) or play? */
+X	{ M_ACTV,	actvact },			/* you are now an active player */
+X	{ M_AUTO,	autoact },			/* you are on autopilot */
+X	{ M_WAIT,	waitact },			/* you are waiting to be added */
+X	{ M_VOYR,	voyract },			/* you are now a voyeur */
+X	{ M_SPDR,	spdract },			/* you are now a spider */
+X	{ M_TURN,	turnact },			/* Player %d, ... up with %d points. */
+X	{ M_NWIN,	nwinact },			/* game over, no winner */
+X	{ M_OVER,	overact },			/* Player %d has won the game! */
+X	{ M_RANK,	rankact },			/* player ranking info after game */
+X	{ M_CPLR,	cplract },			/* clear player roster */
+X	{ M_UARE,	uareact },			/* you are player %d */
+X	{ M_PNUM,	pnumact },			/* player %d %s */
+X	{ M_FARE,	fareact },			/* farewell %d %s */
+X	{ M_NOBS,	nobsact },			/* %d observer%s */
+X	{ M_MSCO,	mscoact },			/* You now have %d points. */
+X	{ M_OSCO,	oscoact },			/* Player %d now has %d points. */
+X	{ M_ANOG,	anogact },			/* play another game? */
+X	{ M_RFST,	rfstact },			/* 0 points, roll first? */
+X	{ M_ARGE,	argeact },			/* argument error, try again */		
+X	{ M_BADM,	badmact },			/* bad message */
+X};
+Xstatic int		nactions	= (sizeof atable / sizeof atable[0]);
+X
+X/*
+X**	actlist: array of pointers to actions
+X*/
+Xstatic int		 (**actlist)()	= 0;
+X
+X/*
+X**	initactions: build an array of actions from atable
+X*/
+Xinitactions()
+X{
+X	register int	m;
+X	unsigned		size;
+X	char		   *malloc();
+X
+X	/*
+X	**	Just in case we're called more than once.
+X	*/
+X	if(actlist != 0) {
+X		free((char *)actlist);
+X		actlist = 0;
+X	}
+X
+X	/*
+X	**	Get memory for action list.  Initialize each pointer.
+X	*/
+X	size = (unsigned)(M_LAST - M_BASE + 1);
+X	if((actlist = (int (**)())malloc(size * sizeof *actlist)) == 0)
+X		cleanup(1, "no memory for action list");
+X	for(m = 0;m < size;++m)
+X		*(actlist+m) = unktact;	/* un-mapped action */
+X	
+X	/*
+X	**	Install the values mapped in atable.
+X	*/
+X	for(m = 0;m < nactions;++m)
+X		actlist[(int)atable[m].a_type-M_BASE] = atable[m].a_action;
+X}
+X
+X/*
+X**	action: a dispatching function
+X*/
+Xaction(type, mesg)
+Xint		type;
+Xchar   *mesg;
+X{
+X	int		r;
+X
+X	if(type < M_BASE || type > M_LAST)
+X		r = badmact(type, mesg);
+X	else
+X		r = (*actlist[type-M_BASE])(type, mesg);
+X
+X	neutral();
+X	return r;
+X}
+END_OF_FILE
+if test 15195 -ne `wc -c <'actions.c'`; then
+    echo shar: \"'actions.c'\" unpacked with wrong size!
+fi
+# end of 'actions.c'
+fi
+if test -f 'cubeserv2.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'cubeserv2.c'\"
+else
+echo shar: Extracting \"'cubeserv2.c'\" \(18633 characters\)
+sed "s/^X//" >'cubeserv2.c' <<'END_OF_FILE'
+X/*	vi:set sw=4 ts=4: */
+X#ifndef	lint
+Xstatic char	sccsid[] = "@(#)cubeserv2.c 5.1 (G.M. Paris) 89/04/25";
+X#endif	lint
+X
+X/*
+X**
+X**	cubes 5.1  Copyright 1989 Gregory M. Paris
+X**		Permission granted to redistribute on a no charge basis.
+X**		All other rights are reserved.
+X**
+X*/
+X
+X#include	<stdio.h>
+X#include	<ctype.h>
+X#include	<strings.h>
+X#include	<syslog.h>
+X#include	<sys/types.h>
+X#include	<sys/time.h>
+X#include	"cubes.h"
+X
+Xextern long		gamenum;
+Xextern char	   *optarg;
+Xextern char	   *fgets();
+Xextern char	   *gets();
+Xextern char	   *malloc();
+Xextern history *histbyname();
+Xextern char	   *moniker();
+Xextern time_t	time();
+Xstruct tm	   *localtime();
+Xextern boolean	nameinuse();
+Xextern boolean	idinuse();
+Xextern boolean	isproxy();
+Xextern winpref	workhourstype();
+X
+Xextern unsigned	nhist;					/* number of entries in history */
+Xextern unsigned	neq;					/* number of equivalent hosts */
+Xextern char	  **equiv;					/* equivalent hosts */
+Xextern int		active;					/* number of Active humans */
+Xextern int		waiting;				/* number of Waiting humans */
+Xextern int		watching;				/* number of Watching humans */
+Xextern int		spiders;				/* number of Spiders */
+Xextern int		turnnum;				/* current turn number */
+Xextern boolean	enajokers;				/* enable jokers */
+Xextern boolean	jokermode;				/* dice do not have joker faces */
+Xextern boolean	inprogress;				/* True when game in progress */
+Xextern boolean	clearobs;				/* Observers are showing in roster */
+Xextern blitzmode blitzwhen;				/* Blitz mode enforced during work */
+Xextern winpref	gametype;				/* specifies winscore */
+Xextern int		winscore;				/* points needed to win */
+Xextern player	plr[];					/* player/connection list */
+X
+X/*
+X**	prescreen: does this person really want to play?
+X*/
+Xboolean
+Xprescreen(c)
+Xregister int	c;
+X{
+X	char   *reason;
+X
+X	/*
+X	**	If there's a game in progress, we'll return False if the
+X	**	game mode is incompatible with the player's preference.
+X	**	If no game is in progress, we check to see if the prevailing
+X	**	mode is enough to decide that the person doesn't want to play.
+X	*/
+X	reason = 0;
+X	switch(plr[c].p_pref) {
+X	case Fstand:	/* only wants to play in a Standard game */
+X		if(inprogress == True && gametype != Standard)
+X			reason = "Sorry, the current game is not Standard.";
+X		else if(blitzwhen == Enforced && workhourstype() == Blitz)
+X			reason = "Sorry, only Blitz games may be played now.";
+X		break;
+X	case Fblitz:	/* only wants to play in a Blitz game */
+X		if(inprogress == True && gametype != Blitz)
+X			reason = "Sorry, the current game is not Blitz.";
+X		else if(blitzwhen == Noblitz)
+X			reason = "Sorry, this server doesn't play Blitz.";
+X		break;
+X	}
+X
+X	/*
+X	**	Tell them why we're saying goodbye and hang up.
+X	*/
+X	if(reason != 0) {
+X		(void) simp(c, M_DOWN, reason);
+X		oldplayer(c);
+X		return False;
+X	}
+X
+X	return True;
+X}
+X
+X/*
+X**	oldplayer: remove a player from the game
+X*/
+Xoldplayer(c)
+Xregister int	c;
+X{
+X	/*
+X	**	Close the socket if one is open.
+X	*/
+X	if(plr[c].p_fd != -1) {
+X		(void) close(plr[c].p_fd);
+X		plr[c].p_fd = -1, plr[c].p_timeouts = 0;
+X	}
+X
+X	/*
+X	**	Change the player's status.
+X	*/
+X	switch(plr[c].p_stat) {
+X	case Inactive:
+X		break;
+X
+X	case Active:
+X		/*
+X		**	If game in progress and there are other humans playing and this
+X		**	player is on board, then there's a good chance that a Computer
+X		**	proxy will be assigned to take over.  The proxy keeps the original
+X		**	name so that other players are not made aware.  The id is also
+X		**	left unchanged so that a single player can't flood the game with
+X		**	proxies.  We do this substitution, more rarely, when a player
+X		**	is not yet on board, to penalize players that repeatedly start
+X		**	and quit games looking for an initial big advantage.
+X		*/
+X		if(inprogress == True && active > 1) {
+X			if(	isproxy(c) == True			/* already a temporary proxy */
+X			||	(plr[c].p_onboard == True && randint(5) > 2)	/* 3/5ths */
+X			||	(plr[c].p_onboard == False && randint(5) == 1)	/* 1/5th */
+X			) {
+X				pickproxy(c);	/* set up proxy personality */
+X				plr[c].p_stat = Computer, --active;	/* permanent proxy */
+X				return;			/* all done */
+X			}
+X		}
+X
+X		/*
+X		**	If the player wasn't replaced, then we remove.
+X		**	If a game is in progress adjust player's history.
+X		*/
+X		if(inprogress == True)
+X			histpoints(c);
+X		plr[c].p_stat = Inactive, --active;
+X		if(active < 0) {
+X			syslog(LOG_DEBUG,
+X				"oldplayer: active=%d (shouldn't be negative)", active);
+X			active = 0;
+X		}
+X		if(active == 0)
+X			inprogress = False;	/* XXX: update Computer points history? */
+X		annfarewell(c);
+X		break;
+X
+X	case Waiting:
+X		/*
+X		**	If observers are showing in the roster, and this is not a
+X		**	Waiting Computer, then announce farewell.
+X		*/
+X		plr[c].p_stat = Inactive, --waiting;
+X		if(waiting < 0) {
+X			syslog(LOG_DEBUG,
+X				"oldplayer: waiting=%d (shouldn't be negative)", waiting);
+X			waiting = 0;
+X		}
+X		if(clearobs == True && plr[c].p_computer == 0)
+X			annfarewell(c);
+X		break;
+X
+X	case Watching:
+X		plr[c].p_stat = Inactive, --watching;
+X		if(watching < 0) {
+X			syslog(LOG_DEBUG,
+X				"oldplayer: watching=%d (shouldn't be negative)", watching);
+X			watching = 0;
+X		}
+X		if(clearobs == True)		/* observers are showing in roster */
+X			annfarewell(c);			/* clear this one */
+X		break;
+X
+X	case Spider:
+X		plr[c].p_stat = Inactive, --spiders;
+X		if(spiders < 0) {
+X			syslog(LOG_DEBUG,
+X				"oldplayer: spiders=%d (shouldn't be negative)", spiders);
+X			spiders = 0;
+X		}
+X		break;
+X
+X	case Computer:
+X		plr[c].p_stat = Inactive;
+X		if(inprogress == True)
+X			histpoints(c);
+X		annfarewell(c);
+X		break;
+X	}
+X
+X	zeroplayer(c);
+X	(void) observers(-1);
+X}
+X
+X/*
+X**	zeroplayer: initialize a player
+X*/
+Xzeroplayer(c)
+Xint		c;
+X{
+X	register player	   *p = &plr[c];
+X
+X	p->p_stat = Inactive, p->p_computer = 0;
+X	p->p_score = p->p_squander = 0, p->p_onboard = False;
+X	p->p_fd = -1, p->p_timeouts = 0;
+X	p->p_pref = Nopref, p->p_mood = 0;
+X	p->p_name[0] = p->p_id[0] = '\0';
+X}
+X
+X/*
+X**	fillroster: add computers to fill in roster
+X*/
+Xfillroster(pplr, pcomp)
+Xint	   *pplr, *pcomp;
+X{
+X	register int	c, nplr, ncomp;
+X
+X	/*
+X	**	Count all players.  We assume that all types of humans will
+X	**	play in the next game.  We add Computers in Waiting mode
+X	**	so we have to count them specially.
+X	*/
+X	ncomp = nplr = 0;
+X	for(c = 0;c < PLAYERS;++c) {
+X		switch(plr[c].p_stat) {
+X		case Inactive:
+X			break;
+X		case Waiting:
+X			if(plr[c].p_computer != 0)
+X				++ncomp;
+X			++nplr;
+X			break;
+X		case Computer:
+X			++ncomp, ++nplr;
+X			break;
+X		default:
+X			++nplr;
+X			break;
+X		}
+X	}
+X	
+X	/*
+X	**	Add enough Computer players to make at least MINCOMP.
+X	**	Add enough Computer players to make MINPLR players total.
+X	**	Add Computer players randomly with probability that
+X	**		decreases with increasing number of players.
+X	*/
+X	while(ncomp < MINCOMP || nplr < MINPLR || randint(nplr+2) == 1) {
+X		for(c = 0;c < PLAYERS;++c) if(plr[c].p_stat == Inactive) {
+X			pickcomputer(c);					/* sets status to Computer */
+X			plr[c].p_stat = Waiting, ++waiting;	/* no Waiting Computer mode */
+X			plr[c].p_fd = -1, plr[c].p_timeouts = 0;
+X			plr[c].p_score = plr[c].p_squander = 0, plr[c].p_onboard = False;
+X			++ncomp, ++nplr;
+X			break;
+X		}
+X	}
+X
+X	*pplr = nplr, *pcomp = ncomp;
+X}
+X
+X/*
+X**	workhourstype: calculate default game type for this time of day
+X**		Working hours: 8:00 - 11:59 AM, 12:45 - 4:45 PM Mon - Fri.
+XXXX:	Sorry, there's no accounting for holidays.
+X*/
+Xwinpref
+Xworkhourstype()
+X{
+X	time_t		now;
+X	struct tm  *tm;
+X
+X	if(blitzwhen != Workhours && blitzwhen != Enforced)
+X		return Standard;
+X
+X	(void) time(&now);
+X	tm = localtime(&now);
+X
+X	if(tm->tm_wday >= 1 && tm->tm_wday <= 5) {				/* Mon thru Fri? */
+X		if(tm->tm_hour >= 8 && tm->tm_hour <= 16) {			/* 8:00 to 4:59 */
+X			if(tm->tm_hour == 12 && tm->tm_min <= 45)		/* Noon to 12:45 */
+X				;											/* lunch */
+X			else if(tm->tm_hour == 16 && tm->tm_min > 45)	/* 4:45 to 4:59 */
+X				;											/* end of day */
+X			else return Blitz;								/* work hours */
+X		}
+X	}
+X
+X	return Standard;
+X}
+X
+X/*
+X**	votegametype: try to find a consensus amongst the players
+X*/
+Xwinpref
+Xvotegametype()
+X{
+X	winpref			pref;
+X	register int	c;
+X
+X	pref = Nopref;
+X	for(c = 0;c < PLAYERS;++c) {
+X		if(plr[c].p_stat == Inactive || plr[c].p_pref == Nopref)
+X			continue;
+X		switch(pref) {
+X		case Standard:
+X			if(plr[c].p_pref != Standard && plr[c].p_pref != Fstand)
+X				return Nopref;
+X			break;
+X		case Blitz:
+X			if(plr[c].p_pref != Blitz && plr[c].p_pref != Fblitz)
+X				return Nopref;
+X			break;
+X		default:
+X			switch(plr[c].p_pref) {
+X			case Standard: case Fstand: pref = Standard; break;
+X			case Blitz:    case Fblitz: pref = Blitz; break;
+X			}
+X			break;
+X		}
+X	}
+X
+X	return pref;
+X}
+X
+X/*
+X**	pickgametype: select gametype, winscore, and jokermode
+X*/
+Xpickgametype()
+X{
+X	winpref		temp;
+X
+X	switch(blitzwhen) {
+X	case Noblitz:
+X		gametype = Standard;
+X		break;
+X	case Onrequest:
+X		if((gametype = votegametype()) == Nopref)
+X			gametype = Standard;
+X		break;
+X	case Workhours:
+X		if((gametype = votegametype()) == Nopref)
+X			gametype = workhourstype();
+X		break;
+X	case Enforced:
+X		if((gametype = workhourstype()) != Blitz)
+X			if((temp = votegametype()) != Nopref)
+X				gametype = temp;
+X		break;
+X	}
+X
+X	winscore = (gametype == Blitz) ? BLITZSCORE : WINSCORE;
+X
+X	if(enajokers == False)
+X		jokermode = False;
+X	else
+X		jokermode = randint(6) == 6 ? True : False;
+X}
+X
+X/*
+X**	getequiv: determine equivalent hosts.
+X*/
+Xgetequiv()
+X{
+X	register FILE  *fp;
+X	register int	n;
+X	char			buf[512];
+X
+X	/*
+X	**	Open the hosts.equiv file and count the entries.
+X	**	Allocate memory for them and this host.
+X	*/
+X	neq = 1;
+X	if((fp = fopen("/etc/hosts.equiv", "r")) != 0) {
+X		while(fgets(buf, sizeof buf, fp) != 0)
+X			++neq;
+X		clearerr(fp);
+X		rewind(fp);
+X	}
+X	if((equiv = (char **)malloc(neq * sizeof *equiv)) == 0) {
+X		syslog(LOG_ERR, "malloc: no memory for equivalent hosts");
+X		exit(1);
+X	}
+X
+X	/*
+X	**	This host is first in the list.
+X	*/
+X	(void) gethostname(buf, sizeof buf);
+X	if((equiv[0] = malloc((unsigned)(strlen(buf) + 1))) == 0) {
+X		syslog(LOG_ERR, "malloc: no memory for this host");
+X		exit(1);
+X	}
+X	strcpy(equiv[0], buf);
+X
+X	/*
+X	**	Add the hosts from hosts.equiv.
+X	*/
+X	if(fp != 0) {
+X		for(n = 1;n < neq;++n) {
+X			if(gets(buf) == 0) {
+X				neq = n;
+X				break;
+X			}
+X			if((equiv[n] = malloc((unsigned)(strlen(buf) + 1))) == 0) {
+X				syslog(LOG_ERR, "malloc: no memory for an equivalent host");
+X				exit(1);
+X			}
+X			strcpy(equiv[n], buf);
+X		}
+X		(void) fclose(fp);
+X	}
+X}
+X
+X/*
+X**	equivalence: strip "@thishost" or "@equivhost" from an id
+X*/
+Xequivalence(id)
+Xchar   *id;
+X{
+X	register char  *at;
+X	register int	n;
+X
+X	if((at = index(id, '@')) == 0)
+X		return;
+X	if(neq == 0)
+X		getequiv();
+X	for(n = 0;n < neq;++n) {
+X		if(strcmp(at+1, equiv[n]) == 0) {
+X			*at = '\0';
+X			return;
+X		}
+X	}
+X}
+X
+X/*
+X**	idinuse: return True if id is in use by a human
+X**		or is in use by more than one Computer player
+X**	side effect: converts user@thishost or user@equivhost to just user
+X*/
+Xboolean
+Xidinuse(c, id)
+Xint		c;
+Xchar   *id;
+X{
+X	register int	cc;
+X	int				humanuse;
+X	int				computeruse;
+X
+X	equivalence(id);	/* strip @equivhost */
+X
+X	humanuse = computeruse = 0;
+X	for(cc = 0;cc < PLAYERS;++cc) if(cc != c) {
+X		if(strncmp(plr[cc].p_id, id, IDLEN-1) == 0) {
+X			switch(plr[cc].p_stat) {
+X			case Active:
+X			case Waiting:
+X			case Watching:
+X			case Spider:
+X				++humanuse;
+X				break;
+X			case Computer:
+X				++computeruse;
+X				break;
+X			default:
+X				break;
+X			}
+X		}
+X	}
+X
+X	if(humanuse > 0 || computeruse > 1)
+X		return True;
+X
+X	return False;
+X}
+X
+X/*
+X**	getplayername: get the player's name and check it
+X*/
+Xgetplayername(c)
+Xint			c;
+X{
+X	register char  *aka;
+X	char			msgbuf[MESGLEN];
+X
+X	/*
+X	**	Prompt for and read name.
+X	*/
+X	sprintf(msgbuf,
+X		"%d Hello, I'm the Cube daemon.  Who are you?\r\n", M_HELO);
+X	if(dialogue(c, msgbuf, sizeof msgbuf) < 0) {
+X		if(plr[c].p_stat != Inactive) {	/* in case of timeout */
+X			(void) simp(c, M_DOWN, "Server closing connection.");
+X			oldplayer(c);
+X		}
+X		return -1;
+X	}
+X
+X	/*
+X	**	Skip past any leading spaces or tabs in the response.
+X	*/
+X	for(aka = msgbuf;*aka == ' ' || *aka == '\t';++aka)
+X		;
+X
+X	/*
+X	**	If a non-null name was supplied, check that it is not in use.
+X	**	If not, save the name in the list and we're done.
+X	*/
+X	if(*aka != '\0') {
+X		strncpy(plr[c].p_name, aka, NAMELEN);
+X		plr[c].p_name[NAMELEN-1] = '\0';
+X		if(nameinuse(c, plr[c].p_name) == False) {
+X			savename(plr[c].p_name);
+X			return 0;
+X		}
+X		(void) simp(c, M_ARGE, "Your chosen moniker is already in use.");
+X	}
+X
+X	/*
+X	**	We were supplied with a null name, or one already in use.
+X	**	Pick one from the monikers list rather than dumping the player.
+X	*/
+X	while(nameinuse(c, (aka = moniker())) == True)
+X		;
+X	strncpy(plr[c].p_name, aka, NAMELEN);
+X	plr[c].p_name[NAMELEN-1] = '\0';
+X
+X	return 0;
+X}
+X
+X/*
+X**	getplayerid: get player's unique id (user@host)
+X**		Allow setting of winscore preference.
+X*/
+Xgetplayerid(c)
+Xint			c;
+X{
+X	register char  *s, *id;
+X	char			msgbuf[MESGLEN];
+X
+X	/*
+X	**	Prompt for and read the id.
+X	*/
+X	sprintf(msgbuf, "%d Please supply a unique id.\r\n", M_RQID);
+X	if(dialogue(c, msgbuf, sizeof msgbuf) < 0) {
+X		if(plr[c].p_stat != Inactive) {	/* in case of timeout */
+X			sprintf(msgbuf, "%d No response taken to mean `No.'\r\n", M_ARGE);
+X			goto iderror;
+X		}
+X		return -1;
+X	}
+X
+X	/*
+X	**	A null id is not valid.
+X	*/
+X	if(msgbuf[0] == '\0') {
+X		sprintf(msgbuf, "%d Sorry, that's not unique.\r\n", M_ARGE);
+X		goto iderror;
+X	}
+X
+X	/*
+X	**	Check for winscore preference.  Ignore bogus values.
+X	*/
+X	if(msgbuf[1] != ';') {
+X		plr[c].p_pref = Nopref;
+X		id = &msgbuf[0];
+X	} else {
+X		switch(msgbuf[0]) {
+X		case 's': plr[c].p_pref = Standard; break;
+X		case 'S': plr[c].p_pref = Fstand; break;
+X		case 'b': plr[c].p_pref = Blitz; break;
+X		case 'B': plr[c].p_pref = Fblitz; break;
+X		default:  plr[c].p_pref = Nopref; break;
+X		}
+X		id = &msgbuf[2];
+X	}
+X
+X	/*
+X	**	Id's are alphanumerics plus a few other characters.
+X	*/
+X	for(s = id;*s != '\0';++s) {
+X		if(isalnum(*s) || index("@._-+=", *s) != 0)
+X			continue;
+X		sprintf(msgbuf, "%d `%c' is not allowed in an id.\r\n", M_ARGE, *s);
+X		goto iderror;
+X	}
+X
+X	/*
+X	**	Check to see that the id is not already in use.
+X	*/
+X	strncpy(plr[c].p_id, id, IDLEN);
+X	plr[c].p_id[IDLEN-1] = '\0';
+X	if(idinuse(c, plr[c].p_id) == True) {
+X		sprintf(msgbuf, "%d You're already playing!\r\n", M_ARGE);
+X		goto iderror;
+X	}
+X
+X	/*
+X	**	Success.
+X	*/
+X	return 0;
+X
+X	/*
+X	**	Common error handling code.
+X	*/
+Xiderror:
+X	if(message(c, msgbuf) < 0)
+X		return -1;
+X	(void) simp(c, M_DOWN, "Server closing connection.");
+X	oldplayer(c);
+X	return -1;
+X}
+X
+X/*
+X**	getplayerintent: get the player's intent
+X**		If a game is inprogress, the question is watch or play?
+X**		Otherwise, the question is wait or play?
+X**	Assumes that player status is already set to Watching.
+X*/
+Xgetplayerintent(c)
+Xint			c;
+X{
+X	history	   *ph;
+X	char		msgbuf[MESGLEN];
+X
+X	/*
+X	**	Prompt for and read intent.
+X	*/
+X	sprintf(msgbuf, "%d Do you want to %s or play? [wp]\r\n",
+X		inprogress == True ? M_WORP : M_SORP,
+X		inprogress == True ? "watch" : "wait");
+X	if(dialogue(c, msgbuf, sizeof msgbuf) < 0) {
+X		if(plr[c].p_stat != Inactive) {	/* in case of timeout */
+X			(void) simp(c, M_DOWN, "Server closing connection.");
+X			oldplayer(c);
+X		}
+X		return -1;
+X	}
+X	
+X	/*
+X	**	Check it for validity.
+X	*/
+X	switch(msgbuf[0]) {
+X	case '\0':				/* default */
+X	case 'p': case 'P':		/* Play */
+X		plr[c].p_stat = Waiting, ++waiting, --watching;
+X		return 0;
+X	case 'w': case 'W':		/* Watch or Wait */
+X		if(inprogress == False) {
+X			plr[c].p_stat = Spider, ++spiders, --watching;
+X			return 0;
+X		}
+X		if(active <= 0 && waiting <= 0) {
+X			if(simp(c, M_ARGE, "Sorry, no game in progress.") < 0)
+X				return -1;
+X			break;
+X		}
+X		/*
+X		**	We let new players watch, but we don't let ancient ones do so.
+X		**	It seems that some people would rather watch than play, but
+X		**	that's no fun for the regular players.
+X		*/
+X		if((ph = histbyname(plr[c].p_id)) != 0) {
+X			if(ph->h_lastgame > 0 && gamenum - ph->h_lastgame >= ANCIENT) {
+X				syslog(LOG_NOTICE,
+X					"getplayerintent: excluded ancient voyeur %s", plr[c].p_id);
+X				if(simp(c, M_ARGE, "Sorry, you're too ancient to watch!") < 0)
+X					return -1;
+X				break;
+X			}
+X		}
+X		return 0;
+X	default:
+X		if(simp(c, M_ARGE, "Sorry, but that's nonsense.") < 0)
+X			return -1;
+X		break;
+X	}
+X
+X	(void) simp(c, M_DOWN, "Server closing connection.");
+X	oldplayer(c);
+X	return -1;
+X}
+X
+X/*
+X**	fixroster: do any necessary roster adjustment
+X**		If add is true, we can add Waiting players to the front of
+X**		the roster.  If false, we will move them to the end.
+X**		Collapses out Inactive slots.
+X*/
+Xfixroster(add)
+Xboolean		add;
+X{
+X	int		c, cc, low, squ;
+X	player	tmp[PLAYERS];
+X
+X	/*
+X	**	No reason to do this except during a game.
+X	*/
+X	if(inprogress == False)
+X		return;
+X
+X	/*
+X	**	If there are no Waiting players, or we're not allowed to add them,
+X	**	check for "empty" slots in the roster.  We define empty here as
+X	**	Inactive, Watching, or Waiting, since to Active players, slots held
+X	**	by Watching or Waiting players appear empty.
+X	*/
+X	if(waiting == 0 || add == False) {
+X		for(c = 0;c < PLAYERS;++c)		/* find first empty slot */
+X			if(plr[c].p_stat != Computer && plr[c].p_stat != Active)
+X				break;
+X		for(++c;c < PLAYERS;++c)		/* look for a non-empty slot */
+X			if(plr[c].p_stat == Computer || plr[c].p_stat == Active)
+X				break;
+X		if(c >= PLAYERS)				/* didn't find any */
+X			return;
+X	}
+X
+X	/*
+X	**	If we are allowed to add Waiting players, put them first,
+X	**	otherwise put them last with the Watching players.  In either
+X	**	case, this algorithm removes empty slots.
+X	*/
+X	cc = 0;
+X	if(add == True) {
+X		for(c = 0;c < PLAYERS;++c)	/* first pass, Waiting players */
+X			if(plr[c].p_stat == Waiting)
+X				tmp[cc++] = plr[c];
+X	}
+X	for(c = 0;c < PLAYERS;++c)		/* second pass, Active players */
+X		if(plr[c].p_stat == Computer || plr[c].p_stat == Active)
+X			tmp[cc++] = plr[c];
+X	for(c = 0;c < PLAYERS;++c)		/* third pass, Watching players */
+X		if(	plr[c].p_stat == Watching
+X		|| plr[c].p_stat == Spider
+X		||	(add == False && plr[c].p_stat == Waiting))
+X			tmp[cc++] = plr[c];
+X	if(cc == 0) {
+X		syslog(LOG_DEBUG, "fixroster: no players!");
+X		active = waiting = watching = 0;
+X		return;
+X	}
+X
+X	/*
+X	**	Calculate a suitable low score for any new players.
+X	*/
+X	if(waiting == 0 || add == False || (low = lowscore(&squ) - ONBOARD) < 0)
+X		low = 0;
+X
+X	/*
+X	**	Copy the reordered roster into the real one while at the
+X	**	same time adding waiting players (if allowed).
+X	*/
+X	for(c = 0;c < cc;++c) {
+X		plr[c] = tmp[c];
+X		if(add == True && plr[c].p_stat == Waiting) {
+X			plr[c].p_score = low;
+X			plr[c].p_squander = squ;
+X			plr[c].p_onboard = False;
+X			if(plr[c].p_computer != 0)
+X				plr[c].p_stat = Computer, --waiting;
+X			else {
+X				plr[c].p_stat = Active, --waiting, ++active;
+X				(void) tellstatus(c);	/* XXX */
+X			}
+X		}
+X	}
+X	for(;c < PLAYERS;++c)
+X		zeroplayer(c);
+X	if(waiting != 0) {
+X		syslog(LOG_DEBUG, "fixroster: waiting=%d (should be zero)", waiting);
+X		waiting = 0;
+X	}
+X
+X	/*
+X	**	Broadcast the new roster to all players.
+X	*/
+X	roster(-1, False);
+X}
+END_OF_FILE
+if test 18633 -ne `wc -c <'cubeserv2.c'`; then
+    echo shar: \"'cubeserv2.c'\" unpacked with wrong size!
+fi
+# end of 'cubeserv2.c'
+fi
+if test -f 'history.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'history.c'\"
+else
+echo shar: Extracting \"'history.c'\" \(17309 characters\)
+sed "s/^X//" >'history.c' <<'END_OF_FILE'
+X/*	vi:set sw=4 ts=4: */
+X#ifndef	lint
+Xstatic char	sccsid[] = "@(#)history.c 5.1 (G.M. Paris) 89/01/22";
+X#endif	lint
+X
+X/*
+X**
+X**	cubes 5.1  Copyright 1989 Gregory M. Paris
+X**		Permission granted to redistribute on a no charge basis.
+X**		All other rights are reserved.
+X**
+X*/
+X
+X#include	<stdio.h>
+X#include	<syslog.h>
+X#include	<signal.h>
+X#include	<sys/file.h>
+X#include	<sys/types.h>
+X#include	<sys/stat.h>
+X#include	<strings.h>
+X#include	"cubes.h"
+X
+X#define		MVGAMES		25			/* number of games for moving avg */
+X
+Xhistory			   *hist;			/* history array */
+Xunsigned			nhist	= 0;	/* entries in history array */
+Xlong				gamenum;		/* current game number */
+Xptstype				ptsmode	= Combined;	/* history points used in ranking */
+X
+Xextern int			winscore;
+Xextern int			turnnum;
+Xextern player		plr[];
+Xextern int			plrcmp();
+Xextern long			histwgt();
+Xextern long			histwgtplr();
+Xstatic history	   *histadd();
+Xextern history	   *histbyname();
+Xextern computer		comptbl[];
+Xextern computer	   *compbyname();
+Xextern boolean		iscomp();
+Xextern boolean		iskamelion();
+X
+Xextern char		   *fgets();
+Xextern char		   *malloc();
+Xextern char		   *realloc();
+X
+X/*
+X**	histread: read history file
+X**		Any format conversions must be handled by a separate utility.
+X*/
+Xhistread(histfile)
+Xchar   *histfile;
+X{
+X	register history   *ph;
+X	register int		n;
+X	register FILE	   *fp;
+X	char				line[BUFSIZ];
+X	char				dupid[IDLEN];
+X	long				duplastgame;
+X	int					omask;
+X
+X	omask = sigsetmask(~0);
+X
+X	if(hist != 0) {
+X		free((char *)hist);
+X		hist = 0, nhist = 0;
+X	}
+X
+X	/*
+X	**	Open the file for reading.  The file must exist.
+X	*/
+X	if((fp = fopen(histfile, "r")) == 0) {
+X		syslog(LOG_ERR, "histread: fopen(%s,r): %m", histfile);
+X		(void) sigsetmask(omask);
+X		return -1;
+X	}
+X	/*
+X	**	Count the lines in the file.  If none, we're all done.
+X	*/
+X	for(n = 0;fgets(line, sizeof line, fp) != 0;++n)
+X		;
+X	if(n == 0) {
+X		(void) fclose(fp);
+X		(void) sigsetmask(omask);
+X		return 0;
+X	}
+X
+X	/*
+X	**	Rewind the file, allocate space, and read in the entries.
+X	**	There are now two lines per player.
+X	*/
+X	clearerr(fp);
+X	rewind(fp);
+X	nhist = n / 2;
+X	if((hist = (history *)malloc(nhist * sizeof *hist)) == 0) {
+X		syslog(LOG_ERR, "histread: malloc: can't allocate space for history");
+X		(void) fclose(fp);
+X		(void) sigsetmask(omask);
+X		return -1;
+X	}
+X
+X	for(n = 0, ph = hist;;++n, ++ph) {
+X		if(fgets(line, sizeof line, fp) == 0)
+X			break;
+X		if(sscanf(line, "L %ld %ld %ld %ld %ld%*[ ]%[^\n]",
+X			&ph->h_games, &ph->h_wins, &ph->h_points, &ph->h_avgturn,
+X			&ph->h_lastgame, ph->h_id) != 6) {
+X			syslog(LOG_DEBUG, "histread: got bad lifetime in %s", histfile);
+X			continue;
+X		}
+X		if(fgets(line, sizeof line, fp) == 0) {
+X			syslog(LOG_DEBUG, "histread: missing last moving in %s", histfile);
+X			break;
+X		}
+X		if(sscanf(line, "M %ld %ld %ld %ld %ld%*[ ]%[^\n]",
+X			&ph->h_mvgames, &ph->h_mvwins, &ph->h_mvpoints, &ph->h_mvavgturn,
+X			&duplastgame, dupid) != 6) {
+X			syslog(LOG_DEBUG, "histread: got bad moving in %s", histfile);
+X			continue;
+X		}
+X		if(strcmp(ph->h_id, dupid) != 0) {
+X			syslog(LOG_DEBUG, "histread: name mismatch %ls vs %ls in %s",
+X				ph->h_id, dupid, histfile);
+X			continue;
+X		}
+X		if(ph->h_lastgame != duplastgame) {
+X			syslog(LOG_DEBUG,
+X				"histread: lastgame mismatch %ld vs %ld for %s in %s",
+X				ph->h_lastgame, duplastgame, ph->h_id, histfile);
+X			continue;
+X		}
+X		ph->h_computer = compbyname(ph->h_id);
+X	}
+X
+X	(void) fclose(fp);
+X
+X	(void) sigsetmask(omask);
+X	histsort();
+X
+X	return 0;
+X}
+X
+X/*
+X**	histprune: remove ancient records from history
+X**		assumes gamenum has been set
+X*/
+Xhistprune(gpcredit)
+Xint		gpcredit;
+X{
+X	register int		h;
+X	register history   *pt, *pf;
+X	register long		span;
+X	unsigned			nnhist;
+X	int					omask;
+X
+X	omask = sigsetmask(~0);
+X
+X	/*
+X	**	Look for ancient records and delete them.
+X	*/
+X	pt = pf = hist;
+X	for(h = 0;h < nhist;++h, ++pf) {
+X		span = gamenum - pf->h_lastgame;
+X		if(gpcredit != 0)
+X			span -= gpcredit * pf->h_games;
+X		if(span >= ANCIENT)
+X			continue;
+X		if(pt != pf)
+X			*pt = *pf;
+X		++pt;
+X	}
+X
+X	/*
+X	**	Shrink memory used by history to account for pruned entries.
+X	*/
+X	nnhist = (unsigned)(pt - hist);
+X	if(nnhist != nhist) {
+X		if((hist =
+X			(history *)realloc((char *)hist, nnhist * sizeof *hist)) == 0) {
+X			syslog(LOG_WARNING, "histprune: realloc failed");
+X			nnhist = 0;
+X		}
+X		nhist = nnhist;
+X	}
+X
+X	(void) sigsetmask(omask);
+X}
+X
+X/*
+X**	histcmp: history comparison function for history file ordering
+X*/
+Xhistcmp(h1, h2)
+Xhistory	   *h1, *h2;
+X{
+X	return (int)(h2->h_weight - h1->h_weight);
+X}
+X
+X/*
+X**	histsort: sort the history array
+X*/
+Xhistsort()
+X{
+X	register int	n;
+X	int				omask;
+X
+X	if(nhist != 0 && hist != 0) {
+X		for(n = 0;n < nhist;++n)
+X			(void) histwgt(n);
+X		omask = sigsetmask(~0);
+X		qsort((char *)hist, (int)nhist, sizeof *hist, histcmp);
+X		(void) sigsetmask(omask);
+X		for(n = 0;n < nhist;++n)
+X			(hist+n)->h_rank = n + 1;
+X	}
+X}
+X
+X/*
+X**	histwrite: write the history file, pruning ancient records
+X*/
+Xhistwrite(histfile)
+Xchar   *histfile;
+X{
+X	register history   *ph;
+X	register FILE	   *fp;
+X	register int		n;
+X	int					omask;
+X
+X	omask = sigsetmask(~0);		/* block all signals */
+X
+X	(void) umask(0644);
+X	if((fp = fopen(histfile, "w")) == 0) {
+X		syslog(LOG_ERR, "histwrite: fopen(%s,w): %m", histfile);
+X		(void) sigsetmask(omask);
+X		return -1;
+X	}
+X
+X	if(nhist != 0) {
+X		histprune(WRITECREDIT);
+X		histsort();
+X		for(n = 0, ph = hist;n < nhist;++n, ++ph) {
+X			fprintf(fp, "L %5ld %5ld %10ld %10ld %6ld %s\n",
+X				ph->h_games, ph->h_wins, ph->h_points, ph->h_avgturn,
+X				ph->h_lastgame, ph->h_id);
+X			fprintf(fp, "M %5ld %5ld %10ld %10ld %6ld %s\n",
+X				ph->h_mvgames, ph->h_mvwins, ph->h_mvpoints, ph->h_mvavgturn,
+X				ph->h_lastgame, ph->h_id);
+X		}
+X	}
+X
+X	(void) fsync(fileno(fp));	/* commit to disk */
+X	(void) fclose(fp);
+X
+X	(void) sigsetmask(omask);	/* restore signal mask */
+X
+X	return 0;
+X}
+X
+X/*
+X**	histtime: return modification time of history file
+X*/
+Xhisttime(histfile, ptime)
+Xchar   *histfile;
+Xtime_t *ptime;
+X{
+X	struct stat	st;
+X
+X	if(stat(histfile, &st) < 0) {
+X		syslog(LOG_NOTICE, "histtime: stat(%s): %m", histfile);
+X		return -1;
+X	}
+X	*ptime = st.st_mtime;
+X
+X	return 0;
+X}
+X
+X/*
+X**	histadd: add a player to the history array
+X*/
+Xstatic history *
+Xhistadd(c)
+Xint		c;
+X{
+X	register history   *ph;
+X	char			   *id;
+X	int					omask;
+X
+X	omask = sigsetmask(~0);
+X
+X	if(nhist == 0)
+X		hist = (history *)malloc(sizeof *hist), ++nhist;
+X	else
+X		hist = (history *)realloc((char *)hist, ++nhist * sizeof *hist);
+X
+X	if(hist == 0) {
+X		syslog(LOG_ERR, "histadd: no memory for more history");
+X		nhist = 0;
+X		(void) sigsetmask(omask);
+X		return (history *)0;
+X	}
+X
+X	/*
+X	**	Initialize the new entry.
+X	*/
+X	ph = hist + nhist - 1;
+X	if(*(id = plr[c].p_id) == '\0')
+X		id = plr[c].p_name;
+X	strncpy(ph->h_id, id, IDLEN);
+X	ph->h_id[IDLEN-1] = '\0';
+X	ph->h_computer = compbyname(ph->h_id);
+X	ph->h_rank = nhist, ph->h_weight = 0;
+X	ph->h_points = ph->h_avgturn = ph->h_wins = ph->h_games = 0;
+X	ph->h_mvpoints = ph->h_mvavgturn = ph->h_mvwins = ph->h_mvgames = 0;
+X	ph->h_lastgame = 0;
+X
+X	(void) sigsetmask(omask);
+X
+X	return ph;
+X}
+X
+X/*
+X**	histpoints: add player's points to history
+X**		updates game count and lastgame and adds new entries as needed
+X**		uses a fifty-percent rule to penalize players not onboard
+X*/
+Xhistpoints(c)
+Xint		c;
+X{
+X	history	   *ph;
+X	char	   *id;
+X	long		scale, fifty;
+X	long		avgturn;
+X	double		winrate;
+X
+X	/*
+X	**	Locate player's entry in history array.
+X	**	If player doesn't have an entry, call histadd
+X	**	to add one.  Histadd returns a pointer to the
+X	**	new entry or zero on error.
+X	*/
+X	if(*(id = plr[c].p_id) == '\0')
+X		id = plr[c].p_name;
+X	if((ph = histbyname(id)) == 0) {
+X		if((ph = histadd(c)) == 0) {
+X			syslog(LOG_DEBUG, "histpoints: histadd failed");
+X			return -1;
+X		}
+X	}
+X
+X	/*
+X	**	If this non-COMP player was not onboard, it was probably a quit.
+X	**	In this case, we penalize the player's point total to get the
+X	**	same ptsmode average that would result if the game was played to
+X	**	finish and the player got 50% of its ptsmode average.  We must not
+X	**	update game count or lastgame.  We do adjust the moving average
+X	**	using the same half-average score, though the updating is a
+X	**	bit more complex due to the nature of the recent point total.
+X	*/
+X	if(plr[c].p_onboard == False && iscomp(c) == False) {
+X		if(ph->h_games == 0)
+X			return 0;
+X
+X		histcalc(ph, &winrate, &fifty, &avgturn);
+X		fifty /= 2;
+X
+X		/*
+X		**	The next calculation done purely as integer math is likely to
+X		**	overflow once the player has about 500 games.
+X		*/
+X#ifdef	notdef
+X		ph->h_points = (ph->h_games * ph->h_points + fifty) / (ph->h_games + 1);
+X#else	notdef
+X		{
+X			double	rat, gam;
+X
+X			gam = (double)(ph->h_games + 1);
+X			rat = (double)ph->h_games / gam;
+X			ph->h_points = (long)(ph->h_points * rat + fifty / gam);
+X		}
+X#endif	notdef
+X
+X		if(ph->h_mvgames == MVGAMES)
+X			ph->h_mvpoints += fifty - ph->h_mvpoints / MVGAMES;
+X		else	/* next line not strictly correct if h_mvgames > MVGAMES */
+X			ph->h_mvpoints = (ph->h_mvgames * ph->h_mvpoints + fifty)
+X				/ (ph->h_mvgames + 1);
+X
+X		return 0;
+X	}
+X
+X	/*
+X	**	Update points and avgturn and increment game count.  History points
+X	**	are based on games of WINSCORE points, so scale points here before
+X	**	adding to history.  Note that avgturn does not need scaling.
+X	**	Game count is incremented and lastgame is set only here.  Mvwins
+X	**	is updated here as if the game was a loss -- corrected in histwin.
+X	*/
+X	scale = (WINSCORE * (long)plr[c].p_score) / winscore;
+X	avgturn = turnnum > 0 ? (long)plr[c].p_score / turnnum : 0L;
+X
+X	if(ph->h_mvgames == MVGAMES) {
+X		ph->h_mvpoints += scale - ph->h_mvpoints / MVGAMES;
+X		ph->h_mvavgturn += avgturn - ph->h_mvavgturn / MVGAMES;
+X		ph->h_mvwins -= ph->h_mvwins / MVGAMES;
+X	} else if(ph->h_mvgames < MVGAMES) {
+X		ph->h_mvpoints += scale;
+X		ph->h_mvavgturn += avgturn;
+X		/* no adjustment of h_mvwins necessary */
+X		++ph->h_mvgames;
+X	} else {	/* over! */
+X		ph->h_mvpoints = (MVGAMES * ph->h_mvpoints) / ph->h_mvgames;
+X		ph->h_mvavgturn = (MVGAMES * ph->h_mvavgturn) / ph->h_mvgames;
+X		ph->h_mvwins = (MVGAMES * ph->h_mvwins) / ph->h_mvgames;
+X		ph->h_mvgames = MVGAMES;
+X		ph->h_mvpoints += scale - ph->h_mvpoints / MVGAMES;
+X		ph->h_mvavgturn += avgturn - ph->h_mvavgturn / MVGAMES;
+X		ph->h_mvwins -= ph->h_mvwins / MVGAMES;
+X	}
+X
+X	ph->h_games++;
+X	ph->h_points += scale;
+X	ph->h_avgturn += avgturn;
+X	ph->h_lastgame = gamenum;
+X
+X	return 0;
+X}
+X
+X/*
+X**	histwins: update win count for game winner
+X**		assumes that histpoints has been called to update game count
+X**		assumes that histpoints adjusts mvwins as if game was lost
+X**		doesn't add new history entries as needed
+X*/
+Xhistwins(c)
+Xint		c;
+X{
+X	register char	   *id;
+X	register history   *ph;
+X
+X	if(*(id = plr[c].p_id) == '\0')
+X		id = plr[c].p_name;
+X
+X	if((ph = histbyname(id)) == 0) {
+X		syslog(LOG_DEBUG, "histwins: can't find <%s> in history", id);
+X		return -1;
+X	}
+X
+X	ph->h_wins++;
+X	ph->h_mvwins += H_MVWINMULT;
+X	return 0;
+X}
+X
+X/*
+X**	histwgt: return weighted value of history item n
+X*/
+Xlong
+Xhistwgt(n)
+Xint		n;
+X{
+X	register history   *ph;
+X	long				avgpoints, avgturn;
+X	double				winrate;
+X
+X	if(n >= nhist || (ph = hist + n)->h_games == 0) {
+X		ph->h_weight = 0;
+X		return 0L;
+X	}
+X
+X	histcalc(ph, &winrate, &avgpoints, &avgturn);
+X	ph->h_weight = (long)(1000L * winrate) + avgpoints + avgturn;
+X
+X	return ph->h_weight;
+X}
+X
+X/*
+X**	histavgplr: return player's historical average game points
+X*/
+Xlong
+Xhistavgplr(c)
+Xint		c;
+X{
+X	history	   *ph;
+X	char	   *id;
+X	long		avgmpt, avtnpt;
+X	double		winrt;
+X
+X	if(*(id = plr[c].p_id) == '\0')
+X		id = plr[c].p_name;
+X	
+X	if((ph = histbyname(id)) == 0 || ph->h_games == 0)
+X		return 0L;	/* no average */
+X
+X	histcalc(ph, &winrt, &avgmpt, &avtnpt);
+X	return avgmpt;
+X}
+X
+X/*
+X**	histwgtplr: return player's historical wins/points weighting
+X*/
+Xlong
+Xhistwgtplr(c)
+Xint		c;
+X{
+X	history	   *ph;
+X	char	   *id;
+X
+X	if(*(id = plr[c].p_id) == '\0')
+X		id = plr[c].p_name;
+X	
+X	if((ph = histbyname(id)) == 0)
+X		return 0L;
+X
+X	return histwgt((int)(ph - hist));
+X}
+X
+X/*
+X**	humanplaying: returns true if the human is playing or watching this game
+X*/
+Xboolean
+Xhumanplaying(c, id)
+Xint		c;
+Xchar   *id;
+X{
+X	register int	cc;
+X
+X	for(cc = 0;cc < PLAYERS;++cc) if(cc != c) {
+X		switch(plr[cc].p_stat) {
+X		case Active:
+X		case Waiting:
+X		case Watching:
+X			if(strncmp(plr[cc].p_id, id, IDLEN) == 0)
+X				return True;
+X			break;
+X		}
+X	}
+X
+X	return False;
+X}
+X
+X/*
+X**	histfmtplr: return formatted history entry for player
+X**		or entry in relation to player
+X**	Note: this routine is used by the server to let players check
+X**		their own and other players' histories during a game.
+X**		Some deception is used when Kamelion is the subject of inquiry.
+X*/
+Xchar *
+Xhistfmtplr(c, rel, useid)
+Xint		c, rel;
+Xboolean	useid;
+X{
+X	register history   *ph;
+X	register int		n, d;
+X	register char	   *id;
+X	static char			fmt[MESGLEN];
+X
+X	/*
+X	**	Sorry, but we don't want to have to do a lookup.
+X	**	What's the right thing to do in this case anyway?
+X	*/
+X	if(useid == False && rel != 0)
+X		useid = True;
+X
+X	/*
+X	**	We have to let Waiting and Watching pass here, or a such a
+X	**	player can't use the related commands at the "next game?"
+X	**	prompt.  This can be used to spy on observers.
+X	*/
+X	if(c < 0 || c >= PLAYERS || plr[c].p_stat == Inactive) {
+X		sprintf(fmt, "No player number %d.", c+1);
+X		return fmt;
+X	}
+X
+X	if(*(id = plr[c].p_id) == '\0')
+X		id = plr[c].p_name;
+X	if((ph = histbyname(id)) == 0) {
+X		sprintf(fmt, "%s is not ranked.",
+X			useid == True ? plr[c].p_id : plr[c].p_name);
+X		return fmt;
+X	}
+X	n = (int)(ph - hist);
+X
+X	if(rel != 0) {
+X		ph += rel, n += rel;
+X		if(n < 0 || n >= nhist) {
+X			sprintf(fmt, "No player is ranked %d.", n+1);
+X			return fmt;
+X		}
+X	}
+X
+X	/*
+X	**	When rel is zero and useid is False, this is a query about one player
+X	**	by another.  In this case, we try to protect Kamelion's identity.
+X	**	What we do is look for the nearest ranked human that's not playing.
+X	**	If there isn't one, we tell the truth.
+X	*/
+X	if(rel == 0 && useid == False && iskamelion(c) == True) {
+X		for(d = 1;d < nhist;++d) {
+X			if(n - d >= 0 && (ph-d)->h_computer == 0
+X			&& humanplaying(c, (ph-d)->h_id) == False) {
+X				ph -= d, n -= d;
+X				break;
+X			}
+X			if(n + d < nhist && (ph+d)->h_computer == 0
+X			&& humanplaying(c, (ph+d)->h_id) == False) {
+X				ph += d, n += d;
+X				break;
+X			}
+X		}
+X	}
+X
+X	if(ph->h_games == 0)
+X		sprintf(fmt, "%ld %.18s 0 * * * %ld",
+X			ph->h_rank, useid == True ? ph->h_id : plr[c].p_name, ph->h_weight);
+X	else {
+X		long	avgpoints, avgturn;
+X		double	winrate;
+X
+X		histcalc(ph, &winrate, &avgpoints, &avgturn);
+X		sprintf(fmt, "%ld %.18s %ld %5.3f %ld %ld %ld",
+X			ph->h_rank, useid == True ? ph->h_id : plr[c].p_name,
+X			ph->h_games, winrate, avgpoints, avgturn, ph->h_weight);
+X	}
+X	
+X	return fmt;
+X}
+X
+X/*
+X**	historder: reorder players by historical wins/points weighting
+X**		and/or score from previous game
+X*/
+Xhistorder(firstgame)
+Xboolean	firstgame;
+X{
+X	register int	c;
+X	int				omask;
+X#define	SORTBONUS	15000
+X
+X	/*
+X	**	Give active players a score based on their history unless they
+X	**	played in the previous game.  In that case, award them a bonus
+X	**	that guarantees preferential treatment.
+X	*/
+X	for(c = 0;c < PLAYERS;++c) {
+X		switch(plr[c].p_stat) {
+X		case Computer:
+X		case Active:
+X			if(firstgame == True || plr[c].p_score == 0)
+X				plr[c].p_score = (int)histwgtplr(c);
+X			else
+X				plr[c].p_score += SORTBONUS;
+X			break;
+X		default:
+X			plr[c].p_score = 0;
+X			break;
+X		}
+X	}
+X
+X	omask = sigsetmask(~0);
+X	qsort((char *)plr, PLAYERS, sizeof plr[0], plrcmp);
+X	(void) sigsetmask(omask);
+X
+X#undef	SORTBONUS
+X}
+X
+X/*
+X**	histbyname: return pointer to player history or NULL
+X*/
+Xhistory *
+Xhistbyname(id)
+Xregister char  *id;
+X{
+X	register int	h;
+X
+X	for(h = 0;h < nhist;++h)
+X		if(strncmp(id, (hist+h)->h_id, IDLEN) == 0)
+X			return hist+h;
+X	
+X	return (history *)0;
+X}
+X
+X/*
+X**	setgamenum: set current game number using COMP's game count
+X*/
+Xsetgamenum()
+X{
+X	register int	h;
+X
+X	/*
+X	**	Search for the COMP computer and set the gamenum to one more
+X	**	than the number of games played.  This works because the COMP
+X	**	computer plays in every game.
+X	*/
+X	for(h = 0;h < nhist;++h) {
+X		if((hist+h)->h_computer == &comptbl[0]) {
+X			gamenum = (hist+h)->h_games + 1;
+X			return;
+X		}
+X	}
+X
+X	/*
+X	**	This really may be the first game!
+X	*/
+X	if(nhist == 0) {
+X		gamenum = 1;
+X		return;
+X	}
+X
+X	/*
+X	**	Don't know what happened to cause this, but let's try to handle it by
+X	**	setting the gamenum to one more than the highest played by any player.
+X	*/
+X	syslog(LOG_DEBUG, "setgamenum: can't find COMP computer");
+X	gamenum = 0;
+X	for(h = 0;h < nhist;++h)
+X		if((hist+h)->h_lastgame > gamenum)
+X			gamenum = (hist+h)->h_lastgame;
+X	++gamenum;
+X}
+X
+X/*
+X**	histcalc: calculate winrt, avgmpt, and avtnpt from history
+X*/
+Xhistcalc(ph, pwinrt, pavgmpt, pavtnpt)
+Xregister history   *ph;
+Xdouble			   *pwinrt;
+Xlong			   *pavgmpt, *pavtnpt;
+X{
+X	if(ph->h_games == 0) {
+X		*pwinrt = 0.0;
+X		*pavgmpt = *pavtnpt = 0;
+X		return;
+X	}
+X
+X	switch(ptsmode) {
+X	case Lifetime:
+X		*pwinrt = (double)ph->h_wins / ph->h_games;
+X		*pavgmpt = ph->h_points / ph->h_games;
+X		*pavtnpt = ph->h_avgturn / ph->h_games;
+X		break;
+X	case Recent:
+X		*pwinrt = (double)ph->h_mvwins / (H_MVWINMULT * ph->h_mvgames);
+X		*pavgmpt = ph->h_mvpoints / ph->h_mvgames;
+X		*pavtnpt = ph->h_mvavgturn / ph->h_mvgames;
+X		break;
+X	case Combined:
+X		*pwinrt = (double)ph->h_wins / ph->h_games;
+X		*pavgmpt = ph->h_points / ph->h_games;
+X		*pavtnpt = ph->h_avgturn / ph->h_games;
+X		*pwinrt += (double)ph->h_mvwins / (H_MVWINMULT * ph->h_mvgames);
+X		*pavgmpt += ph->h_mvpoints / ph->h_mvgames;
+X		*pavtnpt += ph->h_mvavgturn / ph->h_mvgames;
+X		*pwinrt *= 0.5;
+X		*pavgmpt /= 2;
+X		*pavtnpt /= 2;
+X		break;
+X	}
+X}
+END_OF_FILE
+if test 17309 -ne `wc -c <'history.c'`; then
+    echo shar: \"'history.c'\" unpacked with wrong size!
+fi
+# end of 'history.c'
+fi
+echo shar: End of archive 6 \(of 8\).
+cp /dev/null ark6isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 8 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

@@ -1,0 +1,1544 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,bf952104fd1a15b7,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-05-15 17:13:10 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!philabs!cmcl2!harvard!husc6!panda!genrad!decvax!decwrl!sun!saber!imagen!geof
+From: geof@imagen.UUCP
+Newsgroups: net.sources
+Subject: TINYTCP-public domain tcp/ip implementation
+Message-ID: <366@imagen.UUCP>
+Date: Thu, 15-May-86 20:13:10 EDT
+Article-I.D.: imagen.366
+Posted: Thu May 15 20:13:10 1986
+Date-Received: Mon, 19-May-86 01:13:11 EDT
+Distribution: net
+Organization: IMAGEN Corporation, Santa Clara, CA 95052-8101
+Lines: 1524
+
+#!/bin/sh
+: "This is a shell archive, meaning:                              "
+: "1. Remove everything above the #! /bin/sh line.                "
+: "2. Save the resulting test in a file.                          "
+: "3. Execute the file with /bin/sh (not csh) to create the files:"
+: "	README"
+: "	arp.c"
+: "	sed.c"
+: "	sed.h"
+: "	tinyftp.c"
+: "	tinytcp.c"
+: "	tinytcp.h"
+: "This archive created:  Thu May 15 16:43:07 PDT 1986 "
+echo file: README
+sed 's/^X//' >README << 'END-of-README'
+X
+X    TinyTcp Public Domain Release
+X
+XThe files in this release contain a simple implementation of
+XTCP & FTP, suitable for burning into ROM.  It is, in effect,
+Xa big hack put together in two or three days.  It works for
+Xus, though, and you might like it, too.  Warning: the code
+Xwas intended for a 68000, and doesn't have any byte swapping
+Xsupport in it.  Shouldn't be too hard to add, though.
+X
+X    - Geof Cooper
+X      Imagen Corporation
+X      [imagen!geof@decwrl.dec.com]
+X      April 16, 1986
+X
+XThe package requires some system support:
+X
+X    clock_ValueRough() - should be a procedure that returns the current
+X        value of a millisecond clock.  The procedure is called frequently,
+X        so that interrupts are not needed to service the clock.  Our
+X        implementation polls the real time timer and assumes that it is
+X        called frequently enough so that it doesn't miss clock ticks (Since
+X        the timer is only used for network timeouts, it doesn't really matter
+X        if it does miss clock ticks, of course).  Systems without a clock
+X        could probably get by with a procedure that increments a static
+X        variable and returns it, by adjusting the timeout constants in the
+X        program.
+X
+X    Network driver - some network interface  driver is needed.  A driver for a
+X        3Com multibus (ethernet) board is included; this board isn't made anymore
+X        (at least not by 3Com), so you'll probably need to write a driver for the
+X        board in your system.
+X
+X
+XGuide to source files:
+X
+X    sed.c - Simple Ethernet Driver - Driver for 3Com multibus card.  If you
+X            have another type of Ethernet board, you can use this driver as
+X            a template.
+X
+X    sed.h - header file for the above.
+X
+X    arp.c - Implementation of Address Resolution Protocol.  Note that there
+X            is no arp "mapping" per se.  The higher level code (tcp, in this case)
+X            is required to keep track of internet and ethernet addresses.
+X
+X    tinytcp.c - Implementation of TCP.
+X
+X    tinytcp.h - Header file for above, and for everything else.
+X
+X    tinyftp.c - Implementation of FTP, only allows files to be retrieved, not sent.
+END-of-README
+echo file: arp.c
+sed 's/^X//' >arp.c << 'END-of-arp.c'
+X/* 
+X * SAR: Simple Address Resolution Protocol Implementation
+X * Written by Geoffrey Cooper, September 27, 1983
+X * 
+X * This package implements a very simple version of the Plummer Address
+X * Resolution Protocol (RFC 826).  It allows clients to resolve Internet
+X * addresses into Ethernet addresses, and knows how to respond to an
+X * address resolution request (when the transmit buffer is free).
+X * 
+X * Routines:
+X * 
+X *  sar_CheckPacket( pb ) => 1, if ARP packet and processed, 0 otherwise
+X *  sar_MapIn2Eth( ina, ethap ) => 1 if did it, 0 if couldn't.
+X *
+X * Copyright (C) 1983, 1986 IMAGEN Corporation
+X *  "This code may be duplicated in whole or in part provided that [1] there
+X *   is no commercial gain involved in the duplication, and [2] that this
+X *   copyright notice is preserved on all copies.  Any other duplication
+X *   requires written notice of the author."
+X * 
+X */
+X#include "tinytcp.h"
+X
+Xsar_CheckPacket(ap)
+X    register arp_Header *ap;
+X{
+X    register arp_Header *op;
+X
+X    if ( ap->hwType != arp_TypeEther || /* have ethernet hardware, */
+X         ap->protType != 0x800 ||       /* and internet software, */
+X         ap->opcode != ARP_REQUEST ||   /* and be a resolution req. */
+X         ap->dstIPAddr != sin_lclINAddr /* for my addr. */
+X       ) return ( 0 );                  /* .... or we ignore it. */
+X
+X    /* format response. */
+X    op = (arp_Header *)sed_FormatPacket(ap->srcEthAddr, 0x806);
+X    op->hwType = arp_TypeEther;
+X    op->protType = 0x800;
+X    op->hwProtAddrLen = (sizeof(eth_HwAddress) << 8) + sizeof(in_HwAddress);
+X    op->opcode = ARP_REPLY;
+X    op->srcIPAddr = sin_lclINAddr;
+X    MoveW(sed_lclEthAddr, op->srcEthAddr, sizeof(eth_HwAddress));
+X    ap->dstIPAddr = op->srcIPAddr;
+X    MoveW(ap->srcEthAddr, op->dstEthAddr, sizeof(eth_HwAddress));
+X
+X    sed_Send(sizeof(arp_Header));
+X    
+X    return ( 1 );
+X}
+X
+X/* 
+X * Do an address resolution bit.
+X */
+Xsar_MapIn2Eth(ina, ethap)
+X    longword ina;
+X    eth_HwAddress *ethap;
+X{
+X    register arp_Header *op;
+X    extern in_HwAddress sin_lclINAddr;
+X    register i;
+X    longword endTime;
+X    longword rxMitTime;
+X
+X    sed_Receive( 0 );
+X    endTime = clock_ValueRough() + 2000;
+X    while ( endTime > clock_ValueRough() ) {
+X        op = (arp_Header *)sed_FormatPacket(&sed_ethBcastAddr[0], 0x806);
+X        op->hwType = arp_TypeEther;
+X        op->protType = 0x800;
+X        op->hwProtAddrLen = (sizeof(eth_HwAddress) << 8) + sizeof(in_HwAddress);
+X        op->opcode = ARP_REQUEST;
+X        op->srcIPAddr = sin_lclINAddr;
+X        MoveW(sed_lclEthAddr, op->srcEthAddr, sizeof(eth_HwAddress));
+X        op->dstIPAddr = ina;
+X
+X        /* ...and send the packet */
+X        sed_Send( sizeof(arp_Header) );
+X
+X        rxMitTime = clock_ValueRough() + 250;
+X        while ( rxMitTime > clock_ValueRough() ) {
+X            op = (arp_Header *)sed_IsPacket();
+X            if ( op ) {
+X                if ( sed_CheckPacket(op, 0x806) == 1 &&
+X                    op->protType == 0x800 &&
+X                    op->srcIPAddr == ina &&
+X                    op->opcode == ARP_REPLY ) {
+X                    MoveW(op->srcEthAddr, ethap, sizeof(eth_HwAddress));
+X                    return ( 1 );
+X                }
+X                sed_Receive(op);
+X            }
+X        }
+X    }
+X    return ( 0 );
+X}
+END-of-arp.c
+echo file: sed.c
+sed 's/^X//' >sed.c << 'END-of-sed.c'
+X/* 
+X * Ethernet Driver.
+X * A Very Simple set of ethernet driver primitives.  The ethernet (3com Mbus)
+X * interface is controlled by busy-waiting, the application is handed the
+X * location of on-board packet buffers, and allowed to fill in the
+X * transmit buffer directly.  The interface is entirely blocking.
+X * 
+X * Written March, 1986 by Geoffrey Cooper
+X *
+X * Copyright (C) 1986, IMAGEN Corporation
+X *  "This code may be duplicated in whole or in part provided that [1] there
+X *   is no commercial gain involved in the duplication, and [2] that this
+X *   copyright notice is preserved on all copies.  Any other duplication
+X *   requires written notice of the author."
+X * 
+X * Primitives:
+X *  sed_Init()  -- Initialize the package
+X *  sed_FormatPacket( destEAddr ) => location of transmit buffer
+X *  sed_Send( pkLength ) -- send the packet that is in the transmit buffer
+X *  sed_Receive( recBufLocation ) -- enable receiving packets.
+X *  sed_IsPacket() => location of packet in receive buffer
+X *  sed_CheckPacket( recBufLocation, expectedType )
+X *
+X * Global Variables:
+X *  sed_lclEthAddr -- Ethernet address of this host.
+X *  sed_ethBcastAddr -- Ethernet broadcast address.
+X */
+X
+X#include "tinytcp.h"
+X#include "sed.h"
+X
+X#define en10pages        ((en10size) >> pageshift)
+X
+Xoctet *sed_va;                          /* virtual address of ethernet card */
+Xeth_HwAddress sed_lclEthAddr;           /* local ethernet address */
+Xeth_HwAddress sed_ethBcastAddr;         /* Ethernet broadcast address */
+XBOOL sed_respondARPreq;                 /* controls responses to ARP req's */
+Xchar bufAinUse, bufBinUse;              /* tell whether bufs are in use */
+X
+X/* 
+X *  Initialize the Ethernet Interface, and this package.  Enable input on
+X * both buffers.
+X */
+Xsed_Init()
+X{
+X    int recState;
+X    register i, j;
+X
+X    recState = 7;                       /* == mine + broad - errors */
+X
+X    /* Map the Ethernet Interface in, and initialize sed_va */
+X    sed_va = (octet *)SED3CVA;        /* our virtual addr */
+X
+X    /* Map memory for 3Com board (must be 8k boundary) */
+X    /* INSERT CODE HERE */
+X    map_ethernet_board();
+X
+X    /* Reset the Ethernet controller */
+X    MECSR(sed_va) = RESET;
+X    for (i=0; i<10; i++);           /* delay a bit... */
+X
+X    /* just copy on-board ROM to on-board RAM, to use std. address */
+X    Move(MEAROM(sed_va), sed_lclEthAddr, 6);
+X    Move(sed_lclEthAddr, MEARAM(sed_va), 6);
+X    
+X    MECSR(sed_va) |= AMSW;        /* and tell board we did it */
+X
+X    /*
+X     * and initialize the exported variable which gives the Eth broadcast
+X     * address, for everyone else to use. 
+X     */
+X    for (i=0; i<3; i++) sed_ethBcastAddr[i] = 0xFFFF;
+X    
+X    /* accept packets addressed for us and broadcast packets */
+X
+X    MECSR(sed_va) = (MECSR(sed_va)&~PA) | recState;
+X
+X    /* declare both buffers in use... */
+X    bufAinUse = bufBinUse = TRUE;
+X
+X}
+X
+X/* 
+X * Format an ethernet header in the transmit buffer, and say where it is.
+X * Note that because of the way the 3Com interface works, we need to know
+X * how long the packet is before we know where to put it.  The solution is
+X * that we format the packet at the BEGINNING of the transmit buffer, and
+X * later copy it (carefully) to where it belongs.  Another hack would be
+X * to be inefficient about the size of the packet to be sent (always send
+X * a larger ethernet packet than you need to, but copying should be ok for
+X * now.
+X */
+Xoctet *
+Xsed_FormatPacket( destEAddr, ethType )
+X        register octet *destEAddr;
+X{
+X    register octet *xMitBuf;
+X    
+X    xMitBuf = &((octet *)MEXBUF(sed_va))[-0x800];
+X    Move( destEAddr, xMitBuf, 6 );
+X    Move( sed_lclEthAddr, xMitBuf + 6, 6 );
+X    *((short *)(xMitBuf+12)) = ethType;
+X    return ( xMitBuf+14 );
+X}
+X
+X/*
+X *  Send a packet out over the ethernet.  The packet is sitting at the
+X * beginning of the transmit buffer.  The routine returns when the
+X * packet has been successfully sent.
+X */
+Xsed_Send( pkLengthInOctets )
+X    register int pkLengthInOctets;
+X{
+X    register octet *fromO, *toO;
+X    register pkLength;
+X    register csr;
+X
+X    pkLengthInOctets += 14;             /* account for Ethernet header */
+X    pkLengthInOctets = (pkLengthInOctets + 1) & (~1);
+X
+X    if (pkLengthInOctets < E10P_MIN) 
+X        pkLengthInOctets = E10P_MIN; /* and min. ethernet len */
+X
+X    /*  and copy the packet where it belongs */
+X    pkLength = pkLengthInOctets;
+X    fromO = &((octet *)MEXBUF(sed_va))[-0x800] + pkLength;
+X    toO = ((octet *)MEXBUF(sed_va));
+X
+X    while ( pkLength-- ) *--toO = *--fromO;
+X    
+X    /* send the packet */
+X    
+X    MEXHDR(sed_va) = 2048 - pkLengthInOctets;
+X    MECSR(sed_va) |= TBSW;
+X
+X    /* and wait until it has really been sent. */
+X
+X    for (pkLength=0; pkLength < 15; pkLength++) {
+X        while ( (! ((csr = MECSR(sed_va)) & JAM)) && (csr & TBSW) )
+X            ;
+X        if (csr & JAM ) {
+X            /* Ethernet Collision detected... */
+X#ifdef DEBUG
+X            printf("sed: JAM: MECSR=%x\n", csr);
+X#endif
+X            MEBACK(sed_va) = clock_ValueRough();
+X            MECSR(sed_va) |= JAM;
+X        } else break;
+X    }
+X    if ( pkLength == 15 ) SysBug("Go and Buy a New Ethernet Interface.");
+X
+X    /*  else we sent the packet ok. */
+X}
+X
+X/* 
+X *  Enable the Ethernet interface to receive packets from the network.  If
+X * the argument is zero, enable both buffers.  If the argument is nonzero,
+X * take it as the address of the buffer to be enabled.
+X */
+Xsed_Receive( recBufLocation )
+X    octet *recBufLocation;
+X{
+X    word enables = 0;
+X
+X    if (recBufLocation == 0) {
+X        bufAinUse = FALSE;
+X        bufBinUse = FALSE;
+X        enables = (ABSW | BBSW);
+X    }
+X    recBufLocation -= 16;
+X    if (recBufLocation == ((octet *)MEAHDR(sed_va))) {
+X        bufAinUse = FALSE;
+X        enables = ABSW;
+X        }
+X    if (recBufLocation == ((octet *)MEBHDR(sed_va))) {
+X        bufBinUse = FALSE;
+X        enables = BBSW;
+X    }
+X
+X    MECSR (sed_va) |= enables;
+X}
+X
+X/* 
+X * Test for the arrival of a packet on the Ethernet interface.  The packet may
+X * arrive in either buffer A or buffer B; the location of the packet is
+X * returned.  If no packet is returned withing 'timeout' milliseconds,
+X * then the routine returns zero.
+X * 
+X * Note: ignores ethernet errors.  may occasionally return something
+X * which was received in error.
+X */
+X
+Xoctet *
+Xsed_IsPacket()
+X{
+X    register oldStatus;
+X    register octet *pb;
+X    
+X    pb = 0;
+X    if ( ! bufAinUse && (MECSR(sed_va)&ABSW) == 0 ) 
+X        pb = (octet *)MEAHDR(sed_va);
+X    if ( ! pb && ! bufBinUse && (MECSR(sed_va)&BBSW) == 0 )
+X        pb = (octet *)MEBHDR(sed_va);
+X
+X    if ( pb ) {
+X        if ( ((octet *)pb) == ((octet *)MEAHDR(sed_va)) ) bufAinUse = 1;
+X        else bufBinUse = 1;
+X        pb += 16;                       /* get past the ethernet header */
+X    }
+X
+X    return ( pb );
+X}
+X
+X/* 
+X *  Check to make sure that the packet that you received was the one that
+X * you expected to get.
+X */
+Xsed_CheckPacket( recBufLocation, expectedType )
+X    word *recBufLocation;
+X    word expectedType;
+X{
+X    register recHeader = recBufLocation[-8];
+X    if ( (recHeader&R_ERROR) != 0 ||
+X         (recHeader&R_OFFSET) < E10P_MIN ) {
+X         return ( -1 );
+X    }
+X    if ( recBufLocation[-1] != expectedType ) {
+X        return ( 0 );
+X    }
+X    return (1);
+X}
+END-of-sed.c
+echo file: sed.h
+sed 's/^X//' >sed.h << 'END-of-sed.h'
+X/* 
+X *  Header file for very simple ethernet driver, based on 3Com Multibus
+X *  board.
+X *
+X * Copyright (C) 1986, IMAGEN Corporation
+X *  "This code may be duplicated in whole or in part provided that [1] there
+X *   is no commercial gain involved in the duplication, and [2] that this
+X *   copyright notice is preserved on all copies.  Any other duplication
+X *   requires written notice of the author."
+X */
+X
+X#define	en10size        (8*1024)	/* size of interface memory */
+X#define	en10pages	((en10size) >> pageshift)
+X#define E10P_MIN	60              /* Minimum Ethernet packet size */
+X
+X/* 
+X * The position of the 3Com interface in virtual memory.  If we're
+X * Running the bootloader function, then it must be in the last 8k
+X * of virtual addresses.
+X */
+X#ifdef BOOTLOADER
+X#define SED3CVA vm_3ComAdr /* hack, only need pb68.h if bootloader */
+X#endif
+X#ifndef SED3CVA
+X#define SED3CVA 0x1c000
+X#endif
+X
+X/* 10Mb Ethernet interface addresses */
+X
+X#define	MECSR(eth_va)	*(word*)(((octet *) eth_va) + 0x0)
+X#define	MEBACK(eth_va)	*(word*)(((octet *) eth_va) + 0x2)
+X#define	MEAROM(eth_va)	(word*)(((octet *) eth_va) + 0x400)
+X#define	MEARAM(eth_va)	(word*)(((octet *) eth_va) + 0x600)
+X#define	MEXHDR(eth_va)	*(word*)(((octet *) eth_va) + 0x800)
+X#define	MEXBUF(eth_va)	(word*)(((octet *) eth_va) + 0x1000)
+X#define	MEAHDR(eth_va)	(word*)(((octet *) eth_va) + 0x1000)
+X#define	MEBHDR(eth_va)	(word*)(((octet *) eth_va) + 0x1800)
+X
+X/* control/status register fields */
+X
+X#define	BBSW		0x8000	/* Buffer B belongs to Network */
+X#define	ABSW		0x4000	/* Buffer A belongs to Network */
+X#define	TBSW		0x2000	/* Transmit buffer belongs to Network */
+X#define	JAM		0x1000	/* Set when transmit collision */
+X#define	AMSW		0x0800	/* 
+X#define	RBBA		0x0400	/* Oldest received packet is in B */
+X/*#define	UNUSED		0x0200 */
+X#define	RESET		0x0100	/* Reset the controller */
+X#define	BINT		0x0080	/* Interrupt when BBSW=>0 (packet in B) */
+X#define	AINT		0x0040	/* Interrupt when ABSW=>0 (packet in A) */
+X#define	TINT		0x0020	/* Interrupt when TBSW=>0 (transmit done) */
+X#define	JINT		0x0010	/* Enable interrupts when JAM=>1 */
+X#define	PA		0x000F	/* Which packets should be received? */
+X#define INTENABLS	0x00F0
+X
+X/*
+X * Receiver Header Fields: 
+X * The receiver header is the first (short) word of the receive buffer.  It
+X * includes such information as how big the packet is, whether it was a
+X * broadcast, whether there was an error in receiving it, etc.
+X */
+X
+X#define	R_FCS		0x8000	/* fcs error */
+X#define	R_BCAST		0x4000	/* packet was NOT a broadcast */
+X#define	R_RANGE		0x2000	/* range error (size of pkt?) */
+X#define	R_MATCH		0x1000	/* packet is multicast (i.e., address
+X				   received is not that of the interface) */
+X#define	R_FRAME		0x0800	/* framing error */
+X#define	R_ERROR		0x8800	/* was there any error */
+X#define	R_OFFSET	0x07FF	/* packet length + 1 word */
+X
+Xextern octet *sed_FormatPacket(), *sed_WaitPacket();
+X
+X#ifdef BOOTLOADER
+X#define ConsPrintf printf
+X#endif
+END-of-sed.h
+echo file: tinyftp.c
+sed 's/^X//' >tinyftp.c << 'END-of-tinyftp.c'
+X/*
+X * tinyftp.c - user ftp built on tinytcp.c
+X *
+X * Written March 31, 1986 by Geoffrey Cooper
+X *
+X * Copyright (C) 1986, IMAGEN Corporation
+X *  "This code may be duplicated in whole or in part provided that [1] there
+X *   is no commercial gain involved in the duplication, and [2] that this
+X *   copyright notice is preserved on all copies.  Any other duplication
+X *   requires written notice of the author."
+X */
+X#include "tinytcp.h"
+X
+Xtcp_Socket ftp_ctl, ftp_data, ftp_data2;
+Xbyte ftp_cmdbuf[120];
+Xint ftp_cmdbufi;
+X
+Xbyte ftp_outbuf[80];
+Xint ftp_outbufix, ftp_outbuflen;
+X    
+Xshort ftp_rcvState;
+X#define ftp_StateGETCMD     0       /* get a command from the user */
+X#define ftp_StateIDLE       1       /* idle connection */
+X#define ftp_StateINCOMMAND  2       /* command sent, awaiting response */
+X#define ftp_StateRCVRESP    3       /* received response, need more data */
+X
+Xchar *ftp_script[7];
+Xint ftp_scriptline;
+Xchar ftp_retrfile[80];
+XBOOL ftp_echoMode;
+X
+Xftp_ctlHandler(s, dp, len)
+X    tcp_Socket *s;
+X    byte *dp;
+X    int len;
+X{
+X    byte c, *bp, data[80];
+X    int i;
+X
+X    if ( dp == 0 ) {
+X        tcp_Abort(&ftp_data);
+X        return;
+X    }
+X
+X    do {
+X        i = len;
+X        if ( i > sizeof data ) i = sizeof data;
+X        MoveW(dp, data, i);
+X        len -= i;
+X        bp = data;
+X        while ( i-- > 0 ) {
+X            c = *bp++;
+X            if ( c != '\r' ) {
+X                if ( c == '\n' ) {
+X                    ftp_cmdbuf[ftp_cmdbufi] = 0;
+X                    ftp_commandLine();
+X                    ftp_cmdbufi = 0;
+X                } else if ( ftp_cmdbufi < (sizeof ftp_cmdbuf)-1 ) {
+X                    ftp_cmdbuf[ftp_cmdbufi++] = c;
+X                }
+X            }
+X        }
+X    } while ( len > 0 );
+X}
+X
+Xftp_commandLine()
+X{
+X    printf("> %s\n", ftp_cmdbuf);
+X    switch(ftp_rcvState) {
+X     case ftp_StateIDLE:
+X        if ( ftp_cmdbuf[3] == '-' )
+X            ftp_rcvState = ftp_StateRCVRESP;
+X        break;
+X
+X     case ftp_StateINCOMMAND:
+X        if ( ftp_cmdbuf[3] == '-' )
+X            ftp_rcvState = ftp_StateRCVRESP;
+X     case ftp_StateRCVRESP:
+X        if ( ftp_cmdbuf[3] == ' ' )
+X            ftp_rcvState = ftp_StateIDLE;
+X        break;
+X    }
+X}
+X
+Xftp_Abort()
+X{
+X    tcp_Abort(&ftp_ctl);
+X    tcp_Abort(&ftp_data);
+X}
+X
+X
+Xftp_application()
+X{
+X    char *s;
+X    char *dp;
+X    int i;
+X
+X    i = -1;
+X    if ( isina() ) {
+X        i = busyina() & 0177;
+X#ifdef DEBUG
+X        if ( i == ('D' & 037) ) SysBug("Pause to DDT");
+X#endif
+X        if ( i == ('C' & 037) ) {
+X            printf("Closing...\n");
+X            tcp_Close(&ftp_ctl);
+X        }
+X    }
+X
+X    switch (ftp_rcvState) {
+X      case ftp_StateGETCMD:
+X getcmd:if ( i != -1 ) {
+X            ftp_outbuf[ftp_outbuflen] = 0;
+X            switch (i) {
+X                case 'H' & 037:
+X                case 0177:
+X                    if ( ftp_outbuflen > 0 ) {
+X                        ftp_outbuflen--;
+X                        printf("\010 \010");
+X                    }
+X                    break;
+X
+X                case 'R' & 037:
+X                    if ( ftp_echoMode )
+X                        printf("\nFtpCmd> %s", ftp_outbuf);
+X                    break;
+X
+X                case 033:
+X                    ftp_echoMode = ! ftp_echoMode;
+X                    break;
+X
+X                case '\r':
+X                case '\n':
+X                    busyouta('\n');
+X                    dp = &ftp_outbuf[ftp_outbuflen];
+X                    goto docmd;
+X
+X                default:
+X                    if ( i >= ' ' && ftp_outbuflen < sizeof ftp_outbuf ) {
+X                        ftp_outbuf[ftp_outbuflen++] = i;
+X                        if ( ftp_echoMode ) busyouta(i);
+X                    }
+X            }
+X        }
+X        break;
+X
+X      case ftp_StateIDLE:
+X        if ( ftp_scriptline < 0 ) {
+X            ftp_rcvState = ftp_StateGETCMD;
+X            ftp_echoMode = true;
+X            ftp_outbuflen = 0;
+X            printf("FtpCmd> ");
+X            goto getcmd;
+X        }
+X        s = ftp_script[ftp_scriptline];
+X        if ( s == NIL )
+X            break;
+X        ftp_scriptline++;
+X        printf("%s\n", s);
+X        dp = ftp_outbuf;
+X        while ( *dp++ = *s++ ) ;
+X        dp--;
+X docmd: *dp++ = '\r';
+X        *dp++ = '\n';
+X        ftp_outbuflen = dp - ftp_outbuf;
+X        ftp_outbufix = 0;
+X        ftp_rcvState = ftp_StateINCOMMAND;
+X        /* fall through */
+X    case ftp_StateINCOMMAND:
+X        i = ftp_outbuflen - ftp_outbufix;
+X        if ( i > 0 ) {
+X            i = tcp_Write(&ftp_ctl, &ftp_outbuf[ftp_outbufix], i);
+X            ftp_outbufix += i;
+X            tcp_Flush(&ftp_ctl);
+X        }
+X        /* fall through */
+X    case ftp_StateRCVRESP:
+X        break;
+X    }
+X
+X}
+X
+Xftp(host, fn, dataHandler)
+X    in_HwAddress host;
+X    char *fn;
+X    procref dataHandler;
+X{
+X    word port;
+X    char filecmd[80];
+X
+X    port = (sed_lclEthAddr[2] + clock_ValueRough()) | 0x8000;
+X
+X    if ( fn ) {
+X        /* set up the script for this session */
+X        ftp_script[0] = "user foo";
+X        ftp_script[1] = "pass foo";
+X        ftp_script[2] = "type i";
+X        sprintf(filecmd, "retr %s", fn);
+X        ftp_script[3] = filecmd;
+X        ftp_script[4] = "quit";
+X        ftp_script[5] = 0;
+X        ftp_scriptline = 0;
+X    } else {
+X        ftp_scriptline = -1;        /* interactive mode */
+X        ftp_echoMode = true;
+X    }
+X
+X    /* set up state variables */
+X    ftp_rcvState = ftp_StateRCVRESP;
+X    ftp_cmdbufi = 0;
+X    tcp_Listen(&ftp_data, port, dataHandler, 0);
+X    tcp_Open(&ftp_ctl, port, host, 21, ftp_ctlHandler);
+X    tcp(ftp_application);
+X}
+END-of-tinyftp.c
+echo file: tinytcp.c
+sed 's/^X//' >tinytcp.c << 'END-of-tinytcp.c'
+X/*
+X * tinytcp.c - Tiny Implementation of the Transmission Control Protocol
+X *
+X * Written March 28, 1986 by Geoffrey Cooper, IMAGEN Corporation.
+X *
+X * This code is a small implementation of the TCP and IP protocols, suitable
+X * for burning into ROM.  The implementation is bare-bones and represents
+X * two days' coding efforts.  A timer and an ethernet board are assumed.  The
+X * implementation is based on busy-waiting, but the tcp_handler procedure
+X * could easily be integrated into an interrupt driven scheme.
+X *
+X * IP routing is accomplished on active opens by broadcasting the tcp SYN
+X * packet when ARP mapping fails.  If anyone answers, the ethernet address
+X * used is saved for future use.  This also allows IP routing on incoming
+X * connections.
+X * 
+X * The TCP does not implement urgent pointers (easy to add), and discards
+X * segments that are received out of order.  It ignores the received window
+X * and always offers a fixed window size on input (i.e., it is not flow
+X * controlled).
+X *
+X * Special care is taken to access the ethernet buffers only in word
+X * mode.  This is to support boards that only allow word accesses.
+X *
+X * Copyright (C) 1986, IMAGEN Corporation
+X *  "This code may be duplicated in whole or in part provided that [1] there
+X *   is no commercial gain involved in the duplication, and [2] that this
+X *   copyright notice is preserved on all copies.  Any other duplication
+X *   requires written notice of the author."
+X */
+X
+X#include "tinytcp.h"
+X
+X/*
+X * Local IP address
+X */
+Xin_HwAddress sin_lclINAddr;
+X
+X/*
+X * IP identification numbers
+X */
+Xint tcp_id;
+X
+Xtcp_Socket *tcp_allsocs;
+X
+X/* Timer definitions */
+X#define tcp_RETRANSMITTIME 1000     /* interval at which retransmitter is called */
+X#define tcp_LONGTIMEOUT 31000       /* timeout for opens */
+X#define tcp_TIMEOUT 10000           /* timeout during a connection */
+X
+X#ifdef DEBUG
+X/* 
+X * Primitive logging facility
+X */
+X#define tcp_LOGPACKETS 1        /* log packet headers */
+Xword tcp_logState;
+X#endif
+X
+X/*
+X * Initialize the tcp implementation
+X */
+Xtcp_Init()
+X{
+X    extern eth_HwAddress sed_lclEthAddr;
+X
+X    /* initialize ethernet interface */
+X    sed_Init();
+X
+X    tcp_allsocs = NIL;
+X#ifdef DEBUG
+X    tcp_logState = 0;
+X#endif
+X    tcp_id = 0;
+X
+X    /* hack - assume the network number */
+X    sin_lclINAddr = 0x7d000000 + (*((longword *)&sed_lclEthAddr[1]) & 0xFFFFFF);
+X}
+X
+X/*
+X * Actively open a TCP connection to a particular destination.
+X */
+Xtcp_Open(s, lport, ina, port, datahandler)
+X    tcp_Socket *s;
+X    in_HwAddress ina;
+X    word lport, port;
+X    procref datahandler;
+X{
+X    extern eth_HwAddress sed_ethBcastAddr;
+X
+X    s->state = tcp_StateSYNSENT;
+X    s->timeout = tcp_LONGTIMEOUT;
+X    if ( lport == 0 ) lport = clock_ValueRough();
+X    s->myport = lport;
+X    if ( ! sar_MapIn2Eth(ina, &s->hisethaddr[0]) ) {
+X        printf("tcp_Open of 0x%x: defaulting ethernet address to broadcast\n", ina);
+X        Move(&sed_ethBcastAddr[0], &s->hisethaddr[0], sizeof(eth_HwAddress));
+X    }
+X    s->hisaddr = ina;
+X    s->hisport = port;
+X    s->seqnum = 0;
+X    s->dataSize = 0;
+X    s->flags = tcp_FlagSYN;
+X    s->unhappy = true;
+X    s->dataHandler = datahandler;
+X    s->next = tcp_allsocs;
+X    tcp_allsocs = s;
+X    tcp_Send(s);
+X}
+X
+X/*
+X * Passive open: listen for a connection on a particular port
+X */
+Xtcp_Listen(s, port, datahandler, timeout)
+X    tcp_Socket *s;
+X    word port;
+X    procref datahandler;
+X{
+X    s->state = tcp_StateLISTEN;
+X    if ( timeout == 0 ) s->timeout = 0x7ffffff; /* forever... */
+X    else s->timeout = timeout;
+X    s->myport = port;
+X    s->hisport = 0;
+X    s->seqnum = 0;
+X    s->dataSize = 0;
+X    s->flags = 0;
+X    s->unhappy = 0;
+X    s->dataHandler = datahandler;
+X    s->next = tcp_allsocs;
+X    tcp_allsocs = s;
+X}
+X
+X/*
+X * Send a FIN on a particular port -- only works if it is open
+X */
+Xtcp_Close(s)
+X    tcp_Socket *s;
+X{
+X    if ( s->state == tcp_StateESTAB || s->state == tcp_StateSYNREC ) {
+X        s->flags = tcp_FlagACK | tcp_FlagFIN;
+X        s->state = tcp_StateFINWT1;
+X        s->unhappy = true;
+X    }
+X}
+X
+X/*
+X * Abort a tcp connection
+X */
+Xtcp_Abort(s)
+X    tcp_Socket *s;
+X{
+X    if ( s->state != tcp_StateLISTEN && s->state != tcp_StateCLOSED ) {
+X        s->flags = tcp_FlagRST | tcp_FlagACK;
+X        tcp_Send(s);
+X    }
+X    s->unhappy = 0;
+X    s->dataSize = 0;
+X    s->state = tcp_StateCLOSED;
+X    s->dataHandler(s, 0, -1);
+X    tcp_Unthread(s);
+X}
+X
+X/*
+X * Retransmitter - called periodically to perform tcp retransmissions
+X */
+Xtcp_Retransmitter()
+X{
+X    tcp_Socket *s;
+X    BOOL x;
+X
+X    for ( s = tcp_allsocs; s; s = s->next ) {
+X        x = false;
+X        if ( s->dataSize > 0 || s->unhappy ) {
+X            tcp_Send(s);
+X            x = true;
+X        }
+X        if ( x || s->state != tcp_StateESTAB )
+X            s->timeout -= tcp_RETRANSMITTIME;
+X        if ( s->timeout <= 0 ) {
+X            if ( s->state == tcp_StateTIMEWT ) {
+X                printf("Closed.    \n");
+X                s->state = tcp_StateCLOSED;
+X                s->dataHandler(s, 0, 0);
+X                tcp_Unthread(s);
+X            } else {
+X                printf("Timeout, aborting\n");
+X                tcp_Abort(s);
+X            }
+X        }
+X    }
+X}
+X
+X/*
+X * Unthread a socket from the socket list, if it's there 
+X */
+Xtcp_Unthread(ds)
+X    tcp_Socket *ds;
+X{
+X    tcp_Socket *s, **sp;
+X
+X    sp = &tcp_allsocs;
+X    for (;;) {
+X        s = *sp;
+X        if ( s == ds ) {
+X            *sp = s->next;
+X            break;
+X        }
+X        if ( s == NIL ) break;
+X        sp = &s->next;
+X    }
+X}
+X
+X/*
+X * busy-wait loop for tcp.  Also calls an "application proc"
+X */
+Xtcp(application)
+X    procref application;
+X{
+X    in_Header *ip;
+X    longword timeout, start;
+X    int x;
+X
+X    sed_Receive(0);
+X
+X    timeout = 0;
+X    while ( tcp_allsocs ) {
+X        start = clock_ValueRough();
+X        ip = sed_IsPacket();
+X        if ( ip == NIL ) {
+X            if ( clock_ValueRough() > timeout ) {
+X                tcp_Retransmitter();
+X                timeout = clock_ValueRough() + tcp_RETRANSMITTIME;
+X            }
+X
+X            application();
+X
+X            continue;
+X        }
+X
+X        if ( sed_CheckPacket(ip, 0x806) == 1 ) {
+X            /* do arp */
+X            sar_CheckPacket(ip);
+X
+X        } else if ( sed_CheckPacket(ip, 0x800) == 1 ) {
+X            /* do IP */
+X            if ( ip->destination == sin_lclINAddr &&
+X                 in_GetProtocol(ip) == 6 &&
+X                 checksum(ip, in_GetHdrlenBytes(ip)) == 0xFFFF ) {
+X                tcp_Handler(ip);
+X            }
+X        }
+X        /* recycle buffer */
+X        sed_Receive(ip);
+X
+X        x = clock_ValueRough() - start;
+X        timeout -= x;
+X    }
+X
+X    return ( 1 );
+X}
+X
+X/*
+X * Write data to a connection.
+X * Returns number of bytes written, == 0 when connection is not in
+X * established state.
+X */
+Xtcp_Write(s, dp, len)
+X    tcp_Socket *s;
+X    byte *dp;
+X    int len;
+X{
+X    int x;
+X
+X    if ( s->state != tcp_StateESTAB ) len = 0;
+X    if ( len > (x = tcp_MaxData - s->dataSize) ) len = x;
+X    if ( len > 0 ) {
+X        Move(dp, &s->data[s->dataSize], len);
+X        s->dataSize += len;
+X        tcp_Flush(s);
+X    }
+X
+X    return ( len );
+X}
+X
+X/*
+X * Send pending data
+X */
+Xtcp_Flush(s)
+X    tcp_Socket *s;
+X{
+X    if ( s->dataSize > 0 ) {
+X        s->flags |= tcp_FlagPUSH;
+X        tcp_Send(s);
+X    }
+X}
+X
+X/*
+X * Handler for incoming packets.
+X */
+Xtcp_Handler(ip)
+X    in_Header *ip;
+X{
+X    tcp_Header *tp;
+X    tcp_PseudoHeader ph;
+X    int len;
+X    byte *dp;
+X    int x, diff;
+X    tcp_Socket *s;
+X    word flags;
+X
+X    len = in_GetHdrlenBytes(ip);
+X    tp = (tcp_Header *)((byte *)ip + len);
+X    len = ip->length - len;
+X
+X    /* demux to active sockets */
+X    for ( s = tcp_allsocs; s; s = s->next )
+X        if ( s->hisport != 0 &&
+X             tp->dstPort == s->myport &&
+X             tp->srcPort == s->hisport &&
+X             ip->source == s->hisaddr ) break;
+X    if ( s == NIL ) {
+X        /* demux to passive sockets */
+X        for ( s = tcp_allsocs; s; s = s->next )
+X            if ( s->hisport == 0 && tp->dstPort == s->myport ) break;
+X    }
+X    if ( s == NIL ) {
+X#ifdef DEBUG
+X        if ( tcp_logState & tcp_LOGPACKETS ) tcp_DumpHeader(ip, tp, "Discarding");
+X#endif
+X        return;
+X    }
+X
+X#ifdef DEBUG
+X    if ( tcp_logState & tcp_LOGPACKETS )
+X        tcp_DumpHeader(ip, tp, "Received");
+X#endif
+X
+X    /* save his ethernet address */
+X    MoveW(&((((eth_Header *)ip) - 1)->source[0]), &s->hisethaddr[0], sizeof(eth_HwAddress));
+X
+X    ph.src = ip->source;
+X    ph.dst = ip->destination;
+X    ph.mbz = 0;
+X    ph.protocol = 6;
+X    ph.length = len;
+X    ph.checksum = checksum(tp, len);
+X    if ( checksum(&ph, sizeof ph) != 0xffff )
+X         printf("bad tcp checksum, received anyway\n");
+X
+X    flags = tp->flags;
+X    if ( flags & tcp_FlagRST ) {
+X        printf("connection reset\n");
+X        s->state = tcp_StateCLOSED;
+X        s->dataHandler(s, 0, -1);
+X        tcp_Unthread(s);
+X        return;
+X    }
+X
+X    switch ( s->state ) {
+X
+X    case tcp_StateLISTEN:
+X        if ( flags & tcp_FlagSYN ) {
+X            s->acknum = tp->seqnum + 1;
+X            s->hisport = tp->srcPort;
+X            s->hisaddr = ip->source;
+X            s->flags = tcp_FlagSYN | tcp_FlagACK;
+X            tcp_Send(s);
+X            s->state = tcp_StateSYNREC;
+X            s->unhappy = true;
+X            s->timeout = tcp_TIMEOUT;
+X            printf("Syn from 0x%x#%d (seq 0x%x)\n", s->hisaddr, s->hisport, tp->seqnum);
+X        }
+X        break;
+X
+X    case tcp_StateSYNSENT:
+X        if ( flags & tcp_FlagSYN ) {
+X            s->acknum++;
+X            s->flags = tcp_FlagACK;
+X            s->timeout = tcp_TIMEOUT;
+X            if ( (flags & tcp_FlagACK) && tp->acknum == (s->seqnum + 1) ) {
+X                printf("Open\n");
+X                s->state = tcp_StateESTAB;
+X                s->seqnum++;
+X                s->acknum = tp->seqnum + 1;
+X                s->unhappy = false;
+X            } else {
+X                s->state = tcp_StateSYNREC;
+X            }
+X        }
+X        break;
+X
+X    case tcp_StateSYNREC:
+X        if ( flags & tcp_FlagSYN ) {
+X            s->flags = tcp_FlagSYN | tcp_FlagACK;
+X            tcp_Send(s);
+X            s->timeout = tcp_TIMEOUT;
+X            printf(" retransmit of original syn\n");
+X        }
+X        if ( (flags & tcp_FlagACK) && tp->acknum == (s->seqnum + 1) ) {
+X            s->flags = tcp_FlagACK;
+X            tcp_Send(s);
+X            s->seqnum++;
+X            s->unhappy = false;
+X            s->state = tcp_StateESTAB;
+X            s->timeout = tcp_TIMEOUT;
+X            printf("Synack received - connection established\n");
+X        }
+X        break;
+X
+X    case tcp_StateESTAB:
+X        if ( (flags & tcp_FlagACK) == 0 ) return;
+X        /* process ack value in packet */
+X        diff = tp->acknum - s->seqnum;
+X        if ( diff > 0 ) {
+X            Move(&s->data[diff], &s->data[0], diff);
+X            s->dataSize -= diff;
+X            s->seqnum += diff;
+X        }
+X        s->flags = tcp_FlagACK;
+X        tcp_ProcessData(s, tp, len);
+X        break;
+X
+X    case tcp_StateFINWT1:
+X        if ( (flags & tcp_FlagACK) == 0 ) return;
+X        diff = tp->acknum - s->seqnum - 1;
+X        s->flags = tcp_FlagACK | tcp_FlagFIN;
+X        if ( diff == 0 ) {
+X            s->state = tcp_StateFINWT2;
+X            s->flags = tcp_FlagACK;
+X            printf("finack received.\n");
+X        }
+X        tcp_ProcessData(s, tp, len);
+X        break;
+X
+X    case tcp_StateFINWT2:
+X        s->flags = tcp_FlagACK;
+X        tcp_ProcessData(s, tp, len);
+X        break;
+X
+X    case tcp_StateCLOSING:
+X        if ( tp->acknum == (s->seqnum + 1) ) {
+X            s->state = tcp_StateTIMEWT;
+X            s->timeout = tcp_TIMEOUT;
+X        }
+X        break;
+X
+X    case tcp_StateLASTACK:
+X        if ( tp->acknum == (s->seqnum + 1) ) {
+X            s->state = tcp_StateCLOSED;
+X            s->unhappy = false;
+X            s->dataSize = 0;
+X            s->dataHandler(s, 0, 0);
+X            tcp_Unthread(s);
+X            printf("Closed.    \n");
+X        } else {
+X            s->flags = tcp_FlagACK | tcp_FlagFIN;
+X            tcp_Send(s);
+X            s->timeout = tcp_TIMEOUT;
+X            printf("retransmitting FIN\n");
+X        }
+X        break;
+X
+X    case tcp_StateTIMEWT:
+X        s->flags = tcp_FlagACK;
+X        tcp_Send(s);
+X    }
+X}
+X
+X/*
+X * Process the data in an incoming packet.
+X * Called from all states where incoming data can be received: established,
+X * fin-wait-1, fin-wait-2
+X */
+Xtcp_ProcessData(s, tp, len)
+X    tcp_Socket *s;
+X    tcp_Header *tp;
+X    int len;
+X{
+X    int diff, x;
+X    word flags;
+X    byte *dp;
+X
+X    flags = tp->flags;
+X    diff = s->acknum - tp->seqnum;
+X    if ( flags & tcp_FlagSYN ) diff--;
+X    x = tcp_GetDataOffset(tp) << 2;
+X    dp = (byte *)tp + x;
+X    len -= x;
+X    if ( diff >= 0 ) {
+X        dp += diff;
+X        len -= diff;
+X        s->acknum += len;
+X        s->dataHandler(s, dp, len);
+X        if ( flags & tcp_FlagFIN ) {
+X            s->acknum++;
+X#ifdef DEBUG
+X            printf("consumed fin.\n");
+X#endif
+X            switch(s->state) {
+X              case tcp_StateESTAB:
+X                /* note: skip state CLOSEWT by automatically closing conn */
+X                x = tcp_StateLASTACK;
+X                s->flags |= tcp_FlagFIN;
+X                s->unhappy = true;
+X#ifdef DEBUG
+X                printf("sending fin.\n");
+X#endif
+X                break;
+X              case tcp_StateFINWT1:
+X                x = tcp_StateCLOSING;
+X                break;
+X              case tcp_StateFINWT2:
+X                x = tcp_StateTIMEWT;
+X                break;
+X            }
+X            s->state = x;
+X        }
+X    }
+X    s->timeout = tcp_TIMEOUT;
+X    tcp_Send(s);
+X}
+X
+X/*
+X * Format and send an outgoing segment
+X */
+Xtcp_Send(s)
+X    tcp_Socket *s;
+X{
+X    tcp_PseudoHeader ph;
+X    struct _pkt {
+X        in_Header in;
+X        tcp_Header tcp;
+X        longword maxsegopt;
+X    } *pkt;
+X    byte *dp;
+X
+X    pkt = (struct _pkt *)sed_FormatPacket(&s->hisethaddr[0], 0x800);
+X    dp = &pkt->maxsegopt;
+X
+X    pkt->in.length = sizeof(in_Header) + sizeof(tcp_Header) + s->dataSize;
+X
+X    /* tcp header */
+X    pkt->tcp.srcPort = s->myport;
+X    pkt->tcp.dstPort = s->hisport;
+X    pkt->tcp.seqnum = s->seqnum;
+X    pkt->tcp.acknum = s->acknum;
+X    pkt->tcp.window = 1024;
+X    pkt->tcp.flags = s->flags | 0x5000;
+X    pkt->tcp.checksum = 0;
+X    pkt->tcp.urgentPointer = 0;
+X    if ( s->flags & tcp_FlagSYN ) {
+X        pkt->tcp.flags += 0x1000;
+X        pkt->in.length += 4;
+X        pkt->maxsegopt = 0x02040578; /* 1400 bytes */
+X        dp += 4;
+X    }
+X    MoveW(s->data, dp, s->dataSize);
+X
+X    /* internet header */
+X    pkt->in.vht = 0x4500;   /* version 4, hdrlen 5, tos 0 */
+X    pkt->in.identification = tcp_id++;
+X    pkt->in.frag = 0;
+X    pkt->in.ttlProtocol = (250<<8) + 6;
+X    pkt->in.checksum = 0;
+X    pkt->in.source = sin_lclINAddr;
+X    pkt->in.destination = s->hisaddr;
+X    pkt->in.checksum = ~checksum(&pkt->in, sizeof(in_Header));
+X
+X    /* compute tcp checksum */
+X    ph.src = pkt->in.source;
+X    ph.dst = pkt->in.destination;
+X    ph.mbz = 0;
+X    ph.protocol = 6;
+X    ph.length = pkt->in.length - sizeof(in_Header);
+X    ph.checksum = checksum(&pkt->tcp, ph.length);
+X    pkt->tcp.checksum = ~checksum(&ph, sizeof ph);
+X
+X#ifdef DEBUG
+X    if ( tcp_logState & tcp_LOGPACKETS )
+X        tcp_DumpHeader(&pkt->in, &pkt->tcp, "Sending");
+X#endif
+X
+X    sed_Send(pkt->in.length);
+X}
+X
+X/*
+X * Do a one's complement checksum
+X */
+Xchecksum(dp, length)
+X    word *dp;
+X    int length;
+X{
+X    int len;
+X    longword sum;
+X
+X    len = length >> 1;
+X    sum = 0;
+X    while ( len-- > 0 ) sum += *dp++;
+X    if ( length & 1 ) sum += (*dp & 0xFF00);
+X    sum = (sum & 0xFFFF) + ((sum >> 16) & 0xFFFF);
+X    sum = (sum & 0xFFFF) + ((sum >> 16) & 0xFFFF);
+X
+X    return ( sum );
+X}
+X
+X/*
+X * Dump the tcp protocol header of a packet
+X */
+Xtcp_DumpHeader( ip, tp, mesg )
+X    in_Header *ip;
+X    char *mesg;
+X{
+X    register tcp_Header *tp = (tcp_Header *)((byte *)ip + in_GetHdrlenBytes(ip));
+X    static char *flags[] = { "FIN", "SYN", "RST", "PUSH", "ACK", "URG" };
+X    int len;
+X    word f;
+X
+X    len =  ip->length - ((tcp_GetDataOffset(tp) + in_GetHdrlen(ip)) << 2);
+X    printf("TCP: %s packet:\nS: %x; D: %x; SN=%x ACK=%x W=%d DLen=%d\n",
+X           mesg, tp->srcPort, tp->dstPort, tp->seqnum, tp->acknum,
+X           tp->window, len);
+X    printf("DO=%d, C=%x U=%d",
+X           tcp_GetDataOffset(tp), tp->checksum, tp->urgentPointer);
+X    /* output flags */
+X    f = tp->flags;
+X    for ( len = 0; len < 6; len++ )
+X        if ( f & (1 << len) ) printf(" %s", flags[len]);
+X    printf("\n");
+X}
+X
+X/*
+X * Move bytes from hither to yon
+X */
+XMove( src, dest, numbytes )
+X    register byte *src, *dest;
+X    register numbytes;
+X{
+X    if ( numbytes <= 0 ) return;
+X    if ( src < dest ) {
+X        src += numbytes;
+X        dest += numbytes;
+X        do {
+X            *--dest = *--src;
+X        } while ( --numbytes > 0 );
+X    } else
+X        do {
+X             *dest++ = *src++;
+X        } while ( --numbytes > 0 );
+X}
+END-of-tinytcp.c
+echo file: tinytcp.h
+sed 's/^X//' >tinytcp.h << 'END-of-tinytcp.h'
+X/*
+X * tinytcp.h - header file for tinytcp.c
+X *
+X * Copyright (C) 1986, IMAGEN Corporation
+X *  "This code may be duplicated in whole or in part provided that [1] there
+X *   is no commercial gain involved in the duplication, and [2] that this
+X *   copyright notice is preserved on all copies.  Any other duplication
+X *   requires written notice of the author."
+X *
+X * Note: the structures herein must guarantee that the
+X *       code only performs word fetches, since the
+X *       imagenether card doesn't accept byte accesses.
+X */
+X
+X#define TRUE        1
+X#define true        1
+X#define FALSE       0
+X#define false       0
+X#define NULL        0               /* An empty value */
+X#define NIL         0               /* The distinguished empty pointer */
+X
+X/* Useful type definitions */
+Xtypedef int (*procref)();
+Xtypedef short BOOL;                  /* boolean type */
+X
+X/* Canonically-sized data */
+Xtypedef unsigned long longword;     /* 32 bits */
+Xtypedef unsigned short word;        /* 16 bits */
+Xtypedef unsigned char byte;         /*  8 bits */
+Xtypedef byte octet;                 /*  8 bits, for TCP */
+X
+X#ifdef DDT
+Xextern longword MsecClock();
+X#define clock_ValueRough() MsecClock()
+X#else
+Xextern longword clock_MS;
+X#define clock_ValueRough() clock_MS
+X#endif
+X
+X/* protocol address definitions */
+Xtypedef longword in_HwAddress;
+Xtypedef word eth_HwAddress[3];
+X
+X/* The Ethernet header */
+Xtypedef struct {
+X    eth_HwAddress   destination;
+X    eth_HwAddress   source;
+X    word            type;
+X} eth_Header;
+X
+X/* The Internet Header: */
+Xtypedef struct {
+X    word            vht;    /* version, hdrlen, tos */
+X    word            length;
+X    word            identification;
+X    word            frag;
+X    word            ttlProtocol;
+X    word            checksum;
+X    in_HwAddress    source;
+X    in_HwAddress    destination;
+X} in_Header;
+X#define in_GetVersion(ip) (((ip)->vht >> 12) & 0xf)
+X#define in_GetHdrlen(ip)  (((ip)->vht >> 8) & 0xf)
+X#define in_GetHdrlenBytes(ip)  (((ip)->vht >> 6) & 0x3c)
+X#define in_GetTos(ip)      ((ip)->vht & 0xff)
+X
+X#define in_GetTTL(ip)      ((ip)->ttlProtocol >> 8)
+X#define in_GetProtocol(ip) ((ip)->ttlProtocol & 0xff)
+X
+X
+Xtypedef struct {
+X    word            srcPort;
+X    word            dstPort;
+X    longword        seqnum;
+X    longword        acknum;
+X    word            flags;
+X    word            window;
+X    word            checksum;
+X    word            urgentPointer;
+X} tcp_Header;
+X
+X
+X#define tcp_FlagFIN     0x0001
+X#define tcp_FlagSYN     0x0002
+X#define tcp_FlagRST     0x0004
+X#define tcp_FlagPUSH    0x0008
+X#define tcp_FlagACK     0x0010
+X#define tcp_FlagURG     0x0020
+X#define tcp_FlagDO      0xF000
+X#define tcp_GetDataOffset(tp) ((tp)->flags >> 12)
+X
+X/* The TCP/UDP Pseudo Header */
+Xtypedef struct {
+X    in_HwAddress    src;
+X    in_HwAddress    dst;
+X    octet           mbz;
+X    octet           protocol;
+X    word            length;
+X    word            checksum;
+X} tcp_PseudoHeader;
+X
+X/*
+X * TCP states, from tcp manual.
+X * Note: close-wait state is bypassed by automatically closing a connection
+X *       when a FIN is received.  This is easy to undo.
+X */
+X#define tcp_StateLISTEN  0      /* listening for connection */
+X#define tcp_StateSYNSENT 1      /* syn sent, active open */
+X#define tcp_StateSYNREC  2      /* syn received, synack+syn sent. */
+X#define tcp_StateESTAB   3      /* established */
+X#define tcp_StateFINWT1  4      /* sent FIN */
+X#define tcp_StateFINWT2  5      /* sent FIN, received FINACK */
+X/*#define tcp_StateCLOSEWT 6    /* received FIN waiting for close */
+X#define tcp_StateCLOSING 6      /* sent FIN, received FIN (waiting for FINACK) */
+X#define tcp_StateLASTACK 7      /* fin received, finack+fin sent */
+X#define tcp_StateTIMEWT  8      /* dally after sending final FINACK */
+X#define tcp_StateCLOSED  9      /* finack received */
+X
+X/*
+X * TCP Socket definition
+X */
+X#define tcp_MaxData 32              /* maximum bytes to buffer on output */
+X
+Xtypedef struct _tcp_socket {
+X    struct _tcp_socket *next;
+X    short           state;          /* connection state */
+X    procref         dataHandler;    /* called with incoming data */
+X    eth_HwAddress   hisethaddr;     /* ethernet address of peer */
+X    in_HwAddress    hisaddr;        /* internet address of peer */
+X    word            myport, hisport;/* tcp ports for this connection */
+X    longword        acknum, seqnum; /* data ack'd and sequence num */
+X    int             timeout;        /* timeout, in milliseconds */
+X    BOOL            unhappy;        /* flag, indicates retransmitting segt's */
+X    word            flags;          /* tcp flags word for last packet sent */
+X    short           dataSize;       /* number of bytes of data to send */
+X    byte            data[tcp_MaxData]; /* data to send */
+X} tcp_Socket;
+X
+Xextern eth_HwAddress sed_lclEthAddr;
+Xextern eth_HwAddress sed_ethBcastAddr;
+Xextern in_HwAddress  sin_lclINAddr;
+X
+X/*
+X * ARP definitions
+X */
+X#define arp_TypeEther  1        /* ARP type of Ethernet address *
+X
+X/* harp op codes */
+X#define ARP_REQUEST 1
+X#define ARP_REPLY   2
+X
+X/*
+X * Arp header
+X */
+Xtypedef struct {
+X    word            hwType;
+X    word            protType;
+X    word            hwProtAddrLen;  /* hw and prot addr len */
+X    word            opcode;
+X    eth_HwAddress   srcEthAddr;
+X    in_HwAddress    srcIPAddr;
+X    eth_HwAddress   dstEthAddr;
+X    in_HwAddress    dstIPAddr;
+X} arp_Header;
+X
+X/*
+X * Ethernet interface:
+X *   sed_WaitPacket(0) => ptr to packet (beyond eth header)
+X *                          or NIL if no packet ready.
+X *   sed_Receive(ptr) - reenables receive on input buffer
+X *   sed_FormatPacket(&ethdest, ethtype) => ptr to packet buffer
+X *   sed_Send(packet_length) - send the buffer last formatted.
+X */
+Xbyte *sed_IsPacket(), *sed_FormatPacket();
+END-of-tinytcp.h
+exit
+
+

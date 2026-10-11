@@ -1,0 +1,2623 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,49342a4fda0b24f1,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-03-11 11:42:29 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.3 (USS@Tek, v1.1) based on 4.3bsd-beta 6/6/85; site tekcrl.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!bellcore!decvax!decwrl!pyramid!hplabs!tektronix!tekcrl!toddb
+From: toddb@tekcrl.UUCP (Todd Brunhoff)
+Newsgroups: net.sources
+Subject: release #2, shar 7 of 7
+Message-ID: <567@tekcrl.UUCP>
+Date: Tue, 11-Mar-86 14:42:29 EST
+Article-I.D.: tekcrl.567
+Posted: Tue Mar 11 14:42:29 1986
+Date-Received: Fri, 14-Mar-86 06:44:18 EST
+Reply-To: toddb@tekcrl.UUCP (Todd Brunhoff)
+Organization: Tektronix, Inc., Beaverton, OR.
+Lines: 2602
+
+#!/bin/sh
+#
+# RFS, a kernel-resident remote file system.  Shar 7 of 7
+#
+#
+# This is a shell archive, meaning:
+# 1. Remove everything above the #!/bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#	remote/usr.sys.remote/rmt_general.c
+#	remote/usr.sys.remote/rmt_generic.c
+#	remote/usr.sys.remote/rmt_io.c
+#	remote/usr.sys.remote/rmt_subr.c
+#	remote/usr.sys.remote/rmt_syscall1.c
+#	remote/usr.sys.remote/rmt_syscall2.c
+#
+# remote/usr.sys.remote/rmt_general.c
+#
+if [ -f remote/usr.sys.remote/rmt_general.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/usr.sys.remote/rmt_general.c or ^C to quit' 
+	read ans 
+	rm -f remote/usr.sys.remote/rmt_general.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/usr.sys.remote/rmt_general.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Header: rmt_general.c,v 2.0 85/12/07 18:18:06 toddb Rel $
+X *
+X * $Log:	rmt_general.c,v $
+X * Revision 2.0  85/12/07  18:18:06  toddb
+X * First public release.
+X * 
+X */
+X#include	"../h/param.h"
+X#ifndef pyr	/* Pyramid */
+X#include	"../machine/pte.h"
+X#endif
+X#include	"../h/systm.h"
+X#include	"../h/map.h"
+X#include	"../h/dir.h"
+X#include	"../h/user.h"
+X#include	"../h/kernel.h"
+X#include	"../h/proc.h"
+X#ifdef BSD4_3
+X#include	"../h/namei.h"
+X#else BSD4_3
+X#include	"../h/nami.h"
+X#endif BSD4_3
+X#include	"../h/inode.h"
+X#include	"../h/mbuf.h"
+X#include	"../h/socket.h"
+X#include	"../remote/remotefs.h"
+X#include	"../h/errno.h"
+X#include	"../netinet/in.h"
+X#include	"../h/file.h"
+X
+Xextern long	remote_sysindex;
+Xextern struct mbuf	*remote_path;
+Xextern u_char	remote_sysmap[];
+Xextern syscalls	remote_syscall[];
+Xextern struct remoteinfo	remote_info[];
+X
+X/*
+X * This routine is the main gateway into the remote software.  It should
+X * be called from syscall().  Note that sysnum is already mapped to our
+X * idea of the system call number.
+X */
+X#ifdef pyr	/* Pyramid */
+Xremote_startup(pass, sysnum, arg1, arg2, arg3, arg4, arg5, arg6)
+X#else pyr
+Xremote_startup(pass, sysnum)
+X#endif
+X	long	sysnum, pass;
+X{
+X	struct a {
+X		long	arg1,
+X			arg2;
+X	} *uap = (struct a *)u.u_ap;
+X	long	error, sysindex;
+X	extern long	remote_fd();
+X	register syscalls	*sp = remote_syscall + sysnum;
+X	register struct file	*fp;
+X	register struct proc	*p;
+X	register func	general = sp->sys_gen;
+X	register unsigned	fd1,
+X				fd2;
+X#ifdef pyr	/* Pyramid */
+X	long	args[ 6 ];
+X
+X	args[0] = arg1;
+X	args[1] = arg2;
+X	args[2] = arg3;
+X	args[3] = arg4;
+X	args[4] = arg5;
+X	args[5] = arg6;
+X	u.u_ap = args;
+X	uap = (struct a *) args;
+X#endif pyr
+X
+X	debug1("%d strt:#%d,pass%d,%s\n",
+X		u.u_procp->p_pid, sysnum, pass,
+X		pass == 0 ? (!sp->sys_before ? "too soon" : "before") :
+X			    (pass == 1       ? "do it"    : "too late"));
+X
+X	/*
+X	 * For the greatest of speed we check here for invalid or non-
+X	 * remote file descriptors.  Make sure that we let a dup2() go
+X	 * through, even if the first fd is non-remote.
+X	 */
+X	if (general == remote_fd) {
+X		/*
+X		 * Gross kludge from v7 for the bourne shell.
+X		 */
+X		fd1 = uap->arg1;
+X		if (sysnum == RSYS_dup && (fd1 &~ 077)) {
+X			fd1 &= 077;
+X			sysnum = RSYS_dup2;
+X		}
+X		error = 2;
+X		if (fd1 >= NOFILE
+X		|| (fp = u.u_ofile[fd1]) == NULL
+X		|| (fp->f_flag & FREMOTE) == 0)
+X			error--;
+X		if (sysnum != RSYS_dup2)
+X			error--;
+X		else {
+X			fd2 = uap->arg2;
+X			if (fd2 >= NOFILE
+X			|| (fp = u.u_ofile[fd2]) == NULL
+X			|| (fp->f_flag & FREMOTE) == 0)
+X				error--;
+X		}
+X		if (! error)
+X			return(FALSE);
+X		uap->arg1 = fd1;
+X	}
+X	/*
+X	 * Check to see if this is being done too soon.  Note that this is
+X	 * on the else side of the check for remote_fd.  i.e., this code
+X	 * assumes that remote_fd() routines should always be done before
+X	 * the real routines.
+X	 */
+X	else if (pass == 0) {
+X		u.u_rmtoffset[0] = -1;
+X		u.u_rmtoffset[1] = -1;
+X		if (! sp->sys_before)
+X			return(FALSE);
+X	}
+X	else if (pass > 1) {
+X		u.u_error = EISREMOTE;
+X		return(TRUE);
+X	}
+X
+X	/*
+X	 * finally, if the user has turned off remote access for himself,
+X	 * then just return.
+X	 */
+X	p = u.u_procp;
+X	if (p->p_flag & SNOREMOTE)
+X		return(FALSE);
+X	u.u_error = 0;
+X
+X	/*
+X	 * do the remote syscall.
+X	 */
+X	error = (*general)(sysnum);
+X	debug1("%d startup done: ret1=%d, ret2=%d, err=%d\n",
+X		u.u_procp->p_pid, u.u_r.r_val1, u.u_r.r_val2, error);
+X	if (error < 0)	/* call the real system call */
+X		return(FALSE);
+X	u.u_error = error;
+X	return(TRUE);
+X}
+X
+X/*
+X * This routine handles most system calls that have no special requirements
+X * and have a single path in their first argument.
+X */
+Xremote_path1(sysnum)
+X	int	sysnum;
+X{
+X	struct a {
+X		char	*path;
+X	} *uap = (struct a *)u.u_ap;
+X	long	sysindex, len;
+X	struct message *msg;
+X	struct mbuf	*m;
+X	register syscalls	*sp = remote_syscall + sysnum;
+X	register long		error;
+X
+X	/*
+X	 * Get the path mbuf chain and its length.  Also the remote sys #.
+X	 */
+X	if ((m = remote_path) == NULL)
+X		return(ENOBUFS);
+X	for (len=0; m; m = m->m_next)
+X		len += m->m_len;
+X	m = remote_path;
+X	remote_path = NULL;
+X	sysindex = remote_sysindex;
+X
+X	/*
+X	 * Initialize the message and call the specific syscall handler.
+X	 */
+X	msg = mtod(m, struct message *);
+X	introduce(msg, sysnum);
+X	msg->m_hdlen = len;
+X	error = (*sp->sys_spec)(sysindex, m, sysnum);
+X
+X	if (error < 0) {
+X		msg = &remote_info[ sysindex ].r_msg;
+X#ifdef BSD4_3
+X#else BSD4_3
+X		u.u_dirp = (caddr_t) u.u_arg[0];
+X#endif BSD4_3
+X		u.u_rmtoffset[0] = msg->m_args[0];
+X		return ( -1 );
+X	}
+X	return ( error );
+X}
+X/*
+X * This routine handles all two-path system calls.
+X *
+X *	RSYS_link: the placement of path2 determines where
+X *		we run the syscall because path2 is the file
+X * 		that is created.  Isremote() must also resolve the
+X *		path1 so that the remote link will know what file to
+X *		link it to.  Both path1 and path2 must be on the same
+X *		system.  Unfortunately, in kernel mode, we don't know
+X *		which path was found to be remote: we must check both again.
+X *	RSYS_rename: Same as RSYS_link.
+X *	RSYS_symlink: path2 is the only possible remote file and
+X *		path1 does not need to be resolved because symlink()
+X *		blindly creats a symbolic link to it.
+X */
+Xremote_path2(sysnum)
+X	int	sysnum;
+X{
+X	struct a {
+X		char	*path1;
+X		char	*path2;
+X	} *uap = (struct a *)u.u_ap;
+X	long	sysindex,
+X		len,
+X		error;
+X	struct message	*msg;
+X	struct mbuf	*m;
+X
+X	if ((m = remote_path) == NULL)
+X		return(ENOBUFS);
+X	/*
+X	 * If this is rename or link, then throw away what is in remote_path
+X	 * because we don't know which path it refers to .
+X	 */
+X	remote_path = NULL;
+X	if (sysnum != RSYS_symlink) {
+X		m_freem(m);
+X		m = NULL;
+X		sysindex = rmt_checkpath(uap->path2, &m, sysnum);
+X		if (sysindex < 0)
+X			return(-1);
+X	}
+X	else
+X		sysindex = remote_sysindex;
+X	/*
+X	 * Ok, path2 is now safely in our mbuf.  Set the PATHOFF field for
+X	 * the beginning of where path1 will be.
+X	 */
+X	msg = mtod(m, struct message *);
+X	introduce_1extra(msg, sysnum, u.u_cmask);
+X	msg->m_args[ R_PATHOFF ] = htonl(msg->m_hdlen);
+X
+X	/*
+X	 * If its a symbolic link, we can just copy the path onto the
+X	 * end of our mbuf chain.
+X	 */
+X	if (sysnum == RSYS_symlink) {
+X		error = rmt_copypath(uap->path1, m, TRUE);
+X		if (error) {
+X			m_freem(m);
+X			return(error);
+X		}
+X	}
+X	/*
+X	 * Link and rename have to have path1 on the same system as path2.
+X	 */
+X	else if (rmt_checkpath(uap->path1, &m, sysnum) != sysindex) {
+X		m_freem(m);
+X		return(-1);
+X	}
+X
+X	error = rmt_msgfin(sysindex, m, 0);
+X
+X	if(error < 0)
+X		if (sysnum != RSYS_rename && sysnum != RSYS_link) {
+X			msg = &remote_info[ sysindex ].r_msg;
+X#ifdef BSD4_3
+X#else BSD4_3
+X			u.u_dirp = (caddr_t) u.u_arg[0];
+X#endif BSD4_3
+X			u.u_rmtoffset[0] = msg->m_args[0];
+X			u.u_rmtoffset[1] = ntohl(msg->m_args[1]);
+X			return ( -1 );
+X		}
+X		else
+X			error = EISREMOTE;
+X	return( error );
+X}
+X
+X/*
+X * Check a remote file for its "remoteness".  After namei() is called (in
+X * the kernel) and isremote() is called as a result, we can get the result
+X * from remote_path and put it on the end of 'mhead'.
+X */
+Xrmt_checkpath(path, mhead, sysnum)
+X	char	*path;
+X	struct mbuf	**mhead;
+X	long	sysnum;
+X{
+X	char	*psrc, *pdest;
+X	struct mbuf	*m;
+X	struct message	*msg;
+X	long	len;
+X	struct inode	*ip;
+X
+X#ifdef BSD4_3
+X	register struct nameidata *ndp = &u.u_nd;
+X	long	follow = remote_syscall[ sysnum ].sys_follow ? FOLLOW : 0;
+X
+X	ndp->ni_nameiop = LOOKUP | follow;
+X	ndp->ni_segflg = UIO_USERSPACE;
+X	ndp->ni_dirp = (caddr_t)path;
+X	ip = namei(ndp);
+X#else BSD4_3
+X	u.u_dirp = path;
+X	ip = namei(uchar, LOOKUP, remote_syscall[ sysnum ].sys_follow);
+X#endif BSD4_3
+X	if (ip != NULL || u.u_error != EISREMOTE) {
+X		if (ip)
+X			iput(ip);
+X		return(-1);
+X	}
+X	u.u_error = 0;
+X
+X	if (remote_path == NULL)
+X		return(-1);
+X	if (*mhead == NULL)
+X		*mhead = remote_path;
+X	else {
+X		/*
+X		 * If we were handed an mbuf, then we tack the new string
+X		 * of mbufs on the end.  Note that we bump the offset so that
+X		 * the mtod(m, char *) points to the beginning of the path.
+X		 */
+X		for (m = *mhead; m->m_next; )
+X			m = m->m_next;
+X		m->m_next = remote_path;
+X		msg = mtod(remote_path, struct message *);
+X		len = msg->m_hdlen - (R_MINRMSG + R_PATHSTART*sizeof(long));
+X		remote_path->m_off += R_MINRMSG + R_PATHSTART*sizeof(long);
+X		remote_path->m_len -= R_MINRMSG + R_PATHSTART*sizeof(long);
+X		msg = mtod(*mhead, struct message *);
+X		msg->m_hdlen += len;
+X	}
+X	remote_path = NULL;
+X	return(remote_sysindex);
+X}
+X
+X/*
+X * Remote exit()
+X */
+Xremote_exit()
+X{
+X	struct remoteinfo	*rp, *rmt_hostdir();
+X	struct file	*fp;
+X	long	i;
+X	struct mbuf	*m;
+X	struct message *msg;
+X
+X	/*
+X	 * Throw away remote file descriptors.
+X	 */
+X	for (i=0; i<NOFILE; i++)
+X		if ((fp = u.u_ofile[ i ]) && (fp->f_flag & FREMOTE))
+X			rmt_deallocfd(i);
+X	u.u_procp->p_flag &= ~SREMOTE;
+X	if (rp = rmt_hostdir(u.u_cdir, &i))
+X		rp->r_nchdir--;
+X	/*
+X	 * Send the exit message to every remote system to which we
+X	 * have a connection.
+X	 */
+X	for (rp = remote_info, i=0; i<R_MAXSYS; i++, rp++)
+X		if (rmthostused(i) && rp->r_sock) {
+X			/*
+X			 * If ours is the last usage of this connection, then
+X			 * shut it down.
+X			 */
+X			debug4("%d off #%d, now %d usrs\n", u.u_procp->p_pid,
+X				i, rp->r_users-1); 
+X			if (--rp->r_users <= 0 && rp->r_sock) {
+X				if (rp->r_close)
+X					rmt_shutdown(i);
+X				else
+X					rmt_closehost(rp);
+X				continue;
+X			}
+X			MGET(m, M_WAIT, MT_DATA);
+X			if (m == NULL)
+X				break;
+X			msg = mtod(m, struct message *);
+X			msg->m_hdlen = m->m_len = introduce(msg, RSYS_exit);
+X			rmt_msgfin(i, m, RFLG_INFO);
+X		}
+X
+X	return( -1 ); /* do the real syscall, too */
+X}
+X
+X/*
+X * Remote fork()
+X */
+Xremote_fork(sysnum)
+X	long	sysnum;
+X{
+X	register long		i, child, pid, ppid, val1;
+X	long			rmtdir = u.u_rmtcdir,
+X				sysindex;
+X	struct message		*msg;
+X	register struct remoteinfo	*rp;
+X	struct remoteinfo	*rmt_hostdir();
+X	struct mbuf	*m;
+X	register struct file	*fp;
+X	long			rmtsys;	
+X
+X	/*
+X	 * We may not need to even notify anyone, if this process is not
+X	 * doing anything interesting.  If there are no open files or
+X	 * a remote current working directory, then do no more.
+X	 */
+X	rmtcopyhosts(rmtsys, u.u_rmtsys);
+X	rmtclearhosts();
+X	for (i=0; i<NOFILE; i++) {
+X		if ((fp = u.u_ofile[ i ]) && (fp->f_flag & FREMOTE)) {
+X			remote_info[ (int)fp->f_data ].r_nfile++;
+X			rmtusehost((int)fp->f_data);
+X		}
+X	}
+X	if (rp = rmt_hostdir(u.u_cdir, &sysindex)) {
+X		rmtusehost(sysindex);
+X		rp->r_nchdir++;
+X	}
+X
+X	/*
+X	 * Do the fork.
+X	 */
+X	if (sysnum == RSYS_vfork)
+X		vfork();
+X	else
+X		fork();
+X	val1 = u.u_r.r_val1;
+X	child = u.u_r.r_val2;
+X	if (u.u_error)
+X		child = FALSE;
+X	if (u.u_error || u.u_rmtsys == 0)
+X		goto done;
+X
+X	if (child) {
+X		ppid = u.u_procp->p_ppid;
+X		pid = u.u_procp->p_pid;
+X		u.u_procp->p_flag |= SREMOTE; /* set remote flag in child */
+X		u.u_rmtcdir = rmtdir;
+X	}
+X	else { /* parent */
+X		/* "if I am the parent && this is a vfork" */
+X		if (sysnum == RSYS_vfork)
+X			goto done;
+X		ppid = u.u_procp->p_pid;
+X		pid = u.u_r.r_val1;
+X	}
+X	/*
+X	 * Parent (fork() only) and child tell all remote hosts.
+X	 * Also, bump the count of users using all connections.
+X	 */
+X	for (rp=remote_info, i=0; i<R_MAXSYS; i++, rp++)
+X		if (rmthostused(i) && rp->r_sock) {
+X			if(child)
+X				rp->r_users++;
+X			debug4("fork: %s %d notify %s(%d), users=%d\n",
+X				child ? "chld" : "prnt", u.u_procp->p_pid,
+X				rp->r_mntpath, i, rp->r_users);
+X			MGET(m, M_WAIT, MT_DATA);
+X			if (m == NULL)
+X				continue;
+X			msg = mtod(m, struct message *);
+X			msg->m_hdlen = m->m_len =
+X				introduce_2extra(msg, sysnum, pid, ppid);
+X			rmt_msgfin(i, m, RFLG_INFO);
+X		}
+X	/*
+X	 * In the kernel, the r_val[12] elements get tromped on by the
+X	 * io to the server hosts, so restore them here.
+X	 * The 'u.u_error = 0;' is so that we don't run the real syscall
+X	 * (already run) and so that any io errors while notifying servers
+X	 * don't returned to the user... otherwise he might think the fork
+X	 * or vfork failed.
+X	 */
+X	u.u_r.r_val1 = val1;
+X	u.u_r.r_val2 = child;
+X	u.u_error = 0;
+Xdone:
+X	if (! child)
+X		rmtcopyhosts(u.u_rmtsys, rmtsys);
+X	return(u.u_error);
+X}
+X
+X/*
+X * This routine handles most system calls having a file descriptor as
+X * its first argument.  We are guarenteed at this point that uap->fd is
+X * a valid remote file descriptor.  We optimize for reads and writes.
+X */
+Xremote_fd(sysnum)
+X	register long	sysnum;
+X{
+X	struct a {
+X		long	fd;
+X		char	*buf;
+X		long	len;
+X	} *uap = (struct a *)u.u_ap;
+X	register long	sysindex, error;
+X	register struct message	*msg;
+X	register struct mbuf	*m;
+X	register syscalls	*sp = remote_syscall + sysnum;
+X	register struct file	*fp = u.u_ofile[ uap->fd ];
+X
+X	MGET(m, M_WAIT, MT_DATA);
+X	if (m == NULL)
+X		return(ENOBUFS);
+X	msg = mtod(m, struct message *);
+X	msg->m_hdlen = 0; /* rmt_datafin() or rmt_msgfin() will assign this */
+X	m->m_len = introduce_2extra(msg, sysnum, uap->fd, uap->len);
+X
+X	sysindex = (long)fp->f_data;
+X	error = (*sp->sys_spec)(sysindex, m, sp->sys_flag);
+X	if (! error)
+X		switch (sysnum) {
+X		case RSYS_read:
+X		case RSYS_write:
+X		case RSYS_readv:
+X		case RSYS_writev:
+X			fp->f_offset += u.u_r.r_val1;
+X			break;
+X		}
+X	return(error);
+X}
+X
+X/*
+X * Deallocate a file descriptor.
+X */
+Xrmt_deallocfd(fd)
+X	int	fd;
+X{
+X	register struct file	*fp;
+X	register struct remoteinfo	*rp;
+X	register unsigned	system;
+X
+X	fp = u.u_ofile[fd];
+X	u.u_ofile[fd] = NULL;
+X	if (fp == NULL
+X	|| ((system = (unsigned)fp->f_data) >= R_MAXSYS)) {
+X		debug6("dealloc: fp=%x,fd=%d,sys=%d,pid=%d\n",
+X			fp, fd, system, u.u_procp->p_pid);
+X		return;
+X	}
+X
+X	remote_info[ (int)fp->f_data ].r_nfile--;
+X	closef(fp);
+X}
+SHAREOF
+chmod 444 remote/usr.sys.remote/rmt_general.c
+#
+# remote/usr.sys.remote/rmt_generic.c
+#
+if [ -f remote/usr.sys.remote/rmt_generic.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/usr.sys.remote/rmt_generic.c or ^C to quit' 
+	read ans 
+	rm -f remote/usr.sys.remote/rmt_generic.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/usr.sys.remote/rmt_generic.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Header: rmt_generic.c,v 2.4 86/02/17 17:46:07 toddb Exp $
+X *
+X * $Log:	rmt_generic.c,v $
+X * Revision 2.4  86/02/17  17:46:07  toddb
+X * We no longer stop processing in isremote() if the connection is in
+X * the middle of closing.
+X * 
+X * Revision 2.3  86/02/17  14:36:37  toddb
+X * Fix so that the kernel properly reacts to nonexistant hosts
+X * on the generic mount point: sockargs() was being called in the
+X * remotename() system call (case NM_NAMEIS) even if uap->name was null.
+X * Bill Sommerfeld (wesommer@athena.mit.edu).
+X * 
+X * Revision 2.2  86/01/02  13:52:32  toddb
+X * Ifdef'ed calls to sockargs() for the differences in 4.2 vs. 4.3.
+X * 
+X * Revision 2.1  85/12/30  16:58:59  toddb
+X * Isremote() was not freeing it's chain of mbufs if rmt_copypath() failed.
+X * Now it does.
+X * 
+X * Revision 2.0  85/12/07  18:18:27  toddb
+X * First public release.
+X * 
+X */
+X#include "../h/param.h"
+X#include "../h/systm.h"
+X#include "../h/inode.h"
+X#include "../h/dir.h"
+X#ifdef BSD4_3
+X#include "../h/namei.h"
+X#else BSD4_3
+X#include "../h/nami.h"
+X#endif BSD4_3
+X#ifndef pyr	/* Pyramid */
+X#include "../machine/pte.h"
+X#endif
+X#include "../h/user.h"
+X#include "../h/proc.h"
+X#include "../h/buf.h"
+X#include "../h/file.h"
+X#include "../h/uio.h"
+X#include "../h/mbuf.h"
+X#include "../h/socket.h"
+X#include "../h/socketvar.h"
+X#include "../h/errno.h"
+X#include "../remote/remotefs.h"
+X
+Xextern	long		remote_sysindex;
+Xextern struct mbuf	*remote_path;
+Xextern struct remoteinfo remote_info[];
+Xextern struct remoteinfo *remote_generic;
+Xextern struct nameserver	remote_ns;
+X
+X/*
+X * Remote "mount point" definition.
+X */
+X#ifdef pyr	/* Pyramid */
+Xremoteon(arg1, arg2, arg3, arg4)
+X{
+X#ifdef BSD4_3
+X	register struct nameidata *ndp = &u.u_nd;
+X#else BSD4_3
+X#endif BSD4_3
+X	struct a {
+X		char	*path;
+X		unsigned pathlen;
+X		caddr_t	name;
+X		unsigned namelen;
+X	} ua;
+X	register struct a *uap = &ua;
+X	register struct inode		*ip;
+X	register struct remoteinfo	*rp;
+X	struct remoteinfo		*rmt_findslot(),
+X					*rmt_host();
+X	register int			error = 0;
+X	long				sysnum;
+X	struct mbuf *m = NULL;
+X
+X	uap->path = (char *)arg1;
+X	uap->pathlen = (unsigned)arg2;
+X	uap->name = (caddr_t)arg3;
+X	uap->namelen = (unsigned)arg4;
+X#else pyr
+Xremoteon()
+X{
+X#ifdef BSD4_3
+X	register struct nameidata *ndp = &u.u_nd;
+X#else BSD4_3
+X#endif BSD4_3
+X	register struct a {
+X		char	*path;
+X		unsigned pathlen;
+X		caddr_t	name;
+X		unsigned namelen;
+X	} *uap = (struct a *)u.u_ap;
+X	register struct inode		*ip;
+X	register struct remoteinfo	*rp;
+X	struct remoteinfo		*rmt_findslot(),
+X					*rmt_host();
+X	register int			error = 0;
+X	long				sysnum;
+X	struct mbuf *m = NULL;
+X#endif
+X
+X	if (uap->path == NULL) {
+X		u.u_procp->p_flag &= ~SNOREMOTE;
+X		return;
+X	}
+X	if (!suser())
+X		return;
+X#ifdef BSD4_3
+X	ndp->ni_nameiop = LOOKUP;
+X	ndp->ni_segflg = UIO_USERSPACE;
+X	ndp->ni_dirp = (caddr_t)uap->path;
+X	ip = namei(ndp);
+X#else BSD4_3
+X	ip = namei(uchar, LOOKUP, 0);
+X#endif BSD4_3
+X	debug5("remote on ip=%x,path=%x,pthlen=%d,name=%x,nmlen=%d\n",
+X		ip, uap->path, uap->pathlen, uap->name, uap->namelen);
+X	if (ip == NULL)
+X		return;
+X	if (uap->pathlen >= R_MNTPATHLEN)
+X		uap->pathlen = R_MNTPATHLEN - 1;
+X
+X	/*
+X	 * Check for all kinds of errors.
+X	 */
+X	if (rmt_host(ip, &sysnum) || (uap->name == NULL && remote_generic))
+X		error = EBUSY;
+X	else if ((ip->i_mode&IFMT) == IFDIR)
+X		error = EISDIR;
+X	else if (uap->name)
+X#ifdef BSD4_3
+X		error = sockargs(&m, uap->name, uap->namelen, MT_SONAME);
+X#else BSD4_3
+X		error = sockargs(&m, uap->name, uap->namelen);
+X#endif BSD4_3
+X	if (error)
+X		goto out;
+X
+X	/*
+X	 * Everything is ok... so put it in our list.
+X	 */
+X	rp = rmt_findslot(&sysnum);
+X	if (rp == NULL)
+X		error = ETOOMANYREMOTE;
+X	else {
+X		debug5("rp=%x, m=%x ip=%x sys=%d\n", rp, m, ip, sysnum);
+X		rp->r_mntpt = ip;
+X		if ((rp->r_name = m) == NULL)
+X			remote_generic = rp;
+X		(void)copyin((caddr_t)uap->path, (caddr_t)rp->r_mntpath,
+X			MIN(uap->pathlen, R_MNTPATHLEN));
+X		u.u_r.r_val1 = sysnum;
+X		iunlock(ip);
+X		return;
+X	}
+X
+Xout:
+X	u.u_error = error;
+X	iput(ip);
+X}
+X
+X/*
+X * Turn off the remote file system.  If the path to unmount is NULL, then
+X * turn off all remote access for this process.
+X */
+X#ifdef pyr	/* Pyramid */
+Xremoteoff(arg1)
+X{
+X#ifdef BSD4_3
+X	register struct nameidata *ndp = &u.u_nd;
+X#else BSD4_3
+X#endif BSD4_3
+X	struct a {
+X		char	*path;
+X	} ua;
+X	register struct a *uap = &ua;
+X	register struct inode *ip;
+X	register struct remoteinfo	*rp;
+X	struct remoteinfo		*rmt_host();
+X	long			sysnum;
+X
+X	uap->path = (char *)arg1;
+X#else pyr
+Xremoteoff()
+X{
+X#ifdef BSD4_3
+X	register struct nameidata *ndp = &u.u_nd;
+X#else BSD4_3
+X#endif BSD4_3
+X	register struct a {
+X		char	*path;
+X	} *uap = (struct a *)u.u_ap;
+X	register struct inode *ip;
+X	register struct remoteinfo	*rp;
+X	struct remoteinfo		*rmt_host();
+X	long			sysnum;
+X#endif pyr
+X
+X	if (uap->path == NULL) {
+X		u.u_procp->p_flag |= SNOREMOTE;
+X		return;
+X	}
+X	if (!suser())
+X		return;
+X#ifdef BSD4_3
+X	ndp->ni_nameiop = LOOKUP;
+X	ndp->ni_segflg = UIO_USERSPACE;
+X	ndp->ni_dirp = (caddr_t)uap->path;
+X	ip = namei(ndp);
+X#else BSD4_3
+X	ip = namei(uchar, LOOKUP, 0);
+X#endif BSD4_3
+X	if (ip == NULL || (rp = rmt_host(ip, &sysnum)) == NULL) {
+X		if (ip)
+X			iput(ip);
+X		debug5("remoteoff: nope! ip=%x error=%d\n",
+X			ip, u.u_error);
+X		u.u_error = EINVAL;
+X		return;
+X	}
+X
+X	debug5("remote off ip=%x\n", ip);
+X	iput(ip);
+X
+X	/*
+X	 * Now try to shut it down. 
+X	 */
+X	rp->r_close = TRUE;
+X	if (u.u_error = rmt_shutdown(sysnum))
+X		return;
+X	u.u_r.r_val1 = remote_sysindex;
+X	/*
+X	 * reinitialize the structure for the next time,
+X	 * freeing the mbuf and closing the socket.
+X	 */
+X	rp->r_refcnt = 0;
+X	rp->r_nchdir = 0;
+X	rp->r_nfile = 0;
+X	if (rp->r_mntpt)
+X		irele(rp->r_mntpt);
+X	rp->r_mntpt = 0;
+X	if (rp->r_name)
+X		(void)m_free(rp->r_name);
+X	else
+X		remote_generic = NULL;
+X	rp->r_name = 0;
+X	return;
+X}
+X
+X/*
+X * This provides the nameserver function allowing
+X * name information to pass to and from a server and the kernel.
+X */
+X#ifdef pyr	/* Pyramid */
+Xremotename(arg1, arg2, arg3, arg4)
+X{
+X	struct a {
+X		long	action;
+X		caddr_t	name;
+X		long	namelen;
+X		char	*path;
+X	} ap;
+X	register struct a *uap = &ap;
+X	register long	error = 0;
+X	struct mbuf		*m;
+X	register struct proc	*p = u.u_procp;
+X
+X	uap->action = (long)arg1;
+X	uap->name = (caddr_t)arg2;
+X	uap->namelen = (long)arg3;
+X	uap->path = (char *)arg4;
+X#else pyr
+Xremotename()
+X{
+X	register struct a {
+X		long	action;
+X		caddr_t	name;
+X		long	namelen;
+X		char	*path;
+X	} *uap = (struct a *)u.u_ap;
+X	register long	error = 0;
+X	struct mbuf		*m;
+X	register struct proc	*p = u.u_procp;
+X#endif pyr
+X
+X	if ((uap->action == NM_WHATNAME || uap->action == NM_NAMEIS)
+X	&& ! server_alive(p))
+X		error = EPERM;
+X	else switch (uap->action) {
+X	case NM_SERVER:		/* register as name server */
+X	{
+X		struct proc	*p2;
+X		short		pid;
+X
+X		if (!suser())
+X			return;
+X		p2 = remote_ns.rn_proc;
+X		pid = remote_ns.rn_pid;
+X		if (server_alive(p2))
+X			error = EBUSY;
+X		else {
+X			remote_ns.rn_proc = p;
+X			remote_ns.rn_pid = p->p_pid;
+X		}
+X		break;
+X	}
+X	case NM_WHATNAME:
+X		if (remote_ns.rn_path)
+X			error = copyout((caddr_t)remote_ns.rn_path,
+X				(caddr_t)uap->path,
+X				MIN(uap->namelen, remote_ns.rn_pathlen));
+X		else
+X			error = ENOREMOTEFS;
+X		break;
+X	case NM_NAMEIS:
+X	{
+X		register char	*cp;
+X
+X		m = remote_ns.rn_name;
+X		if (m) {
+X			debug13("free old mbuf@%x\n", m);
+X			m_free(m); /* free extra mbuf */
+X			m = remote_ns.rn_name = NULL;
+X		}
+X		if (uap->name) {
+X#ifdef BSD4_3
+X		    error = sockargs(&m, uap->name, uap->namelen, MT_SONAME);
+X#else BSD4_3
+X		    error = sockargs(&m, uap->name, uap->namelen);
+X#endif BSD4_3
+X		    if (error == 0) {
+X			cp = mtod(m, char *) + m->m_len;
+X			if (error = copyin((caddr_t)uap->path, (caddr_t)cp,
+X			    MIN(R_MNTPATHLEN, MLEN - m->m_len))) {
+X				m_free(m);
+X				m = NULL;
+X			}
+X			debug13("nmsrv: %s@%x\n", cp, m);
+X		    }
+X		}
+X		remote_ns.rn_name = m;
+X		wakeup(&remote_ns.rn_name);
+X		break;
+X	}
+X#ifdef RFSDEBUG
+X	case NM_DEBUG:
+X		remote_debug = (long)uap->name;
+X		printf("dbg=%d\n", remote_debug);
+X		break;
+X#endif RFSDEBUG
+X	default:
+X		error = EINVAL;
+X		break;
+X	}
+X	if (error)
+X		u.u_error = error;
+X}
+X
+X/*
+X * This is the routine called by namei() when it encounters what it thinks
+X * might be a remote mount point.
+X */
+Xisremote(ip, path, base)
+X	register struct inode *ip;
+X	char		*path, *base;
+X{
+X	struct remoteinfo *rmt_host(), *rmt_findhost();
+X	register short	offset;
+X	register struct remoteinfo *rp;
+X	register struct mbuf	*m;
+X	register struct message	*msg;
+X	register int	error;
+X	long			sysnum;
+X
+X	rp = rmt_host(ip, &sysnum);
+X	if (rp == NULL) {
+X		debug7("%s, ip=\"%x\" is not remote\n", path, ip);
+X		return(FALSE);
+X	}
+X	if (remote_path)
+X		m_freem(remote_path);
+X	remote_path = NULL;
+X
+X	/*
+X	 * Adjust the path so that if there is a leading '/', the path
+X	 * will start there.
+X	 */
+X	if (path != base && *path != '/' && *(path-1) == '/')
+X		path--;
+X
+X	/*
+X	 * Although we know the file is remote, it may have a loop back
+X	 * to this side; a simple case being if the path is '..' while
+X	 * in the root directory of the remote system.  If this is the case
+X	 * then the server will reply with errno == -1, remote_path[12]()
+X	 * will assign u.u_rmtoffset[0,1] and the real system call will be
+X	 * run again, bringing us back to here.  We know that that has
+X	 * happened if either of u.u_rmtoffset[0,1] is >= 0.  We then
+X	 * just adjust the path handed to us by namei() and return
+X	 * -1 which signals namei() to begin again with the new
+X	 * path with directory set to root (/).
+X	 */
+X	if ((u.u_procp->p_flag & SREMOTE) == 0) {
+X		u.u_rmtcdir = -1;
+X		offset = -1;
+X	}
+X	else if ((offset = u.u_rmtoffset[0]) >= 0)
+X		u.u_rmtoffset[0] = -1;
+X	else if ((offset = u.u_rmtoffset[1]) >= 0)
+X		u.u_rmtoffset[1] = -1;
+X	if (offset >= 0) {
+X		register char	*pstart = path + offset;
+X		register char	*p = path;
+X
+X		debug8("restart path %s locally, offset=%d\n", path, offset);
+X		if (offset) /* validate offset value */
+X			while (p <= pstart)
+X				if (*p++ == '\0') {
+X					u.u_error = EINVAL;
+X					return(FALSE);
+X				} 
+X		if (base != pstart) {
+X			path = base;
+X			do {
+X				*path++ = *pstart;
+X			} while (*pstart++);
+X		}
+X		return(-1);
+X	}
+X
+X	/*
+X	 * We have a remote mount point.   This mount point may be
+X	 * a "generic" mount point, in which case, we must figure out
+X	 * the host.
+X	 */
+X	if (rp->r_name == NULL) {
+X		rp = rmt_findhost(&path, &sysnum);
+X		if (rp == NULL) {
+X			debug8("isremote: can't map path %s\n", path);
+X			return(TRUE);
+X		}
+X	}
+X	u.u_error = EISREMOTE;
+X	remote_sysindex = sysnum;
+X	/*
+X	 * Set the remote flag for this user and bump the
+X	 * user count.
+X	 */
+X	u.u_procp->p_flag |= SREMOTE;
+X	if (! rmthostused(sysnum)) {
+X		rp->r_users++;
+X		rmtusehost(sysnum);
+X		debug4("%d uses rmt %d\n", u.u_procp->p_pid, sysnum);
+X	}
+X	rmtusehost(sysnum);
+X	debug7("%s, ip=%x is remote, idx=%d\n", path, ip, remote_sysindex);
+X	MGET(m, M_WAIT, MT_DATA);
+X	if (m != NULL) {
+X		msg = mtod(m, struct message *);
+X		msg->m_hdlen = R_MINRMSG + R_PATHSTART*sizeof(long);
+X		m->m_len = R_MINRMSG + R_PATHSTART*sizeof(long);
+X		if (error = rmt_copypath(path, m, FALSE)) {
+X			m_freem(m);
+X			u.u_error = error;
+X			return(TRUE);
+X		}
+X		remote_path = m;
+X	}
+X	else
+X		u.u_error = ENOBUFS;
+X	return(TRUE);
+X}
+SHAREOF
+chmod 444 remote/usr.sys.remote/rmt_generic.c
+#
+# remote/usr.sys.remote/rmt_io.c
+#
+if [ -f remote/usr.sys.remote/rmt_io.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/usr.sys.remote/rmt_io.c or ^C to quit' 
+	read ans 
+	rm -f remote/usr.sys.remote/rmt_io.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/usr.sys.remote/rmt_io.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Header: rmt_io.c,v 2.4 86/02/17 17:43:21 toddb Exp $
+X *
+X * $Log:	rmt_io.c,v $
+X * Revision 2.4  86/02/17  17:43:21  toddb
+X * If the host is closing, remote_getconnection() goes right ahead and
+X * closes and then tries to reopen.  This provides a pretty good recover
+X * mechanism, except for the fact that current working directories are
+X * lost and open files are lost.
+X * 
+X * Revision 2.3  86/02/04  10:26:43  toddb
+X * Added a missing rmt_unuse() call when it is too soon to call a host
+X * that has failed a connection.  Contributed by Dennis Rockwell @ csnet.
+X * 
+X * Revision 2.2  86/01/21  11:05:41  toddb
+X * Missing argument to sleep() in rmt_getconnection().
+X * 
+X * Revision 2.1  85/12/30  16:53:01  toddb
+X * Changed shutdown messages for the remotefs from debug messages to 
+X * printf messages.  Also fixed a bug where the return value field in
+X * rp->r_msg.m_args[ R_RETVAL ] was getting cleared for process `x'
+X * by process `y' when process `y' was executing an INFO_ONLY type
+X * of remote system call (like close or fork).  This bug was causing
+X * random system calls (like read or write) to return 0 when it should
+X * have returned something non-zero.
+X * 
+X * Revision 2.0  85/12/07  18:18:51  toddb
+X * First public release.
+X * 
+X */
+X#include "../h/param.h"
+X#include "../h/dir.h"
+X#ifndef pyr	/* Pyramid */
+X#include "../machine/pte.h"
+X#endif
+X#include "../h/user.h"
+X#include "../h/proc.h"
+X#include "../h/buf.h"
+X#include "../h/uio.h"
+X#include "../h/mbuf.h"
+X#include "../h/socket.h"
+X#include "../h/socketvar.h"
+X#include "../h/protosw.h"
+X#include "../h/errno.h"
+X#include "../remote/remotefs.h"
+X#include "../h/inode.h"
+X#include "../h/kernel.h"
+X#include "../netinet/in.h"
+X
+Xextern struct remoteinfo	remote_info[];
+Xextern struct remoteinfo	*remote_generic;
+X
+X/*
+X * Obtain a connection to 'system'.
+X */
+Xremote_getconnection(system)
+X	register int	system;
+X{
+X	register struct remoteinfo	*rp = remote_info + system;
+X	register err, s, opening = FALSE;
+X	short	uid;
+X	struct socket *so = NULL;
+X
+X	if (! rp->r_name) {
+X		rmt_unuse(rp, system);
+X		return(ENOREMOTEFS);	/* no address to call. */
+X	}
+X
+X	/*
+X	 * Lock out other processes from doing an open at the same time.
+X	 */
+X	if (rp->r_opening) {
+X		if (setjmp(&u.u_qsave)) {
+X			rmt_unuse(rp, system);
+X			return(EINTR);
+X		}
+X		while (rp->r_opening)
+X			sleep((caddr_t)&rp->r_sock, PZERO+1);
+X		if (rp->r_sock)
+X			return(0);
+X		rmt_unuse(rp, system);
+X		return(rp->r_openerr);
+X	}
+X	/*
+X	 * If it is closing, do it here and get it over with.
+X	 */
+X	else if (rp->r_close)
+X		rmt_closehost(rp);
+X	/*
+X	 * We may already have a connection
+X	 */
+X	else if (rp->r_sock)
+X		return(0);
+X	/*
+X	 * If we have failed previously, it may be time to try again.
+X	 */
+X	else if (rp->r_failed) {
+X		if (rp->r_age > time.tv_sec) {
+X			rmt_unuse(rp, system);
+X			return(rp->r_openerr);
+X		}
+X		rp->r_failed = FALSE;
+X	}
+X	rp->r_opening = TRUE;
+X	rp->r_close = FALSE;
+X
+X	/*
+X	 * pseudo loop to avoid labels...
+X	 */
+X	do {
+X		/*
+X		 * Fortunately, there is security with ports.  Unfortunately,
+X		 * you must be root to do it.  So we change our uid for a
+X		 * brief moment.
+X		 */
+X		uid = u.u_uid;
+X		if (setjmp(&u.u_qsave)) {
+X			u.u_uid = uid;
+X			if (u.u_error == 0)
+X				err = EINTR;
+X			break;
+X		}
+X
+X		/*
+X		 * first, make a socket for the connection; then connect.  (the
+X		 * connection code is basically connect(2)).
+X		 */
+X		if (err = socreate(AF_INET, &rp->r_sock, SOCK_STREAM, 0))
+X			break;
+X
+X		so = rp->r_sock;
+X		debug9("connect...");
+X		err = soconnect(so, rp->r_name);
+X		u.u_uid = uid;
+X		if (err)
+X			break;
+X
+X		s = splnet();
+X		if ((so->so_state & SS_NBIO) &&
+X		    (so->so_state & SS_ISCONNECTING)) {
+X			err = EINPROGRESS;
+X			splx(s);
+X			break;
+X		}
+X		while ((so->so_state & SS_ISCONNECTING) && so->so_error == 0) {
+X			debug9(".");
+X			sleep((caddr_t)&so->so_timeo, PZERO+1);
+X		}
+X		err = so->so_error;
+X		so->so_error = 0;
+X		rp->r_sock = so;
+X		rp->r_sender = rp->r_recver = -1;
+X		sosetopt(so, SOL_SOCKET, SO_KEEPALIVE, NULL);
+X		splx(s);
+X	} while (FALSE);
+X
+X	if (err) {
+X		rp->r_sock = 0;
+X		rp->r_openerr = err;
+X		rp->r_failed = TRUE;
+X		rp->r_age = time.tv_sec + R_RETRY;
+X		debug9("err=%d\n", err);
+X		rmt_unuse(rp, system);
+X		if (so)
+X			soclose(so);
+X	}
+X	else
+X		debug9(" done.\n");
+X	rp->r_opening = FALSE;
+X	wakeup((caddr_t)&rp->r_sock);
+X	return(err);
+X}
+X
+X/*
+X * Back out of references to a remote host.
+X */
+Xrmt_unuse(rp, system)
+X	register struct remoteinfo *rp;
+X	register long	system;
+X{
+X	rp->r_users--;
+X	rmtunusehost(system);
+X	if (u.u_rmtsys == 0)
+X		u.u_procp->p_flag &= ~SREMOTE;
+X}
+X
+X/*
+X * Send out the message.
+X */
+Xremoteio(system, m, uio, flags)
+X	register int	system;
+X	register struct mbuf	**m;
+X	register struct uio *uio;
+X	int	flags;
+X{
+X	register int	error, signaled = 0, position;
+X	register struct remoteinfo	*rp = remote_info + system;
+X	register struct socket	*so;
+X	register struct iovec *iov;
+X	register struct proc	*p;
+X	long	soreceive(), sosend();
+X	long	oldmask;
+X
+X
+X	/*
+X	 * get a connection.
+X	 */
+X	if ((so = rp->r_sock) == NULL || rp->r_close)
+X		if (error = remote_getconnection(system)) {
+X			(void) m_freem(*m);
+X			return(error);
+X		}
+X		else
+X			so = rp->r_sock;
+X
+X	/*
+X	 * "Hold" SIGTSTP and SIGSTOP signals until we are done.
+X	 */
+X	p = u.u_procp;
+X	oldmask = (1 << (SIGTSTP-1))
+X		| (1 << (SIGSTOP-1));
+X	oldmask = (p->p_sigmask & oldmask);
+X	p->p_sigmask |= (1 << (SIGTSTP-1))
+X			| (1 << (SIGSTOP-1));
+X
+X	/*
+X	 * Note that we re-do the setjmp each time we change state.
+X	 * Two reasons: 1) we are effectively ignoring interrupts until
+X	 * either the message has been completely sent or has been
+X	 * completely recieved. 2) setjmp() restores register variables to
+X	 * their state at the time of the call and since we modify them
+X	 * all the time, we need to re-save the state.
+X	 */
+X	position = R_NOTHINGSENT;
+X	rp->r_refcnt++; /* we are actively using conection */
+X
+X	while(position != 0) {
+X		if (setjmp(&u.u_qsave)) {
+X			error = EINTR;
+X			debug10("signal to %d\n", u.u_procp->p_pid);
+X			if (rp->r_close)
+X				goto remoteio_done;
+X			signaled++;
+X			continue;
+X		}
+X
+X		switch (position) {
+X		case R_NOTHINGSENT:
+X			/*
+X			 * make sure that this is not someone elses data.
+X			 */
+X			if (signaled)
+X				goto remoteio_done;
+X			while (!rp->r_close && rp->r_sender >= 0) {
+X				debug10("I am %d, not %d. Goodnight.\n",
+X					u.u_procp->p_pid, rp->r_sender);
+X				sleep((caddr_t)&rp->r_sender, PZERO+1);
+X			}
+X			if (rp->r_close)
+X				goto remoteio_done;
+X
+X			/*
+X			 * We update position BEFORE we call tcp_usrreq()
+X			 * because we are guarenteed that the data will be
+X			 * sent just by making the call.  i.e. we will never
+X			 * come back to this point once we've been here.
+X			 */
+X			if (uio && (flags & RFLG_WR))
+X				position = R_DATANOTSENT;
+X			else
+X				position = R_MSGNOTRED;
+X			rp->r_sender = u.u_procp->p_pid;
+X			debug10("%d sending... ", rp->r_sender);
+X			error = (*so->so_proto->pr_usrreq)(so,
+X				PRU_SEND, *m, 0, 0);
+X			if (error) {
+X				printf("error=%d on sending msg\n", error);
+X				rp->r_close = TRUE;
+X				goto remoteio_done;
+X			}
+X			*m = 0;
+X			break;
+X
+X		case R_DATANOTSENT:
+X			debug10("%d data\n", u.u_procp->p_pid);
+X			if (error = rmt_uio(rp, uio, sosend))
+X				flushmsg(rp, uio->uio_resid, FALSE);
+X			position = R_MSGNOTRED;
+X			break;
+X
+X		case R_MSGNOTRED:
+X			/*
+X			 * Finally, read from the socket.  Also, if
+X			 * we have been interrupted, now is the time to
+X			 * notify the other side.
+X			 */
+X			rp->r_sender = -1;
+X			wakeup(&rp->r_sender);
+X			if (flags & RFLG_INFO) {
+X				position = 0;
+X				break;
+X			}
+X			debug10("%d recving\n", u.u_procp->p_pid);
+X			if (signaled)
+X				sendrsig(system);
+X			error = rmt_getmsg(system);
+X			rp->r_received = FALSE;
+X			if (error || rp->r_close)
+X				goto remoteio_done;
+X			if (uio && (flags & RFLG_RD))
+X				position = R_DATANOTRED;
+X			else {
+X				rp->r_recver = -1;
+X				position = 0;
+X				wakeup(&rp->r_recver);
+X			}
+X			break;
+X		case R_DATANOTRED:
+X			debug10("%d recving data\n", u.u_procp->p_pid);
+X			if (rp->r_msg.m_args[ R_RETVAL ] > uio->uio_resid) {
+X				printf("usr needs %d, srvr says %d\n",
+X					uio->uio_resid,
+X					rp->r_msg.m_args[ R_RETVAL ]);
+X				rp->r_close = TRUE;
+X				goto remoteio_done;
+X			}
+X					
+X			uio->uio_resid = rp->r_msg.m_args[ R_RETVAL ];
+X			if (error = rmt_uio(rp, uio, soreceive)) {
+X				flushmsg(rp, uio->uio_resid, TRUE);
+X				break;
+X			}
+X			rp->r_recver = -1;
+X			wakeup(&rp->r_recver);
+X			position = 0;
+X			break;
+X		}
+X	}
+Xremoteio_done:
+X	/*
+X	 * Restore mask by first taking out SIGTSTP and SIGSTOP, whatever
+X	 * their values.  And then or'ing in the original value.
+X	 */
+X	p = u.u_procp;
+X	p->p_sigmask &= ~((1 << (SIGTSTP-1))
+X			| (1 << (SIGSTOP-1)));
+X	p->p_sigmask |= oldmask;
+X
+X	rp->r_refcnt--; /* we are done with this transaction */
+X	if (rp->r_close)
+X		error = ECONNABORTED;
+X	if (error) {
+X		debug11("remoteio: err=%d, close=%s\n",
+X			error, rp->r_close ? "true" : "false");
+X		rmt_shutdown(system);
+X	}
+X	return(error);
+X}
+X
+X/*
+X * Force io to happen and consume all of uio->uio_resid.
+X */
+Xrmt_uio(rp, uio, sockfunc)
+X	register struct remoteinfo	*rp;
+X	register struct uio	*uio;
+X	register func		sockfunc;
+X{
+X	register struct socket	*so = rp->r_sock;
+X	label_t	qsave;
+X	register long	error = 0,
+X			flag = (sockfunc == soreceive)
+X				? SS_CANTRCVMORE : SS_CANTSENDMORE;
+X
+X	bcopy(&u.u_qsave, &qsave, sizeof(label_t));
+X	if (setjmp(&u.u_qsave)) {
+X		debug11("rmt_uio: sig %d\n", u.u_procp->p_pid);
+X		if (rp->r_close)
+X			error = ECONNABORTED;
+X	}
+X	while(uio->uio_resid > 0 && ! error && (so->so_state & flag) == 0)
+X		error = (*sockfunc)(so, 0, uio, 0, 0);
+X	bcopy(&qsave, &u.u_qsave, sizeof(label_t));
+X	if (so->so_state & flag) {
+X		rp->r_close = TRUE;
+X		error = ECONNABORTED;
+X	}
+X	return(error);
+X}
+X
+X/*
+X * Obtain the next message from the server.  We don't return from this
+X * routine until our personal message has been received or an error
+X * has occured.
+X */
+Xrmt_getmsg(system)
+X	register int	system;
+X{
+X	struct proc	*p = NULL;
+X	struct remoteinfo	*rp = remote_info + system;
+X	struct socket *so = rp->r_sock;
+X	struct uio	auio;
+X	struct iovec	iov;
+X	register long	msglen, len, error = 0;
+X	long		soreceive();
+X
+X	for(;;) {
+X		iov.iov_len = auio.uio_resid = R_MINRMSG+sizeof(long);
+X		auio.uio_segflg = 1;	/* kernel bcopy */
+X		auio.uio_iov = &iov;
+X		auio.uio_iovcnt = 1;
+X		auio.uio_offset = 0;
+X		iov.iov_base = (caddr_t)&rp->r_msg;
+X
+X		/*
+X		 * Since we may have been usurped by this time, or a different
+X		 * syscall may have been repsponded to, we must make sure
+X		 * that we are the recipient of this message.  In fact,
+X		 * the message may have already arrived.
+X		 */
+X		while (rp->r_recver != u.u_procp->p_pid && rp->r_recver != -1)
+X			sleep((caddr_t)&rp->r_recver, PZERO+1);
+X		if (rp->r_recver == u.u_procp->p_pid && rp->r_received) {
+X			auio.uio_resid = 0;
+X			break;
+X		}
+X		rp->r_recver = u.u_procp->p_pid;
+X
+X		/*
+X		 * get the message.
+X		 */
+X		if (error = rmt_uio(rp, &auio, soreceive)) {
+X			debug11("1st: err=%d\n", error);
+X			break;
+X		}
+X#ifndef magnolia
+X		rp->r_msg.m_totlen  = ntohl(rp->r_msg.m_totlen);
+X		rp->r_msg.m_hdlen   = ntohs(rp->r_msg.m_hdlen);
+X		rp->r_msg.m_pid     = ntohs(rp->r_msg.m_pid);
+X		rp->r_msg.m_uid     = ntohs(rp->r_msg.m_uid);
+X		rp->r_msg.m_errno = ntohs(rp->r_msg.m_errno);
+X		rp->r_msg.m_args[ R_RETVAL ]
+X			    = ntohl(rp->r_msg.m_args[ R_RETVAL ]);
+X#endif
+X		msglen = rp->r_msg.m_hdlen;
+X		if (msglen > R_MAXRMSG
+X		 || msglen < R_MINRMSG+sizeof(long)
+X		 || auio.uio_offset < R_MINRMSG+sizeof(long)) {
+X			debug11("msg len=%d, off=%d!\n",
+X				msglen, auio.uio_offset);
+X			error = ECONNABORTED;
+X			break;
+X		}
+X
+X		/*
+X		 * We may need a few more bytes.
+X		 */
+X		if (msglen > R_MINRMSG + sizeof(long)) {
+X			iov.iov_len = auio.uio_resid =
+X				msglen - auio.uio_offset;
+X			auio.uio_iov = &iov;
+X			auio.uio_iovcnt = 1;
+X			debug10("getmsg2: resid=%d... cc=%d\n",
+X				auio.uio_resid, so->so_rcv.sb_cc);
+X			if (error = rmt_uio(rp, &auio, soreceive)) {
+X				debug11("2nd: err=%d, resid=%d, msglen=%d\n",	
+X					error, auio.uio_resid, msglen);
+X				break;
+X			}
+X		}
+X
+X		/*
+X		 * Now find the right recipient.
+X		 */
+X		rp->r_received = TRUE;
+X		rp->r_recver = rp->r_msg.m_pid;
+X		if (rp->r_recver == u.u_procp->p_pid)
+X			break;
+X		if (rp->r_recver >= 0 && (p = pfind(rp->r_recver))) {
+X			debug11("%d: msg for %d@%x\n",
+X				u.u_procp->p_pid, rp->r_recver, p->p_wchan);
+X			if (p->p_wchan == (caddr_t)&rp->r_recver)
+X				setrun(p);
+X			continue;
+X		}
+X		else
+X			debug11("proc %d?\n", rp->r_recver);
+X		flushmsg(rp, rp->r_msg.m_totlen - rp->r_msg.m_hdlen, TRUE);
+X	}
+X
+X	/*
+X	 * Wrap up and decide if everything is still kosher...
+X	 */
+X	if (rp->r_close || error || auio.uio_resid) {
+X		debug11("%d: getmsg: close=%s,err=%d,resid=%d\n",
+X			u.u_procp->p_pid, rp->r_close ? "true" : "false",
+X			error, auio.uio_resid);
+X		rp->r_close = TRUE;
+X		rmt_shutdown(system);
+X		error = ECONNABORTED;
+X	}
+X	return(error);
+X}
+X
+Xflushmsg(rp, len, input)
+X	register struct remoteinfo	*rp;
+X	register long	len, input;
+X{
+X	register struct socket *so = rp->r_sock;
+X	register long	error = 0, need;
+X	struct uio	auio;
+X	struct iovec	iov;
+X	char	buf[ MLEN ];
+X	extern long	sosend(), soreceive();
+X	func		ioroutine = (input ? soreceive : sosend);
+X
+X	debug11("flush %d %s bytes\n", len, input ? "input" : "output");
+X	auio.uio_segflg = 1;	/* kernel bcopy */
+X	while (len > 0 && ! error) {
+X		need = iov.iov_len = auio.uio_resid = MIN(len, MLEN);
+X		auio.uio_iov = &iov;
+X		auio.uio_iovcnt = 1;
+X		iov.iov_base = (caddr_t)buf;
+X		debug11("flush: resid=%d... cc=%d\n",
+X			auio.uio_resid, so->so_rcv.sb_cc);
+X		error = rmt_uio(rp, &auio, ioroutine);
+X		len -= need - auio.uio_resid;
+X	}
+X	if (error)
+X		rp->r_close = TRUE;
+X	if (input) {
+X		rp->r_recver = -1;
+X		rp->r_received = FALSE;
+X		wakeup((caddr_t)&rp->r_recver);
+X	}
+X	else {
+X		rp->r_sender = -1;
+X		ioroutine = sosend;
+X		wakeup((caddr_t)&rp->r_sender);
+X	}
+X	debug11("flush: error=%d\n", error);
+X}
+X
+Xrmt_shutdown(system)
+X	register int	system;
+X{
+X	register struct remoteinfo *rp = remote_info + system;
+X	register struct proc	*p;
+X
+X	wakeup((caddr_t)&rp->r_sender);
+X	wakeup((caddr_t)&rp->r_recver);
+X	if (rp->r_recver >= 0 && (p = pfind(rp->r_recver)) && p->p_wchan) {
+X		debug12("wake rder %d\n", p->p_pid);
+X		wakeup((caddr_t)p->p_wchan);
+X	}
+X	if (rp->r_sender >= 0 && (p = pfind(rp->r_sender)) && p->p_wchan) {
+X		debug12("wake wrter %d\n", p->p_pid);
+X		wakeup((caddr_t)p->p_wchan);
+X	}
+X	debug12("shtdwn: ref=%d, reason=", rp->r_refcnt);
+X	if (rp->r_close || (rp->r_sock->so_state & SS_CANTRCVMORE))
+X		debug12("%s\n",
+X			(rp->r_sock->so_state & SS_CANTRCVMORE)
+X			? "no more" : "closed");
+X	else {
+X		debug12("?, not done\n");
+X		return(EBUSY);
+X	}
+X	rp->r_close = TRUE;
+X	if (rp->r_refcnt || rp->r_users)
+X		return(EBUSY);
+X	rmt_closehost(rp);
+X	return(0);
+X}
+X
+X/*
+X * Close a host connection.
+X */
+Xrmt_closehost(rp)
+X	register struct remoteinfo	*rp;
+X{
+X	struct socket	*so;
+X
+X	so = rp->r_sock;
+X	rp->r_recver = rp->r_sender = -1;
+X	rp->r_sock = NULL;
+X	rp->r_age = time.tv_sec;
+X	rp->r_close = 0;
+X	if (so)
+X		soclose(so);
+X	else
+X		debug12("rmt_closehost: so == 0, rp=%x\n", rp);
+X}
+X
+Xsendrsig(system)
+X	register int	system;
+X{
+X	debug11("would have sent sig to system %d\n", system);
+X}
+SHAREOF
+chmod 444 remote/usr.sys.remote/rmt_io.c
+#
+# remote/usr.sys.remote/rmt_subr.c
+#
+if [ -f remote/usr.sys.remote/rmt_subr.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/usr.sys.remote/rmt_subr.c or ^C to quit' 
+	read ans 
+	rm -f remote/usr.sys.remote/rmt_subr.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/usr.sys.remote/rmt_subr.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Header: rmt_subr.c,v 2.1 86/03/10 13:21:22 toddb Exp $
+X *
+X * $Log:	rmt_subr.c,v $
+X * Revision 2.1  86/03/10  13:21:22  toddb
+X * rmt_findaddr NEVER worked before.  It now works like a charm, thanks
+X * to  William Sommerfeld <wesommer@athena.mit.edu>.  It was comparing
+X * an struct mbuf with a struct sockaddr, instead of the contents of
+X * the struct mbuf.
+X * 
+X * Revision 2.0  85/12/07  18:19:10  toddb
+X * First public release.
+X * 
+X */
+X#include	"../h/param.h"
+X#ifndef pyr	/* Pyramid */
+X#include	"../machine/pte.h"
+X#endif
+X#include	"../h/systm.h"
+X#include	"../h/map.h"
+X#include	"../h/dir.h"
+X#include	"../h/user.h"
+X#include	"../h/proc.h"
+X#ifdef BSD4_3
+X#include	"../h/namei.h"
+X#else BSD4_3
+X#include	"../h/nami.h"
+X#endif BSD4_3
+X#include	"../h/inode.h"
+X#include	"../h/mbuf.h"
+X#include	"../h/socket.h"
+X#include	"../remote/remotefs.h"
+X#include	"../h/errno.h"
+X#include	"../netinet/in.h"
+X#include	"../h/file.h"
+X
+Xextern struct remoteinfo remote_info[];
+Xextern struct remoteinfo *remote_generic;
+Xextern struct nameserver	remote_ns;
+X
+X/*
+X * A fast routine for determining whether an inode is in the list of
+X * remote hosts, and returning a pointer into that list.
+X * Failure returns NULL.
+X */
+Xstruct remoteinfo *rmt_host(ip, asysnum)
+X	register struct inode	*ip;
+X	register long		*asysnum;
+X{
+X	register struct remoteinfo	*rp = remote_info;
+X	register long			i;
+X	
+X	if (ip == NULL)
+X		printf("rmt_host: ip=0\n");
+X	else for(i=0; i < R_MAXSYS; i++, rp++)
+X		if (rp->r_mntpt == ip) {
+X			*asysnum = i;
+X			return(rp);
+X		}
+X	return(NULL);
+X}
+X
+X/*
+X * This is an extension to rmt_host() in that if rmt_host() returns a
+X * pointer to a generic mount point, we return the pointer to the entry
+X * that describes where we have our current working directory.
+X */
+Xstruct remoteinfo *rmt_hostdir(ip, asysnum)
+X	register struct inode	*ip;
+X	register long		*asysnum;
+X{
+X	register struct remoteinfo *rp;
+X
+X	rp = rmt_host(ip, asysnum);
+X	if (rp == NULL)
+X		return(NULL);
+X	if (rp->r_name == NULL)
+X		if (u.u_rmtcdir < 0)
+X			return(rp);
+X		else
+X			return(remote_info + (*asysnum = u.u_rmtcdir));
+X	return(rp);
+X}
+X
+X/*
+X * called by isremote() to figure out if there is a host implied by
+X * 'path'.  Note that a user process must have ``registered'' with
+X * the kernel as being willing to provide name service.
+X */
+Xstruct remoteinfo *rmt_findhost(apath, asysnum)
+X	char	**apath;
+X	register long	*asysnum;
+X{
+X	label_t				qsave;
+X	register struct remoteinfo	*rp;
+X	char				savec;
+X	struct remoteinfo		*rmt_findaddr(),
+X					*rmt_findslot();
+X	register struct proc		*p;
+X	register char			*path = *apath, *cp;
+X	register struct mbuf		*m = NULL;
+X	register long			error = 0,
+X					i;
+X
+X	/*
+X	 * If the path is relative, then it must be because we have done
+X	 * a remote chdir()... take the directory from there.
+X	 */
+X	if (*path != '/' && u.u_rmtcdir >= 0) {
+X		debug13("path %s==>cwd=#%d\n", path, u.u_rmtcdir);
+X		*asysnum = u.u_rmtcdir;
+X		return (remote_info + u.u_rmtcdir);
+X	}
+X
+X	/*
+X	 * First try to satisfy the name from the existing table... there
+X	 * may have been a mount done explicitly that has the form
+X	 * "/hostname", or there may have been an implicit mount.  Check
+X	 * for both.
+X	 */
+X	rp = remote_info;
+X	for(i=0; i < R_MAXSYS; i++, rp++)
+X		if (rp->r_name && rmt_pathimplies(rp, apath)) {
+X			debug13("%s==>mntpt=%s(#%d)\n",
+X				*apath, rp->r_mntpath, i);
+X			*asysnum = i;
+X			return(rp);
+X		}
+X
+X	/*
+X	 * If that fails, then give the name server a crack at it.  Note that
+X	 * we don't check to see if we found an open slot, because the address
+X	 * that we get back may match an existing address.
+X	 * If the nameserver is around, send him a signal.  Then wait
+X	 * patiently for the response.
+X	 */
+X	while (remote_ns.rn_path) /* Lock out all other nameserver action */
+X		sleep((caddr_t)&remote_ns.rn_path, PZERO+1);
+X
+X	bcopy(&u.u_qsave, &qsave, sizeof(label_t));
+X	if (setjmp(&u.u_qsave)) {
+X		error = EINTR;
+X		goto out;
+X	}
+X
+X	/*
+X	 * The nameserver only needs the first component.
+X	 */
+X	cp = path;
+X	while (*cp == '/')
+X		cp++;
+X	while (*cp && *cp != '/')
+X		cp++;
+X	savec = *cp;
+X	*cp = '\0';
+X	remote_ns.rn_pathlen = cp - path + 1;
+X	remote_ns.rn_path = path;
+X	p = remote_ns.rn_proc;
+X	if (server_alive(p)) {
+X		psignal(p, SIGURG);
+X		sleep((caddr_t)&remote_ns.rn_name, PZERO+1);
+X	}
+X	*cp = savec;
+X
+X	/*
+X	 * Ok, now see what the server had to say...
+X	 */
+X	m = remote_ns.rn_name;
+X	remote_ns.rn_name = NULL;
+X	if (m == NULL)
+X		error = EADDRNOTAVAIL;
+X	else {
+X		rp = rmt_findaddr(m, asysnum);
+X		*apath = cp;
+X	}
+X	if (rp || m == NULL)
+X		goto out;
+X
+X	if ((rp = rmt_findslot(asysnum)) == NULL)
+X		error = ETOOMANYREMOTE;
+X	else {
+X		if (rp->r_name) {
+X			debug13("findhost: reusing %d, %s\n",
+X				asysnum, rp->r_mntpath);
+X			(void) m_free(rp->r_name);
+X		}
+X		rp->r_name = m;
+X		bcopy (mtod(m, caddr_t) + m->m_len, rp->r_mntpath,
+X			MIN(R_MNTPATHLEN, MLEN - m->m_len));
+X		m = NULL;
+X	}
+X
+Xout:
+X	if (remote_ns.rn_name)
+X		(void) m_free(remote_ns.rn_name);
+X	else if (m)
+X		(void) m_free(m);
+X	remote_ns.rn_name = NULL;
+X	remote_ns.rn_path = NULL;
+X	wakeup((caddr_t)&remote_ns.rn_path);
+X	if (error) {
+X		rp = NULL;
+X		u.u_error = error;
+X	}
+X
+X	/*
+X	 * Since we are returning and may sleep again, we must restore the
+X	 * setjmp info so that we don't kill ourselves.
+X	 */
+X	bcopy(&qsave, &u.u_qsave, sizeof(label_t));
+X	return (rp);
+X}
+X
+X/*
+X * if (index >= 0) i.e. valid remote host
+X *	Set the working directory to the mount point for system 'index'.
+X *	This, along with what the server does, will effect a chdir("remotedir");
+X * if (index < 0)
+X *	then simply decrement the number of chdir's on the current remote
+X *	host, if any.
+X */
+Xremotechdir(index)
+X	long	index;
+X{
+X	register struct inode *ip = NULL, *oip;
+X	register struct remoteinfo	*rp;
+X	register long			error = 0;
+X	long				i;
+X	struct remoteinfo		*rmt_host();
+X
+X	debug14("cd #%d\n", index);
+X	if (index >= R_MAXSYS)
+X		return(ENOENT);
+X	/*
+X	 * If we are currently cd'ed to another remote host, decrement its'
+X	 * reference count.
+X	 */
+X	oip = u.u_cdir;
+X	if (rp = rmt_hostdir(oip, &i)) {
+X		debug14("uncd #%d, ip=%x\n", i, oip);
+X		rp->r_nchdir--;
+X	}
+X	rp = remote_info + index;
+X	if (index >= 0) {
+X		/*
+X		 * If this is an implied mount point, find the inode for the
+X		 * generic mount pt.
+X		 */
+X		if (rp->r_mntpt == NULL) {
+X			if (remote_generic)
+X				ip = remote_generic->r_mntpt; 
+X			debug14("cd is generic, ip=%x\n", ip);
+X			if (ip == NULL)
+X				return(ENOENT);
+X		}
+X		else
+X			ip = rp->r_mntpt;
+X		rp->r_nchdir++;		/* bump the reference count */
+X		u.u_rmtcdir = index;
+X		irele(oip);
+X		ip->i_count++;
+X		u.u_cdir = ip;
+X	}
+X
+X	return(error);
+X}
+X
+X/*
+X * See if a host is implied in a remote_info entry from the path name 'path'.
+X */
+Xrmt_pathimplies(rp, path)
+X	register struct remoteinfo	*rp;
+X	register char			**path;
+X{
+X	register char	*p1, *p2, *pend;
+X
+X	p1 = rp->r_mntpath;
+X	while(*p1 == '/')
+X		p1++;
+X	p2 = *path;
+X	while(*p2 == '/')
+X		p2++;
+X
+X	/*
+X	 * Compare against the mount point.
+X	 */
+X	pend = rp->r_mntpath + R_MNTPATHLEN;
+X	while (*p1 == *p2 && *p1 && p1 < pend)
+X		p1++, p2++;
+X	if (*p1 == *p2 || (*p1 == '\0' && *p2 == '/')) {
+X		*path = p2;
+X		return(TRUE);
+X	}
+X
+X	return (FALSE);
+X}
+X
+X/*
+X * See if any remote entry already had address 'addr'.
+X */
+Xstruct remoteinfo *rmt_findaddr(m, asysnum)
+X	register struct mbuf	*m;
+X	register long		*asysnum;
+X{
+X	register struct remoteinfo	*rp;
+X	register caddr_t		addr;
+X	register int			i, len;
+X
+X	addr = mtod(m, caddr_t);
+X	len = m->m_len;
+X	for (i=0, rp = remote_info; i < R_MAXSYS; i++, rp++)
+X		if (rp->r_name
+X		&& len == rp->r_name->m_len
+X		&& bcmp(mtod(rp->r_name, caddr_t), addr, len) == 0) {
+X			*asysnum = i;
+X			debug13("%s: same as mnt %d\n", addr+len, i);
+X			return(rp);
+X		}
+X	return(NULL);
+X}
+X
+X/*
+X * Find an open slot in the remote info.
+X */
+Xstruct remoteinfo *rmt_findslot(asysnum)
+X	register long	*asysnum;
+X{
+X	register struct remoteinfo	*rp,
+X					*frp = NULL;
+X	register int			i, fi;
+X
+X	for (i=0, rp = remote_info; i < R_MAXSYS; i++, rp++) {
+X		if (rp->r_mntpt || rp ->r_sock) /* active connections */
+X			continue;
+X		if (rp->r_name == NULL) {
+X			frp = rp;
+X			fi = i;
+X			break;
+X		}
+X		if (frp == NULL || rp->r_age < frp->r_age) {
+X			frp = rp;
+X			fi = i;
+X		}
+X	}
+X	if (frp) {
+X		debug13("slt: %d\n", fi);
+X		*asysnum = fi;
+X		return(frp);
+X	}
+X
+X	/*
+X	 * No slot... do garbage collection.
+X	 */
+X	for (i=0, rp = remote_info; i < R_MAXSYS; i++, rp++)
+X		if (rp->r_mntpt == NULL
+X		 && rp->r_nchdir == 0 && rp->r_nfile == 0) {
+X			debug13("fndslt: usurp %d=%s\n",
+X				rp - remote_info, rp->r_mntpath);
+X			*asysnum = i;
+X			rmt_closehost(rp);
+X			(void) m_free(rp->r_name);
+X			rp->r_name = NULL;
+X			return(rp);
+X		}
+X
+X	return(NULL);
+X}
+SHAREOF
+chmod 444 remote/usr.sys.remote/rmt_subr.c
+#
+# remote/usr.sys.remote/rmt_syscall1.c
+#
+if [ -f remote/usr.sys.remote/rmt_syscall1.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/usr.sys.remote/rmt_syscall1.c or ^C to quit' 
+	read ans 
+	rm -f remote/usr.sys.remote/rmt_syscall1.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/usr.sys.remote/rmt_syscall1.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Header: rmt_syscall1.c,v 2.0 85/12/07 18:19:21 toddb Rel $
+X *
+X * $Log:	rmt_syscall1.c,v $
+X * Revision 2.0  85/12/07  18:19:21  toddb
+X * First public release.
+X * 
+X */
+X#include	"../h/param.h"
+X#ifndef pyr	/* Pyramid */
+X#include	"../machine/pte.h"
+X#endif
+X#include	"../h/systm.h"
+X#include	"../h/map.h"
+X#include	"../h/dir.h"
+X#include	"../h/user.h"
+X#include	"../h/kernel.h"
+X#include	"../h/proc.h"
+X#include	"../h/mbuf.h"
+X#include	"../h/socket.h"
+X#include	"../h/file.h"
+X#include	"../remote/remotefs.h"
+X#include	"../h/stat.h"
+X#include	"../h/errno.h"
+X#include	"../netinet/in.h"
+X
+Xextern struct remoteinfo	remote_info[];
+X
+X/*
+X * Remote access()
+X */
+Xrmt_access (sysindex, m)
+X	int	sysindex;
+X	struct mbuf	*m;
+X{
+X	struct message	*msg = mtod(m, struct message *);
+X	struct a {
+X		char	*path;
+X		long	mode;
+X	} *uap = (struct a *)u.u_ap;
+X
+X	msg->m_args[ 0 ] = htonl(uap->mode);
+X	
+X	/*
+X	 * Now send it.
+X	 */
+X	return( rmt_msgfin(sysindex, m, 0) );
+X}
+X
+X/*
+X * Remote chdir()
+X */
+Xrmt_chdir (sysindex, m)
+X	int	sysindex;
+X	struct mbuf	*m;
+X{
+X	int	error;
+X
+X	/*
+X	 * Now send it.
+X	 */
+X	if ((error = rmt_msgfin(sysindex, m, 0)) == 0)
+X		error = remotechdir(sysindex);
+X
+X	return( error );
+X}
+X
+X/*
+X * Remote chmod() and fchmod()
+X */
+Xrmt_chmod (sysindex, m)
+X	int	sysindex;
+X	struct mbuf	*m;
+X{
+X	int	i = 0;
+X	struct message *msg = mtod(m, struct message *);
+X	struct a {
+X		long	path_or_fd;
+X		long	mode;
+X	} *uap = (struct a *)u.u_ap;
+X
+X	if (htons(msg->m_syscall) == RSYS_fchmod)
+X		i++;
+X	msg->m_args[ i ] = htonl(uap->mode);
+X	/*
+X	 * Now send it.
+X	 */
+X	return( rmt_msgfin(sysindex, m, 0) );
+X}
+X
+X/*
+X * Remote chown() and fchown()
+X */
+Xrmt_chown (sysindex, m)
+X	int	sysindex;
+X	struct mbuf	*m;
+X{
+X	int	i = 0;
+X	struct message *msg = mtod(m, struct message *);
+X	struct a {
+X		long	path_or_fd;
+X		long	owner, group;
+X	} *uap = (struct a *)u.u_ap;
+X
+X	if (htons(msg->m_syscall) == RSYS_fchown)
+X		i++, m->m_len = R_MINRMSG + 3*sizeof(long);
+X	msg->m_args[ i++ ] = htonl(uap->owner);
+X	msg->m_args[ i ] = htonl(uap->group);
+X	/*
+X	 * Now send it.
+X	 */
+X	return( rmt_msgfin(sysindex, m, 0) );
+X}
+X
+X/*
+X * Remote dup()
+X */
+Xrmt_dup (sysindex, m)
+X	long	sysindex;
+X	struct mbuf	*m;
+X{
+X	int	fd, error;
+X	struct message *msg = mtod(m, struct message *);
+X	struct file	*fp;
+X	struct a {
+X		long	fd;
+X	} *uap = (struct a *)u.u_ap;
+X
+X	fp = u.u_ofile[ uap->fd ];
+X	fd = ufalloc(0);
+X	if (fd < 0)
+X		return(-1);
+X	remote_info[ (int)fp->f_data ].r_nfile++;
+X	dupit(fd, fp, u.u_pofile[uap->fd]);
+X	msg->m_args[ 1 ] = htonl(fd);
+X
+X	/*
+X	 * Now send it.
+X	 */
+X	error = rmt_msgfin(sysindex, m, 0);
+X	if (error)
+X		rmt_deallocfd(fd);
+X	return(error);
+X}
+X
+X/*
+X * Remote dup2()
+X */
+Xrmt_dup2 (sysindex, m)
+X	long	sysindex;
+X	struct mbuf	*m;
+X{
+X	struct message *msg = mtod(m, struct message *);
+X	struct file	*oldfp, *newfp;
+X	struct a {
+X		long	oldfd,
+X			newfd;
+X	} *uap = (struct a *)u.u_ap;
+X	long	oldfd = uap->oldfd,
+X		newfd = uap->newfd,
+X		error;
+X
+X	oldfp = u.u_ofile[ oldfd ];
+X	if (newfd >= NOFILE)
+X		return(EBADF);
+X	if (oldfd == newfd)
+X		return(newfd);
+X	if (newfp = u.u_ofile[ newfd ]) {
+X		/*
+X		 * If the new file descriptor (which must be closed) is
+X		 * remote on system 'n', then we may have to send a close
+X		 * message to system 'n', but only if
+X		 *	1. the file descriptor being duped is non-remote
+X		 *		or
+X		 *	2. the file descriptor being duped is on a different
+X		 *	   remote system.
+X		 * Note that case number 1 implies that there is no more
+X		 * remote work to be done.
+X		 */
+X		if (newfp->f_flag & FREMOTE) {
+X			if ((oldfp->f_flag & FREMOTE) == 0
+X			 || newfp->f_data != oldfp->f_data) {
+X				if ((oldfp->f_flag & FREMOTE) == 0)
+X					sysindex = -1;
+X				uap->oldfd = uap->newfd;
+X				remote_fd(RSYS_close);
+X			}
+X			else
+X				closef(newfp);
+X		}
+X		else
+X			closef(newfp);
+X	}
+X	dupit(newfd, oldfp, u.u_pofile[ oldfd ]);
+X
+X	/*
+X	 * We may already be done.
+X	 */
+X	if (sysindex < 0)
+X		return(0);
+X	
+X	/*
+X	 * Now send it.
+X	 */
+X	remote_info[ sysindex ].r_nfile++;
+X	msg->m_args[ 1 ] = htonl(newfd);
+X	error = rmt_msgfin(sysindex, m, 0);
+X	if (error)
+X		rmt_deallocfd(newfd);
+X
+X	return(error);
+X}
+X
+X/*
+X * routine for handling an error.  We should never get here... but if we
+X * do.....
+X */
+Xrmt_error(sysnum)
+X	int	sysnum;
+X{
+X	debug1("error reached\n");
+X	return(EINVAL);
+X}
+SHAREOF
+chmod 444 remote/usr.sys.remote/rmt_syscall1.c
+#
+# remote/usr.sys.remote/rmt_syscall2.c
+#
+if [ -f remote/usr.sys.remote/rmt_syscall2.c ]; then 
+	echo -n 'Hit <return> to overwrite remote/usr.sys.remote/rmt_syscall2.c or ^C to quit' 
+	read ans 
+	rm -f remote/usr.sys.remote/rmt_syscall2.c 
+fi 
+ 
+sed -e 's/^.//' << \SHAREOF > remote/usr.sys.remote/rmt_syscall2.c
+X/*
+X * Copyright 1985, Todd Brunhoff.
+X *
+X * This software was written at Tektronix Computer Research Laboratories
+X * as partial fulfillment of a Master's degree at the University of Denver.
+X * This is not Tektronix proprietary software and should not be
+X * confused with any software product sold by Tektronix.  No warranty is
+X * expressed or implied on the reliability of this software; the author,
+X * the University of Denver, and Tektronix, inc. accept no liability for
+X * any damage done directly or indirectly by this software.  This software
+X * may be copied, modified or used in any way, without fee, provided this
+X * notice remains an unaltered part of the software.
+X *
+X * $Header: rmt_syscall2.c,v 2.0 85/12/07 18:19:28 toddb Rel $
+X *
+X * $Log:	rmt_syscall2.c,v $
+X * Revision 2.0  85/12/07  18:19:28  toddb
+X * First public release.
+X * 
+X */
+X#include	"../h/param.h"
+X#ifndef pyr	/* Pyramid */
+X#include	"../machine/pte.h"
+X#endif
+X#include	"../h/systm.h"
+X#include	"../h/map.h"
+X#include	"../h/dir.h"
+X#include	"../h/user.h"
+X#include	"../h/kernel.h"
+X#include	"../h/proc.h"
+X#include	"../h/mbuf.h"
+X#include	"../h/socket.h"
+X#include	"../remote/remotefs.h"
+X#include	"../h/file.h"
+X#include	"../h/stat.h"
+X#include	"../h/errno.h"
+X#include	"../netinet/in.h"
+X#include	"../h/uio.h"
+X
+Xextern struct remoteinfo	remote_info[];
+Xextern syscalls			remote_syscall[];
+X
+X/*
+X * Remote fcntl()
+X */
+X
+Xrmt_fcntl (sysindex, m)
+X	int	sysindex;
+X	struct mbuf	*m;
+X{
+X	register long		fd,
+X				error;
+X	register struct message *msg = mtod(m, struct message *);
+X	register struct a {
+X		long	fd,
+X			command,
+X			arg;
+X	} *uap = (struct a *)u.u_ap;
+X	register struct file	*fp;
+X
+X	if (uap->command == F_DUPFD) {
+X		fp = u.u_ofile[ uap->fd ];
+X		fd = ufalloc(uap->arg);
+X		if (fd < 0)
+X			return(-1);
+X		remote_info[ (int)fp->f_data ].r_nfile++;
+X		dupit(fd, fp, u.u_pofile[uap->fd]);
+X		msg->m_args[ 1 ] = htonl(fd);
+X		msg->m_syscall = htons(RSYS_dup);
+X	}
+X	else {
+X		msg->m_args[ 1 ] = htonl(uap->command);
+X		msg->m_args[ 2 ] = htonl(uap->arg);
+X		m->m_len += sizeof(long);
+X	}
+X
+X	/*
+X	 * Now send it
+X	 */
+X	error = rmt_msgfin(sysindex, m, 0);
+X	if (error && uap->command == F_DUPFD)
+X		rmt_deallocfd(fd);
+X
+X	return(error);
+X}
+X
+X/*
+X * Remote flock()
+X */
+Xrmt_flock (sysindex, m)
+X	int	sysindex;
+X	struct mbuf	*m;
+X{
+X	struct message *msg = mtod(m, struct message *);
+X	struct a {
+X		long	fd;
+X		long	operation;
+X	} *uap = (struct a *)u.u_ap;
+X
+X	msg->m_args[ 1 ] = htonl(uap->operation);
+X	/*
+X	 * Now send it.
+X	 */
+X	return( rmt_msgfin(sysindex, m, 0) );
+X}
+X
+X/*
+X * Remote ioctl()
+X */
+X
+Xrmt_ioctl (sysindex, m, request, argp)
+X	int	sysindex,
+X		request;
+X	struct mbuf	*m;
+X	char	*argp;
+X{
+X
+X	/*
+X	 * for now always fail.
+X	 */
+X	return(EINVAL);
+X}
+X
+X/*
+X * Remote lseek()
+X */
+Xrmt_lseek (sysindex, m)
+X	long	sysindex;
+X	struct mbuf	*m;
+X{
+X	struct message	*msg = mtod(m, struct message *);
+X	struct a {
+X		long	fd,
+X			offset,
+X			whence;
+X	} *uap = (struct a *)u.u_ap;
+X	register long	flags = RFLG_INFO;
+X	register long	twhence = uap->whence;
+X	register long	error;
+X	register struct file	*fp = u.u_ofile[ uap->fd ];
+X
+X	/*
+X	 * As a special case for the sake of speed, L_INCR and L_SET can be
+X	 * done locally and then the message can be sent as
+X	 * info only (no reply).
+X	 */
+X	switch (twhence) {
+X	case L_INCR:
+X		/*
+X		 * Very special case: lseek(fd, 0, L_INCR) is a noop.
+X		 */
+X		if (uap->offset == 0) {
+X			m_free(m);
+X			u.u_r.r_off = fp->f_offset;
+X			return(0);
+X		}
+X		fp->f_offset += uap->offset;
+X		break;
+X	case L_XTND:
+X		flags = 0;
+X		break;
+X	case L_SET:
+X		fp->f_offset = uap->offset;
+X		break;
+X	default:
+X		m_free(m);
+X		u.u_error = EINVAL;
+X		return(0);
+X	}
+X	msg->m_args[ 1 ] = htonl(uap->offset);
+X	msg->m_args[ 2 ] = htonl(twhence);
+X	m->m_len += sizeof(long);
+X	if (flags == RFLG_INFO)
+X		msg->m_syscall = htons(RSYS_qlseek);
+X
+X	/*
+X	 * Now send it.
+X	 */
+X	error = rmt_msgfin(sysindex, m, flags);
+X	if (flags != RFLG_INFO)
+X		fp->f_offset = u.u_r.r_val1;
+X	else
+X		u.u_r.r_off = fp->f_offset;
+X	return( error );
+X}
+X
+X/*
+X * Remote mknod()
+X */
+Xrmt_mknod (sysindex, m, mode, dev)
+X	long	sysindex,
+X		mode, dev;
+X	struct mbuf	*m;
+X{
+X	struct message	*msg = mtod(m, struct message *);
+X	struct a {
+X		char	*path;
+X		long	mode,
+X			dev;
+X	} *uap = (struct a *)u.u_ap;
+X
+X	msg->m_args[ 0 ] = htonl(uap->mode);
+X	msg->m_args[ 1 ] = htonl(uap->dev);
+X	msg->m_args[ 2 ] = htonl(u.u_cmask);
+X
+X	/*
+X	 * Now send it.
+X	 */
+X	return( rmt_msgfin(sysindex, m, 0) );
+X}
+X
+Xrmt_noop() {	return;	}
+X
+X/*
+X * Remote mkdir() and rmdir() and unlink() and fsync() and close()
+X */
+Xrmt_onearg (sysindex, m)
+X	int	sysindex;
+X	struct mbuf	*m;
+X{
+X	struct message	*msg = mtod(m, struct message *);
+X	short	syscall = ntohs(msg->m_syscall);
+X	long	error;
+X
+X	if (syscall == RSYS_close) {
+X		struct a {
+X			long	fd;
+X		} *uap = (struct a *)u.u_ap;
+X		rmt_deallocfd(uap->fd);
+X		m->m_len = R_MINRMSG + sizeof(long);
+X	}
+X	else if (syscall == RSYS_fsync)
+X		m->m_len = R_MINRMSG + sizeof(long);
+X	else
+X		msg->m_args[ 0 ] = htonl(u.u_cmask);
+X
+X	error = rmt_msgfin(sysindex, m, remote_syscall[ syscall ].sys_flag);
+X	return(error);
+X}
+SHAREOF
+chmod 444 remote/usr.sys.remote/rmt_syscall2.c
+
+

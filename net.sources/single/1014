@@ -1,0 +1,791 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,825d09cf8b08adf7,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-02-24 13:34:09 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site harvard.UUCP
+Path: utzoo!linus!vaxine!wjh12!harvard!elvy
+From: elvy@harvard.UUCP (Marc Elvy)
+Newsgroups: net.sources
+Subject: TCP/IP over TTY lines (source)
+Message-ID: <158@harvard.UUCP>
+Date: Fri, 24-Feb-84 16:34:09 EST
+Article-I.D.: harvard.158
+Posted: Fri Feb 24 16:34:09 1984
+Date-Received: Sat, 25-Feb-84 04:42:07 EST
+Organization: Aiken Computation Lab, Harvard
+Lines: 771
+
+
+Since I submitted an article some time ago asking for advice on how to
+implement TCP/IP through TTY ports, I received many letters -- some
+offering advice and some wanting to know what I discovered.  Rather
+than respond to each of them in person, I am submitting here the sources
+necessary to effect such a system.
+
+One of our systems hackers (Robert Morris, harvard!morris) fixed up
+the kernel on our 4.2 Vaxes so that they talked to one another using
+TCP/IP stuff (we can rlogin, rwho, ruptime, rsh, telnet, ftp, etc.).
+It is a very nice setup, considering we have two Vaxes right next to
+one another, yet no Ethernet equipment.  While (in empirical terms) it
+is rather slow, it is quite usable if there are not too many people
+on the system.
+
+What follows are four files:  README, if_itt.c, ittconf.c, tty_conf.c
+The README file contains a description of how to modify the kernel
+to run TCP/IP over tty lines on 4.2BSD systems.  The files are separated
+by:
+****************************
+	filename
+****************************
+If you have any questions, send mail to me (or directly to harvard!morris).
+
+Enjoy.
+
+Marc
+
+Enc.
+-----------------
+
+****************************
+	README
+****************************
+
+These are the changes needed to install tcp over tty lines on a 4.2
+system.
+
+Put if_itt.c in vaxif/if_itt.c
+Add a line in conf/files reading
+vaxif/if_itt.c		optional itt inet
+and config SYSTEM; cd ../SYSTEM; make depend
+
+If you have made no changes to sys/tty_conf.c, just copy the one
+supplied. Otherwise, add a line discipline (I assume it is number
+5) which uses ittopen, ittclose, and ittrint.
+
+Add lines in sys/init_main.c reading
+#include "itt.h"
+#if NITT > 0
+	ittattach();
+#endif
+after the lines reading (roughly)
+#if NLOOP > 0
+	loattach();
+#endif
+
+cd ../SYSTEM ; make vmunix
+
+(If it doesn't work, send me a note.)
+
+Compile ittconf.c and install it someplace; it tells the itt driver
+which tty line corresponds to which host number.
+
+Add lines to /etc/rc.local for each non-local host reading
+ittconf /dev/ttyxx <host> > /dev/console &
+(use some appropriate pathname for ittconf, like /etc/ittconf)
+where /dev/ttyxx is the tty line to the other host, and <host> is the
+host number you have chosen (like 1, not 126.1).
+ittconf opens the indicated device, changes the line discipline
+to number five, and does an ioctl whose number is the host number
+at the other end of the line, and then pause()s to keep the line
+open and the line discipline set. If you kill it, you'll stop any
+communication on the line and flush the packet queues for that line.
+
+
+Right at the beginning of /etc/rc.local, add
+/etc/ifconfig itt0 <net>.<localhost>
+where <net> is the net number you have chosen (126 here), and <localhost>
+is the host number on that net you have chosen for this host. One one vax
+we have
+/etc/ifconfig itt0 126.1
+and on the other
+/etc/ifconfig itt0 126.2
+So our vaxes are hosts 126.1 and 126.2; you must add entries in /etc/hosts
+also, of the form
+vax1		126.1
+vax2		126.2
+...
+The additions should be the same on all machines; they should all know
+their local addresses as well as the addresses of other hosts.
+The ifconfig lines must be AFTER the iffconf lines.
+It should work. It has a few problems. It's pretty slow, but it's set
+up so that if you have more than one line between two hosts (configured
+by more than one ittconf command), it shares the load between them. But
+for various reasons, it often hangs for a fraction of a second about every
+1000 characters under full load. This is because I had to use timeouts
+instead of wakeups to keep the tty output queues full, and the timeouts
+have granularity problems. It's not been very thouroughly
+tested. If you check back in a while I'll have
+packet forwarding set up. (Ie, right now if two machines aren't directly
+connected, they can't talk. The driver should know how to pass on packets
+for a third party.)
+****************************
+	if_itt.c
+****************************
+
+/*	if_itt.c	6.1	83/07/29	*/
+
+#include "../machine/pte.h"
+
+#include "../h/param.h"
+#include "../h/systm.h"
+#include "../h/mbuf.h"
+#include "../h/buf.h"
+#include "../h/protosw.h"
+#include "../h/socket.h"
+#include "../h/vmmac.h"
+#include "../h/ioctl.h"
+#include "../h/errno.h"
+
+#include "../net/if.h"
+#include "../net/netisr.h"
+#include "../net/route.h"
+#include "../netinet/in.h"
+#include "../netinet/in_systm.h"
+#include "../netinet/ip.h"
+#include "../netinet/ip_var.h"
+
+#include "../vax/cpu.h"
+#include "../vax/mtpr.h"
+#include "../vaxif/if_uba.h"
+#include "../vaxuba/ubareg.h"
+#include "../vaxuba/ubavar.h"
+#include "../h/tty.h"
+
+/* don't increase this */
+#define	ITTMTU		350	/* Max transmission unit (bytes) */
+#define ITTHIWAT	1000	/* tty total output usage */
+#define ITTSLOWT	((ITTHIWAT * 60) / 900)
+#define ITTFASTT	(ITTSLOWT / 3)
+
+/* escape codes for synchronization */
+/* send ESC, ESC???, argument */
+#define ESC 'E'
+#define ESCBEGIN 'b'	/* null argument */
+#define ESCEND 'e'	/* null argument */
+#define ESCDEST 'd'	/* argument is destination host # */
+#define ESCHOP 'h'	/* hop count, discard after a while */
+
+/* state codes */
+#define IDLE 0
+#define DATA 1
+/* other codes are escape codes; if state is ESCDEST, waiting for dest */
+
+int	ittattach(), ittrint();
+int	ittinit(), ittioctl(), ittoutput(), ittreset();
+int	ittwatch();
+
+
+struct ifnet ittif;
+int itterrIDLE, itterrBEGIN, itterrEND;
+extern struct tty *ittdesttotp();
+struct itt_header{
+	unsigned int itt_dest;
+};
+#define NITTL 5
+struct ittl {
+	int itt_state;
+	struct tty *itt_tp;
+	int itt_host;
+	struct mbuf *itt_mbase, *itt_m;
+	unsigned int itt_dest, itt_hop;
+} ittl[NITTL];
+
+/*
+ * Interface exists: make available by filling in network interface
+ * record.  System will initialize the interface when it is ready
+ * to accept packets.
+ */
+ittattach()
+{
+	register struct ifnet *ifp = &ittif;
+
+	ifp->if_name = "itt";
+	ifp->if_mtu = ITTMTU;
+	ifp->if_init = ittinit;
+	ifp->if_output = ittoutput;
+	ifp->if_ioctl = ittioctl;
+	ifp->if_reset = ittreset;
+	if_attach(ifp);
+	timeout(ittwatch, (caddr_t) 0, 60);
+}
+
+/*
+ * Reset of interface after UNIBUS reset.
+ * If interface is on specified uba, reset its state.
+ */
+ittreset()
+{
+
+	ittinit();
+}
+
+/*
+ * Initialization of interface; clear recorded pending
+ * operations, and reinitialize UNIBUS usage.
+ */
+ittinit()
+{
+	struct sockaddr_in *sin;
+	int s;
+
+	sin = (struct sockaddr_in *)&ittif.if_addr;
+	if (sin->sin_addr.s_addr == 0)
+		return;
+	ittif.if_flags |= IFF_UP | IFF_RUNNING;
+	if_rtinit(&ittif, RTF_UP);
+}
+
+/*
+ * ITT output routine.
+ */
+ittoutput(ifp, m, dst)
+	struct ifnet *ifp;
+	struct mbuf *m;
+	struct sockaddr *dst;
+{
+	struct tty *tp;
+	int s, error, i;
+	unsigned int dest;
+	struct mbuf *m2;
+	struct itt_header *ittp;
+
+	switch (dst->sa_family) {
+
+#ifdef INET
+	case AF_INET:
+		dest = in_lnaof(((struct sockaddr_in *)dst)->sin_addr);
+		break;
+#endif
+	default:
+		printf("itt%d: can't handle af%d\n", ifp->if_unit,
+			dst->sa_family);
+		error = EAFNOSUPPORT;
+		goto bad;
+	}
+	/* insert a fake header packet with destination in it;
+	 * removed and examined by ittstart().
+	 */
+	if (m->m_off > MMAXOFF ||
+	    MMINOFF + sizeof (struct itt_header) > m->m_off) {
+		m2 = m_get(M_DONTWAIT, MT_HEADER);
+		if (m2 == 0) {
+			printf("no bufs in output\n");
+			error = ENOBUFS;
+			goto bad;
+		}
+		m2->m_next = m;
+		m2->m_off = MMINOFF;
+		m2->m_len = sizeof (struct itt_header);
+		m = m2;
+	} else {
+		m->m_off -= sizeof (struct itt_header);
+		m->m_len += sizeof (struct itt_header);
+	}
+	ittp = mtod(m, struct itt_header *);
+	ittp->itt_dest = dest;
+
+	tp = ittdesttotp(dest);
+	if(tp == NULL && dest){
+		m_freem(m);
+		return(EHOSTUNREACH);
+	}
+	s = splimp();
+	if(dest == 0){
+		for(i = 0; i < 20; i++){
+			if((tp = ittdesttotp(i)) != NULL){
+				m2 = m_copy(m, 0, M_COPYALL);
+				mtod(m2, struct itt_header *)->itt_dest = i;
+				if(IF_QFULL(&ifp->if_snd)){
+					IF_DROP(&ifp->if_snd);
+					error = ENOBUFS;
+					splx(s);
+					m_freem(m);
+					m_freem(m2);
+					return(error);
+				}
+				IF_ENQUEUE(&ifp->if_snd, m2);
+			}
+		}
+		m_freem(m);
+	} else {
+		if(IF_QFULL(&ifp->if_snd)){
+			IF_DROP(&ifp->if_snd);
+			ifp->if_oerrors++;
+			error = ENOBUFS;
+			splx(s);
+			m_freem(m);
+			return(error);
+		}
+		IF_ENQUEUE(&ifp->if_snd, m);
+	}
+	while(ittoutq() < ITTHIWAT && ittstart())
+		;
+	splx(s);
+	return (0);
+bad:
+	m_freem(m);
+	return(error);
+}
+
+/*
+ * Start or restart output on interface.
+ */
+ittstart()
+{
+	u_char c;
+	int len;
+	u_char *cp;
+	int dest, s;
+	register struct mbuf *m, *mm;
+	struct mbuf *m2;
+	struct tty *tp;
+
+	s = splimp();
+	IF_DEQUEUE(&ittif.if_snd, m);
+	if(m == 0){
+		splx(s);
+		return(0);
+	}
+	mm = m;
+	dest = mtod(m, struct itt_header *)->itt_dest;
+	m->m_off += sizeof(struct itt_header);
+	m->m_len -= sizeof(struct itt_header);
+
+	tp = ittdesttotp(dest);
+	if(tp == NULL){
+		printf("itt dq %d?\n", dest);
+		m_freem(mm);
+		splx(s);
+		return(1);
+	}
+	ittsendesc(tp, ESCBEGIN, 0);
+	ittsendesc(tp, ESCDEST, dest);
+
+	while(m){
+		for(cp = mtod(m, u_char *); cp < mtod(m, u_char *) + m->m_len; cp++){
+			if(*cp == ESC) ittsend(tp, ESC);
+			ittsend(tp, *cp);
+		}
+		MFREE(m, m2);
+		m = m2;
+	}
+	m = mm;
+	ittsendesc(tp, ESCEND, 0);
+	ittif.if_opackets++;
+	ttstart(tp);
+	splx(s);
+	return(1);
+}
+
+ittrint(c, tp)
+register struct tty *tp;
+u_char c;
+{
+	int i, s;
+	extern int tk_nin;
+	struct ifqueue *ipq;
+	struct ittl *ip;
+
+	tk_nin++;
+	for(i = 0; i < NITTL; i++){
+		if(ittl[i].itt_tp == tp) break;
+	}
+	if(i >= NITTL){
+		printf("ittrint %x?\n", tp);
+		splx(s); return;
+	}
+	ip = &ittl[i];
+	s = splimp();
+	switch(ip->itt_state){
+	case IDLE:
+		if(c == ESC){
+			ip->itt_state = ESC;
+			splx(s); return;
+		}
+		itterrIDLE++;
+		ittif.if_ierrors++;
+		splx(s); return;
+	case DATA:
+		if(c == ESC){
+			ip->itt_state = ESC;
+			splx(s); return;
+		}
+		break;
+	case ESC:
+		if(c == ESC){
+			/* escaped ESC */
+			ip->itt_state = DATA;
+			break;
+		}
+		ip->itt_state = c;
+		splx(s); return;
+	case ESCBEGIN:
+		ip->itt_state = DATA;
+		if(ip->itt_mbase){
+			ittif.if_ierrors++;
+			itterrBEGIN++;
+			m_freem(ip->itt_mbase);
+			ip->itt_mbase = ip->itt_m = 0;
+		}
+		ip->itt_dest = 0;
+		ip->itt_hop = 0;
+		splx(s); return;
+	case ESCEND:
+		if(ip->itt_mbase == NULL){
+			itterrEND++;
+			ittif.if_ierrors++;
+			splx(s); return;
+		}
+		if(ip->itt_hop > 20){
+			printf("itt: loop\n");
+			m_freem(ip->itt_mbase);
+			ip->itt_mbase = ip->itt_m = 0;
+			splx(s);
+			ittif.if_ierrors++;
+			return;
+		}
+		ipq = &ipintrq;
+		if(IF_QFULL(ipq)){
+			IF_DROP(ipq);
+			ittif.if_collisions++;
+			m_freem(ip->itt_mbase);
+			ip->itt_mbase = ip->itt_m = 0;
+		} else {
+			if(mbad(ip->itt_mbase)) panic("ittrint: mbad enq\n");
+			IF_ENQUEUE(ipq, ip->itt_mbase);
+			schednetisr(NETISR_IP);
+			ittif.if_ipackets++;
+		}
+		ip->itt_state = IDLE;
+		ip->itt_m = ip->itt_mbase = 0;
+		splx(s); return;
+	case ESCHOP:
+		ip->itt_hop = c;
+		splx(s); return;
+	case ESCDEST:
+		ip->itt_dest = c;
+		ip->itt_state = DATA;
+		splx(s); return;
+	default:
+		printf("ittrint: unk state 0%o\n", ip->itt_state);
+		ip->itt_state = 0;
+		splx(s); return;
+	}
+	if(ip->itt_mbase == NULL){
+		ip->itt_m = ip->itt_mbase = m_get(M_DONTWAIT, MT_DATA);
+		if(ip->itt_m == 0){
+			splx(s);
+			return;
+		}
+		ip->itt_m->m_len = 1;
+		ip->itt_m->m_dat[0] = c;
+	} else if((ip->itt_m->m_len + ip->itt_m->m_off) >= MMAXOFF){
+		ip->itt_m->m_next = m_get(M_DONTWAIT, MT_DATA);
+		if(ip->itt_m->m_next == 0){
+			splx(s);
+			return;
+		}
+		ip->itt_m = ip->itt_m->m_next;
+		ip->itt_m->m_len = 1;
+		ip->itt_m->m_dat[0] = c;
+	} else {
+		ip->itt_m->m_dat[ip->itt_m->m_len++] = c;
+		if(mbad(ip->itt_mbase)) panic("ittrint: after else mbad\n");
+	}
+	splx(s);
+}
+
+
+/*
+ * Process an ioctl request.
+ */
+ittioctl(ifp, cmd, data)
+	register struct ifnet *ifp;
+	int cmd;
+	caddr_t data;
+{
+	struct ifreq *ifr = (struct ifreq *)data;
+	struct sockaddr_in *sin;
+	int s = splimp(), error = 0;
+
+	switch (cmd) {
+
+	case SIOCSIFADDR:
+		if (ifp->if_flags & IFF_RUNNING)
+			if_rtinit(ifp, -1);	/* delete previous route */
+		sin = (struct sockaddr_in *)&ifr->ifr_addr;
+		ifp->if_addr = *(struct sockaddr *)sin;
+		ifp->if_net = in_netof(sin->sin_addr);
+		ifp->if_host[0] = in_lnaof(sin->sin_addr);
+		ifp->if_broadaddr = *(struct sockaddr *)sin;
+		sin = (struct sockaddr_in *)&ifp->if_broadaddr;
+		sin->sin_addr = if_makeaddr(ifp->if_net, INADDR_ANY);
+		ifp->if_flags |= IFF_BROADCAST;
+		if (ifp->if_flags & IFF_RUNNING)
+			if_rtinit(ifp, RTF_UP);
+		else
+			ittinit(ifp->if_unit);
+		break;
+
+	default:
+		error = EINVAL;
+	}
+	splx(s);
+	return (error);
+}
+
+extern int lbolt;
+
+ittsend(tp, c)
+struct tty *tp;
+u_char c;
+{
+	int s;
+
+	if(putc(c, &tp->t_outq)){
+		printf("ittsend: out of clist\n");
+		return;
+	}
+}
+
+ittopen(dev, tp)
+dev_t dev;
+register struct tty *tp;
+{
+	return(0);
+}
+
+ittclose(tp)
+register struct tty *tp;
+{
+	int i;
+	for(i = 0; i < NITTL; i++){
+		if(ittl[i].itt_tp == tp) ittl[i].itt_tp = NULL;
+	}
+	return(0);
+}
+
+itttioctl(tp, cmd, addr)
+struct tty *tp;
+caddr_t addr;
+{
+	int i, s;
+
+	for(i = 0; i < NITTL; i++){
+		if(ittl[i].itt_tp == 0){
+			break;
+		}
+	}
+	if(i >= NITTL){
+		return(ENXIO);
+	}
+	ittl[i].itt_tp = tp;
+	ittl[i].itt_host = cmd;
+	ittl[i].itt_state = 0;
+	return(0);
+}
+
+ittwatch()
+{
+	while(ittoutq() < ITTHIWAT && ittstart())
+		;
+	if(ittoutq() >= ITTHIWAT){
+		timeout(ittwatch, (caddr_t) 0, ITTFASTT);
+	} else {
+		timeout(ittwatch, (caddr_t) 0, ITTSLOWT);
+	}
+}
+
+ittoutq()
+{
+	int i, cc = 0;
+
+	for(i = 0; i < NITTL; i++){
+		if(ittl[i].itt_tp){
+			cc += ittl[i].itt_tp->t_outq.c_cc;
+		}
+	}
+	return(cc);
+}
+
+mbad(m)
+struct mbuf *m;
+{
+	while(m){
+		switch(m->m_type){
+		case MT_DATA:
+		case MT_HEADER:
+		case MT_FTABLE:
+			break;
+		default:
+			printf("mbad %d\n", m->m_type);
+			return(1);
+		}
+		if((m->m_off + m->m_len) > MMAXOFF || (m->m_off < MMINOFF)){
+			printf("mbad off/size: off %d len %d\n", m->m_off, m->m_len);
+			return(1);
+		}
+		m = m->m_next;
+	}
+	return(0);
+}
+
+struct tty *
+ittdesttotp(dest)
+{
+	int i, mincc = 9999;
+	struct tty *tp = NULL;
+
+	for(i = 0; i < NITTL; i++){
+		if(ittl[i].itt_tp && ittl[i].itt_host == dest){
+			if(ittl[i].itt_tp->t_outq.c_cc < mincc){
+				tp = ittl[i].itt_tp;
+				mincc = tp->t_outq.c_cc;
+			}
+		}
+	}
+	return(tp);
+}
+
+ittsendesc(tp, c, a)
+struct tty *tp;
+u_char c, a;
+{
+	ittsend(tp, ESC);
+	ittsend(tp, c);
+	ittsend(tp, a);
+}
+****************************
+	ittconf.c
+****************************
+
+/* ittconf.c */
+
+#include <sgtty.h>
+
+main(argc, argv)
+char *argv[];
+{
+	int ldisc, host = 1;
+	int speed = B9600;
+	struct sgttyb vec;
+	int fd;
+
+	if(argc < 2){
+		printf("Usage: %s dev\n", argv[0]);
+		exit(1);
+	}
+	if(argc > 2) host = atoi(argv[2]);
+	if(argc > 3){
+		if(strcmp(argv[3], "300") == 0) speed = B300;
+		if(strcmp(argv[3], "1200") == 0) speed = B1200;
+		if(strcmp(argv[3], "2400") == 0) speed = B2400;
+	}
+	if((fd = open(argv[1], 2)) < 0){
+		perror(argv[1]);
+		exit(1);
+	}
+	ldisc = 5;
+	vec.sg_ispeed = vec.sg_ospeed = speed;
+	vec.sg_flags = RAW | EVENP | ODDP;
+	stty(fd, &vec);
+	if(ioctl(fd, TIOCSETD, &ldisc) < 0){
+		perror("SETD");
+		exit(1);
+	}
+	if(ioctl(fd, host, 0) < 0){
+		perror("host");
+	}
+	printf("yup\n");
+	pause();
+}
+****************************
+	tty_conf.c
+****************************
+
+/*	tty_conf.c	6.2	83/09/25	*/
+
+#include "../h/param.h"
+#include "../h/systm.h"
+#include "../h/buf.h"
+#include "../h/tty.h"
+#include "../h/conf.h"
+
+int	nodev();
+int	nulldev();
+
+int	ttyopen(),ttyclose(),ttread(),ttwrite(),nullioctl(),ttstart();
+int	ttyinput();
+
+#include "bk.h"
+#include "itt.h"
+#if NBK > 0
+int	bkopen(),bkclose(),bkread(),bkinput(),bkioctl();
+#endif
+
+#include "tb.h"
+#if NTB > 0
+int	tbopen(),tbclose(),tbread(),tbinput(),tbioctl();
+#endif
+
+#if NITT > 0
+int	ittopen(), ittclose(), itttioctl(), ittrint();
+#endif
+
+struct	linesw linesw[] =
+{
+	ttyopen, nulldev, ttread, ttwrite, nullioctl,
+	ttyinput, nodev, nulldev, ttstart, nulldev,
+#if NBK > 0
+	bkopen, bkclose, bkread, ttwrite, bkioctl,
+	bkinput, nodev, nulldev, ttstart, nulldev,
+#else
+	nodev, nodev, nodev, nodev, nodev,
+	nodev, nodev, nodev, nodev, nodev,
+#endif
+	ttyopen, ttyclose, ttread, ttwrite, nullioctl,
+	ttyinput, nodev, nulldev, ttstart, nulldev,
+#if NTB > 0
+	tbopen, tbclose, tbread, nodev, tbioctl,
+	tbinput, nodev, nulldev, ttstart, nulldev,		/* 3 */
+#else
+	nodev, nodev, nodev, nodev, nodev,
+	nodev, nodev, nodev, nodev, nodev,
+#endif
+#if NTB > 0
+	tbopen, tbclose, tbread, nodev, tbioctl,
+	tbinput, nodev, nulldev, ttstart, nulldev,		/* 4 */
+#else
+	nodev, nodev, nodev, nodev, nodev,
+	nodev, nodev, nodev, nodev, nodev,
+#endif
+#if NITT > 0
+	ittopen, ittclose, nodev, nodev, itttioctl,
+	ittrint, nodev, nodev, ttstart, nulldev,		/* 5 */
+#else
+	nodev, nodev, nodev, nodev, nodev,
+	nodev, nodev, nodev, nodev, nodev,
+#endif
+};
+
+int	nldisp = sizeof (linesw) / sizeof (linesw[0]);
+
+/*
+ * Do nothing specific version of line
+ * discipline specific ioctl command.
+ */
+/*ARGSUSED*/
+nullioctl(tp, cmd, data, flags)
+	struct tty *tp;
+	char *data;
+	int flags;
+{
+
+#ifdef lint
+	tp = tp; data = data; flags = flags;
+#endif
+	return (-1);
+}
+
+

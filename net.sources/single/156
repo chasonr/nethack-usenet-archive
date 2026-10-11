@@ -1,0 +1,533 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,e6647f58689706ba,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1982-12-27 02:44:44 PST
+Message-ID: <bnews.linus.942>
+Newsgroups: net.sources
+Path: utzoo!decvax!wivax!linus!smk
+X-Path: utzoo!decvax!wivax!linus!smk
+From: linus!smk
+Date: Mon Dec 27 05:44:39 1982
+Subject: squish.c
+X-Google-Info: Converted from the original B-News header
+Posted: Sun Dec 26 02:10:08 1982
+Received: Mon Dec 27 05:44:39 1982
+
+
+/*	Squish - compacts directory.
+ *
+ *	Compile:	cc -O -s squish.c -ldir -o squish
+ *	Run:		when directory is quiescent (AS ROOT)
+ *
+ *			..!linus!smk Dec 82
+ *			from an idea by RJKing WECo-Mg6565 Dec 82
+ */
+
+
+#include	<stdio.h>
+#include	<signal.h>
+#include	<fstab.h>
+#include	<sys/types.h>
+#include	<sys/stat.h>
+#include	<ndir.h>
+
+
+#define	MAKE_DIRECTORY	"mkdir"
+#define	REMOVE	"rm -r"
+
+
+char   *mktemp ();
+char   *index ();
+char   *rindex ();
+char   *sprintf ();
+FILE * popen ();
+struct fstab   *getfsent ();
+
+void compact ();
+void legal ();
+void remake_directory ();
+void fix_directory ();
+void activate ();
+
+char   *cmdname;
+
+
+main (argc, argv)
+int     argc;
+char   *argv[];
+{
+    register int    search;
+    register int    scan;
+    register int    files;
+    int     verbose;
+    int     recursive;
+
+    cmdname = argv[0];
+
+    verbose = 0;
+    recursive = 0;
+    files = 0;
+
+    if (argc == 1)
+    {
+	fprintf (stderr, "Usage: %s [-v] [-r] [directories ...]\n",
+		cmdname);
+	exit (1);
+    }
+
+ /* 	Check for command line flags and also for legal file names.	 
+ */
+    for (search = 1; search < argc; search++)
+	switch (argv[search][0])
+	{
+	    case '-': 
+		for (scan = 1; scan < strlen (argv[search]); scan++)
+		    switch (argv[search][scan])
+		    {
+			case 'v': 
+			    verbose = 1;
+			    break;
+			case 'r': 
+			    recursive = 1;
+			    break;
+			default: 
+			    fprintf (stderr,
+				    "Usage: %s [-v] [-r] [directories ...]\n",
+				    cmdname);
+			    exit (1);
+			    break;
+		    }
+		break;
+	    default: 
+		if (access (argv[search], 0) != 0)
+		{
+		    fprintf (stderr, "%s: %s does not exist\n",
+			    cmdname, argv[search]);
+		    exit (1);
+		}
+		else
+		{
+		/* 	Could be dangerous to allow .. and . in paths.	 
+		*/
+		    legal (argv[search]);
+		    files = 1;
+		}
+		break;
+	}
+
+    if (!files)
+    {
+	fprintf (stderr, "Usage: %s [-v] [-r] [directories ...]\n",
+		cmdname);
+	exit (1);
+    }
+
+ /* 	Some of the link operations can only be done by root.	 */
+    if (getuid () != 0)
+    {
+	fprintf (stderr, "%s: not superuser\n", cmdname);
+	exit (1);
+    }
+
+ /* 	Do the actual work -- compact for each argument.	 */
+    for (search = 1; search < argc; search++)
+	switch (argv[search][0])
+	{
+	    case '-': 
+		break;
+	    default: 
+		if (verbose)
+		    fprintf (stdout, "squishing directory %s\n",
+			    argv[search]);
+
+	    /* 	Since some operations in compact() will leave the file
+	       system in a strange state, don't allow interrupts duing
+	       this (and restore them later).	 */
+		(void) signal (SIGHUP, SIG_IGN);
+		(void) signal (SIGINT, SIG_IGN);
+		(void) signal (SIGQUIT, SIG_IGN);
+		(void) signal (SIGALRM, SIG_IGN);
+		(void) signal (SIGTERM, SIG_IGN);
+
+		compact (argv[search], 1, verbose, recursive);
+
+		(void) signal (SIGHUP, SIG_DFL);
+		(void) signal (SIGINT, SIG_DFL);
+		(void) signal (SIGQUIT, SIG_DFL);
+		(void) signal (SIGALRM, SIG_DFL);
+		(void) signal (SIGTERM, SIG_DFL);
+		break;
+	}
+}
+
+
+
+/*	This is the workhorse routine.  It is recursive if the
+	-r flag is set.  It essentially shifts directories and
+	remakes a clean directory so null directory entries are
+	removed.  (UNIX doesn't do this and otherwise would let
+	directories grow without bound.)  When this is performed
+	on a directory, the directory becomes as small as possible
+	without losing any information.  There should be a system
+	call for this.	*/
+void compact (directory, level, verbose, recursive)
+char   *directory;
+int     level;
+int     verbose;
+int     recursive;
+{
+    register int    indent;
+    register struct direct *entry;
+    register    DIR * temp_directory;
+    char   *last_component;
+    struct stat buffer;
+    char    trash[BUFSIZ];
+    char    newfile[BUFSIZ];
+    char    parent[BUFSIZ];
+
+ /* 	Since we can't be in the directory we are about to change (i.e.,
+    remove), we go back to the parent directory.	 */
+    (void) sprintf (parent, "%s", directory);
+    last_component = rindex (parent, '/');
+    if (last_component == NULL)
+    {
+	fprintf (stderr, "%s: must use full pathname\n", cmdname);
+	exit (1);
+    }
+    else
+	if (last_component == parent)
+	    (void) sprintf (parent, "/");
+	else
+	    *last_component = '\0';
+
+    if (chdir (parent) < 0)
+    {
+	fprintf (stderr, "%s: cannot chdir to ", cmdname);
+	perror (parent);
+	exit (1);
+    }
+
+
+ /* 	Make the temporary place where we move the directory. Search until
+    a non-existing name is found there.	 */
+    do
+    {
+	(void) sprintf (trash, "%s/squish%d.XXXXXX", parent, level);
+	(void) sprintf (trash, "%s", mktemp (trash));
+    }
+    while (access (trash, 0) == 0);
+
+
+ /* 	This is dangerous unless you know what is happening. We are
+    linking DIRECTORIES!  This messes up the file system link count
+    temporarily.	 */
+    if (link (directory, trash) < 0)
+    {
+	fprintf (stderr, "%s: cannot link %s to ",
+		cmdname, directory);
+	perror (trash);
+	exit (1);
+    }
+
+ /* 	Now the link count can be restored by removing one of the
+    directories.	 */
+    if (unlink (directory) < 0)
+    {
+	fprintf (stderr, "%s: cannot unlink ", cmdname);
+	perror (directory);
+	exit (1);
+    }
+
+ /* 	The old directory is remade in the normal UNIX way. A by-product
+    is that is is empty -- the key to this.	 */
+    remake_directory (directory, trash);
+
+    if (chdir (trash) < 0)
+    {
+	fprintf (stderr, "%s: cannot chdir to ", cmdname);
+	perror (trash);
+	(void) link (trash, directory);
+	(void) unlink (trash);
+	exit (1);
+    }
+
+
+ /* 	If -r was specified, we now look in the directory for
+    subdirectories on which to call this routine recursively. If not, only
+    the top level directory is compacted.	 */
+    if (recursive)
+    {
+	temp_directory = opendir (".");
+	if (temp_directory == NULL)
+	{
+	    fprintf (stderr, "%s: cannot open ", cmdname);
+	    perror (trash);
+	    (void) link (trash, directory);
+	    (void) unlink (trash);
+	    exit (1);
+	}
+
+	entry = readdir (temp_directory);
+	while (entry != NULL)
+	{
+	    if (strcmp (entry -> d_name, ".") &&
+		    strcmp (entry -> d_name, ".."))
+	    {
+		if (stat (entry -> d_name, &buffer) != 0)
+		{
+		    fprintf (stderr, "%s: cannot stat ", cmdname);
+		    perror (entry -> d_name);
+		}
+		else
+		    if ((buffer.st_mode & S_IFMT) == S_IFDIR)
+		    {
+			(void) sprintf (newfile, "%s/%s",
+				trash, entry -> d_name);
+			if (verbose)
+			{
+			    for (indent = 0; indent < level; indent++)
+				fprintf (stdout, "    ");
+			    fprintf (stdout,
+				    "squishing subdirectory %s\n",
+				    newfile);
+			}
+			compact (newfile, level + 1,
+				verbose, recursive);
+		    }
+	    }
+	    entry = readdir (temp_directory);
+	}
+	closedir (temp_directory);
+
+    }
+
+
+ /* 	Here we go!  Basically, we deal with all entries except . and ..
+    and move them from the temporary directory to the (clean) old one.	 
+ */
+    temp_directory = opendir (".");
+    if (temp_directory == NULL)
+    {
+	fprintf (stderr, "%s: cannot open ", cmdname);
+	perror (trash);
+	(void) link (trash, directory);
+	(void) unlink (trash);
+	exit (1);
+    }
+
+    entry = readdir (temp_directory);
+    while (entry != NULL)
+    {
+	if (strcmp (entry -> d_name, ".") &&
+		strcmp (entry -> d_name, ".."))
+	{
+	    (void) sprintf (newfile, "%s/%s",
+		    directory, entry -> d_name);
+	    if (verbose)
+	    {
+		for (indent = 0; indent < level; indent++)
+		    fprintf (stdout, "    ");
+		fprintf (stdout, "mv %s %s\n", entry -> d_name,
+			newfile);
+	    }
+
+	/* 	Subdirectories can't just be linked/unlinked, because
+	   their contents are dependent on context. This kludge fixes it.
+	   However, for a short period, we have a subdirectory that has a
+	   wrong .. entry!	 */
+	    fix_directory (entry -> d_name, directory);
+
+	    if (link (entry -> d_name, newfile) < 0)
+	    {
+		fprintf (stderr, "%s: cannot link %s to ",
+			cmdname, entry -> d_name);
+		perror (newfile);
+	    }
+	    if (unlink (entry -> d_name) < 0)
+	    {
+		fprintf (stderr, "%s: cannot unlink ", cmdname);
+		perror (entry -> d_name);
+	    }
+	}
+	entry = readdir (temp_directory);
+    }
+    closedir (temp_directory);
+
+    if (chdir (parent) < 0)
+    {
+	fprintf (stderr, "%s: cannot return to ", cmdname);
+	perror (parent);
+	exit (1);
+    }
+
+
+ /* 	This temporary (now clean, but big) directory can now be junked.
+    Everything at this point is OK with file system integrity, so we can
+    use the normal UNIX way to do it.	 */
+    activate (REMOVE, trash);
+}
+
+
+
+/*	We require only full pathnames with no intervening
+	. or .. or double /'s just to insure to a degree that
+	no one is actively using that directory.  Out of
+	the kernel, we really can't do this completely.  There
+	is also a problem if one of the subdirectories is
+	mountable, so we use fstab to check on this.  However,
+	we can't check for 'spontaneous' mounts that don't
+	use fstab.	*/
+void legal (directory)
+register char  *directory;
+{
+    register char  *place;
+    register struct fstab  *file_system;
+    struct stat buffer;
+
+
+ /* 	Check for legal file name syntax.	 */
+    place = directory;
+    do
+    {
+	place++;
+
+	if ((strlen (place) == 0) ||
+		!strncmp (place, "./", strlen ("./")) ||
+		!strncmp (place, "../", strlen ("../")) ||
+		!strncmp (place, "/", strlen ("/")) ||
+		!strcmp (place, ".") || !strcmp (place, ".."))
+	{
+	    fprintf (stderr,
+		    "%s: 'x/', '//', '.', and '..' illegal (in %s)\n",
+		    cmdname, directory);
+	    exit (1);
+	}
+
+	place = index (place, '/');
+    }
+    while (place != NULL);
+
+    if (stat (directory, &buffer) != 0)
+    {
+	fprintf (stderr, "%s: cannot stat ", cmdname);
+	perror (directory);
+    }
+    else
+	if ((buffer.st_mode & S_IFMT) != S_IFDIR)
+	{
+	    fprintf (stderr, "%s: %s is not a directory\n",
+		    cmdname, directory);
+	    exit (1);
+	}
+
+
+ /* 	Now check to see if something at or below this level is a
+    mountable file system.	 */
+    setfsent ();
+
+    file_system = getfsent ();
+    while (file_system != NULL)
+    {
+	if ((!strcmp (file_system -> fs_type, FSTAB_RW) ||
+		    !strcmp (file_system -> fs_type, FSTAB_RO) ||
+		    !strcmp (file_system -> fs_type, "um")) &&
+		(strlen (directory) <= strlen (file_system -> fs_file)))
+	    if (!strncmp (directory, file_system -> fs_file,
+			strlen (directory)))
+	    {
+		fprintf (stderr,
+			"%s: %s contains the %s file system\n",
+			cmdname, directory, file_system -> fs_file);
+		exit (1);
+	    }
+	file_system = getfsent ();
+    }
+
+    endfsent ();
+}
+
+
+
+/*	Create a new directory with the mode/owner/group
+	of the original.	*/
+void remake_directory (original_directory, temp_directory)
+char   *original_directory;
+char   *temp_directory;
+{
+    struct stat buffer;
+
+    if (stat (temp_directory, &buffer) != 0)
+    {
+	fprintf (stderr, "%s: cannot stat ", cmdname);
+	perror (temp_directory);
+	exit (1);
+    }
+
+    activate (MAKE_DIRECTORY, original_directory);
+
+    if (chown (original_directory,
+		(int) buffer.st_uid, (int) buffer.st_gid) < 0)
+    {
+	fprintf (stderr, "%s: cannot chown ", cmdname);
+	perror (original_directory);
+    }
+
+    if (chmod (original_directory, (int) (buffer.st_mode & ~S_IFMT)) < 0)
+    {
+	fprintf (stderr, "%s: cannot chmod ", cmdname);
+	perror (original_directory);
+    }
+}
+
+
+
+/*	Nice little routine to execute a UNIX command that
+	doesn't have any terminal I/O.	*/
+void activate (command_name, argument)
+register char  *command_name;
+register char  *argument;
+{
+    register    FILE * execute;
+    char    command[BUFSIZ];
+
+    (void) sprintf (command, "%s %s", command_name, argument);
+    execute = popen (command, "w");
+    if (execute == NULL)
+    {
+	fprintf (stderr, "%s: could not execute '%s'\n",
+		cmdname, command);
+	exit (1);
+    }
+    if (pclose (execute) != 0)
+    {
+	fprintf (stderr, "%s: execution of '%s' failed\n",
+		cmdname, command);
+	exit (1);
+    }
+}
+
+
+/*	Unfortunately, we need this to make the .. entry
+	in subdirectories point to the correct entry.
+	Beforehand, it points to the temporary directory
+	(correctly).  Afterward, it points to the remade
+	directory (incorrectly).  Howver, the next operation
+	will be a link/unlink combination that will make
+	this whole thing kosher.	*/
+void fix_directory (entry, new_directory)
+register char  *entry;
+register char  *new_directory;
+{
+    struct stat buffer;
+    char    new_link[BUFSIZ];
+
+    if (stat (entry, &buffer) == 0)
+	if ((buffer.st_mode & S_IFMT) == S_IFDIR)
+	{
+	    (void) sprintf (new_link, "%s/..", entry);
+	    if (unlink (new_link) == 0)
+		(void) link (new_directory, new_link);
+	}
+}
+
+

@@ -1,0 +1,404 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,cc4d2f7fb2dea3d1,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-12-18 04:49:10 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!genrad!wjh12!foxvax1!brunix!ddj
+From: ddj@brunix.UUCP (Dave Johnson)
+Newsgroups: net.sources
+Subject: xbin -- Un*x binhex filter
+Message-ID: <11347@brunix.UUCP>
+Date: Tue, 18-Dec-84 07:49:10 EST
+Article-I.D.: brunix.11347
+Posted: Tue Dec 18 07:49:10 1984
+Date-Received: Thu, 20-Dec-84 01:22:50 EST
+References: brunix.11346, ut-sally.504
+Lines: 385
+
+#!/bin/sh-----cut here-----cut here-----cut here-----cut here-----
+# shar:	Shell Archiver
+#	Run the following text with /bin/sh to create:
+#	README #	xbin.c
+echo shar: extracting README
+cat - << \SHAR_EOF > README
+This program will convert a file in BinHex format
+into binary files suitable for downloading via
+Macterminal / macput from a un*x host.  It creates
+all three forks (.info, .data, and .rsrc), so that
+the filetype, author, create/modify times and eventually
+the file flags (ie the Bundle Bit) are all passed on
+to MacTerminal when the file is created on the Mac.
+
+When you receive a BinHex file in the mail or news,
+save the message in a file with extension ".hex" --
+for example "freeware.hex".  Then invoke "xbin freeware".
+This reads freeware.hex and creates freeware.data,
+freeware.rsrc, and freeware.info.  When this is done,
+you can download through MacTerminal by running
+"macput freeware".
+
+The compressed data format is almost identical to
+that used by uuencode/uudecode.  They both store 6
+bits of data per byte, both offset the binary data
+by 0x20 (' '), and both have the number of bytes in
+the record at the beginning of each record.  The
+difference is exactly 2 bits.  In uuencode format
+the first byte contains the entire (6 bit) byte count,
+but in BinHex format the byte count is 8 bits -- 6 from
+the first byte, and 2 from the second.
+
+Note that the problem of trailing spaces has been worked
+around in this program -- short buffers are filled out
+with spaces as needed.  So there is no need to manually
+restore lost spaces as before.
+
+As soon as I can figure out how the crc is computed
+I will post a new version of xbin which actually verifies
+the crc value.  For now the crc line is ignored completely.
+Given the crc formula, it will be straightforward to write
+the complementary encoding program.  How about calling it bhex?
+
+As usual, I'm open to suggestions and bug reports.  I hope
+this will save a lot of people the trouble I went through
+to figure out the format . . . enjoy!
+
+	Dave Johnson
+	Brown University Computer Science
+	ddj%brown@csnet-relay.ARPA
+	{ihnp4,decvax,allegra,linus}!brunix!ddj
+SHAR_EOF
+echo shar: extracting xbin.c
+cat - << \SHAR_EOF > xbin.c
+#include <stdio.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/timeb.h>
+
+/* Mac time of 00:00:00 GMT, Jan 1, 1970 */
+#define TIMEDIFF 0x7c25b080
+
+#define DATABYTES 128
+
+#define BYTEMASK 0xff
+
+#define NAMEBYTES 63
+#define H_NLENOFF 1
+#define H_NAMEOFF 2
+
+/* 65 <-> 80 is the FInfo structure */
+#define H_TYPEOFF 65
+#define H_AUTHOFF 69
+#define H_FLAGOFF XXX
+
+#define H_LOCKOFF 81
+#define H_DLENOFF 83
+#define H_RLENOFF 87
+#define H_CTIMOFF 91
+#define H_MTIMOFF 95
+
+#define H_OLD_DLENOFF 81
+#define H_OLD_RLENOFF 85
+
+struct macheader {
+	char m_name[NAMEBYTES+1];
+	char m_type[4];
+	char m_author[4];
+	long m_flags;
+	long m_datalen;
+	long m_rsrclen;
+	long m_createtime;
+	long m_modifytime;
+} mh;
+
+struct filenames {
+	char f_info[256];
+	char f_data[256];
+	char f_rsrc[256];
+} files;
+
+FILE *ifp;
+int pre_beta;
+int compressed;
+
+/*
+ * xbin -- unpack BinHex style .HEX file into suitable
+ * format for downloading with macput
+ * Dave Johnson, Brown University Computer Science
+ *
+ * (c) 1984 Brown University
+ * may be used but not sold without permission
+ *
+ * created ddj 12/16/84
+ */
+char usage[] = "usage: \"xbin [-o] [-n name] filename\"\n";
+
+main(ac, av)
+char **av;
+{
+	char *filename, *macname;
+
+	filename = ""; macname = "";
+	ac--; av++;
+	while (ac) {
+		if (av[0][0] == '-') {
+			switch (av[0][1]) {
+			case 'o':
+				pre_beta++;
+				break;
+			case 'n':
+				if (ac > 1) {
+					ac--; av++;
+					macname = av[0];
+					break;
+				}
+				else
+					goto bad_usage;
+			default:
+				goto bad_usage;
+			}
+		}
+		else {
+			if (*filename == '\0')
+				filename = av[0];
+			else
+				goto bad_usage;
+		}
+		ac--; av++;
+	}
+	if (*filename == '\0') {
+bad_usage:
+		fprintf(stderr, usage);
+		exit(1);
+	}
+
+	setup_files(filename, macname);
+	parse_file();
+	forge_info();	/* now that we know the size of the forks */
+}
+
+setup_files(filename, macname)
+char *filename;		/* input file name -- .hex extension optional */
+char *macname;		/* name to use on the mac side of things */
+{
+	char namebuf[256];
+	int n, tdiff;
+	struct tm *tp;
+	struct timeb tbuf;
+	struct stat stbuf;
+
+	/* find input .hex file and open it */
+	sprintf(namebuf, "%s.hex", filename);
+	if (stat(namebuf, &stbuf) != 0) {
+		strcpy(namebuf, filename);
+		if (stat(namebuf, &stbuf) != 0) {
+			perror(namebuf);
+			exit(-1);
+		}
+	}
+	ifp = fopen(namebuf, "r");
+	if (ifp == NULL) {
+		perror(namebuf);
+		exit(-1);
+	}
+
+	/* set up names for output files and create them */
+	if (macname[0] == '\0') {
+		macname = filename;
+	}
+	n = strlen(macname);
+	if (n > NAMEBYTES) n = NAMEBYTES;
+	strncpy(mh.m_name, macname, n);
+	mh.m_name[n] = '\0';
+
+	sprintf(files.f_data, "%s.data", mh.m_name);
+	close(creat(files.f_data, 0666));
+	sprintf(files.f_rsrc, "%s.rsrc", mh.m_name);
+	close(creat(files.f_rsrc, 0666));
+	sprintf(files.f_info, "%s.info", mh.m_name);
+	/* info file gets created later */
+
+	/* get file times and convert to mac time format */
+	ftime(&tbuf);
+	tp = localtime(&tbuf.time);
+	tdiff = TIMEDIFF - tbuf.timezone * 60;
+	if (tp->tm_isdst)
+		tdiff += 60 * 60;
+
+	mh.m_createtime = stbuf.st_mtime + tdiff;
+	mh.m_modifytime = stbuf.st_mtime + tdiff;
+}
+
+forge_info()
+{
+	char buf[DATABYTES];
+	char *np;
+	FILE *fp;
+	int n;
+
+	for (np = mh.m_name; *np; np++)
+		if (*np == '_') *np = ' ';
+
+	buf[H_NLENOFF] = n = np - mh.m_name;
+	strncpy(buf + H_NAMEOFF, mh.m_name, n);
+	strncpy(buf + H_TYPEOFF, mh.m_type, 4);
+	strncpy(buf + H_AUTHOFF, mh.m_author, 4);
+	/* put4(buf + H_FLAGOFF, mh.m_flag);	XXX */
+	if (pre_beta) {
+		put4(buf + H_OLD_DLENOFF, mh.m_datalen);
+		put4(buf + H_OLD_RLENOFF, mh.m_rsrclen);
+	}
+	else {
+		put4(buf + H_DLENOFF, mh.m_datalen);
+		put4(buf + H_RLENOFF, mh.m_rsrclen);
+		put4(buf + H_CTIMOFF, mh.m_createtime);
+		put4(buf + H_MTIMOFF, mh.m_modifytime);
+	}
+	fp = fopen(files.f_info, "w");
+	if (fp == NULL) {
+		perror("info file");
+		exit(-1);
+	}
+	fwrite(buf, 1, DATABYTES, fp);
+	fclose(fp);
+}
+
+parse_file()
+{
+	char ibuf[BUFSIZ];
+	int compressed = 0;
+	int forks = 0;
+	int n;
+
+	while (fgets(ibuf, BUFSIZ, ifp) != NULL) {
+		n = strlen(ibuf);
+		if (n >= 7 && ibuf[0] == '#' || ibuf[n-6] == '$') {
+			if (n >= 11)
+				strncpy(mh.m_type, &ibuf[1], 4);
+			if (n >= 15)
+				strncpy(mh.m_author, &ibuf[5], 4);
+			sscanf(&ibuf[n-5], "%4x", &mh.m_flags);
+			break;
+		}
+	}
+	while (forks < 2 && fgets(ibuf, BUFSIZ, ifp) != NULL) {
+		if (forks == 0 && strncmp(ibuf, "***COMPRESSED", 13) == 0) {
+			compressed++;
+			continue;
+		}
+		if (strncmp(ibuf, "***DATA", 7) == 0) {
+			mh.m_datalen = make_file(files.f_data, compressed);
+			forks++;
+			continue;
+		}
+		if (strncmp(ibuf, "***RESOURCE", 11) == 0) {
+			mh.m_rsrclen = make_file(files.f_rsrc, compressed);
+			forks++;
+			continue;
+		}
+	}
+}
+
+static int crc;
+
+make_file(fname, compressed)
+char *fname;
+int compressed;
+{
+	register int n;
+	char ibuf[BUFSIZ];
+	FILE *outf;
+	int nbytes = 0;
+
+	outf = fopen(fname, "w");
+	if (outf == NULL) {
+		perror(fname);
+		exit(-1);
+	}
+
+	while (fgets(ibuf, BUFSIZ, ifp) != NULL) {
+		if (strncmp(ibuf, "***END", 6) == 0)
+			break;
+		if (compressed)
+			nbytes += comp_to_bin(ibuf, outf);
+		else
+			nbytes += hex_to_bin(ibuf, outf);
+	}
+	/* XXX read crc record and do crc check */
+
+	return nbytes;
+}
+
+#define SIXB(c) (((c)-0x20) & 0x3f)
+
+comp_to_bin(ibuf, outf)
+char ibuf[];
+FILE *outf;
+{
+	char obuf[BUFSIZ];
+	register char *ip = ibuf;
+	register char *op = obuf;
+	register int n, outcount;
+	int numread, incount;
+
+	numread = strlen(ibuf);
+	ip[numread-1] = ' ';		/* zap out the newline */
+	outcount = (SIXB(ip[0]) << 2) | (SIXB(ip[1]) >> 4);
+	incount = ((outcount / 3) + 1) * 4;
+	for (n = numread; n < incount; n++)	/* restore lost spaces */
+		ibuf[n] = ' ';
+
+	n = 0;
+	while (n <= outcount) {
+		*op++ = SIXB(ip[0]) << 2 | SIXB(ip[1]) >> 4;
+		*op++ = SIXB(ip[1]) << 4 | SIXB(ip[2]) >> 2;
+		*op++ = SIXB(ip[2]) << 6 | SIXB(ip[3]);
+		ip += 4;
+		n += 3;
+	}
+	fwrite(obuf+1, 1, outcount, outf);
+	return outcount;
+}
+
+hex_to_bin(ibuf, outf)
+char ibuf[];
+FILE *outf;
+{
+	register char *ip = ibuf;
+	register int n, outcount;
+	int c;
+
+	n = strlen(ibuf) - 1;
+	outcount = n / 2;
+	for (n = 0; n < outcount; n++) {
+		c = hexit(*ip++);
+		c = (c << 4) | hexit(*ip++);
+		fputc(c , outf);
+	}
+	return outcount;
+}
+
+hexit(c)
+int c;
+{
+	if ('0' <= c && c <= '9')
+		return c - '0';
+	if ('A' <= c && c <= 'F')
+		return c - 'A' + 10;
+}
+
+put4(bp, value)
+char *bp;
+long value;
+{
+	register int i, c;
+
+	for (i = 0; i < 4; i++) {
+		c = (value >> 24) & BYTEMASK;
+		value <<= 8;
+		*bp++ = c;
+	}
+}
+SHAR_EOF
+
+

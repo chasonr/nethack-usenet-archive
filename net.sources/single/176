@@ -1,0 +1,466 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,5bd16bfdd5bc549f,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-01-14 17:33:30 PST
+Message-ID: <bnews.cwruecmp.389>
+Newsgroups: net.sources
+Path: utzoo!decvax!cwruecmp!ordy
+X-Path: utzoo!decvax!cwruecmp!ordy
+From: cwruecmp!ordy
+Date: Fri Jan 14 20:33:27 1983
+Subject: dirtree
+X-Google-Info: Converted from the original B-News header
+Posted: Wed Jan 12 14:16:48 1983
+Received: Fri Jan 14 20:33:27 1983
+
+	Here is the dirtree source and manual page. It is set up for
+4.1 BSD. If you want to run on other Version 7 systems, you MUST edit
+line 136 in the source and change the name of the directory structure
+to match what you have in <dir.h>. On 4.1 it is 'dir', but on 2.8,
+and perhaps vanilla V7 it is 'direct'.
+
+	The program should use the new directory examination functions
+so that it can work under 4.2, but it does not. If anybody makes those
+changes, please let me know. Other good extensions are in the manual page.
+
+	Greg Ordy
+
+-----------------------------dirtree.c-----------------------------
+#
+/*
+ * dirtree - display a directory tree.
+ *
+ * Greg Ordy, 1/8/83
+ * Case Western Reserve University
+ * Copyright (c) 1983
+ * all rights reserved
+ * Permission is granted for use by
+ * valid Unix* licensees
+ * (*) Unix is a trademark of Bell Labs
+ *
+ * options: -t: truncate at 80 columns
+ *          -T: truncate at 132 columns
+ *          -ox-y : show column x to column y
+*/
+
+#include	<stdio.h>
+#include	<sys/types.h>
+#include	<dir.h>
+#include	<stat.h>
+
+#define	MAXLEVEL 64		/* maximum depth possible */
+
+struct	dentry			/* internal form of a directory entry */
+{
+	struct dentry *d_down;	/* lower level */
+	struct dentry *d_f;	/* links on same level */
+	char   *d_dname;	/* name of the directory */
+	int	d_child;	/* number of children directories */
+	int	d_offset;	/* offset until first character */
+	short	d_left;		/* left column number */
+	short	d_length;	/* length of string */
+	short	d_arrow;	/* column of arrow coming into name */
+};
+
+struct dentry dhead;		/* head of the tree */
+char rootname[256];		/* initial entry */
+
+char	*levels[MAXLEVEL*3];	/* levels deep maximum, contains char */
+				/* pointer per level for printing functions */
+int	maxlevel;		/* maximum depth */
+int	column;			/* global column count for output generation */
+int	clipstart;		/* clipping bounds */
+int	clipstop = {78};
+int	clipped;		/* we did a clip option */
+
+extern char *xalloc ();		/* for type matching */
+
+main (argc, argv)
+int argc;
+char *argv[];
+{
+	init (argc, argv);
+	build_tree (&dhead, 1);
+	show_tree ();
+}
+
+init (c, v)
+int c;
+char *v[];
+{
+	register int i, j;
+
+	for (i = 1; i < c; i++) {
+		if (v[i][0] == '-') {
+			for (j = 1; v[i][j]; j++) {
+				switch (v[i][j]) {
+					case 't': clipstop = 78; clipped++; break;
+					case 'T': clipstop = 131; clipped++; break;
+					case 'o': getclip (v[i]); goto xit;
+					default: fprintf (stderr, "Unknown option: %c\n", v[i][j]);
+						 break;
+				}
+			}
+		    xit:
+			i = i;	/* ugly but functional */
+		}
+		else {
+			if (rootname[0]) {
+				fprintf (stderr,"Too many directory names.\n");
+				exit (-4);
+			}
+			strcpy (rootname, v[i]);
+
+		}
+	}
+	if (rootname[0] == 0)
+		strcpy (rootname, ".");
+
+	dhead.d_dname = rootname;
+	dhead.d_length = strlen (rootname);
+}
+
+getclip (sp)
+register char *sp;
+{
+	register char *p;
+
+	sp++;	/* pass up initial '-' */
+	clipped++;
+	for (p = sp; *p && (*p != '-'); p++);
+	if (*p == 0) {
+		clipstart = atoi (sp);
+		if (clipstart < 0) {
+			fprintf (stderr, "Invalid lower clip value. (%d)\n",
+				clipstart);
+			exit (-5);
+		}
+		clipstop = 79;
+		return;
+	}
+	*p = ' ';
+	sp++;
+	clipstart = atoi (sp);
+	clipstop = atoi (p);
+	if (clipstop <= clipstart) {
+		fprintf (stderr, "clip values must have '<' relationship.\n");
+		exit (-6);
+	}
+	if (clipstart < 0 || clipstop < 0) {
+		fprintf (stderr, "clip values must be postive.\n");
+		exit (-6);
+	}
+}
+
+build_tree (dp, flag)
+register struct dentry *dp;
+int flag;
+{
+	register int i;
+	register char *pp;
+	register FILE *fp;
+	register struct dentry *ddp;
+	long ftemp;
+	struct dir de;
+	struct stat sbuf;
+	struct dentry **nextp;
+	extern long ftell ();
+	char ddname[20];
+
+	if (chdir (dp->d_dname) < 0) {
+		if (flag) {
+			fprintf (stderr, "Cannot chdir to %s\n", dp->d_dname);
+			exit (-1);
+		}
+		pp = xalloc (strlen (dp->d_dname) + 3);
+		sprintf (pp, "*%s*", dp->d_dname);
+		dp->d_dname = pp;
+		dp->d_length = strlen (pp);
+		return;
+	}
+
+	if ((fp = fopen (".", "r")) == NULL) {
+		pp = xalloc (strlen (dp->d_dname) + 3);
+		sprintf (pp, "-%s-", dp->d_dname);
+		dp->d_dname = pp;
+		dp->d_length = strlen (pp);
+		return;
+	}
+
+	nextp = &dp->d_down;
+	fseek (fp, (long) (2 * (sizeof (de))), 0);	/* pass up . and .. */
+
+	while (1) {
+		if (fread (&de, sizeof (de), 1, fp) != 1) {
+			fclose (fp);
+			for (i = 0, ddp = dp->d_down; ddp; ddp = ddp->d_f)
+				i++;
+			dp->d_child = i;
+			chdir ("..");
+			return;
+		}
+		if (de.d_ino == 0)
+			continue;
+		strncpy (ddname, de.d_name, 14);
+		ddname[14] = 0;
+		if (stat (ddname, &sbuf) < 0)
+			continue;
+		if ((sbuf.st_mode & S_IFDIR) == 0)
+			continue;
+		ddp = (struct dentry *) xalloc (sizeof (*ddp));
+		ddp->d_length = strlen (ddname);
+		ddp->d_dname = xalloc (ddp->d_length+2);
+		strcpy (ddp->d_dname, ddname);
+		*nextp = ddp;
+		nextp = &ddp->d_f;
+		ftemp = ftell (fp);
+		fclose (fp);
+		build_tree (ddp, 0);
+		fp = fopen (".", "r");
+		fseek (fp, ftemp, 0);
+	}
+}
+
+char *xalloc (n)
+register int n;
+{
+	extern char *calloc ();
+	register char *pp;
+
+	pp = calloc (1, n);
+	if (pp == NULL) {
+		fprintf (stderr, "Out of Memory!\n");
+		exit (-2);
+	}
+	return (pp);
+}
+
+char *strget (s)
+register char *s;
+{
+	register int n;
+	register char *pp;
+
+	n = strlen (s) + 1;
+	pp = xalloc (n);
+	strcpy (pp, s);
+	return (pp);
+}
+
+stradd (pp, s)
+register char **pp, *s;
+{
+	register int n;
+	register char *p;
+
+	if (*pp)
+		n = strlen (*pp);
+	else
+		n = 0;
+	n += strlen (s);
+	p = xalloc (n + 2);
+	if (*pp) {
+		strcpy (p, *pp);
+		free (*pp);
+	}
+	strcat (p, s);
+	strcat (p, " ");
+	*pp = p;
+}
+
+/*
+ * Here is where the fun is, displaying the directory structure
+ * built off of dhead. In most all cases we will overflow the normal
+ * CRT display, and even 132 column jobbies. We must place the
+ * directory names and connect them together. Placement follows
+ * the following basic algorithm:
+ * 1) If no children, mark left of name at current column, advance
+ * column to right + 1. Mark upper line above middle of name.
+ * Mark horizontal line between upper line limits.
+ * 2) If children, determine span of children, which has been
+ * previously done by step #1. From span, place parent in middle,
+ * locate parent descender.
+*/
+show_tree ()
+{
+	register int i, j;
+	register char *p;
+
+	getdown (&dhead, 0);
+
+	if (maxlevel > MAXLEVEL) {
+		fprintf (stderr, "Sorry, directories too deep, increase MAXLEVELand recompile.\n");
+		exit (-3);
+	}
+	for (i = 0; i != ((maxlevel*3)+1); i++) {
+		levels[i] = xalloc (column+2);
+		for (p = levels[i], j = 0; j != (column+1); j++)
+			*p++ = ' ';
+		*p = 0;
+	}
+
+	fillin (&dhead, 0);
+
+	display ();
+}
+
+getdown (dp, ll)
+register struct dentry *dp;
+register int ll;
+{
+	register struct dentry *ddp, *xp;
+	int left, right, middle, lcol;
+
+	if (dp == 0)		/* no longer necessary, but no harm */
+		return;
+	lcol = column;
+	for (ddp = dp; ddp; ddp = ddp->d_f) {
+		if (ddp->d_down == 0) {
+			ddp->d_left = column;
+			column += (ddp->d_length+1);
+			if (ll > maxlevel)
+				maxlevel = ll;
+		}
+		else {
+			lcol = column;
+			getdown (ddp->d_down, ll+1); /* determine children */
+			left = ddp->d_down->d_left + (ddp->d_down->d_length)/2;
+			for (xp = ddp->d_down; xp; xp = xp->d_f)
+				right = xp->d_left + (xp->d_length)/2;
+			middle = (left+right)/2;
+			ddp->d_left = middle - (ddp->d_length)/2;
+			if (ddp->d_left < lcol)
+				ddp->d_left = lcol;
+			ddp->d_arrow = middle;
+			if ((lcol = (ddp->d_left + ddp->d_length+1)) > column)
+				column = lcol;
+		}
+	}
+}
+
+fillin (dp, ll)
+register struct dentry *dp;
+register int ll;
+{
+	register struct dentry *ddp;
+	register int line;
+	register char *p;
+	int i, left, right;
+
+	if (dp == 0)
+		return;
+	line = ll * 3;
+	if (ll != 0) {
+		p = levels[line-1];
+		p[dp->d_left+(dp->d_length/2)] = '|';
+	}
+	if (dp->d_arrow)
+		levels[line+1][dp->d_arrow] = '^';
+	p = levels[line];
+	munge (dp, p);
+
+	for (ddp = dp->d_down; ddp; ddp = ddp->d_f)
+		fillin (ddp, ll+1);
+	if (dp->d_down && dp->d_down->d_f) {
+		left = dp->d_down->d_left + (dp->d_down->d_length)/2;
+		for (ddp = dp->d_down; ddp; ddp = ddp->d_f)
+			right = ddp->d_left + (ddp->d_length)/2;
+		p = levels[line+1];
+		for (i = left; i != (right+1); i++)
+			if (p[i] != '^')
+				p[i] = '_';
+	}
+}
+
+display ()
+{
+	register int i;
+	register char *p;
+
+	for (i = 0; i != (maxlevel*3+1); i++) {
+		for (p = levels[i]; *p; p++);
+		p--;
+		while (*(p--) == ' ');
+		p++;
+		p++;
+		*p = 0;
+	}
+
+	if (clipstart || (column > clipstop)) {
+		fprintf (stderr, "Truncated structure. Columns %d to %d shown. Max is %d\n", clipstart, clipstop, column);
+	}
+
+	if ((clipstop < column) && clipped) {
+		for (i = 0; i !=((maxlevel*3)+1); i++)
+			levels[i][clipstop+1] = 0;
+	}
+
+	for (i = 0; i != ((maxlevel*3)+1); i++)
+		printf ("%s\n", &levels[i][clipstart]);
+}
+
+munge (dp, p)
+register struct dentry *dp;
+register char *p;
+{
+	register char *pp;
+
+	p = &p[dp->d_left];
+	for (pp = dp->d_dname; *pp;)
+		*p++ = *pp++;
+}
+------------------dirtree.l---------------------------------------
+.TH DIRTREE l
+.UC 4
+dirtree \- graphically display Unix directory structures
+.SH SYNOPSIS
+.B dirtree
+[-t -T -ox-y] [directory]
+.SH DESCRIPTION
+.I Dirtree
+descends the specified directory substructure and produces a graph
+representation of it on the standard output.
+In almost all cases, the resulting structure is wider than a CRT screen
+(80 columns), or even a printer (132 columns).
+.I Dirtree
+therefore has options which clip the displayed output to some portion of
+total output. A composite picture can be made from butting separate
+vertical strips together.
+.PP
+The '-t' option displays columns 0 to 79, and is designed for CRTs.
+The '-T' option displays columns 0 to 131, and is designed for 132
+column devices. The '-o' option contains a range specification, which
+defines the generated output. The two values represent the value
+of the left column and right column in the virtual output which is
+mapped to the displayed output. The format of the '-o' option
+is: '-ox-y', where the number 'x' is the left clip column and the
+number 'y' is the right clip number. The two values are separated
+with a minus (-) sign.
+.PP
+Only directories are displayed by
+.I dirtree.
+.PP
+If a starting directory is not specified, '.' (current directory) is
+chosen.
+.SH DIAGNOSTICS
+.I Dirtree
+must be able to chdir to the specified
+directory. Once running, there are two classes of directories
+which
+.I dirtree
+cannot process, those which it cannot read and those for which
+it only has execute permission. In these cases, the underlying
+structure cannot be determined. If these cases are found, the name
+of the directory involved will be surrounded by minus (-) and
+asterisk (*) characters respectively.
+On small memory systems, dirtree may run out of dynamically allocated
+memory.
+.SH AUTHOR
+Greg Ordy, CWRU.
+.SH BUGS
+Should use the directory search functions to be portable between all
+planned Unix versions. Should sort the entries in a directory.
+The representation can be horizontally compressed, but is not.
+----------------------------Last Line-----------------------------
+
+

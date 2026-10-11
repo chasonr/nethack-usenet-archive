@@ -1,0 +1,304 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,addc083f7f1f6c2a
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-12-14 20:59:30 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site sunybcs.UUCP
+Path: utzoo!watmath!sunybcs!gworek
+From: gworek@sunybcs.UUCP (Don Gworek)
+Newsgroups: net.sources
+Subject: sudo.c (do as root, if permitted to)
+Message-ID: <2622@sunybcs.UUCP>
+Date: Sat, 14-Dec-85 23:59:30 EST
+Article-I.D.: sunybcs.2622
+Posted: Sat Dec 14 23:59:30 1985
+Date-Received: Sun, 15-Dec-85 06:46:03 EST
+References: <2821@watvlsi.UUCP> <3702@cbrma.UUCP>
+Distribution: net
+Organization: SUNY/Buffalo Computer Science
+Lines: 282
+
+We have a useful command called "sudo", which verifies a
+user is allowed to execute a command as root, and keeps
+records of sudo usage. 
+
+/usr/local/adm/sudoers contains a list of superusers and
+their sudo priveleges.  If a user is listed in sudoers, and
+the user is permitted to execute a command, the command is
+executed with root's ownership. 
+
+Permissions in sudoers are either "all", a list of commands,
+an enviornment PATH variable, or a PATH followed by a list
+of commands.
+
+A record of sudo usage is kept in sudo.log, and a record
+of non-superuser attempts to sudo is kept in sudo.log.failures.
+
+Sudo with no command to execute just shows your sudo permission.
+
+Sudo must be installed setuid root.
+
+-----------------------------CUT----------------------------------
+# To unbundle, sh this file.  This archive contains:
+# sudo.8 sudo.c
+
+echo Extracting\: sudo.8
+sed 's/^X//' >sudo.8 <<'E*O*F sudo.8'
+X.\" @(#)sudo.8	1.4 (SUNYAB CS) 12/14/85
+X.\" This document uses the troff(1) -man macros
+X.TH SUDO 8 "14 December 1985" "" "Local UNIX Programmer's Manual"
+X.SH NAME
+Xsudo \- do a command as the superuser
+X.SH SYNOPSIS
+X.B sudo
+X[
+Xcommand
+X]
+X.SH DESCRIPTION
+X.I Sudo
+Xlooks for your username and your
+X.I sudo
+Xpermission in the file /usr/local/adm/sudoers.
+XIf you are permitted, 
+X.I sudo
+Xexecutes
+X.I command
+Xas the superuser.
+X.I Sudo
+Xwith no command arguments just shows your 
+X.I sudo
+Xpermission.
+X.PP
+XIndividual entries in /usr/local/adm/sudoers are a username
+Xfollowed by the user's 
+X.I sudo
+Xpermission, \-- either: "all"; a list of permitted commands; an
+Xenviornment PATH variable; or a PATH followed by a list
+Xof permitted commands.
+X.PP
+XFor readability, permission entries may span several lines
+X\-- each line following the first line should start with
+Xwhite space.  Comment lines are blank lines or lines
+Xstarting with a "#".
+X.PP
+XAn example sudoers file is:
+X.PP
+X.br
+X# comment
+X.br
+Xroot all
+X.br
+Xuser1 all
+X.br
+Xuser2 command1 command2
+X.br
+Xuser3 PATH=/workingdir1:/workingdir2
+X.br
+Xuser4 PATH=/workingdir1 command1 command2 command3
+X.br
+Xuser5 PATH=/workingdir1:/workingdir2
+X.br
+X	command1
+X.br
+X	command2
+X.PP
+X.SH NOTES
+XA working directory for a 
+X.I sudo
+Xenviornment PATH could be /usr/local/restrict-bin.
+X.PP
+X.I Sudo csh
+Xcan be used as a substitute for logging in as root.
+X.PP
+XWhen a user is restricted to commands or a PATH,
+Xif any of those commands have shell escape,
+Xthe user has access to 
+X.I sudo
+X"all".
+X.SH FILES
+X/usr/local/adm/sudoers \- list of superusers
+X.br
+X/usr/local/adm/sudo.log \- record of 
+X.I sudo
+Xusage
+X.br
+X/usr/local/adm/sudo.log.failures \- record of attempts to use 
+X.I sudo
+Xby non-superusers
+X.SH SEE ALSO
+Xsu(1)
+X.SH AUTHORS
+XPhil Betchel
+X.br
+XCliff Spencer
+X.br
+XGretchen Phillips
+X.br
+XJohn LoVerso
+X.br
+XDon Gworek
+E*O*F sudo.8
+
+ls -lg sudo.8
+
+echo Extracting\: sudo.c
+sed 's/^X//' >sudo.c <<'E*O*F sudo.c'
+X#ifndef lint
+Xstatic char *sccsid = "@(#)sudo.c	1.4 (SUNYAB CS) 12/14/85";
+X#endif
+X
+X/*
+X * sudo - run a command as superuser
+X *
+X * Usage: sudo [command]
+X */
+X
+X#include <stdio.h>
+X#include <sys/time.h>
+X#include <sys/types.h>
+X#include <sys/timeb.h>
+X#include <utmp.h>
+X#include <pwd.h>
+X#include <ctype.h>
+X
+X#define SUDOFILE	"/usr/local/adm/sudoers"
+X#define	LOGFILE		"/usr/local/adm/sudo.log"
+X#define	BLOGFILE	"/usr/local/adm/sudo.log.failures"
+X
+X#define TRUE 1
+X#define FALSE 0
+X
+Xchar    buf[BUFSIZ];
+Xchar   *bufp = buf;
+Xchar   *index (), *malloc ();
+X
+Xstruct passwd  *pw, *getpwuid ();
+X
+Xmain (argc, argv, envp)
+Xint     argc;
+Xchar   *argv[], *envp[];
+X{
+X    char   *name, bufcmd[BUFSIZ], *origpath;
+X    int found;
+X    pw = getpwuid (getuid ());
+X    name = pw -> pw_name;
+X    if (setuid (0) == -1) {
+X	perror (*argv);
+X	exit (1);
+X    }
+X    argc--, argv++;
+X    found = lookup (name);
+X    if (argc == 0) {
+X	if (*buf)
+X	    printf ("%s\n", buf);	/* echo permissions, if any */
+X	exit (0);
+X    }
+X    if (!found) {			/* not sudo permitted */
+X	enterlog (BLOGFILE, name, argc, argv);
+X	fprintf (stderr, "Nope.\n");
+X	exit (1);
+X    }
+X    enterlog (LOGFILE, name, argc, argv);
+X    bufp = index (bufp, ' ');
+X    (void) sscanf (bufp, "%s", bufcmd);
+X    if (strcmp (bufcmd, "all")) {
+X	if (!strncmp (bufcmd, "PATH", 4) && index (bufcmd, '=')) {
+X	    origpath = envp[2];
+X	    envp[2] = bufcmd;
+X	    execvp (*argv, argv);	/* return when cmd not in PATH*/
+X	    envp[2] = origpath;
+X	}
+X	if (!inlist (argv)) {
+X	    enterlog (BLOGFILE, name, argc, argv);
+X	    fprintf (stderr, "Nope, you're not allowed to do that\n");
+X	    exit (1);
+X	}
+X    }
+X    execvp (*argv, argv);
+X    enterlog (BLOGFILE, name, argc, argv);
+X    printf ("%s: Command not found\n", *argv);
+X    exit (1);
+X}
+X
+Xlookup (name)
+Xchar   *name;
+X{
+X    register int    namelen;
+X    register    FILE * fp;
+X    namelen = strlen (name);
+X    if ((fp = fopen (SUDOFILE, "r")) == 0) {
+X	perror (SUDOFILE);
+X	exit (1);
+X    }
+X    while (getbuf (buf, BUFSIZ, fp) > 0) {
+X	if (!strncmp (buf, name, namelen)) {
+X	    (void) fclose (fp);
+X	    return (TRUE);
+X	}
+X    }
+X    (void) fclose (fp);
+X    return (FALSE);
+X}
+X
+Xgetbuf (buffer, buflim, fp)
+Xchar   *buffer;
+Xint     buflim;
+XFILE * fp;
+X{
+X    char    ch, eof=EOF;
+X    int     buflen = 0;
+X    while (buflen < buflim && ((ch = getc (fp)) != eof))
+X	if ((ch == '\n') && buflen && (!isspace (ungetc (getc (fp), fp)))) {
+X		*buffer = '\0';
+X		return (buflen);
+X	}
+X	else {
+X	    if (isspace (ch))
+X		ch = ' ';
+X	    buflen++;
+X	    *buffer++ = ch;
+X	}
+X    *buffer = '\0';
+X    return (buflen);
+X}
+X
+Xinlist (cmd)
+Xchar  **cmd;
+X{
+X    int     cmdlen;
+X    char    bcmd[BUFSIZ];
+X    cmdlen = strlen (*cmd);
+X    while (bufp = index (bufp, ' ')) {
+X	(void) sscanf (++bufp, "%s", bcmd);
+X	if (!strncmp (bcmd, *cmd, cmdlen)) {
+X	    if (bufp = index (bufp, '='))
+X		(void) sscanf (++bufp, "%s", *cmd); 	/* substitute a path */
+X	    return (TRUE);
+X	}
+X    }
+X    return (FALSE);
+X}
+X
+Xenterlog (logfile, name, argc, argv)
+Xchar   *logfile, *name;
+Xint     argc;
+Xchar  **argv;
+X{
+X    char   *s;
+X    time_t  now;
+X    FILE * fp;
+X    now = time ((time_t *) 0);
+X    fp = fopen (logfile, "a");
+X    s = (char *) ctime (&now);
+X    fprintf (fp, "%-18.20s: %10s: ", s, name);
+X    while (argc--)
+X	fprintf (fp, "%s ", *argv++);
+X    fprintf (fp, "\n");
+X    (void) fclose (fp);
+X}
+E*O*F sudo.c
+
+ls -lg sudo.c
+exit 0
+
+

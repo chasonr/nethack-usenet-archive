@@ -1,0 +1,1432 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 10fe4c,1edf0f13d944bfca
+X-Google-Attributes: gid10fe4c,public
+X-Google-Thread: 159752,64ce8d978c0cd1b,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1987-01-13 05:29:44 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!mnetor!seismo!rutgers!sri-spam!ames!ucbcad!ucbvax!decvax!tektronix!uw-beaver!ubc-vision!van-bc!sl
+From: sl@van-bc.UUCP (Stuart Lynne)
+Newsgroups: net.sources
+Subject: nroff tables for imagewriter
+Message-ID: <282@van-bc.UUCP>
+Date: Tue, 13-Jan-87 02:03:36 EST
+Article-I.D.: van-bc.282
+Posted: Tue Jan 13 02:03:36 1987
+Date-Received: Wed, 14-Jan-87 01:13:31 EST
+Organization: Public Access Network, Vancouver, BC.
+Lines: 1410
+Keywords: nroff imagewriter lpfilter
+
+
+Here is the nroff table for proportional print on the Apple Imagewriter.
+Also assorted other utilities to use with it to actually make it all work.
+
+Warning - not tested on Berkely Unix. 
+
+I received about thirty requests after my announcement last week so thought
+is was easiest to simply post. (I wouldn't take even odds on being able to
+reply to more than half of the people who responded, without a lot of playing
+around with my mailer!)
+
+Bug reports welcome  ---  caveat emptor.
+
+--
+Stuart Lynne	ihnp4!alberta!ubc-vi!van-bc!sl 	      Vancouver,BC,604-937-7532
+
+------------- cut here ------------ cut here -------------- cut here ---------
+#/bin/sh
+#This is a shar file.  To use:
+#  1. Remove everything before the /bin/sh line
+#  2. Execute with /bin/sh (not csh) to extract the files:
+#         README
+#         iw.c
+#         tabiw.c
+#         tabiwp.c
+#         iw.1ml
+#         iwlp.1ml
+#         tabiw.5l
+#         man.diff
+#         mm.diff
+#         iwlp
+file="${0}"
+echo extracting README 1>&2
+cat >README << 'EnD of README'
+The iw package includes:
+
+	iw.c - simple filter for imagewriter
+	iwlp - interface for sysV lp 
+	tabiw.c - nroff table for non-proportional print
+	tabiwp.c - nroff table for proportional printing
+
+make iw should suffice for most systems (I'm running a Unisoft 5.0
+on an antique Callan Unistar).
+
+You will need the tabgen software posted to mod.sources recently by
+Bruce Townsend (utcs!bnr-vpa!bruce).
+
+If you call nroff with man or mm you may want to ask 
+your system administrator to modify the mm and man
+scripts to allow iw, and iwp to be used with the
+-T command. The following changes
+	
+	iwlp|iwp|iw|2631|2631-c|2631-e)       v=3;     c=c ;;
+
+and
+	iwlp|iwp|iw) g="|col -p -x | iw" ;;
+
+need to be made in man and mm.
+
+man example
+		man -Tiwp iw  
+	produces
+		cat local/man1/iw.1 | nroff -Tiw -rd2 -rm0 -ry87 -can |
+		col -p -x | iw
+
+mm example
+		mm -Tiwp test
+	produces
+	nroff -cm -Tiwp test | col -p -x | iw
+
+To install:
+
+	cp tabiw tabiwp /usr/lib/term
+	ln /usr/lib/term/tablp /usr/lib/term/tabiwlp
+
+The link to tablp allows the use of the standard lp table but piped
+through the iw printer filter.
+
+
+Stuart Lynne	ihnp4!alberta!ubc-vi!van-bc!sl 	      Vancouver,BC,604-937-7532
+EnD of README
+echo extracting iw.c 1>&2
+cat >iw.c << 'EnD of iw.c'
+/* iw.c
+
+	Copyright (c) 1987 by Stuart Lynne
+
+	Permission is hereby granted to use, distribute, modify or copy
+	except for profit, providing this copyright notice and disclaimer
+	is included.
+
+	Version 1.0 - January 11, 1987
+		Cleaned up from initial hacking.
+
+	Bug reports and comments to:
+
+		sl@van-bc.uucp
+		ihpn4!alberta!ubc-vision!van-bc!sl
+
+	
+
+	iw is a filter for nroff output to be sent to the ImageWriter
+	printer.
+
+	It can be used as a filter for output from nroff as driven by three
+	different tables with two different schema's for underline / boldface:
+
+			Boldface	Underline  	Tab's	
+	tablp 	 	C^hC		_^hC		^I
+	tabiw 		<esc>!C<esc>"	<esc>XC<esc>Y	^I
+	tabiwp		<esc>!C<esc>"	<esc>XC<esc>Y	<esc>'~<esc>$
+
+
+	tabiwp uses the ~ in the custom font as a 1 dot width space char.
+
+	Make
+		make iw
+
+	Usage:
+		... | iw | ....
+		iw < file.in > file.out
+		nroff -Tiwp file | col -x -p | iw | ...
+		nroff -Tlp file | col -x -p | iw | ....
+*/
+
+#include	<stdio.h>
+#include	<ctype.h>
+
+#define	FALSE	0
+#define TRUE	1
+
+#define	FIRSTCOL	0
+
+main () 
+{
+	int	nextch = 0;		/* next character in input stream */
+	int	lastch = 0;		/* last character (next to be printed) */
+	
+	int	boldface = FALSE;	/* do we want boldface ? Used with C^HC */
+	int	sentboldface = FALSE;	/* have we sent boldface escape sequence */
+	int	underline = FALSE;	/* do we want underline? Used with _^HC */
+	int	sentunderline = FALSE;	/* have we sent an underline escape sequence */
+	int	overstrike = FALSE;	/* is this an overstrike? Used with X^HY */
+	int	seenunderline = FALSE;	/* have we seen an underline escape sequence */
+
+	int	count;			/* counter for ignoring multiple backspaces */
+
+	int	column = FIRSTCOL;	/* current column, for tabbing */
+	int	newcolumn = FIRSTCOL;	/* where we should go, for tabbing */
+
+	int	haveesc = FALSE;	/* flag for watching for escape seq. */
+
+
+	/* create a special character for nroff to use, a single dot width
+	   space. This allows proportional spacing to work. See tabiwp.c for
+	   usage.
+	*/
+
+	putchar( '\033' );		/* escape - allows creation of */
+	putchar( '-' );			/* 	custom char's */
+	putchar( '\033' );		/* escape I sets to 8 bit size */
+	putchar( 'I' );
+	putchar( '~' );			/* use ~ to signal this char */
+	putchar( 'A' );			/* width code */
+	putchar( '\000' );		/* space is no bits set */
+	putchar( '\004' );		/* end of character definition data */
+	
+	do {
+		/* are we counting spaces for a tab. Unfortunately the
+		   imagewriter and nroff disagree slightly on tab counting
+		   if escape char's are in line (nroff ignores, printer 
+		   doesn't).
+
+		   We either get a char or provide a space.
+
+		*/
+		if ( column < newcolumn )
+			nextch = ' ';
+		else {
+			newcolumn = FIRSTCOL;
+			nextch = getchar();
+		}
+
+		/* are we in an escape sequence we care about (ignore the rest)
+		   <esc>X and <esc>Y are underline start and stop, set underline
+		   flag and go to beginning of loop.
+ 		*/
+		if ( haveesc ) { 
+			switch ( nextch ) {
+			case 'X':
+				seenunderline = TRUE;
+				lastch = 0;
+				continue;
+			case 'Y':
+				seenunderline = FALSE;
+				lastch = 0;
+				continue;
+			}
+			haveesc = FALSE;
+		}
+		else 
+		/* check if next character is backspace for special handling 
+		*/
+		    if ( nextch == '\b' ) {
+			nextch = getchar();
+			
+			/* nroff use's _^hX to underline a char for tablp
+			*/
+			if ( lastch == '_' ) {
+				underline = TRUE;
+				lastch = nextch;
+				nextch = 0;
+				continue;
+			}
+			/* nroff use's X^hX to boldface a char for tablp
+			*/
+			else if ( nextch == lastch ) {
+				boldface = TRUE;
+				continue;
+			}
+			/* nroff sometimes uses XXXXX^h^h^h^h^hYYYYYY
+			   type of sequence. Imagewriter can't handle
+		           so we ignore.
+			   I think it is from combination of bold/italic.
+			*/
+			else if ( nextch == '\b' ) {
+				if ( lastch )
+					putchar( lastch );
+				while (( nextch = getchar()) == '\b' ) {
+					count++;
+					column--;
+				}
+				lastch = 0;
+				/*nextch = 0;*/
+				count += 2;
+			}
+			/* ok, ok, we'll let a simple overstrike get through
+			*/
+			else
+				overstrike = TRUE;
+		}
+		/* check for some special control chars
+		*/	
+		else switch ( nextch ) {
+
+		case '\n':
+			newcolumn = column = FIRSTCOL;
+			break;
+
+		case '\t':
+			newcolumn = (column | 0x7) + 1;
+			nextch = 0;
+			break;
+
+		case '\033':
+			haveesc = TRUE;
+			break;
+			
+		default :
+			column++;
+			break;
+		}
+
+		/* now we have check for various combinations of control
+		   chars and are ready to print the char. First check to see
+		   if we need to turn underline or boldface on or off.
+
+		   Unfortunately the imagewriter auto underline also underlines
+ 		   spaces, which would be alright except that nroff assumes 
+		   that spaces are not underlined. And consequently does not
+		   turn off underlining at the end of a line. So even though
+		   we use underline sequence direct from tabiw(p) we intercept
+		   and regen around whitespace.
+		*/
+
+		if ( seenunderline && isalpha(lastch) )
+				underline = TRUE;
+
+		if ( (underline && !sentunderline) ) {
+			printf( "\033X" );
+			sentunderline = TRUE;
+		}
+		else if ( !underline && sentunderline ) {
+			printf( "\033Y");
+			sentunderline = FALSE;
+		} 
+		if ( boldface && !sentboldface ) {
+			printf( "\033\!" );
+			sentboldface = TRUE;
+		}
+		else if ( !boldface && sentboldface ) {
+			printf( "\033\"" );
+			sentboldface = FALSE;
+		}
+
+		/* to be able to properly handle _ or _____ we must
+		   do a one char lookahead. So we save char until next
+		   time around the loop. Always print previous char.
+	
+		   Also sometimes must simply throw away due to imagewriter
+		   being unable to backup more than one position.
+		*/
+		if ( lastch )
+			if ( count )
+				count--;
+			else 
+				putchar( lastch );
+
+		lastch = nextch;
+
+		/* finally check for overstrike and perform if neccessary
+		*/	
+		if ( overstrike ) {
+			printf( "\b%c", nextch );	
+			lastch = 0;
+		}
+
+		/* turn off flags for next go around */	
+		boldface = overstrike = underline = FALSE;
+
+	}
+	/* termination condition */
+	while ( nextch != EOF);
+}
+	
+
+EnD of iw.c
+echo extracting tabiw.c 1>&2
+cat >tabiw.c << 'EnD of tabiw.c'
+/* tabiw.c
+
+	non-proportional nroff table for Imagewriter II (I) printer
+
+	copyright (c) 1987 Stuart Lynne
+
+*/
+
+/*
+	This file defines an nroff table using the imagewriter's
+	built in fonts.
+
+	To construct tabiwp you must have the table generation software.
+	This has been tested with Bruce Townsend's version.
+
+*/
+
+
+
+#ifndef	INCH
+#define	INCH	240
+#endif
+
+struct t {
+	int bset;
+	int breset;
+	int Hor;
+	int Vert;
+	int Newline;
+	int Char;
+	int Em;
+	int Halfline;
+	int Adj;
+	char *twinit;
+	char *twrest;
+	char *twnl;
+	char *hlr;
+	char *hlf;
+	char *flr;
+	char *bdon;
+	char *bdoff;
+	char *iton;
+	char *itoff;
+	char *ploton;
+	char *plotoff;
+	char *up;
+	char *down;
+	char *right;
+	char *left;
+	char *codetab[256-32];
+	char *zzz;
+	} t = {
+/*bset    */		00,
+/*breset  */		054,
+/*Hor     */		4,
+/*Vert    */		5,
+/*Newline */		40,
+/*Char    */		24,
+/*Em      */		24,
+/*Halfline*/		20,
+/*Adj     */		24,
+/*twinit  */		"", /* we could put stuff here, but leave it for 
+				lp filter instead  sl */
+/*twrest  */		"",
+/*twnl    */		"\033\"\r\n",	/* turn boldface off, newline */
+/*hlr     */		"",
+/*hlf     */		"",
+/*flr     */		"",
+/*bdon    */		"\033!",	/* turn boldface on */
+/*bdoff   */		"\033\"",	/* turn boldface off */
+/*iton    */		"\033X",	/* turn underline on */
+/*itoff   */		"\033Y",	/* turn underline off */
+/*ploton  */		"",
+/*plotoff */		"",
+/*up      */		"",
+/*down    */		"",
+/*right   */		"",
+/*left    */		"",
+/* space */         	"\001 ",
+/* ! */             	"\001!",
+/* " */             	"\001\"",
+/* # */             	"\001#",
+/* $ */             	"\001$",
+/* % */             	"\001%",
+/* & */             	"\001&",
+/* ' close */       	"\001'",
+/* ( */             	"\001(",
+/* ) */             	"\001)",
+/* * */             	"\001*",
+/* + */             	"\001+",
+/* , */             	"\001,",
+/* - hyphen */      	"\001-",
+/* . */             	"\001.",
+/* / */             	"\001/",
+/* 0 */             	"\2010",
+/* 1 */             	"\2011",
+/* 2 */             	"\2012",
+/* 3 */             	"\2013",
+/* 4 */             	"\2014",
+/* 5 */             	"\2015",
+/* 6 */             	"\2016",
+/* 7 */             	"\2017",
+/* 8 */             	"\2018",
+/* 9 */             	"\2019",
+/* : */             	"\001:",
+/* ; */             	"\001;",
+/* < */             	"\001<",
+/* = */             	"\001=",
+/* > */             	"\001>",
+/* ? */             	"\001?",
+/* @ */             	"\001@",
+/* A */             	"\201A",
+/* B */             	"\201B",
+/* C */             	"\201C",
+/* D */             	"\201D",
+/* E */             	"\201E",
+/* F */             	"\201F",
+/* G */             	"\201G",
+/* H */             	"\201H",
+/* I */             	"\201I",
+/* J */             	"\201J",
+/* K */             	"\201K",
+/* L */             	"\201L",
+/* M */             	"\201M",
+/* N */             	"\201N",
+/* O */             	"\201O",
+/* P */             	"\201P",
+/* Q */             	"\201Q",
+/* R */             	"\201R",
+/* S */             	"\201S",
+/* T */             	"\201T",
+/* U */             	"\201U",
+/* V */             	"\201V",
+/* W */             	"\201W",
+/* X */             	"\201X",
+/* Y */             	"\201Y",
+/* Z */             	"\201Z",
+/* [ */             	"\001[",
+/* \ */             	"\001\\",
+/* ] */             	"\001]",
+/* ^ */             	"\001^",
+/* _ dash */        	"\001_",
+/* ` open */        	"\001`",
+/* a */             	"\201a",
+/* b */             	"\201b",
+/* c */             	"\201c",
+/* d */             	"\201d",
+/* e */             	"\201e",
+/* f */             	"\201f",
+/* g */             	"\201g",
+/* h */             	"\201h",
+/* i */             	"\201i",
+/* j */             	"\201j",
+/* k */             	"\201k",
+/* l */             	"\201l",
+/* m */             	"\201m",
+/* n */             	"\201n",
+/* o */             	"\201o",
+/* p */             	"\201p",
+/* q */             	"\201q",
+/* r */             	"\201r",
+/* s */             	"\201s",
+/* t */             	"\201t",
+/* u */             	"\201u",
+/* v */             	"\201v",
+/* w */             	"\201w",
+/* x */             	"\201x",
+/* y */             	"\201y",
+/* z */             	"\201z",
+/* { */             	"\001{",
+/* | */             	"\001|",
+/* } */             	"\001}",
+/* ~ */             	"\001~",
+/* narrow sp */     	"\000\0",
+/* hyphen */        	"\001-",
+/* bullet */        	"\000\0",
+/* square */        	"\000\0",
+/* 3/4 em */        	"\001-",
+/* rule */          	"\001_",
+/* 1/4 */           	"\0031/4",
+/* 1/2 */           	"\0031/2",
+/* 3/4 */           	"\0033/4",
+/* minus */         	"\001-",
+/* fi */            	"\202fi",
+/* fl */            	"\202fl",
+/* ff */            	"\202ff",
+/* ffi */           	"\203ffi",
+/* ffl */           	"\203ffl",
+/* degree */        	"\000\0",
+/* dagger */        	"\000\0",
+/* section */       	"\000\0",
+/* foot mark */     	"\000\0",
+/* acute accent */  	"\000\0",
+/* grave accent */  	"\000\0",
+/* underrule */     	"\001_",
+/* slash (longer) */	"\001/",
+/* half narrow space */	"\000\0",
+/* unpaddable space */	"\001 ",
+/* alpha */         	"\000\0",
+/* beta */          	"\000\0",
+/* gamma */         	"\000\0",
+/* delta */         	"\000\0",
+/* epsilon */       	"\000\0",
+/* zeta */          	"\000\0",
+/* eta */           	"\000\0",
+/* theta */         	"\000\0",
+/* iota */          	"\000\0",
+/* kappa */         	"\000\0",
+/* lambda */        	"\000\0",
+/* mu */            	"\000\0",
+/* nu */            	"\000\0",
+/* xi */            	"\000\0",
+/* omicron */       	"\000\0",
+/* pi */            	"\000\0",
+/* rho */           	"\000\0",
+/* sigma */         	"\000\0",
+/* tau */           	"\000\0",
+/* upsilon */       	"\000\0",
+/* phi */           	"\000\0",
+/* chi */           	"\000\0",
+/* psi */           	"\000\0",
+/* omega */         	"\000\0",
+/* Gamma */         	"\000\0",
+/* Delta */         	"\000\0",
+/* Theta */         	"\000\0",
+/* Lambda */        	"\000\0",
+/* Xi */            	"\000\0",
+/* Pi */            	"\000\0",
+/* Sigma */         	"\000\0",
+/* Tau */           	"\000\0",
+/* Upsilon */       	"\000\0",
+/* Phi */           	"\000\0",
+/* Psi */           	"\000\0",
+/* Omega */         	"\000\0",
+/* square root */   	"\000\0",
+/* terminal sigma */	"\000\0",
+/* root en */       	"\000\0",
+/* >= */            	"\000\0",
+/* <= */            	"\000\0",
+/* identically equal */	"\000\0",
+/* equation minus */	"\000\0",
+/* approx = */      	"\000\0",
+/* approximates */  	"\000\0",
+/* not equal */     	"\000\0",
+/* right arrow */   	"\000\0",
+/* left arrow */    	"\000\0",
+/* up arrow */      	"\000\0",
+/* down arrow */    	"\000\0",
+/* eqn equals */    	"\000\0",
+/* multiply */      	"\000\0",
+/* divide */        	"\000\0",
+/* plus-minus */    	"\000\0",
+/* cup (union) */   	"\000\0",
+/* cap (intersection) */	"\000\0",
+/* subset of */     	"\000\0",
+/* superset of */   	"\000\0",
+/* improper subset */	"\000\0",
+/*  improper superset */	"\000\0",
+/* infinity */      	"\000\0",
+/* pt deriv */      	"\000\0",
+/* gradient */      	"\000\0",
+/* not */           	"\000\0",
+/* integral */      	"\000\0",
+/* proportional to */	"\000\0",
+/* empty set */     	"\000\0",
+/* member of */     	"\001+",
+/* equation plus */ 	"\000\0",
+/* registration mk */	"\000\0",
+/* copyright mk */  	"\001|",
+/* box rule */      	"\000\0",
+/* cent sign */     	"\000\0",
+/* dbl dagger */    	"\000\0",
+/* right hand */    	"\000\0",
+/* left hand */     	"\001*",
+/* math *  */       	"\000\0",
+/* bell system sign */	"\001|",
+/* or (was star) */ 	"\000\0",
+/* circle */        	"\001|",
+/* left top of big curly */	"\001|",
+/* left bottom of big curly */	"\001|",
+/* right top of big curly */	"\001|",
+/* right bottom of big curly */	"\001|",
+/* left center of big curly */	"\001|",
+/* right center of big curly */	"\001|",
+/* bold vertical rule */	"\001|",
+/* left bottom of big bracket */	"\001|",
+/* right bottom of big bracket */	"\001|",
+/* left top of big bracket */	"\001|",
+/* right top of big bracket */	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\033E\033D\001",
+};
+EnD of tabiw.c
+echo extracting tabiwp.c 1>&2
+cat >tabiwp.c << 'EnD of tabiwp.c'
+/* tabiwp.c
+
+	proportional nroff table for Imagewriter II (I) printer
+
+	copyright (c) 1987 Stuart Lynne
+
+*/
+
+/*
+	This file defines an nroff table using the imagewriter's
+	built in proportional font.
+
+	To construct tabiwp you must have the table generation software.
+	This has been tested with Bruce Townsend's version.
+
+	Because of the limitations of this table and nroff, post processing
+	support is required. See the filter iw(1ml).
+
+	Specifically this table assumes that iw is called after nroff:
+
+		nroff .... | col ... | iw | ...
+	
+	The iw filter defines a special char in the alternate font. A one
+	dot width space for nroff to do proportional spacing with.
+
+	Nroff uses this in a round about way. By dropping into plot mode
+	and emitting the move right sequence. In our case simply the 
+	one dot width space.
+
+*/
+
+
+
+#include	<termio.h>	/* Req'd only for bset, breset */
+
+#define INCH 240
+
+struct {
+	int bset;
+	int breset;
+	int Hor;
+	int Vert;
+	int Newline;
+	int Char;
+	int Em;
+	int Halfline;
+	int Adj;
+	char *twinit;
+	char *twrest;
+	char *twnl;
+	char *hlr;
+	char *hlf;
+	char *flr;
+	char *bdon;
+	char *bdoff;
+	char *iton;
+	char *itoff;
+	char *ploton;
+	char *plotoff;
+	char *up;
+	char *down;
+	char *right;
+	char *left;
+	char *codetab[256-32];
+	char *zzz;
+	} t = {
+/*bset    */		0,
+/*breset  */		ONLCR | OCRNL | ONLRET,
+/*Hor     */		INCH / 120, /* 24, */ /*INCH / 60,*/
+/*Vert    */		40, /*INCH / 48,*/
+/*Newline */		INCH / 6,
+/*Char    */		INCH / 120,
+/*Em      */		INCH / 120 * 7, /* seem to want size of sp */
+/*Halfline*/		INCH / 12,
+/*Adj     */		INCH / 120,
+/*twinit  */		"", 
+/*twrest  */		"",
+/*twnl    */		"\033\"\r\n",	/* turn boldface off, newline */
+/*hlr     */		"",
+/*hlf     */		"",
+/*flr     */		"",
+/*bdon    */		"\033!",	/* turn boldface on */
+/*bdoff   */		"\033\"",	/* turn boldface off */
+/*iton    */		"\033X",	/* turn underline on */ 
+/*itoff   */		"\033Y", 	/* turn underline off */
+/*ploton  */		"\033'",	/* turn alternate font on */
+/*plotoff */		"\033$",	/* turn alternate font off */
+/*up      */		"",
+/*down    */		"",
+/*right   */		"~", /* requires support from iw - vis-a-vis special char */
+/*left    */		"",
+/* space */         	"\007 ", 
+/* space   */		/*"\001\033'~\033$", */
+/* ! */             	"\007!",
+/* " */             	"\012\"",
+/* # */             	"\016#",
+/* $ */             	"\014$",
+/* % */             	"\020%",
+/* & */             	"\015&",
+/* ' close */       	"\007'",
+/* ( */             	"\007(",
+/* ) */             	"\007)",
+/* * */             	"\014*",
+/* + */             	"\014+",
+/* , */             	"\007,",
+/* - hyphen */      	"\014-",
+/* . */             	"\007.",
+/* / */             	"\014/",
+/* 0 */             	"\2140",
+/* 1 */             	"\2141",
+/* 2 */             	"\2142",
+/* 3 */             	"\2143",
+/* 4 */             	"\2144",
+/* 5 */             	"\2145",
+/* 6 */             	"\2146",
+/* 7 */             	"\2147",
+/* 8 */             	"\2148",
+/* 9 */             	"\2149",
+/* : */             	"\007:",
+/* ; */             	"\007;",
+/* < */             	"\014<",
+/* = */             	"\014=",
+/* > */             	"\014>",
+/* ? */             	"\014?",
+/* @ */             	"\016@",
+/* A */             	"\220A",
+/* B */             	"\217B",
+/* C */             	"\216C",
+/* D */             	"\217D",
+/* E */             	"\217E",
+/* F */             	"\217F",
+/* G */             	"\216G",
+/* H */             	"\217H",
+/* I */             	"\211I",
+/* J */             	"\215J",
+/* K */             	"\214K",
+/* L */             	"\215L",
+/* M */             	"\221M",
+/* N */             	"\220N",
+/* O */             	"\217O",
+/* P */             	"\215P",
+/* Q */             	"\220Q",
+/* R */             	"\217R",
+/* S */             	"\214S",
+/* T */             	"\216T",
+/* U */             	"\217U",
+/* V */             	"\220V",
+/* W */             	"\221W",
+/* X */             	"\213X",
+/* Y */             	"\216Y",
+/* Z */             	"\213Z",
+/* [ */             	"\014[",
+/* \ */             	"\014\\",
+/* ] */             	"\014]",
+/* ^ */             	"\014^",
+/* _ dash */        	"\021_",
+/* ` open */        	"\007`",
+/* a */             	"\214a",
+/* b */             	"\214b",
+/* c */             	"\212c",
+/* d */             	"\214d",
+/* e */             	"\214e",
+/* f */             	"\212f",
+/* g */             	"\214g",
+/* h */             	"\214h",
+/* i */             	"\210i",
+/* j */             	"\207j",
+/* k */             	"\212k",
+/* l */             	"\210l",
+/* m */             	"\220m",
+/* n */             	"\214n",
+/* o */             	"\214o",
+/* p */             	"\214p",
+/* q */             	"\214q",
+/* r */             	"\212r",
+/* s */             	"\214s",
+/* t */             	"\212t",
+/* u */             	"\214u",
+/* v */             	"\214v",
+/* w */             	"\220w",
+/* x */             	"\214x",
+/* y */             	"\214y",
+/* z */             	"\212z",
+/* { */             	"\012{",
+/* | */             	"\007|",
+/* } */             	"\012}",
+/* ~ */             	"\015~",
+/* narrow sp */     	"\007 ",
+/* hyphen */        	"\014-",
+/* bullet */        	"\000\0",
+/* square */        	"\000\0",
+/* 3/4 em */        	"\014-",
+/* rule */          	"\021_",
+/* 1/4 */           	"\0401/4",
+/* 1/2 */           	"\0401/2",
+/* 3/4 */           	"\0403/4",
+/* minus */         	"\014-",
+/* fi */            	"\222fi",
+/* fl */            	"\222fl",
+/* ff */            	"\224ff",
+/* ffi */           	"\232ffi",
+/* ffl */           	"\203ffl",
+/* degree */        	"\000\0",
+/* dagger */        	"\000\0",
+/* section */       	"\000\0",
+/* foot mark */     	"\000\0",
+/* acute accent */  	"\000\0",
+/* grave accent */  	"\000\0",
+/* underrule */     	"\021_",
+/* slash (longer) */	"\014/",
+/* half narrow space */	"\000\0",
+/* unpaddable space */	"\007 ",
+/* alpha */         	"\000\0",
+/* beta */          	"\000\0",
+/* gamma */         	"\000\0",
+/* epsilon */       	"\000\0",
+/* zeta */          	"\000\0",
+/* eta */           	"\000\0",
+/* theta */         	"\000\0",
+/* iota */          	"\000\0",
+/* kappa */         	"\000\0",
+/* lambda */        	"\000\0",
+/* mu */            	"\000\0",
+/* nu */            	"\000\0",
+/* xi */            	"\000\0",
+/* omicron */       	"\000\0",
+/* pi */            	"\000\0",
+/* rho */           	"\000\0",
+/* sigma */         	"\000\0",
+/* tau */           	"\000\0",
+/* upsilon */       	"\000\0",
+/* phi */           	"\000\0",
+/* chi */           	"\000\0",
+/* psi */           	"\000\0",
+/* omega */         	"\000\0",
+/* Gamma */         	"\000\0",
+/* Delta */         	"\000\0",
+/* Theta */         	"\000\0",
+/* Lambda */        	"\000\0",
+/* Xi */            	"\000\0",
+/* Pi */            	"\000\0",
+/* Sigma */         	"\000\0",
+/* Tau */           	"\000\0",
+/* Upsilon */       	"\000\0",
+/* Phi */           	"\000\0",
+/* Psi */           	"\000\0",
+/* Omega */         	"\000\0",
+/* square root */   	"\000\0",
+/* terminal sigma */	"\000\0",
+/* root en */       	"\000\0",
+/* >= */            	"\000\0",
+/* <= */            	"\000\0",
+/* identically equal */	"\000\0",
+/* equation minus */	"\000\0",
+/* approx = */      	"\000\0",
+/* approximates */  	"\000\0",
+/* not equal */     	"\000\0",
+/* right arrow */   	"\000\0",
+/* left arrow */    	"\000\0",
+/* up arrow */      	"\000\0",
+/* down arrow */    	"\000\0",
+/* eqn equals */    	"\000\0",
+/* multiply */      	"\000\0",
+/* divide */        	"\000\0",
+/* plus-minus */    	"\000\0",
+/* cup (union) */   	"\000\0",
+/* cap (intersection) */	"\000\0",
+/* subset of */     	"\000\0",
+/* superset of */   	"\000\0",
+/* improper subset */	"\000\0",
+/*  improper superset */	"\000\0",
+/* infinity */      	"\000\0",
+/* pt deriv */      	"\000\0",
+/* gradient */      	"\000\0",
+/* not */           	"\000\0",
+/* integral */      	"\000\0",
+/* proportional to */	"\000\0",
+/* empty set */     	"\000\0",
+/* member of */     	"\000\0",
+/* equation plus */ 	"\014+",
+/* registration mk */	"\000\0",
+/* copyright mk */  	"\000\0",
+/* box rule */      	"\007|",
+/* cent sign */     	"\000\0",
+/* dbl dagger */    	"\000\0",
+/* right hand */    	"\000\0",
+/* left hand */     	"\000\0",
+/* math *  */       	"\014*",
+/* bell system sign */	"\000\0",
+/* or (was star) */ 	"\007|",
+/* circle */        	"\000\0",
+/* left top of big curly */	"\007|",
+/* left bottom of big curly */	"\007|",
+/* right top of big curly */	"\007|",
+/* right bottom of big curly */	"\007|",
+/* left center of big curly */	"\007|",
+/* right center of big curly */	"\007|",
+/* bold vertical rule */	"\007|",
+/* left bottom of big bracket */	"\007|",
+/* right bottom of big bracket */	"\007|",
+/* left top of big bracket */	"\007|",
+/* right top of big bracket */	"\007|",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+/* ??? */           	"\000\0",
+};
+EnD of tabiwp.c
+echo extracting iw.1ml 1>&2
+cat >iw.1ml << 'EnD of iw.1ml'
+.TH IW 1ML
+.ad b
+.SH NAME
+iw - filter program for nroff to Apple ImageWriter (I & II) Printers
+.SH SYNOPSIS
+.B iw
+< file.in > file.out
+.br
+.... | 
+.B iw
+| ....
+.SH DESCRIPTION
+.PP
+Iw is a simple filter which fixes various problems with the output from 
+nroff. 
+It should be used (automatically if man and mm are correctly modified),
+when the -Tiw, -Tiwp or -Tiwlp option is specified. 
+.br
+	man -Tiw elm | ....
+.br
+	mm -Tiw elm.guide | ....
+.br
+	nroff -cm -Tiw elm.guide | col -x -p | iw | ...
+.PP
+For tabiwlp, the nroff default boldface mechanism (X^HX) 
+is intercepted and converted
+to the Imagewriter boldface escape sequence (<esc>! and <esc>").
+.PP
+Also for tabiwlp, the nroff default underline mechanism (_^HX) 
+is intercepted and converted
+to the Imagewriter underline escape sequence (<esc>X and <esc>Y).
+.PP
+Multiple backspace char's (abcd^H^H^H^Hefgh), are intercepted and ignored
+(abce is result not abcd). The imagewriter is not able to backspace and
+overstrike more than one character position.
+.PP
+For tabiw and tabiwp where the Imagewriter underline escape 
+sequence is generated by nroff 
+it is intercepted and re-generated to ignore whitespace.
+.PP
+Any tabs are converted to white space due to a discrepency between nroff and
+the Imagewriter.
+.PP
+.SH FILES
+.br
+/usr/local/bin/iw
+.br
+/usr/lib/term/tabiw
+.br
+/usr/lib/term/tabiwp
+.br
+/usr/lib/term/tabiwlp
+.br
+/usr/bin/man
+.br
+/usr/bin/mm
+.br
+.
+.SH AUTHOR
+Stuart Lynne
+.SH SEE\ ALSO
+iwlp(1ml), tabiw(5l), lp(1), lpadmin(1m), nroff(1), man(1), mm(1)
+.SH BUGS
+EnD of iw.1ml
+echo extracting iwlp.1ml 1>&2
+cat >iwlp.1ml << 'EnD of iwlp.1ml'
+.TH IWLP 1ML
+.ad b
+.SH NAME
+iwlp - lp interface program for Apple ImageWriter (I & II) Printer
+.br
+iw - filter for ImageWriter printer
+.br
+tabiw, tabiwp - nroff driving tables for Imagewriter printer
+.SH SYNOPSIS
+.B iwlp
+.br
+.B iwlp
+requestID username banner copies options file1 .. filen
+.SH DESCRIPTION
+.I iwlp
+is primarily used as an interface program by the System V Line
+Printer Spooler. 
+
+Place iwlp into the /usr/spool/lp/model directory. Use the
+/usr/lib/lpadmin command to install.
+
+The following options are supported when used from the lp command.
+
+.SS COMMAND LINE OPTIONS
+.TP 8
+.BI \-c
+compressed print
+.TP
+.B \-u
+ultra compressed print
+.TP
+.B \-s
+semi compressed print
+.TP
+.B \-x
+expanded print
+.TP
+.B \-e
+elite 12 cps (default)
+.TP
+.B \-E
+elite proportional
+.TP
+.B \-p
+pica 10 cps
+.TP
+.B \-P
+pica proportional
+.TP
+.B \-d
+draft mode quality
+.TP
+.B \-s
+standard quality (default)
+.TP
+.B \-n
+near letter quality
+.TP
+.B \-6
+six lines per inch (default)
+.TP
+.B \-8
+eight lines per inch
+.TP
+.B \-0
+slash zero's
+.TP
+.B \-z
+do not add half an inch offset (default if proportional print selected).
+.TP
+.B \-h
+add half an inch offset (default if proportional print not selected).
+.TP
+.B \-t
+no title or cover page
+.P
+This program is implemented as a shell script with an accompaning filter 
+program to convert backspace bold and underline sequences to Imagewriter
+specific escape sequences.
+.br
+Additional support for the Imagewriter is contained in the iw print filter
+and tabiwp nroff table. 
+
+.SH EXAMPLE
+.br
+	/usr/lib/lpadmin -piw -miwlp -v/dev/lp 
+.br
+	man -Tiwp elm.guide | lp -diw -t"IW Test" -oP 
+.br
+.SH FILES
+.B /usr/spool/lp/model/iwlp
+.SP
+.SH AUTHOR
+Stuart Lynne
+.SH SEE ALSO
+lp(1), lpadmin(1m), iw(1ml), tabiw()
+.SH BUGS
+EnD of iwlp.1ml
+echo extracting tabiw.5l 1>&2
+cat >tabiw.5l << 'EnD of tabiw.5l'
+.TH TABIW 5ML
+.ad b
+.SH NAME
+tabiw
+.br
+tabiwp
+.br
+tabiwlp
+.br
+.SH SYNOPSIS
+.B tabiw
+nroff -Tiw .....
+.br
+.B tabiwp
+nroff -Tiwp .....
+.br
+.SH DESCRIPTION
+
+.B tabiw,
+.B tabiwp,
+.B tabiwlp
+are used by nroff to generate the proper escape sequences for the 
+Imagewriter printer. 
+Tabiwp is for proportional print mode (ie. Pica Proportional).
+.P
+Tabiw supports the normal Imagewriter non-proportional character
+sets (ie. Pica 10 cps, Elite 12 cps). 
+Underlining and boldface are done with the standard Imagewriter
+escape sequences.
+.P
+Tabiwp supports the Imagewriter proportional character set.
+.P
+Tabiwlp is a link to tablp. This is used as a signal to man and mm
+shell scripts to use the iw printer filter with tablp.
+.P
+Use the -T flag to tell nroff you wish to use these versions.
+.P
+To allow choice of character sets to be made when printing the
+nroff driving tables do not contain information to set up the 
+printer to the correct font. This can be easily done with the
+iwlp line printer spooler filter.
+.P
+The proportional mode is not correctly mapped to nroffs internal 
+scale. Pica proportional is 83% the size of normal nroff output.
+Elite proportional is 75% the size of normal nroff output.
+.P
+To correct for this a document might place the following commands
+at the front of the input file:
+.nf
+.br
+.B 	Pica
+.br
+	.po .9i
+	.ll 7.25i
+
+.B 	Elite
+	.po 1i
+	.ll 8i
+.fi
+.SH EXAMPLE
+.br
+	nroff -Tiwp -cm elm.guide | col -x -p | iw | lp -diw -oP
+.br
+	man -Tiwp elm.guide | lp -diw -oP
+.br
+.SH FILES
+ /usr/lib/term/tabiw
+.br
+/usr/lib/term/tabiwp 
+.br
+.SH AUTHOR
+Stuart Lynne
+.SH SEE ALSO
+iwlp(1ml), iw(1ml), nroff(1), man(1), mm(1) 
+.SH BUGS
+The sizing of the proportional fonts is not correctly set for nroff, 
+requiring a short preamble to source files resetting the line width
+and page offset.
+EnD of tabiw.5l
+echo extracting man.diff 1>&2
+cat >man.diff << 'EnD of man.diff'
+8c8
+< PATH=/bin:/usr/bin:/usr/local/bin;	y=0;	tbl="tbl";	u="-can";
+---
+> PATH=/bin:/usr/bin:/usr/lbin;	y=0;	tbl="tbl";	u="-can";
+65c65
+< 		iwlp|iwp|iw|2631|2631-c|2631-e)	v=3;	c=c ;;
+---
+> 		2631|2631-c|2631-e)	v=3;	c=c ;;
+78d77
+< 			iwlp|iwp|iw)	g="|col -p -x | iw" ;;
+EnD of man.diff
+echo extracting mm.diff 1>&2
+cat >mm.diff << 'EnD of mm.diff'
+30c30
+< 	iwlp|iwp|iw|2631|2631-c|2631-e)	v=3;	c=c ;;
+---
+> 	2631|2631-c|2631-e)	v=3;	c=c ;;
+44d43
+< 		iwlp|iwp|iw)	g="|col -p -x | iw" ;;
+77d75
+< #echo "$f $e nroff $u $w -T$TERM $a $d $g";	z=0;	exit
+EnD of mm.diff
+echo extracting iwlp 1>&2
+cat >iwlp << 'EnD of iwlp'
+#
+#	$Header: iw,v 1.0 86/06/17 14:50:23 rgb Exp $
+#	$Locker:  $
+#
+# lp interface for Apple Imagewriter printers I/II
+#
+#	SCCS @(#)iw	1.0
+
+version="1.2"
+
+x1="iwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiw"
+x2="wiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwiwi"
+
+# parse arg's first
+#
+copies=$4
+siz=-e
+qual=-S
+lines=-6
+slashzero=0
+pageoffset=1
+coverpage=1
+for i in $5
+do
+	case "$i" in
+	-c | c) # compressed print
+		siz=-c;
+		;;
+	-u | u) # ultra compressed print
+		siz=-u;
+		;;
+	-s | s) # semi condesened print
+		siz=-s;
+		;;
+	-x | x) # expanded print
+		siz=-x;
+		;;
+	-e | e) # elite 12 cps
+		siz=-e		
+		;;
+	-E | E) # elite proportional
+		siz=-E
+		pageoffset=0
+		;;
+	-p | p) # pica 10 cps
+		siz=-p
+		;;
+	-P | P) # pica proportional
+		siz=-P
+		pageoffset=0
+		;;
+	-D | D | -d | d) # draft 
+		qual=-D
+		;;
+	-S | S | -s | s) # standard
+		qual=-S
+		;;
+	-N | N | -n | n) # near letter quality
+		qual=-N
+		;;
+	-6 | 6) # six lines per inch
+		lines=-6
+		;;
+	-8 | 8) # eight lines per inch
+		lines=-8
+		;;
+	-0 | 0) # slash zero's
+		slashzero=1
+		;;
+	-z | z | -Z | Z) # do not add half inch offset
+		pageoffset=0
+		;;
+	-h | h | -H | H) # do add half inch offset
+		pageoffset=1
+		;;
+	-t | t | -T | T) # do not print cover page
+		coverpage=0
+		;;
+
+	esac
+done
+
+# reset printer
+echo "\033c\c"
+
+# print cover page?
+#
+if [ X$coverpage = X1 ]
+then
+#echo "\014\c"
+echo "\033L010\c"		#  offset left margin by 10
+echo "\n$x1\n$x2\n$x1\n$x2\n"
+banner "$2"
+echo "\n"
+user=`grep "^$2:" /etc/passwd | line | cut -d: -f5`
+if [ -n "$user" ]
+then
+	echo "User: $user\n"
+else
+	echo "\n"
+fi
+echo "Request id: $1    Printer: `basename $0`  Interface: IW1 "$version"\n"
+date
+echo "\n"
+if [ -n "$3" ]
+then
+	banner $3
+fi
+echo "\014\c"
+echo "\033L000\c"		#  offset left margin by 0
+fi
+if [ X$siz = X-x ]
+then
+	echo "\033n\c"	# expanded		9 cpi		72 cli
+elif [ X$siz = X-c ]
+then
+	echo "\033q\c"	# condensed 		15 cpi		120 cli
+elif [ X$siz = X-s ]
+then
+	echo "\033e\c"	# semi condensed 	13.4 cpi	107 cli
+elif [ X$siz = X-u ]
+then
+	echo "\033Q\c"	# ultra condensed 	17 cpi 		136 cli
+elif [ X$siz = X-p ]
+then
+	echo "\033N\c"	# pica 			10 cpi
+elif [ X$siz = X-P ]
+then
+	echo "\033p\c"	# pica proportional
+elif [ X$siz = X-e ]
+then
+	echo "\033E\c"	# elite			12 cpi
+elif [ X$siz = X-E ]
+then
+	echo "\033P\c"	# elite proportional
+fi
+if [ X$qual = X-D ]
+then
+	echo "\033a1\c"	# draft mode
+elif [ X$qual = X-S ]
+then
+	echo "\033a0\c"	# standard quality
+elif [ X$qual = X-N ]	
+then
+	echo "\033a2\c"	# near letter quality
+fi
+if [ X$lines = X-6 ]
+then
+	echo "\033A\c"
+elif [ X$lines = X-8 ]
+then
+	echo "\033B\c"
+fi
+if [ X$slashzeros = X1 ]
+then
+	echo "\033D\001\000\c"
+	#echo "\033D\000\001\c"
+fi
+if [ X$pageoffset = X1 ]
+then
+echo "\033L005\c"		#  offset left margin by 5
+fi
+#
+#
+shift; shift; shift; shift; shift
+files="$*"
+i=1
+while [ $i -le $copies ];
+do
+	for file in $files;
+	do
+		cat "$file" 2>&1
+		echo "\014\c"
+	done
+	i=`expr $i + 1`
+done
+#echo "\033c\c"	# reset to power on defaults 
+exit 0
+EnD of iwlp
+chmod +x iwlp
+-- 
+Stuart Lynne	ihnp4!alberta!ubc-vi!van-bc!sl 	      Vancouver,BC,604-937-7532
+Todays feature: The Problem of the Green Capsule, John Dickson Carr, 1939
+Gideon Fell solves the "Psychologist's Murder Case". Five eye-witnesses, a film
+and still no one could identify the murder.
+
+

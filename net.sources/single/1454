@@ -1,0 +1,450 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,aa0b403370ae0260,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-07-31 09:58:22 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83 (MC840302); site mcvax.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxl!ihnp4!zehntel!dual!amd!decwrl!decvax!mcvax!piet
+From: piet@mcvax.UUCP (Piet Beertema)
+Newsgroups: net.sources
+Subject: new uucp protocol
+Message-ID: <5919@mcvax.UUCP>
+Date: Tue, 31-Jul-84 12:58:22 EDT
+Article-I.D.: mcvax.5919
+Posted: Tue Jul 31 12:58:22 1984
+Date-Received: Sat, 4-Aug-84 01:27:01 EDT
+Organization: CWI, Amsterdam
+Lines: 430
+
+<...>
+
+Here is a new uucp protocol for use over X.25+PAD connections. It can
+be used too on direct lines and 7-bit links, provided the receiving
+machine is fast enough to handle high-speed flow control (e.g. no
+11/45's etc.).
+
+The reason for introducing this protocol:
+In Europe there is an increasing tendency to switch uucp links (especially
+the international links) from phone to X.25, because that would be both
+faster and cheaper.
+Initial tests however proved that this was *not* the case, due to (often
+long) delays in the X.25 network. It turned out that with 4800 Baud lines
+no effective speed higher than ~1200 Baud could be attained! Besides it
+proved to be even more expensive than phone links.
+The cause of this was the standard g-protocol which, when used over X.25,
+exchanges more than 3 times as many packets as would be needed for the data.
+Now the problem is that when you're using a PAD to link to the X.25 network,
+you effectively have an async line, which *could* introduce errors, so you
+can't use an X.25-dedicated protocol that doesn't control the data flow and
+makes no security checks on the data. Besides special care should be taken
+with control characters, that may be meaningful for a PAD.
+The f-protocol given here overcomes these difficulties. It has been tested
+now for about two months. On 4800 Baud links it can attain an effective
+speed of ~4000 Baud. Pity is that I still haven't found a site in the USA
+to test it with, so I can't say as yet what speeds can be reached on a
+transatlantic link.
+
+Adding this proto to uucico requires only two minor changes to the existing
+sources:
+- in cico.c the signals SIGINT and SIGQUIT must be ignored not only in
+  MASTER mode, but also in SLAVE mode. Move the corresponding lines to
+  before the "if (Role == MASTER) {" line.
+- in cntrl.c a line "sleep(2);" must be added before "WMESG(HUP, "");" to
+  prevent timing problems during f-proto turnon.
+
+WARNING: if you've installed this proto and have a phone link to a site
+	 that has installed it too, you must hack the sources to prevent
+	 selection of it on a phone link or use a separate uucico for
+	 that link.
+
+
+Here's the source of the f-proto, fio.c:
+
+/*
+ * fio.c; flow-control protocol.
+ *
+ * This protocol relies basically on flow control of the
+ * data stream. It is meant for working over links that
+ * can (almost) be guaranteed to be errorfree, like direct
+ * or X.25 links.
+ * It carries out a sumcheck over a whole file only. If a
+ * file transport fails the receiving side can request
+ * retransmission(s).
+ * This protocol uses a 7-bit datapath only, so it can be
+ * used on links that are not 8-bit transparent.
+ *
+ * Author: Piet Beertema, CWI, June 1984.
+ */
+
+#include "uucp.h"
+#include <signal.h>
+#ifdef SIII
+#include <termio.h>
+#else
+#include <sgtty.h>
+#endif SIII
+#include <setjmp.h>
+
+
+#define MAXRETRIES	1	/* max. attempts to retransmit a file */
+#define FBUFSIZ		256
+
+static int chksum;
+static jmp_buf Ffailbuf;
+
+static falarm()
+{
+	longjmp(Ffailbuf, 1);
+}
+
+static int (*fsig)();
+
+#ifndef SIII
+#define TCGETA	TIOCGETP
+#define TCSETA	TIOCSETP
+#define termio	sgttyb
+#endif SIII
+
+fturnon()
+{
+	int ret;
+	struct termio ttbuf;
+
+	ioctl(Ifn, TCGETA, &ttbuf);
+#ifdef SIII
+	ttbuf.iflag = IXOFF|IXON|ISTRIP;
+	ttbuf.c_cc[4] = FBUFSIZ > 64 ? 64 : FBUFSIZ;
+	ttbuf.c_cc[5] = 5;
+#else
+	ttbuf.sg_flags = ANYP|CBREAK|TANDEM;
+#endif SIII
+	ret = ioctl(Ifn, TCSETA, &ttbuf);
+	ASSERT(ret >= 0, "STTY FAILED", "", ret);
+	fsig = signal(SIGALRM, falarm);
+	return 0;
+}
+
+fturnoff()
+{
+	(void) signal(SIGALRM, fsig);
+	return 0;
+}
+
+fwrmsg(type, str, fn)
+register char *str;
+int fn;
+char type;
+{
+	register char *s;
+	char bufr[MAXMSGLEN];
+
+	s = bufr;
+	*s++ = type;
+	while (*str)
+		*s++ = *str++;
+	if (*(s-1) == '\n')
+		s--;
+	*s++ = '\r';
+	(void) write(fn, bufr, s - bufr);
+	return 0;
+}
+
+frdmsg(str, fn)
+register char *str;
+register int fn;
+{
+	register char *smax;
+
+	if (setjmp(Ffailbuf))
+		return FAIL;
+	smax = str + MAXMSGLEN - 1;
+	for (;;) {
+		(void) alarm(MAXMSGTIME);
+		if (read(fn, str, 1) <= 0)
+			return FAIL;
+		if (*str == '\r')
+			break;
+		if (str++ >= smax)
+			return FAIL;
+	}
+	*str = '\0';
+	(void) alarm(0);
+	return 0;
+}
+
+fwrdata(fp1, fn)
+FILE *fp1;
+int fn;
+{
+	register int flen, alen, ret;
+	register char *obp;
+	char ibuf[FBUFSIZ];
+	char ack;
+	long abytes, fbytes;
+	time_t t1, t2;
+	struct sgttyb sgtty;
+
+	ret = FAIL;
+retry:
+	chksum = 0xffff;
+	abytes = fbytes = 0L;
+	time(&t1);
+	while ((flen = fread(ibuf, sizeof (char), FBUFSIZ, fp1)) > 0) {
+		if ((alen = fwrblk(fn, ibuf, flen)) < 0)
+			goto acct;
+		fbytes += flen;
+		abytes += alen;
+	}
+	sprintf(ibuf, "\176\176%4x", chksum);
+	alen = strlen(ibuf);
+	if (write(fn, ibuf, alen) == alen) {
+		abytes += alen;
+		DEBUG(8, "%d\n", 6);
+		DEBUG(8, "checksum: %4x\n", chksum);
+	}
+	if (frdmsg(ibuf, fn) < 0) {
+		ack = 0;
+		goto acct;
+	}
+	ack = ibuf[0];
+	DEBUG(8, "got ack: '%c'\n", ack);
+	if (ack == 'G')
+		ret = 0;
+acct:
+	time(&t2);
+	sprintf(ibuf, ret == 0 ?
+		"sent data %ld bytes %ld secs" :
+		"send failed after %ld bytes %ld secs",
+		fbytes, t2 - t1);
+	DEBUG(1, "%s\n", ibuf);
+	syslog(ibuf);
+	sysacct(abytes, t2 - t1);
+	if (ack == 'R') {
+		DEBUG(4, "RETRY:\n", 0);
+		fseek(fp1, 0L, 0);
+		goto retry;
+	}
+	return ret;
+}
+
+frddata(fn, fp2)
+register int fn;
+register FILE *fp2;
+{
+	register int flen;
+	register char eof;
+	char ibuf[FBUFSIZ];
+	int ret, alen, retries = 0;
+	long abytes, fbytes;
+	time_t t1, t2;
+
+	ret = FAIL;
+retry:
+	chksum = 0xffff;
+	abytes = fbytes = 0L;
+	time(&t1);
+	do {
+		if ((flen = frdblk(ibuf, fn, &alen)) < 0)
+			goto acct;
+		if (eof = flen > FBUFSIZ)
+			flen -= FBUFSIZ + 1;
+		fbytes += flen;
+		abytes += alen;
+		if (fwrite(ibuf, sizeof (char), flen, fp2) != flen)
+			goto acct;
+	} while (!eof);
+	ret = 0;
+acct:
+	time(&t2);
+	sprintf(ibuf, ret == 0 ? 
+		"received data %ld bytes %ld secs" :
+		"receive failed after %ld bytes %ld secs",
+		fbytes, t2 - t1);
+	DEBUG(1, "%s\n", ibuf);
+	syslog(ibuf);
+	sysacct(abytes, t2 - t1);
+	if (ret) {
+		if (retries++ < MAXRETRIES) {
+			DEBUG(8, "send ack: 'R'\n", 0);
+			fwrmsg('R', "", fn);
+			fseek(fp2, 0L, 0);
+			DEBUG(4, "RETRY:\n", 0);
+			goto retry;
+		}
+		DEBUG(8, "send ack: 'Q'\n", 0);
+		fwrmsg('Q', "", fn);
+	} else {
+		DEBUG(8, "send ack: 'G'\n", 0);
+		fwrmsg('G', "", fn);
+	}
+	return ret;
+}
+
+frdbuf(blk, len, fn)
+register char *blk;
+register int len;
+register int fn;
+{
+	register int ret;
+
+	if (setjmp(Ffailbuf))
+		return FAIL;
+	(void) alarm(MAXCHARTIME);
+	ret = read(fn, blk, len);
+	alarm(0);
+	return ret <= 0 ? FAIL : ret;
+}
+
+/* Byte conversion:
+ *
+ *   from        pre       to
+ * 000-037       172     100-137
+ * 040-171               040-171
+ * 172-177       173     072-077
+ * 200-237       174     100-137
+ * 240-371       175     040-171
+ * 372-377       176     072-077
+ */
+
+fwrblk(fn, ip, len)
+int fn;
+register char *ip;
+register int len;
+{
+	register char *op;
+	register int sum, nl;
+	char obuf[FBUFSIZ * 2];
+
+	DEBUG(8, "%d/", len);
+	op = obuf;
+	nl = 0;
+	sum = chksum;
+	do {
+		if ((sum <<= 1) & 0x10000)
+			sum++;
+		sum = ((sum & 0xffff) + (*ip & 0377)) & 0xffff;
+		if (*ip & 0200) {
+			*ip &= 0177;
+			if (*ip < 040) {
+				*op++ = '\174';
+				*op++ = *ip++ + 0100;
+			} else
+			if (*ip <= 0171) {
+				*op++ = '\175';
+				*op++ = *ip++;
+			}
+			else {
+				*op++ = '\176';
+				*op++ = *ip++ - 0100;
+			}
+			nl += 2;
+		} else {
+			if (*ip < 040) {
+				*op++ = '\172';
+				*op++ = *ip++ + 0100;
+				nl += 2;
+			} else
+			if (*ip <= 0171) {
+				*op++ = *ip++;
+				nl++;
+			} else {
+				*op++ = '\173';
+				*op++ = *ip++ - 0100;
+				nl += 2;
+			}
+		}
+	} while (--len);
+	chksum = sum;
+	DEBUG(8, "%d,", nl);
+	return write(fn, obuf, nl) == nl ? nl : FAIL;
+}
+
+frdblk(ip, fn, rlen)
+register char *ip;
+int fn, *rlen;
+{
+	register char *op, c;
+	register int sum;
+	register int len, nl;
+	char buf[5];
+	int i;
+	static char special = 0;
+
+	if ((*rlen = len = frdbuf(ip, FBUFSIZ, fn)) < 0)
+		return FAIL;
+	DEBUG(8, "%d/", len);
+	op = ip;
+	nl = 0;
+	sum = chksum;
+	do {
+		if (*ip >= '\172') {
+			if (special) {
+				DEBUG(8, "%d", nl);
+				special = 0;
+				ip++;
+				op = buf;
+				i = --len;
+				while (i--)
+					*op++ = *ip++;
+				while (len < 4) {
+					i = frdbuf(&buf[len], 4 - len, fn);
+					if (i < 0)
+						return FAIL;
+					DEBUG(8, ",%d", i);
+					len += i;
+					*rlen += i;
+				}
+				sscanf(buf, "%4x", &chksum);
+				DEBUG(8, "\nchecksum: %4x\n", sum);
+				if (chksum == sum)
+					return FBUFSIZ + 1 + nl;
+				else {
+					DEBUG(4, "Bad checksum\n", 0);
+					return FAIL;
+				}
+			}
+			special = *ip++;
+		} else {
+			if (*ip < '\040') {
+				/* error: shouldn't get control chars */
+				special = 0;
+				sum = chksum ? 0 : 0xffff;
+				break;
+			}
+			switch (special) {
+			case 0:
+				c = *ip++;
+				break;
+			case '\172':
+				c = *ip++ - 0100;
+				break;
+			case '\173':
+				c = *ip++ + 0100;
+				break;
+			case '\174':
+				c = *ip++ + 0100;
+				break;
+			case '\175':
+				c = *ip++ + 0200;
+				break;
+			case '\176':
+				c = *ip++ + 0300;
+				break;
+			}
+			*op++ = c;
+			if ((sum <<= 1) & 0x10000)
+				sum++;
+			sum = ((sum & 0xffff) + (c & 0377)) & 0xffff;
+			special = 0;
+			nl++;
+		}
+	} while (--len);
+	chksum = sum;
+	DEBUG(8, "%d,", nl);
+	return nl;
+}
+-- 
+	Piet Beertema, CWI, Amsterdam
+	...{decvax,philabs}!mcvax!piet
+
+

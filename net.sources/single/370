@@ -1,0 +1,671 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,b86a1ac83aa0398b,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-06-07 11:57:18 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site linus.UUCP
+Path: utzoo!linus!sch
+From: sch@linus.UUCP (Stephen C. Hemminger)
+Newsgroups: net.sources
+Subject: Vnews interface for vt100
+Message-ID: <26850@linus.UUCP>
+Date: Tue, 7-Jun-83 14:57:18 EDT
+Article-I.D.: linus.26850
+Posted: Tue Jun  7 14:57:18 1983
+Date-Received: Tue, 7-Jun-83 23:31:27 EDT
+Organization: MITRE Corp., Bedford MA
+Lines: 652
+
+
+	This is a terminal interface for Vnews which uses the Vt100
+terminal.  It works, but here are some comments.
+
+   1) I would rather have a termcap version, I am working on it.
+   2) It was made in one day, so don't expect it to be absolutely
+      perfect and throughly tested.
+   3) Sorry, but I think the vnews code is a mess.
+   4) I also have the job control fixes necessary for 4.1Bsd implemented.
+
+Please send me any bug fixes or ideas for improvement.
+
+This file is a replacement for virtterm.c in the distribution. Actually,
+I call the original termHP.c and the new one termVT.c.
+
+-----------------------------------
+/*
+ *  Virtual terminal handler for the HP-2621 terminal.
+ *  Written by Kenneth Almquist, AGS Computers  (HO 4C601, X7105).
+ *  Modified by Stephen Hemminger, MITRE for Vt100 terminals (in ANSI mode)
+ */
+
+#include <stdio.h>
+
+
+#define PAGLEN 24
+#define BOTLINE (PAGLEN - 1)
+#define PAGWID 80
+#define DIRTY 01
+
+/* terminal escape sequences */
+#define SHOME "\033[H"		/* move cursor to (0, 0) */
+#define HOMELEN 3		/* length of SHOME */
+#define SCLEAR "\033[H\033[2J"	/* clear screen and move cursor to (0, 0) */
+#define SCLRLINE "\033[K"	/* clear to end of line */
+#define CLRLINELEN 3		/* length of SCLRLINE */
+#define SUP "\033[A"		/* move cursor up one line */
+#define ULON "\033[4m"		/* turn underlining on */
+#define ULOFF "\033[0m"		/* turn underlining off */
+#define SREGION "\033[%d;%dr"	/* scrolling region */
+#define SREGLEN 8
+#define RINDEX	"\033M"		/* move up one line and scroll */
+
+#define ULINE 0200
+#define CURSEEN 1
+#define putch(c) vputc(c)
+
+/* Constants accessable by user */
+int hasscroll = 1;			/* terminal has scrolling regions */
+int LINES = PAGLEN;			/* number of lines on screen */
+int COLS = PAGWID;			/* width of screen */
+
+struct line {
+	char len;
+	char flags;
+	char l[PAGWID];
+};
+
+int _row, _col;
+int _srow, _scol;
+struct line _virt[PAGLEN], _actual[PAGLEN];
+int _uline = 0;
+int _junked = 1;
+int _curjunked;
+int _dir = 1;
+
+
+
+/*
+ * Scrolling commands.  These have immediate effect on the screen.
+ * It is up to the caller to decide whether scrolling will help.
+ */
+
+#ifdef SREGION
+
+dshift(top, bot, count)
+{
+	register i;
+	char buf[SREGLEN];
+
+	if (count < 0) {	/* actually scroll up! */
+		ushift(top, bot, -count);
+		return;
+	}
+	if (_junked || count >= bot - top)
+		return;
+	for (i = bot - count ; _actual[i].len == 0 ; i--)
+		if (i == top)
+			return;
+	for (i = top ; i <= bot ; i++)
+		_virt[i].flags |= DIRTY;
+	for (i = bot ; i >= top + count ; i--)
+		_actual[i] = _actual[i - count];
+	for ( ; i >= top ; i--)
+		_actual[i].len = 0;
+
+	_putstr(sprintf(buf, SREGION, top+1,bot+1));
+	_curjunked = 1;
+	_amove(top, 0);
+	for (i = count ; --i >= 0 ; )
+		_putstr(RINDEX);
+	_putstr(sprintf(buf, SREGION, 1,PAGLEN));
+	_curjunked = 1;
+	_dir = -1;
+}
+
+
+ushift(top, bot, count)
+{
+	char buf[SREGLEN];
+	register i;
+
+	if (count < 0) {
+		dshift(top, bot, -count);
+		return;
+	}
+	if (_junked || count >= bot - top)
+		return;
+	for (i = top + count ; _actual[i].len == 0 ; i++)
+		if (i == bot)
+			return;
+	for (i = top ; i <= bot ; i++)
+		_virt[i].flags |= DIRTY;
+	for (i = top ; i <= bot - count ; i++)
+		_actual[i] = _actual[i + count];
+	for ( ; i <= bot ; i++)
+		_actual[i].len = 0;
+
+	_putstr( sprintf(buf,SREGION,top+1,bot+1));
+	_curjunked = 1;
+	_amove(bot, 0);		/* move to bottom */
+	for (i = 0 ; i < count ; i++)
+		putch('\n');
+	_putstr(sprintf(buf, SREGION, 1,PAGLEN));
+	_curjunked = 1;
+}
+
+#else
+
+dshift(top, bot, count) {
+	if (count < 0) {
+		ushift(top, bot, -count);
+		return;
+	}
+	/* downward shift not implemented */
+}
+
+
+ushift(top, bot, count) {
+	register i;
+
+	if (count < 0) {
+		dshift(top, bot, -count);
+		return;
+	}
+	if (_junked || count >= bot - top)
+		return;
+	for (i = top + count ; _actual[i].len == 0 ; i++)
+		if (i == bot)
+			return;
+	/* we cheat and shift the entire screen */
+	/* be sure we are shifting more lines into than out of position */
+	if ((bot - top + 1) - count <= PAGLEN - (bot - top + 1))
+		return;
+	for (i = 0 ; i <= BOTLINE ; i++)
+		_virt[i].flags |= DIRTY;
+	for (i = 0 ; i <= BOTLINE - count ; i++)
+		_actual[i] = _actual[i + count];
+	for ( ; i <= BOTLINE ; i++)
+		_actual[i].len = 0;
+	_amove(BOTLINE, 0);
+	for (i = 0 ; i < count ; i++)
+		putch('\n');
+}
+
+#endif SREGION
+
+
+
+/*
+ * generate a beep on the terminal
+ */
+
+beep() {
+	putch('\7');
+}
+
+
+
+/*
+ * Move to one line below the bottom of the screen.
+ */
+
+botscreen() {
+	_amove(BOTLINE, 0);
+	putch('\n');
+	vflush();
+}
+
+
+
+move(row, col) {
+	if (row < 0 || row >= PAGLEN || col < 0 || col >= PAGWID)
+		return;
+	_row = row;
+	_col = col;
+}
+
+
+
+/*
+ * Output string at specified location.
+ */
+
+mvaddstr(row, col, str)
+	char *str;
+	{
+	move(row, col);
+	addstr(str);
+}
+
+
+
+addstr(s)
+	char *s;
+	{
+	register char *p;
+	register struct line *lp;
+	register int col = _col;
+
+	lp = &_virt[_row];
+	if (lp->len < col) {
+		p = &lp->l[lp->len];
+		while (lp->len < col) {
+			*p++ = ' ';
+			lp->len++;
+		}
+	}
+	for (p = s ; *p != '\0' ; p++) {
+		if (*p == '\n') {
+			lp->len = col;
+			lp->flags |= DIRTY;
+			col = 0;
+			if (++_row >= PAGLEN)
+				_row = 0;
+			lp = &_virt[_row];
+		} else {
+			lp->l[col] = *p;
+			lp->flags |= DIRTY;
+			if (++col >= PAGWID) {
+				lp->len = PAGWID;
+				col = 0;
+				if (++_row >= PAGLEN)
+					_row = 0;
+				lp = &_virt[_row];
+			}
+		}
+	}
+	if (lp->len <= col)
+		lp->len = col;
+	_col = col;
+}
+
+
+
+addch(c) {
+	register struct line *lp;
+	register char *p;
+
+	lp = &_virt[_row];
+	if (lp->len < _col) {
+		p = &lp->l[lp->len];
+		while (lp->len < _col) {
+			*p++ = ' ';
+			lp->len++;
+		}
+	}
+	lp->l[_col] = c;
+	if (lp->len == _col)
+		lp->len++;
+	if (++_col >= PAGWID) {
+		_col = 0;
+		if (++_row >= PAGLEN)
+			_row = 0;
+	}
+	lp->flags |= DIRTY;
+}
+
+
+
+clrtoeol() {
+	register struct line *lp;
+
+	lp = &_virt[_row];
+	if (lp->len > _col) {
+		lp->len = _col;
+		lp->flags |= DIRTY;
+	}
+}
+
+
+
+/*
+ * Clear an entire line.
+ */
+
+clrline(row) {
+	register struct line *lp;
+
+	lp = &_virt[row];
+	if (lp->len > 0) {
+		lp->len = 0;
+		lp->flags |= DIRTY;
+	}
+}
+
+
+
+clear() {
+	erase();
+	_junked++;
+}
+
+
+
+erase() {
+	register i;
+
+	for (i = 0 ; i < PAGLEN ; i++) {
+		_virt[i].len = 0;
+		_virt[i].flags |= DIRTY;
+	}
+}
+
+
+
+refresh() {
+	register i;
+	int j, len;
+	register char *p, *q;
+
+	if (checkin())  return;
+	if (_junked) {
+		_sclear();
+		_junked = 0;
+	}
+	_fixlines();
+	for (i = _dir > 0? 0 : BOTLINE ; i >= 0 && i < PAGLEN ; i += _dir) {
+		if ((_virt[i].flags & DIRTY) == 0)
+			continue;
+		_ckclrlin(i);		/* decide whether to do a clear line */
+		len = _virt[i].len;
+		if (_actual[i].len < len)  len = _actual[i].len;
+		p = _virt[i].l;
+		q = _actual[i].l;
+		for (j = 0 ; j < len ; j++) {
+			if (*p != *q) {
+				_amove(i, j);
+				_aputc(*p);
+				*q = *p;
+			}
+			p++, q++;
+		}
+		len = _virt[i].len;
+		if (_actual[i].len > len) {
+			_clrtoeol(i, len);
+		} else {
+			for ( ; j < len ; j++) {
+				if (*p != ' ') {
+					_amove(i, j);
+					_aputc(*p);
+				}
+				*q++ = *p++;
+			}
+			_actual[i].len = len;
+		}
+		if (checkin())  return;
+	}
+	_dir = 1;
+	if (CURSEEN)
+		_amove(_row, _col);
+	vflush();		/* flush output buffer */
+}
+
+
+_sclear() {
+	register struct line *lp;
+
+	_putstr(SCLEAR);
+	_srow = _scol = 0;
+	for (lp = _actual ; lp < &_actual[PAGLEN] ; lp++) {
+		lp->len = 0;
+	}
+	for (lp = _virt ; lp < &_virt[PAGLEN] ; lp++) {
+		if (lp->len != 0)
+			lp->flags |= DIRTY;
+	}
+}
+
+
+
+#ifdef notdef		/* included to simplify conversion to new terminal */
+
+_clrtoeol(row, col) {
+	register struct line *lp = &_actual[row];
+	register i;
+
+	for (i = col ; i < lp->len ; i++) {
+		if (lp->l[i] != ' ') {
+			_amove(row, i);
+			_aputc(' ');
+		}
+	}
+	lp->len = col;
+}
+
+#else	/* HP version */
+
+_clrtoeol(row, col) {
+	_amove(row, col);
+	if (_actual[row].len == col + 1)
+		_aputc(' ');
+	else
+		_putstr(SCLRLINE);
+	_actual[row].len = col;
+}
+
+#endif
+
+
+
+_fixlines() {
+	register struct line *lp;
+	register char *p;
+	register int i;
+
+	for (i = 0 ; i < PAGLEN ; i++) {
+		lp = &_virt[i];
+		if (lp->flags & DIRTY) {
+			lp = &_virt[i];
+			for (p = &lp->l[lp->len] ; --p >= lp->l && *p == ' ' ; );
+			lp->len = p + 1 - lp->l;
+			if (lp->len == _actual[i].len && strncmp(lp->l, _actual[i].l, lp->len) == 0)
+				lp->flags &=~ DIRTY;
+		}
+	}
+}
+
+
+
+_ckclrlin(i) {
+	int eval;
+	int len;
+	int first;
+	register struct line *vp, *ap;
+	register int j;
+
+	ap = &_actual[i];
+	vp = &_virt[i];
+	len = ap->len;
+	eval = -2;
+	if (len > vp->len) {
+		len = vp->len;
+		eval = 0;
+	}
+	for (j = 0 ; j < len && vp->l[j] == ap->l[j] ; j++);
+	if (j == len)
+		return;
+	first = j;
+	while (j < len) {
+		if (vp->l[j] == ' ') {
+			if (ap->l[j] != ' ') {
+				while (++j < len
+				    && vp->l[j] == ' ' && ap->l[j] != ' ') {
+					eval++;
+				}
+				if (j == len)
+					eval++;
+				continue;
+			}
+		} else {
+			if (vp->l[j] == ap->l[j]) {
+				while (++j < len && vp->l[j] == ap->l[j]) {
+					eval--;
+				}
+				continue;
+			}
+		}
+		j++;
+	}
+	for (j = first ; --j >= 0 ; )
+		if (vp->l[j] != ' ')
+			break;
+	if (j < 0)
+		first = 0;
+	if (eval > 0) {
+		_amove(i, first);
+		_putstr(SCLRLINE);
+		_actual[i].len = first ;
+	}
+}
+
+
+
+_amove(row, col) {
+	char s[20];
+	register int cost, i;
+
+	if (row == _srow && col == _scol && _curjunked == 0)
+		return;
+	_setul(0);
+	sprintf(s, "\033[%d;%dH", row+1, col+1);
+
+	cost = strlen(s);
+	if (_curjunked == 0 && (i = _rmcost(_srow, _scol, row, col)) < cost) {
+		_relmove(s, _srow, _scol, row, col);
+		cost = i;
+	}
+	if (_curjunked == 0 && col < _scol) {
+		if (_scol < 72 || _srow <= row) {
+			if ((i = _rmcost(_srow, 0, row, col) + 1) < cost) {
+				s[0] = '\r';
+				_relmove(s + 1, _srow, 0, row, col);
+				cost = i;
+			}
+		} else {
+			if ((i = _rmcost(_srow + 1, 0, row, col) + 1) < cost) {
+				s[0] = '\t';
+				_relmove(s + 1, _srow + 1, 0, row, col);
+				cost = i;
+			}
+		}
+	}
+	if (row < cost && (i = _rmcost(0, 0, row, col) + HOMELEN) < cost) {
+		strcpy(s, SHOME);
+		_relmove(s + HOMELEN, 0, 0, row, col);
+		cost = i;
+	}
+	_putstr(s);
+	_srow = row, _scol = col;
+	_curjunked = 0;
+}
+
+
+
+_rmcost(orow, ocol, nrow, ncol) {
+	char s[200];
+
+	_relmove(s, orow, ocol, nrow, ncol);
+	return strlen(s);
+}
+
+
+
+_relmove(s, orow, ocol, nrow, ncol)
+	char *s;
+{
+	register char *p, *q;
+	register int i;
+
+	p = s;
+
+	if( (i = nrow - orow) != 0) {
+		if( i < 0) {
+			if( i == -1)
+				for (q = SUP ; *p = *q++ ; p++);
+			else {
+				sprintf(p, "\033[%dA", -i); /* up */
+				while(*p) p++;
+			}
+		}
+		else if( i < 3) {
+			while(i-- > 0)
+				*p++ = '\n';
+		}
+		else {
+			sprintf(p, "\033[%dB", i); /* down */
+			while(*p) p++;
+		}
+	}
+
+	if( (i = ncol - ocol) != 0) {
+		if( i < 0) {
+			i = -i;
+			if( i < 4) 
+				while(i-- > 0)
+					*p++ = '\b';
+			else {
+				sprintf(p, "\033[%dD", i); /* left */
+				while(*p) p++;
+			}
+		}
+		else {
+			if( i < 4) {
+				register struct line *lp = &_actual[nrow];
+				while (ocol < ncol) {
+					if (ocol < lp->len)
+						*p++ = lp->l[ocol];
+					else
+						*p++ = ' ';
+					ocol++;
+				}
+			}
+			else {
+				sprintf(p, "\033[%dC", i); /* right */
+				while(*p) p++;
+			}
+		}
+	}
+	*p++ = '\0';
+}
+
+
+
+_aputc(c) {
+	_setul(c & ULINE);		
+	putch(c &~ ULINE);
+	if (++_scol > PAGWID) {
+		_scol = 0;
+		if (++_srow >= PAGLEN) {
+			_srow = 0;
+			_putstr(SHOME);
+		}
+	}
+}
+
+
+_setul(on) {
+	if (on) {
+		if (_uline == 0) {
+			_putstr(ULON);
+			_uline = 1;
+		}
+	} else {
+		if (_uline != 0) {
+			_putstr(ULOFF);
+			_uline = 0;
+		}
+	}
+}
+
+
+_putstr(s)
+	char *s;
+	{
+	register char *p;
+
+	for (p = s ; *p ; p++) {
+		putch(*p);
+	}
+}
+
+

@@ -1,0 +1,776 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,ab3c406ba1050ec5,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-12-10 08:06:40 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site jc3b21.UUCP
+Path: utzoo!watmath!clyde!bonnie!akgua!akguc!codas!peora!ucf-cs!usfvax2!3b2bame!jc3b21!larry
+From: larry@jc3b21.UUCP (Lawrence F. Strickland)
+Newsgroups: net.sources
+Subject: 3B2 User Accounting
+Message-ID: <126@jc3b21.UUCP>
+Date: Tue, 10-Dec-85 11:06:40 EST
+Article-I.D.: jc3b21.126
+Posted: Tue Dec 10 11:06:40 1985
+Date-Received: Fri, 13-Dec-85 07:33:54 EST
+Organization: St. Petersburg Jr. College, FL
+Lines: 756
+
+The following "C" program is a "User Accounting" program designed
+specifically for the 3B2 series of computers.  We (like others) found
+that System V Release 2.2 for the 3B2 seems to have 'lost' several
+parts of UNIX (:-) that were standard previously.
+
+One of the worst losses as far as we were concerned was the system
+accounting.  It is necessary for us as an educational institution to
+keep track of who has been on the system and when.  The following
+program, 'ua', takes care of this.
+
+* CAVEATS *
+Ua reads all of wtmp (basically) into memory as a binary sort tree.
+As a result, it expects relatively short wtmp files (we clear ours
+out each night).  If the tree overflows memory, the program will die
+with a message, but not save and/or print any part of the tree.
+
+Although the program has been tested, there are no guarantees that it
+is entirely bugless.  Please send flames/questions/complaints to me at
+the address below.  It works for the 3b2, anything else is anybodys
+guess.  There are NO ifdef's for other system.
+
+Hope this is somewhat useful!
+
+Larry Strickland
+
+UUCP:	...peora!ucf-cs!usfvax2!3b2bame!jc3b21!larry
+USMAIL: Larry Strickland
+	12866 80th Avenue North
+	Seminole, FL 33542
+
+---- cut here ----- cut here ----- cut here ----- cut here ----- cut here ----
+#
+# To unbundle, sh this file with /bin/sh, NOT /bin/csh
+#
+echo Unbundling ua.c 1>&2
+sed "s/^X//" >ua.c <<\'End of ua.c\'
+X/*
+X *	ua -- trace user logins (user accounting)
+X *	      for 3b2 systems ONLY.  Others may not work.
+X *	      Lawrence Strickland, St. Petersburg Jr. College
+X *	      ...usfvax2!3b2bame!jc3b21!larry
+X *	NOTICE:  This program may be copied and used as desired
+X *	         but NOT sold or used for commercial gain!
+X */
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include <utmp.h>
+X#include <time.h>
+X#include <sys/utsname.h>
+X
+X#define FALSE 0
+X#define TRUE  1
+X#define MAXPORTS 24
+X#define LINECNT  18
+X#define PORTSIZE 128
+X#define MODEMCNT  3
+X
+X/***** structure definitions *****/
+X
+Xstruct ports
+X   {
+X   char *name;
+X   int port;
+X   } ;
+X
+Xstruct ports tline[MAXPORTS+1] = { "console", 0, "syscon", 0, "contty", 1,
+X                 "tty11",  2, "tty12",  3, "tty13",  4, "tty14",  5,
+X                 "tty21",  6, "tty22",  7, "tty23",  8, "tty24",  9,
+X                 "tty31", 10, "tty32", 11, "tty33", 12, "tty34", 13,
+X                 "tty41", 14, "tty42", 15, "tty43", 16, "tty44", 17,
+X                 "", -1, "", -1, "", -1, "", -1, "", -1, "", -1 };
+X
+Xstruct linerec
+X   {
+X   char line[12];
+X   time_t on, off;
+X   struct linerec *link;
+X   };
+X
+Xstruct idnode
+X   {
+X   char uid[8];
+X   int uses;
+X   time_t ttime;
+X   struct idnode *left, *right;
+X   struct linerec *link;
+X   };
+X
+Xstruct
+X   {
+X   char uid[8];
+X   char line[12];
+X   time_t on;
+X   int login;
+X   int uses;
+X   } modem[MAXPORTS];
+X
+X/***** global variables *****/
+X
+Xchar *prog;
+Xstruct idnode *logoff();
+Xlong TotUses=0L, TotUsage=0L;
+Xint linecnt=LINECNT;
+Xchar *modemfile = "/etc/modemlines";
+X
+X/***** option variables *****/
+X
+Xint detail=FALSE;	/* do detail for users */
+Xint modemonly=FALSE;	/* do only modem lines */
+Xint summary=TRUE;	/* do normal listing */
+Xint termsum=FALSE;	/* do a terminal summary */
+Xint procsum=FALSE;	/* do a process summary */
+Xint emptflg=FALSE;	/* accrue empty processes */
+Xint runflg=FALSE;	/* accrue run-time processes */
+Xint bootflg=FALSE;	/* accrue boot processes */
+Xint timeflg=FALSE;	/* accrue old/new time processes */
+Xint initflg=FALSE;	/* accrue init processes */
+Xint logflg=FALSE;	/* accrue LOGIN processes */
+Xint acctflg=FALSE;	/* accrue ACCOUNTING processes */
+X
+X/***** start of main program *****/
+X
+Xmain(argc,argv)
+Xint argc;
+Xchar **argv;
+X{
+XFILE *fp;
+Xlong time(), time_tmp;
+Xstruct utsname sname;
+Xstruct utmp who;
+Xstruct idnode *root = NULL;
+Xint ml,c,p;
+Xextern char *optarg;
+Xextern int optind;
+Xchar *wtmp=WTMP_FILE, *rtype, *rport, *ctime(), *mfind(), *malloc(), *fgets();
+Xstatic int pcount[] = {0,0,0,0,0,0,0,0,0,0};
+Xstatic char *pname[] = {"Empty","Run Level","Boot Time","Old Time","New Time",
+X                 "Init Process","Login Process","User Process","Dead Process",
+X                 "Accounting"};
+X
+Xprog = argv[0];
+X
+Xfor(ml = 0; ml < MAXPORTS; ml++)
+X   {
+X   modem[ml].login = FALSE;
+X   modem[ml].uses  = 0;
+X   }
+X
+Xwhile((c = getopt(argc,argv,"admptxABEILM:RT")) != EOF)
+X   switch(c)
+X      {
+X      case 'a':  emptflg = runflg = bootflg = timeflg = TRUE;
+X                 initflg = logflg = acctflg = TRUE;
+X                 break;
+X      case 'd':  detail = TRUE;
+X                 break;
+X      case 'm':  modemonly = TRUE;
+X                 break;
+X      case 'p':  procsum = TRUE;
+X                 break;
+X      case 't':  termsum = TRUE;
+X                 break;
+X      case 'x':  summary = FALSE;
+X                 break;
+X      case 'A':  acctflg = TRUE;
+X                 break;
+X      case 'B':  bootflg = TRUE;
+X                 break;
+X      case 'E':  emptflg = TRUE;
+X                 break;
+X      case 'I':  initflg = TRUE;
+X                 break;
+X      case 'L':  logflg = TRUE;
+X                 break;
+X      case 'M':  modemfile = optarg;
+X                 modemonly = TRUE;
+X                 break;
+X      case 'R':  runflg = TRUE;
+X                 break;
+X      case 'T':  timeflg = TRUE;
+X                 break;
+X      }
+X
+Xif(optind < argc) wtmp = argv[optind];
+X
+Xif(modemonly)
+X   {
+X   if((fp = fopen(modemfile,"r")) == NULL)
+X      fprintf(stderr,"%s: can't open modem file '%s'\n",prog,modemfile),
+X         exit(1);
+X   for(linecnt = 0; linecnt < MAXPORTS; linecnt++)
+X      {
+X      if((tline[linecnt].name = malloc(PORTSIZE)) == NULL)
+X         fprintf(stderr,"%s: out of memory getting lines.\n",prog), exit(1);
+X      if(fgets(tline[linecnt].name,PORTSIZE,fp) == NULL)
+X         break;
+X      tline[linecnt].name[strlen(tline[linecnt].name)-1] = '\0';
+X      if(tline[linecnt].name[0] == '#')
+X         {
+X         free(tline[linecnt].name);
+X         linecnt--;
+X         continue;
+X         }
+X      tline[linecnt].port = linecnt;
+X      }
+X   tline[linecnt].name = "";
+X   tline[linecnt].port = -1;
+X   fclose(fp);
+X   }
+X
+Xif((fp = fopen(wtmp,"r")) == NULL)
+X   fprintf(stderr,"%s: can't open '%s'.\n",prog,wtmp), exit(1);
+X
+Xwhile(fread(&who,sizeof(who),1,fp) > 0)
+X   {
+X   if((who.ut_type >= EMPTY) && (who.ut_type <= ACCOUNTING))
+X      pcount[who.ut_type]++;
+X   if((ml = getml(who.ut_line)) < 0)
+X      continue;  /* this was not a legal port */
+X   if(legalprocess(who.ut_type))
+X      {
+X      if(modem[ml].login)
+X         root = logoff(&who,ml,root);
+X      logon(&who,ml);
+X      }
+X   else if((who.ut_type == DEAD_PROCESS) && (modem[ml].login))
+X      {
+X      modem[ml].login = FALSE;
+X      root = logoff(&who,ml,root);
+X      }
+X   }
+X
+Xfclose(fp);
+X
+Xuname(&sname);
+Xrtype = detail ? "Detailed" : " ";
+Xrport = modemonly ? "Modem" : " User";
+Xtime_tmp = time(0L);
+X
+Xif(summary)
+X   {
+X   printf("\n\n%-9.9s(%-9.9s)      ",sname.sysname,sname.nodename);
+X   printf("%-8.8s %-5.5s Profile      %s\n",rtype,rport,ctime(&time_tmp));
+X
+X   if(detail)
+X      printf("User     Port        Start     End   ");
+X   else
+X      printf("User ID                        Logins");
+X   printf("                                Time Used\n");
+X   printf("---------------------------------------");
+X   printf("---------------------------------------\n");
+X   printtree(root);
+X   printf("---------------------------------------");
+X   printf("---------------------------------------\n");
+X   printf("Total Uses/Time              %8ld",TotUses);
+X   puttime(TotUsage);
+X   printf("\n");
+X   }
+X
+Xif(procsum)
+X   {
+X   printf("\n\nProcess Summary\n\n");
+X   printf(" Process           Count   ");
+X   printf(" Process           Count   ");
+X   printf(" Process           Count\n");
+X   printf(" --------------------------");
+X   printf("--------------------------");
+X   printf("-------------------------\n");
+X   for(ml = 0; ml <= ACCOUNTING; ml++)
+X      {
+X      printf(" %-15.15s%8d",pname[ml],pcount[ml]);
+X      if((ml % 3) == 2)
+X         printf("\n");
+X      else
+X         printf("   ");
+X      }
+X   if((ml % 3) != 2)
+X      printf("\n");
+X   }
+X
+Xif(termsum)
+X   {
+X   printf("\n\nTerminal Summary\n\n");
+X   printf("Terminal           Uses    Logged On     ");
+X   printf(" Terminal           Uses    Logged On\n");
+X   printf("-----------------------------------------");
+X   printf("-------------------------------------\n");
+X   for(ml = 0; ml < linecnt; ml++)
+X      {
+X      printf("%-12.12s   %8d     %8.8s",mfind(ml),modem[ml].uses,
+X         ((modem[ml].login)?modem[ml].uid:""));
+X      if((ml % 2) == 0)
+X         printf("      ");
+X      else
+X         printf("\n");
+X      }
+X   if((ml % 2) != 0)
+X      printf("\n");
+X   }
+X
+Xreturn(0);
+X}
+X
+Xgetml(s)
+Xchar *s;
+X{
+Xint i;
+X
+Xfor(i = 0; *(tline[i].name) != '\0'; i++)
+X   if(strcmp(tline[i].name,s) == 0) break;
+Xreturn(tline[i].port);
+X}
+X
+Xlogon(who,ml)
+Xstruct utmp *who;
+Xint ml;
+X{
+Xmodem[ml].login = TRUE;
+Xstrcpy(modem[ml].uid, who->ut_user);
+Xstrcpy(modem[ml].line, who->ut_line);
+Xmodem[ml].on = who->ut_time;
+X}
+X
+Xstruct idnode *logoff(who,ml,root)
+Xstruct utmp *who;
+Xint ml;
+Xstruct idnode *root;
+X{
+Xchar *malloc();
+Xstruct linerec *newline;
+Xint cmpval;
+X
+Xif(root == NULL)
+X   {
+X   root = (struct idnode *)malloc(sizeof(struct idnode));
+X   if(root == NULL)
+X      fprintf(stderr,"%s: out of memory building tree.\n",prog), exit(1);
+X   strcpy(root->uid, modem[ml].uid);
+X   root->left = root->right = NULL;
+X   root->link = (struct linerec *)malloc(sizeof(struct linerec));
+X   if(root->link == NULL)
+X      fprintf(stderr,"%s: out of memory creating list.\n",prog), exit(1);
+X   strcpy((root->link)->line, modem[ml].line);
+X   (root->link)->on = modem[ml].on;
+X   (root->link)->off = who->ut_time;
+X   (root->link)->link = NULL;
+X   root->uses = 1;
+X   root->ttime = ((root->link)->off) - ((root->link)->on);
+X   TotUses++;
+X   TotUsage += root->ttime;
+X   modem[ml].uses++;
+X   }
+Xelse if((cmpval = strcmp(modem[ml].uid,root->uid)) > 0)
+X   root->right = logoff(who,ml,root->right);
+Xelse if(cmpval < 0)
+X   root->left  = logoff(who,ml,root->left);
+Xelse /* this user already in tree */
+X   {
+X   newline = (struct linerec *)malloc(sizeof(struct linerec));
+X   if(newline == NULL)
+X      fprintf(stderr,"%s: out of memory adding line.\n",prog), exit(1);
+X   strcpy(newline->line, modem[ml].line);
+X   newline->on = modem[ml].on;
+X   newline->off = who->ut_time;
+X   newline->link = root->link;
+X   root->link = newline;
+X   root->uses += 1;
+X   root->ttime += ((root->link)->off) - ((root->link)->on);
+X   TotUses++;
+X   TotUsage += ((root->link)->off) - ((root->link)->on);
+X   modem[ml].uses++;
+X   }
+X
+Xreturn(root);
+X}
+X
+Xprinttree(root)
+Xstruct idnode *root;
+X{
+Xstruct linerec *p;
+Xint cmpval;
+X
+Xif(root != NULL)
+X   {
+X   printtree(root->left);
+X   if(detail)
+X      {
+X      p = root->link;
+X      printf("\n%-8.8s %-8.8s",root->uid,p->line);
+X      dotime(p->on);
+X      dotime(p->off);
+X      puttime(p->off - p->on);
+X      printf("\n");
+X      p = p->link;
+X      while(p)
+X         {
+X         printf("         %-8.8s",p->line);
+X         dotime(p->on);
+X         dotime(p->off);
+X         puttime(p->off - p->on);
+X         printf("\n");
+X         p = p->link;
+X         }
+X      }
+X   if(detail)
+X      printf("         %-8.8s            %8d","Total",root->uses);
+X   else
+X      printf("%-8.8s                     %8d",root->uid,root->uses);
+X   puttime(root->ttime);
+X   printf("\n");
+X   printtree(root->right);
+X   }
+X}
+X
+Xdotime(val)
+Xlong val;
+X{
+Xstruct tm *localtime(), *tval;
+X
+Xtval = localtime(&val);
+X
+Xprintf("  %02d:%02d:%02d",tval->tm_hour,tval->tm_min,tval->tm_sec);
+X}
+X
+Xchar *mfind(ml)
+Xint ml;
+X{
+Xint i;
+X
+Xfor(i = 0; i < linecnt; i++)
+X   if((*(tline[i].name) == NULL) || (tline[i].port == ml)) break;
+Xreturn(tline[i].name);
+X}
+X
+Xlegalprocess(t)
+Xint t;
+X{
+Xint val=FALSE;
+X
+Xif(t == USER_PROCESS)
+X   val = TRUE;
+Xelse if((t == EMPTY) && emptflg)
+X   val = TRUE;
+Xelse if((t == RUN_LVL) && runflg)
+X   val = TRUE;
+Xelse if((t == BOOT_TIME) && bootflg)
+X   val = TRUE;
+Xelse if((t == OLD_TIME) && timeflg)
+X   val = TRUE;
+Xelse if((t == NEW_TIME) && timeflg)
+X   val = TRUE;
+Xelse if((t == INIT_PROCESS) && initflg)
+X   val = TRUE;
+Xelse if((t == LOGIN_PROCESS) && logflg)
+X   val = TRUE;
+Xelse if((t == ACCOUNTING) && acctflg)
+X   val = TRUE;
+X
+Xreturn(val);
+X}
+End of ua.c
+echo Unbundling puttime.c 1>&2
+sed "s/^X//" >puttime.c <<\'End of puttime.c\'
+Xputtime(val)
+Xlong val;
+X{
+Xstatic long spm = 60L;      /* seconds per minute */
+Xstatic long sph = 3600L;    /* seconds per hour   */
+Xlong htemp, mtemp;
+X
+Xhtemp = val/sph;
+Xif (val < 0L)
+X   {
+X   printf("     *** Negative time value ***");
+X   return;
+X   }
+X
+Xif (htemp == 0)
+X   printf("                 ");
+Xelse if (htemp == 1)
+X   printf("  %9ld Hour ",htemp);
+Xelse
+X   printf("  %9ld Hours",htemp);
+Xval %= sph;
+X
+Xmtemp = val/spm;
+Xif ( (mtemp == 0) && (htemp == 0) )
+X   printf("            ");
+Xelse if (mtemp == 1)
+X   printf("  %2ld Minute ",mtemp);
+Xelse
+X   printf("  %2ld Minutes",mtemp);
+Xval %= spm;
+X
+Xif (val == 1)
+X   printf("  %2ld Second",val);
+Xelse
+X   printf("  %2ld Seconds",val);
+X}
+End of puttime.c
+echo Unbundling ua.1l 1>&2
+sed "s/^X//" >ua.1l <<\'End of ua.1l\'
+X.TH UA 1 LOCAL
+X.SH NAME
+Xua -- produce a user/process profile of the system
+X.SH SYNOPSIS
+X.I ua
+X[-dmptx] [-aABDEILRT] [-M line_file] wtmp-like-file
+X.SH DESCRIPTION
+X.P
+X.I Ua
+Xproduces a report detailing number of times logged in and total user
+Xtime for each user plus totals.  It may also produce a summary of all
+Xprocesses; a summary of terminal usage; a modem only summary; or a
+Xdetailed summary.
+X.P
+XIf a file name is given on the command line, it must be similar in structure
+Xto
+X.B /etc/wtmp
+Xor errors will occur.  If no filename is given,
+X.B /etc/wtmp
+Xis used by default.  The global options are:
+X.TP 10
+X-d
+Xproduce a
+X.B detailed
+Xsummary including times on and off for each use plus totals.
+X.TP 10
+X-m
+Xproduce a
+X.B modem only
+Xsummary.  Either \fB/etc/lines\fP or the specified file (see -M)
+Xwill be read for a list of ports to be summarized.
+X.TP 10
+X-p
+Xproduce a
+X.B process
+Xsummary.
+X.TP 10
+X-t
+Xproduce a
+X.B terminal
+Xsummary.
+X.TP 10
+X-x
+X.B exclude
+Xthe normal user summary.
+X.P
+XUnder normal circumstances, only
+X.I USER
+Xprocesses are included in the user summary.  All other process types are
+Xincluded in the process summary but excluded elsewhere.  The following options
+Xwill include these process types both in the user summary and the terminal
+Xsummary:
+X.TP 10
+X-A
+Xinclude
+X.B Accounting
+Xprocesses
+X.TP 10
+X-B
+Xinclude
+X.B Boot Time
+Xprocesses
+X.TP 10
+X-E
+Xinclude
+X.B Empty
+Xprocesses
+X.TP 10
+X-I
+Xinclude
+X.B Init
+Xprocesses
+X.TP 10
+X-L
+Xinclude
+X.B Login
+Xprocesses
+X.TP 10
+X-R
+Xinclude
+X.B Run Level
+Xprocesses
+X.TP 10
+X-T
+Xinclude
+X.B New Time and Old Time
+Xprocesses
+X.TP 10
+X-a
+Xinclude all of the above processes
+X.P
+XNormally, all ports available to the system are checked for activity.  If
+Xthe -m (modem) option is chosen, only the ports specified in the
+X\fB/etc/modemlines\fP file are checked.  Typically, this will be for modem
+Xline usage.  If desired, a separate file may be used by including the:
+X.TP 10
+X-M
+Xinclude
+X.B
+Xmodem lines
+Xfrom the selected file name.  Each line should be one of the port names to
+Xbe found in \fB/etc/wtmp\fP.  Lines starting with a '\#' are considered
+Xcomment lines.  Lines must be no more than 128 characters long. The -M option
+Ximplies the -m option.
+X.SH FILES
+X.P
+X/etc/wtmp, /etc/modemlines
+X.SH SEE ALSO
+Xwho(1)
+X.SH BUGS
+X.P
+XCertain combinations of time changes may result in incorrect or even
+Xnegative times for some processes.  Negative times are trapped and not
+Xprinted, but incorrect times are not.  It is best if time changes are done
+Xonly in single-user mode.
+XThe run-level process should include the new run level, it does not.
+XNo paging of the output is done.
+End of ua.1l
+echo Unbundling ua.help 1>&2
+sed "s/^X//" >ua.help <<\'End of ua.help\'
+X
+X
+X
+X     UUUUAAAA((((1111))))		     UUUUNNNNIIIIXXXX 5555....0000 ((((LLLLOOOOCCCCAAAALLLL))))			 UUUUAAAA((((1111))))
+X
+X
+X
+X     NNNNAAAAMMMMEEEE
+X	  ua --	produce	a user/process profile of the system
+X
+X     SSSSYYYYNNNNOOOOPPPPSSSSIIIISSSS
+X	  _u_a [-dmptx] [-aABDEILRT] [-M line_file] wtmp-like-file
+X
+X     DDDDEEEESSSSCCCCRRRRIIIIPPPPTTTTIIIIOOOONNNN
+X	  _U_a produces a	report detailing number	of times logged	in and
+X	  total	user time for each user	plus totals.  It may also
+X	  produce a summary of all processes; a	summary	of terminal
+X	  usage; a modem only summary; or a detailed summary.
+X
+X	  If a file name is given on the command line, it must be
+X	  similar in structure to ////eeeettttcccc////wwwwttttmmmmpppp or errors will occur.  If
+X	  no filename is given,	////eeeettttcccc////wwwwttttmmmmpppp is used by default.  The
+X	  global options are:
+X
+X	  -d	    produce a ddddeeeettttaaaaiiiilllleeeedddd summary including times on and
+X		    off	for each use plus totals.
+X
+X	  -m	    produce a mmmmooooddddeeeemmmm oooonnnnllllyyyy summary.  Either ////eeeettttcccc////lllliiiinnnneeeessss
+X		    or the specified file (see -M) will	be read	for a
+X		    list of ports to be	summarized.
+X
+X	  -p	    produce a pppprrrroooocccceeeessssssss summary.
+X
+X	  -t	    produce a tttteeeerrrrmmmmiiiinnnnaaaallll summary.
+X
+X	  -x	    eeeexxxxcccclllluuuuddddeeee the	normal user summary.
+X
+X	  Under	normal circumstances, only _U_S_E_R	processes are included
+X	  in the user summary.	All other process types	are included
+X	  in the process summary but excluded elsewhere.  The
+X	  following options will include these process types both in
+X	  the user summary and the terminal summary:
+X
+X	  -A	    include AAAAccccccccoooouuuunnnnttttiiiinnnngggg processes
+X
+X	  -B	    include BBBBooooooootttt TTTTiiiimmmmeeee processes
+X
+X	  -E	    include EEEEmmmmppppttttyyyy processes
+X
+X	  -I	    include IIIInnnniiiitttt processes
+X
+X	  -L	    include LLLLooooggggiiiinnnn processes
+X
+X	  -R	    include RRRRuuuunnnn	LLLLeeeevvvveeeellll processes
+X
+X	  -T	    include NNNNeeeewwww	TTTTiiiimmmmeeee aaaannnndddd OOOOlllldddd TTTTiiiimmmmeeee processes
+X
+X	  -a	    include all	of the above processes
+X
+X
+X
+X
+X     Page 1					      (printed 9/4/85)
+X
+X
+X
+X
+X
+X
+X     UUUUAAAA((((1111))))		     UUUUNNNNIIIIXXXX 5555....0000 ((((LLLLOOOOCCCCAAAALLLL))))			 UUUUAAAA((((1111))))
+X
+X
+X
+X	  Normally, all	ports available	to the system are checked for
+X	  activity.  If	the -m (modem) option is chosen, only the
+X	  ports	specified in the ////eeeettttcccc////mmmmooooddddeeeemmmmlllliiiinnnneeeessss file are checked.
+X	  Typically, this will be for modem line usage.	 If desired, a
+X	  separate file	may be used by including the:
+X
+X	  -M	    include mmmmooooddddeeeemmmm lllliiiinnnneeeessss	from the selected file name.
+X		    Each line should be	one of the port	names to be
+X		    found in ////eeeettttcccc////wwwwttttmmmmpppp.	 Lines starting	with a '#' are
+X		    considered comment lines.  Lines must be no	more
+X		    than 128 characters	long. The -M option implies
+X		    the	-m option.
+X
+X     FFFFIIIILLLLEEEESSSS
+X	  /etc/wtmp, /etc/modemlines
+X
+X     SSSSEEEEEEEE AAAALLLLSSSSOOOO
+X	  who(1)
+X
+X     BBBBUUUUGGGGSSSS
+X	  Certain combinations of time changes may result in incorrect
+X	  or even negative times for some processes.  Negative times
+X	  are trapped and not printed, but incorrect times are not.
+X	  It is	best if	time changes are done only in single-user
+X	  mode.	 The run-level process should include the new run
+X	  level, it does not.  No paging of the	output is done.
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X
+X     Page 2					      (printed 9/4/85)
+X
+X
+X
+End of ua.help
+
+

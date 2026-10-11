@@ -1,0 +1,1914 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,60d8b91e4b004f1f,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-09-03 17:41:24 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site decvax.UUCP
+Path: utzoo!linus!decvax!minow
+From: minow@decvax.UUCP (Martin Minow)
+Newsgroups: net.sources
+Subject: cpp (3-3) file as cpp3.arc
+Message-ID: <70@decvax.UUCP>
+Date: Mon, 3-Sep-84 20:41:24 EDT
+Article-I.D.: decvax.70
+Posted: Mon Sep  3 20:41:24 1984
+Date-Received: Thu, 13-Sep-84 05:23:54 EDT
+Organization: DEC UNIX Engineering Group
+Lines: 1897
+
+-h- cpp2.c	Sat Sep  1 21:43:42 1984	cpp2.c
+/*
+ *			    C P P 2 . C
+ *		M a c r o  D e f i n i t i o n s
+ *	a n d   E x p r e s s i o n   E v a l u a t i o n
+ *
+ * Edit History
+ * 31-Aug-84	MM	USENET net.sources release
+ */
+
+#include	<stdio.h>
+#include	<ctype.h>
+#include	"cppdef.h"
+#include	"cpp.h"
+/*
+ * parm[], parmp, and parlist[] are used to store #define() argument
+ * lists.  nargs contains the actual number of parameters stored.
+ */
+static char	parm[NPARMWORK + 1];	/* define param work buffer 	*/
+static char	*parmp;			/* Free space in parm		*/
+static char	*parlist[NPARM];	/* -> start of each parameter	*/
+static int	nargs;			/* Parameters for this macro	*/
+
+dodefine()
+/*
+ * Called from control when a #define is scanned.  This module
+ * parses formal parameters and the replacement string.  When
+ * the formal parameter name is encountered in the replacement
+ * string, it is replaced by a character in the range 128 to
+ * 128+NPARAM (this allows up to 32 parameters within the
+ * Dec Multinational range).  If cpp is ported to an EBCDIC
+ * machine, you will have to make other arrangements.
+ *
+ * There is some special case code to distinguish
+ *	#define foo	bar
+ * from	#define foo()	bar
+ *
+ * Also, we make sure that
+ *	#define	foo	foo
+ * doesn't put cpp into an infinite loop.
+ *
+ * A warning message is printed if you redefine a symbol to a
+ * different text.  I.e,
+ *	#define	foo	123
+ *	#define foo	123
+ * is ok, but
+ *	#define foo	123
+ *	#define	foo	+123
+ * is not.
+ *
+ * The following subroutines are called from define():
+ * checkparm	called when a token is scanned.  It checks through the
+ *		array of formal parameters.  If a match is found, the
+ *		token is replaced by a control byte which will be used
+ *		to locate the parameter when the macro is expanded.
+ * textput	puts a string in the macro work area (parm[]), updating
+ *		parmp to point to the first free byte in parm[].
+ *		textput() tests for work buffer overflow.
+ * charput	puts a single character in the macro work area (parm[])
+ *		in a manner analogous to textput().
+ */
+{
+	register int		c;
+	register DEFBUF		*dp;		/* -> new definition	*/
+	int			isredefine;	/* TRUE if redefined	*/
+	char			*old;		/* Remember redefined	*/
+#if STRING_FORMAL
+	int			delim;		/* String delimiter	*/
+#endif
+	extern int		save();		/* Save char in work[]	*/
+
+	if (type[(c = skipws())] != LET)
+	    goto bad_define;
+	isredefine = FALSE;			/* Set if redefining	*/
+	if ((dp = lookid(c)) == NULL)		/* If not known now	*/
+	    dp = defendel(token, FALSE);	/* Save the name	*/
+	else {					/* It's known:		*/
+	    isredefine = TRUE;			/* Remember this fact	*/
+	    old = dp->repl;			/* Remember replacement	*/
+	    dp->repl = NULL;			/* No replacement now	*/
+	}
+	parlist[0] = parmp = parm;		/* Setup parm buffer	*/
+	if ((c = get()) == '(') {		/* With arguments?	*/
+	    nargs = 0;				/* Init formals counter	*/
+	    do {				/* Collect formal parms	*/
+		if (nargs >= NPARM)
+		    cfatal("Too many arguments for macro", NULLST);
+		else if ((c = skipws()) == ')')
+		    break;			/* Got them all		*/
+		else if (type[c] != LET)	/* Bad formal syntax	*/
+		    goto bad_define;
+		scanid(token, c);		/* Get the formal param	*/
+		parlist[nargs++] = parmp;	/* Save its start	*/
+		textput(token);			/* Save text in parm[]	*/
+	    } while ((c = skipws()) == ',');	/* Get another argument	*/
+	    if (c != ')')			/* Must end at )	*/
+		goto bad_define;
+	    c = ' ';				/* Will skip to body	*/
+	}
+	else {
+	    /*
+	     * DEF_NOARGS is needed to distinguish between
+	     * "#define foo" and "#define foo()".
+	     */
+	    nargs = DEF_NOARGS;			/* No () parameters	*/
+	}
+	if (type[c] == SPA)			/* At whitespace?	*/
+	    c = skipws();			/* Not any more.	*/
+	workp = work;				/* Replacement put here	*/
+	while (c != EOF_CHAR && c != '\n') {	/* Compile macro body	*/
+	    switch (type[c]) {
+	    case LET:
+		checkparm(c, dp);		/* Might be a formal	*/
+		break;
+
+	    case DIG:				/* Number in mac. body	*/
+	    case DOT:
+		scannumber(c, save);
+		break;
+
+	    case QUO:				/* String in mac. body	*/
+#if STRING_FORMAL
+		save(c);
+		instring = TRUE;
+		delim = c;
+		while ((c = get()) != delim
+		     && c != '\n'
+		     && c != EOF_CHAR) {
+		    if (type[c] == LET)		/* Maybe formal parm	*/
+			checkparm(c, dp);
+		    else {
+			save(c);
+			if (c == '\\')
+			    save(get());
+		    }
+		}
+		instring = FALSE;
+		if (c != delim)
+		    cerror("Unterminated string in macro body", NULLST);
+		save(c);
+#else
+		scanstring(c, save);
+#endif
+		break;
+
+	    case BSH:				/* Backslash		*/
+		if ((c = get()) == '\n') {
+		    save('\n');
+		    wrongline = TRUE;
+		}
+		else {
+		    save('\\');
+		    save(c);
+		}
+		break;
+
+	    case SPA:				/* Absorb whitespace	*/
+		/*
+		 * Note: the "end of comment" marker is passed on
+		 * to allow comments to separate tokens.
+		 */
+		if (workp[-1] == ' ')		/* Absorb multiple	*/
+		    break;			/* spaces		*/
+		else if (c == '\t')
+		    c = ' ';			/* Normalize tabs	*/
+		/* Fall through to store character			*/
+	    default:				/* Other character	*/
+		save(c);
+		break;
+	    }
+	    c = get();
+	}
+	unget();				/* For control check	*/
+	if (workp > work && workp[-1] == ' ')	/* Drop trailing blank	*/
+	    workp--;
+	*workp = EOS;				/* Terminate work	*/
+	dp->repl = savestring(work);		/* Save the string	*/
+	dp->nargs = nargs;			/* Save arg count	*/
+#if DEBUG
+	if (debug)
+	    dumpadef("macro definition", dp);
+#endif
+	if (isredefine) {			/* Warn on redefinition	*/
+	    if ((old != NULL && dp->repl != NULL && !streq(old, dp->repl))
+	     || (old == NULL && dp->repl != NULL)
+	     || (old != NULL && dp->repl == NULL)) {
+		cwarn("Redefining macro \"%s\"", dp->name);
+	    }
+	    if (old != NULL)			/* We don't need the	*/
+		free(old);			/* old definition now.	*/
+	}	 
+	return;
+
+bad_define:
+	cerror("#define syntax error", NULLST);
+}
+
+checkparm(c, dp)
+register int	c;
+DEFBUF		*dp;
+/*
+ * Replace this param if it's defined.  Note that the macro name is a
+ * possible replacement token.  We stuff DEL in front of the token
+ * which is treated as a LETTER by the token scanner and eaten by
+ * the output routine.  This prevents the macro expander from
+ * looping if someone writes "#define foo foo".
+ */
+{
+	register int		i;
+	register char		*cp;
+
+	scanid(token, c);
+	for (i = 0; i < nargs; i++) {		/* For each argument	*/
+	    if (streq(parlist[i], token)) {	/* If it's known	*/
+		save(i + PFLAG);		/* Save a magic cookie	*/
+		return;				/* And exit the search	*/
+	    }
+	}
+	if (streq(dp->name, token))		/* Macro name in body?	*/
+	    save(DEL);				/* Save magic marker	*/
+	for (cp = token; *cp != EOS;)		/* And save		*/
+	    save(*cp++);			/* The token itself	*/
+}
+
+doundef()
+/*
+ * Remove the symbol from the defined list.
+ * Called from the #control processor.
+ */
+{
+	register int		c;
+
+	if (type[(c = skipws())] != LET)
+	    cerror("Illegal #undef argument", NULLST);
+	else {
+	    scanid(token, c);
+	    if (defendel(token, TRUE) == NULL) {
+		cwarn("Symbol \"%s\" not defined in #undef", token);
+	    }
+	}
+}
+
+textput(text)
+char		*text;
+/*
+ * Put the string in the parm[] buffer.
+ */
+{
+	register int	size;
+
+	size = strlen(text) + 1;
+	if ((parmp + size) >= &parm[NPARMWORK])
+	    cfatal("Macro work area overflow", NULLST);
+	else {
+	    strcpy(parmp, text);
+	    parmp += size;
+	}
+}
+
+charput(c)
+register int	c;
+/*
+ * Put the byte in the parm[] buffer.
+ */
+{
+	if (parmp >= &parm[NPARMWORK])
+	    cfatal("Macro work area overflow", NULLST);
+	else {
+	    *parmp++ = c;
+	}
+}
+
+/*
+ *		M a c r o   E x p a n s i o n
+ */
+
+static DEFBUF	*macro;		/* Catches start of infinite macro	*/
+
+expand(tokenp)
+register DEFBUF	*tokenp;
+/*
+ * Expand a macro.  Called from the cpp mainline routine (via subroutine
+ * macroid()) when a token is found in the symbol table.  It calls
+ * expcollect() to parse actual parameters, checking for the correct number.
+ * It then creates a "file" containing a single line containing the
+ * macro with actual parameters inserted appropriately.  This is
+ * "pushed back" onto the input stream.  (When the get() routine runs
+ * off the end of the macro line, it will dismiss the macro itself.)
+ */
+{
+	register int		c;
+	register FILEINFO	*file;
+	extern FILEINFO		*getfile();
+
+#if DEBUG
+	if (debug)
+	    dumpadef("expand entry", tokenp);
+#endif
+	/*
+	 * If no macro is pending, save the name of this macro
+	 * for an eventual error message.
+	 */
+	if (recursion == 0)
+	    macro = tokenp;
+	else if (recursion >= 30) {		/* Too many recursions	*/
+	    cerror("Recursive macro definition of \"%s\"", tokenp->name);
+	    fprintf(stderr, "(Defined by \"%s\")\n", macro->name);
+	    do {				/* Unwind the macros	*/
+		c = get();			/* Tossing all text	*/
+	    } while (recursion > 0);
+	    unget();
+	    return;
+	}
+	/*
+	 * Here's a macro to expand.
+	 */
+	nargs = 0;				/* Formals counter	*/
+	parmp = parm;				/* Setup parm buffer	*/
+	switch (tokenp->nargs) {
+	case (-2):				/* __LINE__		*/
+	    printf("%d", line);
+	    break;
+
+	case (-3):				/* __FILE__		*/
+	    for (file = infile; file != NULL; file = file->parent) {
+		if (file->fp != NULL) {
+		    printf("\"%s\"", (file->progname != NULL)
+			  ? file->progname : file->filename);
+		    break;
+		}
+	    }
+	    break;
+
+	default:
+	    /*
+	     * Nothing funny about this macro.
+	     */
+	    if (tokenp->nargs < 0)
+		cfatal("Bug: Illegal __ macro \"%s\"", tokenp->name);
+	    while ((c = skipws()) == '\n')	/* Look for (, skipping	*/
+		wrongline = TRUE;		/* spaces and newlines	*/
+	    if (c != '(') {
+		/*
+		 * If the programmer writes
+		 *	#define foo() ...
+		 *	...
+		 *	foo [no ()]
+		 * just write foo to the output stream.
+		 */
+		unget();
+		cwarn("Macro \"%s\" needs arguments", tokenp->name);
+		printf("%s", tokenp->name);
+		return;
+	    }
+	    else if (expcollect()) {		/* Collect arguments	*/
+		if (tokenp->nargs != nargs) {	/* ?? != or >		*/
+		    cwarn("Wrong number of macro arguments for \"%s\"",
+			tokenp->name);
+		}
+#if DEBUG
+		if (debug)
+		    dumpparm("expand");
+#endif
+	    }				/* Collect arguments		*/
+	case DEF_NOARGS:		/* No parameters just stuffs	*/
+	    expstuff(tokenp);		/* Do actual parameters		*/
+	}				/* nargs switch			*/
+}
+
+FILE_LOCAL int
+expcollect()
+/*
+ * Collect the actual parameters for this macro.  TRUE if ok.
+ */
+{
+	register int	c;
+	register int	paren;			/* For embedded ()'s	*/
+	extern int	charput();
+
+	for (;;) {
+	    paren = 0;				/* Collect next arg.	*/
+	    while ((c = skipws()) == '\n')	/* Skip over whitespace	*/
+		wrongline = TRUE;		/* and newlines.	*/
+	    if (c == ')') {			/* At end of all args?	*/
+		/*
+		 * Note that there is a guard byte in parm[]
+		 * so we don't have to check for overflow here.
+		 */
+		*parmp = EOS;			/* Make sure terminated	*/
+		break;				/* Exit collection loop	*/
+	    }
+	    else if (nargs >= NPARM)
+		cfatal("Too many arguments in macro expansion", NULLST);
+	    parlist[nargs++] = parmp;		/* At start of new arg	*/
+	    for (;; c = get()) {		/* Collect arg's bytes	*/
+		if (c == EOF_CHAR) {
+		    cerror("end of file within macro argument", NULLST);
+		    return (FALSE);		/* Sorry.		*/
+		}
+		else if (c == '\\') {		/* Quote next character	*/
+		    charput(c);			/* Save the \ for later	*/
+		    charput(cget());		/* Save the next char.	*/
+		    continue;			/* And go get another	*/
+		}
+		else if (type[c] == QUO) {	/* Start of string?	*/
+		    scanstring(c, charput);	/* Scan it off		*/
+		    continue;			/* Go get next char	*/
+		}
+		else if (c == '(')		/* Worry about balance	*/
+		    paren++;			/* To know about commas	*/
+		else if (c == ')') {		/* Other side too	*/
+		    if (paren == 0) {		/* At the end?		*/
+			unget();		/* Look at it later	*/
+			break;			/* Exit arg getter.	*/
+		    }
+		    paren--;			/* More to come.	*/
+		}
+		else if (c == ',' && paren == 0) /* Comma delimits args	*/
+		    break;
+		else if (c == '\n')		/* Newline inside arg?	*/
+		    wrongline = TRUE;		/* We'll need a #line	*/
+		charput(c);			/* Store this one	*/
+	    }					/* Collect an argument	*/
+	    charput(EOS);			/* Terminate argument	*/
+#if DEBUG
+	    if (debug)
+	        printf("parm[%d] = \"%s\"\n", nargs, parlist[nargs - 1]);
+#endif
+	}					/* Collect all args.	*/
+	return (TRUE);				/* Normal return	*/
+}
+
+FILE_LOCAL
+expstuff(tokenp)
+DEFBUF		*tokenp;		/* Current macro being expanded	*/
+/*
+ * Stuff the macro body, replacing formal parameters by actual parameters.
+ */
+{
+	register int	c;			/* Current character	*/
+	register char	*inp;			/* -> repl string	*/
+	register char	*defp;			/* -> macro output buff	*/
+	int		size;			/* Actual parm. size	*/
+	char		*defend;		/* -> output buff end	*/
+	FILEINFO	*file;			/* Funny #include	*/
+	extern FILEINFO	*getfile();
+
+	file = getfile(NBUFF, tokenp->name);
+	recursion++;				/* In a macro, now	*/
+	inp = tokenp->repl;			/* -> macro replacement	*/
+	defp = file->buffer;			/* -> output buffer	*/
+	defend = defp + (NBUFF - 1);		/* Note its end		*/
+	if (inp != NULL) {
+	    while ((c = (*inp++ & 0XFF)) != EOS) {
+		if (c >= PFLAG && c <= (PFLAG + NPARM)) {
+		    /*
+		     * Replace formal parameter by actual parameter string.
+		     */
+		    if ((c -= PFLAG) < nargs) {
+			size = strlen(parlist[c]);
+			if ((defp + size) >= defend)
+			    goto nospace;
+			strcpy(defp, parlist[c]);
+			defp += size;
+		    }
+		}
+		else if (defp >= defend) {
+nospace:	    cfatal("Out of space in macro \"%s\" arg expansion",
+			tokenp->name);
+		}
+		else {
+		    *defp++ = c;
+		}
+	    }
+	}
+	*defp = EOS;
+#if DEBUG
+	if (debug > 1)
+	    printf("macroline: \"%s\"\n", file->buffer);
+#endif
+}
+
+#if DEBUG
+dumpparm(why)
+char		*why;
+/*
+ * Dump parameter list.
+ */
+{
+	register int	i;
+
+	printf("dump of %d parameters (%d bytes total) %s\n",
+	    nargs, parmp - parm, why);
+	for (i = 0; i < nargs; i++) {
+	    printf("parm[%d] (%d) = \"%s\"\n",
+		i + 1, strlen(parlist[i]), parlist[i]);
+	}
+}
+#endif
+
+/*
+ * Evaluate an #if expression.
+ */
+
+static char	*opname[] = {		/* For debug and error messages	*/
+"end of expression", "val", "id",
+  "+",   "-",  "*",  "/",  "%",
+  "<<", ">>",  "&",  "|",  "^",
+  "==", "!=",  "<", "<=", ">=",  ">",
+  "&&", "||",  "?",  ":",  ",",
+  "unary +", "unary -", "~", "!",  "(",  ")", "stack end",
+};
+
+/*
+ * opdope[] has the operator precedence:
+ *     Bits
+ *	  7	Unused (so the value is always positive)
+ *	6-2	Precedence (000x .. 017x)
+ *	1-0	Binary op. flags:
+ *	    01	The binop flag should be set/cleared when this op is seen.
+ *	    10	The new value of the binop flag.
+ * Note:  Expected, New binop
+ * constant	0	1	Binop, end, or ) should follow constants
+ * End of line	1	0	End may not be preceeded by an operator
+ * binary	1	0	Binary op follows a value, value follows.
+ * unary	0	0	Unary op doesn't follow a value, value follows
+ *   (		0	0	Doesn't follow value, value or unop follows
+ *   )		1	1	Follows value.  Op follows.
+ */
+
+static char	opdope[OP_MAX] = {
+  0001,					/* End of expression		*/
+  0002,					/* Digit			*/
+  0000,					/* Letter (identifier)		*/
+  0141, 0141, 0151, 0151, 0151,		/* ADD, SUB, MUL, DIV, MOD	*/
+  0131, 0131, 0101, 0071, 0071,		/* ASL, ASR, AND,  OR, XOR	*/
+  0111, 0111, 0121, 0121, 0121,	0121,	/*  EQ,  NE,  LT,  LE,  GE,  GT	*/
+  0061, 0051, 0041, 0041, 0031,		/* ANA, ORO, QUE, COL, CMA	*/
+/*
+ * Unary op's follow
+ */
+  0160, 0160, 0160, 0160,		/* NEG, PLU, COM, NOT		*/
+  0170, 0013, 0023,			/* LPA, RPA, END		*/
+};
+/*
+ * OP_QUE and OP_RPA have alternate precedences:
+ */
+#define	OP_RPA_PREC	0013
+#define OP_QUE_PREC	0034
+
+typedef struct optab {
+    char	op;			/* Operator			*/
+    char	prec;			/* Its precedence		*/
+} OPTAB;
+
+static int	evalue;			/* Current value from evallex()	*/
+
+#ifdef	nomacargs
+FILE_LOCAL int
+isbinary(op)
+register int	op;
+{
+	return (op >= FIRST_BINOP && op <= LAST_BINOP);
+}
+
+FILE_LOCAL int
+isunary(op)
+register int	op;
+{
+	return (op >= FIRST_UNOP && op <= LAST_UNOP);
+}
+#else
+#define	isbinary(op)	(op >= FIRST_BINOP && op <= LAST_BINOP)
+#define	isunary(op)	(op >= FIRST_UNOP  && op <= LAST_UNOP)
+#endif
+
+#ifdef	DEBUG_EVAL
+dumpstack(opstack, opp, value, valp)
+OPTAB		opstack[NEXP];	/* Operand stack		*/
+register OPTAB	*opp;		/* Operator stack		*/
+int		value[NEXP];	/* Value stack			*/
+register int	*valp;		/* -> value vector		*/
+{
+	printf("op stack dump\n");
+	while (opp > opstack) {
+	    printf("[%d] %d, %s 0%o\n", opp - opstack,
+		opp->op, opname[opp->op], opp->prec);
+	    opp--;
+	}
+	while (--valp >= value) {
+	    printf("value[%d] = %d\n", (valp - value), *valp);
+	}
+}
+#endif
+
+int
+eval()
+/*
+ * Evaluate an expression.  Straight-forward operator precedence.
+ * This is called from control() on encountering an #if statement.
+ * It calls the following routines:
+ * evallex	Lexical analyser -- returns the type and value of
+ *		the next input token.
+ * evaleval	Evaluate the current operator, given the values on
+ *		the value stack.  Returns a pointer to the (new)
+ *		value stack.
+ */
+{
+	register int	op;		/* Current operator		*/
+	register int	*valp;		/* -> value vector		*/
+	register OPTAB	*opp;		/* Operator stack		*/
+	int		prec;		/* Op precedence		*/
+	int		binop;		/* Set if binary op. needed	*/
+	int		op1;		/* Operand from stack		*/
+	int		value[NEXP];	/* Value stack			*/
+	OPTAB		opstack[NEXP];	/* Operand stack		*/
+	extern int	*evaleval();	/* Does actual evaluation	*/
+
+	valp = value;
+	opp = opstack;
+	opp->op = OP_END;		/* Mark bottom of stack		*/
+	opp->prec = opdope[OP_END];	/* And its precedence		*/
+
+	binop = 0;
+again:	;
+#ifdef	DEBUG_EVAL
+	printf("In #if at again:, binop = %d, line is: %s",
+	    binop, infile->bptr);
+#endif
+	if ((op = evallex()) == OP_SUB && !binop)
+	    op = OP_NEG;			/* Unary minus		*/
+	else if (op == OP_ADD && !binop)
+	    op = OP_PLU;			/* Unary plus		*/
+	else if (op == OP_FAIL)
+	    return (0);				/* Error in evallex	*/
+#ifdef	DEBUG_EVAL
+	printf("op = %s, opdope = 0%03o, binop = %d\n",
+	    opname[op], opdope[op], binop);
+#endif
+	if (op == DIG) {			/* Value?		*/
+	    if (binop)
+		return (cerror("misplaced constant", NULLST));
+	    else if (valp >= &value[NEXP-1])
+		return (cerror("if expression stack overflow", NULLST));
+	    else {
+#ifdef	DEBUG_EVAL
+		printf("pushing %d onto stack[%d]\n",
+		    evalue, valp - value);
+#endif
+		*valp++ = evalue;
+		binop = 1;
+	    }
+	    goto again;
+	}
+	else if (op > OP_END)
+	    return (cerror("Illegal #if line", NULLST));
+	prec = opdope[op];
+	if (binop != (prec & 1))
+	    return(cerror("Operator %s in incorrect context", opname[op]));
+	binop = ((prec & 2) != 0);
+	for (;;) {
+#ifdef	DEBUG_EVAL
+	    printf("op %s, prec %d., stacked op %s, prec %d\n",
+		opname[op], prec, opname[opp->op], opp->prec);
+#endif
+	    if (prec > opp->prec) {
+		if (op == OP_LPA)
+		    prec = OP_RPA_PREC;
+		else if (op == OP_QUE)
+		    prec = OP_QUE_PREC;
+		/*
+		 * Push operator onto op. stack.
+		 */
+		opp++;
+		if (opp >= &opstack[NEXP])
+		    return (cerror("expression stack overflow", NULLST));
+#ifdef	DEBUG_EVAL
+		printf("push %s (0%o) onto operand stack[%d]\n",
+		    opname[op], prec, opp - opstack);
+#endif
+		opp->op = op;
+		opp->prec = prec;
+		goto again;
+	    }
+	    /*
+	     * Pop operator from op. stack and evaluate it.
+	     * End of stack and '(' are specials.
+	     */
+	    switch ((op1 = (opp--)->op)) {	/* Looked at stacked op	*/
+	    case OP_END:			/* Stack end marker	*/
+		if (op == OP_EOE)
+		    return (valp[-1]);		/* Finished ok.		*/
+		opp++;				/* More to come.	*/
+		goto again;			/* Read another op.	*/
+
+	    case OP_LPA:			/* ( on stack		*/
+		if (op != OP_RPA) {		/* Matches ) on input	*/
+#ifdef	DEBUG_EVAL
+		    printf("Expecting match to ), read '%s'\n", opname[op]);
+		    dumpstack(opname, opp, value, valp);
+#endif
+		    return (cerror("unbalanced paren's", NULLST));
+		}
+		goto again;
+
+	    case OP_QUE:
+		opp++;				/* Keep it for a while	*/
+		goto again;			/* Evaluate next op.	*/
+
+	    case OP_COL:			/* : on stack.		*/
+		if ((opp--)->op != OP_QUE) {	/* Matches ? on stack?	*/
+		    return(cerror(
+			"Misplaced '?' or ':', previous operator is %s",
+			opname[(opp+1)->op]));
+		}
+		/*
+		 * Evaluate op1.
+		 */
+	    default:				/* Others:		*/
+#ifdef	DEBUG_EVAL
+		printf("Stack before evaluation of %s\n", opname[op1]);
+		dumpstack(opstack, opp, value, valp);
+#endif
+		valp = evaleval(valp, op1);	/* Evaluate value(s)	*/
+#ifdef	DEBUG_EVAL
+		printf("Stack after evaluation\n");
+		dumpstack(opstack, opp, value, valp);
+#endif
+	    }					/* op1 switch end	*/
+	}					/* Stack unwind loop	*/
+}
+
+FILE_LOCAL int
+evallex()
+/*
+ * Return next eval operator or value.  Called from eval().  It
+ * calls a special-purpose routines for 'char' strings and
+ * numeric values:
+ * evalchar	called to evaluate 'x'
+ * evalnum	called to evaluate numbers.
+ */
+{
+	register int	c, c1, t;
+
+again:	if ((c = skipws()) == EOF_CHAR || c == '\n') {
+	    unget();
+	    return (OP_EOE);			/* End of expression	*/
+	}
+	if ((t = type[c]) == INV) {		/* Total nonsense	*/
+	    if (isascii(c) && isprint(c))
+		cierror("illegal character '%c' in #if", c);
+	    else
+		cierror("illegal character (%d decimal) in #if", c);
+	    return (OP_FAIL);
+	}
+	else if (t == QUO) {			/* ' or "		*/
+	    if (c == '\'') {			/* Character constant	*/
+		evalue = evalchar();		/* Somewhat messy	*/
+#ifdef	DEBUG_EVAL
+		printf("evalchar returns %d.\n", evalue);
+#endif
+		return (DIG);			/* Return a value	*/
+	    }
+	    cerror("Can't use a string in an #if", NULLST);
+	    return (OP_FAIL);
+	}
+	else if (t == LET) {			/* ID must be a macro	*/
+	    if (macroid(c))			/* Try to expand it	*/
+		goto again;			/* Reread if so.	*/
+	    else if (streq(token, "defined")) {	/* Or defined name	*/
+		c1 = c = skipws();
+		if (c == '(')			/* Allow defined(name)	*/
+		    c = skipws();
+		if (type[c] == LET) {
+		    evalue = (lookid(c) != NULL);
+		    if (c1 != '('		/* Need to balance	*/
+		     || skipws() == ')')	/* Did we balance?	*/
+			return (DIG);		/* Parsed ok		*/
+		}
+		cerror("Bad #if ... defined() syntax", NULLST);
+		return (OP_FAIL);
+	    }
+	    /*
+	     * The Draft ANSI C Standard says that an undefined symbol
+	     * in an #if has the value zero.  We should really check that
+	     * the programmer didn't write "#if defined(foo) ? foo : 0"
+	     * before printing the warning.
+	     */
+	    cwarn("undefined symbol \"%s\" in #if, 0 used", token);
+	    evalue = 0;
+	    return (DIG);
+	}
+	else if (t == DIG) {			/* Numbers are harder	*/
+	    evalue = evalnum(c);
+#ifdef	DEBUG_EVAL
+	    printf("evalnum returns %d.\n", evalue);
+#endif
+	}
+	else if (strchr("!=<>&|\\", c) != NULL) {
+	    /*
+	     * Process a possible multi-byte lexeme.
+	     */
+	    c1 = get();				/* Peek at next char	*/
+	    switch (c) {
+	    case '!':
+		if (c1 == '=')
+		    return (OP_NE);
+		break;
+
+	    case '=':
+		if (c1 != '=') {		/* Can't say a=b in #if	*/
+		    unget();
+		    cerror("= not allowed in #if", NULLST);
+		    return (OP_FAIL);
+		}
+		return (OP_EQ);
+
+	    case '>':
+	    case '<':
+		if (c1 == c)
+		    return ((c == '<') ? OP_ASL : OP_ASR);
+		else if (c1 == '=')
+		    return ((c == '<') ? OP_LE  : OP_GE);
+		break;
+
+	    case '|':
+	    case '&':
+		if (c1 == c)
+		    return ((c == '|') ? OP_ORO : OP_ANA);
+		break;
+
+	    case '\\':
+		if (c1 == '\n')			/* Multi-line if	*/
+		    goto again;
+		cerror("Unexpected \\ in #if", NULLST);
+		return (OP_FAIL);
+	    }
+	    unget();
+	}
+	return (t);
+}
+
+FILE_LOCAL int
+evalnum(c)
+register int	c;
+/*
+ * Expand number for #if lexical analysis.
+ */
+{
+	register int	value;
+	register int	base;
+	register int	c1;
+
+	if (c != '0')
+	    base = 10;
+	else if ((c = get()) == 'x' || c == 'X') {
+		base = 16;
+		c = get();
+	}
+	else base = 8;
+	value = 0;
+	for (;;) {
+	    c1 = c;
+	    if (isascii(c) && isupper(c1))
+		c1 = tolower(c1);
+	    if (c1 >= 'a')
+		c1 -= ('a' - 10);
+	    else c1 -= '0';
+	    if (c1 < 0 || c1 >= base)
+		break;
+	    value *= base;
+	    value += c1;
+	    c = get();
+	}
+	unget();
+	return (value);
+}
+
+/*
+ * GETCC is called by evalchar() to read a character.  It absorbs
+ * the embedded-comment magic cookie that some Unix implementations use to
+ * allow token concatenation.
+ */
+
+#if COMMENT_INVISIBLE
+#define	GETCC	getcc
+
+FILE_LOCAL int
+getcc() {
+	register int	c;
+
+	do {
+	    c = get();
+	} while (c == COM_SPACE);
+	return (c);
+}
+#else
+#define	GETCC	get
+#endif
+
+FILE_LOCAL int
+evalchar()
+/*
+ * Get a character constant
+ */
+{
+	register int	c;
+	register int	value;
+	register int	count;
+
+	instring = TRUE;
+	if ((c = get()) == '\\') {
+	    switch ((c = GETCC())) {
+	    case 'a':
+		value = ALERT;			/* New in Standard	*/
+		break;
+
+	    case 'b':
+		value = '\b';
+		break;
+
+	    case 'f':
+		value = '\f';
+		break;
+
+	    case 'n':
+		value = '\n';
+		break;
+
+	    case 'r':
+		value = '\r';
+		break;
+
+	    case 't':
+		value = '\t';
+		break;
+
+	    case 'v':
+		value = VT;			/* Vertical tab		*/
+		break;
+
+	    case 'x':				/* '\xFF'		*/
+		count = 3;
+		value = 0;
+		while ((((c = get()) >= '0' && c <= '9')
+		     || (c >= 'a' && c <= 'f')
+		     || (c >= 'A' && c <= 'F'))
+		    && (--count >= 0)) {
+			value *= 16;
+			value += (c <= '9') ? (c - '0') : ((c & 0xF) + 9);
+		}
+		unget();
+		break;
+
+	    default:
+		if (c >= '0' && c <= '7') {
+		    count = 3;
+		    value = 0;
+		    while (c >= '0' && c <= '7' && --count >= 0) {
+			value *= 8;
+			value += (c - '0');
+			c = get();
+		    }
+		    unget();
+		}
+		else value = c;
+		break;
+	    }
+	}
+	else if (c == '\'')
+	    value = 0;
+	else value = c;
+	/*
+	 * We warn on multi-byte constants and try to hack
+	 * (big|little)endian machines.
+	 */
+#if BIG_ENDIAN
+	count = 0;
+#endif
+	while ((c = get()) != '\'' && c != EOF_CHAR && c != '\n') {
+	    ciwarn("multi-byte constant '%c' isn't portable", c);
+#if BIG_ENDIAN
+	    count += BITS_CHAR;
+	    value += (c << count);
+#else
+	    value <<= BITS_CHAR;
+	    value += c;
+#endif
+	}
+	instring = FALSE;
+	return (value);
+}
+
+FILE_LOCAL int *
+evaleval(valp, op)
+register int	*valp;
+int		op;
+/*
+ * Apply the argument operator to the data on the value stack.
+ * One or two values are popped from the value stack and the result
+ * is pushed onto the value stack.
+ *
+ * OP_COL is a special case.
+ *
+ * evaleval() returns the new pointer to the top of the value stack.
+ */
+{
+	register int	v1, v2;
+
+	if (isbinary(op))
+	    v2 = *--valp;
+	v1 = *--valp;
+#ifdef	DEBUG_EVAL
+	printf("%s op %s", (isbinary(op)) ? "binary" : "unary",
+	    opname[op]);
+	if (isbinary(op))
+	    printf(", v2 = %d.", v2);
+	printf(", v1 = %d.\n", v1);
+#endif
+	switch (op) {
+	case OP_EOE:
+	     break;
+
+	case OP_ADD:
+	    v1 += v2;
+	    break;
+
+	case OP_SUB:
+	    v1 -= v2;
+	    break;
+
+	case OP_MUL:
+	    v1 *= v2;
+	    break;
+
+	case OP_DIV:
+	    if (v2 == 0) {
+		cwarn("divide by zero in #if, zero result assumed", NULLST);
+		v1 = 0;
+	    }
+	    else v1 /= v2;
+	    break;
+
+	case OP_MOD:
+	    if (v2 == 0) {
+		cwarn("modulus by zero in #if, zero result assumed", NULLST);
+		v1 = 0;
+	    }
+	    else v1 %= v2;
+	    break;
+
+	case OP_ASL:
+	    v1 <<= v2;
+	    break;
+
+	case OP_ASR:
+	    v1 >>= v2;
+	    break;
+
+	case OP_AND:
+	    v1 &= v2;
+	    break;
+
+	case OP_OR:
+	    v1 |= v2;
+	    break;
+
+	case OP_XOR:
+	    v1 ^= v2;
+	    break;
+
+	case OP_EQ:
+	    v1 = (v1 == v2);
+	    break;
+
+	case OP_NE:
+	    v1 = (v1 != v2);
+	    break;
+
+	case OP_LT:
+	    v1 = (v1 < v2);
+	    break;
+
+	case OP_LE:
+	    v1 = (v1 <= v2);
+	    break;
+
+	case OP_GE:
+	    v1 = (v1 >= v2);
+	    break;
+
+	case OP_GT:
+	    v1 = (v1 > v2);
+	    break;
+
+	case OP_ANA:
+	    v1 = (v1 && v2);
+	    break;
+
+	case OP_ORO:
+	    v1 = (v1 || v2);
+	    break;
+
+	case OP_COL:
+	    /*
+	     * v1 has the "true" value, v2 the "false" value.
+	     * The top of the value stack has the test.
+	     */
+	    v1 = (*--valp) ? v1 : v2;
+	    break;
+
+	case OP_NEG:
+	    v1 = (-v1);
+	    break;
+
+	case OP_PLU:
+	    break;
+
+	case OP_COM:
+	    v1 = ~v1;
+	    break;
+
+	case OP_NOT:
+	    v1 = !v1;
+	    break;
+
+	default:
+	    cierror("#if bug, operand = %d.", op);
+	    v1 = 0;
+	}
+	*valp++ = v1;
+	return (valp);
+}
+-h- cpp3.c	Sat Sep  1 21:43:42 1984	cpp3.c
+
+/*
+ *			    C P P . 3
+ *		S u p p o r t   R o u t i n e s
+ *
+ * Edit History
+ * 25-May-84 MM		Added 8-bit support to type table.
+ * 30-May-84 ARF	sharp() should output filename in quotes
+ * 02-Aug-84 MM		Newline and #line hacking.  sharp() now in cpp1.c
+ * 31-Aug-84 MM		USENET net.sources release
+ */
+
+#include	<stdio.h>
+#include	<ctype.h>
+#include	"cppdef.h"
+#include	"cpp.h"
+
+/*
+ * skipnl()	skips over input text to the end of the line.
+ * skipws()	skips over "whitespace" (spaces or tabs), it
+ *		does not skip over the end of the line.
+ * scanid()	reads the next token (C identifier) into a token
+ *		buffer (usually	token[]).  The caller has already
+ *		read the first 	character of the identifier.
+ * macroid()	reads the next token (C identifier) into token[].
+ *		If it is a #defined macro, it is expanded, and
+ *		macroid() returns TRUE, otherwise, FALSE.
+ * scanstring()	Reads a string from the input stream, calling
+ *		a user-supplied function for each character.
+ *		This function may be output() to write the
+ *		string to the output file, or save() to save
+ *		the string in the work buffer.
+ * scannumber()	Reads a C numeric constant from the input stream,
+ *		calling the user-supplied function for each
+ *		character.  (output() or save() as noted above.)
+ * save()	Save one character in the work[] buffer.
+ * savestring()	Saves a string in malloc() memory.
+ * getfile()	Initialize a new FILEINFO structure, called when
+ *		#include opens a new file, or a macro is to be
+ *		expanded.
+ * getmem()	Get a specified number of bytes from malloc memory.
+ * output()	Write one character to stdout (calling putchar) --
+ *		implemented as a function so its address may be
+ *		passed to scanstring() and scannumber().
+ * lookid()	Scans the next token (identifier) from the input
+ *		stream.  Looks for it in the #defined symbol table.
+ *		Returns a pointer to the definition, if found, or NULL
+ *		if not present.  The identifier is stored in token[].
+ * defnedel()	Define enter/delete subroutine.  Updates the
+ *		symbol table.
+ * get()	Read the next byte from the current input stream,
+ *		handling end of (macro/file) input and embedded
+ *		comments appropriately.  Note that the global
+ *		instring is -- essentially -- a parameter to get().
+ * unget()	Push last gotten character back on the input stream.
+ * cerror(), cwarn(), cfatal(), cierror(), ciwarn()
+ *		These routines format an print messages to the user.
+ *		cerror & cwarn take a format and a single string argument.
+ *		cierror & ciwarn take a format and a single int (char) argument.
+ *		cfatal takes a format and a single string argument.
+ * sharp()	Output the #line.
+ */
+
+/*
+ * Note that DEL is a letter -- this is needed to hack #define foo foo
+ * This table must be modified for non-Ascii machines.
+ */
+
+char type[256] = {		/* Character type codes    Hex		*/
+   END,   000,   000,   000,   000,   000,   000,   000, /* 00		*/
+   000,   SPA,   000,   000,   000,   000,   000,   000, /* 08		*/
+   000,   000,   000,   000,   000,   000,   000,   000, /* 10		*/
+   000,   000,   000,   000,   000,   000,   000,   SPA, /* 18		*/
+   SPA,OP_NOT,   QUO,   000,   LET,OP_MOD,OP_AND,   QUO, /* 20  !"#$%&'	*/
+OP_LPA,OP_RPA,OP_MUL,OP_ADD,   000,OP_SUB,   DOT,OP_DIV, /* 28 ()*+,-./	*/
+   DIG,   DIG,   DIG,   DIG,   DIG,   DIG,   DIG,   DIG, /* 30 01234567	*/
+   DIG,   DIG,OP_COL,   000, OP_LT, OP_EQ, OP_GT,OP_QUE, /* 38 89:;<=>?	*/
+   000,   LET,   LET,   LET,   LET,   LET,   LET,   LET, /* 40 @ABCDEFG	*/
+   LET,   LET,   LET,   LET,   LET,   LET,   LET,   LET, /* 48 HIJKLMNO	*/
+   LET,   LET,   LET,   LET,   LET,   LET,   LET,   LET, /* 50 PQRSTUVW	*/
+   LET,   LET,   LET,   000,   BSH,   000,OP_XOR,   LET, /* 58 XYZ[\]^_	*/
+   000,   LET,   LET,   LET,   LET,   LET,   LET,   LET, /* 60 `abcdefg	*/
+   LET,   LET,   LET,   LET,   LET,   LET,   LET,   LET, /* 68 hijklmno	*/
+   LET,   LET,   LET,   LET,   LET,   LET,   LET,   LET, /* 70 pqrstuvw	*/
+   LET,   LET,   LET,   000, OP_OR,   000,OP_NOT,   LET, /* 78 xyz{|}~	*/
+   000,   000,   000,   000,   000,   000,   000,   000, /*   80 .. FF	*/
+   000,   000,   000,   000,   000,   000,   000,   000, /*   80 .. FF	*/
+   000,   000,   000,   000,   000,   000,   000,   000, /*   80 .. FF	*/
+   000,   000,   000,   000,   000,   000,   000,   000, /*   80 .. FF	*/
+   000,   000,   000,   000,   000,   000,   000,   000, /*   80 .. FF	*/
+   000,   000,   000,   000,   000,   000,   000,   000, /*   80 .. FF	*/
+   000,   000,   000,   000,   000,   000,   000,   000, /*   80 .. FF	*/
+   000,   000,   000,   000,   000,   000,   000,   000, /*   80 .. FF	*/
+};
+
+skipnl()
+/*
+ * Skip to the end of the current input line.
+ */
+{
+	register int		c;
+
+	do {				/* Skip to newline	*/
+	    c = get();
+	} while (c != '\n' && c != EOF_CHAR);
+}
+
+int
+skipws()
+/*
+ * Skip over whitespace
+ */
+{
+	register int		c;
+
+	do {				/* Skip to newline	*/
+	    c = get();
+	} while (type[c] == SPA);
+	return (c);
+}
+
+scanid(buffer, c)
+char		*buffer;			/* Store ID here	*/
+register int	c;				/* First char of id	*/
+/*
+ * Get the next token (an id) into the buffer.
+ * Note: this code is duplicated in lookid().
+ * Change one, change both.
+ */
+{
+	register char	*bp;
+
+	if (c == DEL)				/* Eat the magic token	*/
+	    c = get();				/* undefiner.		*/
+	bp = buffer;
+	do {
+	    if (bp < &buffer[IDMAX])
+		*bp++ = c;
+	    c = get();
+	} while (type[c] == LET || type[c] == DIG);
+	unget();
+	*bp = EOS;
+}
+
+int
+macroid(c)
+/*
+ * Scan the id, if it's #defined, expand it and return TRUE.
+ * Else, the id is in "token", return FALSE.
+ */
+{
+	register DEFBUF	*dp;
+
+	if ((dp = lookid(c)) == NULL)
+	    return (FALSE);
+	else {
+	    expand(dp);
+	    return (TRUE);
+	}
+}
+
+scanstring(delim, outfun)
+register int	delim;			/* ' or "			*/
+int		(*outfun)();		/* Output function		*/
+/*
+ * Scan off a string.  Warning if terminated by newline or EOF.
+ * outfun() outputs the character -- to a buffer if in a macro.
+ */
+{
+	register int		c;
+
+	instring = TRUE;		/* Don't strip comments		*/
+	(*outfun)(delim);
+	while ((c = get()) != delim
+	     && c != '\n'
+	     && c != EOF_CHAR) {
+	    (*outfun)(c);
+	    if (c == '\\')
+		(*outfun)(get());
+	}
+	if (c == delim)
+	    (*outfun)(c);
+	else {
+	    cerror("Unterminated string", NULLST);
+	    unget();
+	}
+	instring = FALSE;
+}
+
+scannumber(c, outfun)
+register int	c;				/* First char of number	*/
+register int	(*outfun)();			/* Output/store func	*/
+/*
+ * Process a number
+ */
+{
+	if (c == '0') {					/* Octal or hex	*/
+	    (*outfun)(c);
+	    if ((c = get()) == 'X' || c == 'x') {	/* Is it hex?	*/
+		(*outfun)(c);				/* Hex		*/
+		while (((c = get()) >= '0' && c <= '9')
+		    || (c >= 'A' && c <= 'F')
+		    || (c >= 'a' && c <= 'f')) {
+		    (*outfun)(c);
+		}
+	    }
+	    else {
+		while (c >= '0' && c <= '7') {		/* Octal	*/
+		    (*outfun)(c);
+		    c = get();
+		}
+	    }
+	    if (c == 'l' || c == 'L') {
+		(*outfun)(c);				/* Long hex/oct	*/
+		c = get();
+	    }
+	}
+	else {						/* Int or float	*/
+	    while (type[c] == DIG) {			/* Int part	*/
+		(*outfun)(c);
+		c = get();
+	    }
+	    if (c == 'l' || c == 'L') {			/* Long int	*/
+		(*outfun)(c);
+		c = get();
+	    }
+	    else {					/* Maybe Float	*/
+		if (c == '.') {				/* '.' is float	*/
+		    (*outfun)(c);			/* Do fraction	*/
+		    while (type[(c = get())] == DIG)
+			(*outfun)(c);
+		}
+		if (c == 'E' || c == 'e') {		/* Exponential	*/
+		    (*outfun)(c);
+		    if ((c = get()) == '+' || c == '-') {
+			(*outfun)(c);
+			c = get();
+		    }
+		    while (type[c] == DIG) {
+			(*outfun)(c);
+			c = get();
+		    }
+		}				/* If E format		*/
+	    }					/* If not long int	*/
+	}					/* If Decimal number	*/
+	unget();				/* Rescan next char	*/
+}
+
+save(c)
+register int	c;
+{
+	if (workp >= &work[NWORK])
+	    cfatal("Work buffer overflow", NULLST);
+	else *workp++ = c;
+}
+
+char *
+savestring(text)
+char		*text;
+/*
+ * Store a string into free memory.
+ */
+{
+	register char	*result;
+
+	result = getmem(strlen(text) + 1);
+	strcpy(result, text);
+	return (result);
+}
+
+FILEINFO	*
+getfile(bufsize, name)
+int		bufsize;		/* Line or define buffer size	*/
+char		*name;			/* File or macro name string	*/
+/*
+ * Common FILEINFO buffer initialization for a new file or macro.
+ */
+{
+	register FILEINFO	*file;
+	register int		size;
+
+	size = strlen(name);			/* File/macro name	*/
+	file = (FILEINFO *) getmem(sizeof (FILEINFO) + bufsize + size);
+	file->parent = infile;			/* Chain files together	*/
+	file->fp = NULL;			/* No file yet		*/
+	file->filename = savestring(name);	/* Save file/macro name	*/
+	file->progname = NULL;			/* No #line seen yet	*/
+	file->bptr = file->buffer;		/* Initialize line ptr	*/
+	file->buffer[0] = EOS;			/* Force first read	*/
+	file->line = 0;				/* (Not used just yet)	*/
+	if (infile != NULL)			/* If #include file	*/
+	    infile->line = line;		/* Save current line	*/
+	infile = file;				/* New current file	*/
+	line = 1;				/* Note first line	*/
+	return (file);				/* All done.		*/
+}
+
+char *
+getmem(size)
+int		size;
+/*
+ * Get a block of free memory.
+ */
+{
+	register char	*result;
+	extern char	*malloc();
+
+	if ((result = malloc((unsigned) size)) == NULL)
+	    cfatal("Out of memory", NULLST);
+	return (result);
+}
+
+/*
+ *			C P P   S y m b o l   T a b l e s
+ */
+
+#ifndef	SBSIZE
+#define	SBSIZE	64		/* Hash chain size (power of 2)		*/
+#endif
+#define	SBMASK	(SBSIZE - 1)
+#if (SBSIZE ^ SBMASK) != ((SBSIZE * 2) - 1)
+	<< error, SBSIZE must be a power of 2 >>
+#endif
+
+static DEFBUF	*symtab[SBSIZE];	/* Symbol table queue headers	*/
+
+DEFBUF *
+lookid(c)
+int	c;				/* First character of token	*/
+/*
+ * Look for the next token in the symbol table.  Returns token in "token".
+ * If found, returns the table pointer;  Else returns NULL.
+ */
+{
+	register int		nhash;
+	register DEFBUF		*dp;
+	REG_UNION {
+		char		*np;
+		int		temp;
+	} r;
+	int			isrecurse;	/* For #define foo foo	*/
+
+	r.np = token;
+	nhash = 0;
+	if ((isrecurse = (c == DEL)))		/* If recursive macro	*/
+	    c = get();				/* hack, skip over DEL	*/
+	do {
+	    if (r.np < &token[IDMAX]) {
+		*r.np++ = c;			/* Store token byte	*/
+		nhash += c;			/* Update hash value	*/
+	    }
+	    c = get();				/* And get another byte	*/
+	} while (type[c] == LET || type[c] == DIG);
+	unget();				/* Rescan terminator	*/
+	*r.np = EOS;				/* Terminate token	*/
+	if (isrecurse)				/* Recursive definition	*/
+	    return (NULL);			/* undefined just now	*/
+	nhash += (r.np - token);		/* Fix hash value	*/
+	/* printf("look for '%s' [%d], hash %d, index %d\n",
+	** token, (r.np - token), nhash, nhash & SBMASK);
+	*/
+	dp = symtab[nhash & SBMASK];		/* Starting bucket	*/
+	while (dp != (DEFBUF *) NULL) {		/* Search symbol table	*/
+	    if (dp->hash == nhash		/* Fast precheck	*/
+	     && (r.temp = strcmp(dp->name, token)) >= 0)
+		break;
+	    dp = dp->link;			/* Nope, try next one	*/
+	}
+	return ((r.temp == 0) ? dp : NULL);
+}
+
+DEFBUF *
+defendel(name, delete)
+char		*name;
+int		delete;			/* TRUE to delete a symbol	*/
+/*
+ * Enter this name in the lookup table (delete = FALSE)
+ * or delete this name (delete = TRUE).
+ * Returns a pointer to the define block (delete = FALSE)
+ * Returns NULL if the symbol wasn't defined (delete = TRUE).
+ */
+{
+	register DEFBUF		*dp;
+	REG_UNION {
+		DEFBUF		**prevp;
+		char		*np;
+	} r;
+	register int		nhash;
+	int			temp;
+	int			size;
+
+	for (nhash = 0, r.np = name; *r.np != EOS;)
+	    nhash += *r.np++;
+	size = (r.np - name);
+	nhash += size;
+	/* printf("'%s', [%d], hash = %d, index = %d\n",
+	** name, size, nhash, nhash & SBMASK);
+	*/
+	r.prevp = &symtab[nhash & SBMASK];
+	while ((dp = *r.prevp) != (DEFBUF *) NULL) {
+	    if (dp->hash == nhash
+	     && (temp = strcmp(dp->name, name)) >= 0) {
+		if (temp > 0)
+		    dp = NULL;			/* Not found		*/
+		else {
+		    *r.prevp = dp->link;	/* Found, unlink and	*/
+		    if (dp->repl != NULL)	/* Free the replacement	*/
+			free(dp->repl);		/* if any, and then	*/
+		    free((char *) dp);		/* Free the symbol	*/
+		}
+		break;
+	    }
+	    r.prevp = &dp->link;
+	}
+	if (!delete) {
+	    dp = (DEFBUF *) getmem(sizeof (DEFBUF) + size);
+	    dp->link = *r.prevp;
+	    *r.prevp = dp;
+	    dp->hash = nhash;
+	    dp->repl = NULL;
+	    dp->nargs = 0;
+	    strcpy(dp->name, name);
+	}
+	return (dp);
+}
+
+#if DEBUG
+
+dumpdef(why)
+char		*why;
+{
+	register DEFBUF		*dp;
+	register DEFBUF		**syp;
+
+	printf("CPP symbol table dump %s\n", why);
+	for (syp = symtab; syp < &symtab[SBSIZE]; syp++) {
+	    if ((dp = *syp) != (DEFBUF *) NULL) {
+		printf("symtab[%d]\n", (syp - symtab));
+		do {
+		    dumpadef((char *) NULL, dp);
+		} while ((dp = dp->link) != (DEFBUF *) NULL);
+	    }
+	}
+}
+
+dumpadef(why, dp)
+char		*why;			/* Notation			*/
+register DEFBUF	*dp;
+{
+	register char		*cp;
+	register int		c;
+
+	printf(" \"%s\" [%d]", dp->name, dp->nargs);
+	if (why != NULL)
+	    printf(" (%s)", why);
+	if (dp->repl != NULL) {
+	    printf(" => ");
+	    for (cp = dp->repl; (c = *cp++ & 0xFF) != EOS;) {
+		if (c >= PFLAG && c <= (PFLAG + NPARM))
+		    printf("<%d>", c - PFLAG);
+		else if (isprint(c) || c == '\n' || c == '\t')
+		    putchar(c);
+		else if (c < ' ')
+		    printf("<^%c>", c + '@');
+		else
+		    printf("<\\0%o>", c);
+	    }
+	}
+	else {
+	    printf(", no replacement.");
+	}
+	putchar('\n');
+}
+#endif
+
+/*
+ *			G E T
+ */
+
+int
+get()
+/*
+ * Return the next character from a macro or the current file.
+ * Handle end of file from #include files.
+ */
+{
+	register int		c;
+	register FILEINFO	*file;
+
+get_from_file:
+	if ((file = infile) == NULL)
+	    return (EOF_CHAR);
+newline:
+#if 0
+	printf("get(%s), line %d, bptr = %d, buffer \"%s\"\n",
+	    file->filename, line, file->bptr - file->buffer, file->buffer);
+#endif
+	/*
+	 * Read a character from the current input line or macro.
+	 * At EOS, either finish the current macro (freeing temp.
+	 * storage) or read another line from the current input file.
+	 * At EOF, exit the current file (#include) or, at EOF from
+	 * a command-line specified file, return EOF_CHAR to trigger
+	 * processing.
+	 */
+	if ((c = *file->bptr++ & 0xFF) == EOS) {
+	    /*
+	     * Nothing in current line or macro.  Get next line (if
+	     * input from a file), or do end of file/macro processing.
+	     * In the latter case, jump back to restart from the top.
+	     */
+	    if (file->fp == NULL)		/* NULL if macro	*/
+	        infile = file->parent;		/* Unwind file chain	*/
+	    else {				/* Get from a file	*/
+		if ((file->bptr = fgets(file->buffer, NBUFF, file->fp))
+			!= NULL) {
+#if DEBUG
+		    if (debug > 1) {		/* Dump it to cpp.tmp	*/
+			printf("\n#line %d (%s), %s",
+			    line, file->filename, file->buffer);
+		    }
+#endif
+		    goto newline;		/* process the line	*/
+		}
+		else {
+		    fclose(file->fp);		/* Close finished file	*/
+		    if ((infile = file->parent) != NULL) {
+			/*
+			 * There is an "ungotten" newline in the current
+			 * infile buffer (set there by doinclude() in
+			 * cpp1.c).  Thus, we know that the mainline code
+			 * is skipping over blank lines and will do a
+			 * #line at its convenience.
+			 */
+			wrongline = TRUE;	/* Need a #line now	*/
+		    }
+		}
+	    }
+	    /*
+	     * Free up space used by the (finished) file or macro and
+	     * restart input from the parent file/macro, if any.
+	     */
+	    free(file->filename);		/* Free name and	*/
+	    if (file->progname != NULL)		/* if a #line was seen,	*/
+		free(file->progname);		/* free it, too.	*/
+	    free((char *) file);		/* Free file space	*/
+	    if (infile == NULL)			/* If at end of file	*/
+		return (EOF_CHAR);		/* Return end of file	*/
+	    line = infile->line; 		/* Reset line number	*/
+	    goto get_from_file;			/* Get from the top.	*/
+	}
+	else if (file->fp != NULL) {
+	    /*
+	     * A byte was read from a "real" file.
+	     *
+	     * The macro recursion hacking is a bit messy and
+	     * deserves an explanation:
+	     * To expand a macro, we read a token from an input file.
+	     * The character just after the token is pushed back on
+	     * the input stream.  Thus, the true next byte from the input
+	     * file is signaled by uindex == 0 on entrance, and input
+	     * from a file.  In that case, the macro recursion counter
+	     * is set to zero.  We reach this point only if a character
+	     * was actually read from a real input file.  Not if
+	     * ungotten, and not if read from a macro.
+	     */
+	    recursion = 0;			/* Stop recursive worry	*/
+	}
+	/*
+	 * Common processing for the new character.
+	 */
+	if (c == DEL && file->fp != NULL)	/* Don't allow DEL from	*/
+	    goto newline;			/* a file		*/
+	if (c == '\n')				/* Maintain current	*/
+	    ++line;				/* line counter		*/
+	if (instring)				/* Don't test for	*/
+	    return (c);				/* Comments in strings	*/
+	if (c == '\f' || c == VT)		/* Form feed, vertical	*/
+	    c = ' ';				/* Tab are whitespace	*/
+	if (c != '/')				/* / begins a comment	*/
+	    return (c);				/* Not / so exit.	*/
+	else {
+	    instring = TRUE;			/* So get() won't loop	*/
+	    if ((c = get()) != '*') {		/* Next byte '*'?	*/
+		instring = FALSE;		/* Nope, no comment	*/
+		unget();			/* Push the char. back	*/
+		return ('/');			/* Return the slash	*/
+	    }
+	    for (;;) {				/* Eat a comment	*/
+		c = get();
+test:		switch (c) {
+		case EOF_CHAR:
+		    cerror("EOF in comment", NULLST);
+		    return (EOF_CHAR);
+
+		case '/':
+		    if ((c = get()) != '*')	/* Don't let comments	*/
+			break;			/* Nest.		*/
+		    cwarn("Nested comments", NULLST);
+						/* Fall into * stuff	*/
+
+		case '*':
+		    if ((c = get()) != '/')	/* If comment doesn't	*/
+			goto test;		/* end, look at next	*/
+		    instring = FALSE;		/* End of comment,	*/
+#if COMMENT_INVISIBLE
+		    return (COM_SPACE);		/* Syntactic space	*/
+#else
+		    return (' ');		/* Real space		*/
+#endif
+
+		case '\n':			/* we'll need a #line	*/
+		    wrongline = TRUE;		/* later...		*/
+		default:			/* Anything else is	*/
+		    break;			/* Just a character	*/
+		}				/* End switch		*/
+	    }					/* End comment loop	*/
+	}					/* End if in comment	*/
+}
+
+unget()
+/*
+ * Backup the pointer to reread the last character.  Fatal error
+ * (code bug) if we backup too far.  unget() may be called,
+ * without problems, at end of file.
+ */
+{
+	register FILEINFO	*file;
+
+	if ((file = infile) == NULL)
+	    return;			/* Unget after EOF		*/
+	if (--file->bptr < file->buffer)
+	    cfatal("Too much pushback", NULLST);
+	if (*file->bptr == '\n')	/* Ungetting a newline?		*/
+	    --line;			/* Unget the line number, too	*/
+}
+
+#if COMMENT_INVISIBLE
+int
+cget()
+/*
+ * Get one character, absorb "funny space" after comments.
+ */
+{
+	register int	c;
+
+	do {
+	    c = get();
+	} while (c == COM_SPACE);
+	return (c);
+}
+#endif
+
+/*
+ * Error messages and other hacks.  The first byte of severity
+ * is 'S' for string arguments and 'I' for int arguments.  This
+ * is needed for portability with machines that have int's that
+ * are shorter than  char *'s.
+ */
+
+static
+domsg(severity, format, arg)
+char		*severity;		/* "Error", "Warning", "Fatal"	*/
+char		*format;		/* Format for the error message	*/
+char		*arg;			/* Something for the message	*/
+/*
+ * Print filenames, macro names, and line numbers for error messages.
+ */
+{
+	register char		*tp;
+	register FILEINFO	*file;
+	char			buf[80];
+
+#ifdef	MSG_PREFIX
+	fputs(MSG_PREFIX, stderr);
+#endif
+	if (*severity++ == 'S')
+	    sprintf(buf, format, arg);
+	else
+	    sprintf(buf, format, (int) arg);
+	fprintf(stderr, "line %d, %s: %s.\n", line, severity, buf);
+	if ((file = infile) == NULL)
+	    return;				/* At end of file	*/
+	if (file->fp != NULL) {
+	    tp = file->buffer;			/* Print current file	*/
+	    fprintf(stderr, "%s", tp);		/* name, making sure	*/
+	    if (tp[strlen(tp) - 1] != '\n')	/* there's a newline	*/
+		putc('\n', stderr);
+	}
+	while ((file = file->parent) != NULL) {	/* Print #includes, too	*/
+	    if (file->fp == NULL)
+		fprintf(stderr, "from macro %s\n", file->filename);
+	    else {
+		tp = file->buffer;
+		fprintf(stderr, "from file %s, line %d:\n%s",
+		    (file->progname != NULL)
+			? file->progname : file->filename,
+		    file->line, tp);
+		if (tp[strlen(tp) - 1] != '\n')
+		    putc('\n', stderr);
+	    }
+	}
+}
+
+int
+cerror(format, sarg)
+char		*format;
+char		*sarg;		/* Single string argument		*/
+/*
+ * Print a normal error message -- return zero to simplify #if evaluator
+ */
+{
+	domsg("SError", format, sarg);
+	errors++;
+	return (0);			/* For expression parser	*/
+}
+
+int
+cierror(format, narg)
+char		*format;
+int		narg;		/* Single numeric argument		*/
+/*
+ * Print a normal error message -- return zero to simplify #if evaluator
+ */
+{
+	domsg("IError", format, (char *) narg);
+	errors++;
+	return (0);			/* For expression parser	*/
+}
+
+cfatal(format, sarg)
+char		*format;
+char		*sarg;			/* Single string argument	*/
+/*
+ * A real disaster
+ */
+{
+	domsg("SFatal error", format, sarg);
+	exit(IO_ERROR);
+}
+
+cwarn(format, sarg)
+char		*format;
+char		*sarg;			/* Single string argument	*/
+/*
+ * A non-fatal error
+ */
+{
+	domsg("SWarning", format, sarg);
+}
+
+ciwarn(format, narg)
+char		*format;
+int		narg;			/* Single string argument	*/
+/*
+ * A non-fatal error
+ */
+{
+	domsg("IWarning", format, (char *) narg);
+}
+
+

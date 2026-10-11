@@ -1,0 +1,383 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,3b90154567202c8e,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-03-12 08:09:04 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site mnetor.UUCP
+Path: utzoo!utcs!mnetor!clewis
+From: clewis@mnetor.UUCP
+Newsgroups: net.sources
+Subject: Reversal filter for HP laserjet printers
+Message-ID: <294@mnetor.UUCP>
+Date: Tue, 12-Mar-85 11:09:04 EST
+Article-I.D.: mnetor.294
+Posted: Tue Mar 12 11:09:04 1985
+Date-Received: Tue, 12-Mar-85 12:54:17 EST
+Organization: Computer X (CANADA) Ltd., Toronto, Ontario, Canada
+Lines: 363
+
+I noticed a few days ago that several people were running into the
+annoyance that the laserjet creates an output bin of backwards
+printout.  Some people are using special rearrangements of the
+output bin to cause the pages to flip over when printing (ugh).
+I have written an lp (att line printer spooler) filter that 
+reverses the order of pages.  Basically, it reads standard input
+writes the output to a temp file, remembering where the start of
+each page was.  Then, it rereads the temp file in reverse-page-order
+(using seeks) to write the file to stdout.  In addition, the filter 
+provides the capability to place arbitrary HP control sequences 
+at the beginning of each page (lines starting with \001).  The 
+filter shell (the second part of this shar file) gives an example of
+how it can be used.  The filter shell was not written by me (I
+don't know where it came from, I suspect netnews).  I have
+modified it extensively from the orignal to support the new filter
+(and next paragraph).  The filter supports landscape mode too 
+(A font cartridge).
+
+The filter shell also solves another grievance I'm sure that some
+people are having - page height.  By default, the laser uses
+the standard 6 lines per inch, but since the laser uses 1/2 inch
+on all margins, you only get 60 lines per page.  The filter shell
+issues appropriate top-of-page commands to change the line
+spacing so that (even in landscape mode) you get precisely 66
+lines per page.
+
+Please let me know if you find any bugs.
+
+Note: the banner page is always right-side-up in 66 lines per page
+mode.  Subsequent pages can be anything you want.
+
+Note: this is in production on a Pyramid, System V universe and on
+a VME10 running UNIX V/68.
+
+#!/bin/sh
+echo 'Start of pack.out, part 01 of 01:'
+echo 'x - laserfilter.c'
+sed 's/^X//' > laserfilter.c << '/'
+X/*
+X	Laser filter - reverses page order.  Takes standard
+X	input and reverses page order to place on standard output.
+X	Any line beginning with a ^A denotes a control sequence
+X	to be emitted at the beginning of each subsequent page.
+X	-t gives debugging output.
+X
+X*/
+Xstatic char SrcId[] = "%Z% %M%:%I%";
+X#include <stdio.h>
+X#include <string.h>
+X
+X#define	FF	0x0c
+X#define	PAGCONT	001
+X#define	LPERPAG	66	/* change if you fiddle around with page lengths */
+X#define	MAXLEN	5120	/* maximum line length */
+Xtypedef struct	line_desc {
+X	long	ld_offset;
+X	char	*ld_pagcntrl;
+X	long	ld_count;
+X	struct	line_desc *ld_prev;
+X} LD;
+X
+Xchar *Progname;
+X
+XLD *last = NULL;
+Xchar	buf[MAXLEN];
+X
+XLD *LDalloc();
+X
+Xmain(argc, argv)
+Xint	argc;
+Xchar	**argv; {
+X	FILE *f;
+X	register LD *p;
+X	register long offset;
+X	register short recvd;
+X	register int lines_pg = LPERPAG;
+X	register char	*ffp;
+X	char	*oldpagcntrl = NULL;
+X	char *pagehdr = NULL;
+X	char *malloc();
+X	int debugFlag = 0;
+X	Progname = argv[0];
+X	if (argc >= 2 && strcmp(argv[1], "-t") == 0) {
+X		argv++;
+X		argc--;
+X		debugFlag = 1;
+X	}
+X	strcpy(buf, "");
+X	f = tmpfile();
+X	offset = 0;
+X	recvd = fgets(buf, sizeof(buf), stdin) != 0;
+X	p = LDalloc();
+X	while(recvd && buf[0]) {
+X		ffp = NULL;
+X		/* if the line is a page control line ... */
+X		if (buf[0] == PAGCONT) {
+X			int ctrllen;
+X			ctrllen = strlen(buf);
+X			if (buf[ctrllen-1] == '\n') buf[ctrllen-1] = '\0';
+X			/* remember page control for this and subsequent
+X			   pages */
+X			p->ld_pagcntrl = malloc(ctrllen);
+X			if (!p->ld_pagcntrl) {
+X				fprintf(stderr, "Could not allocate control\n");
+X				exit(1);
+X			}
+X			strcpy(p->ld_pagcntrl, buf+1);
+X			oldpagcntrl = p->ld_pagcntrl;
+X			goto nextline; /* sorry! */
+X		}
+X		if ((ffp = strchr(buf, FF)) || p->ld_count == lines_pg) {
+X			p = LDalloc();
+X			p->ld_pagcntrl = oldpagcntrl;
+X			/* if (ffp) => we found a FF.  We break the line
+X			   into two parts:
+X				1) before the FF - if any, we write it out
+X				   terminated with a new-line and increment
+X				   previous page's line count.
+X				2) after the FF: copy it into "buf" and
+X				   do this whole thing again.
+X			   Note: the FF is deleted, and explicitly emitted
+X				 during output phase */
+X			if (ffp) {
+X				register char *cp = buf;
+X
+X				/* calculate offset of first character past
+X				   FF in output file - beginning of new page */
+X				offset = p->ld_offset = offset + ffp - buf;
+X
+X				/* copy out first part of line, if any */
+X				while(cp < ffp) fputc(*cp++, f);
+X				
+X				/* if there was something before the
+X				   FF, increment count of previous page and
+X				   output a newline to terminate reread.
+X				   update both cur-page and total offset
+X				   to reflect the fact that we added a char.
+X				*/
+X				if (ffp != buf) {
+X					p->ld_prev->ld_count++;
+X					fputc('\n', f);
+X					offset++;
+X					p->ld_offset++;
+X				}
+X
+X				/* copy the tail of the buffer over and
+X				   do this all again */
+X				strcpy(buf, ffp+1);
+X				continue;
+X			} else {
+X				p->ld_offset = offset;
+X				p->ld_count = 1;
+X			}
+X		} else
+X				p->ld_count++;
+X		offset += strlen(buf);
+X		fputs(buf, f);
+X	    nextline:
+X		recvd = fgets(buf, sizeof(buf), stdin) != 0;
+X	}
+X	while(p) {
+X		register int len = p->ld_count;
+X		fseek(f, p->ld_offset, 0);
+X		if (p->ld_count == 0)
+X			goto skipit;
+X		if (debugFlag) {
+X			printf("offset: %ld count: %ld\n", p->ld_offset,
+X				p->ld_count);
+X			if (p->ld_pagcntrl)
+X				printf("control: %s\n", p->ld_pagcntrl);
+X		}
+X		if (len > 0 && p->ld_pagcntrl)
+X			fputs(p->ld_pagcntrl, stdout);
+X		while (--len >= 0) {
+X			fgets(buf, sizeof(buf), f);
+X			fputs(buf, stdout);
+X			if (debugFlag)
+X				break;
+X		}
+X		if (p->ld_count < lines_pg)
+X			putc(FF, stdout);
+X	    skipit:
+X		p = p->ld_prev;
+X	}
+X	exit(0);
+X}
+X
+XLD *
+XLDalloc() {
+X	register LD *p;
+X	extern char *malloc();
+X	p = (LD *) malloc(sizeof(LD));
+X	if (!p) {
+X		fprintf("%s: cannot allocate memory\n", Progname);
+X		exit(1);
+X	}
+X	if (last == NULL) {
+X		last = p;
+X		p->ld_prev = NULL;
+X	} else {
+X		p->ld_prev = last;
+X		last = p;
+X	}
+X	p->ld_pagcntrl = NULL;
+X	p->ld_offset = 0;
+X	p->ld_count = 0;
+X	return(p);
+X}
+X
+/
+echo 'x - laserjet'
+sed 's/^X//' > laserjet << '/'
+X# lp interface for hp 2686A laserjet printer
+X#
+X#	Modified for use with reversal filter by:
+X#		Chris Lewis, Mar 12, 1985
+X#
+X#       If the filter is not executable, then this interface will disable
+X#       the lp printer which it was called to service.
+X#
+X#       The following options are recognized:
+X#       -f      Use the 450 filter.
+X#       -b      Don't print a banner page.
+X#       -c      Use compressed print.
+X#       -e      Use expanded print.
+X#       -l      Use landscape instead of portrait mode.
+X#	-p	Don't do any filtration/settings
+X#
+X
+Xx="XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+Xprinter=`basename $0`
+Xfilter=/usr/lib/laserfilter
+Xbanner=on
+Xexpand=off
+Xcompress=off
+Xlandscape=off
+Xreverse=on
+Xfor i in $5
+Xdo
+Xcase "$i" in
+X	b | -b) banner=off
+X		;;
+X	c | -c) compress=on
+X		;;
+X	e | -e) expand=on
+X		;;
+X	f | -f)	filter=/usr/bin/450
+X		reverse=off
+X		;;
+X	l | -l) landscape=on
+X		;;
+X	p | -p) filter=/bin/cat
+X		reverse=off
+X		;;
+Xesac
+Xdone
+Xif [ -n "$filter" -a ! -x $filter ]
+Xthen
+X        disable -r"can't execute $filter filter" $printer
+X        exit 1
+Xfi
+Xstty 9600 -tabs -parenb -cstopb cs8 istrip cread opost onlcr ixon -ixany ff0 cr0 nl0 0<&1
+X
+Xtabs -0
+X(
+Xif [ "$reverse" = "on" ]
+Xthen
+X	echo "\001\c"               # issue filter command
+Xfi
+Xecho "\033E\c"                      # Reset printer
+Xecho "\033&l66P\c"                  # Page length of 66 lines
+Xecho "\033&l2E\c"                   # Top margin of 2 lines
+Xecho "\033&l7.6C\c"                 # Vertical motion index of 7.6
+Xecho "\033&l66F\c"                  # Text length of 66 lines
+Xif [ "$reverse" = "on" ]
+Xthen
+X	echo                        # terminate filter command
+Xfi
+Xif [ "$banner" = "on" ]
+Xthen
+X	echo "$x\n$x\n$x\n$x\n"
+X	banner "$2"
+X	echo "\n"
+X	user=`grep "^$2:" /etc/passwd | line | cut -d: -f5`
+X	if [ -n "$user" ]
+X	then
+X		echo "User: $user\n"
+X	else
+X		echo "\n"
+X	fi
+X	echo "Request id: $1    Printer: $printer\n"
+X	date
+X	echo "\n"
+X	if [ -n "$3" ]
+X	then
+X		banner $3
+X	fi
+X	echo "\014\c"
+Xfi
+Xif [ "$reverse" = "on" -a "${landscape}${compress}${expand}" != "offoffoff" ]
+Xthen
+X	echo "\001\c"            # Turn on filter page control
+X	echo "\033E\c"           # Reset printer
+Xfi
+Xif [ "$landscape" = "on" ]
+Xthen
+X	echo "\033&l1O\c"        # Turn on landscape mode
+X#	Set up page
+X	echo "\033&l66P\c"       # Page length of 66 lines
+X	echo "\033&l2E\c"        # Top margin of 2 lines
+X	echo "\033&l5.4545C\c"   # Vertical motion index of 5.4545
+X	echo "\033&l66F\c"       # Text length of 66 lines
+X#	Select font:
+X	echo "\033(8U\c"         # Roman-8
+X	echo "\033(s0p16.66h8.5v0s-1b0T\c" 
+X                                 # Previous gobbledegook was:
+X                                 # Primary font fixed spacing (s0p)
+X                                 # 16.66 pitch (16.66h)
+X                                 # 8.5/72" vertical spacing (8.5v)
+X                                 # "light -1" (-1b)
+X                                 # lineprinter (0T)
+Xfi
+Xif [ "$expand" = "on" ]
+Xthen
+X	echo "\033(5H\c"
+Xfi
+Xif [ "$compress" = "on" ]
+Xthen
+X	echo "\033(16H\c"
+Xfi
+Xif [ "$reverse" = "on" -a "${landscape}${compress}${expand}" != "offoffoff" ]
+Xthen
+X	echo                     # Turn off filter page control
+Xfi
+Xcopies=$4
+Xshift; shift; shift; shift; shift
+Xfiles="$*"
+Xi=1
+Xwhile [ $i -le $copies ]
+Xdo
+X        for file in $files
+X        do
+X                cat "$file" 2>&1
+X		echo '\014\c'
+X        done
+X        i=`expr $i + 1`
+Xdone
+X) | $filter
+Xerrcode=$?
+Xif [ $errcode -ne 0 ]
+Xthen
+X        disable -r"error code $errcode from $filter filter" $printer
+X        exit 1
+Xfi
+Xexit 0
+/
+echo 'Part 01 of pack.out complete.'
+exit
+-- 
+Chris Lewis, Motorola New Enterprises
+SNail: 560 Dennison, Unit 9, Markham, Ontario, Canada, L3R 2M8
+UUCP: {allegra, linus, ihnp4}!utzoo!utcs!mnetor!clewis
+BELL: (416)-475-1300 ext. 321
+
+

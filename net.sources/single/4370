@@ -1,0 +1,290 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,38e0d0239b3fc48,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-04-28 20:04:49 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site dataioDataio.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!bellcore!decvax!tektronix!uw-beaver!uw-june!entropy!dataio!bjorn
+From: bjorn@dataioDataio.UUCP (Bjorn Benson)
+Newsgroups: net.sources
+Subject: Solution to "oops, corrupted memory again!"
+Message-ID: <975@dataioDataio.UUCP>
+Date: Mon, 28-Apr-86 23:04:49 EDT
+Article-I.D.: dataioDa.975
+Posted: Mon Apr 28 23:04:49 1986
+Date-Received: Sat, 3-May-86 18:23:12 EDT
+References: <4495@cbrma.UUCP>
+Organization: Data I/O Corp., Redmond WA
+Lines: 268
+Keywords: malloc free stack tools core memory
+
+[This posting refers to an article entitled "oops, corrupted memory
+again!" in net.lang.c.  I am posting it here because it is source.]
+
+My tool for approaching this problem is to build another level of data 
+abstraction on top of malloc() and free() that implements some checking.  
+This does a number of things for you:
+	- Checks for overruns and underruns on allocated data
+	- Keeps track of where in the program the memory was malloc'ed
+	- Reports on pieces of memory that were not free'ed
+	- Records some statistics such as maximum memory used
+	- Marks newly malloc'ed and newly free'ed memory with special values
+You can use this scheme to:
+	- Find bugs such as overrun, underrun, etc because you know where 
+	  a piece of data was malloc'ed and where it was free'ed
+	- Find bugs where memory was not free'ed
+	- Find bugs where newly malloc'ed memory is used without initializing
+	- Find bugs where newly free'ed memory is still used
+	- Determine how much memory your program really uses
+	- and other things
+To implement my scheme you must have a C compiler that has __LINE__ and
+__FILE__ macros.  If your compiler doesn't have these then (a) buy another:
+compilers that do are available on UNIX 4.2bsd based systems and the PC,
+and probably on other machines; or (b) change my scheme somehow.  I have
+recomendations on both these points if you would like them (e-mail please).
+
+There are 3 functions in my package:
+	char *NEW( uSize )	Allocate memory of uSize bytes
+				(equivalent to malloc())
+	FREE( pPtr )		Free memory allocated by NEW
+				(equivalent to free())
+	TERMINATE()		End system, report errors and stats
+I personally use two more functions, but have not included them here:
+	char *STRSAVE( sPtr )	Save a copy of the string in dynamic memory
+	char *RENEW( pPtr, uSize )
+				(equivalent to realloc())
+
+--------------------------HEADER-FILE---------------------------
+/*
+ * Memory sub-system, written by Bjorn Benson
+ */
+extern char *_new();
+#define	NEW(SZ)		_new( SZ, __FILE__, __LINE__ )
+#define	FREE(PTR)	_free( PTR, __FILE__, __LINE__ )
+
+-------------------------C-SOURCE-FILE-------------------------
+/*
+ * Memory sub-system, written by Bjorn Benson
+ */
+#include <stdio.h>
+
+typedef	unsigned uns;	/* Shorthand */
+
+struct REMEMBER_INTERNAL {
+	struct REMEMBER *_pNext;	/* Linked list of structures	   */
+	struct REMEMBER *_pPrev;	/* Other link			   */
+	char	*_sFileName;		/* File in which memory was new'ed */
+	uns	 _uLineNum;		/* Line number is above file	   */
+	uns	 _uDataSize;		/* Size requested		   */
+	uns	 _lSpecialValue;	/* Underrun marker value	   */
+	};
+struct REMEMBER {
+	struct REMEMBER_INTERNAL tInt;
+	char	 aData[1];
+	};
+#define	pNext		tInt._pNext
+#define	pPrev		tInt._pPrev
+#define	sFileName	tInt._sFileName
+#define	uLineNum	tInt._uLineNum
+#define	uDataSize	tInt._uDataSize
+#define	lSpecialValue	tInt._lSpecialValue
+
+static long lCurMemory = 0;	/* Current memory usage			*/
+static long lMaxMemory = 0;	/* Maximum memory usage			*/
+				/* Note: both these refer to the NEW'ed	*/
+				/*       data only.  They do not include*/
+				/*       malloc() roundoff or the extra	*/
+				/*       space required by the REMEMBER	*/
+				/*       structures.			*/
+static uns cNewCount = 0;	/* Number of times NEW() was called	*/
+
+static struct REMEMBER *pRememberRoot = NULL;
+			/* Root of the linked list of REMEMBERs	*/
+
+#define	ALLOC_VAL	0xA5	/* NEW'ed memory is filled with this	*/
+				/* value so that references to it will	*/
+				/* end up being very strange.		*/
+#define	FREE_VAL	0x8F	/* FREE'ed memory is filled with this	*/
+				/* value so that references to it will	*/
+				/* also end up being strange.		*/
+
+#define	MAGICKEY	0x14235296	/* A magic value for underrun key */
+#define	MAGICEND0	0x68		/* Magic values for overrun keys  */
+#define	MAGICEND1	0x34		/*		"		  */
+#define	MAGICEND2	0x7A		/*              "		  */
+#define	MAGICEND3	0x15		/*		"		  */
+			/* Warning: do not change the MAGICEND? values to */
+			/* something with the high bit set.  Various C    */
+			/* compilers (like the 4.2bsd one) do not do the  */
+			/* sign extension right later on in this code and */
+			/* you will get erroneous errors.		  */
+
+/*
+ * _new( uns uSize, char *sFile, uns uLine ) : char*
+ *	Allocate some memory.
+ */
+char *_new( uSize, sFile, uLine )
+uns uSize,uLine;
+char *sFile;
+{
+	extern char *malloc();
+	struct REMEMBER *pTmp;
+	char *pPtr;
+
+	/* Allocate the physical memory */
+	pTmp = (struct REMEMBER *) malloc(
+			  sizeof(struct REMEMBER_INTERNAL) /* REMEMBER data  */
+			+ uSize				   /* size requested */
+			+ 4				   /* overrun mark   */
+		);
+
+	/* Check if there isn't anymore memory avaiable */
+	if( pTmp == NULL )
+	{
+		fprintf(stderr,"Out of memory at line %d, \"%s\"\n",
+			uLine, sFile );
+		fprintf(stderr,"\t(memory in use: %ld bytes (%ldk))\n",
+			lMaxMemory, (lMaxMemory + 1023L)/1024L );
+		exit(1);
+	}
+
+	/* Fill up the structure */
+	pTmp->lSpecialValue	= MAGICKEY;
+	pTmp->aData[uSize+0]	= MAGICEND0;
+	pTmp->aData[uSize+1]	= MAGICEND1;
+	pTmp->aData[uSize+2]	= MAGICEND2;
+	pTmp->aData[uSize+3]	= MAGICEND3;
+	pTmp->sFileName		= sFile;
+	pTmp->uLineNum  	= uLine;
+	pTmp->uDataSize		= uSize;
+	pTmp->pNext		= pRememberRoot;
+	pTmp->pPrev		= NULL;
+
+	/* Add this REMEMBER structure to the linked list */
+	if( pRememberRoot )
+		pRememberRoot->pPrev = pTmp;
+	pRememberRoot = pTmp;
+
+	/* Keep the statistics */
+	lCurMemory += uSize;
+	if( lCurMemory > lMaxMemory )
+		lMaxMemory = lCurMemory;
+	cNewCount++;
+
+	/* Set the memory to the aribtrary wierd value */
+	for( pPtr = &pTmp->aData[uSize]; pPtr > &pTmp->aData[0]; )
+		*(--pPtr) = ALLOC_VAL;
+
+	/* Return a pointer to the real data */
+	return( &(pTmp->aData[0]) );
+}
+
+/*
+ * _free( char *pPtr, char *sFile, uns uLine )
+ *	Deallocate some memory.
+ */
+_free( pPtr, sFile, uLine )
+char *pPtr,*sFile;
+uns uLine;
+{
+	struct REMEMBER *pRec;
+	char *pTmp;
+	uns uSize;
+
+	/* Check if we have a non-null pointer */
+	if( pPtr == NULL )
+	{
+		fprintf(stderr,"Freeing NULL pointer at line %d, \"%s\"\n",
+			uLine, sFile );
+		return;
+	}
+
+	/* Calculate the address of the REMEMBER structure */
+	pRec = (struct REMEMBER *)( pPtr - 
+			(sizeof(struct REMEMBER_INTERNAL)) );
+
+	/* Check to make sure that we have a real REMEMBER structure */
+	/* Note: this test could fail for four reasons: */
+	/*  (1) The memory was already free'ed		*/
+	/*  (2) The memory was never new'ed		*/
+	/*  (3) There was an underrun			*/
+	/*  (4) A stray pointer hit this location	*/
+	/*						*/
+	if( pRec->lSpecialValue != MAGICKEY )
+	{
+		fprintf(stderr,"Freeing unallocated data at line %d, \"%s\"\n",
+			uLine, sFile );
+		return;
+	}
+
+	/* Check for an overrun */
+	uSize = pRec->uDataSize;
+	if( pRec->aData[uSize+0] != MAGICEND0
+	 || pRec->aData[uSize+1] != MAGICEND1
+	 || pRec->aData[uSize+2] != MAGICEND2
+	 || pRec->aData[uSize+3] != MAGICEND3 )
+	{
+		fprintf(stderr,"Memory being free'ed at line %d, \"%s\" \
+was overrun\n", uLine, sFile );
+		fprintf(stderr,"\t(allocated at line %d, \"%s\")\n",
+			pRec->uLineNum, pRec->sFileName );
+		return;
+	}
+
+	/* Remove this structure from the linked list */
+	if( pRec->pPrev )
+		pRec->pPrev->pNext = pRec->pNext;
+	else
+		pRememberRoot = pRec->pNext;
+	if( pRec->pNext )
+		pRec->pNext->pPrev = pRec->pPrev;
+
+	/* Mark this data as free'ed */
+	for (pTmp = &pRec->aData[pRec->uDataSize]; pTmp > &pRec->aData[0] ; )
+	    *(--pTmp) = FREE_VAL;
+	pRec->lSpecialValue = ~MAGICKEY;
+
+	/* Handle the statistics */
+	lCurMemory -= pRec->uDataSize;
+	cNewCount--;
+
+	/* Actually free the memory */
+	free( (char*)pRec );
+}
+
+/*
+ * TERMINATE()
+ *	Report on all the memory pieces that have not been
+ *	free'ed as well as the statistics.
+ */
+TERMINATE()
+{
+	struct REMEMBER *pPtr;
+
+	/* Report the difference between number of calls to	*/
+	/* NEW and the number of calls to FREE.  >0 means more	*/
+	/* NEWs than FREEs.  <0, etc.				*/
+	if( cNewCount )
+		fprintf(stderr,"cNewCount: %d\n", cNewCount );
+
+	/* Report on all the memory that was allocated with NEW	*/
+	/* but not free'ed with FREE.				*/
+	if( pRememberRoot != NULL )
+		fprintf(stderr, "Memory that was not free'ed:\n");
+	pPtr = pRememberRoot;
+	while( pPtr )
+	{
+		fprintf(stderr,"\t%5d bytes at 0x%06x, \
+allocated at line %3d in \"%s\"\n",
+			pPtr->uDataSize, &(pPtr->aData[0]),
+			pPtr->uLineNum,    pPtr->sFileName
+		);
+		pPtr = pPtr->pNext;
+	}
+
+	/* Report the memory usage statistics */
+	fprintf(stderr,"Maximum memory usage: %ld bytes (%ldk)\n",
+		lMaxMemory, (lMaxMemory + 1023L)/1024L	);
+}
+
+

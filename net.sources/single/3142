@@ -1,0 +1,2539 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,a37c9ce8a1308f56,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-08-11 16:59:38 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site cmu-cs-unh.ARPA
+Path: utzoo!linus!philabs!cmcl2!seismo!rochester!cmu-cs-pt!cmu-cs-unh!agn
+From: agn@cmu-cs-unh.ARPA (Andreas Nowatzyk)
+Newsgroups: net.sources
+Subject: PCB part 7 of 10
+Message-ID: <209@cmu-cs-unh.ARPA>
+Date: Sun, 11-Aug-85 19:59:38 EDT
+Article-I.D.: cmu-cs-u.209
+Posted: Sun Aug 11 19:59:38 1985
+Date-Received: Wed, 14-Aug-85 03:18:38 EDT
+Organization: Carnegie-Mellon University, CS/RI
+Lines: 2519
+
+#
+# type    sh /usru0/agn/pcb/distr/../usenet/part7   to unpack this archive.
+#
+echo extracting pmnrt.c...
+cat >pmnrt.c <<'!E!O!F!'
+/***************************************************************\
+*								*
+*	PCB program						*
+*								*
+*	Manual routing functions				*
+*								*
+*	(c) 1985		A. Nowatzyk			*
+*								*
+\***************************************************************/
+
+#include "pparm.h"
+#include "pcdst.h"
+
+#define maxtrc 200		/* number of items in trace buf	 */
+#define sactrc 10		/* items lost on overflow	 */
+
+extern double atan2();
+extern struct nlhd *choose(), *get_net();
+
+static plow_f = 0;		/* plow flag			 */
+static int trc_cnt = 0;		/* trace counter		 */
+static struct trace {		/* trace buffer (for delete last)*/
+    int x, y;			/* coordinate			 */
+    int ty;			/* type (hole, side)		 */
+} trc_buf[maxtrc];
+
+static int sof_seg = 0;		/* color of first segment	 */
+
+extern int sp[9][2];		/* search pattern		 */
+
+/*ARGSUSED*/
+net_sel (ctx)			/* select a net for routing	 */
+    int ctx;
+{
+    struct nlhd *t;
+
+    if (!placed) {		/* routing only after placement	 */
+	if (V.cnet)
+	    deseln (V.cnet);	/* should not happen		 */
+	if (ck_placed ())
+	    placed = 1;		/* everything is placed		 */
+	else
+	    return PLACE;
+    }
+
+    if (V.cnet) { 		/* we are within a net		 */
+	if (!(V.cnet -> f))
+	    return (START);	/* continue on selected net	 */
+	else
+	    deseln (V.cnet);
+    }
+
+    while (t = choose ()) {/* found a net to work on	 */
+	if (!selnet (t)) {
+            adjw (V.cnet);
+	    err_msg (t -> name);
+	    return (START);
+	}
+	deseln (t);		/* skip complete nets		 */
+    }
+    return (EDIT);		/* no nets found		 */
+}
+
+net_desel (ctx)			/* deselect a net		 */
+    int ctx;
+/******************************************************************\
+* 								   *
+*  Eficiency hack: to avoid a deselec/select cycle for incomplete  *
+*  nets, those net remain selected if the next context is START.   *
+* 								   *
+\******************************************************************/
+{   int i;
+    static int svcnt = 0;	/* auto save counter		 */
+
+    plow_f = 0;
+
+    if (ctx == ROUTE || ctx == PLOW)	/* don't deselect to enter R-cntx*/
+	return;
+
+    if (V.cnet) {
+	i = cchk (V.cnet);	/* update net state		 */
+	nettgo -= i ^ V.cnet -> f;
+	V.cnet -> f = i;
+	nets_msg (nettgo);
+
+	if (V.cnet -> f) {	/* completed net ?		 */
+	    if (++svcnt > savcnt) {	/* time to auto save ?	 */
+		svcnt = 0;
+		Ferr_msg ("Busy: saving work");
+		save (0);
+		beep ();
+		err_msg ("Done!");
+	    }
+	}
+
+	if (V.cnet -> f || ctx != START) {
+	    deseln (V.cnet);	/* time to drop the net		 */
+	}
+    }
+}
+
+/*ARGSUSED*/
+start_nt (x, y, ctx)		/* start a copper trace		 */
+    int x, y, ctx;
+/*****************************************************************\
+* 								  *
+*  This function tries to find a start point for a copper trace:  *
+*    1. if the cursor is near a hole and the hole is part of an	  *
+*       unconnected net, the hole is selected as a start.	  *
+*    2. if the cursor is near a trace of an unfinished net, the	  *
+*       nearest point of that trace is used as an start point.	  *
+*       this might fail due to lack of space for a via hole.	  *
+*    3. If everything fails, the preview map is displayed.	  *
+* 								  *
+\*****************************************************************/
+{
+    struct nlhd *p, *loc (), *fly ();
+    char buf[40 + nmmax];
+
+    sof_seg = 0;		/* reset first color		 */
+
+    if (plow_f && trc_buf[0].x == x && trc_buf[0].y == y &&
+	!(pcb[y][x] & ahb)) {
+	plow_f = 0;
+	plow_ini (PLOW);
+	return plow_src (x, y, PLOW);
+    }
+
+    if (V.cnet -> f)		/* deselect a complted net	 */
+	deseln (V.cnet);
+
+    p = loc (&x, &y);		/* try start from hole		 */
+
+    if (!p)
+	p = fly (&x, &y);	/* failed, try a wire		 */
+
+    if (!V.cnet) {		/* no net			 */
+	if (p && !(p -> f))
+	    selnet (p);
+	else if (!p) {		/* p != 0 is taken care of later */
+	    plow_f = 0;
+	    return (net_sel (0));
+	}
+    }
+
+    if (!p)	 {		/* start failed			 */
+	plow_f = 0;
+	prev (V.cnet, x, y);	/* display preview map		 */
+	return (START);}
+    else if (p -> f) {		/* net is already done		 */
+	plow_f = 1;
+	trc_buf[0].x = x;
+	trc_buf[0].y = y;
+	sprintf (buf, "Net (%s): done!", p -> name);
+	err_msg (buf);
+	if (V.cnet)
+	    deseln (V.cnet);
+	selnet (p);
+	return (START);}
+    else {			/* start ok: save start point	 */
+	plow_f = 0;
+	err_msg (p -> name);
+	trc_buf[0].x = x;
+	trc_buf[0].y = y;
+	trc_buf[0].ty = (pcb[y][x] & ahb) ? vec :
+			((~pcb[y][x] & vec) ? pcb[y][x] & vec : s1b);
+	trc_cnt = 1;
+    }
+
+    if (p != V.cnet) {		/* started on unselected net	 */
+	deseln (V.cnet);	/* drop current net		 */
+	if (selnet (p)) {	/* trouble: net is done		 */
+	    deseln (p);
+	    return (net_sel (0));
+	}
+    }
+
+    return (ROUTE);
+}
+
+struct nlhd *fly (x, y)		/* try flying start		 */
+    int *x, *y;
+{
+    int     i;
+
+    for (i = 0; i < 9; ++i)	/* look for a selected wire	 */
+	if ((pcb[*y + sp[i][1]][*x + sp[i][0]] & vec) &&
+	    (pcb[*y + sp[i][1]][*x + sp[i][0]] & selb)) {
+		*x += sp[i][0];
+		*y += sp[i][1];
+		return (V.cnet);
+	    }
+
+    for (i = 0; i < 9; ++i)	/* look for any wire		 */
+	if (pcb[*y + sp[i][1]][*x + sp[i][0]] & vec) {
+		*x += sp[i][0];
+		*y += sp[i][1];
+		if (~pcb[*y][*x] & vec)
+		    return get_net (*x, *y, vec);
+		else
+		    return get_net (*x, *y, top_side);
+	    }
+
+    return (nil);		/* not close to wire		 */
+}
+
+struct nlhd *loc(x, y)		/* locate net for given pin	 */
+    int *x, *y;
+{
+    int i, j;
+
+    for (i = *x - 1; i < *x + 1; ++i)/* look for holes 		 */
+	for (j = *y - 1; j < *y + 1; ++j)
+	    if (center (&i, &j)) { /* center coordinate		 */
+		*x = i;
+		*y = j;
+		return get_net(i, j, vec);
+	    }
+    return (nil);		/* no hole found		 */
+}
+
+/*ARGSUSED*/
+cont_s1 (x, y, ctx)		/* continue a wire trace	 */
+    int x, y, ctx;
+{
+    return (cont_nt (x, y, s1b));
+}
+
+/*ARGSUSED*/
+cont_s2 (x, y, ctx)		/* continue a wire trace	 */
+    int x, y, ctx;
+{
+    return (cont_nt (x, y, s2b));
+}
+
+cont_nt (x, y, sd)		/* continue a wire trace	 */
+    int x, y, sd;
+{   int     i;
+
+    if ((trc_buf[trc_cnt - 1].x == x) && (trc_buf[trc_cnt - 1].y == y)) {
+	if (trc_cnt == 1 && !(pcb[y][x] & ahb)) {
+	    trc_cnt = 0;
+	    plow_ini (PLOW);
+	    return plow_src (x, y, PLOW);
+	}
+	return (ROUTE);		/* ignore 0-length wires	 */
+    }
+
+    if (trc_cnt == 2)
+	sof_seg = trc_buf[1].ty;
+
+    if (trc_cnt > maxtrc - 3) {	/* sufficient space in buffer	 */
+	for (i = sactrc; i < trc_cnt; i++) {
+	    trc_buf[i - sactrc].x = trc_buf[i].x;
+	    trc_buf[i - sactrc].y = trc_buf[i].y;
+	    trc_buf[i - sactrc].ty = trc_buf[i].ty;
+	}
+	trc_cnt -= sactrc;
+    }
+
+    if (home (x, y, trc_buf[trc_cnt - 1].x, trc_buf[trc_cnt - 1].y,
+	      trc_buf[0].x, trc_buf[0].y, sd, trc_buf[trc_cnt - 1].ty))
+	return (START);		/* successfull home run		 */
+
+    if (sd & ~trc_buf[trc_cnt - 1].ty) {/* need to change sides	 */
+	if (viaalg (sd)) {
+	    err_msg ("No space for a hole");
+	    beep ();
+	    return (ROUTE);
+	}
+	trc_buf[trc_cnt].ty = sd | ishb;}
+    else
+	trc_buf[trc_cnt].ty = sd;
+
+    if (pnt (x, y, sd))		/* add a vector to wire		 */
+	return (START);
+
+    return (ROUTE);
+}
+
+pnt (x_cur, y_cur, si)		/* paint a wire segment		 */
+    int    x_cur, y_cur, si;
+{
+    int     i,
+            j,
+            k,
+            l,			/* random scratch		 */
+            x,
+            y,
+            x1,
+            y1,			/* used for test scan		 */
+	    xo, yo,
+            dx,
+            dy,
+            dxd,
+            dyd;		/* direction vectors		 */
+
+    xo = trc_buf[trc_cnt - 1].x;/* get origin			 */
+    yo = trc_buf[trc_cnt - 1].y;
+    i = (atan2 ((y_cur - yo) * 0.5, (x_cur - xo) * 0.5) + 6.676885) * 1.27324;
+    i = i % 8;			/* chose a direction		 */
+
+    dx = dr[i][0];
+    dy = dr[i][1];
+    color (si | selb, si | selb);
+
+    j = abs (y_cur - yo);
+    k = abs (x_cur - xo);
+    if (i & 1)
+	j = (j < k) ? j : k;	/* run min. length (diag.)	 */
+    else
+	j = dx ? k : j;		/* run axis projection		 */
+
+    x = xo + dx;
+    y = yo + dy;
+    if (i & 1) {		/* diagonal check		 */
+	dxd = (dx - dy) / 2;
+	dyd = (dx + dy) / 2;
+	for (k = 0; k < j; ++k) {/* check for illegal areas	 */
+	    l = pchk1 (x - dy, y + dx, si, &x1, &y1);
+	    if (l & 1)
+		break;
+	    l |= pchk1 (x + dy, y - dx, si, &x1, &y1);
+	    if (l & 1)
+		break;
+	    if (!k && l && !(pcb[y1][x1] & ahb))
+				/* something special		 */
+		l = 0;
+	    l |= pchk1 (x + dx, y + dy, si, &x1, &y1);
+	    if (l & 1)
+		break;
+	    l |= pchk1 (x + dxd, y + dyd, si, &x1, &y1);
+	    if (l & 1)
+		break;
+	    l |= pchk1 (x + dyd, y - dxd, si, &x1, &y1);
+	    if (l & 1)
+		break;
+	    if (l & 2) {
+		l = pchk2 (x, y, x1, y1, i, si);
+		if (l)
+		    break;
+	    }
+	    x += dx;
+	    y += dy;
+	}
+    }
+    else {			/* horizontal / vertical check	 */
+	for (k = 0; k < j; ++k) {/* check for illegal areas	 */
+	    l = pchk1 (x + dx - dy, y + dy + dx, si, &x1, &y1);
+	    if (l & 1)
+		break;
+	    l |= pchk1 (x + dx + dy, y + dy - dx, si, &x1, &y1);
+	    if (l & 1)
+		break;
+	    if (!k && l && !(pcb[y1][x1] & ahb))
+				/* something special		 */
+		l = 0;
+	    l |= pchk1 (x + dx, y + dy, si, &x1, &y1);
+	    if (l & 1)
+		break;
+	    if (l & 2) {
+		l = pchk2 (x, y, x1, y1, i, si);
+		if (l)
+		    break;
+	    }
+	    x += dx;
+	    y += dy;
+	}
+    }
+
+    if (l == 2)			/* an end connection was made	 */
+	return (1);		/* signal success		 */
+    else {
+	x -= dx;		/* correct length		 */
+	y -= dy;
+	plt (xo, yo, x, y);	/* plot new segment		 */
+	trc_buf[trc_cnt].x = x;
+	trc_buf[trc_cnt++].y = y;
+	return (0);
+    }
+}
+
+pchk1 (x, y, b, xs, ys)		/* paint check			 */
+    int     x, y, b, *xs, *ys;
+{
+    int     i;
+/* printf("pchk1: x=%d y=%d b=%2x xs=%d ys=%d\n",x,y,b,*xs,*ys); */
+    i = pcb[y][x];
+    if (!(i & selb))		/* not selected: peace of cake	 */
+	return (0 != (i & (fb | b | ahb)));/* touches other net?	 */
+    *xs = x;
+    *ys = y;
+    return (2);			/* needs more careful examination */
+}
+
+pchk2 (xe, ye, xt, yt, a, b)/* paint check (the same net)	 */
+    int    xe, ye, xt, yt, a, b;
+{
+    register int i;
+
+    i = pcb[yt][xt];
+
+    if (i & b) {		/* touches net on same side: ok  */
+	if (!(pcb[ye][xe] & b) &&
+	    !(~pcb[ye + dr[a][1]][xe + dr[a][0]] & (selb | b))) {
+	    xe += dr[a][0];	/* fill diagonal approach gap	 */
+	    ye += dr[a][1];
+	}
+	plt (trc_buf[trc_cnt - 1].x, trc_buf[trc_cnt - 1].y, xe, ye);
+	return (2);
+    }
+
+    if (i & ahb)		/* hole approach		 */
+	return (pnt_ha (xe, ye, xt, yt, a, b));
+    else	/* remaining case: touches same net on other side*/
+	return (pnt_eha (xe, ye, xt, yt, a, b));
+}
+
+pnt_ha (xe, ye, xt, yt, a, b)
+    int xe, ye, xt, yt, a, b;
+/********************************************************************\
+* 								     *
+*  paint wire: hole approach - a via hole for the same net is found  *
+*  in the paint - scan. A connection between the new wire and	     *
+*  the hole need to be made (this is allways possible). <xe,ye> is   *
+*  the end point of the new wire on side <b> with direction <a>.     *
+*  <xt,yt> is part of the hole (not necessarily the center).	     *
+*  <e> and <t> are one unit apart.				     *
+* 								     *
+*  a 2 is returned if a connection is made. 0 is returned if the     *
+*  hole turns out to be a piece of guard area (pseudo hole).	     *
+* 								     *
+\********************************************************************/
+{
+    register int i;
+
+    if (!center (&xt, &yt))	/* center on hole		 */
+	return 0;
+
+    if ((xt == xe + 2 * dr[a][0]) && (yt == ye + 2 * dr[a][1])) {
+	plt (trc_buf[trc_cnt - 1].x, trc_buf[trc_cnt - 1].y,
+		xe + 2 * dr[a][0], ye + 2 * dr[a][1]);
+	return (2);		/* hole was staight ahead	 */
+    }
+
+    if (a & 1) {		/* diagonal approach		 */
+	if ((abs (xe - xt) >= 2) && (abs (ye - yt)) &&
+		(pcb[ye - yt][xe - dr[a][0]] & b)) {
+	/* this is a wired case		 */
+	    if (abs (yt - (ye - dr[a][1])) > 2)
+		plt (xt, yt, xt, yt - 2 * dr[a][1]);
+	    else
+		plt (xt, yt, xt - 2 * dr[a][0], yt);
+	    plt (trc_buf[trc_cnt - 1].x, trc_buf[trc_cnt - 1].y,
+		    xe -= dr[a][0], ye -= dr[a][1]);
+	    ckgp (xe, ye, b);
+	    return (2);
+	}
+	xe += dr[a][0];
+	ye += dr[a][1];
+	for (i = 0; i < 3; ++i) {
+	    if ((yt == ye) || (xt == xe)) {
+		plt (xt, yt, xe, ye);
+		plt (trc_buf[trc_cnt - 1].x, trc_buf[trc_cnt - 1].y, xe, ye);
+		ckgp (xe, ye, b);
+		return (2);
+	    }
+	    xe -= dr[a][0];
+	    ye -= dr[a][1];
+	}
+	err ("pchk2: funny error - please save the details", xe, ye, xt, yt);}
+    else {
+	if ((abs (xt - xe) > 1) && (abs (yt - ye) > 1))
+	    plt (xt, yt, xe, ye);
+	else {
+	    pxl (xt, yt);
+	    xe += dr[a][0];
+	    ye += dr[a][1];
+	}
+	plt (trc_buf[trc_cnt - 1].x, trc_buf[trc_cnt - 1].y, xe, ye);
+	ckgp (xe, ye, b);
+	return (2);
+    }
+
+    return 0;			/* to keep lint happy		 */
+}
+
+pnt_eha (xe, ye, xt, yt, de, b)
+    int xe, ye, xt, yt, de, b;
+/**********************************************************************\
+* 								       *
+*  paint: end hole allocator - tries to allocate an via-hole.	       *
+*  During the paint-wire scan, the new wire finds itself	       *
+*  approaching the same net on a the other pcb-side. A via-hole	       *
+*  need to be allocated to connect these wires.			       *
+*  <xe,ye> is the end point of the new wire, drawn in direction <de>.  *
+*  <xt,yt> is the offending point of the same (selected) net on	       *
+*  the other side. <e> and <t> are exactly one unit apart. The	       *
+*  new wire is drawn on side <b>.				       *
+* 								       *
+*  On success, a 2 is returned. Unsuccesfull attemps return a 1.       *
+* 								       *
+\**********************************************************************/
+{
+    int i, j, x, y, dt;
+    static struct hsp {		/* hole search pattern		 */
+	int r[7];		/* relative test point position
+				   -1: no displacement = xe,ye	 */
+	int h[7];		/* help-point: 0=none  -1= xe,ye */
+    } hasp[9] = {
+	{			/* diag: xt,yt on  +2		 */
+	    {  2, -1,  1,  3,  0,  4,  5},
+	    {  0,  0,  0,  0,  1,  3, -1}  },
+	{			/* diag: xt,yt on  +1		 */
+	    {  1, -1,  0,  7,  4,  3,  5},
+	    {  0,  0,  0,  0, -1,  0, -1}  },
+	{			/* diag: xt,yt on   0		 */
+	    {  0, -1,  1,  7,  4,  3,  7},
+	    {  0,  0,  0,  0, -1, -1, -1}  },
+	{			/* diag: xt,yt on  -1		 */
+	    {  7, -1,  0,  1,  4,  5,  3},
+	    {  0,  0,  0,  0, -1,  0, -1}  },
+	{			/* diag: xt,yt on  -2		 */
+	    {  6, -1,  7,  5,  0,  4,  3},
+	    {  0,  0,  0,  0,  7,  5, -1}  },
+	{			/* H/V:  xt,yt on  +1		 */
+	    {  1, -1,  0,  2,  3,  7,  6},
+	    {  0,  0,  0,  0,  2,  8,  8}  },
+	{			/* H/V:  xt,yt on   0		 */
+	    {  0, -1,  4,  1,  7,  2,  6},
+	    {  0,  0, -1,  0,  0,  0,  0}  },
+	{			/* H/V:  xt,yt on  -1		 */
+	    {  7, -1,  0,  6,  5,  1,  2},
+	    {  0,  0,  0,  0,  6,  8,  8}  }
+    };
+
+    for (dt = 0; dt < 8; dt++)	/* get direction of e->t	 */
+	if (xt == xe + dr[dt][0] && yt == ye + dr[dt][1])
+	    break;
+    if (dt >= 8)
+	err ("pnt_eha: <xe,ye> not adjacent to <xt,yt>", xe, ye, xt, yt);
+    dt = (8 + dt - de) % 8;	/* need it relative		 */
+    dt = (dt > 4) ? dt - 8 : dt;/* 0 ... 7  ->  -3 ... 4	 */
+
+    if ((de & 1 && (dt > 2 || dt < -2)) ||
+	    (!(de & 1) && (dt > 1 || dt < -1)))
+	err ("pnt_eha: illegal case", xe, ye, xt, yt);
+
+    i = (de & 1) ? 2 - dt : 6 - dt;/* select case (see table)	 */
+
+    color (ishb | selb, ishb | selb);
+
+    for (j = 0; j < 7; j++) {	/* scan through cases		 */
+	if (hasp[i].r[j] < 0) {
+	    x = xe;
+	    y = ye;}
+	else {
+	    x = xe + dr[(hasp[i].r[j] + de) % 8][0];
+	    y = ye + dr[(hasp[i].r[j] + de) % 8][1];
+	}
+	if ((x | y) & 1 || pin (x, y))
+	    continue;		/* not aligned or no space	 */
+	color (b | selb, b | selb);
+	plt (xe, ye, trc_buf[trc_cnt - 1].x, trc_buf[trc_cnt - 1].y);
+	color (vec, vec);
+	pxl (x, y);		/* via hole is inserted		 */
+	if (hasp[i].h[j]) {	/* need a intermediate point	 */
+	    color (b ^ vec, b ^ vec);
+	    pxl ((hasp[i].h[j] < 0) ? xe : xe + dr[(hasp[i].h[j] + de) % 8][0],
+		 (hasp[i].h[j] < 0) ? ye : ye + dr[(hasp[i].h[j] + de) % 8][1]);
+	}
+	ckgp (x, y, b);
+	return (2);
+    }
+
+    err_msg ("No space for a hole");
+    beep ();
+    color (b | selb, b | selb);
+    return (1);
+}
+
+viaalg (b)			/* via hole alignment		 */
+    int b;
+/********************************************************************\
+* 								     *
+* tries to insert a via-hole at <trc_buf[trc_cnt-1].x/y> to allow    *
+* continuation on side <b>. A intermediate vector might be added to  *
+* the trace buffer. trc_buf is assumed to have enough space.	     *
+* 								     *
+* Returns a 0 if succesful, a 1 otherwise			     *
+* 								     *
+\********************************************************************/
+{
+    int     i, j, x, y, dx, dy;
+    static int ct[9] = {5, 4, 3, 6, 8, 2, 7, 0, 1};
+
+    x = trc_buf[trc_cnt - 1].x;
+    y = trc_buf[trc_cnt - 1].y;
+
+    color (ishb | selb, ishb | selb);
+    if (!((x | y) & 1)) {	/* already aligned		 */
+	if (pin (x, y))
+	    return (1);		/* no space			 */
+        else {
+	    color (vec, vec);
+	    pxl (x, y);
+	    return (0); }	/* done !			 */
+    }
+
+    if (trc_cnt > 1) {		/* any prefered direction ?	 */
+	dx = (trc_buf[trc_cnt - 2].x < x) - (trc_buf[trc_cnt - 2].x > x);
+	dy = (trc_buf[trc_cnt - 2].y < y) - (trc_buf[trc_cnt - 2].y > y);
+
+	if (!((x + dx) & 1) && !((y + dy) & 1) && !pin (x + dx, y + dy)) {
+				/* extend previous vector	 */
+	    x = trc_buf[trc_cnt - 1].x += dx;
+	    y = trc_buf[trc_cnt - 1].y += dy;
+	    color (vec, vec);
+	    pxl (x, y);
+	    return (0);
+	}
+
+	if (!((x - dx) & 1) && !((y - dy) & 1) && !pin (x - dx, y - dy)) {
+				/* shorten previous vector	 */
+	    trc_buf[trc_cnt - 1].x -= dx;
+	    trc_buf[trc_cnt - 1].y -= dy;
+	    color (vec, vec);
+	    pxl (trc_buf[trc_cnt - 1].x, trc_buf[trc_cnt - 1].y);
+	    color (0, vec ^ b);
+	    pxl (x, y);
+	    return (0);
+	}
+    }
+
+    for (i = 0; i < 8; ++i)	/* brute force search		 */
+	if (!((x + dr[i][0]) & 1) && !((y + dr[i][1]) & 1) &&
+		!pin (x + dr[i][0], y + dr[i][1])) {
+	    if (trc_cnt > 1) {
+		j = ct[(dx + 1) * 3 + dy + 1];
+		if (((i + 3) % 8 == j) || ((i + 4) % 8 == j) ||
+		    ((i + 5) % 8 == j)) {	/* avoid dead maze	*/
+		    color (0, vec ^ b);
+		    pxl (trc_buf[trc_cnt - 1].x, trc_buf[trc_cnt - 1].y);
+		    trc_buf[trc_cnt - 1].x -= dx;
+		    trc_buf[trc_cnt - 1].y -= dy;
+		}
+	    }
+	    color (vec, vec);
+	    pxl (trc_buf[trc_cnt].x = dr[i][0] + x,
+		 trc_buf[trc_cnt].y = dr[i][1] + y);
+	    trc_buf[trc_cnt++].ty = vec ^ b;
+	    return (0);
+	}
+
+    return (1);			/* there is just no space	 */
+}
+
+static int dex = 0;		/* delete exit feature		 */
+
+m_delete (x, y, ctx)		/* manual delete		 */
+    int x, y, ctx;
+{
+    plow_f = 0;
+
+    if (del (x, y, vec)) {
+	if (dex) {		/* switch to an other net	 */
+	    dex = 0;
+	    if (V.cnet)
+	        deseln (V.cnet);
+	    return (net_sel (ctx));}
+	else
+	    dex = 1;
+    }
+    return (START);
+}
+
+mr_delete (x, y, ctx)		/* manual delete in r-context	 */
+    int x, y, ctx;
+{
+    int     dx, dy;
+
+    plow_f = 0;
+    dex = 0;
+    if (del (x, y, vec)) {	/* del failed: backtrack	 */
+	if (trc_cnt > 1) {
+	    x = trc_buf[trc_cnt - 1].x;
+	    y = trc_buf[trc_cnt - 1].y;
+	    dx = (trc_buf[trc_cnt - 2].x < x) - (trc_buf[trc_cnt - 2].x > x);
+	    dy = (trc_buf[trc_cnt - 2].y < y) - (trc_buf[trc_cnt - 2].y > y);
+	    color (0, selb | (trc_buf[trc_cnt - 1].ty & vec));
+	    plt (x, y, trc_buf[trc_cnt - 2].x + dx, trc_buf[trc_cnt - 2].y + dy);
+	    if (trc_buf[trc_cnt - 1].ty & ishb) {
+		color (0, selb | vec & trc_buf[trc_cnt - 1].ty);
+		ck_rdnb (x = trc_buf[trc_cnt - 2].x,
+		   y = trc_buf[trc_cnt - 2].y, vec & trc_buf[trc_cnt - 1].ty);
+if(pcb[y][x] & ishb) {
+		color (0, ishb | selb);
+		dpin (x, y);
+		color (selb, selb);
+/* guard zones may stay unselected: cosmetic defect */
+		for (dy = -1; dy <= 1; dy++)/* un-unselect	 */
+		    for (dx = -1; dx <= 1; dx++)
+			if (pcb[y + dy][x + dx] & vec)
+			    pxl (x + dx, y + dy);
+}else{
+ printf("This was the bug - please report\n");
+ beep();
+}
+		if (trc_cnt > 2 &&
+		    abs(trc_buf[trc_cnt - 3].x - trc_buf[trc_cnt - 2].x) <2 &&
+		    abs(trc_buf[trc_cnt - 3].y - trc_buf[trc_cnt - 2].y) <2) {
+				/* remove alignment stub	 */
+		    color (0, selb | trc_buf[trc_cnt - 2].ty);
+		    ck_rdnb (trc_buf[trc_cnt - 3].x, trc_buf[trc_cnt - 3].y,
+			trc_buf[trc_cnt - 2].ty);
+		    trc_cnt--;
+		}
+	    }
+	    trc_cnt--;
+	}
+	if (trc_cnt <= 1) {	/* unselect start		 */
+	    ckgp (trc_buf[0].x, trc_buf[0].y, s1b);
+	    ckgp (x = trc_buf[0].x, y = trc_buf[0].y, s2b);
+	    color (selb, selb);
+	    for (dy = -1; dy <= 1; dy++)/* un-unselect		 */
+		for (dx = -1; dx <= 1; dx++)
+		    if (pcb[y + dy][x + dx] & (sof_seg | ahb))
+			pxl (x + dx, y + dy);
+	    trc_cnt = 0;
+	    return (START);
+	}
+    }
+    return (ctx);
+}
+
+static int wxl, wyl, wxh, wyh;	/* window extensions		 */
+
+/*ARGSUSED*/
+cr_window (ctx)			/* create a window		 */
+    int ctx;
+{
+    wxl = wx + 192 / cz;	/* default size			 */
+    wyl = wy + 177 / cz;
+    wxh = wx + 320 / cz;
+    wyh = wy + 305 / cz;
+    di_window ();
+}
+
+di_window ()			/* display window		 */
+{
+    color (resb, resb);
+    plts (wxl, wyl, wxh, wyl);
+    plts (wxh, wyl, wxh, wyh);
+    plts (wxh, wyh, wxl, wyh);
+    plts (wxl, wyh, wxl, wyl);
+}
+
+rm_window ()			/* remove window		 */
+{
+    color (0, resb);
+    plts (wxl, wyl, wxh, wyl);
+    plts (wxh, wyl, wxh, wyh);
+    plts (wxh, wyh, wxl, wyh);
+    plts (wxl, wyh, wxl, wyl);
+}
+
+/*ARGSUSED*/
+w_zoomi (x, y, ctx)		/* zoom in (and maintain window) */
+    int x, y, ctx;
+{
+    if (cz < 16) {
+	rm_window ();
+	zoom (cz + 1);
+	di_window ();
+    }
+    return (ctx);		/* don't change context		 */
+}
+
+/*ARGSUSED*/
+w_zoomo (x, y, ctx)		/* zoom out (and maintain window) */
+    int x, y, ctx;
+{
+    if (cz > 1) {
+	rm_window ();
+	zoom (cz - 1);
+	di_window ();
+    }
+    return (ctx);		/* don't change context		 */
+}
+
+w_wmv (x, y, ctx)		/* move window			 */
+    int x, y, ctx;
+{
+    rm_window ();
+    window (x - 256 / cz, y - 256 / cz);
+    di_window ();
+    return (ctx);		/* don't change context		 */
+}
+
+wnd_urc (x, y, ctx)		/* window: upper right corner	 */
+    int x, y, ctx;
+{
+    rm_window ();
+
+    if (x >= wxl)
+	wxh = x;
+    else {
+	wxh = wxl;
+	wxl = x;
+    }
+
+    if (y >= wyl)
+	wyh = y;
+    else {
+	wyh = wyl;
+	wyl = y;
+    }
+
+    di_window ();
+    return (ctx);
+}
+
+wnd_llc (x, y, ctx)		/* window: lower left corner	*/
+    int x, y, ctx;
+{
+    rm_window ();
+    wxh = x + (wxh - wxl);
+    wxl = x;
+    wyh = y + (wyh - wyl);
+    wyl = y;
+    di_window ();
+    return (ctx);
+}
+
+static int ad_ty;		/* area delete type		 */
+
+ini_adel (ctx)			/* initialize area delete	 */
+   int ctx;
+{
+    ad_ty = vec;
+    cr_window (ctx);
+    return (ctx);
+}
+
+/*ARGSUSED*/
+sel_adel (x, y, ctx)		/* select area delete options	 */
+    int x, y, ctx;
+{
+    static char *txt[] = {
+	"Everything",
+	"Side 1 only",
+	"Side 2 only",
+	"Nothing"
+    };
+
+    switch (menu (txt, 4)) {
+	case 0: 
+	    ad_ty = vec;
+	    break;
+	case 1: 
+	    ad_ty = s1b;
+	    break;
+	case 2: 
+	    ad_ty = s2b;
+	    break;
+	default: 
+	    err_msg ("Area-delete aborted");
+	    rm_window ();
+	    return (START);
+    }
+
+    return (ctx);
+}
+
+/*ARGSUSED*/
+exc_adel (x, y, ctx)		/* execute area delete		 */
+    int x, y, ctx;
+{
+    int    ad_hck (), ad_vck ();
+    struct nlhd *t, *get_net ();
+    register int xx, yy;
+
+    rm_window ();
+    for (yy = wyl + 1; yy < wyh; yy++)/* delete loop		 */
+	for (xx = wxl + 1; xx < wxh; xx++)
+	    if (pcb[yy][xx] & ad_ty) {
+		t = get_net (xx, yy, vec);
+
+		if (t < &NH[0] || t > &NH[V.nnh])
+		    continue;	/* skip power and ground nets	 */
+
+		wthf = ad_hck;
+		wtvf = ad_vck;
+		wtrace (xx, yy, vec);
+		if (t && t -> f && !cchk (t)) {
+		    t -> f = 0;
+		    nettgo++;
+		}
+	    }
+
+    for (xx = wxl; xx <= wxh; xx++) {/* clean edges		 */
+	if (pcb[wyl][xx] & (ahb | vec))
+	    ad_gchk (xx, wyl);
+	if (pcb[wyh][xx] & (ahb | vec))
+	    ad_gchk (xx, wyh);
+    }
+    for (yy = wyl + 1; yy < wyh; yy++) {
+	if (pcb[yy][wxl] & (ahb | vec))
+	    ad_gchk (wxl, yy);
+	if (pcb[yy][wxh] & (ahb | vec))
+	    ad_gchk (wxh, yy);
+    }
+
+    nets_msg (nettgo);		/* update number of nets message */
+
+    return (START);
+}
+
+ad_hck (x, y)			/* area-delete hole check	 */
+    int x, y;
+{
+    if (pcb[y][x] & ishb && x > wxl && y > wyl && x < wxh && y < wyh) {
+	color (0, ishb);
+	dpin (x, y);
+    }
+    return (0);
+}
+
+ad_vck (x1, y1, x2, y2)		/* area-delete vector check	 */
+    int x1, y1, x2, y2;
+{
+    int     i;
+
+    if (y1 > y2) {		/* order y for y-band clipping	 */
+	i = x1;
+	x1 = x2;
+	x2 = i;
+	i = y1;
+	y1 = y2;
+	y2 = i;
+    }
+    i = ((x1 < x2) - (x2 < x1));
+
+    if (y1 <= wyl) {
+	if (y2 <= wyl)
+	    return;
+	x1 += (wyl + 1 - y1) * i;
+	y1 = wyl + 1;
+    };
+
+    if (y2 >= wyh) {
+	if (y1 >= wyh)
+	    return;
+	x2 -= (y2 - (wyh - 1)) * i;
+	y2 = wyh - 1;
+    }
+
+    if (x1 > x2) {		/* order x for x-band clipping	 */
+	i = x1;
+	x1 = x2;
+	x2 = i;
+	i = y1;
+	y1 = y2;
+	y2 = i;
+    }
+    i = (y1 < y2) - (y2 < y1);
+
+    if (x1 <= wxl) {
+	if (x2 <= wxl)
+	    return;
+	y1 += (wxl + 1 - x1) * i;
+	x1 = wxl + 1;
+    }
+
+    if (x2 >= wxh) {
+	if (x1 >= wxh)
+	    return;
+	y2 -= (x2 - (wxh - 1)) * i;
+	x2 = wxh - 1;
+    }
+
+    if (abs (x1 - x2) < 2 && abs (y1 - y2) < 2 &&
+	pcb[x1][y1] & chb && pcb[x2][y2] & chb)
+	return;			/* do not remove parts of a hole */
+
+    color (0, wtsb);
+    plt (x1, y1, x2, y2);
+}
+
+ad_gchk (x, y)			/* area delete: garbage check	 */
+    int x, y;
+{
+    struct nlhd *get_net ();
+    int delh (), delv ();
+
+    if (!get_net (x, y, vec)) {
+	wthf = delh;
+	wtvf = delv;
+	wtrace (x, y, vec);
+    }
+}
+
+ini_art (ctx)			/* initialize area route	 */
+    int ctx;
+{
+    cr_window (ctx);
+    return (ctx);
+}
+
+/*ARGSUSED*/
+sel_art (x, y, ctx)		/* select area route options	 */
+    int x, y, ctx;
+{
+    err_msg ("Area-route has no options yet");
+    return (ctx);
+}
+
+/*ARGSUSED*/
+exc_art (x, y, ctx)		/* execute area route		 */
+    int x, y, ctx;
+{
+    register int xx, yy, max, cnt, i;
+    struct nlhd **nl, *t, *get_net ();
+    char buf[40];
+
+    max = 200;			/* assume 200 for a start	 */
+    cnt = 0;
+    nl = (struct nlhd **) malloc (sizeof (struct nlhd *) * max);
+
+    rm_window ();
+    Ferr_msg ("Busy: routing");
+    for (yy = wyl + 1; yy < wyh; yy++)
+	for (xx = wxl + 1; xx < wxh; xx++)
+	    if ((pcb[yy][xx] & chb) && (t = get_net (xx, yy, vec)) && !(t -> f)) {
+		for (i = 0; i < cnt; i++)
+		    if (nl[i] == t)
+			break;	/* got this net already		 */
+		if (i >= cnt) {
+		    if (cnt >= max) {
+			max += max / 2;
+			nl = (struct nlhd **) realloc
+					(nl, sizeof (struct nlhd *) * max);
+		    }
+		    nl[cnt++] = t;
+		}
+	    }
+
+    for (i = 0; i < cnt; i++) {
+	sprintf (buf, "Routing net %d of %d", i, cnt);
+	nets_msg (nettgo);
+	Ferr_msg (buf);
+	N_route (nl[i], 2, wxl, wyl, wxh, wyh);
+	nettgo -= nl[i] -> f;
+    }
+
+    free (nl);			/* clean up			 */
+    nets_msg (nettgo);
+    err_msg ("Done");
+    beep ();
+    return (START);
+}
+!E!O!F!
+#
+# type    sh /usru0/agn/pcb/distr/../usenet/part7   to unpack this archive.
+#
+echo extracting pplace.c...
+cat >pplace.c <<'!E!O!F!'
+/***************************************************************\
+*								*
+*	PCB program						*
+*								*
+*	Placement routines					*
+*								*
+*	(c) 1985		A. Nowatzyk			*
+*								*
+\***************************************************************/
+
+#include <stdio.h>
+#include "pparm.h"
+#include "pcdst.h"
+
+int rot_m[4][4] = { { 1,  0,  0,  1},
+		    { 0, -1,  1,  0},
+		    {-1,  0,  0, -1},
+		    { 0,  1, -1,  0}  };
+
+
+fnd_cmp (x, y)			/* find component		 */
+    int x, y;
+{
+    register int i, xl, xh, yl, yh;
+
+    for (i = 0; i < V.ncp; i++) {
+	switch (CP[i].r) {
+	    case 0:
+		xl = CP[i].x;
+		yl = CP[i].y;
+		xh = xl + CP[i].ty -> x;
+		yh = yl + CP[i].ty -> y;
+		break;
+	    case 1:
+		xh = CP[i].x;
+		yl = CP[i].y;
+		xl = xh - CP[i].ty -> y;
+		yh = yl + CP[i].ty -> x;
+		break;
+	    case 2:
+		xh = CP[i].x;
+		yh = CP[i].y;
+		xl = xh - CP[i].ty -> x;
+		yl = yh - CP[i].ty -> y;
+		break;
+	    case 3:
+		xl = CP[i].x;
+		yh = CP[i].y;
+		xh = xl + CP[i].ty -> y;
+		yl = yh - CP[i].ty -> x;
+		break;
+	}
+	xl--;
+	yl--;
+	xh++;
+	yh++;
+	if (x <= xh && x >= xl && y <= yh && y >= yl)
+	    return (i);
+    }
+    return (-1);		/* no component found		 */
+}
+
+draw_cp (x, y, r, cp)		/* draw component shape		 */
+    int x, y, r, cp;
+{
+    register int i, xl, yl, xh, yh;
+    register struct pin *pp;
+    int j;
+
+    switch (r) {
+	case 0: 
+	    xl = x;
+	    yl = y;
+	    xh = xl + CP[cp].ty -> x;
+	    yh = yl + CP[cp].ty -> y;
+	    break;
+	case 1: 
+	    xh = x;
+	    yl = y;
+	    xl = xh - CP[cp].ty -> y;
+	    yh = yl + CP[cp].ty -> x;
+	    break;
+	case 2: 
+	    xh = x;
+	    yh = y;
+	    xl = xh - CP[cp].ty -> x;
+	    yl = yh - CP[cp].ty -> y;
+	    break;
+	case 3: 
+	    xl = x;
+	    yh = y;
+	    xh = xl + CP[cp].ty -> y;
+	    yl = yh - CP[cp].ty -> x;
+	    break;
+    }
+
+    xl -= 2;
+    yl -= 2;
+    xh += 2;
+    yh += 2;
+
+    color (resb, resb);
+    plts (xl, yl, xh, yl);
+    plts (xh, yl, xh, yh);
+    plts (xh, yh, xl, yh);
+    plts (xl, yh, xl, yl);
+
+    for (j = 0, i = CP[cp].ty -> np, pp = CP[cp].ty -> p; i; i--, pp++) {
+	xl = x + (pp -> x) * rot_m[r][0] + (pp -> y) * rot_m[r][1];
+	yl = y + (pp -> x) * rot_m[r][2] + (pp -> y) * rot_m[r][3];
+	if (!j) {
+	    j = 1;
+	    dot (xl, yl);
+	}
+	else
+	    point (xl, yl);
+    }
+}
+
+del_cp (x, y, r, cp)		/* delete component shape	 */
+    int x, y, r, cp;
+{
+    register int xl, yl, xh, yh;
+
+    switch (r) {
+	case 0: 
+	    xl = x;
+	    yl = y;
+	    xh = xl + CP[cp].ty -> x;
+	    yh = yl + CP[cp].ty -> y;
+	    break;
+	case 1: 
+	    xh = x;
+	    yl = y;
+	    xl = xh - CP[cp].ty -> y;
+	    yh = yl + CP[cp].ty -> x;
+	    break;
+	case 2: 
+	    xh = x;
+	    yh = y;
+	    xl = xh - CP[cp].ty -> x;
+	    yl = yh - CP[cp].ty -> y;
+	    break;
+	case 3: 
+	    xl = x;
+	    yh = y;
+	    xh = xl + CP[cp].ty -> y;
+	    yl = yh - CP[cp].ty -> x;
+	    break;
+    }
+
+    color (0, resb);
+    c_rect (xl - 2, yl - 2, xh + 2, yh + 2);
+}
+
+static int active = 0;		/* !=0 if some coponent is sel	 */
+static int cp_id, cp_x, cp_y, cp_r;
+
+cmv_sel (x, y, ctx)		/* select a component		 */
+    int x, y, ctx;
+{
+    char buf[nmmax + nmmax + 3];
+
+    if (active)			/* remove previous selection	 */
+	del_cp (cp_x, cp_y, cp_r, cp_id);
+
+    cp_id = fnd_cmp (x, y);
+
+    if (cp_id < 0) {
+	active = 0;
+	err_msg ("No component found");}
+    else {
+	active = 1;
+	cp_x = CP[cp_id].x;
+	cp_y = CP[cp_id].y;
+	cp_r = CP[cp_id].r;
+	draw_cp (cp_x, cp_y, cp_r, cp_id);
+
+	sprintf (buf, "%s (%s)", CP[cp_id].name, CP[cp_id].ty -> name);
+	err_msg (buf);
+    }
+
+    return (ctx);
+}
+
+/*ARGSUSED*/
+exc_cmv (x, y, ctx)		/* execute CP move		 */
+    int x, y, ctx;
+{
+    register int i, x1, y1, or;
+    register struct pin *pp;
+
+    if (!active)
+	return START;		/* nothing to do		 */
+
+    del_cp (cp_x, cp_y, cp_r, cp_id);
+    active = 0;
+
+    if (CP[cp_id].r == cp_r && CP[cp_id].x == cp_x && CP[cp_id].y == cp_y) {
+	err_msg ("Not moved");
+	return START;		/* move to same location	 */
+    }
+
+    or = CP[cp_id].r;		/* get old rotation		 */
+
+    for (i = CP[cp_id].ty -> np, pp = CP[cp_id].ty -> p; i; i--, pp++) {
+
+				/* check alignment of new location */
+	x1 = cp_x + (pp -> x) * rot_m[cp_r][0] + (pp -> y) * rot_m[cp_r][1];
+	y1 = cp_y + (pp -> x) * rot_m[cp_r][2] + (pp -> y) * rot_m[cp_r][3];
+	if (cp_alchk (x1) || cp_alchk (y1)) {
+	    err_msg ("Pins not on drill grid");
+	    return START;
+	}
+
+				/* check range			 */
+	if (x1 < 3 || y1 < 3 || x1 > V.BSX - 3 || y1 > V.BSY - 3) {
+	    err_msg ("Can't move off board");
+	    return START;
+	}
+	
+				/* check for wires		 */
+	x1 = CP[cp_id].x + pp -> x * rot_m[or][0] + pp -> y * rot_m[or][1];
+	y1 = CP[cp_id].y + pp -> x * rot_m[or][2] + pp -> y * rot_m[or][3];
+	if (pcb[y1][x1] & (s1b | s2b)) {
+	    err_msg ("Disconnect wires first");
+	    return START;
+	}
+    }
+
+    x1 = CP[cp_id].x;		/* save old place		 */
+    y1 = CP[cp_id].y;
+    i  = CP[cp_id].r;
+
+    if (!C_unplace (&CP[cp_id]))
+	err ("exc_cmv: this should not happen", cp_id, 0, 0, 0);
+
+    if (!C_place (&CP[cp_id], cp_x, cp_y, cp_r)) {
+	err_msg ("No space at new place");
+	if (!C_place (&CP[cp_id], x1, y1, i))
+	    err ("exc_cmv: re-insert to old place failed", x1, y1, i, cp_id);
+    }
+
+    CH_update ();
+
+    return START;
+}
+
+
+/*ARGSUSED*/
+cmv_rr (x, y, ctx)		/* rotate right			 */
+    int x, y, ctx;
+{
+    if (active) {
+	del_cp (cp_x, cp_y, cp_r, cp_id);
+	cp_r = 3 & (cp_r + 3);
+	draw_cp (cp_x, cp_y, cp_r, cp_id);}
+    else
+	err_msg ("Select a CP first");
+
+    return (ctx);
+}
+
+/*ARGSUSED*/
+cmv_rl (x, y, ctx)		/* rotate left			 */
+    int x, y, ctx;
+{
+    if (active) {
+	del_cp (cp_x, cp_y, cp_r, cp_id);
+	cp_r = 3 & (cp_r + 1);
+	draw_cp (cp_x, cp_y, cp_r, cp_id);}
+    else
+	err_msg ("Select a CP first");
+
+    return (ctx);
+}
+
+cmv_plc (x, y, ctx)		/* place component		 */
+    int x, y, ctx;
+{
+    char buf[40];
+
+    if (active) {
+	del_cp (cp_x, cp_y, cp_r, cp_id);
+	cp_x = cp_align (x);
+	cp_y = cp_align (y);
+	draw_cp (cp_x, cp_y, cp_r, cp_id);
+	sprintf (buf, "X=%6.3f\" Y=%6.3f\"",
+		((float) x / rsun) * 0.1, ((float) y / rsun) * 0.1);
+	err_msg (buf);}
+    else
+	err_msg ("Select a CP first");
+
+    return (ctx);
+}
+
+C_place (cmp, x, y, r)
+    struct comp *cmp;
+    int x, y, r;
+/****************************************************************\
+* 								 *
+*  C_place tries to place the component <cmp> on location <x,y>	 *
+*  with rotation <r>. If it succeedes, the component entry will	 *
+*  be updated and a '1' is returned. A returned '0' indicates	 *
+*  that the desired placement was not possible due to design	 *
+*  rule constraints.						 *
+* 								 *
+\****************************************************************/
+{
+#define xtr(a, b) (x + a * rot_m[r][0] + b * rot_m[r][1])
+#define ytr(a, b) (y + a * rot_m[r][2] + b * rot_m[r][3])
+
+    register struct pin *pp;
+    register int i, j, k, x1, y1;
+    int x2, y2;
+
+    if (!(cmp -> unplaced))
+	err ("C_place: already placed", cmp, x, y, r);
+
+    if (r < 0 || r > 3 || x < 3 || y < 3 || x > V.BSX - 3 || y > V.BSX - 3)
+	return 0;		/* illegal paramenter		 */
+
+    for (i = cmp -> ty -> np, pp = cmp -> ty -> p; i; pp++, i--) {
+	x1 = xtr (pp -> x, pp -> y);
+	y1 = ytr (pp -> x, pp -> y);
+
+	if( x1 < 3 || x1 > V.BSX - 3 || y1 < 3 || y1 > V.BSY - 3)
+	    return 0;		/* pin is off board		 */
+
+	if (cp_alchk (x1) || cp_alchk (y1))
+	    return 0;		/* illegal pin alignment	 */
+
+	if (!ck_pin (x1, y1))
+	    return 0;		/* overlapp problem		 */
+    }
+
+    if (cmp -> ty -> cif)	/* external CIF type: block check*/
+	for (i = cmp -> ty -> cif - 1; CIF[i].blk; i++) {
+	    for (y1 = CIF[i].yl - 1; y1 <= CIF[i].yh + 1; y1++)
+		for (x1 = CIF[i].xl - 1; x1 <= CIF[i].xh + 1; x1++)
+		    if (pcb[ytr (x1, y1)][xtr (x1, y1)] & (fb | ahb | vec))
+			return 0;	/* Block problem	 */
+	    if (!CIF[i].flg)
+		break;
+	}
+
+    /**** everthing looks fine: proceed to insert component   ****/
+
+    color (chb, chb);		/* insert pins			 */
+    for (i = cmp -> ty -> np, pp = cmp -> ty -> p; i; pp++, i--)
+	if (pin (xtr (pp -> x, pp -> y), ytr (pp -> x, pp -> y))) {
+	    printf ("Type definition error for '%s': pins too close\n",
+		cmp -> ty -> name);
+	    color (0, chb);
+	    for (pp = cmp -> ty -> p; i < cmp -> ty -> np; pp++, i++)
+		dpin (xtr (pp -> x, pp -> y), ytr (pp -> x, pp -> y));
+	    return 0;
+	}
+
+    if (cmp -> ty -> cif) {	/* insert road blocks		 */
+	color (fb, fb);
+	for (i = cmp -> ty -> cif - 1; CIF[i].blk; i++) {
+	    x1 = xtr (CIF[i].xl, CIF[i].yl);
+	    y1 = ytr (CIF[i].xl, CIF[i].yl);
+	    x2 = xtr (CIF[i].xh, CIF[i].yh);
+	    y2 = ytr (CIF[i].xh, CIF[i].yh);
+	    if (x1 > x2) {j = x1; x1 = x2; x2 = j;}
+	    if (y1 > y2) {j = y1; y1 = y2; y2 = j;}
+
+	    c_rect (x1, y1, x2, y2);
+	    for (; y1 <= y2; y1++)
+		for (k = x1; k <= x2; k++)
+		    pcb[y1][k] |= fb;
+
+	    if (!CIF[i].flg)
+		break;
+	}
+    }
+
+    k = ((int) cmp - (int) CP) / sizeof (struct comp);	/* get own index */
+    pp = cmp -> ty -> p;
+    for (i = 0, j = 0; i < V.nch; i++)
+	if (CH[i].cpi == k) {
+	    j++;			/* count holes	 */
+	    CH[i].x = xtr (pp[CH[i].pn].x, pp[CH[i].pn].y);
+	    CH[i].y = ytr (pp[CH[i].pn].x, pp[CH[i].pn].y);
+	}
+    if (j != cmp -> ty -> np)
+	err ("C_place: inconsistent pin numbers", j, cmp -> ty -> np, 0, 0);
+
+    cmp -> x = x;		/* update component entry	 */
+    cmp -> y = y;
+    cmp -> r = r;
+    cmp -> unplaced = 0;
+
+    placed = 0;			/* insure update		 */
+
+    return 1;			/* finally done!		 */
+
+#undef xtr
+#undef ytr
+}
+
+C_unplace (cmp)
+    struct comp *cmp;
+/***************************************************************\
+* 							        *
+*  C_unplace tries to remove the component <cmp> from its       *
+*  current location. It returns a '1' if it succeeds.	        *
+*  A returned '0' indicates that the opaeration failed because  *
+*  the component had wires connected to it.		        *
+* 							        *
+\***************************************************************/
+{
+#define xtr(a, b) (x + a * rot_m[r][0] + b * rot_m[r][1])
+#define ytr(a, b) (y + a * rot_m[r][2] + b * rot_m[r][3])
+
+    register struct pin *pp;
+    register int i, x1, x = cmp -> x, y = cmp -> y, r = cmp -> r;
+    int j, y1, x2, y2;
+    struct hole *fndh (), *hp;
+    static struct hole **chl = 0;
+    static int chlmax = 100;
+
+    if (cmp -> unplaced)
+	return 1;		/* is already unplaced		 */
+
+    for (i = cmp -> ty -> np, pp = cmp -> ty -> p; i; pp++, i--) {
+	if (pcb[ytr (pp -> x, pp -> y)][xtr (pp -> x, pp -> y)] & vec)
+	    return 0;		/* no wires allowed		 */
+
+    /**** everthing looks fine: proceed to remove component   ****/
+
+    if (!chl) {			/* allocate temp table		 */
+	if (chlmax < cmp -> ty -> np)
+	    chlmax = 10 + cmp -> ty -> np;
+	chl = (struct hole **) malloc (sizeof (struct hole *) * chlmax);}
+    else if (chlmax < cmp -> ty -> np) {
+	free (chl);
+	chlmax = 10 + cmp -> ty -> np;
+	chl = (struct hole **) malloc (sizeof (struct hole *) * chlmax);}
+    }
+
+    color (0, selb | chb);	/* remove pins			 */
+    for (i = cmp -> ty -> np, pp = cmp -> ty -> p; i; pp++) {
+	x1 = xtr (pp -> x, pp -> y);
+	y1 = ytr (pp -> x, pp -> y);
+	hp = fndh (x1, y1);
+	if (!hp)
+	    err ("C_unplace: missing hole", x1, y1, i, 0);
+	chl[--i] = hp;		/* save hole pointer		 */
+	dpin (x1, y1);
+    }
+
+    for (i = cmp -> ty -> np; i;) {
+	chl[--i] -> x = 0;	/* invalidate cooradinates	 */
+	chl[i] -> y = 0;
+    }
+
+    if (cmp -> ty -> cif) {	/* remove road blocks		 */
+	color (0, fb);
+	for (i = cmp -> ty -> cif - 1; CIF[i].blk; i++) {
+	    x1 = xtr (CIF[i].xl, CIF[i].yl);
+	    y1 = ytr (CIF[i].xl, CIF[i].yl);
+	    x2 = xtr (CIF[i].xh, CIF[i].yh);
+	    y2 = ytr (CIF[i].xh, CIF[i].yh);
+	    if (x1 > x2) {j = x1; x1 = x2; x2 = j;}
+	    if (y1 > y2) {j = y1; y1 = y2; y2 = j;}
+
+	    c_rect (x1, y1, x2, y2);
+	    for (; y1 <= y2; y1++)
+		for (j = x1; j <= x2; j++)
+		    pcb[y1][j] &= ~fb;
+
+	    if (!CIF[i].flg)
+		break;
+	}
+    }
+
+    placed = 0;			/* no longer placed		 */
+    cmp -> unplaced = 1;
+    flush_stat ();		/* statistics are invalid	 */
+
+    return 1;			/* finally done!		 */
+
+#undef xtr
+#undef ytr
+}
+
+CH_update ()
+/****************************************************\
+* 						     *
+*  Sort the hole table and update the pointer to it  *
+*  (this is prerequisite for 'fndh' to work)	     *
+* 						     *
+\****************************************************/
+{
+    register int i;
+    int key ();
+
+    qsort (CH, V.nch, sizeof (CH[0]), key);	/* sort holes	 */
+    for (i = 0; i < V.nch; i++)			/* adj pointers  */
+	if (CH[i].n)
+	    CH[i].n -> c = &CH[i];
+}
+
+key (h1, h2)			/* is used to sort the holes	*/
+    struct hole *h1, *h2;
+{
+    if (h1 -> x > h2 -> x)
+	return 1;
+    if (h1 -> x < h2 -> x)
+	return -1;
+    if (h1 -> y > h2 -> y)
+	return 1;
+    if (h1 -> y < h2 -> y)
+	return -1;
+
+    return 0;
+}
+
+ck_placed ()
+/****************************************************************\
+* 								 *
+*  Check placement:						 *
+*   returns a '1' if all components are placed (and updates the	 *
+*   net location info). A '0' is returned otherwise.		 *
+* 								 *
+\****************************************************************/
+{
+    register int i, j, xl, yl, xh;
+    register struct nlst *p;
+    int yh;
+
+    for (i = 0, xl = V.ncp; i < xl; i++)
+	if (CP[i].unplaced)
+	    return 0;
+
+    for (i = 0; i < V.nnh; i++)	/* update net locations		*/
+	if (NH[i].l) {
+	    xl = xmax;
+	    yl = ymax;
+	    xh = 0;
+	    yh = 0;
+	    for (p = NH[i].lp; p; p = p -> n) {
+		j = p -> c -> x;
+		if (j > xh) xh = j;
+		if (j < xl) xl = j;
+		j = p -> c -> y;
+		if (j > yh) yh = j;
+		if (j < yl) yl = j;
+	    }
+	    if (!xl)
+		err ("ck_placed: invlid hole coordinate", i, xl, yl, xh);
+	    NH[i].x1 = xl;
+	    NH[i].x2 = xh;
+	    NH[i].y1 = yl;
+	    NH[i].y2 = yh;
+	}
+
+    return 1;
+}
+
+CPp_ini (ctx)			/* CP place initialization	 */
+    int ctx;
+{
+    register int i;
+    char buf[nmmax + nmmax + 3];
+
+    if (ck_placed ()) {
+	active = 0;
+	return START;		/* nothing to place		 */
+    }
+
+    for (i = 0; i < V.ncp; i++)	/* find something to place	 */
+	if (CP[i].unplaced)
+	    break;
+
+    cp_id = i;
+    cp_x = wx + 256 / cz;
+    cp_y = wy + 241 / cz;
+    cp_r = 0;
+
+    active = 1;
+    draw_cp (cp_x, cp_y, 0, i);
+
+    sprintf (buf, "%s (%s)", CP[cp_id].name, CP[cp_id].ty -> name);
+    err_msg (buf);
+
+    return ctx;
+}
+
+/*ARGSUSED*/
+CPp_exc (x, y, ctx)		/* try some other component	 */
+    int x, y, ctx;
+{
+    if (C_place (&CP[cp_id], cp_x, cp_y, cp_r)) {
+	del_cp (cp_x, cp_y, cp_r, cp_id);
+	CH_update ();
+	return CPp_ini (ctx);
+    }
+
+    err_msg ("Invalid place");
+
+    return ctx;
+}
+
+CPp_del (x, y, ctx)		/* delete a component		 */
+    int x, y, ctx;
+{
+    register int i, j, k;
+    char buf[nmmax + nmmax + 3];
+
+    i = fnd_cmp (x, y);
+
+    if (i < 0) {		/* try to select an other cmp	 */
+	k = V.ncp;
+	for (i = 0, j = cp_id + 1; i < k; i++)
+	    if (CP[(i + j) % k].unplaced)
+		break;
+	i = (i + j) % k;
+	if (i == cp_id)
+	    err_msg ("only one CMP left");
+	else {
+	    del_cp (cp_x, cp_y, cp_r, cp_id);
+
+	    cp_id = i;
+	    cp_x = x;
+	    cp_y = y;
+	    cp_r = 0;
+
+	    draw_cp (x, y, 0, i);
+
+	    sprintf (buf, "%s (%s)", CP[cp_id].name, CP[cp_id].ty -> name);
+	    err_msg (buf);
+	}}
+
+    else if (!C_unplace (&CP[i]))	/* delete component		 */
+	err_msg ("Remove wires first");
+
+    CH_update ();
+
+    return ctx;
+}
+
+CPp_plc (x, y, ctx)		/* tennativly place component	 */
+    int x, y, ctx;
+{
+    char    buf[40];
+
+    del_cp (cp_x, cp_y, cp_r, cp_id);
+    cp_x = cp_align (x);
+    cp_y = cp_align (y);
+    draw_cp (cp_x, cp_y, cp_r, cp_id);
+    sprintf (buf, "X=%6.3f\" Y=%6.3f\"",
+	    ((float) x / rsun) * 0.1, ((float) y / rsun) * 0.1);
+    err_msg (buf);
+
+    return ctx;
+}
+
+!E!O!F!
+#
+# type    sh /usru0/agn/pcb/distr/../usenet/part7   to unpack this archive.
+#
+echo extracting psub.c...
+cat >psub.c <<'!E!O!F!'
+/***************************************************************\
+*								*
+*	PCB program						*
+*								*
+*	Utility routines					*
+*								*
+*	(c) 1985		A. Nowatzyk			*
+*								*
+\***************************************************************/
+
+#include "pparm.h"
+#include "pcdst.h"
+#include <stdio.h>
+
+err (s, e1, e2, e3, e4)			/* error exit			*/
+    char s[];
+    int e1, e2, e3, e4;
+{
+    printf ("Error: %s -- exited\n", s);
+    strncpy (V.errtxt, s, 80);
+    V.err_info[0] = e1;
+    V.err_info[1] = e2;
+    V.err_info[2] = e3;
+    V.err_info[3] = e4;
+    if (s[0] != '-') {
+	save (1);		/* save state for recovery	 */
+	printf ("Data structure saved on 'pcb.ERR'\n");
+    };
+    finish ();
+}
+
+beep()			/* beep on the terminal		 */
+{
+    if (no_beep)
+	return;
+    putc (7, stdout);
+    fflush (stdout);
+}
+
+pin(x, y)			/* enter pin to pcb and AED	 */
+    int x, y;
+{
+    int     i, j, k;
+    static int hx[8] = {3, 3, 0,-3,-3,-3, 0, 3};
+    static int hy[8] = {0, 3, 3, 3, 0,-3,-3,-3};
+    static int bx[12] = {5, 5, 5, 1, 0,-1,-5,-5,-5, 1, 0,-1};
+    static int by[12] = {1, 0,-1, 5, 5, 5, 1, 0,-1,-5,-5,-5};
+    static int xt[12] = {3, 3, 3, 1, 0,-1,-3,-3,-3, 1, 0,-1};
+    static int yt[12] = {1, 0,-1, 3, 3, 3, 1, 0,-1,-3,-3,-3};
+
+    for (i = x - 2; i <= x + 2; ++i)
+	for (j = y - 2; j <= y + 2; ++j) {
+	    k = pcb[j][i];
+	    if ((k & (fb | chb | ishb)) || (!(k & selb) && k & vec) ||
+		!(vec & ~k))
+		return 1;	/* overlap error		 */
+	}
+
+    for (i = 0; i < 8; ++i)	/* special hole distance	 */
+	if (pcb[y+hy[i]][x+hx[i]] & (ahb | fb))
+	    return (1);		/* too close to hole		 */
+
+    for (i = 0; i < 12; ++i)	/* check for small passages	 */
+	if ((pcb[y+by[i]][x+bx[i]] & ahb) &&
+	    ((pcb[y+yt[i]][x+xt[i]] & vec) && !(pcb[y+yt[i]][x+xt[i]] & selb)))
+	    return (1);
+
+    for (i = x - 1; i <= x + 1; ++i)
+	for (j = y - 1; j <= y + 1; ++j)
+	    pcb[j][i] = ccc | (ccm & pcb[j][i]);
+
+    if (!batch)
+	dot (x, y);		/* update AED 			 */
+
+    for (i = 0; i < 12; ++i)	/* block small passages		 */
+	if (pcb[y+by[i]][x+bx[i]] & ahb)
+	    pxl (x + xt[i], y + yt[i]);
+
+    return (0);
+}
+
+dot (x, y)			/* plot a 3 by 3 rectangle on AED*/
+
+    int  x, y;
+{
+    int x1, y1, x2, y2;
+
+    x1 = (x - 1 > fx) ? x - 1 : fx;
+    x2 = (x < fx + 510) ? x + 1 : fx + 511;
+    y1 = (y - 1 > fy) ? y - 1 : fy;
+    y2 = (y < fy + 510) ? y + 1 : fy + 511;
+    if ((x1 <= x2) && (y1 <= y2))
+	rect (x1, y1, x2, y2);
+}
+
+dpin (x, y)		/* dot on pcb and AED (delete pin)	 */
+    int x, y;
+{
+    int     i, j, s, t;
+    static int  xt[12] = {3, 3, 3, 1, 0, -1, -3, -3, -3, 1, 0, -1};
+    static int  yt[12] = {1, 0, -1, 3, 3, 3, 1, 0, -1, -3, -3, -3};
+
+    s = (~ccm & ahb) ? pcb[y][x] & selb : 0;  /* select prot ?	 */
+
+    for (i = 0; i < 12; ++i)/* remove guard zones		 */
+	if (pcb[y + yt[i]][x + xt[i]] & ahb) {
+	    t = ccc | (ccm & pcb[y + yt[i]][x + xt[i]]);
+	    pcb[y + yt[i]][x + xt[i]] = (s && t & vec) ? t | s : t;
+	    if (!batch)
+		point (x + xt[i], y + yt[i]);
+	}
+
+    for (i = x - 1; i <= x + 1; ++i)
+	for (j = y - 1; j <= y + 1; ++j) {
+	    t = ccc | (ccm & pcb[j][i]);
+	    pcb[j][i] = (t & vec) ? t | s : t;
+	}
+
+    if (!batch)
+	dot (x, y);		/* update AED 			 */
+
+    return 0;	/* this 0 is used, even if lint does not think so  :-) */
+}
+
+ck_pin (x, y)			/* check possibe via hole position */
+    int x, y;
+/*******************************************************************\
+* 								    *
+*  A 1 is returned if it is possible to insert a via-hole at <x,y>  *
+* 								    *
+\*******************************************************************/
+{
+    int     i, j, k;
+    static int hx[8] = {3, 3, 0,-3,-3,-3, 0, 3};
+    static int hy[8] = {0, 3, 3, 3, 0,-3,-3,-3};
+    static int bx[12] = {5, 5, 5, 1, 0,-1,-5,-5,-5, 1, 0,-1};
+    static int by[12] = {1, 0,-1, 5, 5, 5, 1, 0,-1,-5,-5,-5};
+    static int xt[12] = {3, 3, 3, 1, 0,-1,-3,-3,-3, 1, 0,-1};
+    static int yt[12] = {1, 0,-1, 3, 3, 3, 1, 0,-1,-3,-3,-3};
+
+    for (i = x - 2; i <= x + 2; ++i)
+	for (j = y - 2; j <= y + 2; ++j) {
+	    k = pcb[j][i];
+	    if ((k & (fb | chb | ishb)) || ((k & vec) && !(k & selb)) ||
+		!(vec & ~k))
+		return 0; 	/* overlap error		 */
+	}
+
+    for (i = 0; i < 8; ++i)	/* special hole distance	 */
+	if (pcb[y+hy[i]][x+hx[i]] & (ahb | fb))
+	    return (0);		/* too close to hole		 */
+
+    for (i = 0; i < 12; ++i)	/* check for small passages	 */
+	if ((pcb[y+by[i]][x+bx[i]] & ahb) &&
+	    ((pcb[y+yt[i]][x+xt[i]] & vec) && !(pcb[y+yt[i]][x+xt[i]] & selb)))
+	    return (0);
+
+    return (1);			/* good place for a hole	 */
+}
+
+plt(x1, y1, x2, y2)			/* Plot a line		*/
+    int x1, y1, x2, y2;
+{
+    int     dx, dy, n;
+
+    if ((x1 != x2) && (y1 != y2) && (abs (x1 - x2) != abs (y1 - y2)))
+	err ("invalid slope", x1, y1, x2, y2);
+
+    if (!batch)
+	plts (x1, y1, x2, y2);
+
+    dx = (x1 < x2) - (x2 < x1);
+    dy = (y1 < y2) - (y2 < y1);
+
+    n = abs (x1 - x2);
+    if (!n)
+	n = abs (y2 - y1);
+
+    while (n >= 0) {
+	pcb[y1][x1] = ccc | (ccm & pcb[y1][x1]);
+	x1 += dx;
+	y1 += dy;
+	n--;
+    };
+};
+
+plts (x1, y1, x2, y2)		/* plot a line on the AED	 */
+    int x1, y1, x2, y2;
+{
+    int     t;
+
+    if (batch)
+	return;
+
+    if (y1 > y2) {		/* order y for y-band clipping	 */
+	t = x1;
+	x1 = x2;
+	x2 = t;
+	t = y1;
+	y1 = y2;
+	y2 = t;
+    };
+    t = ((x1 < x2) - (x2 < x1));
+
+    if (y1 < fy) {
+	if (y2 < fy)
+	    return;
+	x1 += (fy - y1) * t;
+	y1 = fy;
+    };
+
+    if (y2 > (fy + 511)) {
+	if (y1 > (fy + 511))
+	    return;
+	x2 -= (y2 - (fy + 511)) * t;
+	y2 = fy + 511;
+    };
+
+    if (x1 > x2) {		/* order x for x-band clipping	 */
+	t = x1;
+	x1 = x2;
+	x2 = t;
+	t = y1;
+	y1 = y2;
+	y2 = t;
+    };
+    t = (y1 < y2) - (y2 < y1);
+
+    if (x1 < fx) {
+	if (x2 < fx)
+	    return;
+	y1 += (fx - x1) * t;
+	x1 = fx;
+    };
+
+    if (x2 > (fx + 511)) {
+	if (x1 > (fx + 511))
+	    return;
+	y2 -= (x2 - (fx + 511)) * t;
+	x2 = fx + 511;
+    };
+
+    if (x1 <= x2)
+	plts1 (x1, y1, x2, y2);
+    else
+	plts1 (x2, y2, x1, y1);
+}
+
+plts1 (x1, y1, x2, y2)		/* plot line on aed		 */
+    int x1, y1, x2, y2;
+{
+    int     t;
+
+    if ((x1 & 0xfffffe00) != (x2 & 0xfffffe00)) {
+	t = (y2 > y1) - (y2 < y1);
+	x1 &= 511;
+	plts1 (0, y1 + (512 - x1) * t, x2 & 511, y2);
+	x2 = 511;
+	y2 = y1 + (511 - x1) * t;
+    };
+
+    if (y2 < y1) {	/* this could be optimized with more thinking */
+	t = y1;
+	y1 = y2;
+	y2 = t;
+	t = x1;
+	x1 = x2;
+	x2 = t;
+    };
+
+    if ((y1 & 0xfffffe00) != (y2 & 0xfffffe00)) {
+	t = (x2 > x1) - (x2 < x1);
+	y1 &= 511;
+	plts1 (x1 + (512 - y1) * t, 0, x2, y2 & 511);
+	y2 = 511;
+	x2 = x1 + (511 - y1) * t;
+    };
+
+    move (x1, y1);
+    draw (x2, y2);
+}
+
+menu (s, n)			/* menu function select		 */
+    char *s[];
+    int n;
+/*********************************************************************\
+* 								      *
+* The <n> strings will be displayed on the screen. If the cursor      *
+* is clicked (any key) on a string, the coresponding number <0..n-1>  *
+* is returned. Otherwise, a -1 will be returned.		      *
+* 								      *
+\*********************************************************************/
+{
+    int     i, j, x, y;
+
+    if (cz > 2)			/* No menu on large zooms	 */
+	zoom (2);
+    msg_off ();
+
+    j = (cz == 1) ? 13 : 8;	/* line spaceing		 */
+
+    color (resb, resb);
+
+    for (i = 0; i < n; i++)
+	atext (wx + 20 / cz, wy + 462 / cz - (i + 1) * j, s[i], 2 - cz);
+
+    i = getcur (&x, &y);
+    if (i < 0)
+	err ("menu: couldn't read cursor", i, x, y, 0);
+
+    color (0, resb);
+    rect (wx + 20 / cz, wy + 452 / cz - n * j, wx + 300 / cz, wy + 462 / cz);
+
+    if (x >= wx + 20 / cz  && x < wx + 160 &&
+	y <= wy + 462 / cz && y > wy + 462 / cz - n * j) {
+	msg_on ();
+	return ((wy + 462 / cz - y) / j);}
+    else {
+	err_msg ("Nothing selected");
+	return (-1);
+    }
+}
+
+clp_plt (x0, y0, x1, y1, xl, yl, xh, yh)	/* clip plot	 */
+    int x0, y0, x1, y1, xl, yl, xh, yh;
+{
+    float   a, b, c;
+    int     t;
+
+    if (batch)			/* redundant			 */
+	return;
+
+    if (xh < xl || yh < yl ||
+	    ((x0 < xl && x1 < xl) || (x0 > xh && x1 > xh)) ||
+	    ((y0 < yl && y1 < yl) || (y0 > yh && y1 > yh)))
+	return;			/* nothing to plot		 */
+
+    if (x0 == x1 && y0 == x1) {	/* just one point		 */
+	point (x0, x1);
+	return;
+    }
+
+    a = y0 - y1;		/* get vector equation		 */
+    b = x1 - x0;
+    c = y0 * x1 - x0 * y1;
+
+    if (x0 > x1) {		/* insure x0 <= x1		 */
+	t = x0;
+	x0 = x1;
+	x1 = t;
+	t = y0;
+	y0 = y1;
+	y1 = t;
+    }
+
+    if (x0 < xl) {		/* xl - clip			 */
+	x0 = xl;
+	y0 = (b == 0.0) ? y0 : (c - a * (float) xl) / b;
+    }
+
+    if (x1 > xh) {		/* xh - clip			 */
+	x1 = xh;
+	y1 = (b == 0.0) ? y1 : (c - a * (float) xh) / b;
+    }
+
+    if (y0 > y1) {		/* insure y0 <= y1		 */
+	t = x0;
+	x0 = x1;
+	x1 = t;
+	t = y0;
+	y0 = y1;
+	y1 = t;
+    }
+
+    if (y0 > yh || y1 < yl)	/* out of area ?		 */
+	return;
+
+    if (y0 < yl) {		/* yl - clip			 */
+	y0 = yl;
+	x0 = (a == 0.0) ? x0 : (c - b * (float) yl) / a;
+    }
+
+    if (y1 > yh) {		/* yh - clip			 */
+	y1 = yh;
+	x1 = (a == 0.0) ? x1 : (c - b * (float) yh) / a;
+    }
+
+    if (x0 == x1 && y0 == x1)	/* draw result			 */
+	point (x0, x1);
+    else {
+	move (x0, y0);
+	draw (x1, y1);
+    }
+}
+
+aed_plt (x0, y0, x1, y1)	/* plot on aed within window	 */
+    int x0, y0, x1, y1;
+{
+    int     xl, yl, xh, yh;
+    static int  msk = 0xfffffe00;
+
+    xl = wx;
+    xh = wx + 511 / cz;
+    yl = wy;
+    yh = wy + 482 / cz;
+
+    if ((xl&msk) != (xh&msk)) {	/* need to split x		 */
+	if ((yl&msk) != (yh&msk)) {/* need to split y		 */
+	    clp_plt (x0, y0, x1, y1, xl, yl, (xl&msk) + 511, (yl&msk) + 511);
+	    clp_plt (x0, y0, x1, y1, (xl&msk) + 512, yl, xh, (yl&msk) + 511);
+	    clp_plt (x0, y0, x1, y1, xl, (yl&msk) + 512, (xl&msk) + 511, yh);
+	    clp_plt (x0, y0, x1, y1, (xl&msk) + 512, (yl&msk) + 512, xh, yh);}
+	else {
+	    clp_plt (x0, y0, x1, y1, xl, yl, (xl&msk) + 511, yh);
+	    clp_plt (x0, y0, x1, y1, (xl&msk) + 512, yl, xh, yh);
+	}}
+    else {
+	if ((yl&msk) != (yh&msk)) {/* need to split y */
+	    clp_plt (x0, y0, x1, y1, xl, yl, xh, (yl&msk) + 511);
+	    clp_plt (x0, y0, x1, y1, xl, (yl&msk) + 512, xh, yh);}
+	else
+	    clp_plt (x0, y0, x1, y1, xl, yl, xh, yh);
+    }
+}
+
+
+chg_color ()
+/************************************************\
+* 						 *
+*  Change color: interactive changing of colors	 *
+* 						 *
+\************************************************/
+{
+    register int    i, j, bs, bl, x, y;
+    int             ix, iy;
+    char            *ln[ncolors + 1];
+    struct color_tab t;
+
+    ln[0] = "flip sides";
+    for (i = 0; i < ncolors; i++)
+	ln[i + 1] = Color_tab[i].name;
+
+    if (0 <= (i = menu (ln, ncolors + 1))) {	/* change it	 */
+
+        if (!i) {			/* just flip s1b/s2b	 */
+	    t = Color_tab[CT_s1_n];
+	    Color_tab[CT_s1_n] = Color_tab[CT_s2_n];
+	    Color_tab[CT_s2_n] = t;
+	    t = Color_tab[CT_s1_s];
+	    Color_tab[CT_s1_s] = Color_tab[CT_s2_s];
+	    Color_tab[CT_s2_s] = t;
+	    ldcmp ();
+	    return;}
+        else
+	    i--;
+
+	j = (cz == 1) ? 13 : 8;	/* line spaceing		 */
+	x = wx + 20 / cz;	/* x-start point		 */
+	y = wy + 462 / cz;	/* y-start point		 */
+	bs = wx + 128 / cz;	/* bar start			 */
+	bl = (cz == 1) ? 255 : 127;	/* bar length		 */
+
+ 	msg_off ();
+	color (resb, resb);
+
+	draw_bar (x, y, "Red", Color_tab[i].r, bs, bl, j);
+	draw_bar (x, y - j, "Green", Color_tab[i].g, bs, bl, j);
+	draw_bar (x, y - j * 2, "Blue", Color_tab[i].b, bs, bl, j);
+
+	while (getcur (&ix, &iy) < 4) {	/* change it		 */
+	    if (ix < bs || ix > (bs + bl))
+		break;
+	    ix = (ix - bs) * cz;
+	    iy = (iy - (y - 2 * j)) / j;
+	    if (iy < 0 || iy > 2)
+		break;
+	    switch (iy) {
+		case 0: 	/* blue				 */
+		    Color_tab[i].b = ix;
+		    new_bar (y - 2 * j, ix, bs, bl, j - 3);
+		    break;
+		case 1: 	/* Green			 */
+		    Color_tab[i].g = ix;
+		    new_bar (y - j, ix, bs, bl, j - 3);
+		    break;
+		case 2: 	/* red				 */
+		    Color_tab[i].r = ix;
+		    new_bar (y, ix, bs, bl, j - 3);
+		    break;
+	    }
+	    ldcmp ();
+	}
+
+	color (0, resb);	/* clean it			 */
+	rect (x, y - 2 * j, x + 384 / cz, y + j);
+	msg_on ();
+    }
+}
+
+draw_bar (x, y, s, v, bs, bl, dy)	/* draw a value bar	 */
+    int x, y, v, bs, bl, dy;
+    char *s;
+{
+    atext (x, y, s, 2 - cz);
+    new_bar (y, v, bs, bl, dy - 3);
+}
+
+new_bar (y, v, bs, bl, dy)		/* plain bar		 */
+    int y, v, bs, bl, dy;
+{
+    color (resb, resb);
+    rect (bs, y, bs + bl, y + dy);
+    v /= cz;
+    if (v < (bl - 1) && v >= 0) {/* the value (v) should be in [0,255] */
+	color (0, resb);
+	rect (bs + v + 1, y + 1, bs + bl - 1, y + dy - 1);
+	color (resb, resb);
+    }
+}
+
+struct nlst *deq_NL ()		/* alocate a NL element		 */
+{
+    register struct nlst *p;
+
+    if (V.enll) {		/* recycle old ones		 */
+	p = V.enll;
+	V.enll = p -> n;}
+    else {
+	if (V.nnl >= nlmax)
+	    err ("Net list space too small: increase 'nlmax'", nlmax, 0, 0,0);
+	p = &NL[V.nnl++];
+    }
+
+    return p;
+}
+
+	
+!E!O!F!
+#
+# type    sh /usru0/agn/pcb/distr/../usenet/part7   to unpack this archive.
+#
+echo extracting pwide.c...
+cat >pwide.c <<'!E!O!F!'
+/***************************************************************\
+*								*
+*	PCB program						*
+*								*
+*	Wide wire support stuff					*
+*								*
+*	(c) 1985	A. Nowatzyk				*
+*								*
+\***************************************************************/
+
+#include <stdio.h>
+#include "pparm.h"
+#include "pcdst.h"
+
+extern char uc_tab[];			/* see pwork: ck_rdnb		 */
+extern int pdr[8];			/* offset direction table	 */
+extern int sp[9][2];			/* search pattern		 */
+extern char drc_tab1[256];		/* drc decision table		 */
+
+static char **pnt_lst = 0;		/* point list			 */
+static int pnt_max = xmax;		/* max number of points		 */
+static int pnt_cnt;			/* point count			 */
+
+static int side;			/* side to work on		 */
+
+fnd_pnt (x, y)
+    int x, y;
+/**************************************************************************\
+* 									   *
+*   find points: (similar to fnd_seg of pplow.c)			   *
+*     <x,y> must point to a part of a trace on side "side". fnd_pnt dumps  *
+*     the pointer to all bits of that segment on the segment list. The	   *
+*     segment is terminated by either the center of a hole, the center	   *
+*     of a 'Y' or the last point of a floating end. The terminating	   *
+*     point *is* added to the segment list.				   *
+* 									   *
+\**************************************************************************/
+{
+    register int i;
+
+    if (!pnt_lst) {		/* alloacte point list	 */
+	pnt_lst = (char **) malloc (sizeof (char *) * pnt_max);
+    }
+    pnt_cnt = 0;		/* reset point list counter	 */
+
+    if (!(pcb[y][x] & side))
+	return;			/* no start point !!		 */
+
+    for (i = 0; i <= 8; i++)	/* find direction		 */
+	if (pcb[y + dr[i][1]][x + dr[i][0]] & side)
+	   break;
+
+    if (i > 7)
+	return;			/* start on single point ??	 */
+
+				/* scan one way			 */
+    pnt_scan (&pcb[y][x], i, side);
+				/* scan the other way		 */
+    pnt_scan (&pcb[y + dr[i][1]][x + dr[i][0]], (i + 4) & 7, side);
+}
+
+pnt_scan (p, d, s)
+    char *p;
+    int d, s;
+/****************************************************************\
+* 								 *
+*  Point scan:							 *
+*    <p> points to the start point. <d> is the direction of the	 *
+*    next point. The next point will be added to the list. Scan	 *
+*    stops if that point was a terminal, that is the center of	 *
+*    a hole, a 'Y' or an floating end.				 *
+* 								 *
+\****************************************************************/
+{
+    register char *pp;
+    register int i, j = d, ss = ~s, k, l;
+    int m;
+
+    pp = p + pdr[j];
+
+    do {
+
+        if (pnt_cnt >= pnt_max) {	/* need more space	 */
+	    pnt_max += 10 + pnt_max / 2;
+	    pnt_lst = (char **) realloc (pnt_lst, sizeof (char *) * pnt_max);
+	}
+
+	pnt_lst[pnt_cnt++] = pp;	/* add point		 */
+	
+	i = 0;
+        if (*(pp        + 1) & ~ss) i++;
+        if (*(pp + xmax + 1) & ~ss) i++;
+        if (*(pp + xmax    ) & ~ss) i++;
+        if (*(pp + xmax - 1) & ~ss) i++;
+        if (*(pp        - 1) & ~ss) i++;
+        if (*(pp - xmax - 1) & ~ss) i++;
+        if (*(pp - xmax    ) & ~ss) i++;
+        if (*(pp - xmax + 1) & ~ss) i++;
+
+	if (i > 2) {		/* check for a real Y		 */
+	    for (m = 0; m < 8; m++)
+		if (*(pp + pdr[m]) & ~ss) {
+		    k = 0;
+		    for (l = 0; l < 8; l++)
+			if (*(pp + pdr[m] + pdr[l]) & ~ss)
+			    k |= 1 << l;
+		    i -= uc_tab[k];
+		}
+	}
+
+        if (i != 2) break;	/* floating or Y terminal point	 */
+
+        if (*pp & ahb &&	/* hole terminal point check	 */
+	    *(pp        + 1) & ahb &&
+	    *(pp + xmax + 1) & ahb &&
+	    *(pp + xmax    ) & ahb &&
+	    *(pp + xmax - 1) & ahb &&
+	    *(pp        - 1) & ahb &&
+	    *(pp - xmax - 1) & ahb &&
+	    *(pp - xmax    ) & ahb &&
+	    *(pp - xmax + 1) & ahb    ) break;
+
+        for (i = 6; i < 11; i++)	/* find new direction	 */
+	    if (*(pp + pdr[(j + i) & 7]) & ~ss)
+		break;
+	pp += pdr[j = (j + i) & 7];
+
+    } while (i < 11);
+}
+
+expand (n)			/* widen wire by n		 */
+    int n;
+{
+    static int wt5[12] = 
+	{2, xmax + 2, 2 * xmax + 1, 2 * xmax, 2 * xmax - 1, xmax - 2,
+	 -2, -2 - xmax, -1 - 2 * xmax, -2 * xmax, 1 - 2 * xmax, 2 - xmax};
+    static int *wt[2] = {pdr, wt5};
+    static int wl[2] = {8, 12};
+    register int i, j, k, t;
+    register char *p;
+
+    if (n < 0 || n > 1)
+	return;			/* you may want to add 2, 3...	 */
+
+    t = ~side;			/* DRC test			 */
+
+    for (i = 0; i < pnt_cnt; i++)
+	for (j = 0; j < wl[n]; j++) {
+	    p = pnt_lst[i] + wt[n][j];	/* new candidate	 */
+	    if (*p & side)
+		continue;		/* already taken	 */
+
+	    for (k = 0; k < 8; k++) 	/* check DRC		 */
+		if (drc_tab1[*(p + pdr[k]) & 0xff] & ~t)
+		    break;
+
+	    if (k >= 8)			/* ok			 */
+		pxl (((int) p - (int) pcb) % xmax,
+		     ((int) p - (int) pcb) / xmax);
+	}
+}
+
+wide_wire (ctx)			/* wide wire function		 */
+    int ctx;
+{
+    struct nlhd *get_net (), *net;
+    register int i, j;
+    int x, y;
+    static char *mtext[] = {
+	"13 mil (default)",
+	"38 mil",
+	"63 mil"
+    };
+
+    err_msg ("Point to wire");
+    getcur (&x, &y);
+
+    for (i = 0; i < 9; i++)	/* look for wire		 */
+	if (pcb[y + sp[i][1]][x + sp[i][0]] & vec)
+	    break;
+
+    if (i >= 9) {
+	err_msg ("No wire found");
+	return ctx;
+    }
+
+    x += sp[i][0];		/* update wire pointer		 */
+    y += sp[i][1];
+    side = pcb[y][x] & vec;
+    if (side == vec)
+	side = top_side;
+
+    for (i = 0, j = 0; i < 8; i++)
+	if (pcb[y + dr[i][1]][x + dr[i][0]] & side)
+	    j++;
+    if (j > 2) {
+	err_msg ("no expand on expanded wire");
+	return ctx;
+    }
+
+    switch (menu (mtext, 3)) {
+	case 1:
+	    i = 1;		/* 2 raster units + line width	 */
+	    break;
+	case 2:
+	    i = 2;		/* 4 raster units + line width	 */
+	    break;
+	default:
+	    err_msg ("No change made");
+	    return ctx;
+    }
+
+    net = get_net (x, y, side);	/* find net			 */
+
+    if (V.cnet != net) {	/* select it			 */
+	if (V.cnet)
+	    deseln (V.cnet);
+	selnet (net);
+    }
+
+    fnd_pnt (x, y);		/* find the stuff		 */
+
+    color (selb | side, selb | side);	/* set up color		 */
+    for (j = 0; j < i; j++)
+	expand (j);		/* here we go			 */
+
+    for (i = 0; i < pnt_cnt; i++)
+	if (*pnt_lst[i] & ahb) {	/* clean up holes	 */
+	    x = ((int) pnt_lst[i] - (int) pcb) % xmax;
+	    y = ((int) pnt_lst[i] - (int) pcb) / xmax;
+	    ckgp (x, y, s1b);
+	    ckgp (x, y, s2b);
+	}
+
+    return net_sel (START);
+}
+!E!O!F!
+
+

@@ -1,0 +1,1227 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,93b8923724e9886c,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-04-23 07:51:00 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: Notesfiles $Revision: 1.6.2.14 $; site siemens.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!princeton!siemens!jcc
+From: jcc@siemens.UUCP
+Newsgroups: net.sources
+Subject: DMZ Driver posted
+Message-ID: <28600011@siemens.UUCP>
+Date: Tue, 23-Apr-85 10:51:00 EST
+Article-I.D.: siemens.28600011
+Posted: Tue Apr 23 10:51:00 1985
+Date-Received: Wed, 24-Apr-85 03:42:40 EST
+Lines: 1206
+Nf-ID: #N:siemens:28600011:000:32417
+Nf-From: siemens!jcc    Apr 23 10:51:00 1985
+
+
+<>
+	Since I had numerous requests for the DMZ32 driver, I decided
+	to post is to the net.  The files are in shar format.  I have
+	included our /dev/MAKEDEV.local which makes the necessary devices
+	for the dmz.  I chose to use /dev/tty[a-z][a-x] as the nodes to 
+	represent the terminals.  The major device number is 34. 
+	Instructions for installing device drivers can be found in 
+	the paper "Building Systems With Config".  Since all of our terminals
+	our hard-wired (with minimum wiring), I have not yet tested the
+	modem control software.  Please let me know if you have any problems
+	or discover any bugs.
+
+						Joe Camaratta
+						princeton!siemens!jcc
+
+	--- CUT HERE ---
+#
+# type    sh dmz.shar   to unpack this archive.
+#
+echo extracting dmz.c...
+cat >dmz.c <<'!E!O!F!'
+/* DMZ-32 driver */
+
+/* HISTORY
+ * 23-Apr-85  Joe Camaratta (jcc) at Siemens RTL
+ *	Driver for DEC's DMZ32 24-line asynchronous multiplexor.
+ *	NOTE: The modem control routines have NOT been tested yet!!!
+ *
+*/
+
+#include "dmz.h"
+#if NDMZ > 0
+
+
+#include "../machine/pte.h"
+
+#include "bk.h"
+#include "../h/param.h"
+#include "../h/conf.h"
+#include "../h/dir.h"
+#include "../h/user.h"
+#include "../h/ioctl.h"
+#include "../h/tty.h"
+#include "../h/map.h"
+#include "../h/buf.h"
+#include "../h/vm.h"
+#include "../h/bk.h"
+#include "../h/clist.h"
+#include "../h/file.h"
+#include "../h/uio.h"
+#include "../h/kernel.h"
+
+#include "../vaxuba/ubareg.h"
+#include "../vaxuba/ubavar.h"
+#include "../vaxuba/dmzreg.h"
+
+/* Definition of the driver for the autoconfiguration program */
+int dmzprobe(), dmzattach(), dmzrint(), dmzxint();
+struct uba_device *dmzinfo[NDMZ];
+u_short dmzstd[] = {0, 0};
+struct uba_driver dmzdriver =
+	{
+	dmzprobe, 0, dmzattach, 0, dmzstd, "dmz", dmzinfo
+	};
+
+#define NDMZLINES (NDMZ*24)
+
+int ttrstrt();
+struct tty dmz_tty[NDMZLINES];
+
+/* the purpose of this array is to contain the flags field, the flags */
+/* field represents a line which should be treated as a carrier always */
+/* present. */
+int dmzsoftCAR[NDMZ];
+
+struct{
+	char dmz_state;		/* dmz state */
+	int dmz_count;		/* dmz dma count */
+} dmz_softc[NDMZ*24];
+
+#define ST_TXOFF	(0x01)	/* transmission turned off (^S) */
+#define ST_DMA		(0x02)	/* dma inprogress	*/
+#define ST_INBUSY	(0x04)	/* stop transmission in busy */
+
+char dmz_speeds[] = 
+	{
+	0, 0, 1, 2, 3, 4, 0, 5, 6, 7, 010, 012, 014, 016, 017, 0 
+	};
+
+short dmzact[NDMZ];	/* Mask of active octets on the dmz	*/
+int dmzstart();
+
+/* Constant for the number of milliseconds characters can sit it the	*/
+/* input silo without causing an interrupt. If data overruns or slow	*/
+/* XON/XOFF occur, set it lower but AT LEAST equal to 1			*/
+#define SILO_TIMEOUT	(3)
+
+/* Constant for number of characters at which the driver uses DMA mode	*/
+#define DO_DMA_COUNT	(10)
+
+#define TRUE (1)
+#define FALSE (0)
+
+/* The clist space is mapped by the driver onto each UNIBUS */
+static int cbase[MAXNUBA];	/* base address in unibus map */
+int dmz_ubinfo[MAXNUBA];	/* info about allocated unibus map */
+
+/* The UBACVT macro converts a clist space address for unibus uban 	*/
+/* into an i/o space address for the DMA routine.			*/
+#define	UBACVT(x, uban)	    (cbase[uban] + ((x) - (char *)cfree))
+
+/* These flags are for debugging purposes only */
+int dmz_dma_on = 1;
+int dmz_debug_level;
+
+/* Routine for autoconfig to probe to see if dmz exists */
+
+/* This is a "bare minimum" routine which just initializes br and cvec */
+dmzprobe(reg)
+caddr_t reg;
+{
+	register int br,cvec;	/* these are 'value-result' */
+				/* will be r10 and r11 */
+
+	register struct dmzdevice *dmz_addr;
+	register unsigned int a;
+
+	dmz_addr = (struct dmzdevice *)reg;
+
+#ifdef lint
+	br = 0; cvec = br; br = cvec; dmzxinta(0); dmzxintb(0); dmzxintc(0);
+	dmzrinta(0); dmzrintb(0); dmzrintc(0);
+#endif
+
+	/* Interrupt level is 15 */
+	br = 0x15;
+
+	/* Check to see if 3 octets are present				*/
+	a = dmz_addr->dmz_config;
+	if(((a>>12) & (~DMZ_INTERFACE)) != 0){
+		printf("	Unknown interface type\n");
+		return(0);
+	}
+	if(((a>>8) & DMZ_NOC_MASK) != 3){
+		printf("	Not all octets are available\n");
+		return(0);
+	}
+
+	/* There are 6 interrupt vectors ( 2 per octet, receive and 	*/
+	/* transmit) and 4 bytes/vector					*/
+	cvec = (uba_hd[numuba].uh_lastiv -= 4 * 6);
+	dmz_addr->dmz_config = (cvec >> 2);
+
+	/* Of course, need to save it somewhere for other devices */
+	return(sizeof(struct dmzdevice));
+}
+
+dmzattach(ui)
+struct uba_device *ui;
+{
+	dmzsoftCAR[ui->ui_unit] = ui->ui_flags;
+	return;
+}
+
+/* ARGSUSED */
+
+dmzopen(device,flag)
+dev_t device;
+int flag;
+{
+	register struct tty *tp;
+	register int unit,controller;
+	register struct dmzdevice *dmz_addr;
+	register struct uba_device *ui;
+	int priority;
+	int xstatus;
+	int octet;
+
+	unit = minor(device);
+	controller = DMZ(unit);
+	octet = OCTET(unit);
+
+	/* Test for invalid unit */
+   if(unit >= NDMZLINES || (ui=dmzinfo[controller]) == 0 || ui->ui_alive == 0)
+	return(ENXIO);
+
+	tp = &dmz_tty[unit];
+
+	/* Test for exclusive use flag */
+	if(tp->t_state & TS_XCLUDE && u.u_uid != 0)
+		return(EBUSY);
+
+	dmz_addr = (struct dmzdevice *)ui->ui_addr;
+	tp->t_addr = (caddr_t)dmz_addr;
+	tp->t_oproc = dmzstart;
+	tp->t_state |= TS_WOPEN;
+
+	/* Set up Unibus map registers. Block uba resets which can 	*/
+	/* clear the state						*/
+	
+	priority = spl5();
+	if(dmz_ubinfo[ui->ui_ubanum] == 0){	/* check to see if this was */
+						/* aleady done by a dmz on  */
+						/* this unibus		    */
+		dmz_ubinfo[ui->ui_ubanum] = 
+			uballoc(ui->ui_ubanum, (caddr_t)cfree,
+				nclist * sizeof(struct cblock),0);
+		/* Check to see that we got the space we needed */
+		if(dmz_ubinfo[ui->ui_ubanum] == 0){
+		  printf("dmz: Could not allocate enough unibus map regs\n");
+		  return(-1); /* Is this the right thing to return? */
+		}
+		cbase[ui->ui_ubanum] = dmz_ubinfo[ui->ui_ubanum] & 0x3ffff;
+	}
+
+
+/* CHECK */
+	/* If the octet on the dmz is inactive, activate it. */
+	if((dmzact[controller] & (1 << octet)) == 0){
+		dmz_addr->octet[octet].octet_csr |= DMZ_IE;
+		dmzact[controller] |= (1 << octet);
+	       dmz_addr->octet[octet].octet_receive.octet_sato = SILO_TIMEOUT;
+	}
+
+	splx(priority);
+
+	if((tp->t_state & TS_ISOPEN) == 0){
+		ttychars(tp);
+		if(tp->t_ispeed == 0){
+			tp->t_ispeed = tp->t_ospeed = B300;
+			tp->t_flags = ODDP | EVENP | ECHO;
+		}
+		dmzparam(unit);
+		dmz_softc[unit].dmz_state = 0;
+	}
+
+	/* Wait for carrier, then process line discipline specific open */
+	if((dmzmctl(device,DMZ_ON,DMSET) & (DMZ_CAR << 8)) ||
+	   (dmzsoftCAR[controller] & ( 1 << unit)))
+		tp->t_state |= TS_CARR_ON;
+	priority=spl5();	
+	while ((tp->t_state & TS_CARR_ON) == 0){
+		tp->t_state |= TS_WOPEN;
+		sleep((caddr_t) & tp->t_rawq, TTIPRI);
+	}
+	splx(priority);
+
+	xstatus = (*linesw[tp->t_line].l_open)(device,tp);
+	return(xstatus);
+}
+
+/* Set parameters from open or stty into the DMZ hardware registers. 	*/
+/* Block interrupts so parameters will be set before the line interrupts*/
+/* If terminal speed is set to 0, hang up on last closem turn modem off	*/
+/* and return to caller.						*/
+
+dmzparam(unit)
+register int unit;
+{
+
+	register struct tty *tp;
+	register struct dmzdevice *dmz_addr;
+	register int line_parameters, line_control;
+	register int octet;
+	int priority;
+
+	octet = OCTET(unit);
+
+	tp = &dmz_tty[unit];
+	dmz_addr = (struct dmzdevice *)tp->t_addr;
+
+	priority = spl5();
+	if ((tp->t_ispeed) == 0){
+		tp->t_state |= TS_HUPCLS;	/* hang up on last close */
+		(void) dmzmctl(unit,DMZ_OFF,DMSET); /* stuff these in */
+						    /* lctmr register */
+		return;
+	}
+
+	/* Set up line parameters and control information */
+	/* octet_lprm register */
+
+	/* transmit baud rate is in bits 15-12 and receive baud rate */
+	/* is in bits 11-08 */
+	line_parameters = 
+	   (dmz_speeds[tp->t_ospeed] << 12) | (dmz_speeds[tp->t_ispeed] << 8);
+	/* Set modem interrupt enable, receive enable, and transmit enable */
+	/* in lctmr register */
+	line_control = DMZ_LCE;
+
+	/* The following code is taken directly from the DMF driver */
+	/* START OF DMF CODE */
+    if ((tp->t_ispeed) == B134)
+        {
+        line_parameters |= DMZ_6BT | DMZ_PEN;
+	}
+    else if (tp->t_flags & (RAW | LITOUT))
+        {
+        line_parameters |= DMZ_8BT;
+	}
+     else
+        {
+        line_parameters |= DMZ_7BT | DMZ_PEN;
+	}
+    if (tp->t_flags & EVENP)
+        line_parameters |= DMZ_EPR;
+    if ((tp->t_ospeed) == B110)
+        line_parameters |= DMZ_SCD;
+    line_parameters |= (unit & 07);
+	/* END OF DMF CODE */
+
+     dmz_addr->octet[octet].octet_lprm = line_parameters;
+     dmz_addr->octet[octet].octet_csr = DMZ_IE | IR_LCTMR | (unit & 07);
+     dmz_addr->octet[octet].octet_lctmr = 
+	(dmz_addr->octet[octet].octet_lctmr | (line_control &0xff));
+     splx(priority);
+     return;
+}
+
+/* Routine to close a DMZ32 line */
+
+/* ARGSUSED */
+
+dmzclose(device,flag)
+dev_t device;
+int flag;
+{
+
+	register struct  tty *tp;
+	register int unit;
+
+	unit = minor(device);
+	tp = &dmz_tty[unit];
+
+	/* Break, hang-up and close the modem. Return to caller */
+	(void) dmzmctl(unit,DMZ_BRK,DMBIC);
+	if(tp->t_state & TS_HUPCLS || (tp->t_state & TS_ISOPEN) == 0)
+		(void)dmzmctl(unit,DMZ_OFF,DMSET);
+	ttyclose(tp);
+	return;
+}
+
+/* Reset state of driver if UBA reset was necessary.  Reset the csr,	*/
+/* lprm, and lctmr registers on open lines, and restart transmitters	*/
+
+dmzreset(uban)
+int uban;
+{
+	register int controller,unit;
+	register struct tty *tp;
+	register struct uba_device *ui;
+	register struct dmzdevice *dmz_addr;
+	int i;
+	int octet;
+
+	/* Set up Unibus registers */
+	if(dmz_ubinfo[uban] == 0)
+		return;
+	dmz_ubinfo[uban] =
+		uballoc(uban, (caddr_t)cfree, nclist*sizeof(struct cblock),0);
+	cbase[uban] = dmz_ubinfo[uban] & 0x3ffff;
+
+	for(controller = 0; controller < NDMZ; controller++){
+		ui = dmzinfo[controller];
+		if(ui == 0 || ui->ui_alive == 0 || ui->ui_ubanum != uban)
+			continue;
+		printf("dmz%d ",controller);
+		dmz_addr = (struct dmzdevice *)ui->ui_addr;
+
+		for(octet=0;octet<3;octet++){
+			/* If an octet was previously active,	*/
+			/* reactivate it			*/
+			if((dmzact[controller] & (1 << octet)) != 0){
+	                   dmz_addr->octet[octet].octet_csr |= DMZ_IE;
+	                   dmz_addr->octet[octet].octet_receive.octet_sato = SILO_TIMEOUT;
+			}
+		}
+
+		unit = controller * 24;
+
+		/* If a unit is open or waiting for open to complete,	*/
+		/* reset it.						*/
+		for(i=0;i<24;i++){
+			dmz_softc[unit].dmz_state = 0;
+			tp = &dmz_tty[unit];
+
+			if(tp->t_state & (TS_ISOPEN | TS_WOPEN)){
+				dmzparam(unit);
+				(void) dmzmctl(unit,DMZ_ON,DMSET);
+				tp->t_state &= ~TS_BUSY;
+				dmzstart(tp);
+			}
+			unit++;
+		}
+	}
+	return;
+}
+
+/* Routine to read a DMZ32 line */
+
+dmzread(device,uio)
+dev_t device;
+struct uio *uio;
+{
+	register struct tty *tp;
+	int xstatus;
+
+	tp = &dmz_tty[minor(device)];
+	xstatus = (*linesw[tp->t_line].l_read)(tp,uio);
+	return(xstatus);
+}
+
+/* Routine to write a DMZ32 line */
+
+dmzwrite(device,uio)
+dev_t device;
+struct uio *uio;
+{
+	register struct tty *tp;
+	int xstatus;
+
+       tp = &dmz_tty[minor(device)];
+       xstatus = (*linesw[tp->t_line].l_write)(tp,uio);
+       return(xstatus);
+}
+
+/* Routines to process a receiver interrupt on an octet */
+dmzrinta(controller)
+int controller;
+{
+	dmzrint(controller,0);
+}
+
+dmzrintb(controller)
+int controller;
+{
+	dmzrint(controller,1);
+}
+
+dmzrintc(controller)
+int controller;
+{
+	dmzrint(controller,2);
+}
+
+/* Routine to process a DMZ32 receiver interrupt */
+
+dmzrint(controller,octet)
+int controller;
+int octet;
+{
+	register struct tty *tp;
+	register int character;
+	register struct dmzdevice *dmz_addr;
+	register struct tty *tp0;
+	register struct uba_device *ui;
+	int overrun, priority;
+	int unit;
+
+
+	overrun = 0;
+	ui = dmzinfo[controller];
+	if (ui == 0 || ui->ui_alive == 0)
+		return;
+	dmz_addr = (struct dmzdevice *)ui->ui_addr;
+	tp0 = &dmz_tty[controller*24];	/* address of the first line on	*/
+					/* the controller		*/
+
+	/* Loop fetching characters from the silo for this dmz until	*/
+	/* there are no more in the silo				*/
+
+	/* while data valid bit (bit 15) is set */
+   while((character = dmz_addr->octet[octet].octet_receive.octet_rb) < 0){
+		unit = (character >> 8) & 07;	/* unit is bits 8-10 of rb */
+
+		tp = tp0 + (octet * 8 + (unit & 07));
+		/* if there has been a change in the modem line */
+		if(character & DMZ_DSC){
+			/* if there is NOT a constant carrier */
+			if(!(dmzsoftCAR[controller] & 
+				(1 << (octet * 8 + (unit & 07))))){
+				priority = spl5();
+				/* select RMS register */
+				dmz_addr->octet[octet].octet_csr = 
+					DMZ_IE | IR_RMS | (unit & 07);
+				/* if carrier is detected */
+			   if(dmz_addr->octet[octet].octet_rms & DMZ_CAR){
+				/* if carrier in not already on, wakeup	*/
+				/* whoever is sleeping on this event	*/
+				/* (see DMZOPEN) and mark carrier 	*/
+				if((tp->t_state & TS_CARR_ON) == 0){
+					wakeup((caddr_t) &tp->t_rawq);
+					tp->t_state |= TS_CARR_ON;
+				}
+			   }
+				/* else carrier is dropped */
+			   else{
+				/* if carrier is on */
+				if(tp->t_state & TS_CARR_ON){
+					/* kill of jobs in process grp	*/
+					gsignal(tp->t_pgrp,SIGHUP);
+					gsignal(tp->t_pgrp,SIGCONT);
+					/* select the LCTMR register	*/
+					dmz_addr->octet[octet].octet_csr =
+					   DMZ_IE | IR_LCTMR | (unit & 07);
+					/* clear TMS register */
+					dmz_addr->octet[octet].octet_lctmr =
+					   dmz_addr->octet[octet].octet_lctmr&
+					   ((DMZ_OFF<<8) | 0xff);
+					/* flush r/w queues */
+					ttyflush(tp,FREAD|FWRITE);
+				}
+				/* mark carrier off */
+				tp->t_state &= ~TS_CARR_ON;
+			   }
+			splx(priority);
+			}
+			continue;	/* if constant carrier exists */
+		}
+
+		/* if unit is not open, wake it up and continue with	*/
+		/* next character.					*/
+		if((tp->t_state & TS_ISOPEN)==0){
+			wakeup((caddr_t)tp);	/* Who sleeps on this? */
+			continue;
+		}
+		
+		/* When using parity (even or odd) continue with next	*/
+		/* character (DMZ_PE is parity error)			*/
+		if (character & DMZ_PE){
+			if((tp->t_flags & (EVENP | ODDP)) == EVENP ||
+			   (tp->t_flags & (EVENP | ODDP)) == ODDP )
+				continue;
+		}
+
+		/* At data over-run (silo overflow), print error message */
+		if((character & DMZ_DO) && overrun == 0){
+			printf("dmz%d: silo overflow\n",controller);
+			overrun=1;
+		}
+
+		/* At framing error (break) generate a null ( in raw	*/
+		/* mode, for getty ), or an interrupt ( in cooked/	*/
+		/* cbreak mode )					*/
+		if(character & DMZ_FE){
+			if(tp->t_flags & RAW)
+				character = 0;
+			else
+				/* make character current intr char	*/
+				character = tp->t_intrc;
+		}
+
+		/* Perform the line specific receiver interrupt */
+		/* NOTE: NO special provision for Berkeley	*/
+		(*linesw[tp->t_line].l_rint)(character,tp);
+   }
+	return;
+}
+
+/* Routine for handling transmitter interrupts	on  an octet		*/
+dmzxinta(controller)
+int controller;
+{
+	dmzxint(controller,0);
+}
+
+dmzxintb(controller)
+int controller;
+{
+	dmzxint(controller,1);
+}
+
+dmzxintc(controller)
+int controller;
+{
+	dmzxint(controller,2);
+}
+
+/*	Routine to handle a DMZ transmitter interrupt.			*/
+/*	Restart the idle line.						*/
+/*	Loop while transmit is ready.					*/
+/*	Get the unit number and clear the busy bit.			*/
+/*		Test for DMA error and print error message		*/
+/*			SHOULD RESTART OR SOMETHING...			*/
+/*		Test for DMA flush bit set and clear it.		*/
+/*	Clear the flush flag if it is set.				*/
+/*		Reable the transmitter.					*/
+
+dmzxint(controller,octet)
+int controller;
+int octet;
+{
+	register struct tty *tp;
+	register struct dmzdevice *dmz_addr;
+	register struct uba_device *ui;
+	register int unit, t;
+
+	int priority;
+
+
+	ui = dmzinfo[controller];
+	dmz_addr = (struct dmzdevice *)ui->ui_addr;
+
+	priority = spl5();
+	/* while transmit ready */
+	while((t = dmz_addr->octet[octet].octet_csr) & DMZ_TRDY){
+		unit = controller * 24 + ( octet * 8 + ((t>>8) & 07));
+
+		tp = &dmz_tty[unit];
+		tp->t_state &= ~TS_BUSY;
+
+		if(t & DMZ_NXM)
+			printf("dmz%d: NXM line %d\n",controller, 
+				octet * 8 + (unit&07));
+
+		if(tp->t_state & TS_FLUSH){
+			tp->t_state &= ~TS_FLUSH;
+			dmz_addr->octet[octet].octet_csr = 
+				DMZ_IE | IR_LCTMR | (unit & 07);
+			dmz_addr->octet[octet].octet_lctmr = 
+				(dmz_addr->octet[octet].octet_lctmr | DMZ_TE);
+		}
+		else{
+			if(dmz_softc[unit].dmz_state & ST_DMA){
+			   ndflush(&tp->t_outq, dmz_softc[unit].dmz_count);
+			}
+		}
+		dmz_softc[unit].dmz_state = 0;
+
+		/* Start (restart) the transmission */
+		if(tp->t_line){
+			(*linesw[tp->t_line].l_start)(tp);
+		}
+		else{
+			dmzstart(tp);
+		}
+	}
+
+	splx(priority);
+	return;
+}
+
+/* Routine to start/restart transmission on a given DMZ line 	*/
+
+dmzstart(tp)
+register struct tty *tp;
+{
+	register struct dmzdevice *dmz_addr;
+	register int unit, nch, room;
+	int controller, octet;
+	int priority, car, use_dma;
+	register int i;
+	register char *cp;
+
+	unit = minor(tp->t_dev);
+	controller = DMZ(unit);
+	octet = OCTET(unit);
+	dmz_addr = (struct dmzdevice *)tp->t_addr;
+
+	/* Disable interrupts.  If dmz is currently active, or delaying	*/
+	/* no need to do anything.					*/
+	priority = spl5();
+
+	if(tp->t_state & (TS_TIMEOUT | TS_BUSY | TS_TTSTOP))
+		goto out;
+
+	/* If the transmitter has been disabled, reenable it.	*/
+	/* If the transmitter was disabled before the xint,	*/
+	/* (the ST_INBUSY was still on) then reset the BUSY state	*/
+	/* and we will wait for the interrupt. If !TS_BUSY, we	*/
+	/* already saw the interrupt so we can start another	*/
+	/* transmission.					*/
+
+	/* Check to see if transmission has been turned off */
+	if((dmz_softc[unit].dmz_state & ST_TXOFF)){
+		dmz_addr->octet[octet].octet_csr = 
+			DMZ_IE | IR_LCTMR | (unit & 07);
+		dmz_addr->octet[octet].octet_lctmr = 
+			(dmz_addr->octet[octet].octet_lctmr | DMZ_TE);
+		dmz_softc[unit].dmz_state &= ~ST_TXOFF;
+		if(dmz_softc[unit].dmz_state & ST_INBUSY){
+			dmz_softc[unit].dmz_state &= ~ST_INBUSY;
+			tp->t_state |= TS_BUSY;
+			goto out;
+		}
+	}
+	/* If there are sleepers, and output has drained below	*/
+	/* the high water mark, wake up the sleepers		*/
+	if(tp->t_outq.c_cc <= TTLOWAT(tp)){
+		if(tp->t_state & TS_ASLEEP){
+			tp->t_state &= ~TS_ASLEEP;
+			wakeup((caddr_t)&tp->t_outq);
+		}
+		if(tp->t_wsel){
+			selwakeup(tp->t_wsel,tp->t_state & TS_WCOLL);
+			tp->t_wsel = 0;
+			tp->t_state &= ~TS_WCOLL;
+		}
+	}
+
+	/* Now restart transmission unless the output queue is	*/
+	/* empty.						*/
+	if(tp->t_outq.c_cc == 0)
+		goto out;
+	if(tp->t_flags & (RAW | LITOUT)){
+		nch = ndqb(&tp->t_outq,0);
+	}
+	else{
+		nch = ndqb(&tp->t_outq, 0200);
+		/* If first thing on queue us a delay, process it */
+		if(nch == 0){
+			nch = getc(&tp->t_outq);
+			timeout(ttrstrt, (caddr_t)tp, (nch & 0x7f)+6);
+			tp->t_state |= TS_TIMEOUT;
+			goto out;
+		}
+	}
+
+	/* If there are characters to transmit, (re)start transmission	*/
+	/* Enable transmitter and interrupts and set the mode to busy	*/
+	/* Should we use DMA or SILO mode?				*/
+	/* 	If "nch" is greater than DO_DMA_COUNT then DMA		*/
+
+	if(nch){
+		dmz_addr->octet[octet].octet_csr = 
+			DMZ_IE | IR_LCTMR | (unit & 07);
+		dmz_addr->octet[octet].octet_lctmr = 
+			(dmz_addr->octet[octet].octet_lctmr | DMZ_TE);
+		tp->t_state |= TS_BUSY;
+
+		use_dma = FALSE;
+		room = DMZ_SIZ;
+
+		if (nch > DO_DMA_COUNT){
+			use_dma = TRUE;
+		}
+		
+		if(use_dma && dmz_dma_on){
+			car = UBACVT(tp->t_outq.c_cf, 
+				dmzinfo[controller]->ui_ubanum);
+			dmz_softc[unit].dmz_count = nch;
+			dmz_softc[unit].dmz_state |= ST_DMA;
+			dmz_addr->octet[octet].octet_csr = 
+				DMZ_IE | IR_TBA | (unit & 07);
+			dmz_addr->octet[octet].octet_tba = car;
+			dmz_addr->octet[octet].octet_tcc = 
+				((car >> 2) & 0xc000) | nch;
+		}
+		else{
+			dmz_softc[unit].dmz_state &= ~ST_DMA;
+			cp = tp->t_outq.c_cf;
+			nch = MIN(nch,room);
+			dmz_addr->octet[octet].octet_csr = 
+				DMZ_IE | IR_TBUF | (unit & 07);
+			for(i=0; i<nch; i++)
+				dmz_addr->octet[octet].octet_tbf = *cp++ ;
+			ndflush(&tp->t_outq, nch);
+		}
+	}
+
+out:
+	splx(priority);
+	return;
+}
+
+/*	Stop output on a line (XOFF or output flush)			*/
+/*	Block input/output interrupts by setting priority		*/
+/*	Disable the transmitter (we must do this even if 'tp' says	*/
+/*	the terminal is not busy, because in DMA mode, there are 	*/
+/*	characters left in the silo after the controller interrupts	*/
+/*	with transmit complete).					*/
+/*	If flush request (i.e. a non stopped by XOFF)			*/
+/*		Flush the silo by setting the appropriate bit		*/
+/*		this will cause a xint when the flush is complete, so	*/
+/*		make it busy.						*/
+/*	else, if busy, mark as stopped while busy			*/
+
+/* ARGSUSED */
+dmzstop(tp,flag)
+register struct tty *tp;
+{
+	register struct dmzdevice *dmz_addr;
+	register int unit, priority, octet;
+
+	priority = spl5();
+	dmz_addr = (struct dmzdevice *)tp->t_addr;
+	unit = minor(tp->t_dev);
+	octet = OCTET(unit);
+
+	dmz_addr->octet[octet].octet_csr = IR_LCTMR | (unit & 07) | DMZ_IE;
+	dmz_addr->octet[octet].octet_lctmr = 
+		(dmz_addr->octet[octet].octet_lctmr & ~DMZ_TE);
+	dmz_softc[unit].dmz_state |= ST_TXOFF;
+	if((tp->t_state & TS_TTSTOP) == 0){
+		tp->t_state |= (TS_FLUSH | TS_BUSY);
+		dmz_addr->octet[octet].octet_lctmr = 
+			(dmz_addr->octet[octet].octet_lctmr | DMZ_FLS);
+	}
+	else{
+		if(tp->t_state & TS_BUSY){
+			dmz_softc[unit].dmz_state |= ST_INBUSY;
+			tp->t_state &= ~TS_BUSY;
+		}
+	}
+	splx(priority);
+	return;
+}
+
+/*	Routine for ioctl for DMZ.  Perform line specific ioctl for	*/
+/*	Berkeley line discipline, and tty ioctl tehn process any errors	*/
+
+/* ARGSUSED */
+dmzioctl(device,command,data,flag)
+dev_t device;
+caddr_t data;
+{
+	register struct tty *tp;
+	register int unit;
+	int error;
+
+	unit = minor(device);
+	tp = &dmz_tty[unit];
+
+	error = (*linesw[tp->t_line].l_ioctl)(tp,command,data,flag);
+	if(error >= 0) return(error);
+	error = ttioctl(tp, command, data, flag);
+	if(error >= 0){
+		if(command == TIOCSETP || command == TIOCSETN)
+			dmzparam(unit);
+		return(error);
+	}
+
+	/* Process specific ioctl command */
+	switch(command){
+		case TIOCSBRK:
+			(void) dmzmctl(device, DMZ_BRK, DMBIS);
+			break;
+		case TIOCCBRK:
+			(void) dmzmctl(device, DMZ_BRK, DMBIC);
+			break;
+		case TIOCSDTR:
+			(void) dmzmctl(device, DMZ_DTR | DMZ_RTS, DMBIS);
+			break;
+		case TIOCCDTR:
+			(void) dmzmctl(device, DMZ_DTR | DMZ_RTS, DMBIC);
+			break;
+		case TIOCMSET:
+			(void) dmzmctl(device, dmtodmz(*(int *)data), DMSET);
+			break;
+		case TIOCMBIS:
+			(void) dmzmctl(device, dmtodmz(*(int *)data), DMBIS);
+			break;
+		case TIOCMBIC:
+			(void) dmzmctl(device, dmtodmz(*(int *)data), DMBIC);
+			break;
+		case TIOCMGET:
+			*(int *)data = dmztodm(dmzmctl(device, 0, DMGET));
+			break;
+		default:
+			return(ENOTTY);
+	}
+	return(0);
+}
+
+/* Routine for DMZ32 modem control */
+
+dmzmctl(device,bits,how)
+dev_t device;
+int bits, how;
+{
+	register struct dmzdevice *dmz_addr;
+	register int unit, modem_status, line_control;
+	register int temp;
+	int priority;
+	int octet;
+
+	unit = minor(device);
+	octet = OCTET(unit);
+	dmz_addr = (struct dmzdevice *)(dmz_tty[unit].t_addr);
+
+	/* Block I/O interrupts.  Get receive modem status, transmit	*/
+	/* modem status, & line control info				*/
+	priority = spl5();
+	dmz_addr->octet[octet].octet_csr = 
+		DMZ_IE | IR_RMS | (unit & 07);
+	modem_status = dmz_addr->octet[octet].octet_rms << 8;
+
+	dmz_addr->octet[octet].octet_csr =
+		DMZ_IE | IR_LCTMR | (unit & 07);
+	temp = dmz_addr->octet[octet].octet_lctmr;
+	modem_status |= ((temp>>8) & (0x1f));
+	line_control = (temp & (0x1f));
+
+	if(line_control & DMZ_BRK){
+		modem_status |= DMZ_BRK;
+	}
+
+	/* Process modem control commands */
+	switch(how){
+		case DMSET:
+			modem_status = (modem_status & 0xff00) | bits;
+			break;
+		case DMBIS:
+			modem_status |= bits;
+			break;
+		case DMBIC:
+			modem_status &= ~bits;
+			break;
+		case DMGET:
+			(void) splx(priority);
+			return(modem_status);
+	}
+
+	/* Process the break bit and set up the modem status and line	*/
+	/* control information to be replaced in the transmit modem 	*/
+	/* register for the selected line				*/
+	if(modem_status & DMZ_BRK){
+		line_control |= DMZ_RBK;
+	}
+	else{
+		line_control &= ~DMZ_RBK;
+	}
+
+	dmz_addr->octet[octet].octet_csr =
+		DMZ_IE | IR_LCTMR | (unit & 07);
+	dmz_addr->octet[octet].octet_lctmr =
+		((modem_status & 0x1f) << 8) | (line_control & 0x3f);
+
+	(void)splx(priority);
+	return(modem_status);
+}
+
+/*	This code was stolen directly from the DMF32 driver		*/
+
+/* -----
+    Routine to convert modem status from dm to dmz format.
+	Pull bits 1 & 3 through unchanged. If dm secondary transmit bit is set,
+	and/or dm request to send bit is set, and/or dm user modem signal bit
+	is set, set the corresponding dmz bits. Return to caller.
+----- */
+
+dmtodmz(bits)
+register int     bits;
+{
+register int     b;
+
+    b = bits & 012;
+    if (bits & DM_ST) b |= DMZ_RAT;
+    if (bits & DM_RTS) b |= DMZ_RTS;
+    if (bits & DM_USR) b |= DMZ_USW;
+    return(b);
+}
+
+/* -----
+	Routine to convert modem status from dmz to dm format.
+	    Pull bits 1 & 3 through unchanged. Pull bits 11 - 15 through as bits
+	    4 - 8 and set bit 0 to dm line enable.
+	If dmz user modem signal bit set, and/or  dmz request to send bit set,
+	then set the corresponding dm bit also. Return to caller.
+----- */
+
+dmztodm(bits)
+register int     bits;
+{
+
+    register int     b;
+
+    b = (bits & 012) | ((bits >> 7) & 0760) | DM_LE;
+
+    if (bits & DMZ_USR) b |= DM_USR;
+    if (bits & DMZ_RTS) b |= DM_RTS;
+    return(b);
+}
+
+#endif
+!E!O!F!
+#
+# type    sh /usr0/jcc/dmz.shar   to unpack this archive.
+#
+echo extracting dmzreg.h...
+cat >dmzreg.h <<'!E!O!F!'
+/*	dmzreg.h	1.0	*/
+
+/* HISTORY
+ * 23-Apr-85  Joe Camaratta (jcc) at Siemens RTL
+ *	Header file for DEC's DMZ32
+ *
+*/
+
+struct dmzdevice {
+	short dmz_config;	/* configuration cntl and status register */
+	short dmz_diag;		/* diagnostic control and status register */
+	struct {
+		short octet_csr;	/* octet control and status */
+		short octet_lprm;	/* line parameter */
+		union{
+			short octet_rb;		/* receiver buffer */
+			short octet_rsp;	/* receive silo parameter */
+		} octet_receive;
+		union{
+			u_short word;		/* word */
+			u_char bytes[2];	/* bytes */
+		} octet_ir;			/* indirect registers */
+	} octet[3];
+	short dmz_unused[2];
+};
+
+#define octet_sato octet_rsp
+
+/* aliases for asynchronous indirect control registers */
+#define IR_TBUF	000	/* transmit character */
+#define IR_RMS	000	/* receive modem status register */
+#define IR_TSC	000	/* transmit silo count */
+#define IR_LCTMR 010	/* line control and transmit modem */
+#define	IR_TBA	020	/* transmit buffer address register */
+#define IR_TCC	030	/* transmit character count (DMA) */
+
+#define octet_tbf octet_ir.bytes[0]	/* transmit buffer */
+#define octet_tbf2 octet_ir.word	/* transmit buffer for 2 chars */
+#define octet_rms octet_ir.bytes[1]	/* receive modem status */
+
+#define octet_tsc octet_ir.bytes[0]	/* transmit silo count */
+
+#define octet_lctmr octet_ir.word	/* line control and transmit modem */
+
+#define octet_tba octet_ir.word		/* transmit buffer address */
+
+#define octet_tcc octet_ir.word		/* transmit character count */
+
+/* bits in octet_csr */
+#define DMZ_TRDY 0100000		/* transmit ready */
+#define DMZ_TIE 0040000			/* transmit interrupt enable */
+#define DMZ_NXM 0030000			/* non-existant memory */
+#define DMZ_LIN 0003400			/* transmit line number */
+#define DMZ_RRDY 0000200		/* receiver data available */
+#define DMZ_RIE 0000100			/* receiver interrupt enable */
+#define DMZ_RESET  0000040		/* master reset */
+#define DMZ_IAD 0000037			/* indirect address register */
+
+#define DMZ_IE (DMZ_TIE | DMZ_RIE)	/* enable transmit and receive */
+
+/* bits in octet_lprm (taken from dmfreg.h) */
+#define DMZ_6BT 0010			 /* 6 bits per character */
+#define DMZ_7BT 0020			 /* 7 bits per character */
+#define DMZ_8BT 0030			 /* 8 bits per character */
+#define DMZ_PEN 0040			 /* parity enable */
+#define DMZ_EPR 0100			 /* even parity */
+#define DMZ_SCD 0200			 /* stop code */
+#define DMZ_XTE 0170000		 /* transmit rate */
+#define DMZ_RRT 0007400		 /* receive rate */
+#define DMZ_LSL 0000007		 /* line select */
+
+#define BR_50	 000			 /* baud rate 50    bps */
+#define BR_75	 001			 /*	"     75     "	*/
+#define BR_110	 002			 /*	"     110    "	*/
+#define BR_134_5 003			 /*	"     134.5  "	*/
+#define BR_150	 004			 /*	"     150    "	*/
+#define BR_300	 005			 /*	"     300    "	*/
+#define BR_600	 006			 /*	"     600    "	*/
+#define BR_1200	 007			 /*	"     1200   "	*/
+#define BR_1800	 010			 /*	"     1800   "	*/
+#define BR_2000	 011			 /*	"     2000   "	*/
+#define BR_2400	 012			 /*	"     2400   "	*/
+#define BR_3600	 013			 /*	"     3600   "	*/
+#define BR_4800	 014			 /*	"     4800   "	*/
+#define BR_7200	 015			 /*	"     7200   "	*/
+#define BR_9600	 016			 /*	"     9600   "	*/
+#define BR_19200 017			 /*	"     19200  "	*/
+
+/* bits in octet_rb (taken from dmfreg.h) */
+#define DMZ_DSC	 0004000		/* data set change */
+#define DMZ_PE	 0010000		/* parity error */
+#define DMZ_FE	 0020000		/* framing error */
+#define DMZ_DO	 0040000		/* data overrun */
+#define DMZ_DV	 0100000		/* data valid */
+#define DMZ_RL	 0003400		/* line */
+#define DMZ_RD	 0000377		/* data */
+#define DMZ_AT	 0000377		/* alarm timeout */
+
+/* bits in dmz_rms ( taken from dmfreg.h ) */
+#define DMZ_USR 0004			/* user modem signal (pin 25) */
+#define DMZ_SR	 0010			/* secondary receive */
+#define DMZ_CTS 0020			/* clear to send */
+#define DMZ_CAR 0040			/* carrier detect */
+#define DMZ_RNG 0100			/* ring */
+#define DMZ_DSR 0200			/* data set ready */
+
+/* bits in dmz_tms ( taken from dmfreg.h ) */
+#define DMZ_USW 0001			/* user modem signal (pin 18) */
+#define DMZ_DTR 0002			/* data terminal ready */
+#define DMZ_RAT 0004			/* data signal rate select */
+#define DMZ_ST	 0010			/* secondary transmit */
+#define DMZ_RTS 0020			/* request to send */
+#define DMZ_BRK 0040			/* pseudo break bit */
+#define DMZ_PMT 0200			/* preempt output */
+
+#define DMZ_ON	 (DMZ_DTR|DMZ_RTS)
+#define DMZ_OFF 0
+
+/* bits in octet_lctmr */
+#define DMZ_MIE 0040			/* modem interrupt enable */
+#define DMZ_FLS 0020			/* flush transmit silo */
+#define DMZ_RBK 0010			/* real break bit */
+#define DMZ_RE	 0004			/* receive enable */
+#define DMZ_AUT 0002			/* auto XON/XOFF */
+#define DMZ_TE	 0001			/* transmit enable */
+#define DMZ_CF	 0300			/* control function */
+
+#define DMZ_LCE (DMZ_MIE|DMZ_RE|DMZ_TE)
+
+/* bits in octet_tcc */
+#define DMZ_HA	 0140000		/* high address bits */
+
+/* bits in dm lsr, copied from dmzreg.h, copied from dh.c */
+#define DM_USR	 0001000		/* usr modem sig, not a real DM bit */
+#define DM_DSR	 0000400		/* data set ready, not a real DM bit */
+#define DM_RNG	 0000200		/* ring */
+#define DM_CAR	 0000100		/* carrier detect */
+#define DM_CTS	 0000040		/* clear to send */
+#define DM_SR	 0000020		/* secondary receive */
+#define DM_ST	 0000010		/* secondary transmit */
+#define DM_RTS	 0000004		/* request to send */
+#define DM_DTR	 0000002		/* data terminal ready */
+#define DM_LE	 0000001		/* line enable */
+
+#define DMZ_SIZ	32		/* size of DMZ output silo (per line) */
+
+/* Macros to help find which dmz, octet, and line are being referenced 	*/
+/* by the minor device number. 						*/
+#define DMZ(a) a/24
+#define OCTET(a) (a%24)/8
+#define LINE(a) (a%24)%8
+
+#define	DMZ_NOC_MASK	03
+#define DMZ_INTERFACE	000
+!E!O!F!
+#
+# type    sh /usr0/jcc/dmz.shar   to unpack this archive.
+#
+echo extracting dmz.4...
+cat >dmz.4 <<'!E!O!F!'
+.TH DMZ 4 4/23/85
+.CM 1
+.SH "NAME"
+dmz \- DMZ32 asynchronous terminal multiplexer
+.SH "SYNOPSIS"
+device dmz0 at uba? csr 0760640
+	vector dmzrinta dmzxinta dmzrintb dmzxintb dmzrintc dmzxintc
+.SH "DESCRIPTION"
+The \fIdmz\fP device provides 24 lines of asynchronous serial line support
+with full modem control.
+The \fIdmz\fP device does DMA on output.
+.sp
+Each line attached to a DMZ32 serial line port behaves as described in
+\fItty(4)\fP.
+Input and output for each line may independently be set to run
+at any of 16 speeds; see \fItty(4)\fP for encoding.
+.sp
+Bit \fIi\fP of flags may be specified to say that the line should be
+treated as hard-wired, with a carrier always present.
+Thus specifying
+"flags 0x000004" in the specification of \fIdmz0\fP would cause line ttyac to
+be treated this way.
+.SH "FILES"
+/dev/tty[a-z][a-x]
+.SH "SEE ALSO"
+tty(4), dmf(4)
+.SH HISTORY
+.TP
+23-Apr-85  Joe Camaratta (jcc) at Siemens RTL
+Created.
+!E!O!F!
+#
+# type    sh /usr0/jcc/dmz.shar   to unpack this archive.
+#
+echo extracting MAKEDEV.local...
+cat >MAKEDEV.local <<'!E!O!F!'
+#! /bin/sh
+#	@(#)MAKEDEV.local	1.0	2/13/84
+#
+# Terminal multiplexors:
+#	dmz*	unibus dmz32
+umask 77
+for i
+do
+case $i in
+dmz*)
+	name=dmz; major=34;
+	unit=`expr $i : "$name\(.*\)"`
+	case $unit in
+	0) ch=a ;; 1) ch=b ;; 2) ch=c ;;
+	*) echo bad unit for $name in: $i ;;
+	esac
+	case $ch in
+	a|b|c)
+		echo $ch $unit $major |
+		eval `awk ' { ch = $1; u = 24 * $2; m = $3 } END {
+		    for (i = 0; i < 24; i++)
+			printf("/etc/mknod tty%s%c c %d %d; ",ch,i+97,m,u+i); }'`
+		;;
+	esac
+	;;
+esac
+done
+!E!O!F!
+
+

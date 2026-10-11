@@ -1,0 +1,460 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,d35c647b7c932531,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-03-01 05:36:34 PST
+Message-ID: <bnews.fortune.807>
+Newsgroups: net.sources
+Path: utzoo!decvax!harpo!seismo!hao!hplabs!hpda!fortune!mbr
+X-Path: utzoo!decvax!harpo!seismo!hao!hplabs!hpda!fortune!mbr
+From: fortune!mbr
+Date: Tue Mar  1 08:36:32 1983
+Subject: Realloc which works when it returns 0
+X-Google-Info: Converted from the original B-News header
+Posted: Sun Feb 27 17:41:19 1983
+Received: Tue Mar  1 08:36:32 1983
+
+Any of you who actually check for 0 return codes from malloc() and
+realloc(), (i.e. not enough memory) may have noticed the following
+caveat in the manual:
+
+BUGS
+     When realloc returns 0, the block pointed to by ptr may be
+     destroyed.
+
+The situation is actually worse than that.  If malloc() ever returns
+0, it may leave one of its internal pointers (allocp) with a value which
+will cause malloc() to crash the next time it is called.  I have posted
+a fix to net.sources.  This also includes much more flexible debugging
+options than the original.
+
+		...!fortune!mbr
+		Fortune Systems Corp.
+		Mark Rosenthal
+
+================================================================================
+/* The code below will prevent realloc() from freeing a string if it
+ * can't expand it.  The changes are bracketed by #ifdef FIXBUG.
+ */
+#define FIXBUG 1
+
+#define BASE 16
+/* All values in diagnostic messages will be printed in this base. */
+/* Values for 'BASE': any integer between 2 and 36 */
+
+#define debug 0
+/* Values for 'debug':
+ *	0 - assume all pointers are OK (for production systems)
+ *	1 - check some pointers, but do not check entire list for validity
+ *	2 - check all pointers including malloc's entire memory list for
+ *		validity on entry to malloc(), free(), or realloc().
+ *		Useful when you don't trust the caller.
+ *	3 - check all pointers including malloc's entire memory list for
+ *		validity on both entry to and exit from malloc(), free(),
+ *		or realloc().
+ *		Useful when you don't trust malloc(), realloc(), or
+ *		free().
+ *
+ * When you suspect that malloc()'s memory organization is getting corrupted,
+ * the following is usually an effective approach:
+ *
+ * 1. Define 'debug' as 2 or 3.
+ * 2. Try your program again.  The first call to malloc(), realloc(), or
+ *    free(), which finds an invalid pointer will print a message.
+ * 3. At this point, sprinkle calls to allock() liberally throughout your code.
+ *    A binary search is usually effective.
+ *    This entry point checks the validity of malloc's memory, and prints a
+ *    message if all is not well.  It takes a single argument, which is an
+ *    integer which identifies where allock was called from.  This should
+ *    be an integer whose magnitude is greater than 200.  The integers 1 to
+ *    199 are reserved for internal use by malloc().  If 'debug' was defined
+ *    as 3, and an integer in this range is ever reported as the place allock
+ *    was called from, check the last digit.  If it is '5', the bug is in your
+ *    code.  If it is '0', the bug is inside malloc().  A negative argument to
+ *    allock() will print malloc's memory map.  A positive argument will
+ *    silently check it for validity. 
+ */
+#define print 0
+/* Values for 'print':
+ *	0 - do not print any diagnostics.
+ *	1 - print a warning when malloc() is about to return 0.
+ *	2 - print every call to malloc(), realloc(), or free() including
+ *		arguments and return values.
+ */
+#define file 0
+/* Values for 'file':
+ *	0 - put diagnostics on stdout.
+ *	1 - put diagnostics in "/tmp/malloc.dbg".
+ */
+
+
+#if (file == 1)
+static int fildes = 0;
+#define outdev fildes
+#define INITOUT() if (!fildes) fildes = creat("/tmp/malloc.dbg", 0666)
+#else (file == 1)
+#define outdev 1
+#define INITOUT()
+#endif (file == 1)
+
+#if (print != 0 || debug != 0)
+
+static int
+wstr(x)
+unsigned char *x;
+{
+	INITOUT();
+	write(outdev, x, strlen(x));
+}
+
+static int
+wc(ch)
+int ch;
+{	static unsigned char cp[2] = { 0, 0 };
+
+	cp[0] = ch;
+	wstr(cp);
+}
+
+/* 
+ * wnnum(no) : convert the int no to separate characters and write it out
+ */
+wnnum(no)
+int no;
+{     int  left;
+
+      left = no % BASE;
+      no /= BASE;		/* Octal */
+      if (no) 
+          wnnum(no);     /* recursively call wnnum() */
+      left += (left < 0xa) ? '0' : ('a' - 0xa);
+      wc(left);
+}
+#endif (print != 0 || debug != 0)
+
+#if (print == 2)
+#define WNUM2(a, b, c) wstr(a); wnnum(b); wstr(c)
+#else (print == 2)
+#define WNUM2(a, b, c)
+#endif (print == 2)
+
+#if (print != 0)
+#define NOMEM() { wstr("MALLOC returning 0!\n"); }
+#else (print != 0)
+#define NOMEM()
+#endif (print != 0)
+
+#if (debug != 0)
+#define ASSERT(p) if(!(p))botch("p");else
+botch(s)
+char *s;
+{
+	wstr("\n!!!!!\007assertion botched: ");
+	wstr(s);
+	wstr("\n");
+	abort();
+}
+#else (debug != 0)
+#define ASSERT(p)
+#endif (debug != 0)
+
+#if (debug == 3)
+#define ASSERT3(p) ASSERT(p)
+#else (debug == 3)
+#define ASSERT3(p)
+#endif (debug == 3)
+
+
+/* avoid break bug */
+#ifdef pdp11
+#define GRANULE 64
+#else pdp11
+#define GRANULE 0
+#endif pdp11
+
+
+/*	C storage allocator
+ *	circular first-fit strategy
+ *	works with noncontiguous, but monotonically linked, arena
+ *	each block is preceded by a ptr to the (pointer of) 
+ *	the next following block
+ *	blocks are exact number of words long 
+ *	aligned to the data type requirements of ALIGN
+ *	pointers to blocks must have BUSY bit 0
+ *	bit in ptr is 1 for busy, 0 for idle
+ *	gaps in arena are merely noted as busy blocks
+ *	last block of arena (pointed to by alloct) is empty and
+ *	has a pointer to first
+ *	idle blocks are coalesced during space search
+ *
+ *	a different implementation may need to redefine
+ *	ALIGN, NALIGN, BLOCK, BUSY, INT
+ *	where INT is integer type to which a pointer can be cast
+*/
+#define INT int
+#define ALIGN int
+#define NALIGN 1
+#define WORD sizeof(union store)
+#define BLOCK 1024	/* a multiple of WORD*/
+#define BUSY 1
+#define NULL 0
+#define testbusy(p) ((INT)(p)&BUSY)
+#define setbusy(p) (union store *)((INT)(p)|BUSY)
+#define clearbusy(p) (union store *)((INT)(p)&~BUSY)
+
+union store { union store *ptr;
+	      ALIGN dummy[NALIGN];
+	      int calloc;	/*calloc clears an array of integers*/
+};
+
+static	union store allocs[2];	/*initial arena*/
+static	union store *allocp;	/*search ptr*/
+static	union store *alloct;	/*arena top*/
+static	union store *allocx;	/*for benefit of realloc*/
+unsigned char	*sbrk();
+
+unsigned char *
+malloc(nbytes)
+unsigned int nbytes;
+{
+	register union store *p, *q;
+	register int nw;
+	static temp;	/*coroutines assume no auto*/
+
+	WNUM2("malloc(", nbytes, ")");
+
+	if(allocs[0].ptr==0) {	/*first time*/
+		allocs[0].ptr = setbusy(&allocs[1]);
+		allocs[1].ptr = setbusy(&allocs[0]);
+		alloct = &allocs[1];
+		allocp = &allocs[0];
+	}
+	nw = (nbytes+WORD+WORD-1)/WORD;
+	ASSERT(allocp>=allocs && allocp<=alloct);
+	ASSERT(allock(10));
+	for(p=allocp; ; ) {
+		for(temp=0; ; ) {
+			if(!testbusy(p->ptr)) {
+				while(!testbusy((q=p->ptr)->ptr)) {
+					ASSERT(q>p&&q<alloct);
+					p->ptr = q->ptr;
+				}
+				if(q>=p+nw && p+nw>=p)
+					goto found;
+			}
+			q = p;
+			p = clearbusy(p->ptr);
+			if(p>q)
+				ASSERT(p<=alloct);
+			else if(q!=alloct || p!=allocs) {
+				ASSERT(q==alloct&&p==allocs);
+				{
+					WNUM2(" = ", NULL, "\n");
+					NOMEM();
+#ifdef FIXBUG
+					allocp = &allocs[0];
+#endif FIXBUG
+					ASSERT3(allock(25));
+					return(NULL);
+				}
+			} else if(++temp>1)
+				break;
+		}
+		temp = ((nw+BLOCK/WORD)/(BLOCK/WORD))*(BLOCK/WORD);
+		q = (union store *)sbrk(0);
+		if(q+temp+GRANULE < q) {
+			{
+				WNUM2(" = ", NULL, "\n");
+				NOMEM();
+#ifdef FIXBUG
+				allocp = &allocs[0];
+#endif FIXBUG
+				ASSERT3(allock(35));
+				return(NULL);
+			}
+		}
+		q = (union store *)sbrk(temp*WORD);
+		if((INT)q == -1) {
+			{
+				WNUM2(" = ", NULL, "\n");
+				NOMEM();
+#ifdef FIXBUG
+				allocp = &allocs[0];
+#endif FIXBUG
+				ASSERT3(allock(45));
+				return(NULL);
+			}
+		}
+		ASSERT(q>alloct);
+		alloct->ptr = q;
+		if(q!=alloct+1)
+			alloct->ptr = setbusy(alloct->ptr);
+		alloct = q->ptr = q+temp-1;
+		alloct->ptr = setbusy(allocs);
+	}
+found:
+	allocp = p + nw;
+	ASSERT(allocp<=alloct);
+	if(q>allocp) {
+		allocx = allocp->ptr;
+		allocp->ptr = p->ptr;
+	}
+	p->ptr = setbusy(allocp);
+	{
+		WNUM2(" = ", (unsigned char *)(p+1), "\n");
+		ASSERT3(allock(55));
+		return((unsigned char *)(p+1));
+	}
+}
+
+/* Freeing strategy tuned for LIFO allocation */
+free(ap)
+register unsigned char *ap;
+{
+	register union store *p = (union store *)ap;
+
+	WNUM2("free(", ap, ")\n");
+	ASSERT(p>clearbusy(allocs[1].ptr)&&p<=alloct);
+	ASSERT(allock(60));
+	allocp = --p;
+	ASSERT(testbusy(p->ptr));
+	p->ptr = clearbusy(p->ptr);
+	ASSERT(p->ptr > allocp && p->ptr <= alloct);
+	ASSERT3(allock(75));
+}
+
+/*	realloc(p, nbytes) reallocates a block obtained from malloc()
+ *	and freed since last call of malloc()
+ *	to have new size nbytes, and old content
+ *	returns new location, or 0 on failure
+ */
+
+unsigned char *
+realloc(p, nbytes)
+register union store *p;
+unsigned nbytes;
+{
+	register union store *q;
+	register unsigned nw;
+	union store *s, *t;
+#ifdef FIXBUG
+	union store *savbot, *savtop;
+#endif FIXBUG
+	unsigned onw;
+
+	WNUM2("\nrealloc(", p, ","); WNUM2(" ", nbytes, ")\n");
+	ASSERT(allock(80));
+#ifdef FIXBUG
+	savbot = &p[-1]; savtop = clearbusy(savbot->ptr);
+#endif FIXBUG
+	if (testbusy(p[-1].ptr))
+		free((unsigned char *)p);
+	onw = p[-1].ptr - p;
+	q = (union store *)malloc(nbytes);
+#ifdef FIXBUG
+	if(q == p)
+	{
+		WNUM2("realloc = ", q, "\n\n");
+		ASSERT3(allock(95));
+		return((unsigned char *)q);
+	}
+	if (!q)	/* if out of memory, link old string back in */
+	{
+		q = &allocs[0];
+		while (clearbusy(q->ptr) < savtop)
+			q = clearbusy(q->ptr);
+		if (q < savbot)
+			{ savbot->ptr = q->ptr; q->ptr = savbot; }
+		if (savbot->ptr > savtop)
+			{ savtop->ptr = savbot->ptr; savbot->ptr = savtop; }
+		savbot->ptr = setbusy(savbot->ptr);
+		WNUM2("realloc = ", NULL, "\n\n");
+		ASSERT3(allock(105));
+		return NULL;
+	}
+#endif FIXBUG
+	s = p;
+	t = q;
+	nw = (nbytes+WORD-1)/WORD;
+	if(nw<onw)
+		onw = nw;
+	while(onw--!=0)
+		*t++ = *s++;
+	if(q<p && q+nw>=p)
+		(q+(q+nw-p))->ptr = allocx;
+	WNUM2("realloc = ", q, "\n\n");
+	ASSERT3(allock(115));
+	return((unsigned char *)q);
+}
+
+#if (debug == 1)
+
+allock() { return 1; }
+
+#endif (debug == 1)
+
+#if (debug >= 2)
+
+allock(arg)
+int arg;
+{
+	register union store *p;
+	register union store *q;	/* This allows us to use sdb to
+					 *  examine the value of p which
+					 *  caused us to crash
+					 */
+
+	int x;
+	x = 0;
+	if (arg < 0)
+		allock1(arg);
+	for(p= &allocs[0]; clearbusy(p->ptr) > p; q = p, p=clearbusy(p->ptr))
+	{
+		if (arg < 0)
+		{
+			wstr("\n"); wnnum(p); wstr(" --- "); wnnum(p->ptr);
+		}
+		if(p==allocp)
+			x++;
+	}
+	if (p != alloct || (x != 1 && p != allocp))
+	{
+		if (arg >= 0)
+		{
+			for(p = &allocs[0]; clearbusy(p->ptr) > p;
+				p = clearbusy(p->ptr))
+			{
+				wstr("\n"); wnnum(p);
+				wstr(" --- "); wnnum(p->ptr);
+			}
+			allock1(arg);
+		}
+		else
+		{
+			wstr("\nMALLOC structure screwed up!");
+		}
+	}
+	ASSERT(p==alloct && (x == 1 || p == allocp));
+	return 1;
+}
+
+allock1(arg)
+int arg;
+{
+	wstr("\n\nAllock error #");
+	if (arg < 0)
+	{
+		wstr("-");
+		arg = -arg;
+	}
+	wnnum(arg); wstr("\n");
+	wstr("\n&allocs[0] = "); wnnum(&allocs[0]);
+	wstr("\nallocs[0] = "); wnnum(allocs[0]);
+	wstr("\nallocs[1] = "); wnnum(allocs[1]);
+	wstr("\nallocp = "); wnnum(allocp);
+	wstr("\nalloct = "); wnnum(alloct);
+	wstr("\nallocx = "); wnnum(allocx);
+}
+
+#endif (debug >= 2)
+
+

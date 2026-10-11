@@ -1,0 +1,927 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,b66b5940bd36ace2,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-12-21 21:57:23 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!philabs!seismo!hao!hplabs!hpda!fortune!amd70!decwrl!flairvax!turtleva!ken
+From: ken@turtleva.UUCP (Ken Turkowski)
+Newsgroups: net.sources
+Subject: Graphics source in C: hsalgs/scn_assmblr.c
+Message-ID: <291@turtleva.UUCP>
+Date: Thu, 22-Dec-83 00:57:23 EST
+Article-I.D.: turtleva.291
+Posted: Thu Dec 22 00:57:23 1983
+Date-Received: Sun, 18-Dec-83 09:02:03 EST
+Lines: 909
+
+echo x - hsalgs/scn_assmblr.c
+cat >hsalgs/scn_assmblr.c <<'!Funky!Stuff!'
+/* ----------------------------------------------------------------
+    scn_assmblr.c - scene assembler - Top-level object priority algorithm
+        - Reads standard incremental scene description
+        - Reads standard ASCII object descriptions
+        - Assembles object structures to send to top-level transformation
+          and sort program.
+--------------------------------------------------------------------
+*/
+
+#include "scn_assmblr.h"
+#define csystem system
+
+/* -- lexically sorted object names - all predefined names are always here -- */
+static  struct  {   char  name[LINE_LENGTH]; /* lexically sorted object names */
+                    short postn;           }    obj_name[MAX_OBJECTS];
+
+static  object_def  object[MAX_OBJECTS];           /* object definition array */
+                                              /* priority ordered object list */
+static  struct  {   short obj,insep;  }  p_list[MAX_OBJECTS];
+
+static  short       char_cnt;   /* count of scanned characters (for err msgs) */
+static  short       unused_obj;         /* first unused space in object array */
+static  long        strm_sp;
+static  FILE        *input,*strm_stk[STACK_LIMIT];
+static  char        instrg[LINE_LENGTH];
+
+short   ramp_lnth;                                   /* pseudocolor ramp size */
+double  view_angle,ambient_lite,tilt_angle;          /* global view paramters */
+
+/* ######################### MAIN ##################################### */
+main()
+{   char remainder[LINE_LENGTH],term[LINE_LENGTH],
+         *strcat(),*getlogin(),*fgets(),*strptr;
+
+    nocore();                             /* prevent dumping core on errs */
+
+    initialize();                         /* initialize things */
+
+/* main loop: interpret commands - one command per line, stop on EOF on stdin */
+
+    while (((strptr = fgets(instrg,LINE_LENGTH,input)) != NULL) || (input != stdin))
+    {   char_cnt = 0;
+
+        if (strptr == NULL)    {    fclose(input);  /* EOF, go to last stream */
+                                    input = strm_stk[strm_sp];    --strm_sp;
+                                    continue;
+                               }
+        if (instrg[0] == '!')  {    csystem(&instrg[1]); putchar('>');
+                                    continue;   
+                               }                         /* shell escape */
+        if (instrg[0] == '@')  {    FILE *new_input;
+                                    get_term(&instrg[1],term,remainder);
+                                    if ((new_input = fopen(term,"r")) == NULL)
+                                    {   what("can't open file\n");
+                                        putchar('>');
+                                    }
+                                    else 
+                                    {   strm_sp++;    strm_stk[strm_sp] = input;
+                                        input = new_input;
+                                    }
+                                    continue;
+                               }        /* take input from new file */
+        if (instrg[0] == '#')  continue;                    /* comment line */
+
+        get_term(instrg,term,remainder);  /* get first delimited substring */
+
+        if (strcmp(term,"?") == 0)  printf("        commands:\n\
+                User convenience - \n\
+                  dump_to   show      ? (help)  ! (shell) ^D (quit)\n\
+                  @<filename> - take input from file\n\
+                Image production -\n\
+                  display_on          render_on           sketch_on\n\
+                Object attributes and positioning -\n\
+                  attach    call      delete\n\
+                  paint     place     rotate    scale\n\
+            special objects:\n\
+                center_of_interest   eyepoint   light   light1 - light15\n\
+                foreground           background\n\
+            global parameters\n\
+                set ( view_angle | ambient_lite | tilt_angle )\n\n");
+
+                                                /* set up object hierarchy */
+        else if (strcmp(term,"attach") == 0) attach(remainder);
+                                                /* read in object and name it */
+        else if (strcmp(term,"call") == 0)  call_by(remainder);
+                                                             /* delete object */
+        else if (strcmp(term,"delete") == 0)  delete(remainder);
+                                                /* detach object from hierchy */
+        else if (strcmp(term,"detach") == 0)  detach(remainder);
+                                                   /* make picture - no bkgrd */
+        else if (strcmp(term,"display_on") == 0)  display_on(remainder);
+                                                    /* dump scene description */
+        else if (strcmp(term,"dump_to") == 0)  dump_to(remainder);
+                                                    /* assign color to object */
+        else if (strcmp(term,"paint") == 0) paint(remainder);
+                                                   /* place object on another */
+        else if (strcmp(term,"place") == 0)  place(remainder);
+                                                             /* load rotation */
+        else if (strcmp(term,"rotate") == 0) rotate(remainder);
+                                               /* make picture - high quality */
+        else if (strcmp(term,"render_on") == 0)  render_on(remainder);
+                                                   /* load axis scale factors */
+        else if (strcmp(term,"scale") == 0) scale(remainder);
+                                                      /* set global parameter */
+        else if (strcmp(term,"set") == 0)  set(remainder);
+                                                 /* display object parameters */
+        else if (strcmp(term,"show") == 0)  show(remainder);
+                                             /* make picture - bounding boxes */
+        else if (strcmp(term,"sketch_on") == 0)  sketch_on(remainder);
+                                                   /* no such command - error */
+        else what("mistyped command?\n");
+
+        putchar('>');                           /* print prompt */
+    }
+    puts(strcat(" see ya later ",getlogin()));
+}
+
+
+
+
+/* +++++++++++++++++++++++ ATTACH +++++++++++++++++++++++++++++++ */
+attach(instrg)                          /* set up object hierarchy */
+char *instrg;
+{   char obj_name[LINE_LENGTH],remainder[LINE_LENGTH],substr[LINE_LENGTH];
+    short i,child,dum,parent;    double atof();
+
+    get_term(instrg,obj_name,remainder);        /* get object name */
+    get_obj_index(&child,&dum,obj_name);    /* get index into object array */
+    if (child == -1)  {   what("can't find this object\n");    return;  }
+    if (object[child].parent != 0) what(" re-attaching to object\n");
+    get_term(remainder,substr,remainder);
+    if (strcmp(substr,"to") != 0) { what("this should be \"to\"\n"); return;}
+    get_term(remainder,obj_name,remainder);
+    get_obj_index(&parent,&dum,obj_name);
+    if (parent == -1) {   what("can't find this object\n");    return;  }
+    get_term(remainder,substr,remainder);
+    if (strcmp(substr,"at") != 0) { what("this should be \"at\"\n"); return;}
+    object[child].parent = parent;              /* set pointer to parent */
+    object[child].supported = FALSE;            /* not "on" parent object */
+    object[child].new_mtx = TRUE;               /* ensures matrix composition */
+    for (i=0; i<3; i++)
+    {   get_term(remainder,substr,remainder);
+        object[child].postn[i] = atof(substr);
+    }
+}
+
+
+
+
+/* +++++++++++++++++++++++ CALLBY ++++++++++++++++++++++++++++++++ */
+call_by(instrg)                         /* read in object and name it */
+char *instrg;
+{   short i,j,k,n,save,lexpos;    
+    char name[LINE_LENGTH],file_name[LINE_LENGTH],remainder[LINE_LENGTH];
+    double atof(),sqrt();    char box_found;
+    FILE *input;
+
+    get_term(instrg,file_name,remainder);
+
+    if ((input = fopen(file_name,"r")) == NULL)
+    {   what("can't find this file\n"); return;   }
+
+    save = char_cnt; /* save line position for later messages about this file */
+    get_term(remainder,name,remainder);
+    if (strcmp(name,"by") != 0)  
+    {    what("should be \"by\"\n");    return;   }
+
+    get_term(remainder,name,remainder);
+    for (i=0; i<FIRST_OBJ; i++)    /* check for reserved name (FRG & BKG ok) */
+        if (strcmp(name,obj_name[i].name) == 0)
+        {   j = obj_name[i].postn;
+            if ((j==FRG) || (j==BKG))  
+            {   strcpy(object[j].filename,file_name);    return;   }
+            else  {  what("name in use \n");    return;  }  /* not FRG or BKG */
+        }
+    i = FIRST_OBJ;                         /* check for previously used names */
+    while ((strcmp(name,obj_name[i].name) > 0) && ( i < MAX_OBJECTS ) &&
+           (obj_name[i].name[0] != NULLCHAR)) i++; /* search for lexically >= */
+    if (strcmp(name,obj_name[i].name) == 0)
+    {  what("name in use \n");    return;  }
+    lexpos = i;
+
+    for (n=unused_obj; n<MAX_OBJECTS; n++)      /* find available spot */
+    {   if (object[n].name[0] == NULLCHAR) break;
+        else if (n+1 == MAX_OBJECTS) 
+                {  what("sorry no more room for objects\n");  return;  }
+    }
+    unused_obj = n+1;                               /* set up for next object */
+    strcpy(object[n].filename,file_name);                  /* store file name */
+
+    /* read object file for salient info */
+    {   FILE *test;    
+        char line[LINE_LENGTH],term[LINE_LENGTH],strng[LINE_LENGTH];
+        box_found = FALSE;
+        for (k=0; k<3; k++) object[n].clr[k] = 1.0;     /* set default color */
+        while (fgets(line,LINE_LENGTH,input) != NULL)
+        {   get_term(line,term,line);
+
+            if ((strcmp(term,"bounding_box") == 0) ||   /* bounding box */
+                (strcmp(term,"boundingbox") == 0))
+            {   short i;   
+                for (i=0; i<3; i++)
+                {  get_term(line,term,line);  object[n].box[i*2]   = atof(term);
+                   get_term(line,term,line);  object[n].box[i*2+1] = atof(term);
+                   if (object[n].box[i*2] > object[n].box[i*2+1])
+                   {   char_cnt = save; /* restore top level character count */
+                       what("min > max in bounding box\n");
+                       fclose(input);   return;
+                   }
+                }
+                /* get centroid and radius from bounding box */
+                object[n].centroid[0] = (object[n].box[0] + object[n].box[1])/2;
+                object[n].centroid[1] = (object[n].box[2] + object[n].box[3])/2;
+                object[n].centroid[2] = (object[n].box[4] + object[n].box[5])/2;
+                object[n].radius = sqrt(sqr(object[n].box[1] - object[n].box[0])
+                         + sqr(object[n].box[3] - object[n].box[2]) 
+                         + sqr(object[n].box[5] - object[n].box[4])) / 2;
+
+                box_found = TRUE;
+            }
+
+            else if (strcmp(term,"display") == 0)       /* display routine  */
+            {   get_term(line,term,line);
+                if ((test = fopen(term,"r")) == NULL)
+                    if ((test = fopen(strcat(strcpy(strng,"/usr/local/"),term),
+                                                                  "r")) == NULL)
+                    {  char_cnt = save;  what("can't find display routine\n");
+                       fclose(input);    return; 
+                    }
+                fclose(test);           /* close file again if found */
+                strcpy(object[n].display,term);     /* load filename */
+            }
+            else if (strcmp(term,"color") == 0)         /* object color */
+            {   short i;
+                for (i=0; i<3; i++)
+                {  get_term(line,term,line);  object[n].clr[i] = atof(term);  }
+            }
+        }
+        fclose(input);                  /* close object description file */
+    }
+    char_cnt = save;            /* restore top level character count */
+    if (!box_found)  {  what("no bounding box in file\n");
+                        object[n].name[0] = NULLCHAR;    return;   }
+
+    j = lexpos;
+    while (obj_name[j].name[0] != NULLCHAR) j++;         /* find end of list */
+    for (k=j; k>=lexpos; k--)                        /* open space for entry */
+    {   strcpy(obj_name[k].name,obj_name[k-1].name);
+        obj_name[k].postn = obj_name[k-1].postn;   }
+    strcpy(obj_name[lexpos].name,name);                       /* insert name */
+    strcpy(object[n].name,name);
+    obj_name[lexpos].postn = n;                     /* insert object pointer */
+    for (k=0; k<3; k++) object[n].scale[k] = 1.0;       /* set default scale */
+    for (k=0; k<3; k++) object[n].postn[k] = 0.0;    /* set default position */
+    object[n].new_mtx = TRUE;                           /* flag new matrix   */
+}
+
+
+
+
+/* ++++++++++++++++++++++ DELETE ++++++++++++++++++++++++++++++++++ */
+delete(instrg)                          /* remove objects from further use */
+char *instrg;
+{   short j;    char name[LINE_LENGTH],remainder[LINE_LENGTH];
+    get_term(instrg,name,remainder);
+    if (strcmp(name,"all") == 0)        /* delete everything */
+    {   j = LIT + 1;
+        while (obj_name[j].name[0] != NULLCHAR)
+        {   delete_obj(obj_name[j].name);  if (j < FIRST_OBJ) j++;   }
+        while (obj_name[j].name[0] != NULLCHAR) delete_obj(obj_name[j++].name);
+    }
+    else delete_obj(name);
+}
+
+
+delete_obj(name)                /* remove an object from further use */
+char *name;
+{   short j,i,n;
+    get_obj_index(&n,&i,name);
+    if (n > 0)
+    {   if ((n > LIT) && (object[n].name[0] != NULLCHAR))    /* clear object */
+        {   printf(" deleting %s\n",object[n].name);
+            object[n].name[0] = NULLCHAR;
+        }
+        for (j=0; j<MAXROT; j++)  object[n].angle[0] = 0;
+        object[n].supported = FALSE;
+        object[n].parent = 0;
+
+        if (n < FIRST_OBJ) return;  /* collapse sorted name list unless light */
+        if (unused_obj > obj_name[i].postn)  unused_obj = obj_name[i].postn;
+        while (obj_name[i].name[0] != NULLCHAR) /* fill in hole */
+        {   strcpy(obj_name[i].name,obj_name[i+1].name);
+            obj_name[i].postn = obj_name[i+1].postn;    i++;   }
+    }
+    else  what("name not in use\n");
+}
+
+
+
+
+/* ++++++++++++++++++++++++ DETACH +++++++++++++++++++++++++++++++++++ */
+detach(instrg)                          /* remove from hierarchy */
+char *instrg;
+{   short object_no,dum;    char obj_name[LINE_LENGTH],remainder[LINE_LENGTH];
+    get_term(instrg,obj_name,remainder);
+    get_obj_index(&object_no,&dum,obj_name);
+    object[object_no].parent = 0;
+    object[object_no].supported = FALSE;
+}
+
+
+
+
+/* ++++++++++++++++++++++ DEV_SETUP +++++++++++++++++++++++++++++++++++ */
+dev_setup(instrg,dvc,bits,divisions,frmnum,clear)  /* check device and clear */
+char *instrg,*dvc;    short *bits,*divisions,*frmnum,clear;
+{   short i;
+    FILE *popen(),*stream;    char string[LINE_LENGTH],*sprintf();
+    char remainder[LINE_LENGTH];
+    *bits = *divisions = *frmnum = 0;
+
+    get_term(instrg,dvc,remainder);             /* get device name */
+    sscanf(remainder,"%hd %hd %hd",bits,divisions,frmnum); 
+    if ((clear == -1) && (*bits < 24)) return;  /* render_on only full color */
+
+    if      (strcmp(dvc,"meg") == 0 || strcmp(dvc,"crt") == 0 || 
+             strcmp(dvc,"h19") == 0 || strcmp(dvc, "vt") == 0)
+         {   *bits = *frmnum = *divisions = 0;         /* line_drawing device */
+             if (strcmp(dvc,"vt") == 0) if (clear) csystem("vtclear");
+                                        else       csystem("clear");
+         }
+    else if (strcmp(dvc,"fb") == 0)                    /* Marc I frame buffer */
+         {   *frmnum = *bits;   *divisions = 0;   *bits = (*bits)?  8 : 10;
+             if (clear) csystem(sprintf(string,"fbclear %d 0",*frmnum));
+         }
+    else if (strcmp(dvc,"bb") == 0)                   /* Marc II frame buffer */
+         {   if (strlen(instrg) < 6)  *bits = *divisions = *frmnum = 0;
+             if (*divisions == 0)  *divisions = 1;     /* default bb settings */
+             if ((*bits == 0) || (*bits == 24))  *bits = 32;
+
+             if (*frmnum%(32 / *bits) == 0) /* clear when using 0th bit in BB */
+                 if (*divisions > 1)                        /* partial frame */
+                 {   double sqrt();    short mult,Xres,Xofset,Yres,Yofset;
+                     csystem("bbreset");   /* loads rgb pallette and unzooms */
+                     mult = sqrt((double)*divisions);    
+                     Xres = 640/mult;    Yres = 484/mult;
+                     Xofset = (*frmnum / (32 / *bits)) % mult * Xres;  
+                     Yofset = (mult-1 - (*frmnum/(32 / *bits))/mult) * Yres;
+                     if (((*bits >= 24) && (clear)) || (*bits < 16))
+                        csystem(sprintf(string,"bbclear 0 %g %g %g %d %d %d %d",
+                                object[BKG].clr[0],object[BKG].clr[1],
+                                object[BKG].clr[2],Xres,Xofset,Yres,Yofset));
+                 }
+                 else if ((*bits >= 24) && (clear))      /* full frame clear */
+                            csystem(sprintf(string,"bbclear 0 %g %g %g",
+                                         object[BKG].clr[0],object[BKG].clr[1],
+                                         object[BKG].clr[2]));
+                      else if (clear) csystem("bbclear 0 0 0 0");
+         }
+    else if (strcmp(dvc,"aed") == 0)
+         {   *divisions = *frmnum = 0;    *bits = 8;
+             csystem("aedclear 0");
+         }
+    else if (strcmp(dvc,"file") == 0)
+         {   *bits = 48;  *divisions = 1;  *frmnum = 0;/* file will be opened */
+         }                             /* by first process to actually use it */
+    else if (strcmp(dvc,"dummy") == 0);                /* do nothing if dummy */
+    else {   puts("bad device syntax");    return;   }
+
+
+    if ((*bits == 8) || (*bits == 10))              /* set up for pseudocolor */
+    {   double pow();
+        stream = popen("hueload","w");
+        if (strcmp(dvc,"fb") == 0)  fprintf(stream," %s %d\n",dvc,*frmnum);
+        else   fprintf(stream," %s %d\n",dvc,*bits);            /* bb, or aed */
+        fprintf(stream," %g %g %g\n",object[BKG].clr[0],object[BKG].clr[1],
+                                         object[BKG].clr[2]);   /* background */
+
+            i = FIRST_OBJ;
+            while (obj_name[i].name[0] != NULLCHAR)
+            {   short j;         /* object colors */
+                j =  obj_name[i].postn;
+                { fprintf(stream,"%g %g %g\n",object[j].clr[0],object[j].clr[1],
+                                              object[j].clr[2]);
+                }
+                object[j].clr_num = i - FIRST_OBJ;
+                i++;
+            }
+        pclose(stream);    /* send EOF to hueload and wait for completion */
+        ramp_lnth = (pow(2.,(double)(*bits)) - 1)/(i - FIRST_OBJ);/* clr ramp */
+    }
+}
+ 
+
+
+
+/* ++++++++++++++++++++++ DISPLAY_ON +++++++++++++++++++++++++++++++++ */
+display_on(instrg)      /* generate image without foreground or background */
+char *instrg;
+{   short bits,divisions,frmnum;    char dvc[LINE_LENGTH];
+    dev_setup(instrg,dvc,&bits,&divisions,&frmnum,FALSE);    /* get device */
+    obj_sort(object,p_list);
+    task_master(object,p_list,dvc,bits,divisions,frmnum);
+}
+
+
+
+/* +++++++++++++++++++++++ DUMP_TO +++++++++++++++++++++++++++++++++++++ */
+dump_to(instrg)         /* write input script based on current state */
+char *instrg;
+{   char filename[LINE_LENGTH],remainder[LINE_LENGTH];
+    FILE *output;    short i;
+    
+    get_term(instrg,filename,remainder);
+    output = fopen(filename,"w");
+    if (output == NULL)  {  what("can't open file\n");    return;  }
+
+    for (i=FIRST_OBJ; i<MAX_OBJECTS; i++)  if (obj_name[i].name[0] != NULLCHAR)
+    {   short k;
+        k = obj_name[i].postn;
+        fprintf(output,"call  %s by %s\n",object[k].filename,object[k].name);
+        fprintf(output,"scale %s by %g %g %g\n",object[k].name,
+                object[k].scale[0],object[k].scale[1],object[k].scale[2]);
+    }
+    for (i=0; i<MAX_OBJECTS; i++)  
+        if ((obj_name[i].name[0] != NULLCHAR) &&
+            (object[obj_name[i].postn].name[0] != NULLCHAR))
+    {   short k,j;
+        k = obj_name[i].postn;
+        if (object[k].supported)
+            fprintf(output,"place %s on %s at %g %g %g\n",object[k].name,
+                    object[object[k].parent].name,object[k].postn[0],
+                    object[k].postn[1],object[k].postn[2]);
+        else if (object[k].parent != 0)
+            fprintf(output,"attach %s to %s at %g %g %g\n",object[k].name,
+                    object[object[k].parent].name,object[k].postn[0],
+                    object[k].postn[1],object[k].postn[2]);
+        else if ((k != BKG) && (k != FRG))
+            fprintf(output,"place %s at %g %g %g\n",object[k].name,
+                    object[k].postn[0],object[k].postn[1],object[k].postn[2]);
+
+        if ((k < FIRST_OBJ) && (k >= LIT) && (object[k].radius > 0.))/* light */
+            fprintf(output,"scale %s by %g\n",object[k].name,object[k].radius);
+
+        if (object[k].new_clr)                  /* explicitly modified colors */
+        {   fprintf(output,"paint %s with %g %g %g\n",object[k].name,
+                            object[k].clr[0],object[k].clr[1],object[k].clr[2]);
+        }
+        k = 0;
+        for (j=0; j<MAXROT; j++) if (object[k].angle[j] != 0.)
+        {   if (j > 0) 
+            {   fprintf(output," then\n");
+                fprintf(output,"\t\t about %g %g %g %g %g %g by %g",
+                        object[k].rotbas[j][0],object[k].rotbas[j][1],
+                        object[k].rotbas[j][2],object[k].rotend[j][0],
+                        object[k].rotend[j][1],object[k].rotend[j][2],
+                        object[k].angle[j]);
+                k++;
+            }
+            else
+            {   fprintf(output,"rotate %s\tabout %g %g %g %g %g %g by %g",
+                        object[k].name,
+                        object[k].rotbas[j][0],object[k].rotbas[j][1],
+                        object[k].rotbas[j][2],object[k].rotend[j][0],
+                        object[k].rotend[j][1],object[k].rotend[j][2],
+                        object[k].angle[j]);
+                k++;
+            }
+        }
+        if (k > 0) fprintf(output,"\n");
+    }
+
+    if (view_angle !=  45.) fprintf(output,"set view_angle to %g\n",view_angle);
+    if (tilt_angle !=   0.) fprintf(output,"set tilt_angle to %g\n",tilt_angle);
+    if (ambient_lite != .3) fprintf(output,"set ambient_lite to %g\n",
+                                                                  ambient_lite);
+
+    fclose(output);
+}
+
+
+
+
+/* ++++++++++++++++++++ GET_OBJ_INDEX ++++++++++++++++++++++++++++ */
+get_obj_index(obj_index,name_index,name)        /* search for object name */
+                                        /* this should be a binary search */
+short *obj_index,*name_index;    char *name;    /* return ptr to object entry */
+{   short i;
+    i = 0;                              /* find name in reserved name list */
+    while ((strcmp(name,obj_name[i].name) > 0) && (i < FIRST_OBJ))  i++;
+    if (strcmp(name,obj_name[i].name) == 0)     /* check for exact match */
+    {   *obj_index = obj_name[i].postn;  *name_index = i;  return *obj_index;  }
+
+    i = FIRST_OBJ;                      /* find name in object name list */
+    while ((strcmp(name,obj_name[i].name) > 0) && 
+           (obj_name[i].name[0] != NULLCHAR)) i++; /* search for lexically >= */
+    if (strcmp(name,obj_name[i].name) == 0)     /* check for exact match */
+        {   *obj_index = obj_name[i].postn;    *name_index = i;   }
+    else  {  *obj_index = -1;   *name_index = -1;  } /* return -1 if no match */
+    return *obj_index;
+}
+
+
+
+
+/* +++++++++++++++++++++ GET_TERM +++++++++++++++++++++++++++++++++ */
+get_term(instrg,term,remainder)         /* remove first term from string */
+char *instrg,*term,*remainder;  /* blanks, tabs, nulls, commas are separators */
+{   short i,index1,index2;
+    index1 = 0;                         /* find first non-separator */
+    while ((instrg[index1] == ' ')      || (instrg[index1] == '\t') ||
+           (instrg[index1] == NULLCHAR) || (instrg[index1] == ',' )) index1++;
+    index2 = index1;                    /* find next separator */
+    while ((instrg[index2] != ' ')      && (instrg[index2] != '\t') &&
+           (instrg[index2] != NULLCHAR) && (instrg[index2] != ',' ) &&
+           (instrg[index2] != '\n'))                                 index2++;
+    for (i=index1; i<index2; i++)  term[i-index1] = instrg[i];
+    term[i-index1] = NULLCHAR;
+    while ((instrg[i] != NULLCHAR) && (instrg[i] != '\n'))
+        {  remainder[i-index2] = instrg[i];  i++;  }
+    remainder[i-index2] = NULLCHAR;
+    char_cnt = char_cnt + index2;
+}
+
+
+
+
+/* +++++++++++++++++++++++++ INITIALIZE +++++++++++++++++++++++++++++ */
+initialize()                            /* set up initial conditions */
+{   /* remember, obj_name[] is lexically sorted */
+    short i,j;
+    strcpy(obj_name[0].name,"background");          obj_name[0].postn = BKG;
+    strcpy(object[BKG].name,"background");
+    for (i=0; i<3; i++) object[BKG].scale[i] = 1.0;
+    object[BKG].new_mtx = TRUE;
+    object[BKG].clr[0] =     .2;
+    object[BKG].clr[1] =     .3;
+    object[BKG].clr[2] =     .6;
+    
+    strcpy(obj_name[3].name,"foreground");          obj_name[3].postn = FRG;
+    strcpy(object[FRG].name,"foreground");
+    for (i=0; i<3; i++) object[FRG].scale[i] = 1.0;
+    object[FRG].new_mtx = TRUE;
+
+    strcpy(obj_name[1].name,"center_of_interest");  obj_name[1].postn = CI;
+    strcpy(object[CI].name,"center_of_interest");
+    object[CI].postn[0] =  0.;
+    object[CI].postn[1] =  0.;
+    object[CI].postn[2] =  0.;
+    for (i=0; i<3; i++) object[CI].scale[i] = 1.0;
+    object[CI].new_mtx = TRUE;
+
+    strcpy(obj_name[2].name,"eyepoint");            obj_name[2].postn = EP;
+    strcpy(object[EP].name,"eyepoint");
+    object[EP].postn[0] =    0.;
+    object[EP].postn[1] =  -10.;
+    object[EP].postn[2] =    5.;
+    for (i=0; i<3; i++) object[EP].scale[i] = 1.0;
+    object[EP].new_mtx = TRUE;
+
+    for (j=0; j<16; j++)           /* put in light names "light1" - "light15" */
+    {   short k;    char str[16];
+        k = (j > 9)?  j - 8 : j + 6;   if (j <= 1) k = j; /*keep lexical order*/
+        strcpy(obj_name[LIT+k].name,sprintf(str,"light%d",j)); 
+        obj_name[LIT+k].postn = LIT+j;
+        for (i=0; i<3; i++) object[LIT+j].scale[i] = 1.0;
+        object[LIT+j].new_mtx = TRUE;
+        for (i=0; i<3; i++) object[LIT+j].clr[i] = 1.0;
+        object[LIT+j].radius = 93000000. * 5280.; /* shines 93 million miles */
+    }
+    strcpy(obj_name[LIT].name,"light");  /* turn on and initialize 0th light */ 
+    strcpy(object[LIT].name,"light");   obj_name[LIT].postn = LIT;
+    object[LIT].postn[0] =  1000.;       /* by entering name in object array */
+    object[LIT].postn[1] = -1000.;
+    object[LIT].postn[2] =   500.;
+
+    view_angle = 45.;
+    tilt_angle =  0.;
+    ambient_lite = .3;
+
+    unused_obj = FIRST_OBJ;     /* first unused object array element */
+    strm_sp = 0;                /* stack pointer for input stream stack */
+    input = stdin;
+    putchar('>');
+}
+
+
+
+/* ++++++++++++++++++++++++++ PAINT ++++++++++++++++++++++++++++++++ */
+paint(instrg)                           /* assign color to object */
+char *instrg;
+{   char obj_name[LINE_LENGTH],remainder[LINE_LENGTH],term[LINE_LENGTH];
+    short i,obj_index,dum;    double atof();
+
+    get_term(instrg,obj_name,remainder);        /* get object name */
+    get_obj_index(&obj_index,&dum,obj_name);   /* get index into object array */
+    if (obj_index < 0)  {   what("can't find this object\n");    return;  }
+    get_term(remainder,term,remainder);
+    if (strcmp(term,"with") != 0) 
+    {   what("this should be \"with\"\n");    return;   }
+                                           /* update .obj file with new color */
+    if (obj_index >= FIRST_OBJ)
+        csystem(sprintf(term,"update_obj %s color %s",
+                                        object[obj_index].filename,remainder));
+    for (i=0; i<3; i++)
+    {   float number;
+        get_term(remainder,term,remainder);   number = atof(term);
+        if ((number < 0.) || (number > 1.))
+        {   what("between 0 and 1 please\n");    return;   }
+        object[obj_index].clr[i] = number;
+    }
+    object[obj_index].new_clr = TRUE;   /* flag for new color computation */
+
+    if ((obj_index >= LIT) && (obj_index <= LIT+15))  
+        strcpy(object[obj_index].name,obj_name);   /* turn on light by naming */
+}
+
+
+
+
+/* ++++++++++++++++++++++++++++ PLACE +++++++++++++++++++++++++++++++ */
+place(instrg)                           /* position object (on another) */
+char *instrg;
+{   char obj_name[LINE_LENGTH],remainder[LINE_LENGTH],term[20];
+    short i,obj_index,dum,parent_index; double atof();
+
+    get_term(instrg,obj_name,remainder);        /* get object name */
+    get_obj_index(&obj_index,&dum,obj_name);    /* get index into obj. array */
+    if (obj_index < 0)  {  what("can't find this object\n");    return;  }
+    get_term(remainder,term,remainder);
+    if (strcmp(term,"on") == 0) /* check for attachment */
+    {   get_term(remainder,obj_name,remainder); /* get 2nd object name */
+        get_obj_index(&parent_index,&dum,obj_name);
+        if (parent_index < 0)  {  what("can't find this object\n");  return;  }
+        if (object[obj_index].parent != 0)  {  what(" re-attaching object\n");
+                                               return;  }
+        object[obj_index].parent = parent_index;
+        object[obj_index].supported = TRUE;
+        get_term(remainder,term,remainder);             /* get "at" */
+    }
+    if (strcmp(term,"at") != 0)  
+    {   what(" this should be \"at\" or \"on\"\n");    return;   }
+    for (i=0; i<3; i++)                         /* read position x,y,z */
+    {   get_term(remainder,term,remainder);
+        object[obj_index].postn[i] = atof(term);
+    }
+    object[obj_index].new_mtx = TRUE;           /* flag to compute new matrix */
+
+    if ((obj_index >= LIT) && (obj_index <= LIT+15))  
+        strcpy(object[obj_index].name,obj_name);   /* turn on light by naming */
+
+}
+
+
+
+/* +++++++++++++++++++++++++++ RENDER_ON ++++++++++++++++++++++++++++ */
+render_on(instrg)       /* generate high-quality image */
+char *instrg;
+{   short bits,divisions,frmnum;    char dvc[LINE_LENGTH],string[LINE_LENGTH];
+    dev_setup(instrg,dvc,&bits,&divisions,&frmnum,-1);  /* set up, clear dsp. */
+    if (bits < 24) { printf(" render_on only for BB right now\n");   return; }
+
+    /* ----- load foreground image into BB or "temp_frame" if called for ---- */
+    if (object[FRG].filename[0] != NULLCHAR)             /* foreground image? */
+        if (bits == 32) csystem(sprintf(string,"bbshow %s",object[FRG].name));
+        else            csystem(sprintf(string,"fileshow temp_frame %s",
+                                                          object[FRG].name));
+
+    /* ------------------ sort and display objects -------------------------- */
+    obj_sort(object,p_list);                         /* priority sort objects */
+                       /* distribute object display tasks to display programs */
+    if (bits != 32) task_master(object,p_list,"file temp_frame",32,divisions,0);
+    else            task_master(object,p_list,dvc,bits,divisions,frmnum);
+
+    /* ----- load background image into BB or "temp_frame" if called for ---- */
+    if (object[BKG].filename[0] != NULLCHAR)             /* background image? */
+        if (bits == 32) csystem(sprintf(string,"bbshow %s",object[BKG].name));
+        else            csystem(sprintf(string,"fileshow temp_frame %s",
+                                                          object[BKG].name));
+    else                                         /* fill in with solid color */
+         if (bits == 32)
+             if (divisions > 1)                     /* partial frame */
+             {   double sqrt();    short mult,Xres,Xofset,Yres,Yofset;
+                 mult = sqrt((double)divisions);    
+                 Xres = 640/mult;    Yres = 484/mult;
+                 Xofset = (frmnum/(32/bits))%mult * Xres;  
+                 Yofset = (mult-1 - (frmnum/(32/bits))/mult) * Yres;
+                 csystem(sprintf(string,"bbackfill %g %g %g %d %d %d %d",
+                                object[BKG].clr[0],object[BKG].clr[1],
+                                object[BKG].clr[2],Xres,Xofset,Yres,Yofset));
+             }
+             else 
+                 csystem(sprintf(string,"bbackfill %g %g %g 640 0 484 0",
+                                    object[BKG].clr[0],object[BKG].clr[1],
+                                    object[BKG].clr[2]));
+         else 
+             csystem(sprintf(string,"filebkfill temp_frame %g %g %g",
+                    object[BKG].clr[0],object[BKG].clr[1],object[BKG].clr[2]));
+
+    /* ------------- dither to display if not full-color -------------------- */
+    if (bits < 16)  csystem(sprintf(string,"dither_on temp_frame %s %d %d %d",
+                                                  dvc,bits,divisions,frmnum));
+
+    /* ----------------- change file name if file output ------------------ */
+    if (strcmp(dvc,"file") == 0) 
+    {   char filename[LINE_LENGTH];
+        get_term(instrg,filename,instrg);   /* burn device field */
+        get_term(instrg,filename,instrg);   
+        csystem(sprintf(string,"mv temp_frame %s",filename));
+    }
+}
+
+
+/* ++++++++++++++++++++++++++ ROTATE +++++++++++++++++++++++++++++++++ */
+rotate(instrg)
+char *instrg;
+{   char obj_name[LINE_LENGTH],remainder[LINE_LENGTH],term[20];
+    short i,j,obj_index,dum;    double atof();
+
+    get_term(instrg,obj_name,remainder);        /* get object name */
+    get_obj_index(&obj_index,&dum,obj_name);        /* get index into object array */
+    if (obj_index < 0)  {   what("can't find this object\n");    return;  }
+    j = 0;
+    do
+    {   get_term(remainder,obj_name,remainder);
+        if (strcmp(obj_name,"about") != 0) 
+        {   what("this should be \"about\"\n");    return;   }
+        for (i=0; i<3; i++)
+        {   get_term(remainder,term,remainder);
+            object[obj_index].rotbas[j][i] = atof(term);
+        }
+        for (i=0; i<3; i++)
+        {   get_term(remainder,term,remainder);
+            object[obj_index].rotend[j][i] = atof(term);
+        }
+        get_term(remainder,obj_name,remainder);
+        if (strcmp(obj_name,"by") != 0) 
+        {   what("this should be \"by\"\n");    return;   }
+        get_term(remainder,term,remainder);
+        object[obj_index].angle[j] = atof(term);
+        get_term(remainder,term,remainder);
+        if (strcmp(term,"then") == 0)  fgets(remainder,LINE_LENGTH,input);
+        j++;
+    }   while ((strcmp(term,"then") == 0) && (j <= MAXROT));
+    for (i=j; i<MAXROT; i++) object[obj_index].angle[i] = 0;/* rest of angles */
+    object[obj_index].new_mtx = TRUE;           /* flag to compute new matrix */
+
+    if ((obj_index >= LIT) && (obj_index <= LIT+15))  
+        strcpy(object[obj_index].name,obj_name);   /* turn on light by naming */
+}
+
+
+
+/* ++++++++++++++++++++++++++++ SCALE ++++++++++++++++++++++++++++++++++ */
+scale(instrg)
+char *instrg;
+{   char obj_name[LINE_LENGTH],remainder[LINE_LENGTH],
+         preposition[LINE_LENGTH],term[20];
+    short i,obj_index,dum;    double atof();
+
+    get_term(instrg,obj_name,remainder);        /* get object name */
+    get_obj_index(&obj_index,&dum,obj_name);        /* get index into object array */
+    if (obj_index < 0)  {   what("can't find this object\n");    return;  }
+    get_term(remainder,preposition,remainder);
+    if (strcmp(preposition,"by") != 0) 
+    {   what("this should be \"by\"\n");    return;   }
+    for (i=0; i<3; i++)
+    {   get_term(remainder,term,remainder);
+        if (obj_index < FIRST_OBJ)              /* set radius if light source */
+        {   object[obj_index].radius = atof(term);    break;   }
+        else  object[obj_index].scale[i] = atof(term);
+    }
+    object[obj_index].new_mtx = TRUE;           /* flag to compute new matrix */
+
+    if ((obj_index >= LIT) && (obj_index <= LIT+15))  
+        strcpy(object[obj_index].name,obj_name);   /* turn on light by naming */
+}
+
+
+
+
+/* ++++++++++++++++++++++++++++++ SET ++++++++++++++++++++++++++++++++++ */
+set(instrg)
+char *instrg;
+{   char par_name[LINE_LENGTH],remainder[LINE_LENGTH],str[LINE_LENGTH];
+    double par_value;
+    get_term(instrg,par_name,remainder);
+    get_term(remainder,str,remainder);  
+    if (strcmp(str,"to") != 0)  {  what("this should be 'to'");   return;  }
+    get_term(remainder,str,remainder);
+    par_value = atof(str);
+    if      (strcmp(par_name,"view_angle") == 0)   view_angle = par_value;
+    else if (strcmp(par_name,"tilt_angle") == 0)   tilt_angle = par_value;
+    else if (strcmp(par_name,"ambient_lite") == 0)  ambient_lite = par_value;
+    else what("undefined global parameter - can't set");
+}
+
+
+
+
+/* ++++++++++++++++++++++++++++ SHOW +++++++++++++++++++++++++++++++++++ */
+show(instrg)                            /* display object parameters */
+char *instrg;
+{   char name[LINE_LENGTH],remainder[LINE_LENGTH];
+    get_term(instrg,name,remainder);    /* get object name */
+    if (strcmp(name,"all") == 0)        /* brief summary */
+    {   short j;
+        printf("ambient light = %g,  view angle = %g,  tilt angle = %g\n",
+                                        ambient_lite,view_angle,tilt_angle);
+        for (j=0; j<MAX_OBJECTS; j++)  if (object[j].name[0] != NULLCHAR)
+        {   if (strcmp(object[j].name,"background") == 0)
+            {   printf(" background color %g %g %g\n",
+                        object[j].clr[0],object[j].clr[1],object[j].clr[2]);
+                if (object[j].filename[0] != NULLCHAR)
+                    printf(" background file %s\n",object[j].filename);
+                continue;
+            }
+            if (strcmp(object[j].name,"foreground") == 0)
+            {   if (object[j].filename[0] != NULLCHAR)
+                    printf(" foreground file %s\n",object[j].filename);
+                continue;
+            }
+            if (object[j].parent > 0)
+                if (object[j].supported)
+                    printf(" %s on %s at %g %g %g",object[j].name,
+                        object[object[j].parent].name,object[j].postn[0],
+                        object[j].postn[1],object[j].postn[2]);
+                else
+                    printf(" %s attached to %s at %g %g %g",object[j].name,
+                        object[object[j].parent].name,object[j].postn[0],
+                        object[j].postn[1],object[j].postn[2]);
+            else
+                printf(" %s at\t %g %g %g",object[j].name,object[j].postn[0],
+                        object[j].postn[1],object[j].postn[2]);
+
+            if (j >= LIT)  printf(",  \tcolor %g %g %g",object[j].clr[0],
+                        object[j].clr[1],object[j].clr[2]);
+            if ((j >= LIT) && (j < FIRST_OBJ)) printf(", \tradius %g",
+                        object[j].radius);     /* radius of influence if lite */
+            printf("\n");
+        }
+    }
+    else                        /* specific info on object */
+    {   short n,i,dum;
+        get_obj_index(&n,&dum,name);            /* get index to object array */
+        if (n < 0)  {   what("name not in use\n");    return;   }
+        printf(" file name:      %s\n",object[n].filename);
+        printf(" scale factors:  %g %g %g\n",
+            object[n].scale[0],object[n].scale[1],object[n].scale[2]);
+        for (i=0; i<MAXROT; i++) if (object[n].angle[i] != 0.)
+        {  printf(" rotation:      %g %g %g (base) %g %g %g (end) %g (angle)\n",
+           object[n].rotbas[i][0],object[n].rotbas[i][1],object[n].rotbas[i][2],
+           object[n].rotend[i][0],object[n].rotend[i][1],object[n].rotend[i][2],
+           object[n].angle[i]);
+        }
+        printf(" position:      %g %g %g\n",
+            object[n].postn[0],object[n].postn[1],object[n].postn[2]);
+        printf(" color:         %g %g %g\n",object[n].clr[0],object[n].clr[1],
+            object[n].clr[2]);
+        if (object[n].parent > 0)
+            printf(" connected to %s\n",object[object[n].parent].name);
+        printf(" bounding box:  %g < E - W < %g\n\
+                %g < N - S < %g\n\
+                %g < hight < %g\n",
+            object[n].box[0], object[n].box[1], object[n].box[2],
+            object[n].box[3], object[n].box[4], object[n].box[5]);
+        printf(" centroid: %g %g %g   radius: %g\n\n\n",object[n].centroid[0],
+            object[n].centroid[1],object[n].centroid[2],object[n].radius);
+    }
+}
+
+
+
+/* +++++++++++++++++++++++++++ SKETCH_ON +++++++++++++++++++++++++++++ */
+sketch_on(instrg)                       /* make image of bounding boxes */
+char *instrg;
+{   short bits,divisions,frmnum;    char dvc[LINE_LENGTH];
+  
+    dev_setup(instrg,dvc,&bits,&divisions,&frmnum,TRUE);
+    obj_sort(object,p_list);
+    bbox_task(object,p_list,dvc,bits,divisions,frmnum);
+}
+
+
+
+
+/* +++++++++++++++++++++++++++++ WHAT ++++++++++++++++++++++++++++++++++ */
+what(string)                            /* error message with position noted */
+char *string;
+{   short i;    char outstrg[2*LINE_LENGTH],*strcat();
+    for (i=0; i<char_cnt; i++)  outstrg[i] = '_';  /* build position string */
+    outstrg[char_cnt] = NULLCHAR;
+    strcat(outstrg,"^  ");
+    if (input != stdin) { puts(" "); puts(instrg); }   /* echo input line if from file */
+    fputs(outstrg,stdout);   puts(string);    /* write out position + message */
+}
+
+
+
+
+
+/*
+csystem() is just a cobbled-up version of system().  I believe the only
+differences lay in the path searches on file names.  csystem() allows
+shorter versions of the path names, in general.  -- FC
+*/
+!Funky!Stuff!
+
+

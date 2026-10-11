@@ -1,0 +1,211 @@
+Date: Thu, 28 Aug 2003 14:04:42 -0700
+From: M. Drew Streib <dtype@dtype.org>
+MIME-Version: 1.0
+User-Agent: Hogwasher/3.1 (Carbon/OSX)
+Content-Type: text/plain; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+Message-ID: <0001HW.BB73BC7A003FC2F5F0305600@text-west.newsfeeds.com>
+Subject: [PATCH] nh341-fcntl.diff - Implements fcntl(2) locking. no more
+ perm_lock errors (good for servers)
+Newsgroups: rec.games.roguelike.nethack
+Lines: 189
+X-Authenticated-User: $$_s3$ng
+X-Comments: This message was posted through <A href
+X-Comments2: IMPORTANT: Newsfeed.com does not condone,
+X-Report: Please report illegal or inappropriate use to
+X-Comments3: <A href ="http://www.newsgroups.com">Visit
+Organization: Newsfeeds.com http://www.newsfeeds.com 100,
+ 000+ UNCENSORED Newsgroups.
+Path: news5.aus1.giganews.com!firehose2!nntp4!intern1.nntp.aus1.giganews.com!border1.nntp.aus1.giganews.com!nntp.giganews.com!news-out.spamkiller.net!local!news-out.superfeed.net!local!text-west!not-for-mail
+Xref: intern1.nntp.aus1.giganews.com rec.games.roguelike.nethack:231200
+
+If you run a server, then you know of the somewhat annoying perm_lock errors
+that creep up, requiring your attention before anyone else can start a game.
+
+This patch properly implements fcntl(2) locking on systems that can handle it
+(*nix systems), that results in the lock being automatically released on 
+program termination, whether abnormal or not.
+
+If you try it and it works, or doesn't work for you, please let me know.
+
+A non-usenet version of this patch is available at
+ftp://alt.org/pub/nethack/
+
+-drew
+
+=============
+
+diff -u -r nethack-3.4.1/include/unixconf.h 
+nethack-3.4.1-permlock/include/unixconf.h
+--- nethack-3.4.1/include/unixconf.h	Sun Feb 23 14:43:23 2003
++++ nethack-3.4.1-permlock/include/unixconf.h	Tue Aug 26 17:34:18 2003
+@@ -205,6 +205,13 @@
+ 
+ #define FCMASK	0660	/* file creation mask */
+ 
++/* fcntl(2) is a POSIX-portable call for manipulating file descriptors.
++ * Comment out the USE_FCNTL if for some reason you have a strange
++ * os/filesystem combination for which fcntl(2) does not work. */
++#ifdef POSIX_TYPES
++# define USE_FCNTL
++#endif
++
+ 
+ /*
+  * The remainder of the file should not need to be changed.
+diff -u -r nethack-3.4.1/src/files.c nethack-3.4.1-permlock/src/files.c
+--- nethack-3.4.1/src/files.c	Sun Feb 23 14:43:26 2003
++++ nethack-3.4.1-permlock/src/files.c	Tue Aug 26 19:40:42 2003
+@@ -11,7 +11,7 @@
+ 
+ #include <ctype.h>
+ 
+-#if !defined(MAC) && !defined(O_WRONLY) && !defined(AZTEC_C)
++#if (!defined(MAC) && !defined(O_WRONLY) && !defined(AZTEC_C)) || 
+defined(USE_FCNTL)
+ #include <fcntl.h>
+ #endif
+ 
+@@ -1227,9 +1227,12 @@
+ 
+ static int nesting = 0;
+ 
+-#ifdef NO_FILE_LINKS	/* implies UNIX */
++#if defined(NO_FILE_LINKS) || defined(USE_FCNTL) 	/* implies UNIX */
+ static int lockfd;	/* for lock_file() to pass to unlock_file() */
+ #endif
++#ifdef USE_FCNTL
++struct flock sflock; /* for unlocking, same as above */
++#endif
+ 
+ #define HUP	if (!program_state.done_hup)
+ 
+@@ -1267,7 +1270,6 @@
+ #endif
+ }
+ 
+-
+ /* lock a file */
+ boolean
+ lock_file(filename, whichprefix, retryct)
+@@ -1287,18 +1290,51 @@
+ 	    return TRUE;
+ 	}
+ 
++#ifndef USE_FCNTL
+ 	lockname = make_lockname(filename, locknambuf);
+-	filename = fqname(filename, whichprefix, 0);
+-#ifndef NO_FILE_LINKS	/* LOCKDIR should be subsumed by LOCKPREFIX */
++# ifndef NO_FILE_LINKS	/* LOCKDIR should be subsumed by LOCKPREFIX */
+ 	lockname = fqname(lockname, LOCKPREFIX, 2);
++# endif
++#endif
++	filename = fqname(filename, whichprefix, 0);
++
++#ifdef USE_FCNTL
++	lockfd = open(filename,O_RDWR);
++	if (lockfd == -1) {
++		HUP raw_printf("Cannot open file %s. This is a program bug.",
++			filename);
++	}
++	sflock.l_type = F_WRLCK;
++	sflock.l_whence = SEEK_SET;
++	sflock.l_start = 0;
++	sflock.l_len = 0;
+ #endif
+ 
+ #if defined(UNIX) || defined(VMS)
+-# ifdef NO_FILE_LINKS
++# ifdef USE_FCNTL
++	while (fcntl(lockfd,F_SETLK,&sflock) == -1) {
++# else 
++#  ifdef NO_FILE_LINKS
+ 	while ((lockfd = open(lockname, O_RDWR|O_CREAT|O_EXCL, 0666)) == -1) {
+-# else
++#  else
+ 	while (link(filename, lockname) == -1) {
+-# endif
++#  endif
++# endif 
++
++#ifdef USE_FCNTL
++		if (retryct--) {
++			HUP raw_printf(
++				"Waiting for release of fcntl lock on %s. (%d retries left).",
++				filename, retryct);
++			sleep(1);
++		} else {
++		    HUP (void) raw_print("I give up.  Sorry.");
++		    HUP raw_printf("Some other process has an unnatural grip on %s.",
++					filename);
++		    nesting--;
++		    return FALSE;
++		}
++#else
+ 	    register int errnosv = errno;
+ 
+ 	    switch (errnosv) {	/* George Barbanis */
+@@ -1344,11 +1380,11 @@
+ 		nesting--;
+ 		return FALSE;
+ 	    }
+-
++#endif	/* USE_FCNTL */
+ 	}
+ #endif  /* UNIX || VMS */
+ 
+-#if defined(AMIGA) || defined(WIN32) || defined(MSDOS)
++#if (defined(AMIGA) || defined(WIN32) || defined(MSDOS)) && 
+!defined(USE_FCNTL)
+     lockptr = 0;
+     while (retryct-- && !lockptr) {
+ # ifdef AMIGA
+@@ -1392,25 +1428,32 @@
+ 	const char *lockname;
+ 
+ 	if (nesting == 1) {
++#ifdef USE_FCNTL
++		sflock.l_type = F_UNLCK;
++		if (fcntl(lockfd,F_SETLK,&sflock) == -1) {
++			HUP raw_printf("Can't remove fcntl lock on %s.", filename);
++		}
++#else
+ 		lockname = make_lockname(filename, locknambuf);
+-#ifndef NO_FILE_LINKS	/* LOCKDIR should be subsumed by LOCKPREFIX */
++# ifndef NO_FILE_LINKS	/* LOCKDIR should be subsumed by LOCKPREFIX */
+ 		lockname = fqname(lockname, LOCKPREFIX, 2);
+-#endif
++# endif
+ 
+-#if defined(UNIX) || defined(VMS)
++# if defined(UNIX) || defined(VMS)
+ 		if (unlink(lockname) < 0)
+ 			HUP raw_printf("Can't unlink %s.", lockname);
+		(void) close(lockfd);
+-# ifdef NO_FILE_LINKS
++#  ifdef NO_FILE_LINKS
+ 		(void) close(lockfd);
+-# endif
++#  endif
+ 
+-#endif  /* UNIX || VMS */
++# endif  /* UNIX || VMS */
+ 
+-#if defined(AMIGA) || defined(WIN32) || defined(MSDOS)
++# if defined(AMIGA) || defined(WIN32) || defined(MSDOS)
+ 		if (lockptr) Close(lockptr);
+ 		DeleteFile(lockname);
+ 		lockptr = 0;
+-#endif /* AMIGA || WIN32 || MSDOS */
++# endif /* AMIGA || WIN32 || MSDOS */
++#endif /* USE_FCNTL */
+ 	}
+ 
+ 	nesting--;
+
+
+
+----== Posted via Newsfeed.Com - Unlimited-Uncensored-Secure Usenet News==----
+http://www.newsfeed.com The #1 Newsgroup Service in the World! >100,000 Newsgroups
+---= 19 East/West-Coast Specialized Servers - Total Privacy via Encryption =---
+

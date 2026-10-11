@@ -1,0 +1,306 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,e9a09dfe53f6ef47,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-10-19 16:29:25 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.3 alpha 4/3/85; site ukma.UUCP
+Path: utzoo!watmath!clyde!cbosgd!ukma!david
+From: david@ukma.UUCP (David Herron, NPR Lover)
+Newsgroups: net.sources
+Subject: CPU usage limiter
+Message-ID: <2308@ukma.UUCP>
+Date: Sat, 19-Oct-85 19:29:25 EDT
+Article-I.D.: ukma.2308
+Posted: Sat Oct 19 19:29:25 1985
+Date-Received: Mon, 21-Oct-85 04:01:06 EDT
+Organization: U of Kentucky, Mathematical Sciences, Lexington KY
+Lines: 286
+
+I wrote this program after a couple of days in a row of news
+arriving and being unbatched during the day.  News unbatching
+doesn't mix well with troffing and macsyma.  Our poor 750 was
+at load averages hardly ever seen before (~20!).
+
+This is a modified form of our play program.  It sits above
+the program and monitors the load average.  If the load average
+gets high it nices the process group.  If the load average comes
+back down the nice goes down also.  After a couple of days of use
+this looks like a useful program.  
+
+
+Sigh!  I know....  post it to net.sources.4bsd.  Well, there aint
+one, so there!   (phthththth)  (We need a little icon for raspberries)
+
+
+: This is a shell archive, meaning:
+: 1. Remove everything above the '#! /bin/sh' line.
+: 2. Save the resulting text in a file.
+: 3. Execute the file with /bin/sh '(not csh)' to create the files:
+:	'limit.1'
+:	'limit.c'
+:	'Makefile'
+: This archive created: 'Fri Oct 18 22:09:59 1985
+'
+: By:	'David Herron, NPR Lover ()'
+export PATH; PATH=/bin:$PATH
+echo shar: extracting "'limit.1'" '(1501 characters)'
+if test -f 'limit.1'
+then
+	echo shar: will not over-write existing file "'limit.1'"
+else
+sed 's/^X//'  >'limit.1' <<'SHAR_EOF'
+X.TH LIMIT 1L "University of Kentucky" "4.2BSD"
+X.SH NAME
+Xlimit \- limit processor usage of a program by renicing
+X.SH USAGE
+Xlimit 
+X.I file
+X[
+X.I args
+X]
+X.SH DESCRIPTION
+X.LP
+XLimit(1) is meant to limit processor usage by background processes.
+XIt fork()'s and exec()'s 
+X.I file
+Xwith 
+X.I args
+X(if any) then goes into an infinite loop watching the load average.
+XIf the load average becomes very high then it changes the 
+X.I nice
+Xvalue for the process group to successively higher numbers.
+XIf the load average drops back down it again lowers the nice value.
+XIf the load average is nonexistant it sets the nice value 
+Xa little bit below 0.
+X.LP
+XIntended usage of the program is via a shell script, for instance
+Xreplace /usr/bin/rnews with:
+X.RS
+X.nf
+X.ft L
+X
+X#! /bin/sh
+Xexec /usr/local/limit /usr/lib/news/rnews
+X
+X.ft P
+X.RE
+X.LP
+XWhich will limit the impact of rnews upon your system.
+X.SH AUTHOR
+XDavid Herron
+X.br
+XUniversity of Kentucky, Computer Science
+X.br
+Xcbosgd!ukma!david, david@ukma.bitnet
+X.SH BUGS
+XThis program is a little simple minded.
+XThere are some cases where you will want all but one of a set of 
+Xprocess groups to be niced down, and the other given extra priority.
+X.LP
+XNote that this program needs to be setuid to root, so it can
+Xraise and lower process priorities at will.
+XHowever, the child process sets its uid and gid back to the real ones
+Xbefore doing the exec().
+X.LP
+XAs written it is 4.2BSD specific.
+XHowever if System V provided functions similar to load average and renice
+Xthen it could run there.
+SHAR_EOF
+if test 1501 -ne "`wc -c < 'limit.1'`"
+then
+	echo shar: error transmitting "'limit.1'" '(should have been 1501 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'limit.c'" '(2521 characters)'
+if test -f 'limit.c'
+then
+	echo shar: will not over-write existing file "'limit.c'"
+else
+sed 's/^X//'  >'limit.c' <<'SHAR_EOF'
+X/*
+X * USAGE -- limit file args
+X *
+X * SYNOPSIS
+X *
+X * file is a file to exec
+X * args are the arguments for the exec'd program
+X *
+X * Limit constantly watches the load average and if the load average
+X * gets very high will renice its process group to higher values.
+X *
+X * Note that this program is dependent on such Bezerkeley ideas
+X * as "load average", and "renice".
+X * 
+X * AUTHOR
+X *	David Herron
+X *	University of Kentucky, Computer Science
+X */
+X
+X
+X#include <stdio.h>
+X#include <nlist.h>
+X#include <signal.h>
+X#include <sys/time.h>
+X#include <sys/resource.h>
+X
+Xstruct nlist avenrun[] = {
+X	{ "_avenrun" },
+X	{ (char *)0 }
+X};
+X
+Xextern char **environ;
+X
+Xint pid;	/* Process id of child being monitored */
+Xint lastpr;
+X
+X
+X#define NAMELIST "/vmunix"
+X#define CHECK_TIME 10	/* Time between load average checks in seconds */
+X
+X#define MUCHTOOHIGH	6.0
+X#define TOOHIGH		5.0
+X#define HIGH		4.0
+X#define MODERATE	3.0
+X#define LIGHT		2.0
+X#define NONEXISTANT	1.0
+X#define NOLOAD		0.0
+X
+X
+Xmain(argc,argv)
+Xint argc;
+Xchar *argv[];
+X{
+X	void check();
+X	void leave();
+X	void set();
+X	extern char *rindex();
+X	double avg[3];
+X	char buf[256];
+X	char *s;
+X
+X	if (argc < 2) {
+X		fprintf(stderr, "Usage: limit file [args]\n");
+X		exit(1);
+X	}
+X	loadav(avg);
+X	lastpr = 200;
+X	if((pid=fork()) == 0) {
+X		strcpy(buf, argv[1]);
+X		s = rindex(argv[1], '/');
+X		argv[1] = ++s;
+X		setuid(getuid());
+X		setgid(getgid());
+X		execve(buf, &argv[1], environ);
+X		sprintf(buf, "Unknown program: %s\n", argv[1]);
+X		perror(buf);
+X		exit(1);
+X	}
+X	setuid(0);
+X	setgid(0);
+X	signal(SIGCHLD, leave);
+X	signal(SIGINT, SIG_IGN);
+X	signal(SIGQUIT, SIG_IGN);
+X	check();
+X	wait(0);
+X}
+X
+Xvoid leave() { exit(0); }
+X
+Xvoid check()
+X{
+X	double avg[3];
+X	double t;
+X
+X	signal(SIGALRM, check);
+X	loadav(avg);
+X	t = avg[1];
+X	if (t > MUCHTOOHIGH)
+X		set(17);
+X	else if(t > TOOHIGH)
+X		set(15);
+X	else if(t > HIGH) 
+X		set(13);
+X	else if(t > MODERATE) 
+X		set(10);
+X	else if(t > LIGHT) 
+X		set(5);
+X	else if (t > NONEXISTANT)
+X		set(0);
+X	else 
+X		set(-2);
+X	alarm(CHECK_TIME);
+X}
+X
+Xvoid set(prio)
+Xint prio;
+X{
+X	static int pgrp = 0;
+X
+X	if (prio == lastpr) 
+X		return;
+X	if (!pgrp) 
+X		pgrp = getpgrp(pid);
+X	setpriority(PRIO_PGRP, pgrp, prio);
+X	/* setpriority(PRIO_PROCESS, pid, prio); */
+X	lastpr = prio;
+X}
+X
+Xloadav(avg)
+Xregister double *avg;
+X{
+X	register int kmem;
+X
+X	if ((kmem = open("/dev/kmem", 0)) < 0)
+X		goto bad;
+X	nlist(NAMELIST, avenrun);
+X	if (avenrun[0].n_type == 0) {
+X		close(kmem);
+Xbad:
+X		avg[0] = 0.0;
+X		avg[1] = 0.0;
+X		avg[2] = 0.0;
+X		return;
+X	}
+X
+X	lseek(kmem, (long) avenrun[0].n_value, 0);
+X	read(kmem, (char *)avg, 3*sizeof(double));
+X	close(kmem);
+X}
+SHAR_EOF
+if test 2521 -ne "`wc -c < 'limit.c'`"
+then
+	echo shar: error transmitting "'limit.c'" '(should have been 2521 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'Makefile'" '(188 characters)'
+if test -f 'Makefile'
+then
+	echo shar: will not over-write existing file "'Makefile'"
+else
+sed 's/^X//'  >'Makefile' <<'SHAR_EOF'
+X# Makefile for limit
+X
+Xall: limit install
+X
+Xlimit: limit.o
+X	cc limit.o -o limit
+X
+Xinstall: 
+X	install -m 6755 -c -s limit /usr/local/limit
+X
+Xshar:
+X	shar -a limit.1 limit.c Makefile >limit.shar
+SHAR_EOF
+if test 188 -ne "`wc -c < 'Makefile'`"
+then
+	echo shar: error transmitting "'Makefile'" '(should have been 188 characters)'
+fi
+fi # end of overwriting check
+:	End of shell archive
+exit 0
+-- 
+David Herron,  cbosgd!ukma!david, david@UKMA.BITNET.
+
+English is a second language to me -- Baby talk was my first language.
+
+

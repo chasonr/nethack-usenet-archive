@@ -1,0 +1,1011 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,ce029f70de2da01a,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-05-13 15:24:10 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!philabs!prls!pyramid!amiga!robp
+From: robp@amiga.UUCP (Robert A. Peck)
+Newsgroups: net.sources
+Subject: FASTDIR ... faster DIR command for the Amiga Personal Computer
+Message-ID: <1154@amiga.amiga.UUCP>
+Date: Tue, 13-May-86 18:24:10 EDT
+Article-I.D.: amiga.1154
+Posted: Tue May 13 18:24:10 1986
+Date-Received: Thu, 15-May-86 05:02:43 EDT
+Reply-To: robp@dudley.UUCP (Robert A. Peck)
+Organization: Commodore-Amiga Inc., 983 University Ave #D, Los Gatos CA 95030
+Lines: 989
+Keywords: FASTDIR DIR
+Summary: There is a way to generate directory listings more quickly.
+
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#       fastdir.doc
+#       fastdir.c
+#       tree.c
+#       treeprint.c
+#       filecurrent.c
+# This archive created: Mon May 13, 1986
+export PATH; PATH=/bin:$PATH
+echo shar: extracting "'fastdir.doc'" '(2008 characters (and then some))'
+if test -f 'fastdir.doc'
+then
+        echo shar: will not over-write existing file "'fastdir.doc'"
+else
+cat << \SHAR_EOF > 'fastdir.doc'
+
+This release made to V/internal/aug by Rob Peck 5/13/86.
+
+/* fastdir.c */
+
+/* *********************************************************************** */
+/* Fastdir was designed to be a faster implementation of the "DIR" command
+ * for directories that have a large number of items in them, such as c:
+ *
+ * It is implemented as follows:
+ * 
+ * 	command:  FASTDIR 
+ *	or	  FASTDIR <pathname>
+ *
+ * If there is a file by the name ".dir" in the selected or current path
+ * name, fastdir checks the creation date of this .dir file (stored as the
+ * first line in the file itself) against the modification date of its 
+ * parent directory.  If they match exactly, it means that ".dir" contains 
+ * the (near) equivalent of somebody doing a command "DIR > .dir" within this
+ * directory.  If the creation/modification dates don't match, fastdir
+ * attempts to create such a file.  After either finding or creating
+ * this file, it copies ".dir" to the standard output.
+ * 
+ * Fastdir handles most known error conditions, such as: 
+ *
+ * write-protected disk 
+ *     (outputs the generated listing equivalent to DIR without writing
+ * 	or rewriting the .dir file).
+ * trying to get a directory of a nonexistent file
+ * 	(responds "can't find <pathname>")
+ * trying to generate a directory listing of a file
+ * 	(responds "<pathname> is not a directory")
+ * trying to generate a listing of an empty directory
+ * 	(responds "Directory '<pathname>' is empty.)
+ *
+ * Could use some error checking around the Write commands to handle
+ * too-full disks, or a write error while generating ".dir".  Anybody
+ * out there want to add these?  
+ *
+ * Fastdir does not implement DIR's "OPT" option. (OPT A, OPT I)
+ * 
+ * Fastdir modifies the DIR output slightly in that directories are NOT
+ * listed separately, but are merged alphabetically into the normal
+ * sorted alpha listing, still marked " (dir)" as they should be marked. 
+ *
+ * Author:  Rob Peck 5/13/86
+ *
+ * Lattice/Amiga C (3.03) linking information:
+ *
+ * 	compile with stack checking code disabled in pass 2 (lc2 -v file.q)
+ * 
+ * FROM lib:Astartup.obj fastdir.o filecurrent.o tree.o treeprint.o
+ * TO fastdir
+ * LIBRARY lib:amiga.lib, lib:lc.lib 
+ *
+ */
+
+
+SHAR_EOF
+fi # end of overwriting check
+echo shar: extracting "'fastdir.c'" '(11003 characters)'
+if test -f 'fastdir.c'
+then
+        echo shar: will not over-write existing file "'fastdir.c'"
+else
+cat << \SHAR_EOF > 'fastdir.c'
+
+/* fastdir.c */
+
+/*
+ * Author:  Rob Peck 5/13/86
+ */
+
+#include "libraries/dos.h"
+#include "libraries/dosextens.h"
+#include "exec/memory.h"
+
+#define ABS(x) (x > 0 ? x : -x)
+#define MAX(x,y) (x > y ? x : y)
+
+extern struct FileHandle *stdout;
+
+extern struct FileLock *Lock(),*DupLock();
+extern struct FileLock *CurrentDir(), *ParentDir();
+extern struct FileHandle *stdout, *Open();
+char *blanks = "                                   ";	/* 35 blank spaces */
+char linebuffer[80];			/* workspace for output formatting */
+int leftright=0;			/* start at left column  */
+
+struct tnode	/* for quick alphabetizing */
+{
+	struct tnode *left;
+	struct tnode *right;
+	char name[36];	/* space to store the name (30 + ' (dir)') max */
+	char dirflag;	/* nonzero if it is a directory */
+};
+
+extern struct tnode *tree();
+struct tnode *root;	   /* Pointer to the first one so we can deallocate */
+struct FileInfoBlock *m;   /* for getting write-protect information */
+struct FileLock *newlock;  /* Lock on current (or requested) dir    */
+struct FileLock *dirlock;  /* Lock on the .dir file 	 	     */
+int    maxlen=0;	   /* Maximum length of any string, provided 
+			    * for later change in formatting (more
+			    * entries per line
+		            */
+
+#define PROTECTED 1
+#define WRITEABLE 0    
+
+main(argc, argv)
+	int argc;
+	char *argv[];
+{
+	LONG myerror;		    /* place for error return filecurrent */
+	LONG success;	    	    /* work variables			  */
+	char *whichdir;		    /* which directory to get a lock on?  */
+	struct FileLock *startlock; /* lock on the current directory      */
+	struct FileLock *ignorlock; /* going back to original dir.        */
+	struct InfoData *id;	    /* see if disk is write-protected     */
+	struct FileLock *originallock; /* for "going home" again */
+
+	/* Save a lock to original directory so that before we exit, we
+	 * can move the CLI back to where it started
+	 */
+	originallock = Lock("",ACCESS_READ);	
+
+	id = NULL;
+
+	if(argc == 1) 
+	{
+	    /* No directory specified, use current one! */
+	    /* Null string means use current dir */
+	    whichdir = "";	
+	}
+	else
+	{
+	    whichdir = argv[1];
+	} 
+	/* Get a lock on the user-specified directory */
+
+   	newlock = Lock(whichdir,ACCESS_READ);
+
+	if(newlock == 0)
+	{
+	  if(argc == 1)
+	    printf("Can't get a lock on current dir!\n");
+	  else
+	    printf("Can't find %ls\n",argv[1]);
+	  exit(100);
+	}
+	else
+	{
+	    /* Move into this user selected directory */
+	
+	    startlock = CurrentDir(newlock);
+	}
+	/* Now see if there is a current copy of the ".dir" file here */
+
+	if(filecurrent(".dir",&myerror))
+	{
+	    /* If its there and current, then output it */
+
+	    output_dirfile(newlock);
+	}
+	else
+	{ 
+	    /* If its not current, attempt to create or overwrite it */
+
+	    /* InfoData MUST BE LONGWORD ALIGNED, so allocate it     */
+
+	    id = (struct InfoData *)
+		AllocMem(sizeof(struct InfoData),MEMF_CLEAR);
+
+	    if(id)
+	    {
+		/* Get info to see if disk is write protected */
+
+	        success = Info(newlock, id);  
+	        if(success)
+	        {
+		    if(id->id_DiskState == ID_WRITE_PROTECTED)
+		    {
+		        DirList(newlock, PROTECTED, whichdir);
+			goto finish;
+		    }
+	        } 
+		else
+		{
+		    printf("Can't get Info about current directory\n");
+		    goto finish;	/* Info command failed */
+		}
+	        if(DirList(newlock, WRITEABLE, whichdir))
+	        {
+		    /* If DirList returns nonzero, means the file
+		     * got created (there was at least one entry
+		     * in the directory and the disk wasn't write
+		     * protected.)
+		     */ 
+	             output_dirfile(newlock);  /* copy ".dir" to stdout */
+	        }
+	        goto finish;
+	    }
+	    else
+	    {
+	        printf("Not enough memory for InfoData\n");
+		/* If this happens, there certainly isn't enough
+		 * to generate a DirList either! 
+		 */
+	    }
+    finish:		
+	}
+	if(id) FreeMem(id, sizeof(struct InfoData));
+    cleanup:
+	if(newlock) UnLock(newlock);
+	/* move into the original directory from whence you came */
+	ignorlock = CurrentDir(originallock);
+/* 	if(originallock) UnLock(originallock);   */
+}
+
+
+/* output_dirfile -- copy ".dir" to stdout  	        	*/
+
+output_dirfile(lock)
+struct FileLock *lock;	/* shows the current directory to use */
+{
+    struct FileHandle *fh;
+    struct FileLock *ignoredlock;
+    UBYTE buffer[300];
+    int actualcount, outcount;
+
+    ignoredlock = CurrentDir(lock);	/* make sure are in correct place */
+    fh = Open(".dir",MODE_OLDFILE);   
+    if(fh)
+    {
+      while(1)				     /* forever, till EOF */
+      {
+
+        actualcount = Read(fh, buffer, 255); /* decent block size */
+	if(actualcount == 255)
+	{
+	    /* ======================++++++++======================= */
+	    /* NOTE: This assumes an AmigaDOS file handle for stdout */
+	    /* ======================++++++++======================= */
+	    outcount = Write(stdout, buffer, actualcount); 
+	}
+	if(actualcount < 255)
+	{
+	    outcount = Write(stdout, buffer, actualcount); 
+	    break;
+	}
+	if(actualcount == -1)
+	{
+	    printf("Error ( %ld ) copying .dir to output\n",IoErr());
+	    break;
+	}
+      }
+    Close(fh);	/* close the file */
+    }
+    else
+    {
+	printf("'.dir' won't open!  IoErr() = %ld\n", IoErr());
+    }
+} 
+
+/* DirList -- Look through the binary tree listing that tree() produced
+ * 	      and output the names in that tree in alphabetical order.
+ *	      If selected directory is writeable, create a file named
+ * 	      .dir there, containing the formatted output.  Current
+ * 	      implementation puts two names on each line, just like DIR.
+ */
+
+
+DirList(lock, protectstatus, pathname)   
+struct FileLock *lock;
+int protectstatus;
+char *pathname;			/* Pathname that user gave us. */
+{
+    struct FileHandle *tfh;
+    LONG success;
+    struct tnode *allocated;
+    struct tnode *t;
+    LONG *ds;
+
+    /* if at the end of the road, don't print anything */
+    if(!lock) return(0);   
+
+    root = (struct tnode *)
+		AllocMem(sizeof(struct tnode),MEMF_CLEAR);
+
+    if(!root) return(0);
+
+    /* allocate space for a FileInfoBlock */
+
+    m = (struct FileInfoBlock *)
+    	AllocMem(sizeof(struct FileInfoBlock),MEMF_CLEAR);
+
+    if(!m) goto noentries;
+
+    success = Examine(lock,m);
+
+    if(!success) 
+    {
+	printf("Can't examine directory for '%ls'\n",pathname);
+	goto noentries;
+    }	
+  	 
+   /* The first call to examine fills the FileInfoBlock with 
+    * INFORMATION ABOUT THE DIRECTORY.  If it is called at the 
+    * root level, it contains the volume name of the disk.  If 
+    * we're building a directory listing, we won't want this 
+    * entry to be in it, so we call ExNext before starting the
+    * listing itself.
+    */
+
+    /* Three conditions to consider here... 
+     * a.  is NOT a directory.
+     * b.  is an empty directory.
+     * c.  has at least one entry.
+     */
+
+    /* NOT A DIRECTORY */
+
+    if(m->fib_DirEntryType <= 0)
+    {
+	/* If this is true, we're dealing with a plain file.
+	 * It should exit saying this is NOT a directory 
+	 */
+	printf("'%ls' is not a directory.\n",pathname);
+
+  noentries:
+
+	if(root) FreeMem(root, sizeof(struct tnode));
+	/* treeprint normally frees all entries, including root, but
+	 * we never get there so we have to free the memory here instead
+	 */
+	if(m) FreeMem(m, sizeof(struct FileInfoBlock));
+	return(0);	/* didn't create a file, so don't print it. */
+    }	
+    success = ExNext(lock,m);
+
+    /* EMPTY DIRECTORY */
+
+    if(!(success)) 
+    {
+	printf("Directory '%ls' is empty.\n", pathname);
+	goto noentries;
+    }
+
+    /* AT LEAST ONE ENTRY */
+   
+    /* Initialize the very first node */
+	
+    t = root;		
+    strcpy(  &(t->name[0]), &(m->fib_FileName[0]) );
+    if (m->fib_DirEntryType > 0)
+    {
+	strcat( &(t->name[0]), " (dir)" );
+    }
+    maxlen = MAX(maxlen, strlen( &(t->name[0])));
+
+    /* t->left and t->right pointers are already set to zero by AllocMem */
+
+    success = ExNext(lock,m);
+    while (success)		/* was (success != 0)  */
+    {
+	t = root;	/* begin the search at the root */
+
+ 	/* Install it into the chain, recursively.  Allocated is an
+	 * indicator that there was still enough memory to build a
+	 * new chain for this node.  If allocated == 0, have to
+	 * terminate prematurely.
+	 */
+	allocated = tree(t, &(m->fib_FileName[0]));
+	if(allocated == 0) break;	
+      	success = ExNext(lock,m);
+    }
+    if(allocated == 0)	/* header for the premature termination */
+    {
+	printf("\nPARTIAL DIR LISTING ONLY....NOT ENOUGH MEMORY\n");
+	goto showlist;
+    }
+     
+    /* "KLUGE".... we are trying to create a file named '.dir', but we
+     * don't have any (FileInfoBlock) info about it yet since the builder 
+     * of the file hasn't yet even written it.  So we'll take the very 
+     * last entry in the file info block and modify its name field to 
+     * be '.dir' so that this file name will actually appear in the listing.
+     * (this is ok since tree() is not using anything but the name field).
+     */
+
+    if(protectstatus == WRITEABLE)
+    {
+        strcpy( &(m->fib_FileName[0]), ".dir" );
+        allocated = tree(root, ".dir");		/* install .dir */
+    }
+showlist:
+
+    /* Now begin to build the output listing, two to a line */
+
+    sprintf(&linebuffer[0], "%ls", blanks);	/* blank first 35 locations */
+    sprintf(&linebuffer[35], "%ls", blanks);	/* blank next  35 locations */
+    linebuffer[67] = '\0';	/* null terminator */
+
+    tfh = 0;				/* start out with no file open    */
+    if(protectstatus == WRITEABLE)	/* If seems to be unprotected ... */
+    {
+	tfh = Open(".dir",MODE_NEWFILE);  /* if fails, tfh = 0 */
+    }
+    /* When this file is FIRST opened, the time of its parent directory
+     * modification is established.  If we want to know if the file we
+     * have created is current, we have to store the change time of the
+     * parent directory in this file itself.  Then no matter, with
+     * multi-tasking, how long it takes to create this .dir file
+     * (whose date is established when it CLOSES), we'll have the
+     * correct numbers to compare, and be zero time-ticks off.
+     * The .dir file will contain its parent's creation date and time as the
+     * first line, so you'll be able to see whether DIR gets generated
+     * fresh or if it came from the .dir file.
+     */
+    success = Examine(newlock,m);	/* Succeeded once already so it
+					 * should also succeed here.
+					 * Now the date has been changed
+					 * to reflect the .dir file opened.
+					 */
+    ds = (LONG *)&(m->fib_Date); 	/* Pass along the address of the 
+					 * datestamp of the parent directory
+					 */
+    dotreeprint(root, tfh, ds);
+
+    if(tfh) Close(tfh);
+    if(m) FreeMem(m,sizeof(struct FileInfoBlock));
+    return(TRUE);	/* Created a file, so its ok to print it later */
+}
+
+strcat( to, from )
+register char *to, *from;
+{
+    while( *to ) to++;	/* find the end of the current string */
+
+    strcpy( to, from ); /* then overlay trailing null, with first char.
+			 * of the string to be concatenated. */
+}
+
+strlen( s )
+register char *s;
+{
+    register i = 0;
+
+    while( *s++ ) i++;
+
+    return( i );
+}
+
+SHAR_EOF
+fi # end of overwriting check
+echo shar: extracting "'tree.c'" '(3821 characters)'
+if test -f 'tree.c'
+then
+        echo shar: will not over-write existing file "'tree.c'"
+else
+cat << \SHAR_EOF > 'tree.c'
+
+
+/* tree.c */
+
+/* Author:  Rob Peck  5/13/86 */
+
+/* part of "fastdir" command */
+
+
+
+#include "exec/types.h"
+#include "libraries/dos.h"
+#include "exec/memory.h"
+
+
+#define MAX(x,y) (x > y ? x : y)
+
+#define FASTDIR 1
+
+#ifdef FASTDIR
+extern struct FileInfoBlock *m;
+#endif FASTDIR
+
+extern int maxlen;
+
+struct tnode    /* for quick alphabetizing */
+{
+        struct tnode *left;
+        struct tnode *right;
+        char name[36];  /* space to store the name (30 + ' (dir)') max */
+        char dirflag;   /* nonzero if it is a directory */
+};
+
+
+/* tolower(c) --  Convert characters to lower case              */
+
+int tolower( b )
+        int b;
+{
+        if( (b >= 'A') && (b <= 'Z') )
+                return(b - 'A' + 'a');
+        else
+                return( b );
+}
+
+/* tree -- Install a new named node at or below the one now pointed to
+ * 	   RECURSIVELY CALLS ITSELF.... be careful not to run out of
+ * 	   stack space if the strings nest too deeply.			
+ */
+
+struct tnode *tree(t, name)
+	struct tnode *t;
+	char *name;
+{
+	int cond;	/* Condition code from return */
+	struct tnode *allocated;
+
+	if(t == NULL)	/* If prior invocation has reached a null pointer,
+			 * a new node must be allocated.
+			 */
+	{
+	    t = (struct tnode *)
+                AllocMem(sizeof(struct tnode),MEMF_CLEAR);
+
+	    if(t == 0)
+	    {
+		/* NOT ENOUGH MEMORY TO FINISH THE TREE */
+		/* Make sure to STOP!			*/
+
+		return(0);	
+	    }
+    	    strcpy(  &(t->name[0]), name );
+#ifdef FASTDIR
+    	    if (m->fib_DirEntryType > 0)
+    	    {
+	    	strcat( &(t->name[0]), " (dir)" );
+    	    }
+#endif FASTDIR
+    	    maxlen = MAX(maxlen, strlen( &(t->name[0])));
+
+	    return(t);
+	}		
+	/* compare two strings and decide where to install the new one */
+
+	cond = compLC(&(t->name[0]), name );
+
+	if(cond < 0)
+	{
+	    if (t->left != NULL) /* search for a NULL entry */
+	    { 
+		return(tree(t->left, name)); 
+	    }
+	    else		 /* try to install at the null entry found */
+	    { 
+		allocated = tree(0, name);  
+		/* If allocated == 0, then it passes a NULL all the
+		 * way back to the caller, telling him the system has
+		 * just run out of memory trying to build the chains.
+		 * So it should consider the chain complete and try
+		 * to output it, thereby freeing the memory along the way.
+		 */  
+		t->left = allocated;
+		return(allocated);
+	    }
+	}
+	else if(cond > 0)
+	{
+	    if (t->right != NULL) /* search for a NULL entry */
+	    { 
+		return(tree(t->right, name)); 
+	    }
+	    else		 /* try to install at the null entry found */
+	    { 
+		allocated = tree(0, name);
+		t->right = allocated;
+		return(allocated);
+	    }
+	}
+	else 
+	{
+	/* If it EVER gets here, means entry of a duplicate item into tree.
+	 * Is treated as an error.  Upper and lower case are the same and only
+	 * get listed once.  Original application was for 'fastdir' and  
+	 * AmigaDOS cannot install duplicate file names into a single 
+	 * directory.
+	 */
+	return(0);
+	}
+}
+ 
+strcpy( to, from )
+register char *to, *from;
+{
+    do { 
+        *to++ = *from;
+    } while( *from++ );
+}
+
+
+/* compLC --    Compare two strings, ignoring case.
+ *              returns -1 if s<t, 1 if s>t, 0 if s=t.
+ */
+
+int compLC(s,t)
+register char *s, *t;
+{
+register char test;
+    while(1)
+    {
+        test = tolower(*s)-tolower(*t); /* compare two characters */
+
+        if (test < 0)
+        {
+           return(-1);        /* first less than second */
+        }
+        else
+        {
+            if (test > 0)
+            {
+                return(1);   /* first greater than second */
+            }
+            else             /* first equals second, so far */
+            {
+                if( *s == '\0')  /* if nulls match also, strings are equal */
+                {
+                    return(0);
+                }
+            t++;
+            s++;
+            }
+        }
+    }
+}
+
+
+SHAR_EOF
+fi # end of overwriting check
+echo shar: extracting "'treeprint.c'" '(3624 characters)'
+if test -f 'treeprint.c'
+then
+        echo shar: will not over-write existing file "'treeprint.c'"
+else
+cat << \SHAR_EOF > 'treeprint.c'
+
+/* treeprint.c */
+
+/* author:  Rob Peck  5/13/86 */
+
+/* part of "fastdir" command  */
+
+
+#include "libraries/dos.h"
+#include "libraries/dosextens.h"
+#include "exec/memory.h"
+#define SPRINTF 1
+#define FPRINTF 0
+
+extern int leftright;
+extern char *blanks;
+extern char linebuffer[];
+extern int (*fprintf)();
+
+struct tnode    /* for quick alphabetizing */
+{
+        struct tnode *left;
+        struct tnode *right;
+        char name[36];  /* space to store the name (30 + ' (dir)') max */
+        char dirflag;   /* nonzero if it is a directory */
+};
+/* This SPECIAL VERSION of strcpy does NOT copy the trailing null */
+
+mystrcpy( to, from )
+register char *to, *from;
+{
+    char *leadingfrom;
+    leadingfrom = from + 1;
+    do {
+        *to++ = *from++;
+    } while( *leadingfrom++ );
+}
+
+
+/* treeprint -- recursive output, to stdout or to a file, from the 
+ * 		linked node list that tree() creates.  tree() allocates
+ * 		memory;  treeprint() deallocates it as it runs
+ */
+
+treeprint(t,tfh)		/* print the tree recursively */
+struct tnode *t;
+struct FileHandle *tfh; 	/* if theres a file open, use it */
+{
+	int actual;
+	if(t->right != NULL) treeprint(t->right,tfh);
+	if(leftright == 0)
+	{
+	    mystrcpy(&linebuffer[2], blanks);	/* blank the string */
+	    mystrcpy(&linebuffer[2], &(t->name[0])); /* install the name */
+ 	    mystrcpy(&linebuffer[35],blanks);	/* blank out rest. */
+	    leftright = 1;
+	}
+	else
+	{
+	    mystrcpy(&linebuffer[35], &(t->name[0])); /* install the name */
+	    leftright = 0;
+	    if(tfh == 0)
+	    {
+	        printf("%ls\n", linebuffer);
+	    }
+	    else
+	    {
+	        actual = Write(tfh, linebuffer, 66);
+		actual = Write(tfh, "\n", 1);
+	    }
+	}
+	if(t->left != NULL) treeprint(t->left,tfh);
+	FreeMem(t, sizeof(struct tnode));
+	return(0);
+}
+
+dotreeprint(root, tfh, ds)
+    struct tnode *root;
+    struct FileHandle *tfh;
+    LONG *ds;			/* points to the datestamp */
+{
+    char dummy[50];		/* When call for FPRINTF, dummy is not used. */
+    
+    if(tfh)
+    {
+	DateToAscii(FPRINTF, dummy, ds, tfh);
+    }	
+    treeprint(root, tfh);    /* call does all except the final line */
+    if(leftright == 1) 
+    {
+	if(tfh)	/* if there is a file open, thats where the output goes. */
+	{
+	    Write(tfh, linebuffer, 66);
+	    Write(tfh, "\n", 1);
+	}
+	else	/* otherwise print it to stdout */
+	{
+	    printf("%ls\n",linebuffer);
+	}
+    }
+}
+
+/* This routine can accept either "FPRINTF", which expects whereto
+ * to be a file handle, or "SPRINTF", which expects whereto to be the
+ * address of a string.
+ */
+
+DateToAscii(routine, whereto, ds, tfh)
+	LONG routine;		/* which routine to use   */
+	char *whereto;
+	struct FileHandle *tfh;
+
+	LONG *ds;		/* pointer to a datestamp */
+{
+	char dateout[50];	/* only need about 41, but this is ok */
+	int actual;
+	LONG n ;	/* number of days past 1/1/78 */
+   	int m, d, y ;	/* month, day, year */
+	int h, mn, sec; /* hours, minutes, seconds */
+	n = ds[0] - 2251 ;
+   	y = (4 * n + 3) / 1461 ;
+   	n -= 1461 * y / 4 ;
+   	y += 84 ;		/* was 1984 */
+   	m = (5 * n + 2) / 153 ;
+   	d = n - (153 * m + 2) / 5 + 1 ;
+   	m += 3 ;
+   	if (m > 12) 
+	{
+      		y++ ;
+      		m -= 12 ;
+   	}
+	h = ds[1] / 60;	/* 60 minutes per hour */
+	mn = ds[1] - h * 60; /* remainder is the minutes */
+	sec = ds[2] / TICKS_PER_SECOND;
+	switch(routine)
+	{
+	   case SPRINTF:
+		sprintf(whereto, 
+	"<dir> Creation Date: %02ld/%02ld/%02ld %02ld:%02ld:%02ld.\n",m,d,y,h,mn,sec);
+	   	break;
+	   case FPRINTF:
+		sprintf(dateout, 
+	"<dir> Creation Date: %02ld/%02ld/%02ld %02ld:%02ld:%02ld.\n",m,d,y,h,mn,sec);
+		actual = Write(tfh, dateout, 41);
+	   	break;
+	   default:
+		break;
+	}	
+	return(0);
+}
+
+
+SHAR_EOF
+fi # end of overwriting check
+echo shar: extracting "'filecurrent.c'" '(4296 characters)'
+if test -f 'filecurrent.c'
+then
+        echo shar: will not over-write existing file "'filecurrent.c'"
+else
+cat << \SHAR_EOF > 'filecurrent.c'
+
+
+/* filecurrent.c */
+
+/* Author:  Rob Peck   5/13/86  */
+
+/* part of "fastdir" */
+
+
+#include "libraries/dos.h"
+#include "libraries/dosextens.h"
+#include "exec/memory.h"
+
+#define ABS(x) (x > 0 ? x : -x)
+#define SPRINTF 1
+#define FPRINTF 0
+
+extern struct FileLock *Lock(),*DupLock();
+extern struct FileLock *CurrentDir(), *ParentDir();
+extern struct FileHandle *stdout, *Open();
+
+/* filecurrent -- See if there is a "current" copy of a specified file name
+ *		  in the directory in which we now reside.  Return FALSE if
+ *		  it is either nonexistent, or if it is non-current, based
+ *		  on the minutes and seconds information passed to this
+ *		  subroutine.  (When a file is opened into a directory
+ *		  under AmigaDOS, both the file-written date and the 
+ *		  directory-written date are modified.  The file date
+ *		  itself gets written when it is closed.)  
+ */
+
+int 
+filecurrent(name, error)
+
+	char *name;	/* What is the name of the file to look for */
+	int *error;	/* Where to put an error code, if and only if
+			 * a value of FALSE is returned (TRUE is expected).
+			 */
+{
+	LONG success, i; 
+	LONG *parentdate;
+	struct FileHandle *fh;
+	char cbuffer[50];	    /* creation date buffer */
+	char dbuffer[50];	    /* .dir file contents   */
+	int actual, status;
+
+	struct FileInfoBlock *fib;  /* for getting date information 	  */
+	struct FileLock *filelock;  /* lock on the selected file          */
+	struct FileLock *currentlock;  /* lock on the selected file       */
+	struct FileHandle *dummyfh;
+
+	dummyfh = NULL;		    /* not used anyhow */
+	fib = NULL;
+	currentlock = NULL;
+	filelock = NULL;
+
+	/* Try to lock this file, just to see if it exists */
+
+	filelock = Lock(name, ACCESS_READ);
+
+	if(!filelock)
+	{
+	    *error = ERROR_OBJECT_NOT_FOUND; 
+	    return(FALSE);	/* If non-existent, it is not current! */
+	}
+	UnLock(filelock);
+	filelock = NULL;
+
+ 	/* Once we get here, we know that the file exists, but we now
+	 * have to determine whether it is current.  If it didn't exist,
+	 * the above return(FALSE) would have happened.  Now read the 
+	 * last modified date of the directory the file is in to get
+	 * something against which to compare.  This particular date
+	 * is stored as the first info within the file itself.
+	 */
+
+	/* FileInfoBlock MUST BE LONGWORD ALIGNED, so we have to 
+	 * dynamically allocate it.
+	 */
+
+	fib = (struct FileInfoBlock *)
+		AllocMem(sizeof(struct FileInfoBlock),MEMF_CLEAR);
+
+	if(fib == 0)	/* no memory for file info block? */
+	{
+	    *error = ERROR_NO_FREE_STORE;
+	    return(FALSE);	/* Cannot allocate memory */
+	}
+	
+	/* initialize the buffers */
+
+	for(i=0; i<50; i++)
+	{
+	    cbuffer[i] = 0x20;  /* ascii blank */
+	    dbuffer[i] = 0x20;
+	}
+	cbuffer[49] = 0;  dbuffer[49] = 0;	/* end of string nulls */
+	
+	/* (Passing a null-string asks for a lock on the current directory) */
+
+	/* Look at the directory we've moved into, and check its mod date   */
+	/* Start by getting a lock on the current directory		    */
+
+	currentlock = Lock("",ACCESS_READ);
+	if(!currentlock)
+	{
+	    *error = ERROR_DIR_NOT_FOUND;  /* Can't lock current directory */
+	    status = FALSE;
+	    goto cleanfinish;
+	}
+
+	/* Now using that lock, Examine current directory to get the date */
+
+	success = Examine(currentlock,fib);
+	if(success)
+	{
+	    parentdate = (LONG *)&(fib->fib_Date);
+	    DateToAscii(SPRINTF, cbuffer, parentdate, dummyfh);
+	}
+	status = FALSE;	   /* Start out assuming it is not the same */
+	*error = 0;	   /* A false return with 0 errors is valid....
+			    * it means file found, but not up to date   
+			    */
+	
+	fh = Open(name,MODE_OLDFILE);
+	if(!fh) goto cleanfinish;
+
+	actual = Read(fh, dbuffer, 40);	/* get the date from the file */
+	if(actual != 40)
+	{
+	    printf("Error while reading %ls\n",name);
+	    goto cleanfinish;
+	}
+	status = comparedates(cbuffer, dbuffer);
+
+    cleanfinish:
+
+	if(fh) Close(fh);
+	if(fib) FreeMem(fib, sizeof(struct FileInfoBlock));
+	if(currentlock) UnLock(currentlock);
+	return(status);
+}
+
+comparedates(s,t)
+	char *s, *t;
+{
+	while( *s == *t )
+	{
+	    if(*s == '.') 	/* both equal and reach a period, ok! */
+	    {
+		return(TRUE);
+	    }
+	    if(*s == '\0') return(FALSE);	/* error, hit end of string
+						 * without finding '.' 
+						 */
+	s++; t++;
+	}
+	return(FALSE);	/* found an unequal character prior to the period */
+}
+
+
+SHAR_EOF
+fi # end of overwriting check
+#       End of shell archive
+exit 0
+ 
+
+

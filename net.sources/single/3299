@@ -1,0 +1,334 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,13ffaf263bdce2fa,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-09-11 15:54:11 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site umcp-cs.UUCP
+Path: utzoo!linus!decvax!genrad!panda!talcott!harvard!seismo!umcp-cs!chris
+From: chris@umcp-cs.UUCP (Chris Torek)
+Newsgroups: net.sources
+Subject: Almost-generic search table routine using binary search
+Message-ID: <1551@umcp-cs.UUCP>
+Date: Wed, 11-Sep-85 18:54:11 EDT
+Article-I.D.: umcp-cs.1551
+Posted: Wed Sep 11 18:54:11 1985
+Date-Received: Sat, 14-Sep-85 02:22:21 EDT
+Distribution: net
+Organization: U of Maryland, Computer Science Dept., College Park, MD
+Lines: 313
+
+# The following is some almost-generic table storage and lookup code.
+# It operates off 32-bit keys, which is where it departs from being
+# generic, but could be easily modified for other uses.
+#
+# The documentation consists of the following extract from ../lib/README:
+# ---------------------------------------------------------------
+#	struct search *SCreate(dsize)
+#	unsigned dsize;
+#
+# Creates a search table; keys are i32 integers, data objects are of
+# size dsize and of unspecified type.  A null pointer is returned if
+# the table cannot be created.
+#
+#	SEnumerate(table, func)
+#	struct search *table;
+#	int (*func)();
+#
+# Invokes the given function on each object in the table.  The function
+# is handed a "char *" pointer to the objects as its first argument
+# and the i32 key as its second.  (The return value from (*func)(),
+# if any, is ignored; technically it should be void (*func)(), but
+# that is not implemented quite right in many Unix compilers...)
+#
+#	char *SSearch(table, key, disp)
+#	struct search *table;
+#	i32 key;
+#	int *disp;
+#
+# Searches for a given key within the given search table.  A number
+# of dispositions can be specified; see ../h/search.h for the flags
+# that can be specified in *disp.  *disp is modified before return
+# to set the reason for the search success or failure.  The return
+# value is a pointer to the user data area for the given key if found,
+# otherwise NULL.
+#
+# WARNING: data areas may move on future searches that create new
+# data objects.
+# ---------------------------------------------------------------
+# You will probably have to fiddle with the file names somewhat, as
+# I am using this code in a large project where lots of directories
+# are helpful.  Also note that ``types.h'' is machine dependent.
+#
+# For those of you who are stuck with System V, bcopy and memcpy have
+# identical semantics (only the order of arguments is different);
+# bzero can be accomplished with memset (set all bytes to '\0').
+# bcopy takes (from, to, count), and bzero takes (from, count);
+# see your manual for the arguments for memcpy and memset.
+#
+# Chris
+#
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ x$1 = x-a ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting search.c'
+sed 's/^X//' <<'//go.sysin dd *' >search.c
+#ifndef lint
+static char rcsid[] = "$Header: /ful/chris/ctex/lib/RCS/search.c,v 1.2 85/09/11 18:31:19 chris Exp $";
+#endif
+
+X/*
+ * Key search routines (for a 32 bit key)
+ *
+ * SCreate initializes the search control area.
+ *
+ * SSearch returns the address of the data area (if found or created)
+ * or a null pointer (if not).  The last argument controls the disposition
+ * in various cases, and is a ``value-result'' parameter.
+ *
+ * SEnumerate calls the given function on each data object within the
+ * search table.  Note that no ordering is specified (though currently
+ * it runs in increasing-key-value sequence).
+ */
+
+#include "../h/types.h"
+#include "../h/search.h"
+
+#if vax || mc68000 || ns32000 || pyr
+#define	HARD_ALIGNMENT	4
+#else
+#define	HARD_ALIGNMENT	16	/* should suffice for most everyone */
+#endif
+
+static int DOffset;		/* part of alignment code */
+
+char *malloc(), *realloc();
+
+struct search *
+SCreate (dsize)
+register unsigned int dsize;
+{
+    register struct search *s;
+
+    if ((s = (struct search *) malloc (sizeof *s)) == 0)
+	return 0;
+
+    if (DOffset == 0) {
+#ifndef HARD_ALIGNMENT
+	DOffset = sizeof (i32);
+#else
+	DOffset = (sizeof (i32) + HARD_ALIGNMENT - 1) & ~(HARD_ALIGNMENT - 1);
+#endif
+    }
+    dsize += DOffset;		/* tack on space for keys */
+
+#ifdef HARD_ALIGNMENT
+ /* For machines with strict alignment constraints, it may be necessary to
+    align the data at a multiple of some positive power of two.  In general,
+    it would suffice to make dsize a power of two, but this could be very
+    space-wasteful, so instead we align it to HARD_ALIGNMENT.  64 bit
+    machines might ``#define HARD_ALIGNMENT 8'', for example.  N.B.:  we
+    assume that HARD_ALIGNMENT is a power of two. */
+
+    dsize = (dsize + HARD_ALIGNMENT - 1) & ~(HARD_ALIGNMENT - 1);
+#endif
+
+    s -> s_dsize = dsize;	/* save data object size */
+    s -> s_space = 10;		/* initially, room for 10 objects */
+    s -> s_n = 0;		/* and none in the table */
+    if ((s -> s_data = malloc (s -> s_space * dsize)) == 0) {
+	free ((char *) s);
+	return 0;
+    }
+    return s;
+}
+
+X/* we actually use a binary search right now - this may change */
+char *
+SSearch (s, key, disp)
+register struct search *s;
+register i32 key;
+int *disp;
+{
+    register char *keyaddr;
+    int itemstomove;
+
+    *disp &= S_CREATE | S_EXCL;	/* clear return codes */
+    if (s -> s_n) {		/* look for the key */
+	register int h, l, m;
+
+	h = s -> s_n - 1;
+	l = 0;
+	while (l <= h) {
+	    m = (l + h) >> 1;
+	    keyaddr = s -> s_data + m * s -> s_dsize;
+	    if (*(i32 *) keyaddr > key)
+		h = m - 1;
+	    else if (*(i32 *) keyaddr < key)
+		l = m + 1;
+	    else {		/* found it, now what? */
+		if (*disp & S_EXCL) {
+		    *disp |= S_COLL;
+		    return 0;	/* collision */
+		}
+		*disp |= S_FOUND;
+		return keyaddr + DOffset;
+	    }
+	}
+	keyaddr = s -> s_data + l * s -> s_dsize;
+    }
+    else
+	keyaddr = s -> s_data;
+
+ /* keyaddr is now where the key should have been found, if anywhere */
+    if ((*disp & S_CREATE) == 0)
+	return 0;		/* not found */
+
+ /* avoid using realloc so as to retain old data if out of memory */
+    if (s -> s_space <= 0) {	/* must expand; double it */
+	register char *new;
+
+	if ((new = malloc ((s -> s_n << 1) * s -> s_dsize)) == 0) {
+	    *disp |= S_ERROR;	/* no space */
+	    return 0;
+	}
+	keyaddr = (keyaddr - s -> s_data) + new;	/* relocate */
+	bcopy (s -> s_data, new, s -> s_n * s -> s_dsize);
+	free (s -> s_data);
+	s -> s_data = new;
+	s -> s_space = s -> s_n;
+    }
+
+ /* now move any keyed data that is beyond keyaddr down */
+    itemstomove = s -> s_n - (keyaddr - s -> s_data) / s -> s_dsize;
+    if (itemstomove) {
+#ifndef USE_BCOPY		/* often bcopy doesn't handle overlap */
+	register char *from, *to;
+
+	from = s -> s_data + s -> s_n * s -> s_dsize;
+	to = from + s -> s_dsize;
+	while (from > keyaddr)
+	    *--to = *--from;
+#else
+	bcopy (keyaddr + s -> s_dsize, keyaddr + (s -> s_dsize << 1),
+		itemstomove * s -> s_dsize);
+#endif
+    }
+    *disp |= S_NEW;
+    s -> s_n++;
+    s -> s_space--;
+    *(i32 *) keyaddr = key;
+    keyaddr += DOffset;		/* now actually dataaddr */
+ /* the bzero is just a frill... */
+    bzero (keyaddr, s -> s_dsize - DOffset);
+    return keyaddr;
+}
+
+SEnumerate (s, f)
+register struct search *s;
+register int (*f) (); {
+    register int n;
+    register char *p;
+
+    n = s -> s_n;
+    p = s -> s_data;
+    while (--n >= 0) {
+	(*f) (p + DOffset, *(i32 *) p);
+	p += s -> s_dsize;
+    }
+}
+//go.sysin dd *
+if [ `wc -c < search.c` != 4404 ]; then
+	made=FALSE
+	/bin/echo 'error transmitting "search.c" --'
+	/bin/echo 'length should be 4404, not' `wc -c < search.c`
+else
+	made=TRUE
+fi
+if [ $made = TRUE ]; then
+	/bin/chmod 644 search.c
+	/bin/echo -n '	'; /bin/ls -ld search.c
+fi
+/bin/echo 'Extracting search.h'
+sed 's/^X//' <<'//go.sysin dd *' >search.h
+X/* search structures and routines for 32-bit key, arbitrary data */
+
+struct search {
+	unsigned s_dsize;	/* data object size (includes key size) */
+	unsigned s_space;	/* space left (in terms of objects) */
+	unsigned s_n;		/* number of objects in the table */
+	char	*s_data;	/* data area */
+};
+
+X/* returns a pointer to the search table (for future search/installs) */
+struct search *SCreate ();	/* create a search table */
+
+X/* returns a pointer to the data object found or created */
+char *SSearch ();		/* search for a data object */
+
+X/* the third argument to SSearch controls operation as follows: */
+#define	S_LOOKUP	0x00	/* pseudo flag */
+#define	S_CREATE	0x01	/* create object if not found */
+#define	S_EXCL		0x02	/* complain if already exists */
+
+X/* in addition, it is modified before return to hold status: */
+#define	S_COLL		0x04	/* collision (occurs iff S_EXCL set) */
+#define	S_FOUND		0x08	/* found (occurs iff existed already) */
+#define	S_NEW		0x10	/* created (occurs iff S_CREATE && !S_EXCL) */
+#define	S_ERROR		0x20	/* problem creating (out of memory) */
+//go.sysin dd *
+if [ `wc -c < search.h` != 1066 ]; then
+	made=FALSE
+	/bin/echo 'error transmitting "search.h" --'
+	/bin/echo 'length should be 1066, not' `wc -c < search.h`
+else
+	made=TRUE
+fi
+if [ $made = TRUE ]; then
+	/bin/chmod 644 search.h
+	/bin/echo -n '	'; /bin/ls -ld search.h
+fi
+/bin/echo 'Extracting types.h'
+sed 's/^X//' <<'//go.sysin dd *' >types.h
+X/* a 32 (or more) bit integer (signed) */
+typedef int i32;
+
+X/* macros to sign extend quantities that are less than 32 bits long */
+X/* Sun mishandles (int)(char)(constant) */
+#ifndef sun
+#define Sign8(n)	((int)(char)(n))
+#else
+#define Sign8(n)	(((n) << 24) >> 24)
+#endif
+#define Sign16(n)	((int)(short)(n))
+X/* #define Sign24(n)	((n) & (1<<23) ? ((n)|0xff000000) : (n)) */
+#define Sign24(n)	(((n) << 8) >> 8)
+
+X/* macros to truncate quantites that are signed but shouldn't be */
+#define UnSign8(n)	((n) & 0xff)
+#define UnSign16(n)	((n) & 0xffff)
+#define UnSign24(n)	((n) & 0xffffff)
+
+X/* note that we never have unsigned 32 bit integers */
+//go.sysin dd *
+if [ `wc -c < types.h` != 636 ]; then
+	made=FALSE
+	/bin/echo 'error transmitting "types.h" --'
+	/bin/echo 'length should be 636, not' `wc -c < types.h`
+else
+	made=TRUE
+fi
+if [ $made = TRUE ]; then
+	/bin/chmod 644 types.h
+	/bin/echo -n '	'; /bin/ls -ld types.h
+fi
+exit 0
+-- 
+In-Real-Life: Chris Torek, Univ of MD Comp Sci Dept (+1 301 454 4251)
+UUCP:	seismo!umcp-cs!chris
+CSNet:	chris@umcp-cs		ARPA:	chris@maryland
+
+

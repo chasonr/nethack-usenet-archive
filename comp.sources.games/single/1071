@@ -1,0 +1,2251 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,9e1d89ee7b59a21a,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1990-08-28 16:05:58 PST
+Path: gmdzi!unido!mcsun!uunet!zephyr.ens.tek.com!tekred!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v11i045:  gb3 - Galactic Bloodshed, an empire-like war game [Ver. 2.0], Patch2g
+Message-ID: <6232@tekred.CNA.TEK.COM>
+Date: 28 Aug 90 19:36:15 GMT
+Sender: news@tekred.CNA.TEK.COM
+Lines: 2234
+Approved: billr@saab.CNA.TEK.COM
+Posted: Tue Aug 28 20:36:15 1990
+
+Submitted-by: VANCLEEF@mps.ohio-state.edu
+Posting-number: Volume 11, Issue 45
+Archive-name: gb3/Patch2g
+Patch-To: gb3: Volume 10, Issue 1-14
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 7 (of 9)."
+# Contents:  client/GB_client.c server/doturn.c server/move.c
+#   server/moveship.c server/rst.c server/teleg_send.c
+# Wrapped by billr@saab on Tue Aug 28 08:54:58 1990
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'client/GB_client.c' -a "${1}" != "-c" ; then 
+  echo shar: Renaming existing file \"'client/GB_client.c'\" to \"'client/GB_client.c.orig'\"
+  mv -f 'client/GB_client.c' 'client/GB_client.c.orig'
+fi
+echo shar: Extracting \"'client/GB_client.c'\" \(8287 characters\)
+sed "s/^X//" >'client/GB_client.c' <<'END_OF_FILE'
+X/************************************************************************/
+X/* TinyTalk: the real good stuff (network connections, main loop).	 */
+X/* */
+X/* Version 1.0 [ 1/24/90] : Initial implementation by ABR.		 */
+X/* 1.1 [ 1/25/90] : Changed for systems without FD_SET.	 */
+X/* 1.2 [ 1/26/90] : Added "quiet" and "nologin" control.	 */
+X/* 1.3 [ 1/27/90] : Increased max number of 'quiet' lines.	 */
+X/* 1.3.1	25-Jul-90	Hubert Bartels
+X				hgb@catalina.opt-sci.arizona.edu
+X				Added code to complete the map, if the
+X				map is sent in two packets.
+X*/
+X/************************************************************************/
+X
+X/* particular routines chosen for GB interface by Garrett van Cleef */
+X/* modifications for the GB interfacing copyright 1990 Garrett W. van Cleef */
+X/* mods on or about 7/90 by Robert Chansky:
+X *  added segv, interrupt blocking.
+X *  added 'source' command.
+X *  allowed host, port settings & defaults.
+X *  removed segmentation-fault bug (crashed client on many machines on
+X	'orbit' command)
+X */
+X
+X#include "TinyMUD_copyright.h"
+X
+X#include <sys/types.h>
+X#include <sys/time.h>
+X#include <sys/socket.h>
+X#include <netdb.h>
+X#include <netinet/in.h>
+X#include <fcntl.h>
+X#include <sys/errno.h>
+X#include <stdio.h>
+X#include <curses.h>
+X#include <signal.h>
+X#include <setjmp.h>
+X#include "client.h"
+X
+Xint             errno;
+X
+X/* For BSD 4.2 systems. */
+X#ifndef FD_ZERO
+X#define OLD_BSD_FDSETS
+X#include "ultrix_cpt.h"
+X#endif
+X/* End of BSD 4.2 systems. */
+X
+X/*
+X	Store the flag if we are in map mode or not, along with the
+X	last X and Y plotted. Also store if we have seen the shiftin/out 
+X	flag. This helps with the synchronization.
+X*/
+Xint MAP;
+Xint s_in_out;
+Xint curX;
+Xint curY;
+Xint Maxx;
+Xint Maxy;
+X
+X#define REFRESH_TIME 500000	/* Microseconds */
+X
+X#ifndef GB_HOST
+X#define GB_HOST "pooh.caltech.edu"      /* change these for the host system */
+X#endif
+X 
+X#ifndef GB_PORT
+X#define GB_PORT "2010"
+X#endif
+X
+Xextern char		*index(), *malloc();
+Xextern struct hostent	*gethostbyname();
+Xextern unsigned long 	 inet_addr();
+X
+Xstatic jmp_buf		int_jmp;
+X
+Xstatic int      current_socket;
+Xstatic int      connected;	/* Are we connected? */
+Xhugestr         current_output;	/* Queued as messages arrive. */
+Xstatic int      need_refresh;	/* Does input line need refresh? */
+Xstatic int      done;		/* Are we all done? */
+X
+Xmain(argc,argv)
+Xint argc;
+Xchar *argv[];
+X{
+X	char *host,*port;
+X	extern int MAP;
+X	extern int s_in_out;
+X	extern int curX;
+X	extern int curY;
+X
+X	initscr();		/* set up screen for graphics */
+X	init_keyboard();
+X
+X	host = GB_HOST;
+X	port = GB_PORT;
+X
+X	MAP = FALSE;		/* Initialize map completion */
+X	s_in_out = TRUE;
+X	curY = curX = 0;
+X
+X	if (argc==2) {		/* Load user-specified PORT and HOST */
+X	  port = argv[1];
+X	} else if (argc==3) {
+X	  host = argv[1], port = argv[2];
+X	} else if (argc!=1) {
+X	  printf("usage: GB host port\n");
+X	  exit(1);
+X	}
+X	client(host,port);
+X}
+X
+Xclient(host,port)
+Xsmallstr host,port;
+X{
+X	int		int_handler();
+X	int		segflt_handler();
+X	int             count;
+X	DESCR_MASK      readers, exceptions;
+X	struct timeval  refresh_timeout;
+X	struct timeval *tv;
+X
+X	signal(SIGINT, int_handler);	/* go to int_handler on intrpt */
+X	/*signal(SIGSEGV, segflt_handler);*/
+X
+X	printf("           Galactic Bloodshed Client ver %s\n",VERS);
+X
+X
+X	/*sprintf(host, "%s", GB_HOST);
+X	sprintf(port, "%s", GB_PORT);*/
+X
+X	connected = FALSE;
+X
+X	connect_to(host, port);
+X
+X	setjmp(int_jmp);	/* set interrupts to go here. */
+X
+X	*current_output = '\0';	/* No output yet. */
+X
+X	done = FALSE;
+X
+X	need_refresh = 0;	/* No keyboard typing yet. */
+X
+X	do {			/* main loop */
+X		FD_ZERO(&readers);
+X		FD_ZERO(&exceptions);
+X		FD_SET(0, &readers);	/* Check standard input. */
+X		FD_SET(current_socket, &readers);	/* Check socket. */
+X
+X		if (need_refresh) {
+X			refresh_timeout.tv_sec = 0;
+X			refresh_timeout.tv_usec = REFRESH_TIME;
+X			tv = &refresh_timeout;
+X		} else
+X			tv = NULL;
+X
+X		count = select(current_socket + 1, &readers, NULL, &exceptions,
+X		    tv);
+X		if (count == -1) {
+X			if (errno != EINTR)	/* Control-Z will do this. */
+X				perror("select");
+X		} else if (count == 0) {
+X			do_refresh();
+X		} else {
+X			/* always check this, even after a command is issued */
+X			if (FD_ISSET(current_socket, &readers)) {
+X				handle_socket_input();
+X			} else if (FD_ISSET(0, &readers)) {
+X				/* look for conferencing */
+X				if (need_refresh)
+X					do_refresh();
+X				handle_keyboard_input();
+X			}
+X		}
+X
+X	} while (!done);
+X
+X	disconnect();
+X	cleanup_keyboard();
+X}
+X
+Xconnect_to(host, port)		/* Try to make a connection. */
+X	smallstr        host, port;
+X{
+X	struct in_addr  host_address;
+X	struct sockaddr_in socket_address;
+X	int             err;
+X
+X	/* register int current_socket; */
+X
+X	get_host_address(host, &host_address);
+X
+X	socket_address.sin_family = AF_INET;
+X	socket_address.sin_port = htons(atoi(port));
+X	bcopy(&host_address, &socket_address.sin_addr, sizeof(struct in_addr));
+X
+X	current_socket = socket(AF_INET, SOCK_STREAM, 0);
+X	if (current_socket < 0) {
+X		perror("Couldn't open socket");
+X		die("Exiting.\n");
+X	}
+X	err = connect(current_socket, &socket_address, 
+X	    sizeof(struct sockaddr_in));
+X	if (err < 0) {
+X		perror("Couldn't connect to socket");
+X		die("Exiting.\n");
+X	}
+X	fcntl(current_socket, F_SETFL, FNDELAY);	/* Do we need this? */
+X
+X	connected = TRUE;
+X	return;
+X}
+X
+Xget_host_address(name, addr)	/* Get a host address. */
+X	char           *name;
+X	struct in_addr *addr;
+X{
+X	struct hostent *temp;
+X	if (*name == '\0')
+X		die("No host address specified.\n");
+X
+X	temp = gethostbyname(name);
+X
+X	if (temp == NULL)
+X		die("Couldn't find host %s.\n", name);
+X
+X	bcopy(temp->h_addr, addr, sizeof(struct in_addr));
+X}
+X
+X
+Xdisconnect()
+X{				/* Disconnect from current world. */
+X	if (connected)
+X		close(current_socket);
+X
+X	connected = FALSE;
+X}
+X
+Xint 
+Xtransmit(s, l)			/* Send a message over the socket. */
+X	char           *s;
+X	int             l;
+X{
+X	int             err;
+X
+X	err = send(current_socket, s, l, 0);
+X	if (err == -1)
+X		perror("send failed");
+X
+X	return err;
+X}
+X
+Xint 
+Xreceive(s)
+X	char           *s;
+X{
+X	int             count;
+X
+X	count = recv(current_socket, s, MAXSTRLEN-1, 0);
+X	if (count <= 0) {
+X		if (errno == EWOULDBLOCK)
+X			*s = '\0';
+X		else {
+X			perror("recv failed");
+X		}
+X	} else
+X		s[count] = '\0';
+X
+X	if (count <= 0)		/* Don't ask me. */
+X		done = TRUE;
+X
+X	return count;
+X}
+X
+X
+Xclear_refresh_pending()
+X{
+X	need_refresh = 0;
+X}
+X
+Xset_refresh_pending()
+X{
+X	need_refresh = 1;
+X}
+X
+X
+Xstatic string          blob;
+Xstatic hugestr         bigblob;
+X
+Xhandle_socket_input()
+X{
+X	char           *place;
+X
+X	receive(blob);
+X	strcat(current_output, blob);
+X/*
+X	Concatenate the packet to the current output buffer. Test for the
+X	current type of output. Check if we are going to complete a map
+X*/
+X	if (current_output[0] != '#'
+X		 && current_output[0] != '$' && MAP == FALSE) {
+X		/* text data coming in */
+X
+X		place = index(current_output, '\n');	/* Output any whole
+X							 * lines.  */
+X		if (place != NULL) {
+X			erase_keyboard_input();	/* Clear current line. */
+X			while (place != NULL) {
+X				*place = NULL;
+X				print_with_wrap(current_output);
+X				strcpy(bigblob, place + 1);
+X					/* Rest of buffer. */
+X				strcpy(current_output, bigblob);
+X					/* Copy it back to buffer. */
+X				place = index(current_output, '\n');
+X			}
+X		}
+X		if (strlen(current_output) > 0) {
+X			printf("%s", current_output);
+X		}
+X		if (strlen(current_output) > MAXSTRLEN) {
+X			/* Too long, flush it. */
+X			erase_keyboard_input();	/* Clear current line. */
+X			print_with_wrap(current_output);
+X		}
+X	} else if( MAP == FALSE) {		/* map data coming in */
+X		if (current_output[0] == '#') {	/* orbit map */
+X			plot_orbit(current_output);
+X		} else if (current_output[0] == '$') {	/* planet map */
+X			plot_surface(current_output);
+X		}
+X	} else {				/* complete map */
+X			plot_balance(current_output);
+X	}
+X	*current_output = '\0';	/* Flush the buffer. */
+X}
+X
+X
+X/* goes here when ^C is pressed. */
+Xint int_handler()
+X{
+X	int junk;
+X	longjmp(int_jmp, junk);
+X	/*disconnect();
+X	cleanup_keyboard();*/
+X}
+X
+X/* and here when those pesky segmentation faults happen. */
+Xint segflt_handler()
+X{
+Xstatic n=0;
+Xint junk;
+X
+X	/*switch (n) {
+X	  case 0:
+X		printf("Caught one of those pesky segmentation faults.\n");
+X		break;
+X	  case 1:
+X		printf("Caught another segmentation fault.\n");
+X		break;
+X	  case 2:
+X	  default:
+X		printf("Yet another segmentation fault.  What a dumb program.\n");
+X		break;
+X	}
+X	n++;*/
+X
+X	longjmp(int_jmp, junk);
+X	/*disconnect();
+X	cleanup_keyboard();*/
+X}
+END_OF_FILE
+if test 8287 -ne `wc -c <'client/GB_client.c'`; then
+    echo shar: \"'client/GB_client.c'\" unpacked with wrong size!
+fi
+# end of 'client/GB_client.c'
+if test -f 'server/doturn.c' -a "${1}" != "-c" ; then 
+  echo shar: Renaming existing file \"'server/doturn.c'\" to \"'server/doturn.c.orig'\"
+  mv -f 'server/doturn.c' 'server/doturn.c.orig'
+fi
+echo shar: Extracting \"'server/doturn.c'\" \(10588 characters\)
+sed "s/^X//" >'server/doturn.c' <<'END_OF_FILE'
+X/*
+X * Galactic Bloodshed, copyright (c) 1989 by Robert P. Chansky, 
+X * smq@ucscb.ucsc.edu, mods by people in GB_copyright.h.
+X * Restrictions in GB_copyright.h.
+X * doturn -- does one turn.  
+X */
+X
+X#include "GB_copyright.h"
+X#define EXTERN extern
+X#include "vars.h"
+X#include "ships.h"
+X#include "races.h"
+X#include "doturn.h"
+X#include "power.h"
+X#include "buffers.h"
+X#include <math.h>
+Xint doturn_racedata;
+X
+Xdo_turn()
+X{
+X int star,i,j,fd, x, y;
+X int shdata,stardata,pdata,sectdata;
+X boolean err=0;
+X shiptype *ship;
+X sectortype *p;
+X char t_buf[200];
+Xint dummy;
+X
+X 		/* make all 0 for first iteration of doplanet */
+X bzero((char *)starpopns, sizeof(starpopns));
+X bzero((char *)starnumships, sizeof(starnumships));
+X bzero((char *)Sdatanumships, sizeof(Sdatanumships));
+X bzero((char *)Stinfo, sizeof(Stinfo));
+X bzero((char *)StarsInhab, sizeof(StarsInhab));
+X bzero((char *)Power, sizeof(Power));
+X bzero((char *) inhabited, sizeof(inhabited));
+X
+Xopenshdata(&shdata);
+XNum_ships = Numships(shdata);
+Xclose_file(shdata);
+X 
+X printf("Num ships = %d\n", Num_ships);
+X
+X	/* do mines */
+X        for (i=1; i<=Num_ships; i++)
+X	    domine(i, 0);
+X
+Xopenshdata(&shdata);
+Xships = (shiptype **)malloc(sizeof(shiptype *) * (Num_ships + 1));
+Xfor(i=1; i<=Num_ships;i++) {
+X	getship(shdata,&ships[i], i);	
+X	}
+Xclose_file(shdata);  
+X
+X/* get all stars and planets */
+X openstardata(&stardata);
+X getsdata(stardata,&Sdata);
+X openpdata(&pdata);
+X for (star=0; star<Sdata.numstars; star++) {
+X	free(Stars[star]);
+X 	getstar(stardata, &Stars[star], star);
+X/*	fix_stability(Stars[star]);		 /* nova */
+X 	for (i=0; i<Stars[star]->numplanets; i++) {
+X	    free(planets[star][i]);
+X	    getplanet(pdata,&planets[star][i],Stars[star]->planetpos[i]);
+X		/* move planets in orbit; also sets StarsInhab[] */
+X	   moveplanet(star, planets[star][i], i);
+X	if(Stars[star]->pnames[i]=='\0')
+X		sprintf(Stars[star]->pnames[i], "NULL-%d", i);
+X	}
+X	if(Stars[star]->name[0]=='\0')
+X		sprintf(Stars[star]->name, "NULL-%d", star);
+X
+X	putstar(stardata, Stars[star], star);
+X} 
+Xclose_file(stardata);
+Xclose_file(pdata);
+X
+X/*printf("doing VN_brain\n");*/
+XVN_brain.Most_mad = 0;	/* not mad at anyone for starts */
+X
+XNum_races = Numraces();
+Xprintf("Num_races = %d\n",Num_races);
+X
+Xopenracedata(&doturn_racedata);
+Xfor (i=1; i<=Num_races; i++) {
+X	free(races[i-1]);
+X	getrace(doturn_racedata, &(races[i-1]),(int)i);
+X		/* increase tech; change to something else */
+X	  races[i-1]->tech += (float)races[i-1]->IQ / 100.0;
+X
+X		/* add VN program */
+X	VN_brain.Total_mad += Sdata.VN_hitlist[i-1];
+X		/* find out who they're most mad at */
+X	if (VN_brain.Most_mad > 0 && Sdata.VN_hitlist[VN_brain.Most_mad-1] <= Sdata.VN_hitlist[i-1])
+X		VN_brain.Most_mad = i;
+X
+X}
+X	close_file(doturn_racedata);
+X
+X	/* do all ships one turn */
+X        for (i=1; i<=Num_ships; i++) {
+X/*	    printf("ship %d\n",i);*/
+X	    doship(i,ships[i]);
+X      }
+X/* erase next ship pointers - reset in insert_sh_... */
+X	for (i=1; i<Num_ships;i++) 
+X	  ships[i]->nextship=0;
+X
+X	/* clear ship list for insertion */
+X Sdata.ships = 0;
+X for (star=0; star<Sdata.numstars; star++) {
+X	Stars[star]->ships = 0;
+X 	for (i=0; i<Stars[star]->numplanets; i++) {
+X	   planets[star][i]->ships = 0;
+X	}
+X }
+X
+X     /* insert ship into the list of wherever it might be */
+X openshdata(&shdata);
+X for (i=Num_ships; i>=1; i--) {
+X    if(ships[i]->is_alive && !(ships[i]->type == STYPE_FIGHTER &&
+X		ships[i]->object.number4) ) {
+X	switch(ships[i]->whatorbits) {
+X	  case LEVEL_UNIV:
+X		insert_sh_univ(&Sdata, ships[i], i);
+X		break;
+X	  case LEVEL_STAR:
+X		insert_sh_star(Stars[ships[i]->storbits], ships[i],i);
+X		break;
+X	  case LEVEL_PLAN:
+X		insert_sh_plan(planets[ships[i]->storbits][ships[i]->pnumorbits], ships[i],i);
+X		break;
+X	  default:
+X		break;
+X	}
+X    }
+X    putship(shdata,ships[i],i);
+X }
+X close_file(shdata);
+X
+X
+X
+X  /* add APs to sdata for ea. player */
+X  for (i=1; i<=Num_races; i++) { 
+X    int a;
+X
+X	Blocks[i-1].systems_owned = 0; /* recount systems owned */
+X
+X if (races[i-1]->Gov_ship && races[i-1]->Gov_ship <= Num_ships &&
+X	ships[(int)races[i-1]->Gov_ship] != NULL &&
+X	ships[(int)races[i-1]->Gov_ship]->is_alive &&
+X	ships[(int)races[i-1]->Gov_ship]->is_docked &&
+X	ships[(int)races[i-1]->Gov_ship]->whatdest==LEVEL_PLAN)
+X	Sdata.AP[i-1] = MIN(LIMIT_APs, Sdata.AP[i-1] + APadd((int)Sdatanumships[i-1], (int)Sdatapopns[i],races[i-1]) + 1);
+X }
+X 
+X
+X for (star=0; star<Sdata.numstars; star++) {
+X
+X  for (i=0; i<Stars[star]->numplanets; i++) { 
+X/*	printf("%s %d\n",Stars[star]->name,i); */
+X    if (doplanet(star, planets[star][i], i)) {
+X	 /* save smap gotten & altered by doplanet only if the planet is expl*/
+X        opensectdata(&sectdata);
+X        putsmap(sectdata,Smap,planets[star][i]);
+X        close_file(sectdata);
+X    }
+X
+X/* store occupation for VPs */
+X		for (j=1; j<Num_races; j++)
+X			if(planets[star][i]->info[j-1].numsectsowned) setbit(inhabited[star], j);
+X
+Xopenpdata(&pdata);
+X    putplanet(pdata,planets[star][i],Stars[star]->planetpos[i]);
+Xclose_file(pdata);
+X  }
+X
+X	   /* do AP's for ea. player  */
+X  for (i=1; i<=Num_races; i++) {
+X
+X       if (starpopns[star][i-1])
+X	   setbit(Stars[star]->inhabited,i);
+X       else
+X	   clrbit(Stars[star]->inhabited,i);
+X
+X     if (isset(Stars[star]->inhabited, i) ) {
+X         	Stars[star]->AP[i-1] = MIN(LIMIT_APs, Stars[star]->AP[i-1] + APadd((int)starnumships[star][i-1], (int)starpopns[star][i-1], races[i-1]) + 1);
+X       } 
+X
+X/* compute victory points for the block */
+X	if(inhabited[star]) {
+X		dummy = (Blocks[i-1].invite & Blocks[i-1].pledge);
+X		Blocks[i-1].systems_owned += ((inhabited[star] | dummy) == dummy);
+X	}
+X   }
+X
+X
+X  openstardata(&stardata);
+X  putstar(stardata, Stars[star], star);
+X  close_file(stardata);
+X}
+X
+Xopenstardata(&stardata);
+X putsdata(stardata,&Sdata);
+X close_file(stardata);
+X
+X
+X openshdata(&shdata);
+X for (i=1; i<=Num_ships; i++)
+X	putship(shdata,ships[i],i);
+X
+X close_file(shdata);
+X
+X
+Xopenracedata(&doturn_racedata); 
+Xfor (i=1; i<=Num_races; i++) {
+X    races[i-1]->Thing = 0;
+X    putrace(doturn_racedata, races[i-1]);
+X	Blocks[i-1].VPs = 10 * Blocks[i-1].systems_owned;
+X    }
+Xclose_file(doturn_racedata);
+X
+Xfree(ships);
+X
+Xcompute_power_blocks();
+X
+XPutpower(Power);
+X
+X Putblock(Blocks);
+X
+Xfor (i=1; i<=Num_races; i++)
+X	notify(i, "Finished with update.\n");
+X	printf("Finished.\n");
+X}
+X
+X
+X
+X /* routine for number of AP's to add to each player in ea. system,scaled
+X    by amount of crew in their palace */
+X
+Xint APadd(sh, popn, race)
+Xint sh, popn;
+Xracetype *race;
+X{
+X if (race->Gov_ship && race->Gov_ship <= Num_ships &&
+X	ships[race->Gov_ship] != NULL &&
+X	ships[(int)(race->Gov_ship)]->is_alive &&
+X	ships[(int)(race->Gov_ship)]->is_docked &&
+X	ships[(int)(race->Gov_ship)]->whatdest==LEVEL_PLAN)
+X    return 
+X      round_rand( ((float)sh / 10.0 + 5.*(float)log10(1.0+popn)) );
+X else	/* dont have an active gov center */
+X    return round_rand( 0.25 * ((float)sh / 10.0 + 5.*(float)log10(1.0+popn)) );
+X
+X}
+X
+X
+X
+X	/* fix stability for stars */
+Xfix_stability(s)
+Xstartype *s;
+X{
+Xchar buf[100];
+Xint a,i;
+X
+X
+X  if (s->nova_stage > 0) {
+X
+X  	if (s->nova_stage > 14) {
+X		s->stability = 20;
+X		s->nova_stage = 0;
+X		sprintf(telegram_buf, "Notice\n");
+X		sprintf(buf,"\n  Scientists report that star %s\n", s->name);
+X			str_cat(telegram_buf, buf);
+X		sprintf(buf, "is no longer undergoing nova.\n");
+X			str_cat(telegram_buf, buf);
+X		for (i=1; i<=Num_races; i++)
+X			push_message(TELEG_PLAYER_AUTO, i, telegram_buf, TELEGRAM);
+X
+X			/* telegram everyone when nova over? */
+X	} else
+X		s->nova_stage++;
+X
+X  } else if (s->stability > 50) {
+X	a = int_rand(-1,3);
+X		/* nova just starting; notify everyone */
+X  	if ( (s->stability + a) > 100) {
+X		s->stability = 100;
+X		s->nova_stage = 1;
+X		sprintf(telegram_buf, "***** BULLETIN! ******\n");
+X		sprintf(buf,"\n  Scientists report that star %s\n", s->name);
+X			str_cat(telegram_buf, buf);
+X		sprintf(buf, "is undergoing nova.\n");
+X			str_cat(telegram_buf, buf);
+X		for (i=1; i<=Num_races; i++)
+X	push_message(TELEG_PLAYER_AUTO, i, telegram_buf, TELEGRAM);
+X	} else
+X		s->stability += a;
+X
+X  } else { /* this bracket wasn't here */
+X
+X  	a = int_rand(-2,int_rand(0,int_rand(0,1) ) );
+X 
+X 	if ( ((int)s->stability + a) < 0)
+X		s->stability = 0;
+X	else
+X		s->stability += a;
+X  } /* nor was this one */
+X
+X}
+X
+X
+Xdo_reset()
+X{
+X int star,i,j,fd, x, y;
+X int shdata,stardata,pdata,sectdata, racedata;
+X boolean err=0;
+X shiptype *ship;
+X sectortype *p;
+X char t_buf[200];
+X racetype *r;
+Xint dummy;
+X
+Xopenshdata(&shdata);
+XNum_ships = Numships(shdata);
+Xclose_file(shdata);
+X 
+X printf("Num ships = %d\n", Num_ships);
+X
+Xopenshdata(&shdata);
+Xships = (shiptype **)malloc(sizeof(shiptype *) * (Num_ships + 1));
+Xfor(i=1; i<=Num_ships;i++) {
+X	getship(shdata,&ships[i], i);	
+X	}
+Xclose_file(shdata);  
+X
+X/* get all stars and planets */
+X openstardata(&stardata);
+X getsdata(stardata,&Sdata);
+X openpdata(&pdata);
+X for (star=0; star<Sdata.numstars; star++) {
+X	free(Stars[star]);
+X 	getstar(stardata, &Stars[star], star);
+X 	for (i=0; i<Stars[star]->numplanets; i++) {
+X	    free(planets[star][i]);
+X	    getplanet(pdata,&planets[star][i],Stars[star]->planetpos[i]);
+X	}
+X} 
+Xclose_file(stardata);
+Xclose_file(pdata);
+X
+X/* erase next ship pointers - reset in insert_sh_... */
+X	for (i=1; i<Num_ships;i++) 
+X	  ships[i]->nextship=0;
+X
+X	/* clear ship list for insertion */
+X Sdata.ships = 0;
+X for (star=0; star<Sdata.numstars; star++) {
+X	Stars[star]->ships = 0;
+X 	for (i=0; i<Stars[star]->numplanets; i++) {
+X	   planets[star][i]->ships = 0;
+X	}
+X }
+X
+X     /* insert ship into the list of wherever it might be */
+X openshdata(&shdata);
+X for (i=Num_ships; i>=1; i--) {
+X    if(ships[i]->is_alive && !(ships[i]->type == STYPE_FIGHTER &&
+X		ships[i]->object.number4) ) {
+X	switch(ships[i]->whatorbits) {
+X	  case LEVEL_UNIV:
+X		insert_sh_univ(&Sdata, ships[i], i);
+X		break;
+X	  case LEVEL_STAR:
+X		insert_sh_star(Stars[ships[i]->storbits], ships[i],i);
+X		break;
+X	  case LEVEL_PLAN:
+X		insert_sh_plan(planets[ships[i]->storbits][ships[i]->pnumorbits], ships[i],i);
+X		break;
+X	  default:
+X		break;
+X	}
+X    }
+X    putship(shdata,ships[i],i);
+X }
+X close_file(shdata);
+X
+X
+X for (star=0; star<Sdata.numstars; star++) {
+Xfor (i=0; i<Stars[star]->numplanets; i++) { 
+Xopenpdata(&pdata);
+X    putplanet(pdata,planets[star][i],Stars[star]->planetpos[i]);
+Xclose_file(pdata);
+X  }
+X  openstardata(&stardata);
+X  putstar(stardata, Stars[star], star);
+X  close_file(stardata);
+X}
+X
+Xopenstardata(&stardata);
+X putsdata(stardata,&Sdata);
+X close_file(stardata);
+X
+X
+X openshdata(&shdata);
+X for (i=1; i<=Num_ships; i++)
+X	putship(shdata,ships[i],i);
+X
+X close_file(shdata);
+X
+Xfree(ships);
+X
+Xopenracedata(&racedata);
+Xfor (i=1; i<=Num_races; i++) {
+X	getrace(racedata, &r, i);
+X	r->weekly = WEEKLY*60;
+X	r->daily = DAILY*60;
+X	putrace(racedata, r);
+X	notify(i, "Finished with reset.\n");
+X	printf("Finished.\n");
+X	}
+Xclose_file(racedata);
+X}
+X
+END_OF_FILE
+if test 10588 -ne `wc -c <'server/doturn.c'`; then
+    echo shar: \"'server/doturn.c'\" unpacked with wrong size!
+fi
+# end of 'server/doturn.c'
+if test -f 'server/move.c' -a "${1}" != "-c" ; then 
+  echo shar: Renaming existing file \"'server/move.c'\" to \"'server/move.c.orig'\"
+  mv -f 'server/move.c' 'server/move.c.orig'
+fi
+echo shar: Extracting \"'server/move.c'\" \(8766 characters\)
+sed "s/^X//" >'server/move.c' <<'END_OF_FILE'
+X/*
+X** Galactic Bloodshed, copyright (c) 1989 by Robert P. Chansky, 
+X** smq@ucscb.ucsc.edu, mods by people in GB_copyright.h.
+X** Restrictions in GB_copyright.h.
+X**
+X**  move.c -- move population and assault aliens on target sector
+X*/
+X
+X#include "GB_copyright.h"
+X#define EXTERN extern
+X#include "vars.h"
+X#include "ships.h"
+X#include "races.h"
+X#include "buffers.h"
+X#include <signal.h>
+X#include <math.h>
+X#include <signal.h>
+X
+Xint move_sectdata,move_pdata, move_racedata;
+Xint Defensedata[] = { 1, 1, 3, 2, 2, 4};
+Xextern char *Desnames[];
+X
+Xmove_popn(Playernum,APcount,argn,args)
+Xint Playernum;
+Xint APcount;
+Xint argn;
+Xchar args[MAXARGS][COMMANDSIZE];
+X{
+Xint Assault;	/* unfriendly movement */
+Xint casualties,casualties2;
+X
+Xchar c;
+Xplanettype *planet;
+Xsectortype *sect,*sect2;
+Xboolean legal,planetmod=0,sectmod=0;
+Xint people,oldpopn,old2popn,x= -1,y= -1,x2= -1,y2= -1,i,mask;
+Xint old2owner, absorbed, casualty_scale;
+Xfloat fuel,astrength,dstrength,pris;
+Xracetype *Race, *alien;
+X
+Xmove_sectdata = move_pdata = NEUTRAL_FD;
+X
+Xif(!(Dir[Playernum-1].level==LEVEL_PLAN))
+X	{
+X		sprintf(buf,"Wrong scope\n");
+X		return;
+X	}
+X
+Xopenpdata(&move_pdata);
+Xgetplanet(move_pdata,&planet,Stars[Dir[Playernum-1].snum]->planetpos[Dir[Playernum-1].pnum]);
+Xclose_file(move_pdata);
+X
+Xif (planet->slaved_to>0 && planet->slaved_to != Playernum) {
+X	sprintf(buf,"That planet has been enslaved!\n");
+X			notify(Playernum, buf);		
+X	free(planet);
+X	return;
+X}
+X
+X	sscanf(args[1],"%d,%d",&x,&y);
+X	if(x < 0 || y < 0 || x > planet->Maxx-1 || y > planet->Maxy-1){
+X		sprintf(buf,"Illegal coordinates.\n");
+X			notify(Playernum, buf);
+X		free(planet);
+X		return;
+X		}
+X
+X	opensectdata(&move_sectdata);
+X	getsector(move_sectdata,&sect,planet->sectormappos+(y*planet->Maxx+x)*
+X		sizeof(sectortype));
+X
+X	if(sect->owner != Playernum) {
+X	sprintf(buf,"You don't own sector %d,%d!\n",x,y);
+X			notify(Playernum, buf);
+X	close_file(move_sectdata);
+X	free(planet);
+X	free(sect);
+X	return;
+X	}
+X	close_file(move_sectdata);	
+X
+X	sscanf(args[2],"%d,%d",&x2,&y2);
+X
+X	if(x2 < 0 || y2 < 0 || x2 > planet->Maxx-1 || y2 > planet->Maxy-1){
+X		sprintf(buf,"Illegal coordinates.\n");
+X			notify(Playernum, buf);
+X		free(sect);
+X		free(planet);
+X		return;
+X		}
+X
+X
+X/* check to see if the move is legal */
+X     legal = 1;
+Xif(abs(y-y2) > 1) legal = 0;
+Xelse if(x==x2 && y==y2) legal = 0;
+Xelse {
+Xif(!((x == 0 && x2 == planet->Maxx-1) ||
+X     (x == planet->Maxx-1 && x2 == 0) ||
+X     (abs(x-x2) <= 1)) )  legal = 0;
+X}
+X
+Xif(!legal) {
+X  sprintf(buf,"Illegal move - to adjacent sectors only!\n");
+X		notify(Playernum, buf);
+X  free(planet);
+X  free(sect);
+X  return;
+X}
+X
+X/* ok, the move is legal */
+X	opensectdata(&move_sectdata);
+X	getsector(move_sectdata,&sect2,planet->sectormappos+(y2*planet->Maxx+x2)*
+X		sizeof(sectortype));
+X
+X	close_file(move_sectdata);	
+X
+Xif(argn >= 4) {
+X    sscanf(args[3],"%d",&people);
+X    if(people < 0)
+X	people = sect->popn + people;
+X} else
+X    people = sect->popn;
+X
+X
+Xif(abs(people) > sect->popn || people <= 0) {
+X	sprintf(buf,"Illegal value - sector population is %d\n", sect->popn);
+X		notify(Playernum, buf);
+X	free(sect);
+X	free(sect2);
+X	free(planet);
+X	return;
+X}
+X
+X    sprintf(buf, "%d population moved.\n", people);
+X    notify(Playernum, buf);
+X
+X
+Xif(sect2->owner && sect2->owner != Playernum)
+X	Assault = 1;
+Xelse
+X	Assault = 0;
+X
+Xif (!enufAP(Playernum,Stars[Dir[Playernum-1].snum]->AP[Playernum-1], APcount)) {
+X	free(sect);
+X	free(sect2);
+X	free(planet);
+X	return;
+X	}
+X	
+X	if (Assault) {
+X		sprintf(buf,"Assault!\n");
+X		notify(Playernum, buf);
+X
+X		openracedata(&move_racedata);
+X		getrace(move_racedata, &Race, Playernum);
+X		close_file(move_racedata);
+X
+X		openracedata(&move_racedata);
+X		getrace(move_racedata, &alien, sect2->owner);
+X		close_file(move_racedata);
+X
+X/* races find out about each other */
+X	alien->translate[Playernum-1] = MIN(alien->translate[Playernum-1]+5, 100);
+X	Race->translate[sect2->owner-1] = MIN(Race->translate[sect2->owner-1]+5, 100);
+X
+X		old2owner = sect2->owner;
+X		sect->popn = MAX(0, sect->popn - people);
+X		sprintf(buf,"%d attackers (fighting = %d) vs. %d defenders (fighting = %d)\n",
+X			people,Race->fighters,sect2->popn,alien->fighters);
+X			notify(Playernum, buf);
+X		sprintf(buf,"Attack strength: %.2f   Defense strength: %.2f.\n", 
+X
+X		   astrength = (float)people * (float)Race->fighters
+X			* .01 * Race->tech
+X			* .01 * (Race->likes[sect->des]+1.0) *
+X 			((sect->is_wasted ? 0.0 : (float)Defensedata[sect->des]) +1.0),
+X
+X
+X		   dstrength =  (float)sect2->popn * (float)alien->fighters
+X			* .01 * alien->tech
+X			* .01 * (alien->likes[sect2->des]+1.0) *
+X 			((sect2->is_wasted ? 0.0 : (float)Defensedata[sect2->des]) + 1.0)
+X			);
+X		notify(Playernum, buf);
+X
+X
+X		 /* nuke both populations */
+X	casualty_scale = MIN(people, sect2->popn);
+X
+X		oldpopn = people;
+X		casualties = int_rand(0, round_rand((float)casualty_scale 
+X				* (dstrength+1.0) / (astrength+1.0)));
+X		casualties = MIN(oldpopn, casualties);
+X		people = MAX(0, oldpopn - casualties);
+X
+X
+X		   old2popn = sect2->popn;
+X		   casualties2 = int_rand(0, round_rand((float)casualty_scale 
+X				* (astrength+1.0) / (dstrength+1.0)));
+X		   casualties2 = MIN(old2popn, casualties2);
+X		   sect2->popn = MAX(0, old2popn - casualties2);
+X
+X		   if (sect2->popn == 0) {	 /* we got 'em */
+X			sect2->owner = Playernum;
+X/* mesomorphs absorb the bodies of their victims */
+X			absorbed = 0;
+X			if(Race->Thing) {
+X				absorbed = int_rand(0, old2popn);
+X		sprintf(buf, "%d alien bodies absorbed.\n", absorbed);
+X		notify(Playernum, buf);
+X		sprintf(buf, "Mesomorphs have absorbed %d bodies!!!\n", absorbed);
+X		notify(old2owner, buf);
+X				}
+X				sect2->popn = people+absorbed;
+X		   } else {		/* retreat */
+X			absorbed = 0;
+X			if(alien->Thing) {
+X				absorbed = int_rand(0, oldpopn-people);				
+X				sprintf(buf, "%d alien bodies absorbed.\n", absorbed);
+X				notify(old2owner, buf);
+X				sprintf(buf, "Mesomorphs have absorbed %d bodies!!!\n", absorbed);
+X				notify(Playernum, buf);
+X				sect2->popn += absorbed;
+X				}
+X			sect->popn += people;
+X		   }
+X
+X
+X		sprintf(telegram_buf,"Assaulted by%s %s [%d] at %s/%s!!!\n",
+X			(isset(alien->allied,Playernum) ? " your ally" :
+X				(isset(alien->atwar,Playernum) ? " your enemy" : "")),
+X				Race->name, Playernum,
+X			Stars[Dir[Playernum-1].snum]->name,
+X			Stars[Dir[Playernum-1].snum]->pnames[Dir[Playernum-1].pnum]);
+X
+X		sprintf(buf,"Sector %d,%d (%s) attacked from sector %d,%d (%s)\n",
+X			x2,y2,Desnames[sect2->des],x,y,Desnames[sect->des]);
+X			str_cat(telegram_buf, buf);
+X
+X		if (sect2->owner==Playernum) {
+X			sprintf(buf,"VICTORY! The sector is yours!\n");
+X				notify(Playernum, buf);
+X			sprintf(buf,"Sector CAPTURED!\n");
+X				str_cat(telegram_buf, buf);
+X			if ((astrength+1.0)/(dstrength+1.0) > 5.0) {
+X				 /* not really exclusive but so what*/
+X				 pris = round_rand((astrength+1.0)/(dstrength+1.0));
+X				 pris = MIN(pris, old2popn);
+X				 if (Race->captured_prisoners[old2owner-1]<100)
+X				   Race->captured_prisoners[old2owner-1]++;
+X				sprintf(buf,"1 prisoner captured!\n");
+X					notify(Playernum, buf);
+X				sprintf(buf,"1 prisoner captured!\n");
+X					str_cat(telegram_buf, buf);
+X			}
+X			if (people) {
+X			  sprintf(buf,"%d critters move in.\n", people);
+X				notify(Playernum, buf);
+X					}
+X		} else {
+X			sprintf(buf,"The invasion was repulsed; try again.\n");
+X				notify(Playernum, buf);
+X			sprintf(buf,"You fought them off!\n");
+X				str_cat(telegram_buf, buf);
+X		}
+X
+X		if (sect->popn + people == 0) {
+X			sprintf(buf,"You killed all of them!\n");
+X			str_cat(telegram_buf, buf);
+X/* increase modifier */
+X	Race->translate[old2owner-1] = MIN(Race->translate[old2owner-1]+5, 100);
+X			}
+X
+X		if (people==0) {
+X			sprintf(buf,"Oh no! They killed your party to the last man!\n");
+X				notify(Playernum, buf);
+X/* increase modifier */
+X	alien->translate[Playernum-1] = MIN(alien->translate[Playernum-1]+5, 100);
+X			}
+X
+X		openracedata(&move_racedata);
+X		putrace(move_racedata, alien);
+X		putrace(move_racedata, Race);
+X		close_file(move_racedata);
+X		free(alien);
+X		free(Race);
+X		
+X		sprintf(buf,"Casualties: Yours: %d, Theirs: %d\n", casualties2,casualties);
+X			str_cat(telegram_buf, buf);
+X		if(!notify(old2owner, telegram_buf))
+X		      push_message(TELEG_PLAYER_AUTO, old2owner, telegram_buf, COMBAT);
+X
+X		sprintf(buf,"Casualties: Yours: %d, Theirs: %d\n",
+X			casualties, casualties2);
+X				notify(Playernum, buf);
+X
+X	} else {
+X	  sect->popn -= people;
+X	  sect2->popn += people;
+X	  if(sect2->owner == 0)
+X	    sect2->owner = Playernum;
+X	}
+X
+Xif(sect->popn == 0)
+X  sect->owner = 0;
+X
+Xif(sect2->popn == 0)
+X  sect2->owner = 0;
+X	
+X	opensectdata(&move_sectdata);
+X	putsector(move_sectdata,sect,planet->sectormappos+(y*planet->Maxx+x)*
+X		sizeof(sectortype));
+X	putsector(move_sectdata,sect2,planet->sectormappos+(y2*planet->Maxx+x2)*
+X		sizeof(sectortype));
+X	close_file(move_sectdata);	
+X        free(sect);
+X        free(sect2);
+X        free(planet);
+X
+XdeductAPs(Playernum,APcount+Assault, Dir[Playernum-1].snum, 0);
+X
+X
+X}
+X
+X
+X
+END_OF_FILE
+if test 8766 -ne `wc -c <'server/move.c'`; then
+    echo shar: \"'server/move.c'\" unpacked with wrong size!
+fi
+# end of 'server/move.c'
+if test -f 'server/moveship.c' -a "${1}" != "-c" ; then 
+  echo shar: Renaming existing file \"'server/moveship.c'\" to \"'server/moveship.c.orig'\"
+  mv -f 'server/moveship.c' 'server/moveship.c.orig'
+fi
+echo shar: Extracting \"'server/moveship.c'\" \(11633 characters\)
+sed "s/^X//" >'server/moveship.c' <<'END_OF_FILE'
+X/*
+X * Galactic Bloodshed, copyright (c) 1989 by Robert P. Chansky, 
+X * smq@ucscb.ucsc.edu, mods by people in GB_copyright.h.
+X * Restrictions in GB_copyright.h.
+X *
+X *  moveship -- moves specified ship according to its orders.
+X *	also deducts fuel from the ship's stores.
+X */
+X
+X#include "GB_copyright.h"
+X#define EXTERN extern
+X#include "vars.h"
+X#include "ships.h"
+X#include "races.h"
+X#include "doturn.h"
+X#include "buffers.h"
+X#include <math.h>
+X
+X
+X/* amount to move for each dir level. I arrived on these #'s only after
+X	hours of dilligent tweaking */
+X  /* amount to move for each directory level  */
+Xfloat MoveConsts[] = { 600.0, 300.0, 40.0 };
+X  /* amnt to move for each ship speed level (ordered) */
+Xfloat SpeedConsts[] = { 0.0, 0.61, 1.26, 1.50, 1.73, 1.81, 1.90, 1.93, 1.96, 1.97};
+X  /* amount of fuel it costs to move at speed level */
+X
+X
+XMoveship(shipno,s)
+Xint shipno;
+Xshiptype *s;
+X{
+X double stardist,movedist,truedist,dist,xdest,ydest,sn,cs;
+X float fuse,mfactor,heading, distfac;
+X int destlevel,deststar=0,destpnum=0;
+X boolean move_err = 0;
+X shiptype *dsh;
+X startype *ost,*dst;
+X planettype *opl,*dpl;
+X
+Xif(fabs(s->xpos) > 999999999. || fabs(s->ypos) > 999999999.)
+X	{
+X	printf("we got a problem here!\n");
+X	return;
+X	}
+X
+Xif(s->hyper_drive.on) { 	/* do a hyperspace jump */
+X	if(s->hyper_drive.ready) {
+X/* uses up fuel to jump. This is dependent on the mass of the ship
+X   - if you don't have enough fuel for the jump - jump is cancelled
+X   and a message sent to the owner */
+X	 dist = sqrt( Distsq(s->xpos, s->ypos,
+X			 Stars[s->deststar]->xpos, Stars[s->deststar]->ypos));
+X/* decreased fuel usage for ships with crystals */
+X	 distfac = HYPER_DIST_FACTOR * (s->tech + 100.0);
+X	 if(s->hyper_drive.mounted && dist > distfac) {
+X		fuse = HYPER_DRIVE_FUEL_USE * sqrt(s->mass)
+X			* (dist/distfac);
+X	} else {
+X		fuse = HYPER_DRIVE_FUEL_USE * sqrt(s->mass)
+X			* (dist/distfac) * (dist/distfac);
+X			}
+X
+X	if(s->fuel < fuse) {
+X		  sprintf(telegram_buf,
+X			   "%s #%d %s at system %s does not have %.1ff to do hyperspace jump.\n",
+X			   Shipnames[s->type], shipno, s->name, prin_ship_orbits(s), fuse);
+X		       push_message(TELEG_PLAYER_AUTO, s->owner, telegram_buf, TELEGRAM);
+X		s->hyper_drive.on = 0;
+X		return;
+X		}
+X
+X/* check to see if ship explodes */
+X		
+X
+X   		s->fuel -= fuse;
+X   		s->mass -= fuse * MASS_FUEL;
+X
+X   		heading = atan2( Stars[s->deststar]->xpos - s->xpos,
+X				Stars[s->deststar]->ypos - s->ypos);
+X		sn = sin(heading);
+X		cs = cos(heading);
+X	 	s->xpos = Stars[s->deststar]->xpos - sn * 0.9 * SYSTEMSIZE;
+X	 	s->ypos = Stars[s->deststar]->ypos - cs * 0.9 * SYSTEMSIZE;
+X
+X		s->whatorbits = LEVEL_STAR;
+X		s->storbits = s->deststar;
+X
+X		s->hyper_drive.on = 0;
+X		s->hyper_drive.ready = 0;
+X		s->hyper_drive.charge = 0;
+X		  sprintf(telegram_buf,"%s #%d %s arrived at system %s.\n",
+X			   Shipnames[s->type], shipno, s->name,
+X				prin_ship_orbits(s));
+X		push_message(TELEG_PLAYER_AUTO, s->owner, telegram_buf, TELEGRAM);
+X		} else if(s->hyper_drive.mounted) {
+X				s->hyper_drive.ready = 1;
+X				s->hyper_drive.charge = HYPER_DRIVE_READY_CHARGE;
+X		} else {
+X			if(s->hyper_drive.charge==HYPER_DRIVE_READY_CHARGE)
+X				s->hyper_drive.ready = 1;
+X			else		
+X				s->hyper_drive.charge += 1;
+X
+X			  }
+X	return;
+X	}
+X
+X if (s->speed && !s->is_docked && s->is_alive && (s->whatdest!=LEVEL_UNIV
+X		|| s->navigate.on) ) {
+X
+X    /* subtract fuel from the ship */
+X   fuse = 0.5 * s->speed * (1 + s->protect.evade) * s->mass * FUEL_USE;
+X
+X   if (s->fuel < fuse) {
+X	  /* ship is out of fuel; do whatever it is to do */
+X	if (!s->notified) {
+X	  s->notified = 1;
+X	  s->fuel = 0.0;		/* in case it's negative */
+X	  msg_OOF(s, shipno, telegram_buf);	/* send OOF notify */
+X
+X		/* kill the ship if we lost it and it's expendable */
+X	  if (s->whatorbits == LEVEL_UNIV && Shipdata[s->type][ABIL_COST]<=50) {
+X	sprintf(telegram_buf,"Ship #%d has been lost in deep space.\n",shipno);
+X	push_message(TELEG_PLAYER_AUTO, s->owner, telegram_buf, TELEGRAM);
+X	    kill_ship(s->owner, s);
+X	  }
+X	}
+X	return;
+X   }
+X
+X/*******   move the ship towards dest ******/
+X	if(s->navigate.on){   /* follow navigational orders */
+X	heading = .0174329252*s->navigate.bearing;
+X   mfactor = SHIP_MOVE_SCALE * (1.0 - .01 * s->rad) * (1.0 - .01 * s->damage) 
+X        * SpeedConsts[s->speed] * MoveConsts[s->whatorbits];
+X
+X   	s->fuel -= fuse;
+X   	s->mass -= fuse * MASS_FUEL;
+X
+X	sn = sin(heading);
+X	cs = cos(heading);
+X   	xdest = sn * mfactor;
+X   	ydest = cs * mfactor;
+X
+X   	s->xpos += xdest;
+X   	s->ypos -= ydest;
+X
+X	s->navigate.turns --;
+X	if(s->navigate.turns == 0) s->navigate.on = 0; 
+X
+X} else {  /*		navigate is off            */
+X
+X   switch (s->whatdest) {
+X      case LEVEL_STAR:
+X	 destlevel = LEVEL_STAR;
+X	 deststar = s->deststar;
+X	 xdest = Stars[deststar]->xpos;
+X	 ydest = Stars[deststar]->ypos;
+X	 break;
+X      case LEVEL_PLAN:
+X	 destlevel = LEVEL_PLAN;
+X	 deststar = s->deststar;
+X	 destpnum = s->destpnum;
+X	 xdest = Stars[deststar]->xpos + planets[deststar][destpnum]->xpos;
+X	 ydest = Stars[deststar]->ypos + planets[deststar][destpnum]->ypos;
+X	 if(sqrt( Distsq(s->xpos, s->ypos, xdest, ydest)) <= DIST_TO_LAND)
+X	   destlevel = LEVEL_UNIV;
+X	 break;
+X      case LEVEL_SHIP:
+X	 dsh = ships[s->destshipno];
+X	 destlevel = LEVEL_SHIP;
+X	 deststar = dsh->storbits;
+X	 destpnum = dsh->pnumorbits;
+X	 xdest = dsh->xpos;
+X	 ydest = dsh->ypos;
+X	 if(sqrt( Distsq(s->xpos, s->ypos, xdest, ydest))==0.0)destlevel = LEVEL_UNIV;
+X	 break;
+X      default:
+X	 printf("wow, seriously bad error.\n");
+X	 return;
+X	 break;
+X   }
+X   dst = Stars[deststar];
+X   ost = Stars[s->storbits];
+X   dpl = planets[deststar][destpnum];
+X   opl = planets[s->storbits][s->pnumorbits];
+X
+X
+X/*  update new xpos,ypos */
+X   heading = atan2( xdest-s->xpos, 
+X	((ydest - s->ypos)==0.0) ? 0.000001 : (ydest-s->ypos) );
+X   mfactor = SHIP_MOVE_SCALE * (1. - .01 * s->rad) * (1. - .01 * s->damage)
+X       * SpeedConsts[s->speed] * MoveConsts[s->whatorbits];
+X
+X
+X   truedist = movedist = sqrt( Distsq(s->xpos, s->ypos, xdest, ydest));
+X
+X
+X    /* keep from ending up in the middle of the system. */
+X	/* Change the distance so that we
+X	   don't go all the way into the system. */
+X   if (s->whatorbits==LEVEL_UNIV ||
+X	  (destlevel==LEVEL_STAR && s->storbits!=deststar) ||
+X	  (destlevel==LEVEL_PLAN && s->storbits!=deststar) &&
+X	   truedist >= SYSTEMSIZE)
+X   	movedist -= SYSTEMSIZE * 0.90;
+X   else if (destlevel==LEVEL_PLAN && s->whatorbits==LEVEL_STAR &&
+X		s->storbits==deststar && truedist >= PLORBITSIZE)
+X	 /* we're in a system, don't go all the way into a planetary
+X	    orbit */
+X	movedist -= PLORBITSIZE * 0.90;
+X
+X
+X   if (s->whatdest==LEVEL_SHIP && s->owner!=ships[s->destshipno]->owner
+X	&& !isset(races[s->owner-1]->allied, ships[s->destshipno]->owner)
+X   	   && truedist > SYSTEMSIZE*4.0) {
+X	  /* (an allied ship lets you follow it..) */
+X	  /* we lost sight of the destination ship. */
+X	  /* should change SYSTEMSIZE*1.0 to calculated gun range.. */
+X	s->whatdest = LEVEL_UNIV;
+X	s->protect.evade = 0;
+X   	sprintf(telegram_buf,"Telecomm from ship #%d at %s\n\n", 
+X				shipno, prin_ship_orbits(s));
+X    	sprintf(buf,"%s #%d %s lost sight of destination ship #%d.\n", 
+X			Shipnames[s->type],shipno,s->name,s->destshipno);
+X		str_cat(telegram_buf, buf); 
+X	push_message(TELEG_PLAYER_AUTO, s->owner, telegram_buf, TELEGRAM);
+X	return;
+X   }
+X
+X
+X   if (truedist > DIST_TO_LAND) {
+X   	s->fuel -= fuse;
+X   	s->mass -= fuse * MASS_FUEL;
+X
+X		/* dont overshoot */
+X	sn = sin(heading);
+X	cs = cos(heading);
+X   	xdest = sn * mfactor;
+X   	ydest = cs * mfactor;
+X    	if (hypot(xdest, ydest) > movedist) {
+X		xdest = sn * movedist;
+X		ydest = cs * movedist;
+X	}
+X   	s->xpos += xdest;
+X   	s->ypos += ydest;
+X   }
+X
+X/*****  check if far enough away from object it's orbiting to break orbit *****/
+X
+X  if (s->whatorbits==LEVEL_PLAN) {
+X		dist = sqrt( Distsq(s->xpos, s->ypos, 
+X			ost->xpos+opl->xpos, ost->ypos+opl->ypos ) );
+X	 if (dist > PLORBITSIZE) {
+X		s->whatorbits = LEVEL_STAR;
+X	 }
+X
+X   } else if (s->whatorbits==LEVEL_STAR) {
+X	dist = sqrt( Distsq(s->xpos, s->ypos, ost->xpos, ost->ypos ) );
+X	 if (dist > SYSTEMSIZE) {
+X		s->whatorbits = LEVEL_UNIV;
+X		s->protect.evade = 0;
+X	 }
+X   }
+X
+X	/*******   check for arriving at destination *******/
+X
+X   if (destlevel==LEVEL_STAR || (destlevel==LEVEL_PLAN
+X	&& !(s->whatorbits!=LEVEL_UNIV && s->storbits==deststar) ) ) {
+X       		/* not in same star system as deststar */
+X
+X	 stardist = sqrt(Distsq(s->xpos,s->ypos,dst->xpos,dst->ypos));
+X
+X	 if (stardist <= SYSTEMSIZE * 1.5) {
+X	   if (s->type == STYPE_POD)
+X		s->notified = 1;	/* signal to explode */
+X	    /* mark as explored & inhabited by that player */
+X	   setbit(dst->explored, s->owner);
+X	   setbit(dst->inhabited, s->owner);
+X	   s->whatorbits = LEVEL_STAR;
+X	   s->storbits = deststar;
+X		  sprintf(telegram_buf,"%s #%d %s arrived at system %s.\n",
+X			   Shipnames[s->type], shipno, s->name,
+X			prin_ship_orbits(s));
+X	push_message(TELEG_PLAYER_AUTO, s->owner, telegram_buf, TELEGRAM);
+X
+X	   if (destlevel == LEVEL_STAR)
+X	   	  s->whatdest = LEVEL_UNIV;
+X		/* clear orders if the ship is not headed to a planet in
+X		   this system */
+X
+X
+X       }
+X
+X   } else if ( destlevel==LEVEL_PLAN && 
+X		 (s->whatorbits!=LEVEL_UNIV && deststar==s->storbits  &&
+X		!(s->whatorbits==LEVEL_PLAN && s->pnumorbits==destpnum)) ) {
+X	/* headed for a planet in the same system, & not already there.. */
+X		dist = sqrt( Distsq(s->xpos, s->ypos, 
+X			dst->xpos+dpl->xpos, dst->ypos+dpl->ypos ) ) ;
+X
+X	 if (dist<=PLORBITSIZE) {
+X		 /* mark planet as explored by that player */
+X	   dpl->info[s->owner-1].explored = 1;
+X	        /* mark sun as explored too, if the ship might have bypassed it
+X		    (we are trying to be thorough here) */
+X	   setbit(dst->explored, s->owner);
+X	   setbit(dst->inhabited, s->owner);
+X	   s->whatorbits = LEVEL_PLAN;
+X	   s->pnumorbits = destpnum;	
+X
+X	   sprintf(telegram_buf,"Telecomm from ship #%d\n\n",shipno);
+X
+X	if(dist<=DIST_TO_LAND) {
+X	   sprintf(telegram_buf,"%s #%d %s arrived at planet %s.\n This ship is close enough to land.\n",Shipnames[s->type],shipno, s->name, prin_ship_orbits(s));
+X	} else {
+X	   sprintf(telegram_buf,"%s #%d %s arriving at planet %s.\n",
+X				Shipnames[s->type],shipno, s->name, prin_ship_orbits(s));
+X		}
+X
+X	   if (s->type==STYPE_ASS) {
+X	   	sprintf(buf,"\nEnslavement of the planet is now possible.\n");
+X		str_cat(telegram_buf, buf);
+X			}
+X	push_message(TELEG_PLAYER_AUTO, s->owner, telegram_buf, TELEGRAM);
+X	 }
+X
+X  } 
+X
+X }
+X
+X} /* if 'destination' orders */
+X
+X}
+X
+X
+X
+X/* 
+X * insert the ship into wherever it's supposed to be.
+X *  this is done every turn, for every ship; as a bonus it puts them in
+X *  alphabetical order.
+X */
+Xinsert_sh(sdata, star, pl, s, shipno)
+Xstruct stardata *sdata;
+Xstartype *star;
+Xplanettype *pl;
+Xshiptype *s;
+Xint shipno;
+X{
+X
+X if (s->is_alive)
+X    switch (s->whatorbits) {
+X	case LEVEL_UNIV:
+X		s->nextship = sdata->ships;
+X		sdata->ships = shipno;
+X		break;
+X	case LEVEL_STAR:
+X		s->nextship = star->ships;
+X		star->ships = shipno;
+X		break;
+X	case LEVEL_PLAN:
+X		s->nextship = pl->ships;
+X		pl->ships = shipno;
+X		break;
+X	default:
+X		break;
+X    }
+X
+X}
+X
+X
+X/* deliver an "out of fuel" message.  Used by a number of ship-updating
+X *  code segments; so that code isn't duplicated.
+X */
+Xmsg_OOF(s, shipno, tbuf)
+Xshiptype *s;
+Xint shipno;
+Xchar *tbuf;
+X{
+X char buf[200];
+X
+X	sprintf(buf,"%s #%d is out of fuel at %s\n", Shipnames[s->type],
+X				shipno, prin_ship_orbits(s));
+X	push_message(TELEG_PLAYER_AUTO, s->owner, buf, TELEGRAM);
+X}
+X
+X
+Xinsert_sh_univ(sdata, s, shipno)
+Xshiptype *s;
+Xstruct stardata *sdata;
+X{
+X	s->nextship = sdata->ships;
+X	sdata->ships = shipno;
+X}
+X
+X
+Xinsert_sh_star(star, s, shipno)
+Xstartype *star;
+Xshiptype *s;
+Xint shipno;
+X{
+X	s->nextship = star->ships;
+X	star->ships = shipno;
+X}
+X
+X
+Xinsert_sh_plan(pl, s, shipno)
+Xplanettype *pl;
+Xshiptype *s;
+Xint shipno;
+X{
+X	s->nextship = pl->ships;
+X	pl->ships = shipno;
+X}
+END_OF_FILE
+if test 11633 -ne `wc -c <'server/moveship.c'`; then
+    echo shar: \"'server/moveship.c'\" unpacked with wrong size!
+fi
+# end of 'server/moveship.c'
+if test -f 'server/rst.c' -a "${1}" != "-c" ; then 
+  echo shar: Renaming existing file \"'server/rst.c'\" to \"'server/rst.c.orig'\"
+  mv -f 'server/rst.c' 'server/rst.c.orig'
+fi
+echo shar: Extracting \"'server/rst.c'\" \(12592 characters\)
+sed "s/^X//" >'server/rst.c' <<'END_OF_FILE'
+X/*
+X * Galactic Bloodshed, copyright (c) 1989 by Robert P. Chansky, 
+X * smq@ucscb.ucsc.edu, mods by people in GB_copyright.h.
+X * Restrictions in GB_copyright.h.
+X *
+X *  ship -- report -- stock -- tactical -- stuff on ship
+X */
+X
+X#define REPORT	0
+X#define STOCK	1
+X#define TACTICAL 2
+X#define SHIP	3
+X#define STATUS	4
+X
+X#define PLANET 1
+X
+X#include "GB_copyright.h"
+X#define EXTERN extern
+X#include "vars.h"
+X#include "ships.h"
+X#include "races.h"
+X#include "buffers.h"
+X#include <math.h>
+X#include <ctype.h>
+Xextern char Shipltrs[];
+X
+Xchar *prin_aimed_at(), *prin_ship_dest();
+X
+Xstatic boolean Status,Ship,Stock,Report,Tactical,first;
+Xint rst_racedata;
+X
+Xextern float Kill_factor();
+X
+Xstruct reportdata {
+X	unsigned type : 1;	/* ship or planet */
+X	shiptype *s;
+X	planettype *p;
+X	short n;
+X	unsigned char star,pnum;
+X	float x,y;
+X};
+X
+Xracetype *Race;
+X
+Xrst(Playernum,APcount, argn,args,Rst)
+Xint Playernum;
+Xint APcount;
+Xint argn;
+Xchar args[MAXARGS][COMMANDSIZE];
+Xint Rst;
+X{
+X int shdata,shipno;
+X reg int shn,i;
+X struct reportdata *rd;
+X int n_ships, num;
+X boolean Report_types[NUMSTYPES];
+X 
+X for (i=0; i<NUMSTYPES; i++) Report_types[i]=1;
+X Num_ships = 0;
+X first = 1;
+X switch (Rst) {
+X	case REPORT:	Report = 1;
+X			Status = Stock = Ship = Tactical = 0;
+X			break;
+X	case STOCK:	Stock = 1;
+X			Status = Report = Ship = Tactical = 0;
+X			break;
+X	case TACTICAL:	Tactical = 1;
+X			Status = Report = Ship = Stock = 0;
+X			break;
+X	case SHIP:	Ship = Report = Stock = 1;
+X			Tactical = 0;
+X			Status = 1;
+X			break;
+X	case STATUS:	Status = 1;
+X 			Report = Stock = Tactical = Ship = 0;
+X			break;
+X }
+X
+X openshdata(&shdata);
+X  n_ships = Numships(shdata);
+X close_file(shdata);
+X
+X rd = (struct reportdata *)malloc(sizeof(struct reportdata) * 
+X	(n_ships + Sdata.numstars * MAXPLANETS));
+X	/* (one list entry for each ship, planet in universe) */
+X
+Xopenracedata(&rst_racedata);
+Xgetrace(rst_racedata, &Race, Playernum);
+Xclose_file(rst_racedata);
+X
+X
+X if (argn>=2) {
+X
+X   if (*args[1] == '#' || isdigit(*args[1])) {
+X	/* report on a couple ships */
+X	 int l=1;
+X      while (l<MAXARGS && *args[l]!='\0') {
+X
+X      	sscanf(args[l] + (*args[l]=='#'),"%d",&shipno);
+X
+X      	if ( shipno > n_ships || shipno<1) {
+X	   sprintf (buf,"rst: no such ship #%d \n",shipno);
+X		notify(Playernum, buf);
+X	   Free_shiplist(rd);
+X	   free(Race);
+X	   return ;
+X       	}
+X
+X      	openshdata(&shdata);
+X      	Getrship(Playernum,shdata,rd, shipno);
+X      	close_file(shdata);
+X	num = Num_ships;
+X	if(rd[Num_ships-1].s->whatorbits != LEVEL_UNIV)
+X		{
+X      			star_getrships(Playernum,rd,rd[num-1].s->storbits);
+X      			ship_report(Playernum,rd,num-1,Report_types);
+X		}
+X	else 
+X   			ship_report(Playernum,rd,num-1,Report_types);
+X
+X	l++;
+X      }
+X
+X      Free_shiplist(rd);
+X	 free(Race);
+X	 return;
+X
+X   } else {
+X	int l;
+X	l = strlen(args[1]);
+X	for (i=0; i<NUMSTYPES; i++) Report_types[i]=0;
+X
+X	while (l--) {
+X	   i = NUMSTYPES;
+X	   while (--i && Shipltrs[i]!=args[1][l]) 
+X		;
+X	   if (Shipltrs[i]!=args[1][l]) {
+X		sprintf(buf,"'%c' -- no such ship letter\n",args[1][l]);
+X			notify(Playernum, buf);
+X	   } else
+X		Report_types[i] = 1;
+X	}
+X   }
+X
+X  }
+X
+X  switch (Dir[Playernum-1].level) {
+X   case LEVEL_UNIV:
+X	  openshdata(&shdata);
+X	  shn = Sdata.ships;
+X	  while (shn && Getrship(Playernum, shdata, rd, shn))
+X	      shn = rd[Num_ships-1].s->nextship;
+X
+X	  close_file(shdata);
+X      for (i=0; i<Sdata.numstars; i++)
+X        star_getrships(Playernum,rd,i);
+X      for (i=0; i<Num_ships; i++)
+X        ship_report(Playernum,rd,i,Report_types);
+X      break;
+X   case LEVEL_PLAN:
+X      plan_getrships(Playernum,rd, Dir[Playernum-1].snum, Dir[Playernum-1].pnum);
+X      for (i=0; i<Num_ships; i++)
+X        ship_report(Playernum,rd,i,Report_types);
+X      break; 
+X   case LEVEL_STAR:
+X      star_getrships(Playernum,rd,Dir[Playernum-1].snum);
+X      for (i=0; i<Num_ships; i++)
+X        ship_report(Playernum,rd,i,Report_types);
+X      break; 
+X   case LEVEL_SHIP:
+X      openshdata(&shdata);
+X      Getrship(Playernum,shdata,rd, Dir[Playernum-1].shipno);
+X      ship_report(Playernum,rd,0,Report_types);		/* first ship report */
+X
+X	if(rd[0].s->type == STYPE_CARRIER) /* list attached fighter groups */
+X	{
+X	  shn = rd[0].s->object.number;
+X	  Num_ships = 0;	
+X
+X	  while (shn && Getrship(Playernum, shdata, rd, shn))
+X	      shn = rd[Num_ships-1].s->object.number;
+X
+X
+X	for (i=0; i<Num_ships; i++)
+X		ship_report(Playernum,rd,i,Report_types);
+X	}
+X
+X      close_file(shdata);
+X      break;
+X  }
+X
+X  Free_shiplist(rd);
+X free(Race);
+X}
+X
+X
+Xship_report(Playernum,rd,indx,rep_on)
+Xint Playernum;
+Xstruct reportdata rd[];
+Xint indx;
+Xboolean rep_on[];
+X{
+X shiptype *s;
+X planettype *p;
+X int shipno,test;
+X reg int i,sight;
+X placetype where;
+X char orb[PLACENAMESIZE];
+X char strng[COMMANDSIZE],locstrn[COMMANDSIZE];
+X float Dist;
+X 
+X	/* last ship gotten from disk */
+X  s = rd[indx].s;
+X  p = rd[indx].p;
+X  shipno = rd[indx].n;
+X
+X	/* launched canister, non-owned ships don't show up */
+X    if ( (rd[indx].type==PLANET && p->info[Playernum-1].numsectsowned)
+X      || (rd[indx].type!=PLANET && s->owner==Playernum &&
+X	 rep_on[s->type] &&
+X	!(s->type==OTYPE_CANIST && !s->is_docked) && s->is_alive) ) {
+X
+X   if (rd[indx].type!=PLANET && Stock) {
+X    if (first) {
+X      sprintf(buf,"   #       name        mass crys   resources  destructive  fuel      crew     class\n");
+X		notify(Playernum, buf);
+X      if (!Ship)
+X	      first=0;
+X    }
+X
+X
+X      sprintf(buf,"%4d %c %13.13s%7.1f%5u%5u(%4d)%5u(%4d)%5.1f(%4d)%5u(%4d) %c %s %s",
+X	shipno, Shipltrs[s->type], s->name, s->mass, s->crystals, 
+X	s->resource, Max_resource(s),
+X	s->destruct, Max_destruct(s),
+X	s->fuel, Max_fuel(s),
+X	s->popn, Max_crew(s), Shipltrs[s->build_type],  s->class, (s->active ? "" : "INACTIVE"));
+X		notify(Playernum, buf);
+X      sprintf(buf,"\n");
+X		notify(Playernum, buf);
+X
+X   }
+X
+X  if (rd[indx].type!=PLANET && Status) {
+X    if (first) {
+X      sprintf(buf,"   #       name      guns  arm rcap dcap fcap crew  spd cost   mass size dam class\n");
+X		notify(Playernum, buf);
+X      if (!Ship)
+X	      first=0;
+X    }
+X
+X
+X      sprintf(buf,"%4d %c %13.13s %c%3u%5u%5u%5u%5u%5u   %c%1u%5u%7.1f%5u%3u%% %c %s%s\n",
+X	shipno, Shipltrs[s->type], s->name, Laser(s) ? '+' : ' ',
+X	Guns(s), Armor(s), Max_resource(s), Max_destruct(s), Max_fuel(s), Max_crew(s),
+X		s->hyper_drive.has ? (s->hyper_drive.mounted ? '+' : '*') : ' ',
+X		Max_speed(s), Cost(s), Mass(s), Size(s), s->damage, 
+X		Shipltrs[s->build_type],  s->class, (s->active ? "" : " INACTIVE"));
+X		notify(Playernum, buf);
+X   }
+X
+X
+X
+X   if (rd[indx].type!=PLANET && Report) {
+X         if (first) {
+X		sprintf(buf,"  #                crew dam dest fuel spd            orbits       destination\n");
+X		notify(Playernum, buf);
+X		 if (!Ship)
+X		      first=0;
+X	 }
+X
+X	if(s->navigate.on)
+X		sprintf(strng,"nav: %d (%d)",s->navigate.bearing,
+X				s->navigate.turns);
+X
+X	  sprintf(locstrn,"%2.0f,%-2.0f",s->xpos,s->ypos);
+X
+X 	  sprintf(buf,"%4d %c %12.12s%4u%4u%5u%5.0f %c%1u%c%5s%15.15s %15.15s",
+X		shipno, 
+X		Shipltrs[s->type], 
+X		s->name,
+X		s->popn,
+X		s->damage, 
+X		s->destruct, 
+X		s->fuel,
+X		s->hyper_drive.has ? (s->hyper_drive.mounted ? '+' : '*') : ' ',
+X		s->speed, 
+X		s->is_docked ? ( (s->whatdest==LEVEL_SHIP) ? 'D' : 'L') : ' ',
+X		(s->is_docked&&s->whatdest==LEVEL_PLAN) ? locstrn : "",
+X		prin_ship_orbits(s), 
+X		(s->navigate.on) ? strng : prin_ship_dest(Playernum, s) );
+X		notify(Playernum, buf);
+X      if (!s->active) {
+X	sprintf(buf," INACTIVE(%d)",s->rad);
+X		notify(Playernum, buf);
+X		}
+X         sprintf(buf,"\n");
+X		notify(Playernum, buf);
+X
+X   }
+X
+X   if (Tactical) {
+X
+Xint fev=0,fspeed=0;
+Xfloat tech;
+X	sprintf(buf,"\n  #         name        tech guns armor size dest   fuel dam spd evad               orbits\n");
+X		notify(Playernum, buf);
+X
+X	if (rd[indx].type==PLANET) {
+X			tech = Race->tech;
+X		/* tac report from planet */
+X		sprintf(buf,"(planet)%15.15s%4.0f %4d           %5u %6u\n",
+X			Stars[rd[indx].star]->pnames[rd[indx].pnum],
+X			 tech,PLAN_FIRE_LIM,p->info[Playernum-1].destruct,
+X			p->info[Playernum-1].fuel);
+X		notify(Playernum, buf);
+X	} else {
+X
+X 	  where.level = s->whatorbits;
+X 	  where.snum = s->storbits;
+X 	  where.pnum = s->pnumorbits;
+X	  tech = s->tech;
+X
+X	  if((s->whatdest != LEVEL_UNIV || s->navigate.on) && !s->is_docked && s->active) {
+X		fspeed = s->speed;
+X		fev = s->protect.evade;
+X	  }
+X	  sprintf(orb, "%30.30s", Dispplace(Playernum, &where));
+X	  sprintf(buf,"%3d %c%19.19s%4.0f%5d%6d%5d%5u%7.1f%3d%%  %d  %3s%21.22s%s", 
+X		shipno, Shipltrs[s->type], s->name, s->tech,
+X		Guns(s), s->armor, s->size,
+X		s->destruct, s->fuel, s->damage, fspeed,(fev ? "yes" : "   "),
+X		orb, (s->active ? "" : " INACTIVE"));
+X		notify(Playernum, buf);
+X
+X	  if (s->is_docked && s->whatorbits==LEVEL_PLAN) {
+X	    sprintf(buf," (%.0f,%.0f)",s->xpos,s->ypos);
+X		notify(Playernum, buf);
+X		}
+X          if (!s->active) {
+X		sprintf(buf," INACTIVE(%d)",s->rad);
+X		notify(Playernum, buf);
+X			}
+X	  sprintf(buf,"\n");
+X		notify(Playernum, buf);
+X
+X	}
+X
+X	sight = 0;
+X	if(rd[indx].type==PLANET) {
+X		sight = 1;
+X	} else if(Sight(s)) sight = 1;
+X
+X		/* tactical display */
+X	sprintf(buf,"\n  Tactical: #  own typ        name   rng   (50%%) size spd evade hit  dam  loc\n");
+X		notify(Playernum, buf);
+X
+X	if(sight)
+X	for (i=0; i<Num_ships; i++) {
+X	   if (i!=indx && (Dist = sqrt(Distsq(rd[indx].x, rd[indx].y, 
+X				rd[i].x, rd[i].y))) < gun_range(Race, NULL))
+X	      if (rd[i].type==PLANET) {
+X		/* tac report at planet */
+X		sprintf(buf," %13s(planet)          %8.0f\n", 
+X			Stars[rd[i].star]->pnames[rd[i].pnum], Dist);
+X		notify(Playernum, buf);
+X
+X	      } else {
+X			/* tac report at ship */
+X		if (rd[i].s->owner!=Playernum && rd[i].s->is_alive
+X			&& rd[i].s->type != OTYPE_CANIST)
+X			 {
+X		int tev=0, tspeed=0, body=0,prob=0;
+X		int factor=0;		
+X		if((rd[i].s->whatdest != LEVEL_UNIV || rd[i].s->navigate.on) && !rd[i].s->is_docked && rd[i].s->active)
+X					{
+X					tspeed = rd[i].s->speed;
+X					tev = rd[i].s->protect.evade;
+X					}
+X					
+X		body = Size(rd[i].s);
+X
+X			 prob = hit_odds(Dist,&factor,tech,fev,tev,fspeed,tspeed,body);
+X		   sprintf(buf,"%13d %4d %c%15.15s %4.0f  %4d   %4d %d  %3s  %3d%% %3u%%%s",
+X			rd[i].n, rd[i].s->owner, Shipltrs[rd[i].s->type], 
+X			rd[i].s->name, Dist,factor,body,tspeed,(tev ? "yes" : "   "), prob,rd[i].s->damage,
+X			(rd[i].s->active ? "" : " INACTIVE"));
+X		notify(Playernum, buf);
+X	  if (rd[i].s->is_docked && rd[i].s->whatorbits==LEVEL_PLAN) {
+X	    sprintf(buf," (%.0f,%.0f)",rd[i].s->xpos,rd[i].s->ypos);
+X		notify(Playernum, buf);
+X	  } else {
+X	    sprintf(buf,"     ");
+X		notify(Playernum, buf);
+X		}
+X
+X	sprintf(buf, "\n");
+X		notify(Playernum, buf);
+X		}
+X	      }
+X
+X	}
+X   }
+X
+X
+X  }
+X
+X}
+X
+X
+X
+Xplan_getrships(Playernum,rd,snum,pnum)
+Xint Playernum;
+Xstruct reportdata rd[];
+Xint snum, pnum;
+X{
+X reg int i,shn;
+X planettype *p;
+X int shdata,pdata;
+X
+X openpdata(&pdata);
+X   getplanet(pdata, &rd[Num_ships].p, Stars[snum]->planetpos[pnum]);
+X close_file(pdata);
+X p = rd[Num_ships].p;
+X	/* add this planet into the ship list */
+X rd[Num_ships].star = snum;
+X rd[Num_ships].pnum = pnum;
+X rd[Num_ships].type = PLANET;
+X rd[Num_ships].n = 0;
+X rd[Num_ships].x = Stars[snum]->xpos + p->xpos;
+X rd[Num_ships].y = Stars[snum]->ypos + p->ypos;
+X    Num_ships++;
+X
+X if (p->info[Playernum-1].explored) {
+X
+X   openshdata(&shdata);
+X   shn = p->ships;
+X   while (shn && Getrship(Playernum, shdata, rd, shn)) {
+X		/* add offsets for docked ships */
+X	if (rd[Num_ships-1].s->is_docked && 
+X			rd[Num_ships-1].s->whatdest==LEVEL_PLAN) {
+X		rd[Num_ships-1].x += Stars[snum]->xpos + p->xpos;
+X		rd[Num_ships-1].y += Stars[snum]->ypos + p->ypos;
+X	}
+X	shn = rd[Num_ships-1].s->nextship;
+X   }
+X   close_file(shdata);
+X }
+X 
+X}
+X
+X
+X
+Xstar_getrships(Playernum,rd,snum)
+Xint Playernum;
+Xstruct reportdata rd[];
+Xint snum;
+X{
+X reg int shn;
+X int i,shdata;
+X
+X
+X if (isset(Stars[snum]->explored, Playernum)) {
+X   openshdata(&shdata);
+X   shn = Stars[snum]->ships;
+X   while (shn && Getrship(Playernum, shdata, rd, shn))
+X	shn = rd[Num_ships-1].s->nextship;
+X
+X   close_file(shdata);
+X   for (i=0; i<Stars[snum]->numplanets; i++)
+X     plan_getrships(Playernum,rd, snum, i);
+X }
+X}
+X
+X
+X/* get a ship from the disk and add it to the ship list we're maintaining. */
+XGetrship(Playernum,shdata,rd, shipno)
+Xint Playernum;
+Xint shdata,shipno;
+Xstruct reportdata rd[];
+X{
+Xint noerr;
+X
+X 
+X   if (getship(shdata,&rd[Num_ships].s,shipno)) {
+X	   rd[Num_ships].type = 0;
+X	   rd[Num_ships].n = shipno;
+X	   rd[Num_ships].x = rd[Num_ships].s->xpos;
+X	   rd[Num_ships].y = rd[Num_ships].s->ypos;
+X 	   Num_ships++;
+X	   return 1;
+X       } else {
+X	sprintf(buf,"Getrship: error on ship get (%d).\n",shipno);
+X		notify(Playernum, buf);
+X	   return 0;
+X    }
+X}
+X
+X
+X
+XFree_shiplist(rd)
+Xstruct reportdata rd[];
+X{
+X reg int i;
+X
+X for (i=0; i<Num_ships; i++)
+X	if (rd[i].type==PLANET)
+X		free(rd[i].p);
+X	else
+X		free(rd[i].s);
+X
+X free(rd);
+X}
+X
+X/* 
+X * return what the ship is aimed at, if it's a mirror 
+X */
+X
+X
+END_OF_FILE
+if test 12592 -ne `wc -c <'server/rst.c'`; then
+    echo shar: \"'server/rst.c'\" unpacked with wrong size!
+fi
+# end of 'server/rst.c'
+if test -f 'server/teleg_send.c' -a "${1}" != "-c" ; then 
+  echo shar: Renaming existing file \"'server/teleg_send.c'\" to \"'server/teleg_send.c.orig'\"
+  mv -f 'server/teleg_send.c' 'server/teleg_send.c.orig'
+fi
+echo shar: Extracting \"'server/teleg_send.c'\" \(1574 characters\)
+sed "s/^X//" >'server/teleg_send.c' <<'END_OF_FILE'
+X/*
+X * Galactic Bloodshed, copyright (c) 1989 by Robert P. Chansky, 
+X * smq@ucscb.ucsc.edu, mods by people in GB_copyright.h.
+X * Restrictions in GB_copyright.h.
+X *
+X *	teleg_send.c -- does the work of sending a telegram
+X */
+X
+X#define EXTERN extern
+X#include "GB_copyright.h"
+X#include "tweakables.h"
+X#include "files.h"
+X#include "buffers.h"
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <strings.h>
+X#include <errno.h>
+X#include <signal.h>
+X#include <sys/file.h>
+X#include <sys/time.h>
+Xlong tm;
+Xchar *ctime();
+X
+Xstruct tm *current_tm;/* for watching for next update */
+X
+Xpush_message(sender, recpient, msg, type)
+Xint sender;
+Xint recpient;
+Xchar *msg;
+Xint type;
+X{
+X char telefl[100],tmbuf[50], numcodes, *tmp;
+X int mask;
+X FILE *telegram_fd;
+X register int i,t;
+X
+X switch(type) {
+X   case TELEGRAM:
+X     sprintf(telefl, "%s.%d",TELEGRAMFL, recpient );
+X     break;
+X   case DECLARATION:
+X     sprintf(telefl, "%s.%d",DECLARATIONFL, recpient );
+X     break;
+X   case TRANSFER:
+X     sprintf(telefl, "%s.%d",TRANSFERFL, recpient );
+X     break;
+X   case COMBAT:
+X     sprintf(telefl, "%s.%d",COMBATFL, recpient );
+X     break;
+X   case ANNOUNCE:
+X     sprintf(telefl, "%s.%d",ANNOUNCEFL, recpient );
+X     break;
+X   default:
+X     return;
+X }
+X 
+X if ((telegram_fd = fopen( telefl, "a" ))==NULL) {
+X	perror("teleg_send");
+X	return;
+X    } else {
+X
+Xtm = time(0);
+X  current_tm=localtime(&tm);
+Xfprintf(telegram_fd,"%2d/%2d %02d:%02d:%02d %s%s",
+X	current_tm->tm_mon+1, current_tm->tm_mday, current_tm->tm_hour,
+X	current_tm->tm_min, current_tm->tm_sec, msg,
+X	(type==TELEGRAM ? "\n": ""));
+X
+X	fclose(telegram_fd);
+X
+X }
+X
+X}
+X
+END_OF_FILE
+if test 1574 -ne `wc -c <'server/teleg_send.c'`; then
+    echo shar: \"'server/teleg_send.c'\" unpacked with wrong size!
+fi
+# end of 'server/teleg_send.c'
+echo shar: End of archive 7 \(of 9\).
+cp /dev/null ark7isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 9 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

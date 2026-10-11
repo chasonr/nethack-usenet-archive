@@ -1,0 +1,1369 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,cc88f04ffb93061,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-08-12 09:04:59 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site omsvax
+Path: utzoo!linus!decvax!tektronix!ogcvax!omsvax!flamer
+From: flamer@omsvax.UUCP
+Newsgroups: net.sources
+Subject: nwrite.c
+Message-ID: <628@omsvax>
+Date: Fri, 12-Aug-83 12:04:59 EDT
+Article-I.D.: omsvax.628
+Posted: Fri Aug 12 12:04:59 1983
+Date-Received: Sat, 13-Aug-83 18:15:23 EDT
+Organization: Intel Corp. - Hillsboro,OR
+Lines: 1349
+
+
+/*   Program:         nwrite.
+ *   Author:          Jim Earenluindil Trethewey.
+ *   Version:         2.08 (VAX edition).
+ *   Index:           CSD246.
+ *   Date:            27-Apr-1983.
+ *   Last-edit:       08-Jul-1983.
+ *   Language:        C.
+ *   Ppn:             /rl2/cs414/trethewe.
+ *   For:             CS 416, Operating Systems III, Toshi Minoura.
+ *                    Oregon State University,  Corvallis, Oregon.
+ *
+ *   This is a UNIX multi-user interprocess communications (IPC) program.
+ *  
+ *   This module, nwrite.c, contains the program procedures.
+ *
+ *   This program has a few flaws:
+ *
+ *      1.  It is pretty slow.  It should really only be run on a VAX
+ *          or on a PDP-11 with few users.
+ *      2.  The method used for writer-lock semaphores is strange.
+ *          It would be nicer if the operating system had global
+ *          sense-switches (like in COBOL, except all processes
+ *          can see them), or other elegant P/V mechanism.
+ *      3.  It uses the Berkeley extended signal set, not available
+ *          in standard Version 7 UNIX.  This makes it less portable.
+ *          Also, work is going on at UCB to make nicer IPC features,
+ *          which will require major program revisions when they are
+ *          introduced.
+ *      4.  The maximum number of users per conversation is limited to
+ *          the maximum files allowed open on your system minus 3.  For
+ *          example, our file tables only allow 20 simultaneously open
+ *          files: 17 talkers + stdin + stdout + stderr.
+ *          The program can be rewritten so that this is not a factor
+ *          (send_message = open + write + close for each talker) but
+ *          this makes it slower.
+ *
+ *   If you want to send flames or suggestions, here's how to find me:
+ *
+ *      Jim Trethewey                Jim Trethewey
+ *      2458 NE Kathryn St.          Intel Corporation
+ *      Hillsboro,  OR  97123        OMO Engineering
+ *      phone: 503-648-0697          Mail Stop HF2-2-243
+ *                                   5200 NE Elam Young Pkwy.
+ *                                   Hillsboro,  OR  97123
+ *                                   phone: 503-640-5444
+ *                                   uucp: ...!tektronix!ogcvax!omsvax!flamer
+ *                                         ...!hp-pcd!ogcvax!omsvax!flamer
+ *
+ */
+
+#include "nwrite.h"
+
+
+/*
+ *   main:   program mainline.
+ */
+
+main (argc, argv, envp)
+
+   int argc;
+   char **argv;
+   char **envp;
+
+   {
+      analyze (argc, argv);
+      environ = envp;
+      set_up ();
+      while (!done)
+         {
+            eval_input ();
+         }
+      restore_tty_context ();
+   }
+
+/*
+ *   add_mfrec:   add a new person and master file record.
+ */
+
+add_mfrec ()
+   {
+      open_master ("a");
+      mfd.conversation = conversation;
+      strcpy (mfd.person, my_name);
+      strcpy (mfd.location, my_tty);
+      ascii_time ();
+      strcpy (mfd.time_on, current_time); 
+      write_master ();
+      fclose (f_master);
+   }
+
+/*
+ *   analyze:   look at argc and argv, see if OK and determine the
+ *              lead-in character for 'tilde escapes'.
+ */
+
+analyze (argc, argv)
+
+   int argc;
+   char *argv [];
+
+   {
+      int byte;
+
+      if (argc > 1)
+         {
+            *argv++;
+            byte = 0;
+            while ((byte < 2) && ((*argv) [byte] == pattern [byte]))
+               {
+                  byte++;
+               }
+            if ((byte == 2) && ((*argv) [byte] != NULL))
+               {
+                  lead_in = (*argv) [byte];
+               }
+            else
+               {
+                  lead_in = TILDE;
+               }
+         }
+      else
+         {
+            lead_in = TILDE;
+         }
+   }   
+
+/*
+ *   ascii_time:   get current time as ascii string CTIME(3).
+ */
+
+ascii_time ()
+   {
+      long clock;
+      char *t_clock;
+      char a_clock [26];
+
+      time (&clock);
+      t_clock = ctime (&clock);
+      strncpy (a_clock, t_clock, 24);
+      a_clock [24] = NULL;
+      strcpy (current_time, a_clock);
+   }
+
+/*
+ *   back_up:   erase a character from the screen.
+ */
+
+back_up ()
+   {
+      if (isprint (line [column]) || isspace (line [column]))
+         {
+            force (ERASE);
+            if (writing)
+               {
+                  send_message (ERASE);
+               }
+         }
+      column--;
+   }
+
+/*
+ *   call_up:   call another person to talk to.
+ */
+
+call_up ()
+   {
+      parse_request ();
+      if (*callee != NULL)
+         {
+            lookup_callee_on_system ();
+         }
+      if (can_call)
+         {
+            mfd_search ();
+            if (conversation != NO)
+               {
+                  if (was_found && (found_conversation == conversation))
+                     {
+                        printf ("? Already in this conversation.\n");
+                     }
+                  else
+                     {
+                        ring_ring ();
+                     }
+               }
+            else
+               {
+                  if (was_found)
+                     {
+                        conversation = found_conversation;
+                        enter_conference ();
+                        ascii_time ();
+                        strcpy (current_time, current_time);
+                        open_talk_files ();
+                        sprintf (message, "\n%c[Just joined: %s on %s at %s]\n",
+                           BEEP, my_name, my_tty, current_time);
+                        printf ("[Joining conversation %d]\n", conversation);
+                        send_message (message);
+                        close_talk_files ();
+                     }
+                  else
+                     {
+                        choose_conversation ();
+                        enter_conference ();
+                        ring_ring ();
+                     }
+               }
+         }
+   }
+
+/*
+ *   choose_conversation:   grab the first free conversation number.
+ */
+
+choose_conversation ()
+   {
+      int taken;
+
+      load_mfd ();
+      conversation = 0;
+      taken = YES;
+      while (taken)
+         {
+            conversation++;
+            taken = NO;
+            for (ptr = t_o_s; ptr != NULL; ptr = ptr->next)
+               {
+                  if (ptr->record.conversation == conversation)
+                     {
+                        taken = YES;
+                     }
+               }
+         }
+   }
+
+/*
+ *   close_talk_files:   close all conversation message files.
+ */
+
+close_talk_files ()
+   {
+      int i;
+
+      for (i = 1; i <= n_open_files; i++)
+         {
+            fclose (out_file [i]);
+         }
+   }
+
+/*
+ *   delete_mfrec:   leave nwrite and get rid of master record entry.
+ */
+
+delete_mfrec ()
+   {
+      load_mfd ();
+      ptr_1 = t_o_s;
+      ptr_2 = ptr_1;
+      while (ptr_1 != NULL)
+         {
+            if (!strcmp (ptr_1->record.location, my_tty))
+               {
+                  if (t_o_s != ptr_1)
+                     {
+                        ptr_2->next = ptr_1->next;
+                        free (ptr_1);
+                        ptr_1 = ptr_2->next;
+                     }
+                  else
+                     {
+                        t_o_s = ptr_1->next;
+                        free (ptr_1);
+                        ptr_1 = t_o_s;
+                        ptr_2 = ptr_1;
+                     }
+               }
+            else
+               {
+                  if (t_o_s != ptr_1)
+                     {
+                        ptr_1 = ptr_1->next;
+                        ptr_2 = ptr_2->next;
+                     }
+                  else
+                     {
+                        ptr_1 = ptr_1->next;
+                     }
+               }
+         }
+      store_mfd ();
+   }
+
+/*
+ *   enter_conference:   go into a conversation.
+ */
+
+enter_conference ()
+   {
+      load_mfd ();
+      for (ptr = t_o_s; ptr != NULL; ptr = ptr->next)
+         {
+            if (!strcmp (ptr->record.location, my_tty))
+               {
+                  ptr->record.conversation = conversation;
+                  ascii_time ();
+                  strcpy (ptr->record.time_on, current_time);
+               }
+         }
+      store_mfd ();
+   }
+
+/*
+ *   eval_input:   terminal char interrupt... what command is it?
+ */
+
+eval_input ()
+   {
+      column = position (0);
+      ch = getc (stdin);
+      while (ch == EOF)
+         {
+            ch = getc (stdin);
+         }
+      if (ch == lead_in)
+         {
+            tilde_escape ();
+         }
+      else
+         {
+            switch (ch)
+               {
+                  case TILDE:    tilde_escape ();
+                                 break;
+                  case ESCAPE:   over ();
+                                 break;
+                  case CTRL(D):  printf ("^D\r\n");
+                                 quit ();
+                                 break;
+                  case '!':      shell_escape ();
+                                 break;
+                  case '?':      help ();
+                                 break;
+                  default:       text_process ();
+                                 break;
+               }
+         }
+      fflush (stdout);
+   }
+
+/*
+ *   force:   display message even if noecho set.
+ */
+
+force (message)
+
+   char message [];
+
+   {
+      printf ("%s", message);
+   }
+
+/*
+ *   get_line:   get a complete line from the terminal.
+ */
+
+get_line ()
+   {
+      while ((ch != CRLF) &&
+             (ch != CTRL(D)) &&
+             (ch != ESCAPE) &&
+             (column > position (0)))
+         {
+            ch = getc (stdin);
+            while (ch == EOF)
+               {
+                  ch = getc (stdin);
+		  if (timed_out)
+		     {
+			ch = CRLF;
+			timed_out = NO;
+                     }
+               }
+            if (writing)
+               {
+                  alarm (dead_man);
+               }
+            show_char (ch);
+         }
+      if (writing)
+         {
+            if (ch == CTRL(D))
+               {
+                  quit ();
+               }
+            else if (ch == ESCAPE)
+               {
+                  printf ("\r");
+                  over ();
+               }
+         }
+      if (ch == CRLF)
+         {
+            line [column + 1] = NULL;
+         }
+   }
+
+/*
+ *   hang_up:   exit from a conversation.
+ */
+
+hang_up ()
+   {
+      if (conversation != NO)
+         {
+            ascii_time ();
+            open_talk_files ();
+            sprintf (message, "\n[over and out: %s on %s at %s]\n",
+               my_name, my_tty, current_time);
+            force (message);
+            send_message (message);
+            close_talk_files ();
+            conversation = NO;
+            load_mfd ();
+            for (ptr = t_o_s; ptr != NULL; ptr = ptr->next)
+               {
+                  if (!strcmp (ptr->record.location, my_tty))
+                     {
+                        ptr->record.conversation = NO;
+                     }
+               }
+            store_mfd ();
+         }
+      else
+         {
+            printf ("? You aren't in a conversation to hang up from.\n");
+         }
+   }
+
+/*
+ *   help:   show the list of valid commands.
+ */
+
+help ()
+   {
+      show_char (ch);
+      get_line ();
+      if (column != position (0))
+         {
+            help_text ();
+            printf ("?\n\n");
+         }
+   }
+
+/*
+ *   help_text:   this is the actual list of valid nwrite commands.
+ */
+
+help_text ()
+   {
+      printf ("-----------------------------------------------------------------------\n");
+      printf ("nwrite   v%4.2f                                        as of %s\n", version, as_of);
+      printf ("\n");
+      printf ("%cc [<user_name> [<tty_name>]]\n", lead_in);
+      printf ("             Call <user_name> on <tty_name> for conversation.\n");
+      printf ("%ce           Toggle echo-plex on/off (for half-duplex tty's).\n", lead_in);
+      printf ("%ch           Hang up: leave a conversation (\"over and out\").\n", lead_in);
+      printf ("%co           Send \"over\" and relinquish write control.\n", lead_in);
+      printf ("%cq           Quit nwrite.\n", lead_in);
+      printf ("%cw           Who is in which conversations?\n", lead_in);
+      printf ("<escape>     Like %co but works in-line.\n", lead_in);
+      printf ("^D           Like %cq but works in-line.\n", lead_in);
+      printf ("?            Print this help list.\n");
+      printf ("![<command>] Invoke subshell, optionally with <command>.\n");
+      printf ("<text>       Attempt to get write control, send <text> in conversation.\n");
+      printf ("-----------------------------------------------------------------------\n");
+   }
+
+/*
+ *   id_me:   find out my login_name and tty.
+ */
+
+id_me ()
+   {
+      if (!isatty (TTY))
+         {
+            printf ("? You shouldn't redirect standard input for nwrite.\n");
+            done = YES;
+         }
+      strcpy (my_name, getlogin ());
+      if (*my_name == NULL)
+         {
+            printf ("? You don't exist.  Go away!\n");
+            done = YES;
+         }
+      strcpy (my_devtty, ttyname (TTY));
+      strcpy (my_tty, rindex (my_devtty, '/') + 1);
+      if (stat (my_devtty, &stat_buf) < 0)
+         {
+            printf ("? Can't find logical device for your tty.\n");
+            done = YES;
+         }
+      if (!(stat_buf.st_mode & S_OWRITE))
+         {
+            printf ("? You have write permission turned off.\n");
+            done = YES;
+         }
+   }
+
+/*
+ *   init_tty_context:   set tty mode to that convenient for nwriting.
+ */
+
+init_tty_context ()
+   {
+      new_tty = old_tty;
+      new_tty.sg_flags |= CBREAK;
+      new_tty.sg_flags &= ~ECHO;
+      ioctl (TTY, TIOCSETP, &new_tty);
+      new_ltchars = old_ltchars;
+      new_lmodes = old_lmodes | LPENDIN | LINTRUP | LTOSTOP;
+      ioctl (TTY, TIOCLSET, &new_lmodes);
+      sigset (SIGALRM, time_out);
+      sigset (SIGTSTP, please_no);
+      sigset (SIGINT, please_no);
+      sigset (SIGQUIT, please_no);
+      sigset (SIGSTOP, please_no);
+      sigset (SIGHUP, SIG_IGN);
+      sigset (SIGPIPE, SIG_IGN);
+      sigset (SIGTINT, SIG_IGN);
+      sigset (SIGTTOU, SIG_IGN);
+      sigset (SIGTTIN, SIG_IGN);
+   }
+
+/*
+ *   load_mfd:   build a linked_list of mfd records for manipulation.
+ */
+
+load_mfd ()
+   {
+      open_master ("r");
+      if (f_master != NULL)
+         {
+            t_o_s = NULL;
+            read_master ();
+            while (n != f_EOF)
+               {
+                  ptr_2 = (struct mct_node *) malloc (sizeof (struct mct_node));
+                  ptr_2->record.conversation = mfd.conversation;
+                  strcpy (ptr_2->record.person, mfd.person);
+                  strcpy (ptr_2->record.location, mfd.location);
+                  strcpy (ptr_2->record.time_on, mfd.time_on);
+                  ptr_2->next = NULL;
+                  if (t_o_s == NULL)
+                     {
+                        t_o_s = ptr_2;
+                        ptr_1 = t_o_s;
+                     }
+                  else
+                     {
+                        ptr_1->next = ptr_2;
+                        ptr_1 = ptr_1->next;
+                     }
+                  read_master ();
+               }
+            fclose (f_master);
+         }
+   }
+
+/*
+ *   lookup_callee_on_system:   look in /etc/utmp for callee and get his_tty.
+ */
+
+lookup_callee_on_system ()
+   {
+      int tty_specified;
+
+      f_utmp = fopen (h_utmp, "r");
+      match_tty = NO;
+      logged_on = NO;
+      if (*his_tty == NULL)
+         {
+            tty_specified = NO;
+         }
+      else
+         {
+            tty_specified = YES;
+         }
+      n = fread (&ubuf, sizeof ubuf, 1, f_utmp);
+      while (n != f_EOF)
+         {
+            name_match = !strncmp (ubuf.ut_name, callee, strlen (callee));
+            if (name_match)
+               {
+                  if (*his_tty != NULL)
+                     {
+                        if (!match_tty)
+                           {
+                              match_tty = !strncmp (ubuf.ut_line, his_tty, strlen (his_tty));
+                           }
+                     }
+                  else
+                     {
+                        strcpy (his_tty, ubuf.ut_line);
+                        match_tty = YES;
+                     }
+                  logged_on++;
+               }
+            n = fread (&ubuf, sizeof ubuf, 1, f_utmp);
+         }
+      fclose (f_utmp);
+      can_call = NO;
+      if (!logged_on)
+         {
+            printf ("? %s is not logged in.\n", callee);
+         }
+      else
+         {
+            if (!match_tty)
+               {
+                  printf ("? %s is not on %s.\n", callee, his_tty);
+               }
+            else if ((logged_on == 1) || tty_specified)
+               {
+                  can_call = YES;
+               }
+            else
+               {
+                  printf ("? %s is logged on more than once... please specify tty.\n", callee);
+               }
+         }
+   }
+
+/*
+ *   mfd_search:   is the callee currently running nwrite?
+ */
+
+mfd_search ()
+   {
+      was_found = NO;
+      load_mfd ();
+      for (ptr = t_o_s; (ptr != NULL) && !was_found; ptr = ptr->next)
+         {
+            if (!strcmp (callee, ptr->record.person) &&
+                !strcmp (his_tty, ptr->record.location) &&
+                (ptr->record.conversation != NO))
+               {
+                  was_found = YES;
+                  found_conversation = ptr->record.conversation;
+               }
+         }
+   }
+
+/*
+ *   open_master:   open the master file.
+ */
+ 
+open_master (mode)
+   
+   char mode [];
+
+   {
+      f_master = fopen (h_mfd, mode);
+      if (f_master == NULL)
+         {
+            printf ("? Can't open conversation master file %s.\n", h_mfd);
+         }
+   }
+
+/* 
+ *   open_talk_files:   open conversation message files.
+ */
+
+open_talk_files ()
+   {
+      load_mfd ();
+      n_open_files = 0;
+      for (ptr = t_o_s; ptr != NULL; ptr = ptr->next)
+         {
+            if ((ptr->record.conversation == conversation) &&
+                strcmp (ptr->record.location, my_tty))
+               {
+                  strcat (strcpy (f_devtty, h_tty), ptr->record.location);
+                  f_otty = fopen (f_devtty, "w");
+                  if (f_otty != NULL)
+                     {
+                        n_open_files++;
+                        out_file [n_open_files] = f_otty;
+                     }
+               }
+         }
+   }
+
+/*
+ *   over:   I'm done with this message, relinquish write control.
+ */
+
+over ()
+   {
+      if (writing)
+         {
+            ascii_time ();
+            sprintf (message, "\n[over: %s on %s at %s]\n\n",
+               my_name, my_tty, current_time);
+            force (message);
+            send_message (message);
+            close_talk_files ();
+            alarm (0);
+            V (conversation);
+         }
+      else
+         {
+            printf ("? You don't have write control, you can't \"over\".\n");
+         }
+   }
+
+/*
+ *   P:   lock myself as conversation writer (a pseudo-semaphore).
+ *        Actually, the file <c_file> is linked to a user temp file.
+ */
+
+P (conversation)
+
+   int conversation;
+
+   {
+      char c_file [40];
+      int link_error;
+
+      sprintf (c_file, h_conv, conversation);
+      link_error = link (tmp_file, c_file);
+      if (!link_error)
+         {
+            writing = YES;
+         }
+   }
+
+/*
+ *   page_confirm:   handle SIGTTOU signal.
+ */
+
+page_confirm ()
+   {
+      if (debug)
+         {
+            printf ("<<< page_confirm >>>\n");
+         }
+   }
+
+/*
+ *   parse_request:   strip out arguments of the ~c command.
+ */
+
+parse_request ()
+   {
+      char word_1 [40], word_2 [40];
+      int i, j;
+
+      i = 0;
+      while (!isspace (line [i]) && (line [i] != NULL))
+         {
+            i++;
+         }
+      while (isspace (line [i]) && (line [i] != NULL))
+         {
+            i++;
+         }
+      j = 0;
+      while (!isspace (line [i]) && (line [i] != NULL))
+         {
+            word_1 [j++] = line [i++];
+         }
+      word_1 [j] = NULL;
+      while (isspace (line [i]) && (line [i] != NULL))
+         {
+            i++;
+         }
+      j = 0;
+      while (!isspace (line [i]) && (line [i] != NULL))
+         {
+            word_2 [j++] = line [i++];
+         }
+      word_2 [j] = NULL;
+      if (*word_1 != NULL)
+         {
+            if (*word_2 != NULL)
+               {
+                  strcpy (his_tty, word_2);
+               }
+            else
+               {
+                  if (strcmp (callee, word_1))
+                     {
+                        *his_tty = NULL;
+                     }
+               }
+            strcpy (callee, word_1);
+         }
+      if (*callee == NULL)
+         {
+            printf ("? Call who?\n");
+         }
+   }
+
+/*
+ *   please_no:   ask user not to use interrupt signals, etc.
+ */
+
+please_no ()
+   {
+      printf ("\n%cPlease %cuse %c^D %cto %cexit %cnwrite!\n",
+         BEEP, BEEP, BEEP, BEEP, BEEP, BEEP);
+   }
+
+/*
+ *   position:   point to the i'th character in a string.
+ */
+
+position (i)
+   
+   int i;
+
+   {
+      return (i - 1);
+   }
+
+/*
+ *   print_header:   look official.
+ */
+
+print_header ()
+   {
+      printf ("\nnwrite   v%4.2f\n", version);
+      printf ("%s\n", myname);
+      printf ("Type ? for help.\n");
+   }
+
+/*
+ *   quit:   leave nwrite, go back to the shell.
+ */
+
+quit ()
+   {
+      if (writing)
+         {
+            over ();
+         }
+      if (conversation != NO)
+         {
+            hang_up ();
+         }
+      printf ("[Leaving nwrite]\n");
+      done = YES;
+      delete_mfrec ();
+      unlink (tmp_file);
+      sleep (1);
+   }
+
+/*
+ *   read_master:   get a master_control_table record.
+ */
+
+read_master ()
+   {
+      n = fread (&mfd, sizeof mfd, 1, f_master);
+   }
+
+/*
+ *   read_pipe:   get reader control flag from child process.
+ */
+
+read_pipe ()
+   {
+      int ctrl_flag;
+
+      read (ctrl_pipe [0], &ctrl_flag, 2);
+      return (ctrl_flag);
+   }
+
+/*
+ *   receive_message:   if someone sends us a message, display it.
+ */
+
+receive_message ()
+   {
+      ch = getc (f_tty);
+      if (ch != EOF)
+         {
+            putc (ch, stdout);
+            fflush (stdout);
+         }
+   }
+
+/*
+ *   restore_tty_context:   put tty modes back as they were.
+ */
+
+restore_tty_context ()
+   {
+      ioctl (TTY, TIOCSETP, &old_tty);
+      ioctl (TTY, TIOCLSET, &old_lmodes);
+      sigset (SIGALRM, SIG_DFL);
+   }
+
+/*
+ *   ring_ring:   hello?  are you there?  I want to talk to you.
+ */
+
+ring_ring ()
+   {
+      char p_file [40];
+      char m_file [40];
+
+      strcat (strcpy (p_file, h_tty), his_tty);
+      f_pager = fopen (p_file, "w");
+      if (f_pager != NULL)
+         {
+            ascii_time ();
+            fprintf (f_pager, "\n%c%cMessage from: %s on %s at %s...\n",
+               BEEP, BEEP, my_name, my_tty, current_time);
+            fprintf (f_pager, "Use nwrite to respond.\n");
+            printf ("[Message sent to: %s on %s at %s]\n",
+               callee, his_tty, current_time);
+            fclose (f_pager);
+         }
+      else
+         {
+            printf ("[User %s on %s has write protection turned on...\n",
+               callee, his_tty);
+            sprintf (m_file, "mail %s", callee);
+            f_mail = popen (m_file, "w");
+            if (f_mail != NULL)
+               {
+                  ascii_time ();
+                  fprintf (f_mail, "\n%c%cMessage from: %s on %s at %s...\n",
+                     BEEP, BEEP, my_name, my_tty, current_time);
+                  fprintf (f_mail, "Use nwrite to respond.\n");
+                  fclose (f_mail);
+                  printf ("   ...sent mail at %s]\n", current_time);
+               }
+            else
+               {
+                  printf ("   ...couldn't send mail either]\n");
+               }
+         }
+   }
+
+/*
+ *   save_tty_context:   remember current tty modes so we can restore later.
+ */
+
+save_tty_context ()
+   {
+      ioctl (TTY, TIOCGETP, &old_tty);
+      ioctl (TTY, TIOCGLTC, &old_ltchars);
+      ioctl (TTY, TIOCLGET, &old_lmodes);
+   }
+
+/*
+ *   send_message:   send the message to all receivers in conversation.
+ */
+
+send_message (message)
+
+   char message [];
+
+   {
+      int i;
+
+      for (i = 1; i <= n_open_files; i++)
+         {
+            fprintf (out_file [i], "%s", message);
+            fflush (out_file [i]);
+         }
+   }
+
+/*
+ *   set_up:   lots of initialization.
+ */
+
+set_up ()
+   {
+      echo = YES;
+      done = NO;
+      print_header ();
+      printf ("\n");
+      save_tty_context ();
+      init_tty_context ();
+      id_me ();
+      conversation = NO;
+      timed_out = NO;
+      writing = NO;
+      *callee = NULL;
+      *his_tty = NULL;
+      if (!done)
+         {
+            add_mfrec ();
+            strcpy (tmp_file, mktemp (h_temp));
+            creat (tmp_file, MODE);
+         }
+   }
+
+/*
+ *   shell_escape:   perform a shell command or invoke a subshell.
+ */
+
+shell_escape ()
+   {
+      int pid;
+      char *csh;
+
+      if (writing)
+         {
+            over ();
+         }
+      show_char (ch);
+      get_line ();
+      if (column != position (0))
+         {
+            restore_tty_context ();
+            pid = fork ();
+            if (pid == -1)
+               {
+                  printf ("? Can't fork.\n");
+               }
+            else if (pid != 0)
+               {
+                  while (wait (0) != pid) 
+                     {
+                        /* spin in a tight loop */;
+                     }
+               }
+            else
+               {
+                  setuid (getuid ());
+                  csh = getenv ("SHELL");
+                  if (*csh == NULL)
+                     {
+                        csh = sh;
+                     }
+                  if (column == position (1))
+                     {
+                        execle (csh, "-", 0, environ);
+                     }
+                  else
+                     {
+                        execle (csh, &csh[4], "-c", &line[position (2)], 0, environ);
+                     }
+                  exit (0);
+               }
+            init_tty_context ();
+            printf ("!\n\n");
+         }
+   }
+
+/*
+ *   show_char:   we typed something; show it.
+ */
+
+show_char (ch)
+   
+   char ch;
+   
+   {
+      if (isprint (ch) || isspace (ch))
+         {
+            if (echo)
+               {
+                  putc (ch, stdout);
+                  fflush (stdout);
+               }
+            else if ((ch == CRLF) && !echo)
+               {
+                  printf ("\n");
+               }
+            if (writing)
+               {
+                  sprintf (message, "%c", ch);
+                  send_message (message);
+               }
+            column++;
+            line [column] = ch;
+         }
+      else
+         {
+            if (ch == old_tty.sg_erase)
+               {
+                  if (!echo)
+                     {
+                        force (" ");
+                     }
+                  back_up ();
+               }
+            else if (ch == old_ltchars.t_werasc)
+               {
+                  while (isspace (line [column]) && (column != position (0)))
+                     {
+                        back_up ();
+                     }
+                  while (!isspace (line [column]) && 
+                         (isprint (line [column])) &&
+                         (column != position (0)))
+                     {
+                        back_up ();
+                     }
+               }
+            else if (ch == old_tty.sg_kill)
+               {
+                  while (column != position (0))
+                     {
+                        back_up ();
+                     }
+               }
+             else if (ch == CTRL(D))
+               {
+                  printf ("^D\n");
+               }
+         }
+   }
+
+/*
+ *   store_mfd:   we tweaked master records, now put them back.
+ */
+
+store_mfd ()
+   {
+      open_master ("w");
+      if (f_master != NULL)
+         {
+            ptr_1 = t_o_s;
+            while (ptr_1 != NULL)
+               {
+                  mfd.conversation = ptr_1->record.conversation;
+                  strcpy (mfd.person, ptr_1->record.person);
+                  strcpy (mfd.location, ptr_1->record.location);
+                  strcpy (mfd.time_on, ptr_1->record.time_on);
+                  write_master ();
+                  ptr_2 = ptr_1;
+                  ptr_1 = ptr_1->next;
+                  free (ptr_2);
+               }
+            fflush (f_master);
+            fclose (f_master);
+         }
+   }
+
+/*
+ *   text_process:   try to get write control and/or send text message.
+ */
+
+text_process ()
+   {
+      if (writing)
+         {
+            show_char (ch);
+            get_line ();
+         }
+      else
+         {
+            if (conversation == NO)
+               {
+                  printf ("? You haven't called anyone yet.\n");
+               }
+            else
+               {
+                  P (conversation);
+                  if (writing)
+                     {
+                        open_talk_files ();
+                        ascii_time ();
+                        sprintf (message, "\n[From: %s on %s at %s]\n",
+                           my_name, my_tty, current_time);
+                        send_message (message);
+                        printf ("[you have write control of conversation %d]\n",
+                           conversation);
+                        show_char (ch);
+                        alarm (dead_man);
+                        get_line ();
+                     }
+               }
+         }
+   }
+
+/*
+ *   tilde_escape:   a tilde was typed, which command does he want?
+ */
+
+tilde_escape ()
+   {
+      show_char (ch);
+      get_line ();
+      if (column != position (0))
+         {
+            if (column == position (1))
+               {
+                  ch = line [position (1)];
+               }
+            else
+               {
+                  ch = line [position (2)];
+               }
+            switch (ch)
+               {
+                  case 'c':   call_up ();
+                              break;
+                  case 'e':   toggle_echo ();
+                              break;
+                  case 'h':   hang_up ();
+                              break;
+                  case 'o':   over ();
+                              break;
+                  case 'q':   quit ();
+                              break;
+                  case 'w':   who ();
+                              break;
+                  default:    printf ("? Invalid tilde escape.  Type ? for help.\n");
+                              break;
+               }
+            printf ("%c\n\n", lead_in);
+         }
+   }
+
+/*
+ *   time_out:   take away write control if you're a terminal hog.
+ */
+
+time_out ()
+   {
+      if (writing)
+         {
+            ascii_time ();
+            sprintf (message, "\n%c[%d second time out: %s on %s at %s]\n",
+               BEEP, dead_man, my_name, my_tty, current_time);
+            force (message);
+            send_message (message);
+            V (conversation);
+	    timed_out = YES;
+         }
+   }
+
+/*
+ *   toggle_echo:   change echo/noecho (for half duplex tty's).
+ */
+
+toggle_echo ()
+   {
+      if (echo)
+         {
+            printf ("[Echo now OFF]\n");
+         }
+      else
+         {
+            printf ("[Echo now ON]\n");
+         }
+      echo = !echo;
+   }
+
+/*
+ *   trapse_list:   print linked list for debugging purposes.
+ */
+
+trapse_list ()
+   {
+      struct mct_node *ptr;
+
+      printf ("=============================================================\n");
+      printf ("Conv Person        Location      Time On\n");
+      printf ("-------------------------------------------------------------\n");
+      for (ptr = t_o_s; ptr != NULL; ptr = ptr->next)
+          {
+             printf ("%3d  %-12s  %-12s  %24s\n", ptr->record.conversation,
+                ptr->record.person, ptr->record.location, ptr->record.time_on);
+          }
+      printf ("=============================================================\n");
+   }
+
+/*
+ *   V:   unlock write control (a pseudo-semaphore).
+ *        Actually, the file <c_file> is unlinked from a user temp file.
+ */
+
+V (conversation)
+
+   int conversation;
+
+   {
+      char c_file [40];
+
+      writing = NO;
+      sprintf (c_file, h_conv, conversation);
+      unlink (c_file);
+   }
+
+/*
+ *   who:   who is running nwrite, and what conversations are they in?
+ */
+
+who ()
+   {
+      load_mfd ();
+      printf ("Conversation    User        Where        Talking since\n");
+      printf ("-----------------------------------------------------------------\n");
+      for (ptr = t_o_s; ptr != NULL; ptr = ptr->next)
+         {
+            if (ptr->record.conversation == 0)
+               {
+                  printf ("      -");
+               }
+            else
+               {   
+                  printf ("    %3d", ptr->record.conversation);
+               }
+            printf ("         %-8s    %-8s     %-25s\n",
+               ptr->record.person, ptr->record.location, ptr->record.time_on);
+         }
+   }
+
+/*
+ *   write_master:   write a master_control_table record.
+ */
+
+write_master ()
+   {
+      int tries;
+
+      tries = 1;
+      n = fwrite (&mfd, sizeof mfd, 1, f_master);
+      while ((n < 1) && (tries < 10))
+         {
+            if (debug)
+               {
+                  printf ("<<< failure to write master record. >>>\n");
+               }
+            tries++;
+            n = fwrite (&mfd, sizeof mfd, 1, f_master);
+         }
+   }
+
+/*
+ *   write_pipe:   send the reader control flag to parent process.
+ */
+
+write_pipe (ctrl_flag)
+
+   int ctrl_flag;
+
+   {
+      write (ctrl_pipe [1], &ctrl_flag, 2);
+   }
+
+

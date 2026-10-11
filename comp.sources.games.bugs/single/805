@@ -1,0 +1,548 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: fad06,17229c28b6bee027,start
+X-Google-Attributes: gidfad06,public
+X-Google-ArrivalTime: 1989-06-22 21:39:16 PST
+Path: utzoo!utgpu!jarvis.csri.toronto.edu!rutgers!tut.cis.ohio-state.edu!pacific.mps.ohio-state.edu!ohstpy!vancleef
+From: vancleef@ohstpy.mps.ohio-state.edu
+Newsgroups: comp.sources.games.bugs
+Subject: <None>
+Message-ID: <2026@ohstpy.mps.ohio-state.edu>
+Date: 23 Jun 89 04:39:16 GMT
+Lines: 534
+
+it is VERY IMPORTANT that you replace doship.c with this version of it
+in your GB code. it contains a very important self check for the
+daemon to weed out an exotic bug in the program!
+
+Garrett
+
+
+/*
+ * Galactic Bloodshed (Robert Chansky, smq@b)
+ * doship -- do one ship turn.
+ */
+
+#include "vars.h"
+#include "ships.h"
+#include "races.h"
+#include "doturn.h"
+#include "power.h"
+#include <math.h>
+#include <strings.h>
+extern struct power Power[];
+
+
+doship(shipno,ship)
+int shipno;
+shiptype *ship;
+{
+ int sh,sh2,j,shfdata;
+ char buf[300];
+
+ if (!ship->is_dead && ship->owner == 0){
+	ship->is_dead=1;
+
+} /* used to counteract bugs */
+
+ if (!ship->is_dead) {
+
+		/* add ships, popn to total count to add AP's */
+	if (ship->type==OTYPE_VN)
+		Power[ship->owner].ships_owned += ship->orders.object.number;
+	else
+		Power[ship->owner].ships_owned++;
+	Power[ship->owner].resource += ship->resource;
+	Power[ship->owner].fuel += ship->fuel;
+	Power[ship->owner].destruct += ship->destruct;
+	Power[ship->owner].popn += ship->popn;
+	if (ship->whatorbits==LEVEL_UNIV) {
+		 Sdatanumships[ship->owner]++;
+		 Sdatapopns[ship->owner] += ship->popn;
+	} else {
+		starnumships[ship->storbits][ship->owner] += 
+			(ship->type==OTYPE_VN) ? ship->orders.object.number : 1;
+	         /* add popn of ships to popn */
+	        starpopns[ship->storbits][ship->owner] += ship->popn;
+		 /* set inhabited for ship */
+		setbit(Stars[ship->storbits]->inhabited, ship->owner);
+	}
+
+		/* repair radiation */
+      if (ship->rad) {
+			/* kill off some people */
+		ship->popn = round_rand(ship->popn * .90);
+		if (ship->rad > REPAIR_RATE)
+			ship->rad -= REPAIR_RATE;
+		else
+			ship->rad = 0;
+      } else {
+		/* irradiated ships are immobile.. */
+
+		/* make sure of an update if someones bombarding the planet */
+	if (can_bombard(ship) && ship->orders.o.bombard &&
+			ship->whatorbits==LEVEL_PLAN)
+		Stinfo[ship->storbits][ship->pnumorbits].inhab = 1;
+
+	Moveship(shipno, ship);
+	
+		/* repair ship by the amount of crew it has */
+	if (ship->damage && ship->popn) { reg int d;
+		if ((d = ((float)ship->popn / 
+			Shipdata[ship->type][ABIL_MAXCREW]) * REPAIR_RATE)
+			> ship->damage)
+		   ship->damage = 0;
+		else
+		   ship->damage -= d;
+	}
+
+     switch (ship->type) {
+
+      case OTYPE_CANIST:
+	   if (ship->whatorbits == LEVEL_PLAN && !ship->is_docked) { short *t;
+	      if (--ship->orders.object.number) {
+		  t = &Stinfo[ship->storbits][ship->pnumorbits].temp_add;
+		  if (*t - 10 < -120)
+			*t = -120;
+		  else
+			*t -= 10;
+	      } else {	/* timer expired; destroy canister */
+		   reg int j=0;
+		  kill_ship(ship);
+		  teleg_add("",telegram_buf);
+		  sprintf(buf,"Notice from /%s/%s\n\n", 
+			   Stars[ship->storbits]->name, 
+			   Stars[ship->storbits]->pnames[ship->pnumorbits]);
+		  teleg_add(buf,telegram_buf);
+		  teleg_add("Canister of dust previously covering this planet has dissipated.\n",telegram_buf);
+		  for (j=1; j<=Num_races; j++)
+		       if (planets[ship->storbits][ship->pnumorbits]->info[j-1].numsectsowned) 
+				teleg_send(TELEG_PLAYER_AUTO, j, telegram_buf);
+	      }
+	   }
+	   break;
+
+      case STYPE_MINE:
+		/* check around and see if we should explode. */
+	   if (ship->on) {
+		int rad=0; float xd,yd; int p;
+	     if (ship->whatorbits==LEVEL_STAR)
+	     	sh = Stars[ship->storbits]->ships;
+	     else if (ship->whatorbits==LEVEL_PLAN)
+		sh = planets[ship->storbits][ship->pnumorbits]->ships;
+	     else
+		sh = 0;	/* don't explode in interstellar space.  so what. */
+	     sh2 = sh;
+	      /* traverse the list, look for people we are at war with, 
+		 and are closer than the trigger radius... */
+	     while (sh) {
+		xd = ships[sh]->xpos - ship->xpos;
+		yd = ships[sh]->ypos - ship->ypos;
+		if (isset(races[ship->owner]->atwar,ships[sh]->owner) &&
+			(abs(xd)+abs(yd)) < ship->orders.object.number)
+				rad = 1;
+		sh = ships[sh]->nextship;
+	     }
+	     if (rad) {
+		 /* we've found someone we don't like,
+		   detonate and irradiate them */
+		kill_ship(ship);
+		teleg_add("",telegram_buf);
+		sprintf(buf, "BULLETIN!\n mine #%d triggered at system /%s",shipno,Stars[ship->storbits]->name);
+		teleg_add(buf, telegram_buf);
+		teleg_send(TELEG_PLAYER_AUTO,ship->owner,telegram_buf);
+		   while (sh2) {	/* sh2=beginning of list */
+			xd = ships[sh2]->xpos - ship->xpos;
+			yd = ships[sh2]->ypos - ship->ypos;
+			if (sh2!=shipno &&
+		    	    (abs(xd)+abs(yd)) < ship->orders.object.number) {
+				      rad = round_rand(((float)Shipdata[STYPE_MINE][ABIL_DESTCAP] / ship->destruct)*.5);
+			      	      if (ships[sh2]->rad + rad > 100)
+				        ships[sh2]->rad = 100;
+				      else
+				        ships[sh2]->rad += rad;
+				      teleg_add("",telegram_buf);
+				      sprintf(buf, "BULLETIN!\n ship #%d irradiated by mine at system /%s", sh2, Stars[ship->storbits]->name);
+				      teleg_add(buf, telegram_buf);
+				      teleg_send(TELEG_PLAYER_AUTO,ships[sh2]->owner,telegram_buf);
+			}
+			sh2 = ships[sh2]->nextship;
+		}
+	     }
+	   }
+	   break;
+
+      case STYPE_MIRROR:
+	  switch (ship->orders.aimed_at.level) {
+	   case LEVEL_SHIP: /* ship aimed at is a legal ship now */
+			  /* if in the same system */
+		   if ( (ship->whatorbits==LEVEL_STAR || ship->whatorbits==LEVEL_PLAN)
+			&& (ships[ship->orders.aimed_at.shipno]!=NULL)
+			&& (ships[ship->orders.aimed_at.shipno]->whatorbits==LEVEL_STAR ||
+			ships[ship->orders.aimed_at.shipno]->whatorbits==LEVEL_PLAN)
+			&& ship->storbits == ships[ship->orders.aimed_at.shipno]->storbits 
+			&& !ships[ship->orders.aimed_at.shipno]->is_dead )
+				ships[ship->orders.aimed_at.shipno]->damage += 10;
+		break;
+	   case LEVEL_PLAN: { reg short *t; reg int i;
+		  t = &Stinfo[ship->storbits][ship->orders.aimed_at.pnum].temp_add;
+		  i = ship->orders.aimed_at.intensity;
+		  if (*t + i > 120)
+			*t = 120;
+		  else if (*t + i < -120)
+			*t = -120;
+		  else
+			*t += i;
+		}
+		break;
+	   case LEVEL_STAR:
+		if (ship->orders.aimed_at.snum>0 && 
+			ship->orders.aimed_at.snum<Sdata.numstars)
+		    Stars[ship->orders.aimed_at.snum]->stability += random()&01;
+		break;
+	   case LEVEL_UNIV:
+		break;
+	}
+	break;
+     case STYPE_GOD:
+		/* gods have infinite power.... heh heh heh */
+	ship->fuel = Shipdata[ship->type][ABIL_FUELCAP];
+	ship->popn = Shipdata[ship->type][ABIL_MAXCREW];
+	ship->destruct = Shipdata[ship->type][ABIL_DESTCAP];
+	ship->resource = Shipdata[ship->type][ABIL_CARGO];
+	break;
+
+     case OTYPE_AP:	/* terraforming device */
+		/* if landed on planet, change conditions to be like race */
+	if (ship->is_docked && ship->whatdest==LEVEL_PLAN && ship->on) {
+		int j,d,a;planettype *p;
+		p = planets[ship->storbits][ship->pnumorbits];
+		if (ship->fuel >= 3.0) {
+			ship->fuel -= 3.0;
+			for (j=RTEMP+1; j<=OTHER; j++) {
+				if ( (d = races[ship->owner]->conditions[j] - p->conditions[j]) != 0) {
+				  a = int_rand(sgn(d)*3,-sgn(d));
+				  if (p->conditions[j] + a < 0)
+					p->conditions[j] = 0;
+				  else if (p->conditions[j] + a > 100)
+					p->conditions[j] = 100;
+				  else p->conditions[j] += a;
+				}
+			}
+		}
+	}
+	break;
+
+     case OTYPE_AMOEBA:	  /* space amoeba */
+	if (ship->orders.amoeba.dig) {
+		/* we are currently digesting a planet. */
+		if (planets[ship->storbits][ship->pnumorbits]->digested) {
+			 reg int i,s; reg bool f=0;
+			/* the planet has been digested. get rid of it. */
+			 /* move the highest-#'d planet over this one */
+			/*Stars[ship->storbits]->numplanets--;
+			Stars[ship->storbits]->planetpos[ship->pnumorbits] = 
+				Stars[ship->storbits]->planetpos[Stars[ship->storbits]->numplanets];
+			strcpy(Stars[ship->storbits]->pnames[ship->pnumorbits],
+				Stars[ship->storbits]->pnames[Stars[ship->storbits]->numplanets]);
+				/* insert into star list */
+			/*ship->nextship = Stars[ship->storbits]->ships;
+			Stars[ship->storbits]->ships = shipno;*/
+
+			 /* kill all ships here; take their stuff */
+			/*sh = planets[ship->storbits][ship->pnumorbits]->ships;
+			while (sh) {
+			   if (sh!=shipno) ) {
+				ship->destruct += ships[sh]->destruct;
+				ship->mass += ships[sh]->destruct*MASS_DESTRUCT;
+				ship->fuel += ships[sh]->fuel;
+				ship->mass += ships[sh]->fuel*MASS_FUEL;
+				kill_ship(ships[sh]);
+			   }
+			   sh = ships[sh]->nextship;
+			}
+			 /* no longer orbiting star */
+			/*ship->whatorbits = LEVEL_STAR;
+			ship->whatdest = LEVEL_UNIV;*/
+			 /* no longer digesting */
+			ship->orders.amoeba.dig = 0;
+			 /* find a new place to digest */
+			ship->orders.amoeba.dest = 0;
+		}
+	} else {
+		 /* we have a planet in mind. */
+		if (!ship->orders.amoeba.dest || ship->whatdest==LEVEL_UNIV) {
+			/* we have orders; wait to get to destination */
+			if (ship->whatdest == LEVEL_PLAN && 
+			    ship->whatorbits == LEVEL_PLAN &&
+			    ship->deststar == ship->storbits &&
+			    ship->destpnum == ship->pnumorbits) {
+				/* we just arrived at our destination. */
+			   Stinfo[ship->storbits][ship->pnumorbits].amoeba_add = 1;
+			    /* start digesting */
+			   ship->orders.amoeba.dig = 1;
+			    /* telegram people */
+			   teleg_add("", telegram_buf);
+			   teleg_add("BULLETIN!!\n\n ",telegram_buf);
+			   sprintf(buf, "%s #%d is attacking your planet /%s/%s!\n\n", 
+			      Shipnames[ship->type], 
+			      shipno, Stars[ship->storbits]->name, 
+			      Stars[ship->storbits]->pnames[ship->pnumorbits]);
+			   teleg_add(buf, telegram_buf);
+			   for (j=1; j<=Num_races; j++)
+				if (planets[ship->storbits][ship->pnumorbits]->info[j-1].numsectsowned)
+			   		teleg_send(TELEG_PLAYER_AUTO, j, telegram_buf);
+			}
+
+		} else {
+		   reg int s,min=0,min2=0,i;
+		   char expl=0,expl2=0;
+
+			/* find a yummy planet to munch on */
+		     /* find closest _explored_ star */
+		     /*  (this is the opposite method VN's use) */
+		   for (s=0; s<Sdata.numstars; s++)
+			if (s != ship->storbits &&
+				Distsq(Stars[s]->xpos,Stars[s]->ypos,ship->xpos,ship->ypos) < 
+				Distsq(Stars[min]->xpos,Stars[min]->ypos,ship->xpos,ship->ypos))
+				   min2 = min,min = s;
+		   for (i=0; i<howmanybytes(Num_races); i++) {
+			expl |= Stars[min]->inhabited[i];
+			expl2 |= Stars[min2]->inhabited[i];
+		   }
+		   if (!expl)
+		     if (!expl2)
+			   ship->deststar = int_rand(0,Sdata.numstars-1);
+		     else
+			   ship->deststar = min2;	/* 2nd closest star */
+		   else
+		         ship->deststar = min;
+			 /* find a good planet to go to */
+		   
+		   if (Stars[ship->deststar]->numplanets) {
+			ship->destpnum =
+				int_rand(0,Stars[ship->deststar]->numplanets-1);
+		 	ship->whatdest = LEVEL_PLAN;
+			ship->orders.amoeba.dest = 1;
+		   } else {
+			/* no good; find someplace else. */
+			ship->orders.amoeba.dest = 0;
+		   }
+		   ship->speed = 1;	/* amoebae are very fastidious,too */
+		   fprintf(stderr,"amoeba #%d headed for star %d, pl %d.\n",shipno,ship->deststar, ship->destpnum);
+		}
+	}
+	break;
+
+     case OTYPE_VN:	/* Von Neumann machine */
+	do_VN(ship,shipno);
+	break;
+
+     case STYPE_ASS:
+	 /* "indimidate" the planet below, for enslavement purposes. */
+	if (ship->whatorbits==LEVEL_PLAN)
+		Stinfo[ship->storbits][ship->pnumorbits].intimidated = 1;
+	break;
+
+     case OTYPE_OMCL:
+	 /* orbital mind control laser */
+	if (ship->orders.aimed_at.level==LEVEL_PLAN && ship->on &&
+	    ship->speed==1) {
+		planets[ship->orders.aimed_at.snum][ship->orders.aimed_at.pnum]
+			->is_sheep = 1;
+	}
+	break;
+
+     case STYPE_HABITAT:{ reg int add;
+	 /* habitats multiply some resources inside them. */
+	add = ship->resource *
+		((float)ship->popn / Shipdata[STYPE_HABITAT][ABIL_MAXCREW]) 
+	         * (100 - ship->damage) * 0.001;
+	if (ship->resource+add > Shipdata[STYPE_HABITAT][ABIL_CARGO])
+		add = Shipdata[STYPE_HABITAT][ABIL_CARGO] - ship->resource;
+	ship->resource += add;
+	ship->mass += add * MASS_RESOURCE;
+	add = ship->popn * races[ship->owner]->birthrate * 
+		(100 - ship->damage) * 0.005;
+	if (ship->popn+add > Shipdata[STYPE_HABITAT][ABIL_MAXCREW])
+		add = Shipdata[STYPE_HABITAT][ABIL_MAXCREW] - ship->popn;
+	ship->popn += add;
+	ship->mass += add * races[ship->owner]->mass;
+	} break;
+
+     case STYPE_POD:
+	if (ship->notified) {
+		/* we just arrived at this system -- explode */
+		/* or, we are floating in space with no fuel -- just die */
+		reg int i,f= -1;
+		kill_ship(ship);
+		if (ship->whatorbits==LEVEL_STAR) {
+		  for (i=0; f== -1 && i<Stars[ship->storbits]->numplanets; i++)
+			if (sqrt((double)Distsq(ship->xpos, ship->ypos,
+			  Stars[ship->storbits]->xpos + planets[ship->storbits][i]->xpos,
+			  Stars[ship->storbits]->ypos + planets[ship->storbits][i]->ypos))/SYSTEMSIZE < float_rand())
+				f = i;
+		  teleg_add("",telegram_buf);
+		  sprintf(buf, "Bulletin\n\nSpore pod #%d has warmed and exploded.\n",shipno);
+		  teleg_add(buf,telegram_buf);
+		  if (f != -1) {
+			sprintf(buf,"A spore has landed on planet %s.\n",Stars[ship->storbits]->pnames[f]);
+			Stinfo[ship->storbits][f].Thing_add = ship->owner;
+				/* so doplanet does not pass over it */
+			setbit(Stars[ship->storbits]->inhabited,ship->owner);
+			planets[ship->storbits][f]->info[ship->owner-1].explored = 1;
+		  } else {
+			sprintf(buf,"No spores have survived.\n");
+		  }
+		  teleg_add(buf,telegram_buf);
+		  teleg_send(TELEG_PLAYER_AUTO, ship->owner, telegram_buf);
+		  teleg_add("",telegram_buf);
+		  sprintf(buf,"BULLETIN!\n\n A spore pod has exploded in system /%s.\n",Stars[ship->storbits]->name);
+		  teleg_add(buf,telegram_buf);
+		  teleg_add("Spores may have drifted to planets here.\n",telegram_buf);
+		  for (i=1; i<=Num_races; i++)
+			if (i!=ship->owner && isset(Stars[ship->storbits]->inhabited,i))
+				teleg_send(TELEG_PLAYER_AUTO, i, telegram_buf);
+		}
+	}
+	break;
+
+     default:
+	break;
+    }
+
+   }
+
+ } else if (ship->owner ==0 || !ship->notified) {
+	/* ship is dead -- add to shipfree file, remove from all lists. */
+	/* if notified, this means it's already been deleted and written. */
+	ship->notified = 1;
+	makeshipdead(shipno);
+	printf("destroyed ship #%d\n",shipno);
+ }
+
+}
+
+
+
+do_VN(ship,shipno)
+shiptype *ship;
+int shipno;
+{
+int r; 
+planettype *p;
+char buf[150];
+
+  if (ship->on) {
+
+    if (ship->whatorbits==LEVEL_PLAN)
+    	p = planets[ship->storbits][ship->pnumorbits];
+
+    if (ship->whatorbits==LEVEL_PLAN &&
+	ship->is_docked && ship->whatdest==LEVEL_PLAN) {
+		/* make sure the planet is updated */
+	Stinfo[ship->storbits][ship->pnumorbits].inhab = 1;
+	   /* try to launch it */
+	if (ship->orders.object.number2 == 0) {	/* launch if no assignment */
+	  /* steal some fuel from other players,telegram */
+		int f=0;
+		if (ship->fuel < Shipdata[OTYPE_VN][ABIL_COST]) {
+		 for (r=1; !f && r<=Num_races; r++)
+		  if (p->info[r-1].fuel >= Shipdata[OTYPE_VN][ABIL_COST])
+			f = r;
+	          if (f) {
+			ship->fuel += Shipdata[OTYPE_VN][ABIL_FUELCAP];
+		  	p->info[f-1].fuel -= Shipdata[OTYPE_VN][ABIL_FUELCAP];
+			teleg_add("",telegram_buf);
+			teleg_add("Bulletin!\n\n",telegram_buf);
+			sprintf(buf,"%d fuel stolen by %s #%d on planet /%s/%s!\n",
+			   Shipdata[OTYPE_VN][ABIL_FUELCAP],
+			   Shipnames[OTYPE_VN],
+			   shipno, Stars[ship->storbits]->name,
+			   Stars[ship->storbits]->pnames[ship->pnumorbits]);
+			teleg_add(buf,telegram_buf);
+	    		teleg_send(TELEG_PLAYER_AUTO, f, telegram_buf);
+	    
+		ship->orders.object.number2 = 0; /* no current assignment */
+		ship->xpos = Stars[ship->storbits]->xpos + planets[ship->storbits][ship->pnumorbits]->xpos + int_rand(-10,10);
+		ship->ypos = Stars[ship->storbits]->ypos + planets[ship->storbits][ship->pnumorbits]->ypos + int_rand(-10,10);
+		ship->is_docked = 0;
+		ship->whatdest = LEVEL_UNIV;
+	      }
+	     }
+	} else {
+		/* we have an assignment.  Since we are landed, this means
+		   we are engaged in building up resources/fuel. */
+		/* steal resources from other players,telegram */
+		reg int i,f; int nums[MAXPLAYERS+1];
+		  /* permute list of people to steal from */
+		for (i=1; i<=Num_races; i++)
+			nums[i] = i;
+		for (i=1; i<=Num_races; i++) {
+			f = int_rand(1,Num_races);
+			swap(nums[i], nums[f]);
+		}
+		for (f=0,i=1; i<=Num_races; i++)
+			if (p->info[nums[i]-1].resource)
+				f = nums[i];
+		if (f) {
+		  	p->info[f-1].resource -= Shipdata[OTYPE_VN][ABIL_COST];
+			ship->resource += Shipdata[OTYPE_VN][ABIL_COST];
+			ship->mass += Shipdata[OTYPE_VN][ABIL_COST] * MASS_RESOURCE;
+			teleg_add("",telegram_buf);
+			teleg_add("Bulletin!\n\n",telegram_buf);
+			sprintf(buf,"%d resources stolen by %s #%d\non planet ",
+			     Shipdata[OTYPE_VN][ABIL_COST],
+			     Shipnames[OTYPE_VN], shipno);
+			teleg_add(buf,telegram_buf);
+			sprintf(buf,"/%s/%s!\n",
+			     Stars[ship->storbits]->name,
+			     Stars[ship->storbits]->pnames[ship->pnumorbits]);
+			teleg_add(buf,telegram_buf);
+	    		teleg_send(TELEG_PLAYER_AUTO, f, telegram_buf);
+		} else {
+		 /*if no resources to steal, more will be produced in doplanet*/
+		}
+	}
+  } else {
+	/* we are not landed */
+	if (ship->orders.object.number2) {
+		/* we've arrived from somewhere -- look for a place to land.  
+		   this is done on planet turn */
+	} else {
+		/* we were just built & launched */
+		reg int s,min=0,min2=0;
+		  /* find closest unexplored star */
+		for (s=1; s<Sdata.numstars; s++)
+			if (s != ship->storbits &&
+				Distsq(Stars[s]->xpos,Stars[s]->ypos,ship->xpos,ship->ypos) < 
+				Distsq(Stars[min]->xpos,Stars[min]->ypos,ship->xpos,ship->ypos))
+				   min2 = min,min = s;
+			/* don't go there if we have a choice, 
+			   and we have VN's there already */
+		if (isset(Stars[min]->inhabited,1))
+		  if (isset(Stars[min2]->inhabited,1))
+			ship->deststar = int_rand(0,Sdata.numstars-1);
+		  else
+			ship->deststar = min2;	/* 2nd closest star */
+		else
+		      ship->deststar = min;
+		if (Stars[ship->deststar]->numplanets) {
+			ship->destpnum =
+				int_rand(0,Stars[ship->deststar]->numplanets-1);
+		 	ship->whatdest = LEVEL_PLAN;
+			ship->orders.object.number2 = 1;
+		} else {
+			/* no good; find someplace else. */
+			ship->orders.object.number2 = 0;
+		}
+		ship->speed = 1;	/* VN's are very fastidious */
+		fprintf(stderr,"VN #%d headed for star %d, pl %d.\n",shipno,ship->deststar, ship->destpnum);
+			/* we are assigned to go */
+	}
+  }
+ 
+ }
+
+}
+
+

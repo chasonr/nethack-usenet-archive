@@ -1,0 +1,832 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,d917d67b5914b9d1,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-03-04 08:18:36 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site sdccsu3.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxl!eagle!harpo!decvax!ittvax!dcdwest!sdcsvax!sdccsu3!brian
+From: brian@sdccsu3.UUCP
+Newsgroups: net.sources
+Subject: reposting of xmodem.c - umodem for 4.2BSD
+Message-ID: <1617@sdccsu3.UUCP>
+Date: Sun, 4-Mar-84 11:18:36 EST
+Article-I.D.: sdccsu3.1617
+Posted: Sun Mar  4 11:18:36 1984
+Date-Received: Mon, 5-Mar-84 01:06:04 EST
+Organization: UCSD beer & pizza society
+Lines: 812
+
+This is being reposted because a number of sites have notified me that
+it was arriving truncated.  My apologies if you've already seen in.
+--------------------- cut here --------------------
+/*
+ *  XMODEM Version 1.0  - by Brian Kantor, UCSD
+ *
+ *  XMODEM -- Implements the "CP/M User's Group XMODEM" protocol, 
+ *            for packetized file up/downloading.    
+ *
+ *	This version is designed for 4.2BSD ONLY!  It won't work
+ *	ANYWHERE else - uses the 'select' system call to replace
+ *	the old alarm handlers.
+ *
+ *   -- Based on UMODEM 3.5 by Lauren Weinstein, Richard Conn, and others.
+ *
+ */
+
+#include <ctype.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sgtty.h>
+#include <signal.h>
+
+/* log default define */
+#ifndef LOGDEFAULT
+#define LOGDEFAULT	1
+#endif
+
+/* Delete logfile define.  Useful on small systems with limited
+ * filesystem space and careless users.
+ */
+#ifndef DELDEFAULT
+#define DELDEFAULT	1
+#endif
+
+#define	     VERSION	10	/* Version Number */
+#define      FALSE      0
+#define      TRUE       1
+
+
+/*  ASCII Constants  */
+#define      SOH  	001 
+#define	     STX	002
+#define	     ETX	003
+#define      EOT	004
+#define	     ENQ	005
+#define      ACK  	006
+#define	     LF		012   /* Unix LF/NL */
+#define	     CR		015  
+#define      NAK  	025
+#define	     SYN	026
+#define	     CAN	030
+#define	     ESC	033
+#define	     CTRLZ	032   /* CP/M EOF for text (usually!) */
+
+/*  XMODEM Constants  */
+#define      TIMEOUT  	-1
+#define      ERRORMAX  	10    /* maximum errors tolerated */
+#define      RETRYMAX  	10    /* maximum retries to be made */
+#define	     BBUFSIZ	128   /* buffer size -- do not change! */
+
+/*  Mode for Created Files  */
+#define      CREATMODE	0644  /* mode for created files */
+
+struct sgttyb  ttys, ttysnew, ttystemp;    /* for stty terminal mode calls */
+
+struct stat statbuf;  	/* for terminal message on/off control */
+char *strcat();
+FILE *LOGFP, *fopen();
+char buff[BBUFSIZ];
+int nbchr;  /* number of chars read so far for buffered read */
+
+int wason;
+
+int pagelen;
+char *ttyname();  /* forward declaration for C */
+char *tty;
+char XMITTYPE;
+int CRCMODE, RECVFLAG, SENDFLAG, PMSG, DELFLAG, LOGFLAG, MUNGMODE;
+int FILTER, DEBUG;
+int STATDISP;
+char filename[256];
+
+main(argc, argv)
+int argc;
+char **argv;
+{
+	char *getenv();
+	char *fname = filename;
+	char *logfile;
+	int index;
+	char flag;
+
+	logfile = "xmodem.log";  /* Name of LOG File */
+
+	printf("\nXMODEM Version %d.%d", VERSION/10, VERSION%10);
+	printf(" -- UNIX-CP/M Remote File Transfer Facility\n");
+
+	if (argc < 3)
+		{
+		help(FALSE);
+		exit(-1);
+		}
+
+	index = 0;  /* set index for loop */
+	PMSG = FALSE;  /* turn off flags */
+	DEBUG = FALSE;
+	RECVFLAG = FALSE;  /* not receive */
+	SENDFLAG = FALSE;  /* not send either */
+	FILTER = FALSE;		/* assume literal mode */
+	CRCMODE = FALSE;	/* use checksums for now */
+	XMITTYPE = 't';  /* assume text */
+
+	DELFLAG = DELDEFAULT;
+	LOGFLAG = LOGDEFAULT;
+	if (LOGFLAG) 
+		LOGFLAG = TRUE;
+	   else
+		LOGFLAG = FALSE;  
+
+	MUNGMODE = FALSE; /* protect files from overwriting */
+
+	while ((flag = argv[1][index++]) != '\0')
+	    switch (flag) {
+		case '-' : break;
+		case 'x' : DEBUG = TRUE;
+			   break;
+/* no crc mode yet
+		case 'c' : CRCMODE = TRUE;
+			   xmdebug("CRC mode selected");
+			   break;
+*/
+		case 'd' : DELFLAG = !DELDEFAULT;  /* delete log file ? */
+			   xmdebug("delete log toggled");
+			   break;
+		case 'l' : LOGFLAG = !LOGDEFAULT;  /* turn off log ? */
+			   xmdebug("write log toggled");
+			   break;
+		case 'm' : MUNGMODE = TRUE; /* allow overwriting of files */
+			   xmdebug("munge mode selected");
+			   break;
+		case 'r' : RECVFLAG = TRUE;  /* receive file */
+			   XMITTYPE = gettype(argv[1][index++]);  /* get t/b */
+			   xmdebug("receive mode selected");
+			   break;
+		case 's' : SENDFLAG = TRUE;  /* send file */
+			   XMITTYPE = gettype(argv[1][index++]);
+			   xmdebug("send mode selected");
+			   break;
+		case 'f' : FILTER = TRUE;
+			   xmdebug("filter selected");
+			   break;
+		default  : error("Invalid Flag", FALSE);
+		}
+
+	if (LOGFLAG)
+	   { 
+	     if ((fname = getenv("HOME")) == 0)	/* Get HOME variable */
+		error("Can't get Environment!", FALSE);
+	     fname = strcat(fname, "/");
+	     fname = strcat(fname, logfile);
+	     if (!DELFLAG)
+		LOGFP = fopen(fname, "a");  /* append to LOG file */
+	     else
+		LOGFP = fopen(fname, "w");  /* new LOG file */
+	     if (!LOGFP)
+		error("Can't Open Log File", FALSE);
+	     fprintf(LOGFP,"\n\n++++++++\n");
+	     fprintf(LOGFP,"\nXMODEM Version %d.%d\n", VERSION/10, VERSION%10);
+	     printf("\nXMODEM:  LOG File '%s' is Open\n", fname);
+	   }
+
+
+	if (RECVFLAG && SENDFLAG)
+		error("Both Send and Receive Functions Specified", FALSE);
+
+	if (!RECVFLAG && !SENDFLAG)
+		error("Either Send or Receive Function must be chosen!",FALSE);
+	
+	if (FILTER && (!RECVFLAG || XMITTYPE != 't'))
+		error("Filter is only valid in text receive mode!",FALSE);
+
+	if (RECVFLAG)
+		{  
+		if(open(argv[2], 0) != -1)  /* possible abort if file exists */
+	   		{	
+			printf("\nXMODEM:  Warning -- Target File Exists\n");
+			if( MUNGMODE == FALSE )
+				error("Fatal - Can't overwrite file\n",FALSE);
+			printf("XMODEM:  Overwriting Target File\n");
+	   		}
+	   	rfile(argv[2]);  /* receive file */
+		}
+
+	if (SENDFLAG) 
+		sfile(argv[2]);  /* send file */
+	
+	if (LOGFLAG) fclose(LOGFP);
+	xmdebug("done");
+	exit(0);
+}
+
+/*  Print Help Message  */
+help()
+	{
+	xmdebug("help:");
+	printf("\nUsage:  \n\txmodem ");
+	printf("-[rb!rt!sb!st][options] filename\n");
+	printf("\nMajor Commands --");
+	printf("\n\trb <-- Receive Binary");
+	printf("\n\trt <-- Receive Text");
+	printf("\n\tsb <-- Send Binary");
+	printf("\n\tst <-- Send Text");
+	printf("\nOptions --");
+#if DELDEFAULT == 1
+	printf("\n\td  <-- Do not delete umodem.log file before starting");
+#else
+	printf("\n\td  <-- Delete umodem.log file before starting");
+#endif
+
+#if LOGDEFAULT == 1
+	printf("\n\tl  <-- (ell) Turn OFF LOG File Entries");
+#else
+	printf("\n\tl  <-- (ell) Turn ON LOG File Entries");
+#endif
+
+/* no crc mode yet
+	printf("\n\tc  <-- Select CRC mode on receive");
+*/
+	printf("\n\tf  <-- Filter 8-bit chars on receive - use with WordStar files");
+	printf("\n");
+	}
+
+/* get type of transmission requested (text or binary) */
+gettype(ichar)
+char ichar;
+	{
+	xmdebug("gettype:");
+	if (ichar == 't') return(ichar);
+	if (ichar == 'b') return(ichar);
+	error("Invalid Send/Receive Parameter - not t or b", FALSE);
+	return;
+	}
+
+/* set tty modes for XMODEM transfers */
+setmodes()
+	{
+	xmdebug("setmodes:");
+	if (ioctl(0,TIOCGETP,&ttys)<0)  /* get tty params [V7] */
+		error("Can't get TTY Parameters", TRUE);
+
+	tty = ttyname(0);  /* identify current tty */
+	
+	/* transfer current modes to new structure */
+	ttysnew.sg_ispeed = ttys.sg_ispeed;	/* copy input speed */
+	ttysnew.sg_ospeed = ttys.sg_ospeed;	/* copy output speed */
+	ttysnew.sg_erase  = ttys.sg_erase;	/* copy erase flags */
+	ttysnew.sg_flags  = ttys.sg_flags;	/* copy flags */
+ 	ttysnew.sg_kill   = ttys.sg_kill;	/* copy std terminal flags */
+
+	ttysnew.sg_flags |= RAW;    /* set for RAW Mode */
+			/* This ORs in the RAW mode value, thereby
+			   setting RAW mode and leaving the other
+			   mode settings unchanged */
+
+	ttysnew.sg_flags &= ~ECHO;  /* set for no echoing */
+			/* This ANDs in the complement of the ECHO
+			   setting (for NO echo), thereby leaving all
+			   current parameters unchanged and turning
+			   OFF ECHO only */
+
+	ttysnew.sg_flags &= ~XTABS;  /* set for no tab expansion */
+	ttysnew.sg_flags &= ~LCASE;  /* set for no upper-to-lower case xlate */
+	ttysnew.sg_flags |= ANYP;  /* set for ANY Parity */
+	ttysnew.sg_flags &= ~NL3;  /* turn off ALL 3s - new line */
+	ttysnew.sg_flags &= ~TAB2; /* turn off tab 3s */
+	ttysnew.sg_flags &= ~CR3;  /* turn off CR 3s */
+	ttysnew.sg_flags &= ~FF1;  /* turn off FF 3s */
+	ttysnew.sg_flags &= ~BS1;  /* turn off BS 3s */
+	ttysnew.sg_flags &= ~TANDEM;  /* turn off flow control */
+
+	/* set new paramters */
+	if (ioctl(0,TIOCSETP,&ttysnew) < 0)
+		error("Can't set new TTY Parameters", TRUE);
+
+	if (stat(tty, &statbuf) < 0)  /* get tty status */ 
+		error("Can't get your TTY Status", TRUE);
+
+	if (statbuf.st_mode & 022)	/* Need to turn messages off */
+		if (chmod(tty, statbuf.st_mode & ~022) < 0)
+			error("Can't change  TTY mode", TRUE);
+		else 
+			wason = TRUE;
+	else 
+		wason = FALSE;
+	xmdebug("tty modes set");
+	}
+
+/* restore normal tty modes */
+restoremodes(errcall)
+int errcall;
+	{
+	xmdebug("restoremodes:");
+	if (wason)
+		if (chmod(tty, statbuf.st_mode | 022) < 0)
+			error("Can't change TTY mode", FALSE);
+	if (ioctl(0,TIOCSETP,&ttys) < 0)
+		{ if (!errcall)
+		   error("RESET - Can't restore normal TTY Params", FALSE);
+		else
+		   { printf("XMODEM:  ");
+		     printf("RESET - Can't restore normal TTY Params\n");
+		   }
+		}
+	xmdebug("tty modes reset");
+	return;
+	}
+
+/* print error message and exit; if mode == TRUE, restore normal tty modes */
+error(msg, mode)
+char *msg;
+int mode;
+	{
+	xmdebug("error:");
+	if (mode)
+		restoremodes(TRUE);  /* put back normal tty modes */
+	printf("\r\nXMODEM:  %s\n", msg);
+	if ((LOGFLAG || DEBUG) & (int)LOGFP)
+		{   
+		fprintf(LOGFP, "XMODEM Fatal Error:  %s\n", msg);
+	    	fclose(LOGFP);
+		}
+	exit(-1);
+	}
+
+/**  print status (size) of a file  **/
+yfile(name)
+char *name;
+	{
+	xmdebug("yfile:");
+	printf("\nXMODEM File Status Display for %s\n", name);
+
+	if (open(name,0) < 0) 
+		{
+		printf("File %s does not exist\n", name);
+		return;
+		}
+	prfilestat(name);  /* print status */
+	printf("\n");
+	}
+
+/*
+ *
+ *	Get a byte from the specified file.  Buffer the read so we don't
+ *	have to use a system call for each character.
+ *
+ */
+getbyte(fildes, ch)				/* Buffered disk read */
+int fildes;
+char *ch;
+
+	{
+	static char buf[BUFSIZ];	/* Remember buffer */
+	static char *bufp = buf;	/* Remember where we are in buffer */
+	
+	xmdebug("getbyte:");
+	if (nbchr == 0)			/* Buffer exausted; read some more */
+		{
+		if ((nbchr = read(fildes, buf, BUFSIZ)) < 0)
+			error("File Read Error", TRUE);
+		bufp = buf;		/* Set pointer to start of array */
+		}
+	if (--nbchr >= 0)
+		{
+		*ch = *bufp++;
+		return(0);
+		}
+	else
+		return(EOF);
+	}
+
+/**  receive a file  **/
+rfile(name)
+char *name;
+	{
+	register int bufctr, checksum;
+	register int c;
+	char mode;
+	int fd, j, firstchar, sectnum, sectcurr, tmode;
+	int sectcomp, errors, errorflag, recfin;
+	int errorchar, fatalerror, startstx, inchecksum, endetx, endenq;
+	long recvsectcnt;
+
+	xmdebug("rfile:");
+	mode = XMITTYPE;  /* set t/b mode */
+
+	if ((fd = creat(name, CREATMODE)) < 0)
+	  	error("Can't create file for receive", FALSE);
+
+	printf("XMODEM:  Ready to RECEIVE File %s\n", name);
+	puts("Control-X to cancel.\n");
+
+	if (LOGFLAG)
+		{    
+		fprintf(LOGFP, "\n----\nXMODEM Receive Function\n");
+	     	fprintf(LOGFP, "File Name: %s\n", name);
+		}
+
+	setmodes();  /* setup tty modes for xfer */
+
+	recfin = FALSE;
+	sectnum = errors = 0;
+	fatalerror = FALSE;  /* NO fatal errors */
+	recvsectcnt = 0;  /* number of received sectors */
+
+	if (mode == 't')
+		tmode = TRUE;
+	else
+		tmode = FALSE;
+
+	if (CRCMODE)
+		{
+		xmdebug("crc mode request sent");
+		sendbyte('C');	/* CRC request for first block */
+		}
+	else
+		{
+		xmdebug("NAK sent");
+		sendbyte(NAK);  /* Start up the sender's first block */
+		}
+
+        do
+        	{   
+		errorflag = FALSE;
+            	do 
+			{
+                  	firstchar = readbyte(6);
+            		} 
+			while ((firstchar != SOH) 
+				&& (firstchar != EOT) 
+				&& (firstchar != TIMEOUT) 
+				&& ((firstchar & 0x7f) != CAN));
+
+            	if (firstchar == TIMEOUT)
+	    		{  
+			xmdebug("first char was timeout");
+			if (LOGFLAG)
+				fprintf(LOGFP, "Timeout on Sector %d\n", sectnum);
+               		errorflag = TRUE;
+	    		}
+
+            	if ((firstchar & 0x7f) == CAN)
+	    		{  
+			xmdebug("CAN received");
+			if (LOGFLAG)
+				fprintf(LOGFP, "Reception canceled at user's request.\n");
+			error("Reception canceled at user's request",TRUE);
+	    		}
+
+            	if (firstchar == SOH)
+	   		{
+			xmdebug("SOH received");
+               		sectcurr = readbyte(3);
+               		sectcomp = readbyte(3);
+               		if ((sectcurr + sectcomp) == 0xff)
+               			{  
+				if (sectcurr == ((sectnum+1) & 0xff))
+		 			{  
+					checksum = 0;
+		     			for (j = bufctr = 0; j < BBUFSIZ; j++)
+	      	     				{  
+						buff[bufctr] = c = readbyte(3);
+		        			checksum = ((checksum+c) & 0xff);
+						if (!tmode)  /* binary mode */
+							{  
+							bufctr++;
+		           				continue;
+		        				}
+						if (FILTER)	/* bit 8 */
+							buff[bufctr] &= 0x7f;
+						if (c == CR)
+			   				continue;  /* skip CR's */
+						if (c == CTRLZ)  /* CP/M EOF char */
+							{  
+							recfin = TRUE;  /* flag EOF */
+		           				continue;
+		        				}
+		        			if (!recfin)
+			   				bufctr++;
+		     				}
+		     			inchecksum = readbyte(3);  /* get checksum */
+		    			if (checksum == inchecksum)  /* good checksum */
+		     				{  
+						xmdebug("checksum ok");
+						errors = 0;
+						recvsectcnt++;
+		        			sectnum = sectcurr; 
+						if (write(fd, buff, bufctr) < 0)
+			   				error("File Write Error", TRUE);
+		        			else
+			   				sendbyte(ACK);
+		     				}
+		     			else
+		     				{  
+						xmdebug("checksum bad");
+						if (LOGFLAG)
+							fprintf(LOGFP, "Checksum Error on Sector %d\n",
+								sectnum);
+		        			errorflag = TRUE;
+		     				}
+                  			}
+                  		else
+                  			{ 
+					if (sectcurr == sectnum)
+                    				{  
+						xmdebug("dup sector flushed");
+						while(readbyte(3) != TIMEOUT)
+							;
+            	       				sendbyte(ACK);
+                    				}
+                    			else
+		    				{  
+						xmdebug("sector out of seq");
+						if (LOGFLAG)
+							{ 
+							fprintf(LOGFP, "Phase Error - Received Sector is ");
+			  				fprintf(LOGFP, "%d while Expected Sector is %d\n",
+			   					sectcurr, ((sectnum+1) & 0xff));
+							}
+						errorflag = TRUE;
+						fatalerror = TRUE;
+						sendbyte(CAN);
+		    				}
+	          			}
+           			}
+			else
+	   			{  
+				if (DEBUG)
+					fprintf(LOGFP,"DEBUG: bad sector# sectcurr=%02xH, sectcomp=%02xH\n",sectcurr,sectcomp);
+				if (LOGFLAG)
+					fprintf(LOGFP, "Header Sector Number Error on Sector %d\n",
+		   				sectnum);
+               			errorflag = TRUE;
+	   			}
+        		}
+	
+        	if (errorflag)
+        		{  
+			xmdebug("flushing bad sector");
+			errors++;
+	   		while (readbyte(3) != TIMEOUT)
+				;
+			sendbyte(NAK);
+        		}
+  		}
+  		while ((firstchar != EOT) && (errors < ERRORMAX) && !fatalerror);
+
+  	if ((firstchar == EOT) && (errors < ERRORMAX))
+  		{
+		xmdebug("EOT received");
+     		close(fd);
+		sendbyte(ACK);
+     		restoremodes(FALSE);  /* restore normal tty modes */
+     		sleep(5);  /* give other side time to return to terminal mode */
+     		if (LOGFLAG)
+     			{  
+			fprintf(LOGFP, "\nReceive Complete\n");
+			fprintf(LOGFP,"Number of Received CP/M Records is %ld\n", recvsectcnt);
+     			}
+     		printf("\n");
+  		}
+  	else
+  		{ 
+		sendbyte(CAN);
+		xmdebug("error limit exceeded");
+     		error("\r\nABORTED -- Too Many Errors", TRUE);
+  		}
+	}
+
+/**  send a file  **/
+sfile(name)
+char *name;
+	{
+	register int bufctr, checksum, sectnum;
+	char blockbuf[134];
+	char mode;
+	int fd, attempts;
+	int nlflag, sendfin, tmode;
+	int bbufcnt;
+	int firstchar;
+	char c;
+	int sendresp;  /* response char to sent block */
+
+	xmdebug("sfile:");
+	nbchr = 0;  /* clear buffered read char count */
+	mode = XMITTYPE;  /* set t/b mode */
+		
+	if ((fd = open(name, 0)) < 0)
+		{  
+		if (LOGFLAG) fprintf(LOGFP, "Can't Open File\n");
+     	   	error("Can't open file for send", FALSE);
+		}
+
+
+	printf("XMODEM:  File %s Ready to SEND\n", name);
+	prfilestat(name);  /* print file size statistics */
+	puts("\nControl-X to cancel.\n");
+
+	if (LOGFLAG)
+		{   
+		fprintf(LOGFP, "\n----\nXMODEM Send Function\n");
+	    	fprintf(LOGFP, "File Name: %s\n", name);
+		}
+
+	if (mode == 't')
+	   tmode = TRUE;
+	else
+	   tmode = FALSE;
+
+        sendfin = nlflag = FALSE;
+  	attempts = 0;
+
+	setmodes();  /* setup tty modes for xfer */	
+
+	while (((firstchar=readbyte(30)) != NAK)
+/* no crc mode yet
+	&& (firstchar != 'C') 
+*/
+	&& (firstchar != CAN))
+		{
+		if (++attempts > RETRYMAX)
+			error("Remote System Not Responding", TRUE);
+		}
+
+	if ((firstchar & 0x7f) == CAN)
+		{
+		xmdebug("can received");
+		error("\nSend cancelled at user's request.\n",TRUE);
+		exit(-1);
+		}
+
+	sectnum = 1;  /* first sector number */
+	attempts = 0;
+
+        do 
+		{   
+		for (bufctr=0; bufctr < BBUFSIZ;)
+	    		{
+			if (nlflag)
+	        		{  
+				buff[bufctr++] = LF;  /* leftover newline */
+	           		nlflag = FALSE;
+	        		}
+			if (getbyte(fd, &c) == EOF)
+				{ 
+				sendfin = TRUE;  /* this is the last sector */
+		   		if (!bufctr)  /* if EOF on sector boundary */
+		      			break;  /* avoid sending extra sector */
+		   		if (tmode)
+		      			buff[bufctr++] = CTRLZ;  /* Control-Z for CP/M EOF */
+	           		else
+		      			bufctr++;
+		   		continue;
+		      		}
+
+			if (tmode && c == LF)  /* text mode & Unix newline? */
+	    			{
+				buff[bufctr++] = CR;  /* insert carriage return */
+		     		if (bufctr < BBUFSIZ)
+	                		buff[bufctr++] = LF;  /* insert LF */
+	 	      		else
+		        		nlflag = TRUE;  /* insert on next sector */
+	   			}	
+			else
+				buff[bufctr++] = c;  /* copy the char without change */
+	    		}
+
+            	attempts = 0;
+	
+	    	if (!bufctr)  /* if EOF on sector boundary */
+   	       		break;  /* avoid sending empty sector */
+
+            	do
+            		{
+			bbufcnt = 0;		/* start building block to be sent */
+			blockbuf[bbufcnt++] = SOH;	    /* start of packet char */
+			blockbuf[bbufcnt++] = sectnum;	    /* current sector # */
+			blockbuf[bbufcnt++] = -sectnum-1;   /* and its complement */
+
+                	checksum = 0;  /* init checksum */
+                	for (bufctr=0; bufctr < BBUFSIZ; bufctr++)
+               			{
+				blockbuf[bbufcnt++] = buff[bufctr];
+                 		checksum = ((checksum+buff[bufctr]) & 0xff);
+	         		}
+
+			blockbuf[bbufcnt++] = checksum;
+			write(1, blockbuf, 132);  /* write the block */
+			ioctl(1,TIOCFLUSH,0);
+
+                	attempts++;
+			sendresp = readbyte(10);  /* get response */
+			if ((sendresp != ACK) && LOGFLAG)
+		   		{
+		   		fprintf(LOGFP, "Non-ACK Received on Sector %d\n",sectnum);
+		   		if (sendresp == TIMEOUT)
+					fprintf(LOGFP, "This Non-ACK was a TIMEOUT\n");
+		   		}
+            		}
+			while((sendresp != ACK) && (attempts < RETRYMAX));
+
+       		sectnum++;  /* increment to next sector number */
+    		}
+		while (!sendfin && (attempts < RETRYMAX));
+
+    	if (attempts >= RETRYMAX)
+		error("Remote System Not Responding", TRUE);
+
+    	attempts = 0;
+    	sendbyte(EOT);  /* send 1st EOT */
+	
+    	while ((readbyte(15) != ACK) && (attempts++ < RETRYMAX))
+	   	sendbyte(EOT);
+
+    	if (attempts >= RETRYMAX)
+	   	error("Remote System Not Responding on Completion", TRUE);
+
+    	close(fd);
+    	restoremodes(FALSE);  
+    	sleep(15);  /* give other side time to return to terminal mode */
+
+    	if (LOGFLAG)
+    		fprintf(LOGFP, "\nSend Complete\n");
+    	printf("\n");
+
+	}
+
+/*  print file size status information  */
+prfilestat(name)
+char *name;
+	{
+	struct stat filestatbuf; /* file status info */
+
+	xmdebug("prfilestat:");
+	stat(name, &filestatbuf);  /* get file status bytes */
+	printf("  Estimated File Size %ldK, %ld Records, %ld Bytes",
+	  	(filestatbuf.st_size/1024)+1, (filestatbuf.st_size/128)+1,
+	  	filestatbuf.st_size);
+	if (LOGFLAG)
+	  	fprintf(LOGFP,"Estimated File Size %ldK, %ld Records, %ld Bytes\n",
+	  	(filestatbuf.st_size/1024)+1, (filestatbuf.st_size/128)+1,
+	  	filestatbuf.st_size);
+		return;
+	}
+
+/* get a byte from data stream -- timeout if "seconds" elapses */
+int readbyte(seconds)
+int seconds;
+	{
+	int i, readfd;
+	char c;
+	struct timeval tmout;
+
+	tmout.tv_sec = seconds;
+	tmout.tv_usec = 0;
+
+	readfd = 1;
+
+	if ((i=select(1, &readfd, 0, 0, &tmout)) == 0)
+		{
+		xmdebug("readbyte timeout");
+		return(TIMEOUT);
+		}
+	if (DEBUG)
+		fprintf(LOGFP,"DEBUG: readbyte select returned %d\n",i);
+
+	read(0, &c, 1);
+
+	if (DEBUG)
+		fprintf(LOGFP,"DEBUG: readbyte %02xh\n",c);
+
+	return(c & 0xff);  /* return the char */
+	}
+
+/* send a byte to data stream */
+sendbyte(data)
+char data;
+	{
+	if (DEBUG)
+		fprintf(LOGFP,"DEBUG: sendbyte %02xh\n",data);
+	write(1, &data, 1);  	/* write the byte */
+	ioctl(1,TIOCFLUSH,0);	/* flush so it really happens now! */
+	return;
+	}
+
+/* type out debugging info */
+xmdebug(str)
+char *str;
+	{
+	if (DEBUG)
+		fprintf(LOGFP,"DEBUG: '%s'\n",str);
+	}
+-- 
+	-Brian Kantor, UC San Diego 
+	Kantor@Nosc
+	ihnp4 \
+	decvax \
+	dcdwest  -----  sdcsvax  ----- brian
+	ittvax /
+	ucbvax/
+
+

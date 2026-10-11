@@ -1,0 +1,493 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,f2d37719add112bf,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-09-01 00:11:08 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site umcp-cs.UUCP
+Path: utzoo!linus!decvax!genrad!panda!talcott!harvard!seismo!umcp-cs!chris
+From: chris@umcp-cs.UUCP (Chris Torek)
+Newsgroups: net.sources
+Subject: preen
+Message-ID: <1459@umcp-cs.UUCP>
+Date: Sun, 1-Sep-85 03:11:08 EDT
+Article-I.D.: umcp-cs.1459
+Posted: Sun Sep  1 03:11:08 1985
+Date-Received: Mon, 2-Sep-85 09:04:13 EDT
+Distribution: net
+Organization: U of Maryland, Computer Science Dept., College Park, MD
+Lines: 472
+
+# This is preen, a program to run /etc/fsck in parallel (more
+# than fsck -p does).  It tends to speed up reboots; anywhere
+# from a little, if your file systems are all even sizes, to
+# quite a bit, if you have an arrangement like ours: one 400M
+# fs, several 200M, and a few small ones.
+#
+# The major difference between this version and the one I
+# posted more than a year ago is that this has been cleaned up
+# to use wait(), and that it is more verbose.
+#
+# It should run under both 4.1 and 4.2 BSD.  It can probably be
+# made to run under other systems fairly easily.  To use it,
+# change the line in /etc/rc from "/etc/fsck -p >/dev/console"
+# to "/etc/preen >/dev/console".  It uses the same exit
+# conventions, so everything else remains the same.
+#
+# Chris
+#
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ x$1 = x-a ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting preen.c'
+sed 's/^X//' <<'//go.sysin dd *' >preen.c
+X/*
+ * Preen
+ *
+ * Run fsck in parallel over the normally mounted disks.
+ *
+ * This program differs from the -p option to fsck in that it
+ * uses the base names of the disks to determine which are the
+ * same physical drive, and actually tries to keep all drives
+ * busy.  fsck -p merely runs groups of "passes" and with odd
+ * configurations tends to leave the arms idle a lot.
+ *
+ * Compilation:
+ %	cc -O -R -o preen preen.c
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fstab.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+#define FSCK "/etc/fsck"	/* where fsck lives */
+
+struct fsck_info {
+    struct fsck_info *fi_next;	/* linked list */
+    struct fstab fi_fs;		/* copy of /etc/fstab entry */
+    struct diskdev *fi_disk;	/* disk device info */
+    int fi_isroot;		/* true iff this is the root file system */
+    union wait fi_w;		/* info from wait() sys call */
+    int fi_pid;			/* PID of fsck checking this device */
+    int fi_stat;		/* status flag; see below */
+};
+#define FI_NOTYET	0	/* not started yet */
+#define FI_RUNNING	1	/* running now */
+#define FI_NORMAL	2	/* exited normally */
+#define FI_BAD		3	/* exited with error(s) */
+
+struct diskdev {
+    struct diskdev *dd_next;	/* linked list */
+    char *dd_name;		/* name of drive */
+    int dd_stat;		/* disk arm status */
+};
+#define DD_IDLE		0	/* arm is idle */
+#define DD_BUSY		1	/* arm is busy */
+
+int nfs;			/* number of fs entries still active */
+struct fsck_info *fi_hd;	/* list head */
+struct fsck_info *fi_tl;	/* list tail */
+struct fsck_info *fi_root;	/* info for root file system */
+struct diskdev *dd_hd;		/* disk head */
+struct diskdev *dd_tl;		/* disk tail */
+
+char *ProgName;			/* argv[0] actually */
+
+X/* Exit stats.  N.B.: we borrow fsck -p's algorithm of using the max of
+   all child exits as our own exit. */
+#define E_OK	0		/* all OK */
+#define E_RB	4		/* please reboot (no sync) */
+#define E_MISC	8		/* miscellaneous failure code */
+#define E_INTR	12		/* interrupted from keyboard */
+#define E_SIG   127		/* fsck(s) killed by signal(s) */
+
+X/* imports */
+int   errno;
+char *malloc ();
+
+X/* Convert system error number to string */
+char *
+errstr (e)
+register int e; {
+    static char  unknown[80];
+    extern char *sys_errlist[];
+    extern int   sys_nerr;
+
+    if (e < 0 || e >= sys_nerr) {
+	(void) sprintf (unknown, "unknown error (%d)", e);
+	return unknown;
+    }
+    return sys_errlist[e];
+}
+
+X/* Signal hander */
+sigdie (sig) {
+    if (sig == SIGINT) {
+	(void) fprintf (stderr, "\n*** Preen interrupted\n");
+	exit (E_INTR);
+    }
+    (void) fprintf (stderr, "%s: help ... dying on signal %d\n", ProgName,
+	    sig);
+    exit (E_SIG);
+}
+
+X/* Initialize signal handlers */
+initsig () {
+    static int siglist[] = { SIGHUP, SIGINT, SIGQUIT, SIGPIPE, SIGTERM, 0 };
+    register int *p;
+
+    for (p = siglist; *p; p++)
+	if (signal (*p, sigdie) == SIG_IGN)
+	    (void) signal (*p, SIG_IGN);
+}
+
+X/* Save a string in managed memory */
+char *
+savestr (s)
+register char *s; {
+    register char *t, *rv;
+
+    t = s;
+    while (*t++);
+    if ((rv = malloc ((unsigned) (t - s))) == 0) {
+	(void) fprintf (stderr, "%s: malloc: %s\n", ProgName, errstr (errno));
+	exit (E_MISC);
+    }
+    t = rv;
+    while (*t++ = *s++);
+    return rv;
+}
+
+X/* Convert a block device name to the equivalent raw name, by prepending
+   an "r" before the final /.  The new name is stuck into static storage. */
+char *
+DiskRawName (name)
+register char *name; {
+    register char  *p,
+                   *t;
+    static char newnm[200];
+
+    p = name;
+    while (*p++);
+    while (p > name && *--p != '/');
+    if (*p++ != '/') {
+	(void) fprintf (stderr, "%s: malformed disk device name \"%s\"\n",
+		ProgName, name);
+	return name;
+    }
+    t = newnm;
+    while (name != p)
+	*t++ = *name++;
+    *t++ = 'r';
+    while (*t++ = *name++);
+    return newnm;
+}
+
+X/* Convert a disk name (either raw or block) to the base name of the disk
+   (e.g., "/dev/rhp2a" -> "/dev/hp2"; "/dev/ra0g" -> "/dev/ra0"). */
+char *
+DiskBaseName (name, isblock)
+char *name;
+int isblock; {
+    register char  *nm,
+                   *p,
+                   *t;
+    static char newnm[200];
+
+    p = t = name;
+    while (*p)
+	if (*p++ == '/')
+	    t = p;
+    p = newnm;
+    nm = name;
+    while (nm < t)
+	*p++ = *nm++;
+    if (!isblock) {
+	if (*nm == 'r')
+	    nm++;
+	else
+	    (void) fprintf (stderr,
+		    "%s: (DiskBaseName) claimed \"%s\" raw but no ``r''?\n",
+		    ProgName, name);
+    }
+    while (*p++ = *nm++);
+    while (--p >= newnm && !isdigit (*p));
+    if (p < newnm)
+	(void) fprintf (stderr,
+		"%s: (DiskBaseName) malformed disk name \"%s\"\n",
+		ProgName, name);
+    p[1] = 0;
+    return newnm;
+}
+    
+X/* Get a disk descriptor.  "name" is either a raw or block device name; it's
+   the block device iff "rootdev" is set. */
+struct diskdev *
+GetDisk (name, rootdev)
+char *name;
+int rootdev; {
+    register struct diskdev *dd;
+    register char  *p1,
+                   *p2,
+		   *dname;
+
+ /* first, convert the name to the base name */
+    dname = DiskBaseName (name, rootdev);
+
+ /* now search the existing list */
+    for (dd = dd_hd; dd; dd = dd -> dd_next) {
+	p1 = dd -> dd_name;
+	p2 = dname;
+	while (*p1++ == *p2)
+	    if (*p2++ == 0)
+		return dd;	/* found it */
+    }
+
+ /* make a new entry */
+    if ((dd = (struct diskdev *) malloc (sizeof *dd)) == 0) {
+	(void) fprintf (stderr, "%s: malloc: %s\n", ProgName, errstr (errno));
+	exit (E_MISC);
+    }
+    dd -> dd_next = 0;
+    dd -> dd_name = savestr (dname);
+    dd -> dd_stat = DD_IDLE;
+    if (dd_tl) {
+	dd_tl -> dd_next = dd;
+	dd_tl = dd;
+    }
+    else
+	dd_hd = dd_tl = dd;
+    return dd;
+}
+
+X/* The following macro determines which file systems are normally mounted.
+   Since these are the ones labeled "ro", "rw", and "rq", we just check the
+   first character, which is sufficient for now. */
+#define NormallyMounted(fs) ((fs)->fs_type[0] == 'r')
+
+X/* read in the entire fstab table */
+readfs () {
+    register struct fstab  *fs;
+    register struct fsck_info  *fi;
+    struct fstab   *getfsent ();
+
+    (void) setfsent ();		/* big deal. */
+
+ /* Run through the entire file, saving info about any file systems that
+    are normally mounted. */
+    while ((fs = getfsent ()) != 0) {
+	if (!NormallyMounted (fs))
+	    continue;
+	if ((fi = (struct fsck_info *) malloc (sizeof *fi)) == 0) {
+	    (void) fprintf (stderr, "%s: malloc: %s\n", ProgName,
+		    errstr (errno));
+	    exit (E_MISC);
+	}
+	fi -> fi_isroot = fs -> fs_file[0] == '/' && fs -> fs_file[1] == 0;
+	if (fi -> fi_isroot) {
+	    if (fi_root) {
+		fprintf (stderr,
+			"%s: odd... you seem to have two root file systems!\n",
+			ProgName);
+		exit (E_MISC);
+	    }
+	    fi_root = fi;
+	/* the root file system is checked using the block device. */
+	    fs -> fs_spec = savestr (fs -> fs_spec);
+	}
+	else
+	    fs -> fs_spec = savestr (DiskRawName (fs -> fs_spec));
+	fs -> fs_file = savestr (fs -> fs_file);
+	fs -> fs_type = savestr (fs -> fs_type);
+	fi -> fi_next = 0;
+	fi -> fi_fs = *fs;
+	fi -> fi_pid = 0;
+	fi -> fi_stat = FI_NOTYET;
+	if (fi_tl) {
+	    fi_tl -> fi_next = fi;
+	    fi_tl = fi;
+	}
+	else
+	    fi_hd = fi_tl = fi;
+	fi -> fi_disk = GetDisk (fi -> fi_fs.fs_spec, fi -> fi_isroot);
+	nfs++;
+    }
+    if (!fi_root) {
+	(void) fprintf (stderr,
+		"%s: odd... you don't seem to have a root file system!\n",
+		ProgName);
+	exit (E_MISC);
+    }
+    (void) endfsent ();
+}
+
+X/* ARGSUSED */
+main (argc, argv)
+int argc;
+char **argv; {
+    ProgName = *argv;
+    initsig ();
+    readfs ();
+
+ /* run the initial fsck on root */
+    StartOne (fi_root);
+    waitfor ();
+
+ /* handle root FS errors */
+    if (fi_root -> fi_stat != FI_NORMAL)
+	done (1);
+
+ /* do the remaining file systems */
+    while (nfs > 0) {
+	StartFscks ();
+	waitfor ();
+    }
+    done (0);
+}
+
+X/* Wait for children, and find them in the list of filesystems.  Reset the
+   state of the drive (arm) to DD_IDLE and note the exit code. */
+waitfor () {
+    register int    pid;
+    register struct fsck_info  *fi;
+    union wait status;
+
+    while ((pid = wait (&status)) != 0) {
+	if (pid == -1) {
+	    if (errno == EINTR)
+		continue;
+	    else
+		break;
+	}
+	for (fi = fi_hd; fi; fi = fi -> fi_next)
+	    if (fi -> fi_pid == pid)
+		goto found;
+	continue;		/* presumably some random process */
+found:
+	if (fi -> fi_stat != FI_RUNNING) {
+	    (void) fprintf (stderr, "%s: internal error: bad fi_stat %d\n",
+		    ProgName, fi -> fi_stat);
+	    continue;
+	}
+	nfs--;			/* another one bites the dust */
+	fi -> fi_w = status;
+	if (WIFSIGNALED (status) || status.w_retcode != E_OK)
+	    fi -> fi_stat = FI_BAD;
+	else
+	    fi -> fi_stat = FI_NORMAL;
+	fi -> fi_disk -> dd_stat = DD_IDLE;
+    }
+}
+
+X/* Start up fscks on the idle drives. */
+StartFscks () {
+    register struct fsck_info *fi;
+
+    for (fi = fi_hd; fi; fi = fi -> fi_next)
+	if (fi -> fi_stat == FI_NOTYET && fi -> fi_disk -> dd_stat == DD_IDLE)
+	    StartOne (fi);
+}
+
+X/* Start up a single fsck on the indicated file system.  Also, mark the
+   disk arm busy. */
+StartOne (fi)
+register struct fsck_info *fi; {
+    register int pid;
+
+    (void) printf ("%s -p %s\n", FSCK, fi -> fi_fs.fs_spec);
+    (void) fflush (stdout);
+    if ((pid = vfork ()) == 0) {
+	execl (FSCK, FSCK, "-p", fi -> fi_fs.fs_spec, (char *) 0);
+	(void) fprintf (stderr, "%s: execl(%s) failed: %s\n", ProgName,
+		FSCK, errstr (errno));
+	(void) fflush (stderr);
+	_exit (E_MISC);
+    }
+    if (pid == -1) {
+	(void) fprintf (stderr, "%s: fork: %s\n", ProgName, errstr (errno));
+	exit (E_MISC);
+    }
+    fi -> fi_pid = pid;
+    fi -> fi_stat = FI_RUNNING;
+    fi -> fi_disk -> dd_stat = DD_BUSY;
+}
+
+X/* Figure out what exit code to use to summarize the whole situation */
+done (justroot) {
+    register struct fsck_info  *fi;
+    register int    e = 0,
+		    ee;
+    char  *msg;
+
+    for (fi = fi_hd; fi; fi = fi -> fi_next) {
+	if (justroot && fi != fi_root)
+	    continue;
+	switch (fi -> fi_stat) {
+	    case FI_NORMAL: 
+		continue;
+	    case FI_NOTYET: 
+	    case FI_RUNNING: 
+		ee = E_INTR;
+		break;
+	    case FI_BAD: 
+		if (WIFSIGNALED (fi -> fi_w)) {
+		    ee = E_SIG;
+		    break;
+		}
+		ee = fi -> fi_w.w_retcode;
+		break;
+	    default: 
+		(void) fprintf (stderr, "%s: internal error: fi_stat = %d\n",
+			ProgName, fi -> fi_stat);
+		ee = E_MISC;
+		break;
+	}
+	if (ee > e)		/* take the max of all exit values */
+	    e = ee;
+    }
+    switch (e) {
+	case E_OK:
+	    msg = "File systems OK\n";
+	    break;
+	case E_RB:
+	    msg = "*** Reboot UNIX (no sync!)";
+	    break;
+	case E_MISC:
+	default:
+	    msg = "*** Preen failed ... help!";
+	    break;
+	case E_INTR:
+	    msg = "*** Preen interrupted";
+	    break;
+	case E_SIG:
+	    msg = "*** Preen failed (fsck died) ... help!";
+	    break;
+    }
+    (void) printf ("%s\n", msg);
+    exit (e);
+}
+//go.sysin dd *
+if [ `wc -c < preen.c` != 10706 ]; then
+	made=FALSE
+	/bin/echo 'error transmitting "preen.c" --'
+	/bin/echo 'length should be 10706, not' `wc -c < preen.c`
+else
+	made=TRUE
+fi
+if [ $made = TRUE ]; then
+	/bin/chmod 644 preen.c
+	/bin/echo -n '	'; /bin/ls -ld preen.c
+fi
+-- 
+In-Real-Life: Chris Torek, Univ of MD Comp Sci Dept (+1 301 454 4251)
+UUCP:	seismo!umcp-cs!chris
+CSNet:	chris@umcp-cs		ARPA:	chris@maryland
+
+

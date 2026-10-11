@@ -1,0 +1,2295 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,804fa728a4d106f6,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1989-04-27 12:22:54 PST
+Path: utzoo!attcan!uunet!tektronix!tekgen!tekred!games
+From: games@tekred.CNA.TEK.COM
+Newsgroups: comp.sources.games
+Subject: v06i063:  cubes2 - a networked dice game (version 5.1), Part05/08
+Message-ID: <3904@tekred.CNA.TEK.COM>
+Date: 27 Apr 89 19:22:54 GMT
+Sender: billr@tekred.CNA.TEK.COM
+Lines: 2279
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: gmp@rayssdb.RAY.COM (Gregory M. Paris)
+Posting-number: Volume 6, Issue 63
+Archive-name: cubes2/Part05
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 5 (of 8)."
+# Contents:  announce.c dieopts.c histanal.c scr.sh
+# Wrapped by billr@saab on Thu Apr 27 12:13:38 1989
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'announce.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'announce.c'\"
+else
+echo shar: Extracting \"'announce.c'\" \(12245 characters\)
+sed "s/^X//" >'announce.c' <<'END_OF_FILE'
+X/*	vi:set sw=4 ts=4: */
+X#ifndef	lint
+Xstatic char	sccsid[] = "@(#)announce.c 5.1 (G.M. Paris) 89/01/22";
+X#endif	lint
+X
+X/*
+X**
+X**	cubes 5.1  Copyright 1989 Gregory M. Paris
+X**		Permission granted to redistribute on a no charge basis.
+X**		All other rights are reserved.
+X**
+X*/
+X
+X#include	<stdio.h>
+X#include	<strings.h>
+X#include	<syslog.h>
+X#include	<signal.h>
+X#include	<errno.h>
+X#include	<setjmp.h>
+X#include	<ctype.h>
+X#include	<sys/types.h>
+X#include	<sys/time.h>
+X#include	<sys/socket.h>
+X#include	<sys/ioctl.h>
+X#include	"cubes.h"
+X
+Xextern int				errno;
+Xextern player			plr[];
+Xextern int				waiting;
+Xextern int				watching;
+Xextern int				winscore;
+Xextern boolean			jokermode;
+Xextern boolean			clearobs;
+Xextern boolean			adjroster;
+Xextern boolean			isproxy();
+Xextern struct timeval	poll;
+X
+X/*
+X**	announce: send a message to all human players but one
+X*/
+Xannounce(but, mesg)
+Xint		but;
+Xchar   *mesg;
+X{
+X	register int	c;
+X
+X	for(c = 0;c < PLAYERS;++c) if(c != but) {
+X		switch(plr[c].p_stat) {
+X		case Active:
+X		case Waiting:
+X		case Watching:
+X		case Spider:
+X			(void) message(c, mesg);
+X			break;
+X		}
+X	}
+X}
+X
+X/*
+X**	annscore: announce player score
+X**		announces differently for affected player
+X*/
+Xannscore(sc)
+Xint		sc;
+X{
+X	char			msgbuf[MESGLEN+64];
+X
+X	sprintf(msgbuf, "%d Player %d now has %d points (squandered %d).\r\n",
+X		M_OSCO, sc+1, plr[sc].p_score, plr[sc].p_squander);
+X	announce(sc, msgbuf);
+X	if(plr[sc].p_stat != Computer) {
+X		sprintf(msgbuf, "%d You now have %d points (squandered %d).\r\n",
+X			M_MSCO, plr[sc].p_score, plr[sc].p_squander);
+X		(void) message(sc, msgbuf);
+X	}
+X}
+X
+X/*
+X**	annfarewell: bid farewell to player
+X**		doesn't tell player about own leave
+X*/
+Xannfarewell(oldc)
+Xint		oldc;
+X{
+X	char			msgbuf[MESGLEN+64];
+X
+X	sprintf(msgbuf, "%d farewell %d %s\r\n",
+X		M_FARE, oldc+1, plr[oldc].p_name);
+X	announce(oldc, msgbuf);
+X	adjroster = True;
+X}
+X
+X/*
+X**	clearroster: send clear roster message to all clients
+X*/
+Xclearroster()
+X{
+X	register int	c;
+X
+X	clearobs = False;
+X	for(c = 0;c < PLAYERS;++c) {
+X		switch(plr[c].p_stat) {
+X		case Active:
+X		case Waiting:
+X		case Watching:
+X		case Spider:
+X			(void) simp(c, M_CPLR, "Clear player roster.");
+X			break;
+X		}
+X	}
+X}
+X
+X/*
+X**	heartbeat: send a noop to Spiders
+X*/
+Xheartbeat()
+X{
+X	register int	c;
+X
+X	for(c = 0;c < PLAYERS;++c)
+X		if(plr[c].p_stat == Spider)
+X			(void) simp(c, M_NOOP, "Bum-Bum Bum-Bump.");
+X}
+X
+X/*
+X**	observers: tell how many observers there are
+X**		If clearobs is True the observers are showing in the
+X**		roster, so report unseen observers as zero.
+X*/
+Xobservers(c)
+X{
+X	register int	cc;
+X	char			msgbuf[MESGLEN];
+X
+X	cc = (clearobs == True) ? 0 : (waiting + watching);
+X	sprintf(msgbuf, "%d %d observer%s\r\n", M_NOBS, cc, cc == 1 ? "" : "s");
+X	
+X	if(c != -1)
+X		return message(c, msgbuf);
+X	
+X	for(cc = 0;cc < PLAYERS;++cc) {
+X		switch(plr[cc].p_stat) {
+X		case Active:
+X		case Waiting:
+X		case Watching:
+X		case Spider:
+X			(void) message(cc, msgbuf);
+X			break;
+X		}
+X	}
+X
+X	return 0;
+X}
+X
+X/*
+X**	roster: broadcast the roster to all players
+X*/
+Xroster(only, showobs)
+Xint		only;
+Xboolean	showobs;
+X{
+X	register int	c, cc;
+X	char			msgbuf[MESGLEN];
+X
+X	clearobs = False;		/* no observers showing (yet) */
+X
+X	/*
+X	**	Tell each player who he/she is then give a roster.
+X	**	Tell Waiting and Watching players, but don't show them
+X	**		unless showobjs is True.
+X	*/
+X	for(c = 0;c < PLAYERS;++c) {
+X		if(only != -1 && c != only)
+X			continue;
+X		if(plr[c].p_stat == Inactive || plr[c].p_stat == Computer)
+X			continue;
+X
+X		if(simp(c, M_CPLR, "New player roster.") < 0)
+X			continue;
+X
+X		for(cc = 0;cc < PLAYERS;++cc) {
+X			switch(plr[cc].p_stat) {
+X			case Watching:
+X			case Waiting:
+X			case Spider:
+X				if(showobs == False)
+X					break;
+X				clearobs = True;
+X				/* fall */
+X			case Active:
+X			case Computer:
+X				if(cc == c)
+X					sprintf(msgbuf, "%d You are player %d %s\r\n",
+X						M_UARE, cc+1, plr[cc].p_name);
+X				else
+X					sprintf(msgbuf, "%d player %d %s\r\n",
+X						M_PNUM, cc+1, plr[cc].p_name);
+X				if(message(c, msgbuf) < 0)
+X					goto nextrecip;
+X
+X				if(cc == c)
+X					sprintf(msgbuf,
+X						"%d You now have %d points (squandered %d).\r\n",
+X						M_MSCO, plr[cc].p_score, plr[cc].p_squander);
+X				else
+X					sprintf(msgbuf,
+X						"%d Player %d now has %d points (squandered %d).\r\n",
+X						M_OSCO, cc+1, plr[cc].p_score, plr[cc].p_squander);
+X				if(message(c, msgbuf) < 0)
+X					goto nextrecip;
+X				break;
+X			}
+X		}
+X
+X		(void) observers(c);
+Xnextrecip:	;
+X	}
+X
+X	/*
+X	**	If this was a broadcast, the roster is now up to date.
+X	*/
+X	if(only == -1)
+X		adjroster = False;
+X}
+X
+X/*
+X**	tellstatus: report a player's status
+X*/
+Xtellstatus(c)
+X{
+X	m_num	t;
+X	char   *m;
+X
+X	switch(plr[c].p_stat) {
+X	case Inactive:
+X		return -1;
+X	case Active:
+X		if(isproxy(c) == False) {
+X			t = M_ACTV, m = "You're now an active player.";
+X			break;
+X		}
+X		t = M_AUTO, m = "You're on autopilot; type g<return> to gain control.";
+X		break;
+X	case Waiting:
+X		t = M_WAIT, m = "You're waiting to be added...";
+X		break;
+X	case Watching:
+X		t = M_VOYR,
+X			m = "You're now a voyeur; type g<return> to enter this game.";
+X		break;
+X	case Spider:
+X		t = M_SPDR, m = "You're now a spider; type g<return> to start a game.";
+X		break;
+X	case Computer:
+X		if(plr[c].p_fd < 0)
+X			return -1;
+X		t = M_AUTO, m = "You've somehow become a computer!!!";
+X		syslog(LOG_DEBUG, "tellstatus: `%s' is a Computer", plr[c].p_name);
+X		break;
+X	default:
+X		t = M_ARGE, m = "You're now in an unknown mode!";
+X		syslog(LOG_ERR, "tellstatus: `%s' is in an unknown mode (%d)",
+X			plr[c].p_name, plr[c].p_stat);
+X		break;
+X	}
+X
+X	return simp(c, t, m);
+X}
+X
+X/*
+X**	tellwinscore: notify one or all players about the current winscore
+X**		also notifies player as to whether jokermode is True or False.
+X*/
+Xtellwinscore(c)
+X{
+X	register int	cc;
+X	char			msgbuf[MESGLEN];
+X
+X	sprintf(msgbuf, "%d This is a %d point game%s.\r\n", M_PARM, winscore, 
+X		jokermode == True ? " with jokers" : "");
+X
+X	if(c >= 0)
+X		(void) message(c, msgbuf);
+X	else {
+X		for(cc = 0;cc < PLAYERS;++cc) {
+X			switch(plr[cc].p_stat) {
+X			case Active:
+X			case Waiting:
+X			case Watching:
+X			case Spider:
+X				(void) message(cc, msgbuf);
+X				break;
+X			}
+X		}
+X	}
+X}
+X
+X/*
+X**	simp: format and send a simple message
+X*/
+Xsimp(c, type, mtxt)
+Xint		c;
+Xm_num	type;
+Xchar   *mtxt;
+X{
+X	char	msgbuf[MESGLEN];
+X
+X	sprintf(msgbuf, "%3d %.*s\r\n", type, MESGLEN-7, mtxt);
+X	return message(c, msgbuf);
+X}
+X
+X/*
+X**	invalid: invalid command message
+X*/
+Xinvalid(c)
+Xint		c;
+X{
+X	return simp(c, M_ARGE, "Invalid command; type ?<return> for help.");
+X}
+X
+X/*
+X**	multimesg: send multi-line message
+X*/
+Xmultimesg(c, type, marr)
+Xint		c;
+Xm_num	type;
+Xchar   *marr[];
+X{
+X	int		n;
+X	char	msgbuf[MESGLEN];
+X
+X	/*
+X	**	Send each line of the message.  All but the final
+X	**	has a period between the type number and the message.
+X	*/
+X	for(n = 0;marr[n] != 0;++n) {
+X		sprintf(msgbuf, "%d%c%s\r\n",
+X			type, marr[n+1] == 0 ? ' ' : '.', marr[n]);
+X		if(message(c, msgbuf) < 0)
+X			return -1;
+X	}
+X
+X	return n;
+X}
+X
+X/*
+X**	messagejmp, messagetimo: message timeout handler
+X*/
+Xstatic jmp_buf	messagejmp;
+Xstatic int
+Xmessagetimo(sig)
+X{
+X	longjmp(messagejmp, sig);
+X}
+X
+X/*
+X**	message: write a message on a channel
+X*/
+Xmessage(c, mesg)
+Xint		c;
+Xchar   *mesg;
+X{
+X	int			n, mesglen;
+X	int		  (*oldalrm)();
+X	int		  (*oldpipe)();
+X	unsigned	alarmv;
+X	fd_set		rdy;
+X
+X	switch(plr[c].p_stat) {
+X	case Inactive:
+X		syslog(LOG_DEBUG, "message: to Inactive: %s", mesg);
+X		return -1;
+X	case Computer:
+X		syslog(LOG_DEBUG, "message: to Computer: %s", mesg);
+X		return 0;	/* "succeeds" */
+X	}
+X
+X	if(plr[c].p_fd < 0) {
+X		if(plr[c].p_stat == Waiting && plr[c].p_computer != 0)
+X			return 0;	/* OK, Waiting Computer */
+X		syslog(LOG_DEBUG,
+X			"message: bad fd (c=%d;stat=%d): %s", c, plr[c].p_stat, mesg);
+X		oldplayer(c);
+X		return -1;
+X	}
+X
+X	if((mesglen = strlen(mesg)) == 0)
+X		return 0;
+X
+X	oldalrm = signal(SIGALRM, SIG_IGN);
+X	oldpipe = signal(SIGPIPE, SIG_IGN);
+X	alarmv = alarm(0);
+X	switch(setjmp(messagejmp)) {
+X	case 0:
+X		break;
+X	case SIGALRM:
+X		syslog(LOG_DEBUG, "message: timeout: %s", mesg);
+X		goto common;
+X	case SIGPIPE:
+X		(void) alarm(0);
+X		syslog(LOG_DEBUG, "message: dead pipe: %s", mesg);
+X		goto common;
+X	default:
+X		(void) alarm(0);
+X		syslog(LOG_DEBUG, "message: unexpected signal: %s", mesg);
+Xcommon:
+X		oldplayer(c);
+X		(void) signal(SIGALRM, oldalrm);
+X		(void) signal(SIGPIPE, oldpipe);
+X		(void) alarm(alarmv);
+X		return -1;
+X	}
+X
+X	(void) signal(SIGALRM, messagetimo);
+X	(void) signal(SIGPIPE, messagetimo);	/* treat like timeout */
+X	(void) alarm(WRITETIMO);
+X	FD_ZERO(&rdy);
+X	FD_SET(plr[c].p_fd, &rdy);
+X	(void) select(plr[c].p_fd+1, NOSEL, &rdy, NOSEL, &poll);
+X	if((n = write(plr[c].p_fd, mesg, mesglen)) < 0) {
+X		if(errno != EPIPE && errno != ENOTCONN)
+X			syslog(LOG_DEBUG, "message: write: %m: %s", mesg);
+X		(void) alarm(0);
+X		oldplayer(c);
+X		(void) signal(SIGALRM, oldalrm);
+X		(void) signal(SIGPIPE, oldpipe);
+X		(void) alarm(alarmv);
+X		return -1;
+X	}
+X	(void) alarm(0);
+X	(void) signal(SIGALRM, oldalrm);
+X	(void) signal(SIGPIPE, oldpipe);
+X	(void) alarm(alarmv);
+X	return n;
+X}
+X
+X/*
+X**	replyjmp, replytimo: reply timeout handler
+X*/
+Xstatic jmp_buf	replyjmp;
+Xstatic int
+Xreplytimo()
+X{
+X	longjmp(replyjmp, 1);
+X}
+X
+X/*
+X**	reply: read a reply from a channel
+X*/
+Xreply(c, mesg, mesglen)
+Xint		c, mesglen;
+Xchar   *mesg;
+X{
+X	int			n, ntot;
+X	int		  (*oldalrm)();
+X	unsigned	alarmv;
+X	fd_set		rdy;
+X
+X	switch(plr[c].p_stat) {
+X	case Inactive:
+X		syslog(LOG_DEBUG, "reply: from Inactive");
+X		return -1;
+X	case Computer:
+X		syslog(LOG_DEBUG, "reply: from Computer");
+X		return -1;
+X	}
+X
+X	/*
+X	**	Handle read timeout.
+X	*/
+X	oldalrm = signal(SIGALRM, SIG_IGN);
+X	alarmv = alarm(0);
+X	if(setjmp(replyjmp) != 0) {
+X		(void) signal(SIGALRM, oldalrm);
+X		(void) alarm(alarmv);
+X		/*
+X		**	Increment this player's timeout count.  If we've
+X		**	reached or exceeded MAXTIMO, then say goodbye.
+X		*/
+X		if(++plr[c].p_timeouts >= MAXTIMO) {
+X			syslog(LOG_DEBUG, "reply: too many timeouts");
+X			(void) simp(c, M_DOWN, "Too many timeouts -- goodbye!");
+X			oldplayer(c);
+X			return -1;
+X		}
+X		/*
+X		**	Send a message to the client indicating timeout.
+X		*/
+X		syslog(LOG_DEBUG, "reply: timeout");
+X		if(simp(c, M_INFO, "Timed out waiting for your response!") < 0)
+X			return -1;
+X		(void) send(plr[c].p_fd, "\001", 1, MSG_OOB);
+X		return -2;
+X	}
+X
+X	/*
+X	**	Read until we get a newline.
+X	*/
+X	(void) signal(SIGALRM, replytimo);
+X	(void) alarm(READTIMO);
+X	ntot = 0, mesg[0] = '\0';
+X	while(index(mesg, '\n') == 0) {
+X		FD_ZERO(&rdy);
+X		FD_SET(plr[c].p_fd, &rdy);
+X		(void) select(plr[c].p_fd+1, &rdy, NOSEL, NOSEL, HANG);
+X		if((n = read(plr[c].p_fd, mesg+ntot, mesglen-ntot)) <= 0) {
+X			(void) alarm(0);
+X#ifdef	notdef
+X			if(n < 0)
+X				syslog(LOG_DEBUG, "reply: read: %m");
+X			else
+X				syslog(LOG_DEBUG, "reply: read got zero bytes");
+X#endif	notdef
+X			oldplayer(c);
+X			(void) signal(SIGALRM, oldalrm);
+X			(void) alarm(alarmv);
+X			return -1;
+X		}
+X		ntot += n, mesg[ntot] = '\0';
+X	}
+X	(void) alarm(0);
+X
+X	/*
+X	**	Had a successful read, so zero timeout count.
+X	*/
+X	plr[c].p_timeouts = 0;
+X
+X	/*
+X	**	Strip trailing control characters and spaces.
+X	**	Then get rid of control characters in the message.
+X	**	We must be careful to preserve ASYNCMARK at position 0.
+X	XXX	Assumes iscntrl(ASYNCMARK) is true.
+X	*/
+X	for(n = ntot - 1;n >= 0;--n) {
+X		mesg[n] &= 0x7f;	/* strip high bit */
+X		if(iscntrl(mesg[n])) {
+X			if(n != 0 || mesg[n] != ASYNCMARK)
+X				mesg[n] = '\0';
+X		} else if(isspace(mesg[n]))
+X			mesg[n] = '\0';
+X		else
+X			break;
+X	}
+X	for(n = 0;mesg[n] != '\0';++n)
+X		if(iscntrl(mesg[n]))
+X			if(n != 0 || mesg[n] != ASYNCMARK)
+X				mesg[n] = '?';
+X
+X	(void) signal(SIGALRM, oldalrm);
+X	(void) alarm(alarmv);
+X	return n;
+X}
+X
+X/*
+X**	dialogue: flush pending data, send message, read reply
+X*/
+Xdialogue(c, msg, len)
+Xint		c, len;
+Xchar   *msg;
+X{
+X	long	q;
+X	int		n;
+X	char	junk[MESGLEN];
+X
+X	if(plr[c].p_fd < 0)
+X		return -1;
+X	if(plr[c].p_stat == Inactive || plr[c].p_stat == Computer)
+X		return -1;
+X
+X	/*
+X	**	Because of the way this protocol is set up, any pending input at
+X	**	this point should be discarded, because it means that the client
+X	**	has somehow gotten out of sync.
+X	*/
+X	while(ioctl(plr[c].p_fd, FIONREAD, (char *)&q) != -1 && q > 0) {
+X		if(q > sizeof junk)
+X			q = sizeof junk;
+X		(void) read(plr[c].p_fd, junk, (int)q);
+X	}
+X
+X	/*
+X	**	Send message.
+X	*/
+X	if(message(c, msg) < 0)
+X		return -1;
+X	
+X	/*
+X	**	We keep reading here until we get a non-asynchronous reply.
+X	*/
+X	for(;;) {
+X		if((n = reply(c, msg, len)) < 0)	/* error or timeout */
+X			return n;
+X		if(msg[0] != ASYNCMARK)				/* not asynchronous */
+X			return n;
+X	}
+X}
+END_OF_FILE
+if test 12245 -ne `wc -c <'announce.c'`; then
+    echo shar: \"'announce.c'\" unpacked with wrong size!
+fi
+# end of 'announce.c'
+fi
+if test -f 'dieopts.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'dieopts.c'\"
+else
+echo shar: Extracting \"'dieopts.c'\" \(18796 characters\)
+sed "s/^X//" >'dieopts.c' <<'END_OF_FILE'
+X/*	vi:set sw=4 ts=4: */
+X#ifndef	lint
+Xstatic char	sccsid[] = "@(#)dieopts.c 5.1 (G.M. Paris) 89/01/22";
+X#endif	lint
+X
+X/*
+X**
+X**	cubes 5.1  Copyright 1989 Gregory M. Paris
+X**		Permission granted to redistribute on a no charge basis.
+X**		All other rights are reserved.
+X**
+X*/
+X
+X#include	<strings.h>
+X#include	"cubes.h"
+X
+Xextern boolean	jokermode;
+X
+X#define	SIDESIZE	(JOKER + 1)	/* enough room for all faces */
+X#define	JSIDES		(jokermode == True ? JOKER : SIDES)
+X#define	JFACE(f)	((jokermode == True && (f) == JOKER) ? P_JOKERMULT : (f))
+X#define	FVALUE(f)	((f) == ACE ? P_ACEMULT : JFACE(f))
+X
+X/*
+X**	names: names of die faces, singular and plural
+X**		Must be filled in to at least max of SIDES and NDICE!
+X*/
+Xchar   *numnames[][2]	= {
+X	{ "zero",	"zeroes" },
+X	{ "one",	"ones" },
+X	{ "two",	"twos" },
+X	{ "three",	"threes" },
+X	{ "four",	"fours" },
+X	{ "five",	"fives" },
+X	{ "six",	"sixes" },
+X	{ "seven",	"sevens" },
+X	{ "eight",	"eights" },
+X	{ "joker",	"jokers" },
+X};
+X
+X/*
+X**	initdice: initialize dice status
+X*/
+Xinitdice(pd)
+Xregister diceset   *pd;
+X{
+X	register int	d;
+X
+X	for(d = 0;d < NDICE;++d) {
+X		pd->d_stat[d] = Free;		/* rolling this die */
+X		pd->d_face[d] = BADFACE;	/* impossible value */
+X		pd->d_comb[d] = Nothing;	/* no combination */
+X	}
+X	zapdesc(pd);					/* clear scoring description */
+X	pd->d_best = Nothing;			/* no combination */
+X	pd->d_again = True;				/* rolling again */
+X	pd->d_rolling = NDICE;			/* rolling all dice */
+X	pd->d_pts_roll = 0;				/* no points rolled */
+X	pd->d_pts_dice = 0;				/* no points in set */
+X	pd->d_pts_turn = 0;				/* no points in turn */
+X	pd->d_pts_max = 0;				/* no max in turn yet */
+X	pd->d_mesg[0] = '\0';			/* no message */
+X}
+X
+X/*
+X**	pickup: similar to initdice but only does initialization
+X**		for re-roll of (usually partial) dice set
+X**
+X**		non-scoring dice are Freed
+X**		change Rolled dice to Free
+X**		set Free dice faces to BADFACE and combs to Nothing
+X**		change Taken dice to Held
+X**		set Held dice combs to Previous
+X**		resets d_rolling, d_best, d_pts_roll, and d_mesg
+X*/
+Xpickup(pd)
+Xregister diceset   *pd;
+X{
+X	register int	d;
+X
+X	zapdesc(pd);
+X	pd->d_best = Nothing;
+X	pd->d_again = True;
+X	pd->d_rolling = 0;
+X	pd->d_pts_roll = 0;
+X	pd->d_mesg[0] = '\0';
+X
+X	for(d = 0;d < NDICE;++d) {
+X		if(pd->d_comb[d] == Nothing)
+X			pd->d_stat[d] = Free;
+X		switch(pd->d_stat[d]) {
+X		case Rolled:
+X			pd->d_stat[d] = Free;	/* fall */
+X		case Free:
+X			pd->d_face[d] = BADFACE;
+X			pd->d_comb[d] = Nothing;
+X			++pd->d_rolling;
+X			break;
+X		case Taken:
+X			pd->d_stat[d] = Held;	/* fall */
+X		case Held:
+X			pd->d_comb[d] = Previous;
+X			break;
+X		}
+X	}
+X
+X	/*
+X	**	If no dice are free, then free them all.
+X	*/
+X	if(pd->d_rolling == 0) {
+X		for(d = 0;d < NDICE;++d) {
+X			pd->d_stat[d] = Free;
+X			pd->d_face[d] = BADFACE;
+X			pd->d_comb[d] = Nothing;
+X		}
+X		pd->d_rolling = NDICE;
+X		pd->d_pts_dice = 0;
+X	}
+X}
+X
+X/*
+X**	rolldice: roll free dice
+X**		sets d_rolling to number of dice rolled
+X**		sets d_again to False
+X*/
+Xrolldice(pd)
+Xregister diceset   *pd;
+X{
+X	register int	d;
+X
+X	pd->d_again = False;
+X	zapdesc(pd);
+X	pd->d_best = Nothing;
+X	pd->d_rolling = 0;
+X	for(d = 0;d < NDICE;++d) {
+X		if(pd->d_stat[d] == Free) {
+X			pd->d_stat[d] = Rolled;
+X			pd->d_face[d] = dieroll();
+X			pd->d_comb[d] = Nothing;
+X			++pd->d_rolling;
+X		}
+X	}
+X}
+X
+X/*
+X**	zapdesc: clear scoring combination description
+X*/
+Xzapdesc(pd)
+Xdiceset	   *pd;
+X{
+X#ifdef	DESC
+X	register int	d;
+X
+X	for(d = 0;d < NDICE;++d) {
+X		pd->d_desc[d].sc_comb = Nothing;	/* no combination */
+X		pd->d_desc[d].sc_num = 0;			/* none of them */
+X		pd->d_desc[d].sc_face = BADFACE;	/* no face value */
+X	}
+X#else	DESC
+X#ifdef	lint
+X	pd = pd;
+X#endif	lint
+X#endif	DESC
+X}
+X
+X/*
+X**	evaluate: categorize dice marked as Rolled or Taken
+X*/
+Xevaluate(pd)
+Xregister diceset   *pd;
+X{
+X	register int	d, s;
+X#ifdef	DESC
+X	register int	nc = 0;
+X#endif	DESC
+X	int				held, rolled;
+X	int				rshow[SIDESIZE];
+X	int				minshow, maxshow;
+X	int				len, aces, fives, jokers;
+X	boolean			ok;
+X
+X	/*
+X	**	We start with s == 0 to allow accounting for BADFACE.
+X	*/
+X	for(s = 0;s <= JSIDES;++s)
+X		rshow[s] = 0;
+X		
+X	pd->d_mesg[0] = '\0';
+X	pd->d_best = Nothing;
+X	zapdesc(pd);
+X	rolled = held = 0;
+X	for(d = 0;d < NDICE;++d) {
+X		s = pd->d_face[d];
+X		switch(pd->d_stat[d]) {
+X		case Rolled:
+X		case Taken:
+X			pd->d_comb[d] = Nothing;
+X			++rolled, ++rshow[s];
+X			break;
+X		case Held:
+X			pd->d_comb[d] = Previous;
+X			++held;
+X			break;
+X		default:
+X			pd->d_stat[d] = Free;
+X			pd->d_comb[d] = Nothing;
+X			break;
+X		}
+X	}
+X
+X	/*
+X	**	Check for All_of_a_kind.  All dice count.
+X	**	Uses all dice.
+X	*/
+X	if((rolled + held) == NDICE) {
+X		s = pd->d_face[0];
+X		for(d = 1;d < NDICE;++d)
+X			if(pd->d_face[d] != s)
+X				break;
+X		if(d == NDICE) {
+X			for(d = 0;d < NDICE;++d)
+X				pd->d_comb[d] = All_of_a_kind;
+X			pd->d_best = All_of_a_kind;
+X
+X#ifdef	DESC
+X			pd->d_desc[nc].sc_comb = All_of_a_kind;
+X			pd->d_desc[nc].sc_num = 1;
+X			pd->d_desc[nc].sc_face = pd->d_face[0];
+X/*			++nc;	/* not needed */
+X#endif	DESC
+X
+X			sprintf(pd->d_mesg, "%s of a kind in %s",
+X				NUMBER(NDICE), FACE(pd->d_face[0], NDICE));
+X			return;
+X		}
+X	}
+X
+X	/*
+X	**	Check for Straight.  Only rolled dice count.
+X	**	Uses all dice.
+X	*/
+X	if(rolled == NDICE) {
+X		if(rshow[BADFACE] != 0)
+X			ok = False;
+X		else {
+X			ok = True, minshow = JSIDES + 1, maxshow = 0;
+X			for(s = 0;ok == True && s <= JSIDES;++s) {
+X				switch(rshow[s]) {
+X				case 1:
+X					if(s < minshow) minshow = s;
+X					if(s > maxshow) maxshow = s;
+X					break;
+X				case 0:		break;
+X				default:	ok = False; break;
+X				}
+X			}
+X		}
+X
+X		if(ok == True && maxshow - minshow == NDICE - 1) {
+X			for(d = 0;d < NDICE;++d)
+X				pd->d_comb[d] = Straight;
+X			pd->d_best = Straight;
+X
+X#ifdef	DESC
+X			pd->d_desc[nc].sc_comb = Straight;
+X			pd->d_desc[nc].sc_num = 1;
+X/*			++nc;	/* not needed */
+X#endif	DESC
+X
+X			strcpy(pd->d_mesg, "a straight");
+X			return;
+X		}
+X	}
+X
+X#ifdef	ASMSTR
+X	/*
+X	**	Check for Assembled Straight.  Held and Rolled dice count.
+X	**	Uses all dice.
+X	*/
+X	if((rolled + held) == NDICE) {
+X		int		ashow[SIDESIZE];
+X
+X		/*
+X		**	We start with s == 0 to allow accounting for BADFACE.
+X		*/
+X		for(s = 0;s <= JSIDES;++s)
+X			ashow[s] = 0;
+X		for(d = 0;d < NDICE;++d)
+X			++ashow[pd->d_face[d]];
+X
+X		if(ashow[BADFACE] != 0)
+X			ok = False;
+X		else {
+X			ok = True, minshow = JSIDES + 1, maxshow = 0;
+X			for(s = 0;ok == True && s <= JSIDES;++s) {
+X				switch(ashow[s]) {
+X				case 1:
+X					if(s < minshow) minshow = s;
+X					if(s > maxshow) maxshow = s;
+X					break;
+X				case 0:		break;
+X				default:	ok = False; break;
+X				}
+X			}
+X		}
+X
+X		if(ok == True && maxshow - minshow == NDICE - 1) {
+X			for(d = 0;d < NDICE;++d)
+X				pd->d_comb[d] = Asm_straight;
+X			pd->d_best = Asm_straight;
+X
+X#ifdef	DESC
+X			pd->d_desc[nc].sc_comb = Asm_straight;
+X			pd->d_desc[nc].sc_num = 1;
+X	/*			++nc;	/* not needed */
+X#endif	DESC
+X
+X			switch(rolled) {
+X			case ASMSTR-1:	strcpy(pd->d_mesg, "a completed straight"); break;
+X			case ASMSTR-2:	strcpy(pd->d_mesg, "an inside straight"); break;
+X			case 1:			strcpy(pd->d_mesg, "an outside straight"); break;
+X			default: /*?*/	strcpy(pd->d_mesg, "an assembled straight"); break;
+X			}
+X			return;
+X		}
+X	}
+X#endif	ASMSTR
+X
+X#ifdef	FOUR
+X	/*
+X	**	Check for Four_of_a_kind.  Only rolled dice count.
+X	**	Assumes that only one is possible.
+X	*/
+X	if(rolled >= FOUR) {
+X		for(s = 1;s <= JSIDES;++s) {
+X			while(rshow[s] >= FOUR) {
+X				maxshow = FOUR;
+X				for(d = 0;d < NDICE && maxshow > 0;++d) {
+X					switch(pd->d_stat[d]) {
+X					case Rolled:
+X					case Taken:
+X						if(pd->d_comb[d] == Nothing && pd->d_face[d] == s) {
+X							pd->d_comb[d] = Four_of_a_kind;
+X							--rshow[s];
+X							--maxshow;
+X						}
+X						break;
+X					}
+X				}
+X
+X				if(pd->d_best == Nothing)
+X					pd->d_best = Four_of_a_kind;
+X
+X#ifdef	DESC
+X				pd->d_desc[nc].sc_comb = Four_of_a_kind;
+X				pd->d_desc[nc].sc_num = 1;
+X				pd->d_desc[nc].sc_face = s;
+X				++nc;
+X#endif	DESC
+X
+X				if((len = strlen(pd->d_mesg)) > 0) {
+X					strcat(pd->d_mesg, ", ");
+X					len += 2;
+X				}
+X				sprintf(pd->d_mesg + len, "%s of a kind in %s",
+X					NUMBER(FOUR), FACE(s, FOUR));
+X			}
+X		}
+X	}
+X#endif	FOUR
+X
+X#ifdef	SMSTR
+X	/*
+X	**	Check for Small_straight.  Only rolled dice count.
+X	**	Assumes that only one is possible.
+X	*/
+X	if(rolled >= NDICE - 1) {
+X		ok = False;
+X		if(rshow[BADFACE] == 0) {
+X			minshow = maxshow = 0;
+X			for(s = 1;ok == False && s <= JSIDES;++s) {
+X				switch(rshow[s]) {
+X				case 1: case 2:
+X					if(minshow == 0)
+X						minshow = maxshow = s;
+X					else if((maxshow = s) - minshow == NDICE - 2)
+X						ok = True;
+X					break;
+X				case 0:		minshow = maxshow = 0; break;
+X				default:	s = JSIDES; break;
+X				}
+X			}
+X		}
+X
+X		if(ok == True) {
+X			for(s = minshow;s <= maxshow;++s) {
+X				for(ok = True, d = 0;ok == True && d < NDICE;++d) {
+X					switch(pd->d_stat[d]) {
+X					case Rolled:
+X					case Taken:
+X						if(pd->d_comb[d] == Nothing && pd->d_face[d] == s) {
+X							pd->d_comb[d] = Small_straight;
+X							--rshow[s];
+X							ok = False;	/* got it */
+X						}
+X						break;
+X					}
+X				}
+X			}
+X			if(pd->d_best == Nothing)
+X				pd->d_best = Small_straight;
+X
+X#ifdef	DESC
+X			pd->d_desc[nc].sc_comb = Small_straight;
+X			pd->d_desc[nc].sc_num = 1;
+X			++nc;
+X#endif	DESC
+X
+X			if(pd->d_mesg[0] != '\0')
+X				strcat(pd->d_mesg, ", ");
+X			strcat(pd->d_mesg, "a small straight");
+X		}
+X	}
+X#endif	SMSTR
+X
+X	/*
+X	**	Check for Three_of_a_kind.  Only rolled dice count.
+X	**	Code is supposed to be able to handle more than one
+X	**	Three_of_a_kind, but is untested with current NDICE val.
+X	*/
+X	if(rolled >= THREE) {
+X		for(s = 1;s <= JSIDES;++s) {
+X			while(rshow[s] >= THREE) {
+X				maxshow = THREE;
+X				for(d = 0;d < NDICE && maxshow > 0;++d) {
+X					switch(pd->d_stat[d]) {
+X					case Rolled:
+X					case Taken:
+X						if(pd->d_comb[d] == Nothing && pd->d_face[d] == s) {
+X							pd->d_comb[d] = Three_of_a_kind;
+X							--rshow[s];
+X							--maxshow;
+X						}
+X						break;
+X					}
+X				}
+X
+X				if(pd->d_best == Nothing)
+X					pd->d_best = Three_of_a_kind;
+X
+X#ifdef	DESC
+X				pd->d_desc[nc].sc_comb = Three_of_a_kind;
+X				pd->d_desc[nc].sc_num = 1;
+X				pd->d_desc[nc].sc_face = s;
+X				++nc;
+X#endif	DESC
+X
+X				if((len = strlen(pd->d_mesg)) > 0) {
+X					strcat(pd->d_mesg, ", ");
+X					len += 2;
+X				}
+X				sprintf(pd->d_mesg + len, "%s of a kind in %s",
+X					NUMBER(THREE), FACE(s, THREE));
+X			}
+X		}
+X	}
+X
+X	/*
+X	**	Check for stray Aces, Fives, and Jokers.  Only rolled dice count.
+X	*/
+X	aces = fives = jokers = 0;
+X	for(d = 0;d < NDICE;++d) {
+X		switch(pd->d_stat[d]) {
+X		case Rolled:
+X		case Taken:
+X			if(pd->d_comb[d] == Nothing) {
+X				switch(pd->d_face[d]) {
+X				case ACE:
+X					++aces;
+X					pd->d_comb[d] = Ace;
+X					if(pd->d_best == Nothing
+X					|| pd->d_best == Joker || pd->d_best == Five)
+X						pd->d_best = Ace;
+X					break;
+X				case FIVE:
+X					++fives;
+X					pd->d_comb[d] = Five;
+X					if(pd->d_best == Nothing || pd->d_best == Joker)
+X						pd->d_best = Five;
+X					break;
+X				case JOKER:
+X					/*
+X					**	The test for jokermode here prevents any Joker
+X					**	dice being marked, thus it is unnecessary to
+X					**	test jokermode when testing Joker in other places.
+X					*/
+X					if(jokermode == True) {
+X						++jokers;
+X						pd->d_comb[d] = Joker;
+X						if(pd->d_best == Nothing)
+X							pd->d_best = Joker;
+X					}
+X					break;
+X				}
+X			}
+X			break;
+X		}
+X	}
+X
+X	if(pd->d_best != Nothing) {
+X		if(aces > 0) {
+X#ifdef	DESC
+X			pd->d_desc[nc].sc_comb = Ace;
+X			pd->d_desc[nc].sc_num = aces;
+X			pd->d_desc[nc].sc_face = ACE;
+X			++nc;
+X#endif	DESC
+X			if((len = strlen(pd->d_mesg)) > 0) {
+X				strcat(pd->d_mesg, ", ");
+X				len += 2;
+X			}
+X			sprintf(pd->d_mesg + len, "%s %s",
+X				NUMBER(aces), FACE(ACE, aces));
+X		}
+X
+X		if(fives > 0) {
+X#ifdef	DESC
+X			pd->d_desc[nc].sc_comb = Five;
+X			pd->d_desc[nc].sc_num = fives;
+X			pd->d_desc[nc].sc_face = FIVE;
+X			++nc;
+X#endif	DESC
+X			if((len = strlen(pd->d_mesg)) > 0) {
+X				strcat(pd->d_mesg, ", ");
+X				len += 2;
+X			}
+X			sprintf(pd->d_mesg + len, "%s %s",
+X				NUMBER(fives), FACE(FIVE, fives));
+X		}
+X
+X		if(jokermode == True && jokers > 0) {
+X#ifdef	DESC
+X			pd->d_desc[nc].sc_comb = Joker;
+X			pd->d_desc[nc].sc_num = jokers;
+X			pd->d_desc[nc].sc_face = JOKER;
+X			++nc;
+X#endif	DESC
+X			if((len = strlen(pd->d_mesg)) > 0) {
+X				strcat(pd->d_mesg, ", ");
+X				len += 2;
+X			}
+X			sprintf(pd->d_mesg + len, "%s %s",
+X				NUMBER(jokers), FACE(JOKER, jokers));
+X		}
+X	}
+X
+X	if(pd->d_best == Nothing) {
+X		strcpy(pd->d_mesg, "nothing");
+X#ifdef	DESC
+X		pd->d_desc[nc].sc_num = 1;	/* to be strictly accurate */
+X/*		++nc;						/* not needed */
+X#endif	DESC
+X	}
+X}
+X
+X/*
+X**	keepall: mark all scoring dice (based on combinations) as Taken
+X**		frees Nothing dice and marks as Held Previous dice
+X**		sets d_rolling to number of Free dice
+X**		does not alter d_again or d_pts_????
+X*/
+Xkeepall(pd)
+Xregister diceset   *pd;
+X{
+X	register int	d;
+X
+X	pd->d_rolling = 0;
+X	for(d = 0;d < NDICE;++d) {
+X		switch(pd->d_comb[d]) {
+X		case Previous:
+X			pd->d_stat[d] = Held;
+X			break;
+X		case Nothing:
+X			pd->d_stat[d] = Free;
+X			++pd->d_rolling;
+X			break;
+X		case All_of_a_kind:
+X		case Asm_straight:
+X			if(pd->d_stat[d] != Held)
+X				pd->d_stat[d] = Taken;
+X			break;
+X		default:
+X			pd->d_stat[d] = Taken;
+X			break;
+X		}
+X	}
+X}
+X
+X/*
+X**	freeall: mark all non-held dice (based on combinations) as Free
+X**		sets d_rolling to number of Free dice
+X**		does not alter d_again or d_pts_????
+X*/
+Xfreeall(pd)
+Xregister diceset   *pd;
+X{
+X	register int	d;
+X
+X	pd->d_rolling = 0;
+X	for(d = 0;d < NDICE;++d) {
+X		switch(pd->d_comb[d]) {
+X		case Previous:
+X			pd->d_stat[d] = Held;
+X			break;
+X		default:
+X			pd->d_stat[d] = Free;
+X			++pd->d_rolling;
+X			break;
+X		}
+X	}
+X}
+X
+X/*
+X**	scoredice: update points values after roll and decision
+X*/
+Xscoredice(pd)
+Xregister diceset   *pd;
+X{
+X	register int	d, dd, n;
+X	register int	points;
+X	int				face;
+X	combination		comb[NDICE];
+X
+X	/*
+X	**	The easiest of all is the Nothing combination.  The points for the roll
+X	**	are the negative of the points accumulated so far in this turn.  We
+X	**	leave d_pts_max alone -- signifying the true loss due to the reroll.
+X	*/
+X	if(pd->d_best == Nothing) {
+X		pd->d_pts_roll = -pd->d_pts_turn;
+X		pd->d_pts_dice = pd->d_pts_turn = 0;
+X/*		pd->d_pts_max = pd->d_pts_max;			/* leave alone */
+X		return;
+X	}
+X
+X	/*
+X	**	All_of_a_kind can occur at any time and changes the value of any saved
+X	**	dice.  The value of d_pts_dice must be used to update d_pts_roll,
+X	**	d_pts_turn, and d_pts_max.  Further, the value of All_of_a_kind depends
+X	**	on its denomination.
+X	*/
+X	if(pd->d_best == All_of_a_kind) {
+X		face = pd->d_face[0];
+X		points = P_AOKMULT * FVALUE(face);
+X		pd->d_pts_roll = points - pd->d_pts_dice;
+X		if((pd->d_pts_turn += pd->d_pts_roll) > pd->d_pts_max)
+X			pd->d_pts_max = pd->d_pts_turn;
+X		return;
+X	}
+X
+X	/*
+X	**	A Straight can occur only when all dice are being rolled, so d_pts_roll
+X	**	and d_pts_dice should be zero.  The value of a Straight is a constant.
+X	*/
+X	if(pd->d_best == Straight) {
+X		points = P_STRAIGHT;
+X		pd->d_pts_roll = points;
+X		pd->d_pts_dice = points;
+X		if((pd->d_pts_turn += points) > pd->d_pts_max)
+X			pd->d_pts_max = pd->d_pts_turn;
+X		return;
+X	}
+X
+X#ifdef	ASMSTR
+X	/*
+X	**	An Asm_straight can occur only when there were previously held dice.
+X	**	As with All_of_a_kind, the value of the saved dice is altered.
+X	**	This combination uses all dice and its value is a constant.
+X	*/
+X	if(pd->d_best == Asm_straight) {
+X		points = P_ASMSTR;
+X		pd->d_pts_roll = points - pd->d_pts_dice;
+X		if((pd->d_pts_turn += pd->d_pts_roll) > pd->d_pts_max)
+X			pd->d_pts_max = pd->d_pts_turn;
+X		return;
+X	}
+X#endif	ASMSTR
+X
+X	/*
+X	**	The rest of the combinations can occur in concert.
+X	*/
+X	pd->d_pts_roll = 0;
+X
+X#ifdef	FOUR
+X	/*
+X	**	Four_of_a_kind is tricky. The value is dependent on the denomination,
+X	**	but not all dice are used up.  Even worse, for the sake of generality,
+X	**	we must assume that there could be more than one Four_of_a_kind.
+X	**	This code assumes that Four_of_a_kind and Small_straight will
+X	**	not occur at the same time.
+X	*/
+X	if(pd->d_best == Four_of_a_kind) {
+X		for(d = 0;d < NDICE;++d)
+X			comb[d] = pd->d_comb[d];
+X		for(d = 0;d < NDICE;++d) {
+X			if(comb[d] == Four_of_a_kind) {
+X				/*
+X				**	Award the points for this one.
+X				*/
+X				face = pd->d_face[d];
+X				points = P_4OKMULT * FVALUE(face);
+X				pd->d_pts_roll += points;
+X				pd->d_pts_dice += points;
+X				if((pd->d_pts_turn += points) > pd->d_pts_max)
+X					pd->d_pts_max = pd->d_pts_turn;
+X
+X				/*
+X				**	Obliterate the scoring dice.
+X				*/
+X				for(n = FOUR, dd = d;dd < NDICE;++dd) {
+X					if(comb[dd] != Four_of_a_kind)
+X						continue;
+X					if(pd->d_face[dd] != face)
+X						continue;
+X					comb[dd] = Nothing;
+X					if(--n == 0)
+X						break;
+X				}
+X			}
+X		}
+X	}
+X#endif	FOUR
+X
+X#ifdef	SMSTR
+X	/*
+X	**	Score a Small_straight.  This code assumes that Four_of_a_kind
+X	**	(or Three_of_a_kind) and Small_straight will not occur at the
+X	**	same time.  It also assumes that only one Small_straight can
+X	**	occur at a time.
+X	*/
+X	if(pd->d_best == Small_straight) {
+X		points = P_SMSTR;
+X		pd->d_pts_roll += points;
+X		pd->d_pts_dice += points;
+X		if((pd->d_pts_turn += points) > pd->d_pts_max)
+X			pd->d_pts_max = pd->d_pts_turn;
+X	}
+X#endif	SMSTR
+X
+X	/*
+X	**	Three_of_a_kind is tricky. The value is dependent on the denomination,
+X	**	but not all dice are used up.  Even worse, for the sake of generality,
+X	**	we must assume that there could be more than one Three_of_a_kind.
+X	**	Assumes that Three_of_a_kind does not occur in conjunction with
+X	**	Four_of_a_kind or Small_straight.
+X	*/
+X	if(pd->d_best == Three_of_a_kind) {
+X		for(d = 0;d < NDICE;++d)
+X			comb[d] = pd->d_comb[d];
+X		for(d = 0;d < NDICE;++d) {
+X			if(comb[d] == Three_of_a_kind) {
+X				/*
+X				**	Award the points for this one.
+X				*/
+X				face = pd->d_face[d];
+X				points = P_3OKMULT * FVALUE(face);
+X				pd->d_pts_roll += points;
+X				pd->d_pts_dice += points;
+X				if((pd->d_pts_turn += points) > pd->d_pts_max)
+X					pd->d_pts_max = pd->d_pts_turn;
+X
+X				/*
+X				**	Obliterate the scoring dice.
+X				*/
+X				for(n = THREE, dd = d;dd < NDICE;++dd) {
+X					if(comb[dd] != Three_of_a_kind)
+X						continue;
+X					if(pd->d_face[dd] != face)
+X						continue;
+X					comb[dd] = Nothing;
+X					if(--n == 0)
+X						break;
+X				}
+X			}
+X		}
+X	}
+X
+X	/*
+X	**	Finally we have Aces, Fives and Jokers.  Easy.
+X	*/
+X	for(d = 0;d < NDICE;++d) {
+X		switch(pd->d_comb[d]) {
+X		case Joker:	points = P_JOKER; goto addscore;
+X		case Five:	points = P_FIVE; goto addscore;
+X		case Ace:	points = P_ACE; goto addscore;
+Xaddscore:
+X			pd->d_pts_roll += points;
+X			pd->d_pts_dice += points;
+X			if((pd->d_pts_turn += points) > pd->d_pts_max)
+X				pd->d_pts_max = pd->d_pts_turn;
+X			break;
+X		default:
+X			break;
+X		}
+X	}
+X}
+X
+X#ifdef	ASMSTR
+X/*
+X**	heldsmall: if Small_straight held, return lowest face, else BADFACE
+X*/
+Xheldsmall(pd)
+Xdiceset	   *pd;
+X{
+X	register int	d, low;
+X	diceset			temp;
+X
+X	if(pd->d_rolling != 1)
+X		return BADFACE;
+X	
+X	/*
+X	**	Pretend like we just rolled this hand then evaluate it.
+X	*/
+X	temp = *pd;
+X	for(d = 0;d < NDICE;++d)
+X		temp.d_stat[d] = Rolled;
+X	evaluate(&temp);
+X	if(temp.d_best != Small_straight)
+X		return BADFACE;
+X	
+X	/*
+X	**	Find lowest face in the Small_straight.
+X	*/
+X	low = JOKER+1;
+X	for(d = 0;d < NDICE;++d)
+X		if(temp.d_comb[d] == Small_straight && temp.d_face[d] < low)
+X			low = temp.d_face[d];
+X	
+X	return low;
+X}
+X#endif	ASMSTR
+END_OF_FILE
+if test 18796 -ne `wc -c <'dieopts.c'`; then
+    echo shar: \"'dieopts.c'\" unpacked with wrong size!
+fi
+# end of 'dieopts.c'
+fi
+if test -f 'histanal.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'histanal.c'\"
+else
+echo shar: Extracting \"'histanal.c'\" \(19000 characters\)
+sed "s/^X//" >'histanal.c' <<'END_OF_FILE'
+X/*	vi:set sw=4 ts=4: */
+X#ifndef	lint
+Xstatic char	sccsid[] = "@(#)histanal.c 5.1 (G.M. Paris) 89/01/22";
+X#endif	lint
+X
+X/*
+X**
+X**	cubes 5.1  Copyright 1989 Gregory M. Paris
+X**		Permission granted to redistribute on a no charge basis.
+X**		All other rights are reserved.
+X**
+X*/
+X
+X#include	<stdio.h>
+X#include	<pwd.h>
+X#include	<syslog.h>
+X#include	<strings.h>
+X#include	"cubes.h"
+X
+X#ifdef	lint
+X#ifndef	HISTFILE
+X#define	HISTFILE	"dummy-histfile"
+X#endif	HISTFILE
+X#endif	lint
+X
+X/*
+X**	rating: a structure for rating strategies and temperaments
+X*/
+Xtypedef struct {
+X	history		r_hist;
+X	long		r_count;
+X	char	   *r_name;
+X} rating;
+X
+Xextern unsigned		nhist;
+Xextern history	   *hist;
+Xextern ptstype		ptsmode;
+Xextern computer		comptbl[];
+Xextern int			tempers, strategies;
+Xextern long			gamenum;
+Xstatic int			rwid;
+Xstatic int			gwid;
+X
+Xextern int			optind;
+Xextern int			opterr;
+Xextern char		   *optarg;
+Xextern char		   *calloc();
+Xextern double		log10();
+Xextern int			nextupcmp();
+Xextern char		   *fullname();
+Xstruct passwd	   *getpwnam();
+Xstruct passwd	   *getpwuid();
+X
+Xboolean	inprogress	= False;						/* dummy */
+Xboolean	jokermode	= False;						/* dummy */
+Xwinpref	gametype	= Standard;						/* dummy */
+Xint		winscore	= WINSCORE;						/* dummy */
+Xint		turnnum;									/* dummy */
+Xint		nojokers(pd)   diceset *pd; { pd = pd; }	/* stub */
+Xint		nofives(pd)    diceset *pd; { pd = pd; }	/* stub */
+Xint		noaces(pd)     diceset *pd; { pd = pd; }	/* stub */
+Xint		no3deuce(pd)   diceset *pd; { pd = pd; }	/* stub */
+Xint		no3three(pd)   diceset *pd; { pd = pd; }	/* stub */
+Xint		no3any(pd)	   diceset *pd; { pd = pd; }	/* stub */
+Xint		nosmall(pd)    diceset *pd; { pd = pd; }	/* stub */
+Xint		noacesmall(pd) diceset *pd; { pd = pd; }	/* stub */
+Xint		expect(pd)     diceset *pd; { pd = pd; }	/* stub */
+Xdouble	ziprisk(n) { n = n; }						/* stub */
+Xchar   *moniker() { return "Kamelion"; }			/* stub */
+Xboolean	sameface(pd,c,s) diceset *pd;combination c;boolean s;
+X	{ pd = pd, c = c; return s; }					/* stub */
+X
+X/*
+X**	Fake definitions for humans and cubex to allow easy tallying.
+X*/
+Xstatic strategy	st_human	= { 0, "human" };
+Xstatic temper	te_human	= { 0, "human" };
+Xstatic computer	human	= { "**human**", &st_human, &te_human, Fickle };
+Xstatic strategy	st_cubex	= { 0, "cubex" };
+Xstatic temper	te_cubex	= { 0, "cubex" };
+X
+Xstatic char		   *ptsmodename;
+Xstatic char		  **namelist;
+Xstatic boolean		inlist();
+Xstatic boolean		careabout();
+X
+Xstatic char		   *histfile	= HISTFILE;	/* the file to analyze */
+Xstatic boolean		dorank		= True;		/* show individual rankings */
+Xstatic boolean		nextup		= False;	/* rankings in next-up order */
+Xstatic boolean		tallystrat	= False;	/* produce strategy tally */
+Xstatic boolean		tallytemp	= False;	/* produce temperament tally */
+Xstatic boolean		humansonly	= False;	/* consider only humans */
+Xstatic boolean		ancient		= False;	/* consider ancient players */
+Xstatic boolean		showpers	= False;	/* show "personalities" */
+Xstatic boolean		showlast	= False;	/* show last game played */
+Xstatic boolean		nospaces	= False;	/* convert spaces in names */
+Xstatic int			onlylast	= -1;		/* only players of recent games */
+Xstatic long			myrank		= -1;		/* user's rank */
+Xstatic int			range		= -1;		/* a range around user's rank */
+Xstatic char			myid[IDLEN]	= "";		/* user's id */
+X
+Xmain(ac, av)
+Xchar   *av[];
+X{
+X	register int		c, h;
+X	register history   *phist;
+X	double				winrt, bwinrt;
+X	long				avgmpt, bavgmpt;
+X	long				avtnpt, bavtnpt, bweight;
+X	rating			   *temprat, *stratrat;
+X	struct passwd	   *pw;
+X	char				name[NAMELEN];
+X
+X	opterr = 0;
+X	while((c = getopt(ac, av, "rtRLCPSTahlsuf:g:n:p:")) >= 0) {
+X		switch(c) {
+X		case 'C':	/* use combined (lifetime+recent) points in ranking */
+X			ptsmode = Combined;
+X			break;
+X		case 'L':	/* use lifetime points in ranking */
+X			ptsmode = Lifetime;
+X			break;
+X		case 'R':	/* use recent points in ranking */
+X			ptsmode = Recent;
+X			break;
+X		case 'P':	/* toggle show personality */
+X			showpers = (showpers == True) ? False : True;
+X			break;
+X		case 'S':	/* toggle strategy tally */
+X			tallystrat = (tallystrat == True) ? False : True;
+X			break;
+X		case 'T':	/* toggle temperament tally */
+X			tallytemp = (tallytemp == True) ? False : True;
+X			break;
+X		case 'r':	/* XXX: backwards compat */
+X			fprintf(stderr, "cuberank: warning: -r obsolete; use -[PST]\n");
+X			dorank = (dorank == True) ? False : True;
+X			break;
+X		case 't':	/* XXX: backwards compat */
+X			fprintf(stderr, "cuberank: warning: -t obsolete; use -[PST]\n");
+X			tallystrat = (tallystrat == True) ? False : True;
+X			tallytemp  = (tallytemp  == True) ? False : True;
+X			break;
+X		case 'a':	/* toggle ancient mode */
+X			ancient = (ancient == True) ? False : True;
+X			break;
+X		case 'h':	/* toggle humans only */
+X			humansonly = (humansonly == True) ? False : True;
+X			break;
+X		case 'l':	/* toggle showlast mode */
+X			showlast = (showlast == True) ? False : True;
+X			break;
+X		case 's':	/* toggle replacing spaces in names */
+X			nospaces = (nospaces == True) ? False : True;
+X			break;
+X		case 'u':	/* toggle next-up mode */
+X			nextup = (nextup == True) ? False : True;
+X			break;
+X		case 'f':	/* specify the history file to use */
+X			histfile = optarg;
+X			break;
+X		case 'g':	/* consider players of onlylast most recent games */
+X			if((onlylast = atoi(optarg)) <= 0) {
+X				fprintf(stderr,
+X					"cuberank: recent game count must be positive\n");
+X				exit(1);
+X			}
+X			break;
+X		case 'n':	/* a range about a player (default this one) */
+X			if((range = atoi(optarg)) < 0) {
+X				fprintf(stderr,
+X					"cuberank: range around your rank must be non-negative\n");
+X				exit(1);
+X			}
+X			break;
+X		case 'p':	/* specify player id for use with the range option */
+X			strncpy(myid, optarg, IDLEN);
+X			myid[IDLEN-1] = '\0';
+X			if(range == -1)
+X				range = 1;	/* maybe should be an error? */
+X			break;
+X		default:
+X			fprintf(stderr,
+X"usage -- cuberank [-{ahlsuRLCPST}] [-g games] [-n range [-p plr]] [plr ...]\n"
+X				);
+X			exit(1);
+X		}
+X	}
+X
+X	/*
+X	**	Normally tallytemp and tallystrat want to turn off printing
+X	**	of rankings, but we allow certain options to keep it on.
+X	*/
+X	if(showpers==False && nextup==False && humansonly==False && range==-1)
+X		if(tallytemp == True || tallystrat == True)
+X			dorank = False;
+X
+X	/*
+X	**	Remaining arguments are a list of names of players that we
+X	**	care about.  All others are ignored.
+X	*/
+X	namelist = &av[optind];
+X
+X	/*
+X	**	Reconcile incompatible options.
+X	*/
+X	if(range != -1 && nextup == True) {
+X		fprintf(stderr, "cuberank: range cannot be used with nextup\n");
+X		exit(1);
+X	}
+X	if(nextup == True && humansonly == True) {
+X		fprintf(stderr, "cuberank: humans cannot be used with nextup\n");
+X		exit(1);
+X	}
+X
+X	/*
+X	**	Suitable symbolic for ptsmode.
+X	*/
+X	switch(ptsmode) {
+X	case Lifetime:	ptsmodename = "(Life.)"; break;
+X	case Recent:	ptsmodename = "(Recent)"; break;
+X	case Combined:	ptsmodename = "(Comb.)"; break;
+X	default:		ptsmodename = "(Error)"; break;
+X	}
+X
+X	/*
+X	**	Call openlog to provide for syslog calls in shared routines.
+X	*/
+X#ifdef	LOG_USER
+X	openlog("cuberank", LOG_PID, LOG_USER);
+X	setlogmask(LOG_UPTO(LOG_ERR));
+X#else	LOG_USER
+X	openlog("cuberank", LOG_PID);
+X#endif	LOG_USER
+X
+X	/*
+X	**	Read in the player histories.
+X	*/
+X	initcomptbl();
+X	if(histread(histfile) < 0)
+X		exit(1);
+X	setgamenum();
+X	if(ancient == False)
+X		histprune(ANALCREDIT);
+X	histsort();
+X	if(nextup == True)
+X		qsort((char *)hist, (int)nhist, sizeof *hist, nextupcmp);
+X
+X	/*
+X	**	Massage things a bit for tallying/printing purposes.
+X	XXX	This must be done after nextup sort.
+X	*/
+X	for(phist = hist, h = 0;h < nhist;++h, ++phist) {
+X		if(phist->h_computer == 0)
+X			phist->h_computer = &human;
+X		else if(phist->h_computer == &comptbl[0]) {
+X			phist->h_computer->c_strategy = &st_cubex;
+X			phist->h_computer->c_temper = &te_cubex;
+X		}
+X	}
+X
+X	rwid = (nhist < 100) ? 2 : ((int)log10((double)nhist) + 1);
+X	gwid = (gamenum < 100) ? 2 : ((int)log10((double)gamenum) + 1);
+X
+X	/*
+X	**	If necessary, get this user's id from the password file.
+X	**	Find the ranking of this user.
+X	*/
+X	if(range != -1) {
+X		if(myid[0] == '\0') {
+X			if((pw = getpwuid(getuid())) == 0) {
+X				syslog(LOG_ERR, "no password entry for uid %d", getuid());
+X				fprintf(stderr, "cuberank: you have no password file entry\n");
+X				exit(1);
+X			}
+X			strncpy(myid, pw->pw_name, IDLEN);
+X			myid[IDLEN-1] = '\0';
+X		}
+X
+X		myrank = -1;
+X		for(phist = hist, h = 0;h < nhist;++h, ++phist) {
+X			if(strncmp(myid, phist->h_id, IDLEN) == 0) {
+X				myrank = phist->h_rank;
+X				break;
+X			}
+X		}
+X		if(myrank == -1) {
+X			fprintf(stderr, "cuberank: you (%s) are not ranked\n", myid);
+X			exit(1);
+X		}
+X	}
+X
+X	/*
+X	**	If temperament tally is requested, initialize the ranking tallies.
+X	**	We need room for three extras: kamelion, human, and cubex.
+X	*/
+X	if(tallytemp == True) {
+X		temprat = (rating *)calloc((unsigned)(tempers+3), sizeof *temprat);
+X		if(temprat == 0) {
+X			syslog(LOG_ERR, "no memory for temperaments");
+X			fprintf(stderr,
+X				"cuberank: no memory for temperament rating table\n");
+X			exit(1);
+X		}
+X		for(phist = hist, h = 0;h < nhist;++h, ++phist)
+X			if(careabout(phist) == True)
+X				addtemp(h, temprat);
+X	}
+X
+X	/*
+X	**	If strategy tally is requested, initialize the ranking tallies.
+X	**	We need room for three extras: kamelion, human, and cubex.
+X	*/
+X	if(tallystrat == True) {
+X		stratrat = (rating *)calloc((unsigned)(strategies+3), sizeof *stratrat);
+X		if(stratrat == 0) {
+X			syslog(LOG_ERR, "no memory for strategies");
+X			fprintf(stderr, "cuberank: no memory for strategy rating table\n");
+X			exit(1);
+X		}
+X		for(phist = hist, h = 0;h < nhist;++h, ++phist)
+X			if(careabout(phist) == True)
+X				addstrat(h, stratrat);
+X	}
+X
+X	if(dorank == True) {
+X		/*
+X		**	Find the players with the best win rate, best average game points,
+X		**	best average turn points, and best weighted points.
+X		*/
+X		bwinrt = -1.0;
+X		bavgmpt = bavtnpt = -1;
+X		bweight = nextup == False ? hist->h_weight : -1;
+X		for(phist = hist, h = 0;h < nhist;++h, ++phist) {
+X			if(phist->h_games == 0)
+X				continue;
+X			histcalc(phist, &winrt, &avgmpt, &avtnpt);
+X
+X			if(winrt > bwinrt)
+X				bwinrt = winrt;
+X			if(avgmpt > bavgmpt)
+X				bavgmpt = avgmpt;
+X			if(avtnpt > bavtnpt)
+X				bavtnpt = avtnpt;
+X			if(nextup == True && phist->h_weight > bweight)
+X				bweight = phist->h_weight;
+X		}
+X
+X		/*
+X		**	Print the players in ranking order.  Ancient records are
+X		**	ranked even if they're not displayed.
+X		*/
+X		if(nextup == True)
+X			printf("%*.*s  ", rwid, rwid, "Up");
+X		printf("%.*s  Player %-*.*s  %*s  ",
+X			rwid, "######", DISPLEN-7, DISPLEN-7, ptsmodename, gwid, "GP");
+X		if(showlast == True)
+X			printf("%*s  ", gwid, "LG");
+X		printf("%5s  %5s  %4s  %5s ", "WinRt", "GamPt", "TnPt", "WgtPt");
+X		if(showpers == True)
+X			printf(" %-2.2s  %-3.3s  %-3.3s", "Pref", "Tmp", "Str");
+X		printf("\n");
+X		for(phist = hist, h = 0;h < nhist;++h, ++phist) {
+X			if(careabout(phist) == False)
+X				continue;
+X			histcalc(phist, &winrt, &avgmpt, &avtnpt);
+X
+X			if(phist->h_computer == &human && index(phist->h_id, '@') == 0
+X			&& (pw = getpwnam(phist->h_id)) != 0 && pw->pw_gecos[0] != '\0')
+X				strcpy(name, fullname(pw));
+X			else
+X				sprintf(name, "%.*s", DISPLEN, phist->h_id);
+X
+X			/*
+X			**	Convert spaces to underscores when required.
+X			*/
+X			if(nospaces == True) {
+X				char   *space;
+X
+X				while((space = index(name, ' ')) != 0)
+X					*space = '_';
+X			}
+X
+X			if(nextup == True)
+X				printf("%*d  ", rwid, h + 1);
+X			printf("%*ld  %-*.*s  %*ld  ", rwid, phist->h_rank,
+X				DISPLEN, DISPLEN, name, gwid, phist->h_games);
+X
+X			if(showlast == True)
+X				printf("%*ld  ", gwid, phist->h_lastgame);
+X			printf("%5.3f%c %5ld%c %4ld%c %5ld%c",
+X				winrt, (winrt > bwinrt - 1e-5) ? '*' : ' ',	/* episilon == 1e-5 */
+X				avgmpt, avgmpt == bavgmpt ? '*' : ' ',
+X				avtnpt, avtnpt == bavtnpt ? '*' : ' ',
+X				phist->h_weight, phist->h_weight == bweight ? '*' : ' '
+X			);
+X			if(showpers == True) {
+X				char   *pref;
+X				switch(phist->h_computer->c_pref) {
+X				case Nopref:	pref = "-";  break;
+X				case Standard:	pref = "S";  break;
+X				case Blitz:		pref = "B";  break;
+X				case Fickle:	pref = "?";  break;
+X				case Fstand:	pref = "FS"; break;
+X				case Fblitz:	pref = "FB"; break;
+X				default:		pref = "??"; break;
+X				}
+X				printf(" %-2.2s  %-3.3s  %-3.3s", pref,
+X					phist->h_computer->c_temper->t_name,
+X					phist->h_computer->c_strategy->s_name
+X				);
+X			}
+X			printf("\n");
+X		}
+X	}
+X
+X	/*
+X	**	If temperament tally was requested, print it.
+X	*/
+X	if(tallytemp == True) {
+X		if(dorank == True)
+X			putchar('\n');
+X		ratranksort(temprat);
+X		ratprint(temprat, "Temper  ");
+X	}
+X
+X	/*
+X	**	If strategy tally was requested, print it.
+X	*/
+X	if(tallystrat == True) {
+X		if(dorank == True || tallytemp == True)
+X			putchar('\n');
+X		ratranksort(stratrat);
+X		ratprint(stratrat, "Strat   ");
+X	}
+X	
+X	exit(0);
+X}
+X
+X/*
+X**	words: break a string into words
+X**		Fills passed array with pointers to words, returns number of words.
+X**		Destroys the original string.
+X*/
+Xwords(s, w, maxw)
+Xregister char  *s, **w;
+Xint				maxw;
+X{
+X	register int	nw		= 0;
+X	boolean			inword	= False;
+X
+X	for(;*s != '\0';++s) {
+X		if(*s == ' ' || *s == '\t') {
+X			*s = '\0';
+X			inword = False;
+X		} else if(inword == False) {
+X			if(--maxw < 0)
+X				break;
+X			w[nw++] = s;
+X			inword = True;
+X		}
+X	}
+X
+X	return nw;
+X}
+X
+X/*
+X**	inlist: return true if name matches one in namelist
+X**		Does word by word match.
+X*/
+Xstatic boolean
+Xinlist(test)
+Xchar   *test;
+X{
+X#define	MAXWORDS	16
+X
+X	register int	tt, ll, ofs, len;
+X	int				ntw, nlw, i;
+X	char			tbuf[NAMELEN], lbuf[NAMELEN];
+X	char		   *tw[MAXWORDS], *lw[MAXWORDS];
+X	boolean			match;
+X
+X	if(namelist[0] == 0)		/* first item is NULL */
+X		return True;			/* no namelist */
+X	
+X	/*
+X	**	Break the test string into words.
+X	*/
+X	strncpy(tbuf, test, NAMELEN);
+X	tbuf[NAMELEN-1] = '\0';
+X	ntw = words(tbuf, tw, MAXWORDS);
+X
+X	/*
+X	**	Search the namelist.  If the namelist string has more
+X	**	words than the test string, it can't be a match.
+X	**	Otherwise, try various matching methods.
+X	*/
+X	for(i = 0;namelist[i] != 0;++i) {
+X		strncpy(lbuf, namelist[i], NAMELEN);
+X		lbuf[NAMELEN-1] = '\0';
+X		if((nlw = words(lbuf, lw, MAXWORDS)) == 0)
+X			continue;
+X
+X		/*
+X		**	If there's more words in the namelist string than in
+X		**	the test string, this cannot be a match.
+X		*/
+X		if(nlw > ntw)
+X			continue;
+X
+X		/*
+X		**	Try to match each word in the namelist string with a word
+X		**	in the test string.  Treat the namelist words as initial
+X		**	substrings.  We can skip words in the test string, but we
+X		**	must match every word in the namelist string.
+X		*/
+X		ofs = 0;
+X		match = True;
+X		for(ll = 0;ll < nlw;++ll) {
+X			len = strlen(lw[ll]);
+X			for(tt = ofs;tt < ntw;++tt) {
+X				if(strncmp(tw[tt], lw[ll], len) == 0) {
+X					ofs = tt + 1;
+X					break;
+X				}
+X			}
+X			if(tt == ntw) {
+X				match = False;
+X				break;
+X			}
+X		}
+X		if(match == True)
+X			return True;
+X	}
+X	
+X	return False;
+X
+X#undef	MAXWORDS
+X}
+X
+X/*
+X**	careabout: do we care about this history entry?
+X*/
+Xstatic boolean
+Xcareabout(phist)
+Xregister history   *phist;
+X{
+X	struct passwd  *pw;
+X
+X	if(range != -1) {
+X		if(phist->h_rank < myrank - range)
+X			return False;
+X		if(phist->h_rank > myrank + range)
+X			return False;
+X	}
+X
+X	if(onlylast != -1)
+X		if(phist->h_lastgame + onlylast < gamenum)
+X			return False;
+X
+X	if(humansonly == True && phist->h_computer != &human)
+X		return False;
+X
+X	if(nextup == True && phist->h_computer == &human)
+X		return False;
+X
+X	if(namelist[0] != 0) {
+X		if(inlist(phist->h_id) == True)
+X			return True;
+X		if(phist->h_computer == &human && index(phist->h_id, '@') == 0)
+X			if((pw = getpwnam(phist->h_id)) != 0 && pw->pw_gecos[0] != '\0')
+X				if(inlist(fullname(pw)) == True)
+X					return True;
+X		return False;
+X	}
+X	
+X	return True;
+X}
+X
+X/*
+X**	addtemp: add temperament stats to rating table
+X*/
+Xaddtemp(h, prat)
+Xint					h;
+Xregister rating	   *prat;
+X{
+X	register history   *phist	= hist + h;
+X	register history   *phacc;
+X
+X#define	T_NAME	phist->h_computer->c_temper->t_name
+X
+X	for(;;++prat) {							/* assumes prat is large enough */
+X		if(prat->r_name == 0)
+X			prat->r_name = T_NAME;
+X		else if(strcmp(prat->r_name, T_NAME) != 0)	/* no pointer compare! */
+X			continue;
+X		phacc = &prat->r_hist;
+X		phacc->h_points += phist->h_points;
+X		phacc->h_avgturn += phist->h_avgturn;
+X		phacc->h_wins += phist->h_wins;
+X		phacc->h_games += phist->h_games;
+X		phacc->h_mvpoints += phist->h_mvpoints;
+X		phacc->h_mvavgturn += phist->h_mvavgturn;
+X		phacc->h_mvwins += phist->h_mvwins;
+X		phacc->h_mvgames += phist->h_mvgames;
+X		phacc->h_lastgame += phist->h_lastgame;
+X		phacc->h_weight += phist->h_weight;
+X		phacc->h_rank += h + 1;
+X		prat->r_count++;
+X		break;
+X	}
+X
+X#undef	T_NAME
+X}
+X
+X/*
+X**	addstrat: add strategy stats to rating table
+X*/
+Xaddstrat(h, prat)
+Xint					h;
+Xregister rating	   *prat;
+X{
+X	register history   *phist	= hist + h;
+X	register history   *phacc;
+X
+X#define	S_NAME	phist->h_computer->c_strategy->s_name
+X
+X	for(;;++prat) {							/* assumes prat is large enough */
+X		if(prat->r_name == 0)
+X			prat->r_name = S_NAME;
+X		else if(strcmp(prat->r_name, S_NAME) != 0)	/* no pointer compare! */
+X			continue;
+X		phacc = &prat->r_hist;
+X		phacc->h_points += phist->h_points;
+X		phacc->h_avgturn += phist->h_avgturn;
+X		phacc->h_wins += phist->h_wins;
+X		phacc->h_games += phist->h_games;
+X		phacc->h_mvpoints += phist->h_mvpoints;
+X		phacc->h_mvavgturn += phist->h_mvavgturn;
+X		phacc->h_mvwins += phist->h_mvwins;
+X		phacc->h_mvgames += phist->h_mvgames;
+X		phacc->h_lastgame += phist->h_lastgame;
+X		phacc->h_weight += phist->h_weight;
+X		phacc->h_rank += h + 1;
+X		prat->r_count++;
+X		break;
+X	}
+X
+X#undef	S_NAME
+X}
+X
+X/*
+X**	ratcomp: rating comparison function
+X*/
+Xratcomp(r1, r2)
+Xrating *r1, *r2;
+X{
+X	int		diff;
+X
+X	if((diff = r1->r_hist.h_rank - r2->r_hist.h_rank) != 0)
+X		return diff;
+X	if((diff = r2->r_hist.h_weight - r1->r_hist.h_weight) != 0)
+X		return diff;
+X	return 0;
+X}
+X
+X/*
+X**	ratranksort: reorder a rating table based on average ranking
+X*/
+Xratranksort(rattbl)
+Xrating *rattbl;
+X{
+X	register rating	   *pr;
+X	register int		n;
+X
+X	for(n = 0, pr = rattbl;pr->r_name != 0;++pr, ++n) {
+X		if(pr->r_count != 0) {
+X			pr->r_hist.h_rank /= pr->r_count;		/* normalize rank */
+X			pr->r_hist.h_weight /= pr->r_count;		/* normalize weight */
+X			pr->r_hist.h_lastgame /= pr->r_count;	/* normalize lastgame */
+X		}
+X	}
+X
+X	qsort((char *)rattbl, n, sizeof *rattbl, ratcomp);
+X}
+X
+X/*
+X**	ratprint: print a rating table with the given heading
+X*/
+Xratprint(rattbl, heading)
+Xrating *rattbl;
+Xchar   *heading;
+X{
+X	register rating	   *pr;
+X	long				avgmpt, avtnpt;
+X	double				winrt;
+X
+X	printf("%.*s  %-6.6s %-*.*s %1.1s  %*s", rwid, "######", heading,
+X		DISPLEN-9, DISPLEN-9, ptsmodename, "NP", gwid, "GP");
+X	if(showlast == True)
+X		printf("  %*s", gwid, "LG");
+X	printf("  %5s  %5s  %4s  %5s\n",
+X		"WinRt", "GamPt", "TnPt", "WgtPt");
+X	for(pr = rattbl;pr->r_name != 0;++pr) {
+X		if(pr->r_count == 0 || pr->r_hist.h_games == 0)
+X			continue;
+X		histcalc(&pr->r_hist, &winrt, &avgmpt, &avtnpt);
+X		printf("%*ld  %-*.*s  %3d  %*ld",
+X			rwid, pr->r_hist.h_rank,	/* normalized by ratranksort */
+X			DISPLEN-5, DISPLEN-5, pr->r_name, pr->r_count,
+X			gwid, pr->r_hist.h_games
+X		);
+X		if(showlast == True)
+X			printf("  %*ld", gwid,
+X				pr->r_hist.h_lastgame	/* normalized by ratranksort */
+X			);
+X		printf("  %5.3f  %5ld  %4ld  %5ld\n",
+X			winrt, avgmpt, avtnpt,
+X			pr->r_hist.h_weight			/* normalized by ratranksort */
+X		);
+X	}
+X}
+END_OF_FILE
+if test 19000 -ne `wc -c <'histanal.c'`; then
+    echo shar: \"'histanal.c'\" unpacked with wrong size!
+fi
+# end of 'histanal.c'
+fi
+if test -f 'scr.sh' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'scr.sh'\"
+else
+echo shar: Extracting \"'scr.sh'\" \(832 characters\)
+sed "s/^X//" >'scr.sh' <<'END_OF_FILE'
+X#! /bin/sh
+X# vi:set sw=4 ts=4:
+X#
+X# scr: Super CubeRank (cuberank combining your favorite options)
+X#
+X
+XPATH=/usr/games:/bin:/usr/bin
+Xumask 066
+Xcmds=/tmp/scr.cmds$$ text=/tmp/scr.text$$
+Xtrap "rm -f $cmds $text;exit 1" 1 2 3 15
+Xrm -f $cmds $text
+X
+X# players in last game played
+Xcuberank -g1 $*                >> $text
+X
+X# players ranked within 3
+Xcuberank -n3 $*                >> $text
+X
+X# top 4 humans
+Xcuberank -h  $* | sed 5q       >> $text
+X
+X# top 5 players, record-holding players, and favorites
+Xcuberank     $* | sed -n -e '
+X	1d
+X	2,6{;p;d;}
+X	/\*/{;p;d;}
+X	/ Kamelion /{;p;d;}
+X' >> $text
+X
+X# next 5 up and marking commands
+Xcuberank -u  $* | sed -n -e '
+X	1d
+X	s/^ *[0-9]*  //p
+X	s/^\( *[0-9]*\) .*/\/^\1 \/s\/\/\1*\//w '$cmds'
+X	6q
+X' >> $text
+X
+X# sort by rank uniquely and mark next up
+Xsort +0nu $text | sed -f $cmds
+X
+Xrm -f $cmds $text
+Xexit 0
+END_OF_FILE
+if test 832 -ne `wc -c <'scr.sh'`; then
+    echo shar: \"'scr.sh'\" unpacked with wrong size!
+fi
+chmod +x 'scr.sh'
+# end of 'scr.sh'
+fi
+echo shar: End of archive 5 \(of 8\).
+cp /dev/null ark5isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 8 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

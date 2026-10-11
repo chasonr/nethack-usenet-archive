@@ -1,0 +1,251 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,8a4c9661743cedc0,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-07-04 14:21:24 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!henry
+From: henry@utzoo.UUCP (Henry Spencer)
+Newsgroups: net.sources
+Subject: public-domain getwd(3)
+Message-ID: <4027@utzoo.UUCP>
+Date: Wed, 4-Jul-84 17:21:24 EDT
+Article-I.D.: utzoo.4027
+Posted: Wed Jul  4 17:21:24 1984
+Date-Received: Wed, 4-Jul-84 17:21:24 EDT
+Organization: U of Toronto Zoology
+Lines: 231
+
+The following is the source and manual page for a public-domain getwd(3)
+routine, the C function equivalent of the pwd(1) program.  This stuff has
+been written from scratch without reference to Bell or Berkeley sources.
+It may be used by anyone, on any system, for any purpose.  It has been
+tested on both V7 and 4.1BSD, and is believed to contain no gratuitous
+system dependencies, with one exception:  it wants the Berkeley routines
+for directory scanning.  It could easily be fixed to bypass this need,
+but since I think the directory routines are a Good Thing and their use
+should be encouraged, I haven't done so.
+
+Note that the reference in the manual page to pwd(1) running setuid-root
+may not be true everywhere (although it should be made true everywhere...).
+
+-----
+/*
+ * getwd - get working directory
+ *
+ * Probably should use lstat rather than stat throughout, if run on
+ * a system with symbolic links.
+ */
+
+#include <stdio.h>
+#include <sys/types.h>
+#include <ndir.h>
+#include <sys/stat.h>
+
+/*
+ * getwd - master control
+ */
+char *
+getwd(pathname)
+register char pathname[];
+{
+	register char *ret;
+	register FILE *pwd;
+	extern char *trygetwd();
+	extern FILE *popen();
+
+	ret = trygetwd(pathname);
+	if (ret != NULL)
+		return(pathname);
+
+	/*
+	 * The simple approach failed.  Try doing it the hard way.
+	 */
+	pwd = popen("PATH=/bin:/usr/bin pwd", "r");
+	ret = fgets(pathname, 1024, pwd);
+	pclose(pwd);
+	if (ret != NULL) {
+		pathname[strlen(pathname)-1] = '\0';	/* Junk the \n. */
+		return(pathname);
+	}
+
+	/*
+	 * Total failure.
+	 */
+	strcpy(pathname, "getwd-failed");
+	return(NULL);
+}
+
+/*
+ * trygetwd - try to get the path without resorting to extreme measures
+ */
+static char *
+trygetwd(pathname)
+char pathname[];
+{
+	char parent[1024];		/* ../../.. and so forth. */
+	char *parend;			/* See comment where used. */
+	register DIR *par;
+	register struct direct *direntry;
+	struct stat parstat;
+	struct stat maybe;
+	register int statall;		/* Looking for a mounted fs? */
+	ino_t lastino;
+	dev_t lastdev;
+	ino_t rootino;
+	dev_t rootdev;
+
+	if (stat(".", &parstat) < 0)
+		return(NULL);
+	lastino = parstat.st_ino;
+	lastdev = parstat.st_dev;
+	if (stat("/", &parstat) < 0)
+		return(NULL);
+	rootino = parstat.st_ino;
+	rootdev = parstat.st_dev;
+	strcpy(parent, "..");
+	pathname[0] = '\0';
+
+	/*
+	 * Build up the pathname, ascending one level of
+	 * directory on each iteration.
+	 */
+	while (lastino != rootino || lastdev != rootdev) {
+		if (stat(parent, &parstat) < 0)
+			return(NULL);
+
+		/*
+		 * Scan directory, looking for an inode-number match with
+		 * the child directory.  There are two tricky cases:
+		 *
+		 * First, getting an inode-number match is not sufficient,
+		 * because inode numbers are unique only within a filesystem.
+		 * We must check that a promising-looking directory entry
+		 * really does point to the place we came up from.  So we
+		 * use stat() to verify number matches.
+		 *
+		 * Second, getting an inode-number match is not necessary
+		 * either, because the directory entry for the top of a
+		 * mounted filesystem carries the inode number of the place
+		 * where the filesystem is mounted, so the entry doesn't
+		 * look like it's for the-place-we-came-from until we do
+		 * a stat.  So if we run out of directory entries without
+		 * finding the child, we go through again statting everything.
+		 */
+		par = opendir(parent);
+		if (par == NULL)
+			return(NULL);
+		statall = 0;
+		for (;;) {
+			direntry = readdir(par);
+			if (direntry == NULL && statall)
+				return(NULL);	/* Both passes failed. */
+			if (direntry == NULL && !statall) {
+				/* Maybe we've hit a mount boundary... */
+				rewinddir(par);
+				statall = 1;
+				direntry = readdir(par);
+			}
+			if (direntry->d_ino == lastino || statall) {
+				/*
+				 * Use stat to check things out.  Build
+				 * a suitable pathname on the end of the
+				 * "parent" string, remembering where it
+				 * ended so we can put it back later.
+				 */
+				parend = parent + strlen(parent);
+				strcat(parent, "/");
+				strcat(parent, direntry->d_name);
+				if (stat(parent, &maybe) < 0)
+					return(NULL);
+				*parend = '\0';
+				if (maybe.st_dev == lastdev && maybe.st_ino == lastino)
+					break;		/* Found child! */
+			}
+		}
+		if (pathname[0] != '\0')
+			prepend(direntry->d_name, pathname);
+		else
+			strcpy(pathname, direntry->d_name);
+		closedir(par);
+
+		lastino = parstat.st_ino;
+		lastdev = parstat.st_dev;
+		strcat(parent, "/..");
+	}
+
+	prepend("", pathname);	/* Supply leading slash. */
+	return(pathname);
+}
+
+/*
+ * prepend - prepend a new component to a filename, with / in between
+ */
+static
+prepend(cpt, name)
+char *cpt;
+char *name;
+{
+	char tmpname[1024];
+
+	strcpy(tmpname, name);
+	strcpy(name, cpt);
+	strcat(name, "/");
+	strcat(name, tmpname);
+}
+
+#ifdef TESTING
+
+main()
+{
+	char buf[1024];
+	printf("%s\n", getwd(buf));
+}
+
+#endif
+-----
+.TH GETWD 3 local
+.DA 4 July 1984
+.SH NAME
+getwd \- get current working directory pathname
+.SH SYNOPSIS
+.B char *getwd(pathname)
+.br
+.B char *pathname;
+.SH DESCRIPTION
+.I Getwd
+copies the absolute pathname of the current working directory to
+.I pathname
+and returns a pointer to the result.
+.I Getwd
+uses the directory-scanning routines of
+.IR directory (3)
+and hence requires the
+.B \-lndir
+loader option.
+.PP
+.I Getwd
+will try to traverse the directory tree itself first;
+failing this, it will use
+.IR popen (3)
+to invoke
+.IR pwd (1),
+which runs setuid-root and can get past some permission problems
+that a C function can't.
+.SH SEE ALSO
+pwd(1)
+.SH DIAGNOSTICS
+.I Getwd
+returns NULL and places a message in
+.I pathname
+if an error occurs.
+.SH HISTORY
+Local product, written to match 4.2BSD semantics.
+.SH BUGS
+Pathnames longer than 1023 bytes will cause trouble.
+-----
+-- 
+				Henry Spencer @ U of Toronto Zoology
+				{allegra,ihnp4,linus,decvax}!utzoo!henry
+
+

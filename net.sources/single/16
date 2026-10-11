@@ -1,0 +1,224 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,d4076adb7354ac6e,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1982-04-29 03:21:47 PST
+Message-ID: <anews.Aucbcory.422>
+Newsgroups: net.sources
+Path: utzoo!decvax!ucbvax!ARPAVAX:CAD:ESVAX:Cory:erik
+X-Path: utzoo!decvax!ucbvax!ARPAVAX:CAD:ESVAX:Cory:erik
+From: Cory:erik
+Date: Thu Apr 29 03:21:47 1982
+Subject: New Version of upd.c
+X-Google-Info: Converted from the original A-News header
+
+/******************************************************************************
+ * upd.c - popen a process and use its output to update the screen
+ *
+ * argv[1] is popen'ed so quote your command if it's more than one arg.
+ * argv[2] is number of seconds to sleep between cycles.
+ *
+ * During its sojourn in Berkeley, a number a features were added:
+ *
+ * Commands: type characters during program execution and things
+ *		are now likely to happen!
+ *
+ *	Char	Action
+ *	----	------
+ *	 ^L	clear/refresh
+ *	 c	clear/refresh
+ *	 r	clear/refresh
+ *	 e	exit		Note: a signal (INT, QUIT, TERM) will also
+ *	 q	exit		stop the program, and quicker too!
+ *
+ * Windows: Those commands include windows. Type a number between 0 and 9
+ *		and if there's program output in that window, you will see it.
+ *
+ * To Compile:
+ *	cc upd.c -lcurses -ltermlib -n -O -o upd
+ *
+ * Author(s)
+ *	Andy Tannenbaum
+ *		WECo/BTL Whippany, NJ
+ *		(UUCP: mhtsa!harpo!floyd!trb)
+ *	Erik Fair
+ *		UCB/CS Berkeley, CA
+ *		(UUCP: ucbvax!ucbcory!erik)
+ *		(ARPA: Cory.erik@Berkeley)
+ *****************************************************************************/
+
+#include <curses.h>
+#include <signal.h>
+#include <ctype.h>
+
+/*	If your system does NOT have the ioctl FIONREAD, then #define
+ *	KLUDGE, so that the command input code will compile correctly
+ *	{I use alarm(2) instead}. This means that vanilla v7 systems,
+ *	and other systems w/o the new tty driver (as it appears in
+ *	VMUNIX) will have to use KLUDGE.
+ */
+#define WINDOWS	10		/* Number of windows of output */
+#define BUFSIZE WINDOWS*(24*80)	/* Windows of 24*80 (Assuming 24 Lines) */
+#define USAGE	"usage: upd 'command_string' [delay_time]\n"
+
+char	buf[BUFSIZE];		/* Massive output buffer */
+char	*screen[WINDOWS];	/* Screen pointers into output buffer */
+int	scrn;			/* Screen Number (index to `screen') */
+int	timeout;		/* For input kludge */
+
+/******************************************************************************
+*	Begin MainLine
+*/
+
+main(argc,argv)
+int	argc;
+char	**argv;
+{
+register int	i;
+register int	bufcnt;
+register int	lncnt;
+extern int	LINES;	/* Curses looks this up in termcap */
+unsigned	sleeptime;
+FILE		*pp;
+int		wincnt,poof();
+
+	/* Must have at least two arguements and not more than three */
+	if ((argc < 2) || (argc > 3)) {
+		fprintf(stderr,USAGE);
+		exit(1);
+	}
+	/* sleep for sleeptime seconds between cycles */
+	sleeptime=((argc > 2) ? atoi(argv[2]) : 0);
+	fprintf(stderr,"Delay is %u seconds between updates\n",sleeptime);
+
+	signal(SIGINT,poof);	/* Set up signals so that when one comes, we */
+	signal(SIGTERM,poof);	/* exit gracefully from the program 	     */
+	signal(SIGQUIT,poof);
+
+	scrn=0;			/* Start with screen Number Zero */
+	screen[0]=(&buf[0]);	/* Always */
+	initscr();		/* Curses screen initialization */
+	savetty();		/* Save current tty state */
+	noecho();		/* Set no echoing */
+	crmode();		/* set cbreak mode */
+
+/******************************************************************************
+*	Begin Main Loop
+*/
+	for(;;) {
+		/* if popen fails, we're hurting, so break */
+		if((pp=popen(argv[1],"r")) == NULL) {
+			fprintf(stderr,"upd: popen failed.\n");
+			poof();
+		}
+		bufcnt=fread(buf,1,BUFSIZE,pp);	/* Grab the output */
+		pclose(pp);			/* Close the channel */
+		buf[bufcnt]=0;			/* Zero that last char */
+		wincnt = lncnt = 1;		/* Initialize some stuff */
+		for( i=0 ; i < bufcnt ; i++ ) {
+			if (buf[i] == '\n') {
+				lncnt++;	/* Count Lines */
+				if (lncnt == LINES) {
+					screen[wincnt]=(&buf[i+1]);
+					wincnt++;
+					lncnt=1;
+				}
+			}
+		}
+		for( i=wincnt ; i < WINDOWS ; i++ )
+			screen[i]=NULL;	/* Set pointers that aren't there to NULL */
+		while((screen[scrn] == NULL) && (scrn > 0))
+			scrn--;		/* If window is empty, then backup */
+
+		mvaddstr(0,0,screen[scrn]);
+		clrtobot();
+		refresh();
+		docomd();		/* Do any commands that were input */
+		sleep(sleeptime);	/* Sleep awhile */
+	}
+}
+
+/**********************************************************************
+*	Exit from the program gracefully
+*/
+
+poof()
+{
+	clear();	/* Clear the screen */
+	refresh();
+	resetty();	/* Put tty back the way we found it */
+	exit();		/* Go home */
+}
+
+/**********************************************************************
+*	Do commands input from the keyboard
+*/
+
+docomd()
+{
+char	comnd;
+long	count;
+int	numb;
+int	wakeup();
+
+#ifdef KLUDGE
+	timeout=FALSE;
+	signal(SIGALRM,wakeup);
+	alarm(3);			/* Three seconds for input */
+#else
+	ioctl(0,FIONREAD,&count);	/* check standard input for chars */
+	if (count == 0L)
+		return;
+#endif
+	comnd=toascii(getch());		/* Wait here for alarm or input */
+#ifdef KLUDGE
+	if (timeout == TRUE)
+		return;			/* No input, go back to whatever */
+	else {
+		timeout=FALSE;		/* No timeout */
+		alarm(0);		/* Shut off alarm clock */
+	}
+#endif
+	/* Convert input to lower case, if upper case */
+	comnd=((isupper(comnd)) ? tolower(comnd) : comnd);
+
+	/* Selecting new window? */
+	if(isdigit(comnd)) {
+		numb=(comnd-'0');
+		if ((numb <= WINDOWS) && (screen[numb] != NULL)) {
+			scrn=numb;	/* Set a new window number */
+			clear();
+			mvaddstr(0,0,screen[scrn]);
+			clrtobot();
+			refresh();
+		} else {
+			fprintf(stderr,"\07");	/* Bleep, nothing there */
+		};
+	} else switch(comnd) {
+		case '\014':		/* Control-L */
+		case 'c':		/* c for clear */
+		case 'r':		/* r for refresh */
+			clear();	/* Refresh the screen */
+			mvaddstr(0,0,screen[scrn]);
+			refresh();
+			break;
+		case 'e':		/* e for exit */
+		case 'q':		/* q for quit */
+			poof();		/* Exit from the program */
+			break;
+		default:
+			fprintf(stderr,"\07");	/* Bleep, no such command */
+			break;
+	}
+}
+
+#ifdef KLUDGE
+/******************************************************************************
+*	For waking up after input wait
+*/
+wakeup()
+{
+	timeout=TRUE;
+}
+#endif
+
+

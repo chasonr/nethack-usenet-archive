@@ -1,0 +1,721 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,17b443e186e08766,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-07-31 19:59:04 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site umcp-cs.UUCP
+Path: utzoo!linus!philabs!seismo!rlgvax!cvl!umcp-cs!chris
+From: chris@umcp-cs.UUCP
+Newsgroups: net.sources
+Subject: vmpic -- vmstat in windows
+Message-ID: <1325@umcp-cs.UUCP>
+Date: Sun, 31-Jul-83 22:59:04 EDT
+Article-I.D.: umcp-cs.1325
+Posted: Sun Jul 31 22:59:04 1983
+Date-Received: Mon, 1-Aug-83 22:30:00 EDT
+Organization: Univ. of Maryland, Computer Science Dept.
+Lines: 701
+
+Vmpic is a slightly expanded and much modified version of vmstat.
+Vmpic shows the statistics in windows and is therefore easier(?)
+to read.  It uses the Maryland Windows Library and it will run only
+on 4.1BSD (well, actually I just can't try it on 4.1a or 4.1c but
+I severely doubt it would work).
+
+				- Chris
+
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting vmpic.c'
+sed 's/^X//' <<'//go.sysin dd *' >vmpic.c
+#ifndef lint
+static char rcsid[] = "@(#)$Header:   vmpic.v  Revision 1.1  83/03/18  19:21:09  chris  Stab$ vmpic.c	U of Maryland ACT 5-Mar-1983";
+#endif
+
+X/*
+ * vmpic - vmstat using full screen
+ *
+ % cc -O -s -o vmpic vmpic.c -lwinlib -ljobs -ltermlib
+ %i cc -O -s -o /usr/local/vmpic vmpic.c -lwinlib -ljobs -ltermlib; chmod g+s /usr/local/vmpic
+ *
+ * Joe Pallas 5-Mar-1983
+ * Modified:	5-Mar-1983 ACT for window library, load average
+ *		7-Mar-1983 ACT for multiple windows
+ *		8-Mar-1983 ACT highlight system %cpu if >= 40.0
+ *		18-Mar-1983 ACT added ^L check, minor changes
+ *		19-Mar-1983 Andrew & Patrick hacked for vmpic login...
+ *			    (a REALLY horrible hack!)
+ *		19-Mar-1983 ACT Cleaned up above mod a bit
+ *		2-May-1983 ACT Cleaned up yet more (fix from JIP)
+ */
+
+#include <stdio.h>
+#include <sys/param.h>
+#include <sys/vm.h>
+#include <sys/dk.h>
+#include <sys/stat.h>
+#include <nlist.h>
+#include <sys/ioctl.h>
+#include <local/window.h>
+
+#define	LOOPSIZ		(LOOPPAGES / CLSIZE)
+
+X/* This one is an /etc/config option; not available in h files */
+
+struct nlist nml[] = {
+#define	X_CPTIME	0
+	{"_cp_time"},
+#define	X_RATE		1
+	{"_rate"},
+#define	X_TOTAL		2
+	{"_total"},
+#define	X_DEFICIT	3
+	{"_deficit"},
+#define	X_FORKSTAT	4
+	{"_forkstat"},
+#define	X_SUM		5
+	{"_sum"},
+#define	X_FIRSTFREE	6
+	{"_firstfree"},
+#define	X_MAXFREE	7
+	{"_maxfree"},
+#define	X_BOOTIME	8
+	{"_bootime"},
+#define	X_DK_XFER	9
+	{"_dk_xfer"},
+#define	X_TK_NIN	10
+	{"_tk_nin"},
+#define	X_TK_NOUT	11
+	{"_tk_nout"},
+#define	X_AVENRUN	12
+	{"_avenrun"},
+#define	X_LOTSFREE	13
+	{"_lotsfree"},
+#define	X_DESFREE	14
+	{"_desfree"},
+#define	X_MINFREE	15
+	{"_minfree"},
+#define	X_HZ		16
+	{"_hz"},
+#define	X_LP_NOUT	17
+	{"_lp_nout"},
+	0
+};
+
+char	*ctime ();
+double	stat1 ();
+
+char	buf[100];
+int	firstfree, maxfree, minfree, lotsfree, desfree, deficit, hz, kmem;
+time_t	bootime;
+double	etime;
+double	avenrun[3];
+
+X/* Grouping of stuff so can use structure assignment */
+struct {
+	long		time[CPUSTATES];
+	long		xfer[DK_NDRIVE];
+	struct vmmeter	Rate;
+	struct vmtotal	Total;
+	struct vmmeter	Sum;
+X/*	struct forkstat	Forkstat; -- not currently used */
+	long		tk_nin;
+	long		tk_nout;
+	int		lp_nout;
+} s, s1;			/* s1 == the previous s */
+
+X/* This structure is used to specify what to read from the kernel.  k_item is
+   the address to read into, k_size is the number of bytes, and k_index is
+   the index into the namelist "nml" which determines the kernel address. */
+struct kvalues {
+	caddr_t		k_item;
+	off_t		k_size;
+	int		k_index;
+};
+
+struct kvalues LoopTable[] = {
+	(caddr_t) s.time,	sizeof s.time,	X_CPTIME,
+	(caddr_t) s.xfer,	sizeof s.xfer,	X_DK_XFER,
+	(caddr_t) &s.Rate,	sizeof s.Rate,	X_RATE,
+	(caddr_t) &s.Sum,	sizeof s.Sum,	X_SUM,
+X/*	(caddr_t) &s.Forkstat,	sizeof s.Forkstat, X_FORKSTAT, */
+	(caddr_t) &s.Total,	sizeof s.Total,	X_TOTAL,
+	(caddr_t) &s.tk_nin,	sizeof s.tk_nin, X_TK_NIN,
+	(caddr_t) &s.tk_nout,	sizeof s.tk_nout, X_TK_NOUT,
+	(caddr_t) &deficit,	sizeof deficit,	X_DEFICIT,
+	(caddr_t) avenrun,	sizeof avenrun,	X_AVENRUN,
+	(caddr_t) &s.lp_nout,	sizeof s.lp_nout, X_LP_NOUT,
+	0, 0, 0
+};
+
+struct kvalues InitTable[] = {
+	(caddr_t) &firstfree,	sizeof firstfree, X_FIRSTFREE,
+	(caddr_t) &maxfree,	sizeof maxfree,	X_MAXFREE,
+	(caddr_t) &bootime,	sizeof bootime,	X_BOOTIME,
+	(caddr_t) &lotsfree,	sizeof lotsfree, X_LOTSFREE,
+	(caddr_t) &desfree,	sizeof desfree, X_DESFREE,
+	(caddr_t) &minfree,	sizeof minfree, X_MINFREE,
+	(caddr_t) &hz,		sizeof hz,	X_HZ,
+	0, 0, 0
+};
+
+X/* This determines what windows to display */
+X/* The 4 ints specify the position & size; the two strings are optional, and
+   are the label and initial contents for the window */
+struct initscreen {
+	int	i_x, i_y, i_xe, i_ye;
+	char	*i_lbl, *i_str;
+} InitScreen[] = {
+#define	W_TIME (wins[0])
+X/*0*/	18, 0,  38, 1,	0,
+			"$SYSTEM STATUS",
+#define	W_PROC (wins[1])
+X/*1*/	0,  1,  15, 7,	"Processes",
+			"Runnable\nDisk Wait\nPage Wait\nSwapped\nSleeping",
+#define	W_BOOTIME (wins[2])
+X/*2*/	18, 1,  39, 1,	0,
+			"Last reboot @ ",
+#define	W_DISK (wins[3])
+X/*3*/	17, 2,  12, 6,	"Disk Xfers",
+			"D0\nD1\nD2\nD3",
+#define	W_FAULTS (wins[4])
+X/*4*/	32, 3,  18, 6,	"Faults",
+			"Interrupts\nDZ Pseudo\nSyscalls\nContext Sw",
+#define	W_PAGE (wins[5])
+X/*5*/	0,  8,  19, 10,	"Paging",
+			"Reclaims\nPage Ins\nPage Outs\nPages Freed\nDeficit\nScan Rate\nSwap Ins\nSwap Outs",
+#define	W_CPU (wins[6])
+X/*6*/	22, 9,  21, 6,	"CPU Usage",
+			"User (normal)\t  %\nUser (nice)\t  %\nSystem\t\t  %\nIdle\t\t  %",
+#define	W_MEM (wins[7])
+X/*7*/	22, 15, 28, 5,	"Memory",
+			"Active Virtual       pages\nActive Real\t     pages\nFree\t\t     pages",
+#define	W_TERM (wins[8])
+X/*8*/	0,  18, 15, 5,	"Terminals",
+			"Input\nOutput\nLP Out",
+#define	W_UP (wins[9])
+X/*9*/	22, 20, 20, 1,	0,
+			"up",
+#define	W_LOAD (wins[10])
+X/*10*/	22, 21, 34, 1,	0,
+			"Load average:",
+#define	W_MAIL (wins[11])
+X/*11*/	22, 22,	4,  1,	0,
+			"$Mail",
+};
+
+#define	NWINS	(sizeof InitScreen/sizeof *InitScreen)
+
+Win	*wins[NWINS];
+
+main (argc, argv)
+int argc;
+char **argv;
+{
+	register	i;
+	register struct initscreen *ip;
+	register struct vmmeter *v;
+	time_t		now, mtime;
+	int		days, hrs, mins;
+	int		iter, sleeptime, nintv;
+	char		*str;
+	char		mail[300];
+	double		f;
+	struct stat	st;
+	int		NewMail = 0;
+
+	/* Read the namelist */
+	nlist ("/vmunix", nml);
+	if (nml[0].n_type == 0) {
+		fprintf (stderr, "No /vmunix namelist\n");
+		exit (1);
+	}
+	if (nml[X_LP_NOUT].n_type == 0)
+		nml[X_LP_NOUT].n_value = 0;
+	/* Open /dev/kmem */
+	kmem = open ("/dev/kmem", 0);
+	if (kmem < 0) {
+		fprintf (stderr, "Can't open /dev/kmem\n");
+		exit (1);
+	}
+	if (argc < 2) {
+		iter = 1;
+		sleeptime = 0;
+#if 0
+		/* This is the way it *should* be done, */
+		if (getppid () == 1) {	/* Parent is init, must be a
+					   "login shell" */
+#else
+		/* but with our "fakelogin" program ppid != 1, sigh */
+		if (getuid () == 199) {	/* ugly ... */
+#endif
+			iter = 0;
+			sleeptime = 5;
+		}
+	}
+	else if (argc == 2)
+		iter = 0, sleeptime = atoi (argv[1]);
+	else if (argc >= 3)
+		iter = atoi (argv[2]), sleeptime = atoi (argv[1]);
+	if (ReadKernel (InitTable))
+		exit (1);
+	time (&now);
+	nintv = now - bootime;
+	if (nintv <= 0 || nintv > 60*60*24*365*10) {
+		fprintf (stderr,
+			"Time makes no sense: namelist must be wrong\n");
+		exit (1);
+	}
+	/* Initialize windows */
+	if (Winit (0, 0)) {
+		fprintf (stderr,
+			"Sorry, this terminal doesn't support windows\n");
+		exit (1);
+	}
+	for (ip = InitScreen; ip < &InitScreen[NWINS]; ip++) {
+		register Win *w;
+
+		w = Wopen (0, ip->i_x, ip->i_y, ip->i_xe, ip->i_ye, 0, 0);
+		if (w == 0) {
+			Wcleanup ();
+			fprintf (stderr, "Sorry, your screen is too small\n");
+			exit (1);
+		}
+		wins[ip - InitScreen] = w;
+		Woncursor (w, 0);
+		Wnewline (w, 1);
+		Wwrap (w, 0);
+		if (ip -> i_ye > 1) {
+			Wframe (w);
+			if (ip -> i_lbl)
+				Wlabel (w, ip -> i_lbl, 0, 1);
+		}
+		if (str = ip -> i_str) {
+			if (*str == '$') {/* Use inverse video */
+				Wsetmode (w, WINVERSE);
+				str++;
+			}
+			Wputs (str, w);
+			Wsetmode (w, 0);
+		}
+	}
+	WSetRealCursor = 1;
+	WRCurRow = 0;
+	WRCurCol = 0;
+	sprintf (mail, "/usr/spool/mail/%s", getenv ("USER"));
+	if (stat (mail, &st) >= 0)
+		mtime = st.st_mtime;
+	sprintf (buf, "%.24s", ctime (&bootime));
+	Wputs (buf, W_BOOTIME);
+	Whide (W_MAIL);
+
+	/* This is the main loop.  It should be a for(;;) but then everything
+	   would be way over on the right. */
+loop:
+	time (&now);
+
+	/* Read the kernel stuff */
+	if (ReadKernel (LoopTable))
+		Wexit (1);
+
+	/* Put info into windows */
+	WAcursor (W_TIME, 0, 14);
+	sprintf (buf, "%.24s", ctime (&now));
+	Wputs (buf, W_TIME);
+	etime = 0.;
+	for (i = 0; i < CPUSTATES; i++)
+		etime += s.time[i] - s1.time[i];
+	if (etime == 0.)
+		etime = 1.;
+
+#define	WPR(w,y,x,fmt,n)	WAcursor (w, y, x),	\
+				sprintf (buf, fmt, n),	\
+				Wputs (buf, w)
+
+	/* Processes */
+	WPR (W_PROC, 0, 10, "%3d", s.Total.t_rq);/* Running */
+	WPR (W_PROC, 1, 10, "%3d", s.Total.t_dw);/* Disk Wait */
+	WPR (W_PROC, 2, 10, "%3d", s.Total.t_pw);/* Page Wait */
+	WPR (W_PROC, 3, 10, "%3d", s.Total.t_sw);/* Swapped */
+	WPR (W_PROC, 4, 10, "%3d", s.Total.t_sl);/* Sleeping */
+
+	/* Virtual memory */
+	WPR (W_MEM, 0, 15, "%5d", s.Total.t_avm / 2);/* AVM */
+	WPR (W_MEM, 1, 15, "%5d", s.Total.t_rm / 2);/* ARM */
+	WAcursor (W_MEM, 2, 15);
+	sprintf (buf, "%5d", i = s.Total.t_free / 2);
+	if (i < minfree)
+		Wsetmode (W_MEM, WBLINK|WINVERSE);
+	else if (i < desfree)
+		Wsetmode (W_MEM, WINVERSE);
+	Wputs (buf, W_MEM);	/* Free space */
+	Wsetmode (W_MEM, 0);
+
+	v = nintv != 1 ? &s.Sum : &s.Rate;
+
+	/* Paging */
+	WPR (W_PAGE, 0, 12, "%5d",/* Reclaims */
+		(v -> v_pgrec - (v -> v_xsfrec + v -> v_xifrec)) / nintv);
+	WPR (W_PAGE, 1, 12, "%5d", v -> v_pgin  / nintv);/* Pageins */
+	WPR (W_PAGE, 2, 12, "%5d", v -> v_pgout / nintv);/* Pageouts */
+	WPR (W_PAGE, 3, 12, "%5d", v -> v_dfree / nintv);/* Freed per sec */
+	WPR (W_PAGE, 4, 12, "%5d", deficit / 2);/* Shortfall */
+	f = (60.0 * v -> v_scan) / (LOOPSIZ * nintv);
+	if (f >= 0.01)
+		Wsetmode (W_PAGE, WINVERSE);
+	WPR (W_PAGE, 5, 12, "%5.2f", f);
+	Wsetmode (W_PAGE, 0);
+	WPR (W_PAGE, 6, 12, "%5d", v -> v_swpin  / nintv);/* Swap ins */
+	WPR (W_PAGE, 7, 12, "%5d", v -> v_swpout / nintv);/* Swap outs */
+
+	etime /= 60.;
+
+	/* Disk transfers */
+	for (i = 0; i < DK_NDRIVE; i++)
+		WPR (W_DISK, i, 6, "%4.0f", (s.xfer[i]-s1.xfer[i])/etime);
+
+	/* Faults */
+	WPR (W_FAULTS, 0, 12, "%4d", v -> v_intr / nintv - hz);/* Interrupts */
+	WPR (W_FAULTS, 1, 12, "%4d", v -> v_pdma / nintv);/* DZ pseudo intr */
+	WPR (W_FAULTS, 2, 12, "%4d", v -> v_syscall / nintv);/* System calls */
+	WPR (W_FAULTS, 3, 12, "%4d", v -> v_swtch / nintv);/* Context sws */
+
+	/* CPU usage */
+	WPR (W_CPU, 0, 15, "%3.0f", stat1 (0));/* User mode (normal) */
+	WPR (W_CPU, 1, 15, "%3.0f", stat1 (1));/* User mode (nice) */
+	f = stat1 (2);
+	if (f >= 40.)
+		Wsetmode (W_CPU, WINVERSE);
+	WPR (W_CPU, 2, 15, "%3.0f", f);/* System */
+	Wsetmode (W_CPU, 0);
+	WPR (W_CPU, 3, 15, "%3.0f", stat1 (3));/* Idle */
+
+	/* Terminal I/O */
+	WPR (W_TERM, 0, 8, "%5.0f", (s.tk_nin-s1.tk_nin)/etime);/* In */
+	WPR (W_TERM, 1, 8, "%5.0f", (s.tk_nout-s1.tk_nout)/etime);/* Out */
+	WPR (W_TERM, 2, 8, "%5.0f", (s.lp_nout-s1.lp_nout)/etime);/* LP Out */
+
+	/* Load average */
+	WAcursor (W_LOAD, 0, 14);
+	for (i = 0; i < 3; i++) {
+		sprintf (buf, "%5.2f", avenrun[i]);
+		if (avenrun[i] > 6.)
+			Wsetmode (W_LOAD, WINVERSE);
+		Wputs (buf, W_LOAD);
+		Wsetmode (W_LOAD, 0);
+		if (i != 2)
+			Wputc (' ', W_LOAD);
+	}
+
+	/* Uptime */
+	WAcursor (W_UP, 0, 3);
+	Wclear (W_UP, 0);
+	i = now - bootime;
+	days = i / (60*60*24);
+	i -= days * 60*60*24;
+	hrs = i / (60*60);
+	i -= hrs * 60*60;
+	mins = i / 60;
+	i = 0;
+	if (days) {
+		sprintf (buf, "%d day%s", days, days == 1 ? "" : "s");
+		Wputs (buf, W_UP);
+		i = 1;
+	}
+	if (hrs && mins)
+		sprintf (buf, "%s%2d:%02d", i ? ", " : "", hrs, mins);
+	else {
+		buf[0] = 0;
+		if (hrs > 0)
+			sprintf (buf, "%s%d hr%s", i ? ", " : "",
+					hrs, hrs == 1 ? "" : "s");
+		if (mins > 0)
+			sprintf (buf, "%s%d min%s", i ? ", " : "",
+					mins, mins == 1 ? "" : "s");
+	}
+	Wputs (buf, W_UP);
+
+	/* Mail */
+	if (stat (mail, &st) >= 0 && st.st_size) {
+		if (st.st_mtime < st.st_atime)
+			NewMail = 0;
+		else if (st.st_mtime > mtime)
+			NewMail++, mtime = st.st_mtime;
+	}
+	else
+		NewMail = 0;
+	if (NewMail)
+		Wunhide (W_MAIL);
+	else
+		Whide (W_MAIL);
+
+	/* Update screen and loop if desired */
+	Wrefresh (0);
+	if (InputPending) {
+		char c;
+
+		while (InputPending) {
+			read (0, &c, 1);
+			if (c == 014)
+				ScreenGarbaged++;
+			ioctl (0, FIONREAD, &InputPending);
+		}
+		Wrefresh (0);
+	}
+	if (--iter == 0)
+		Wexit (0);
+	nintv = 1;
+	s1 = s;
+	if (sleeptime)
+		sleep (sleeptime);
+	goto loop;
+}
+
+X/* Return the %cpu for s.time[row] */
+double
+stat1 (row)
+{
+	double t;
+	register i;
+
+	t = 0.;
+	for (i = 0; i < CPUSTATES; i++)
+		t += s.time[i] - s1.time[i];
+	if (t == 0.)
+		t = 1.;
+	return (s.time[row] - s1.time[row]) * 100. / t;
+}
+
+X/* Read kernel values according to table starting at k */
+ReadKernel (k)
+register struct kvalues *k;
+{
+	while (k -> k_item) {
+		lseek (kmem, (long) nml[k -> k_index].n_value, 0);
+		if (read (kmem, (char *) k->k_item, k->k_size) != k->k_size) {
+			fprintf (stderr, "Error reading kmem at %d\r\n",
+					nml[k -> k_index].n_value);
+			return -1;
+		}
+		k++;
+	}
+	return 0;
+}
+
+X/* The standard sleep creates problems because it uses longjmp() on an alarm
+   to return.  This one uses a flag instead, so is much safer. */
+
+X/* @(#)sleep.c	4.1 (Berkeley) 12/21/80 */
+#include <signal.h>
+
+static alarmed;
+
+sleep(n)
+unsigned n;
+{
+	int sleepx();
+	unsigned altime;
+	int (*alsig)() = SIG_DFL;
+	int (*sigset())();
+
+	if (n==0)
+		return;
+	altime = alarm(1000);	/* time to maneuver */
+	if (altime) {
+		if (altime > n)
+			altime -= n;
+		else {
+			n = altime;
+			altime = 1;
+		}
+	}
+	alsig = sigset(SIGALRM, sleepx);
+	alarmed = 0;
+	alarm(n);
+	while (!alarmed)
+		pause();
+	sigset (SIGALRM, alsig);
+	alarm (altime);
+}
+
+static
+sleepx()
+{
+	alarmed++;
+}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 vmpic.c
+	/bin/echo -n '	'; /bin/ls -ld vmpic.c
+fi
+/bin/echo 'Extracting vmpic.1l'
+sed 's/^X//' <<'//go.sysin dd *' >vmpic.1l
+X.TH VMPIC 1L "U of M Local"
+X.UC
+X.SH NAME
+vmpic \- report virtual memory and system statistics in windows
+X.SH SYNOPSIS
+X.B vmpic
+[
+X.I interval
+[
+X.I count
+] ]
+X.SH DESCRIPTION
+X.B Vmpic
+delves into the system and normally reports certain statistics kept
+about process, virtual memory, disk, trap and cpu activity.  The
+optional
+X.I interval
+argument causes
+X.B vmpic
+to report once each
+X.I interval
+seconds; ``vmpic 5'' will print what the system is doing every five
+seconds; this is a good choice of printing interval since this is how
+often the statistics are sampled in the system.  If a
+X.I count
+is given, the statistics are repeated
+X.I count
+times.  The display is done in windows, with each window being labeled
+as to genral contents and with one line per statistic in each window.
+Standout mode is used to highlight things which are considered unusual
+or bad for response.  The screen can be completely redrawn by typing
+control-L.
+X.TP 10
+X.I Processes
+X.B Running
+processes are those trying to use the CPU.  Processes in
+X.B "Disk Wait"
+are waiting for disk (or other short-term I/O) operations to complete.
+Processes in
+X.B "Page Wait"
+are waiting for free memory pages.  Process
+X.B Sleeping
+are those that are runnable or short sleepers (< 20 seconds);
+X.B "Swapped"
+processes are those that are runnable but swapped.
+X.TP 10
+X.I Memory
+Information about the usage of virtual and real memory.
+X.B "Active Virtual"
+pages are those which belong to processes that are running or have run
+in the last 20 seconds.  A ``page'' here is 1024 bytes.
+X.B "Active Real"
+pages are those which are in use by processes and are actually in core
+(as opposed to "virtually" existing, being out on disk).
+X.B Free
+memory is the number of pages not currently in use.
+X.TP 10
+X.I Page
+Information about page faults and paging activity, and swaps.  These
+are averaged each five seconds, and given in units per second.
+X.B Reclaims
+are pages that were freed but taken back by the process from which they
+were freed before being allocated anywhere else.  Reclaims also include
+text pages that were given up by a process that exited, but taken back
+by a new instance of the same program.
+X.B "Page Ins"
+are pages that were transferered in from disk.
+X.B "Page Outs"
+are pages that were freed and transferred out to disk.
+X.B "Pages Freed"
+is the number of pages freed per second.  This counts pages that were
+reclaimed, so is not necessarily the number of new free pages.
+X.B Deficit
+is the number of pages needed to swap someone in.  Normally this will
+always be zero; if it is nonzero, the paging system is getting
+overloaded.  The
+X.B "Scan Rate"
+is the rate at which the pageout daemon is running through physical
+memory and freeing pages.  As the scan rate goes up, so does the number
+of pages freed, and probably the number of reclaims.  If the pageout
+daemon gets back around to a page and it's still free, it gets paged
+out.  I'm not sure just what units the scan rate is in.
+X.B "Swap Ins"
+is the number of process swap ins in the last 5 seconds;
+X.B "Swap Outs"
+is the number of process swap outs.
+X.TP 10
+X.I "Disk Xfers"
+Disk operations per second (this field is system dependent).  The
+numbers after each
+X.B D
+are the disk numbers.  On our system,
+disk 0 is /usr, /, and some paging; disk 1 is /u; and disk 2 is /g, /tmp,
+and more paging.
+X.TP 10
+X.I Faults
+Trap/interrupt rate averages per second over last 5 seconds.
+X.B Interrupts
+is interrupts per second, not including the clock.
+X.B "DZ Pseudo"
+is the number of DZ PDMA (Pseudo DMA) interrupts.
+X.B Syscalls
+is system calls per second.
+X.B "Context Sw"
+is the cpu context switch rate (switches/sec).
+X.TP 10
+X.I "CPU Usage"
+is a breakdown of percentage usage of CPU time.
+X.B "User (normal)"
+is the time spent running normal priority user processes.
+X.B "User (nice)"
+is the time spent running low priority ("niced") processes.
+X.B System
+is the time spent running system code, and
+X.B Idle
+is the amount of time the CPU has nothing to do.
+X.TP 10
+X.I Terminals
+shows the number of characters read and written on ttys per second
+averaged over the last interval.
+X.B Input
+is the number of characters read and
+X.B Output
+is the number of characters written.
+X.TP 10
+X.I Mail
+A
+X.B Mail
+window pops up if you get new mail.  This is for those of you who
+have nothing better to do than wait for mail and watch the show.
+X.SH FILES
+X/dev/kmem, /vmunix
+X.SH SEE ALSO
+The sections starting with ``Interpreting system activity'' in
+X.I "Setting up the Fourth Berkeley Software Tape"
+by W. Joy, O. Babaoglu, and K. Sklower
+X.SH AUTHORS
+Joe Pallas and Chris Torek
+X.sp
+The code was originally derived from
+X.IR vmstat (1).
+X.SH BUGS
+The way CPU time is computed can cause the number of interrupts to be
+printed as "-1" occasionally.
+X.br
+Won't run on very small screens.
+X.br
+Should include lots of other goodies.
+X.SH CAVEATS
+I don't guarantee that any of the above is correct.  --Chris
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 vmpic.1l
+	/bin/echo -n '	'; /bin/ls -ld vmpic.1l
+fi
+-- 
+In-Real-Life:	Chris Torek, Univ of MD Comp Sci
+UUCP:		{seismo,allegra,brl-bmd}!umcp-cs!chris
+CSNet:		chris@umcp-cs
+ARPA:		chris.umcp-cs@UDel-Relay
+
+

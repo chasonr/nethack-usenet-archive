@@ -1,0 +1,1493 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,8f76ea57713e0605,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-11-11 07:02:56 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!mnetor!seismo!husc6!necntc!encore!linus!philabs!micomvax!musocs!mcgill-vision!leei
+From: leei@mcgill-vision.UUCP (Lee Iverson)
+Newsgroups: net.sources
+Subject: 4.[23] Inet Client/Server model package.
+Message-ID: <549@mcgill-vision.UUCP>
+Date: Tue, 11-Nov-86 10:02:56 EST
+Article-I.D.: mcgill-v.549
+Posted: Tue Nov 11 10:02:56 1986
+Date-Received: Thu, 13-Nov-86 00:03:14 EST
+Reply-To: leei@larry.ee.mcgill.edu.UUCP (Lee Iverson)
+Organization: McGill University, Montreal
+Lines: 1473
+
+This package (sort of posted some time ago) is something I hacked
+together in response to our setting up a network of Suns along with
+our old Vaxen.  I wanted to play around a bit with the networking,
+so I set myself the task of putting together a pair of client and
+server modules which would allow pretty transparent access to a
+service which exists somewhere on the network without having to
+any sort of network database of locations.  The solution is to
+broadcast a request for a service on a given port, and then wait
+for a response.  The service requested is named and there is a
+simple protocol for communicating between the two processes.
+The server is set up so that it can serve any number of clients
+simultaneously, all on the same socket, so there is a natural
+sequencing of messages as they arrive.  Obviously, this could be
+used as the basic interface system for a multi-player game, or some
+even simpler service.  I hope someone gets some use out of it.
+
+If anyone has any ideas for improvements, I think that the best
+thing to do would be to impliment them yourself, and forward them
+to me.  This is my first attempt at this sort of stuff, so please
+be gentle.  Also, the source code is liberally documented, and
+at this point, that is what I'll rely on as the basic documentation.
+
+				Happy Hacking,
+				Lee Iverson
+				utcsri!larry.ee.mcgill.edu!leei
+				leei%larry.ee.mcgill.edu.UUCP@uw-beaver.ARPA
+				Mcgill University, Montreal
+				Computer Vision and Robotics Lab
+
+------------------------------ cut here ------------------------------
+echo x - README
+sed 's/^X//' >README <<'*-*-END-of-README-*-*'
+XThis stuff is 4.3BSD code for setting up and accessing a server process
+Xfor a network.  The server code simply sets up a datagram socket which it
+Xregisters on a particular port and then listens for requests.  The client
+Xthen sends out a broadcast message (the idea is that the server exists, or
+Xnot, on n machines somewhere on the network, but nobody knows where!) which
+Xshould be responded to if the server is active.  If there is a response,
+Xthe client code then connects its end of the datagram socket to the server
+Xand starts firing away.
+X
+XThe most obvious application (to someone like me) of all of this is a
+Xdistributed game, with a referee which runs on one arbitrary machine on the
+Xnet and a client process for each player.  If a client looks for a server
+Xand can't find one then it should fork off a server process and try again.
+XThe server receives all requests on the same socket, so there will have to
+Xbe some specific sign-on protocol and it will have to deal with address-name
+Xmapping in its own way.
+X
+XBUGS & SHORTCOMINGS:
+X	- Currently set up in such a way that it depends on INET protocols
+X	  (specifically for the client sign-on broadcasting).
+X	- Doesn't at all deal with host-network data format mapping and
+X	  such potential problems.
+X	- Depends on the datagram socket protocol.
+X	- I've been told that this duplicates some of the functionality of
+X	  Sun RPC code and the XDR (Xternal Data Representation?) library.
+X
+XMANIFEST:
+X	This package should include these files:
+X
+XREADME		- you're reading it.
+XMakefile	- a simple makefile for creating the test programs.
+Xclient.c	- the client code
+Xclient.h	- the client interface specification
+Xserver.c	- the server code
+Xserver.h	- the server interface specification
+Xcomm.h		- defines common to server and client (for communication)
+Xserv.c		- The server test program.
+Xfindserv.c	- The client test program.
+Xservice.h	- Defines the port and service name of the test program.
+X
+X
+X				Happy hacking,
+X				Lee Iverson
+X				leei@larry.ee.mcgill.edu.UUCP
+X				utcsri!mcgill-vision!leei
+X				leei%mcgill-vision.UUCP@uw-beaver.ARPA
+X				Mcgill University, Montreal
+X				Computer Vision and Robotics Lab
+*-*-END-of-README-*-*
+echo x - Makefile
+sed 's/^X//' >Makefile <<'*-*-END-of-Makefile-*-*'
+XCFLAGS=
+X
+Xall: sockets
+X
+Xsockets: findserv serv
+X
+Xfindserv: findserv.o client.o
+X	$(CC) -o findserv findserv.o client.o
+X
+Xserv: serv.o server.o
+X	$(CC) -o serv serv.o server.o
+X
+Xclient.o: client.h
+Xserver.o: server.h
+X
+Xfindserv.o: service.h client.h
+Xserv.o:     service.h server.h
+*-*-END-of-Makefile-*-*
+echo x - client.c
+sed 's/^X//' >client.c <<'*-*-END-of-client.c-*-*'
+X#include <stdio.h>
+X#include <netdb.h>
+X
+X#include "comm.h"
+X#include "client.h"
+X
+X#include <sys/time.h>
+X#include <sys/ioctl.h>
+X
+X#include <netinet/in.h>
+X#include <net/if.h>
+X
+X#ifdef DEBUG
+X#undef DEBUG
+X#define DEBUG(x)	(printf x, fflush(stdout), 1)
+X#define DEBUGGING	(1)
+X#else
+X#define DEBUG(x)	(0)
+X#define DEBUGGING	(0)
+X#endif DEBUG
+X
+X#ifndef FD_SET
+X
+X#define NBBY (8)
+X#define NFDBITS	(sizeof(fd_set) * NBBY)	/* bits per mask */
+X#define FD_SETSIZE NFDBITS
+X
+X#define	FD_SET(n, p)	((p)->fds_bits[(n)/NFDBITS] |= (1 << ((n) % NFDBITS)))
+X#define	FD_CLR(n, p)	((p)->fds_bits[(n)/NFDBITS] &= ~(1 << ((n) % NFDBITS)))
+X#define	FD_ISSET(n, p)	((p)->fds_bits[(n)/NFDBITS] & (1 << ((n) % NFDBITS)))
+X#define FD_ZERO(p)	bzero((char *)(p), sizeof(*(p)))
+X
+X#endif FD_SET
+X
+Xstatic int serv_sock = -1;
+X
+Xint server_socket() { return serv_sock; }
+X
+Xstatic struct sockaddr server_addr;
+Xstatic int server_addr_size = sizeof(server_addr);
+X
+X/*
+X *	void set_select_server( struct server*(*new_func)(struct server*,int) )
+X *
+X *	These structures are used to determine which of the servers which
+X *	answer the initial call will be selected for signing on.  The
+X *	servers which have answered are listed in the NULL-terminated array
+X *	pointed to by all_servers.  This is passed to the function pointed
+X *	to by select_server, which should choose one and return a pointer
+X *	to it.  The user may select a different choosing function than the
+X *	default (select the first one) by calling the function
+X *	set_select_server().
+X */
+X
+X#define NUM_SERVERS (5)
+X
+Xstatic struct server server_space[NUM_SERVERS];
+Xstatic int num_server_spaces = NUM_SERVERS;
+Xstatic int num_servers = 0;
+Xstatic struct server *all_servers = server_space;
+X
+Xstatic struct server *
+Xdefault_select_server( servers, num_servers )
+Xstruct server *servers;
+Xint num_servers;
+X{
+X    /* Select first server */
+X    return &servers[0];
+X}
+X
+Xstatic struct server *(*select_server)() = default_select_server;
+X
+Xvoid
+Xset_select_server( new_function )
+Xstruct server *(*new_function)();
+X{
+X    select_server = new_function;
+X}
+X
+X/*
+X *	void set_dropped_func( void (*)( char *, int ) );
+X *
+X *	When a SIGN_OFF message is received from the server, the function
+X *	specified by dropped_func is called with a description of the rest
+X *	of the buffer in which the message is stored.  It may take any action
+X *	that the user wants, including exiting.  If it is set to 0 (the
+X *	default) then no function is called, and the recv_server function will
+X *	just return with the DROPPED return value.
+X */
+X
+Xstatic void (*dropped_func)() = 0;
+X
+Xvoid
+Xset_dropped_func( new_df )
+Xvoid (*new_df)();
+X{
+X    dropped_func = new_df;
+X}
+X
+X/*
+X *	int obtain_service( char *name, int port, int timeout_sec, int verbose,
+X *			    char *sign_on_msg, int sign_on_len )
+X *
+X *	    Sends a broadcast message over the net asking for the existence
+X *	of a server socket on the given port associated with the named
+X *	service.  The port argument is a default port number if the service
+X *	is not found in the local net DB.  If there is no response after
+X *	timeout_sec seconds, then we return with -1.  If a response is
+X *	received, then the socket is connected to that address and the socket
+X *	number is returned.  The socket type used is SOCK_DGRAM.
+X */
+X
+Xint
+Xobtain_service( serv_name, serv_port, timeout_sec, verbose,
+X	        sign_on_msg, sign_on_len )
+Xchar *serv_name;
+Xint serv_port;
+Xint timeout_sec;
+Xint verbose;
+Xchar *sign_on_msg;
+Xint sign_on_len;
+X{
+X    int sock;
+X    long curr_time, end_time, time();
+X    struct timeval timeout;
+X    struct servent  *serv,  *getservbyname();
+X    struct protoent *proto, *getprotobyname();
+X    int serv_proto = 0;
+X    static char tbuf[64];
+X    struct server *selected_server;
+X    int serv_name_len;
+X    int server_addr_len;
+X    void request_service();
+X    void add_server_response(), free_servers();
+X
+X    serv_name_len = strlen(serv_name) + 1;
+X
+X#if DEBUGGING
+X    verbose = 1;
+X#endif
+X
+X    /* Get service information */
+X    serv_port = htons(serv_port);
+X    if ( (serv = getservbyname( serv_name, (char *) 0 )) != NULL ) {
+X	serv_port = serv->s_port;
+X#ifdef PROTO_SUPPORTED
+X	if ( (proto = getprotobyname(serv->s_proto)) != NULL )
+X	    serv_proto = proto->p_proto;
+X#endif PROTO_SUPPORTED
+X    }
+X
+X    DEBUG(( "Access port %d and proto %d\n", ntohs(serv_port), serv_proto ));
+X
+X    /* Initialize the socket */
+X    if ( (sock = socket( AF_INET, SOCK_DGRAM, serv_proto )) < 0 ) {
+X	perror( "creating socket to server" );
+X	exit(1);
+X    }
+X
+X    /* Make the request */
+X    if ( verbose ) {
+X	printf( "[Request %s service ...", serv_name ); fflush(stdout);
+X    }
+X    request_service( sock, serv_port, serv_name, serv_name_len );
+X
+X    /* Collect responses until time is up */
+X    for ( curr_time = time(0), end_time = curr_time + timeout_sec;
+X	  curr_time < end_time;
+X	  curr_time = time(0) ) {
+X	int msg_size;
+X	fd_set mask;
+X
+X	/* Initialize the timeout structure */
+X	timeout.tv_sec = end_time - curr_time;
+X	timeout.tv_usec = 0;
+X
+X	/* Now, wait for some response */
+X	FD_ZERO(&mask);
+X	FD_SET(sock,&mask);
+X	if ( select(FD_SETSIZE,&mask,(fd_set *)0,(fd_set *)0,&timeout) <= 0 ||
+X	     !FD_ISSET( sock, &mask ) ) {
+X	    break;
+X	}
+X
+X	/* So, peek at the response (to get address) */
+X	server_addr_len = server_addr_size;
+X	if ( (msg_size = recvfrom( sock, tbuf, sizeof(tbuf), 0,
+X				   &server_addr, &server_addr_len )) < 0 ) {
+X	    perror( "receive initial response" );
+X	    exit(1);
+X	}
+X
+X	/* Make sure that this is a response to the service requested */
+X	if ( !strcmp( serv_name, tbuf ) ) {
+X	    /* Enter this response into the collection received so far */
+X	    add_server_response(&server_addr,server_addr_len,tbuf,msg_size);
+X
+X	    /* We got a response (YAY!) */
+X	    if ( verbose ) {
+X		printf( " %d", num_servers );
+X		fflush(stdout);
+X	    }
+X
+X	    DEBUG(( "[by %s %d]...",
+X		    inet_ntoa(((struct sockaddr_in *) &server_addr)->sin_addr),
+X		    ntohs(((struct sockaddr_in *) &server_addr)->sin_port) ));
+X	}
+X    }
+X
+X    /* Failure if no responses */
+X    if ( num_servers == 0 ) {
+X	if ( verbose ) {
+X	    printf( " timed out]\n" );
+X	    fflush(stdout);
+X	}
+X	return NO_SERVER;
+X    }
+X
+X    /* Connect socket to the address */
+X    if ( !(selected_server = (*select_server)(all_servers,num_servers)) ) {
+X	return START_SERVER;
+X    }
+X    server_addr = selected_server->addr;
+X    server_addr_size = selected_server->addr_len;
+X    DEBUG(("connect(%d,%#x (%s),%d)\n",sock,&server_addr,
+X	   inet_ntoa(((struct sockaddr_in *)&server_addr)->sin_addr),
+X	   server_addr_size));
+X    if ( connect( sock, &server_addr, server_addr_size ) < 0 ) {
+X	perror( "connect to server" );
+X	exit(1);
+X    }
+X
+X    /* Send the sign-on message to the selected server */
+X    serv_sock = sock;
+X    {
+X	char sign_on_buf[512];
+X
+X	sign_on_buf[0] = MSG_SIGN_ON;	/* Sign on flag to server */
+X	bcopy( serv_name, sign_on_buf+1, serv_name_len );
+X	bcopy( sign_on_msg, sign_on_buf+serv_name_len+1, sign_on_len );
+X	send_server( sign_on_buf, serv_name_len+sign_on_len+1, 0 );
+X    }
+X    free_servers();
+X
+X    /* Return with a happy (:-) response */
+X    if ( verbose ) {
+X	printf( " connected]\n" );
+X	fflush(stdout);
+X    }
+X    return sock;
+X}
+X
+X/*
+X *	int get_ifc( int sock )
+X *
+X *	    Put the IFCONF data structure into the ifc structure and return
+X *	the number of ifreq structures it contains.
+X */
+X
+Xstatic struct ifconf ifc;
+X
+Xint
+Xget_ifc( sock )
+Xint sock;
+X{
+X    static char ifc_buffer[BUFSIZ];
+X
+X    ifc.ifc_len = sizeof(ifc_buffer);
+X    ifc.ifc_buf = ifc_buffer;
+X    if ( (ioctl( sock, SIOCGIFCONF, (char *) &ifc )) < 0 ) {
+X	perror( "get ifconf" );
+X	exit(1);
+X    }
+X    return ifc.ifc_len / sizeof(struct ifreq);
+X}
+X
+X#if DEBUGGING
+X#include <ctype.h>
+X
+Xchar *
+Xshow_data( p, len )
+Xunsigned char *p;
+Xint len;
+X{
+X    static char buf[512], *q;
+X    char *index();
+X    
+X    for ( q = buf; len > 0; ++p, --len ) {
+X	if ( *p != 0 && isascii(*p) ) {
+X	    *q++ = *p;
+X	}
+X	else {
+X	    sprintf( q, "|%d|", *p );
+X	    q = index(q,'|') + 1;
+X	    q = index(q,'|') + 1;
+X	}
+X    }
+X    *q = 0;
+X    return buf;
+X}
+X#endif
+X
+X/*
+X *	void request_service( int sock, int port, char *name, int name_len )
+X *
+X *	    This function broadcasts a request for the given service using
+X *	the socket sock.  The request is directed at servers on the named
+X *	port on all machines in the local INET network.
+X */
+X
+Xvoid
+Xrequest_service( sock, port, name, name_len )
+Xint sock;
+Xint port;
+Xchar *name;
+Xint name_len;
+X{
+X    struct sockaddr_in sin;
+X    struct sockaddr dst;
+X    int off = 0, on = 1;
+X    int n;
+X    static char data[64];
+X    int data_len = name_len + 1;
+X
+X#ifdef SO_BROADCAST
+X    struct ifreq *ifr;
+X
+X    /* Set up the data buffer for an initial request */
+X    data[0] = MSG_REQUEST;
+X    bcopy( name, data+1, name_len );
+X    DEBUG(("Broadcast [%2d] %s\n",data_len,show_data(data,data_len) ));
+X
+X    /* Set socket for broadcast mode */
+X    if ( (setsockopt( sock,SOL_SOCKET,SO_BROADCAST,&on,sizeof(on) )) < 0 ) {
+X	perror( "set socket option for broadcast" );
+X	exit(1);
+X    }
+X
+X    /* Initialize broadcast address and bind socket to it */
+X    sin.sin_family = AF_INET;
+X    sin.sin_port = port;
+X    sin.sin_addr.s_addr = htonl(INADDR_ANY);
+X    bind( sock, (struct sockaddr *) &sin, sizeof(sin) );
+X
+X    for ( n = get_ifc(sock), ifr = ifc.ifc_req; n > 0; --n, ++ifr ) {
+X
+X	/* Only deal with AF_INET networks */
+X	if ( ifr->ifr_addr.sa_family != AF_INET ) continue;
+X
+X	/* Use the current address by default */
+X	bzero( (char *) &dst, sizeof(dst) );
+X	bcopy( (char *)&ifr->ifr_addr, (char *)&dst, sizeof(ifr->ifr_addr) );
+X
+X	/* Get the flags */
+X	if ( ioctl( sock, SIOCGIFFLAGS, (char *) ifr ) < 0 ) {
+X	    perror( "get ifr flags" );
+X	    exit(1);
+X	}
+X
+X	/* Skip unusable cases */
+X	if ( !(ifr->ifr_flags & IFF_UP) ||	    /* If not up, OR */
+X	     (ifr->ifr_flags & IFF_LOOPBACK ) ||    /* if loopback, OR */
+X	     !(ifr->ifr_flags & (IFF_BROADCAST | IFF_POINTOPOINT)) )
+X	    continue;
+X
+X	/* Now, determine the address to send to */
+X	if ( ifr->ifr_flags & IFF_POINTOPOINT ) {
+X	    if ( ioctl( sock, SIOCGIFDSTADDR, (char *) ifr ) < 0 ) {
+X		perror( "get ifr destination address" );
+X		exit(1);
+X	    }
+X	    bcopy( (char *) &ifr->ifr_dstaddr,
+X		   (char *) &dst,
+X		   sizeof(ifr->ifr_dstaddr) );
+X	}
+X	if ( ifr->ifr_flags & IFF_BROADCAST ) {
+X	    if ( ioctl( sock, SIOCGIFBRDADDR, (char *) ifr ) < 0 ) {
+X		perror( "get ifr broadcast address" );
+X		exit(1);
+X	    }
+X	    bcopy( (char *) &ifr->ifr_broadaddr,
+X		   (char *) &dst,
+X		   sizeof(ifr->ifr_broadaddr) );
+X	}
+X
+X	/* ... make sure that the port number is OK */
+X	if ( dst.sa_family == AF_INET ) {
+X	    struct sockaddr_in *sa_in = (struct sockaddr_in *) &dst;
+X	    sa_in->sin_port = port;
+X	    DEBUG(( "Request address = %s (%d)\n",
+X		    inet_ntoa(sa_in->sin_addr), ntohs(port) ));
+X	}
+X
+X	/* ... and send the request */
+X	DEBUG((" Send to %d [%2d] %s\n",sock,data_len,show_data(data,data_len)));
+X	if ( sendto( sock, data, data_len, 0,
+X		     (struct sockaddr *) &dst, sizeof(dst) ) < 0 ) {
+X	    perror( "sendto" );
+X	    exit(1);
+X	}
+X    }
+X
+X    /* Reset socket option to normal operation */
+X    if ( (setsockopt( sock,SOL_SOCKET,SO_BROADCAST,&off,sizeof(off) )) < 0 ) {
+X	perror( "reset socket option for no broadcast" );
+X	exit(1);
+X    }
+X
+X#else !defined(SO_BROADCAST)
+X    struct hostent *host, *gethostent();
+X
+X    /* Set up the data buffer for an initial request */
+X    data[0] = MSG_REQUEST;
+X    bcopy( name, data+1, name_len );
+X    DEBUG(("Broadcast [%2d] %s\n",data_len,show_data(data,data_len) ));
+X
+X    DEBUG(("Attempting pseudo broadcast\n"));
+X
+X    /* Simulate broadcast if you ain't got it */
+X    while ( (host = gethostent()) != NULL ) {
+X	/* Only deal with AF_INET networks */
+X	if ( host->h_addrtype != AF_INET ||
+X	     *host->h_addr == 127 /* LOOPBACK */ ) {
+X	    DEBUG(("Host %s has address family %d & first %d\n",
+X		   host->h_name, host->h_addrtype,
+X		   (unsigned char) *host->h_addr ));
+X	    continue;
+X	}
+X
+X	/* Start building the address from scratch */
+X	bzero( (char *) &dst, sizeof(dst) );
+X
+X	{
+X	    struct sockaddr_in *sa_in = (struct sockaddr_in *) &dst;
+X
+X	    /* Copy the host address into the destination address */
+X	    bcopy( (char *) host->h_addr,
+X		   (char *) &(sa_in->sin_addr),
+X		   host->h_length );
+X
+X	    /* ... make sure that the port number is OK */
+X	    sa_in->sin_family = host->h_addrtype;
+X	    sa_in->sin_port = port;
+X	}
+X
+X	/* ... and send the request */
+X	DEBUG(( "Send request to %s at %s %d\n", host->h_name,
+X	        inet_ntoa(*(struct in_addr *)host->h_addr), ntohs(port) ));
+X	DEBUG((" Send [%2d] %s\n",data_len,show_data(data,data_len)));
+X	if ( sendto( sock, data, data_len, 0,
+X		     (struct sockaddr *) &dst, sizeof(dst) ) < 0 ) {
+X	    perror( "sendto" );
+X	    exit(1);
+X	}
+X    }
+X#endif SO_BROADCAST
+X}
+X
+X/*
+X *	void add_server_response( struct sockaddr *addr, int addr_len,
+X *				  char *msg, int msg_len )
+X *
+X *	Add the given server address and message to the list of servers
+X *	which have responded to the initial broadcast request.  This
+X *	table will be used for selection of the appropriate server to
+X *	register with.
+X */
+X
+Xstatic void
+Xadd_server_response( addr, addr_len, msg, msg_len )
+Xstruct sockaddr *addr;
+Xint addr_len;
+Xchar *msg;
+Xint msg_len;
+X{
+X    char *malloc(), *index();
+X    struct server *next;
+X
+X    /* If we have run out of space for saving servers, then expand */
+X    if ( num_servers == num_server_spaces ) {
+X	struct server *old_servers = all_servers;
+X	all_servers = (struct server *)
+X	  malloc( (num_server_spaces + 5) * sizeof(struct server) );
+X	bcopy( (char *) old_servers,
+X	      (char *) all_servers,
+X	      num_server_spaces * sizeof(struct server) );
+X	if ( old_servers != server_space ) free( old_servers );
+X	num_server_spaces += 5;
+X    }
+X
+X    /* Go to next server location */
+X    next = &all_servers[num_servers];
+X    ++num_servers;
+X
+X    /* Copy the information into the newly allocated server structure */
+X    msg_len -= strlen(msg) + 1;
+X    msg = index(msg,'\0') + 1;
+X    DEBUG(("Received message [%2d] %s\n",msg_len,show_data(msg,msg_len)));
+X    next->addr = *addr;
+X    next->addr_len = addr_len;
+X    next->msg_len = msg_len;
+X    next->msg = malloc( msg_len );
+X    bcopy( msg, next->msg, msg_len );
+X}
+X
+X/*
+X *	void free_servers()
+X *
+X *	Clean up the memory allocated for saving server information
+X *	after the correct server has been selected.
+X */
+X
+Xstatic void
+Xfree_servers()
+X{
+X    register int i;
+X
+X    /* Free space allocated for messages */
+X    for ( i = 0; i < num_servers; ++i ) {
+X	free( all_servers[i].msg );
+X    }
+X
+X    /* Free the server space if was allocated by malloc */
+X    if ( all_servers != server_space ) {
+X	free( all_servers );
+X    }
+X}
+X
+X/*
+X *	int recv_server( char *buf, int buf_len, int flags )
+X *
+X *	Read a message from the server socket.  Any messages that arrive on
+X *	this socket which aren't from the server are ignored (silently).
+X */
+X
+Xint
+Xrecv_server( buf, buf_len, flags )
+Xchar *buf;
+Xint buf_len;
+Xint flags;
+X{
+X    struct sockaddr addr;
+X    int addr_len;
+X    int cnt;
+X
+X    for ( ;; ) {
+X	DEBUG(("Listening for message from server\n"));
+X	addr_len = sizeof(addr);
+X	cnt = recvfrom( serv_sock, buf, buf_len, flags,
+X		       &addr, &addr_len );
+X	if ( cnt < 0 ) {
+X	    DEBUG(("   No message\n"));
+X	    return cnt;
+X	}
+X	DEBUG((" From %s %d (server at %s %d)\n",
+X	       inet_ntoa(((struct sockaddr_in *)&addr)->sin_addr),
+X	       ntohs(((struct sockaddr_in *)&addr)->sin_port),
+X	       inet_ntoa(((struct sockaddr_in *)&server_addr)->sin_addr),
+X	       ntohs(((struct sockaddr_in *)&server_addr)->sin_port)));
+X	if ( server_addr_size == addr_len &&
+X	     !bcmp( (char *) &server_addr, (char *) &addr, addr_len ) ) {
+X	    switch ( *buf ) {
+X	      case MSG_SIGN_OFF:
+X		DEBUG(("   Received sign off message: [%2d] %s\n",
+X		       cnt-1,show_data(buf+1,cnt-1)));
+X		if ( dropped_func ) (*dropped_func)( buf+1, cnt-1 );
+X		return RECV_DROPPED;
+X	    }
+X	    DEBUG(("   Received message: [%2d] %s\n",cnt,show_data(buf,cnt)));
+X	    return cnt;
+X	}
+X    }
+X}
+X
+X/*
+X *	int send_server( char *buf, int buf_len, int flags )
+X *
+X *	Send a message to the server.
+X */
+X
+Xint
+Xsend_server( buf, buf_len, flags )
+Xchar *buf;
+Xint buf_len;
+Xint flags;
+X{
+X    DEBUG(("Send message [%2d] %s\n",buf_len,show_data(buf,buf_len)));
+X    return send( serv_sock, buf, buf_len, flags );
+X}
+X
+X/*
+X *	int sign_off( char *buf, int buf_len, int flags )
+X *
+X *	Tell the server that we are signing off.
+X */
+X
+Xint
+Xsign_off( buf, buf_len, flags )
+Xchar *buf;
+Xint buf_len;
+Xint flags;
+X{
+X    char tbuf[512];
+X
+X    DEBUG(("Signing off with [%2d] %s\n",buf_len,show_data(buf,buf_len)));
+X    tbuf[0] = MSG_SIGN_OFF;
+X    bcopy( buf, tbuf+1, buf_len );
+X    return send_server( tbuf, buf_len+1, flags );
+X}
+*-*-END-of-client.c-*-*
+echo x - client.h
+sed 's/^X//' >client.h <<'*-*-END-of-client.h-*-*'
+X/*
+X *	client.h: Copyright 1986, Lee Iverson.
+X */
+X
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X
+X/*
+X *	Error values returned by obtain_service(). [should check errno]
+X */
+X
+X#define NO_SERVER	(-1)
+X#define START_SERVER	(-2)
+X
+X/*
+X *	Special values returned by recv_server().
+X */
+X
+X#define RECV_ERROR	(-1)	/* Check errno */
+X#define RECV_DROPPED	(-2)	/* Server dropped us */
+X
+Xstruct server {
+X    struct sockaddr addr;
+X    int addr_len;
+X    char *msg;
+X    int msg_len;
+X};
+X
+Xextern int server_socket();
+X
+Xextern void set_dropped_func(/* void (*)(char *, int) */);
+Xextern void set_select_server(/* struct server *(*)(struct server *, int) */);
+X
+Xextern int obtain_service(/* char *, int, int */);
+X
+Xextern int recv_server(/* char *, int, int */);
+Xextern int send_server(/* char *, int, int */);
+Xextern int sign_off(/* char *, int, int */);
+*-*-END-of-client.h-*-*
+echo x - server.c
+sed 's/^X//' >server.c <<'*-*-END-of-server.c-*-*'
+X#ifndef lint
+Xstatic char Copyright[] = "server.c: Copyright 1986, Lee Iverson";
+X#endif lint
+X
+X#include <stdio.h>
+X#include <netdb.h>
+X
+X#include "comm.h"
+X#include "server.h"
+X
+X#include <netinet/in.h>
+X#include <net/if.h>
+X
+X#ifdef DEBUG
+X#undef DEBUG
+X#define DEBUGGING (1)
+X#define DEBUG(x) (printf x, fflush(stdout), 1)
+X#else
+X#define DEBUGGING (0)
+X#define DEBUG(x) (0)
+X#endif DEBUG
+X
+Xextern char *malloc();
+Xvoid inactive_client();
+X
+X#define TBUF_SIZE (512)
+Xstatic char tbuf[TBUF_SIZE];
+X
+Xstatic int serv_sock = -1;
+X
+Xint allow_new_clients = 1;
+X
+X#define UNDEFINED "<undefined>"
+X
+Xstatic char *service_name = UNDEFINED;
+Xstatic int service_name_len = sizeof(UNDEFINED);
+X
+X/*
+X *	The message sent to potential clients.
+X */
+X
+Xstatic char new_client_msg[512];
+Xstatic int new_client_msg_len = 0;
+X
+Xvoid 
+Xset_new_client_message( msg, len )
+Xchar *msg;
+Xint len;
+X{
+X    bcopy( msg, new_client_msg, len );
+X    new_client_msg_len = len;
+X}
+X
+X/*
+X *	Set up for the client table.
+X */
+X
+Xstruct client {
+X    struct sockaddr addr;
+X    short addr_len;
+X    char active;
+X};
+X
+Xstatic struct client client_space[10];
+Xstatic int num_client_spaces = 10;
+Xstatic int num_clients = 0;
+Xstatic struct client *all_clients = client_space;
+X
+X/*
+X *	Initialize for new client hook.
+X */
+X
+Xstatic void (*new_client_func)() = 0;
+X
+Xvoid
+Xset_new_client_func( ncf )
+Xvoid (*ncf)();
+X{
+X    new_client_func = ncf;
+X}
+X
+X/*
+X *	Initialize for dead client hook.
+X */
+X
+Xstatic void (*dead_client_func)() = 0;
+Xvoid
+Xset_dead_client_func( dcf )
+Xvoid (*dcf)();
+X{
+X    dead_client_func = dcf;
+X}
+X
+X/*
+X *	int setup_server( char* name, int port )
+X *
+X *	Set up the server side of the client/server model to receive datagram
+X *	messages on a socket with the given service name, on the given port.
+X *	If the service named exists in the service table (/etc/services) then
+X *	it uses the port number specified therein, otherwise it uses the value
+X *	passed as the port parameter.  If the port parameter is 0 and the
+X *	named service is not found in the service table, then the function
+X *	returns with an error value.  The return value of the function
+X *	is the number of the socket initialized, with a negative number
+X *	indicating and error.  The negative return values are:
+X *		NO_SERVICE	(-1)	Unrecognized service.
+X *		NO_SOCKET	(-2)	Unable to create socket (use errno).
+X *		NO_BIND		(-3)	Unable to bind socket (use errno).
+X */
+X 
+Xint
+Xsetup_server( name, port )
+Xchar *name;
+Xint port;
+X{
+X    int sock;
+X    struct sockaddr_in sin;
+X    struct servent  *serv,  *getservbyname();
+X    struct protoent *proto, *getprotobyname();
+X    int serv_proto = 0;
+X
+X    /* Save the name of the service */
+X    service_name_len = strlen(name) + 1;
+X    service_name = malloc( service_name_len );
+X    bcopy( name, service_name, service_name_len );
+X
+X    /* Initialize service information */
+X    port = htons(port);
+X    if ( (serv = getservbyname( name, (char *) 0 )) != NULL ) {
+X	port = serv->s_port;
+X#ifdef PROTO_SUPPORTED
+X	if ( (proto = getprotobyname(serv->s_proto)) != NULL ) {
+X	    serv_proto = proto->p_proto;
+X	}
+X#endif PROTO_SUPPORTED
+X    }
+X
+X    /* If service port not determined, then return with an error */
+X    if ( port == 0 ) {
+X	return NO_SERVICE;
+X    }
+X
+X    /* Set up the receiving socket */
+X    if ( (sock = socket( AF_INET, SOCK_DGRAM, serv_proto )) < 0 ) {
+X	return NO_SOCKET;
+X    }
+X
+X    /* Bind this socket to the receiving port */
+X    sin.sin_family = AF_INET;
+X    sin.sin_port = port;
+X    sin.sin_addr.s_addr = htonl(INADDR_ANY);
+X    if ( bind( sock, (caddr_t)&sin, sizeof(sin) ) < 0 ) {
+X	return NO_BIND;
+X    }
+X
+X    DEBUG(( "Server at port %d on socket %d\n", ntohs(port), sock ));
+X    serv_sock = sock;
+X    return sock;
+X}
+X
+X#if DEBUGGING
+X#include <ctype.h>
+X
+Xchar *
+Xshow_data( p, len )
+Xunsigned char *p;
+Xint len;
+X{
+X    static char buf[TBUF_SIZE];
+X    char *q;
+X    char *index();
+X    
+X    for ( q = buf; len > 0; ++p, --len ) {
+X	if ( *p != 0 && isascii(*p) ) {
+X	    *q++ = *p;
+X	}
+X	else {
+X	    sprintf( q, "|%d|", *p );
+X	    q = index(q,'|') + 1;
+X	    q = index(q,'|') + 1;
+X	}
+X    }
+X    *q = 0;
+X    return buf;
+X}
+X#endif
+X
+X/*
+X *	int recv_client( char *buf, int *buf_len, int flags )
+X *
+X *	Receive another message from a client.  If the message is a request
+X *	for the service and the server is ready to receive new clients, then
+X *	an acknowledgement is returned.  Otherwise, the message is received
+X *	from the client and is inserted into the buffer, with the client
+X *	number returned.  It should be noted that the buf_len parameter is
+X *	a value/return parameter which should point to a value which is the
+X *	length of the buffer on input, and is modified to represent the length
+X *	of the data received on output.  A negative return value means that
+X *	no message was received.
+X */
+X
+Xint
+Xrecv_client( buf, len, flags )
+Xchar *buf;
+Xint *len;
+Xint flags;
+X{
+X    struct sockaddr recv_addr;
+X    int addr_len;
+X    int client_num;
+X    int buf_len = *len;
+X
+X    for ( ;; ) {
+X	/* Get the message */
+X	addr_len = sizeof(recv_addr);
+X	DEBUG(("Listen for input\n"));
+X	*len = recvfrom( serv_sock, buf, buf_len, flags,
+X		         &recv_addr, &addr_len );
+X
+X	/* If the socket is non-blocking and no data, just return */
+X	if ( *len < 0 ) {
+X	    return *len;
+X 	}
+X
+X	/* Check for a request message */
+X	DEBUG(("Message [%2d] %s\n",*len,show_data(buf,*len)));
+X	switch ( *buf ) {
+X	  case MSG_REQUEST:
+X	    /* Maybe acknowledge request */
+X	    DEBUG((" - Request [%2d] %s\n",*len-1,show_data(buf+1,*len-1)));
+X	    if ( allow_new_clients && !strcmp(buf+1,service_name) ) {
+X		int name_len = strlen(service_name) + 1;
+X		bcopy( service_name, tbuf, name_len );
+X		bcopy( new_client_msg, tbuf+name_len, new_client_msg_len );
+X		DEBUG(("   Return [%2d] %s\n",name_len+new_client_msg_len,
+X		       show_data(tbuf,name_len+new_client_msg_len)));
+X		sendto( serv_sock, tbuf, name_len+new_client_msg_len, 0,
+X		        &recv_addr, addr_len );
+X		DEBUG(("   Acknowledge %s [%d]\n",
+X		       inet_ntoa(((struct sockaddr_in *)&recv_addr)->sin_addr),
+X		       ntohs(((struct sockaddr_in *)&recv_addr)->sin_port)));
+X	    }
+X	    break;
+X	  case MSG_SIGN_ON:
+X	    /* Sign on this client */
+X	    DEBUG((" - Sign on to %s\n", buf+1 ));
+X	    if ( allow_new_clients && !strcmp(buf+1,service_name) ) {
+X		client_num = add_new_client( &recv_addr, addr_len );
+X		if ( new_client_func ) {
+X		    (*new_client_func)( client_num,
+X				        buf + service_name_len + 1,
+X				        *len - (service_name_len + 1) );
+X		}
+X	    }
+X	    else {
+X		/* Send a sign off message */
+X#define REJECT_MSG "Attempt to sign on rejected."
+X		tbuf[0] = MSG_SIGN_OFF;
+X		bcopy( REJECT_MSG, tbuf, sizeof(REJECT_MSG) );
+X		DEBUG((" - Attempt to sign on rejected.\n"));
+X		sendto( serv_sock, tbuf, sizeof(REJECT_MSG)+1, 0,
+X		       &recv_addr, addr_len );
+X	    }
+X	    break;
+X	  case MSG_SIGN_OFF:
+X	    /* Sign the client off if he still exists */
+X	    DEBUG((" - Sign off [%2d] %s\n",*len-1,
+X		   show_data(buf+1,*len-1)));
+X	    if ( (client_num = find_client( &recv_addr, addr_len )) >= 0 ) {
+X		if ( dead_client_func ) {
+X		    (*dead_client_func)( client_num, buf + 1, *len - 1 );
+X		}
+X		inactive_client(client_num);
+X	    }
+X	    break;
+X	  default:
+X	    /* All other messages */
+X	    if ( (client_num = find_client( &recv_addr, addr_len )) >= 0 ) {
+X		DEBUG((" - Message received from %d\n",client_num));
+X		return client_num;
+X	    }
+X	    else {
+X		DEBUG((" - Not a client, ignored.\n"));
+X	    }
+X	    break;
+X	}
+X    }
+X}
+X
+X/*
+X *	void send_client( int client_num, char *buf, int buf_len, int flags )
+X *
+X *	Send the message in the buffer pointed to by buf to the client
+X *	indicated by the client number.  This is a no-op if the client
+X *	number is invalid or inactive.
+X */
+X
+Xvoid
+Xsend_client( client_num, buf, buf_len, flags )
+Xint client_num;
+Xchar *buf;
+Xint buf_len;
+Xint flags;
+X{
+X    if ( client_num < num_clients && all_clients[client_num].active ) {
+X	DEBUG(("   Send to %d [%2d] %s\n",client_num,buf_len,
+X	       show_data(buf,buf_len)));
+X	sendto( serv_sock, buf, buf_len, flags,
+X	        &all_clients[client_num].addr,
+X	        all_clients[client_num].addr_len );
+X    }
+X}
+X
+X/*
+X *	void drop_client( int client_num, char *buf, int buf_len, int flags )
+X *
+X *	Drop the client.  This sends a message to the client which specifies
+X *	that he has been dropped, and marks him as invalid, so any further
+X *	messages from him will be ignored.
+X */
+X
+Xvoid
+Xdrop_client( client_num, buf, buf_len, flags )
+Xint client_num;
+Xchar *buf;
+Xint buf_len;
+Xint flags;
+X{
+X    if ( client_num < num_clients && all_clients[client_num].active ) {
+X	tbuf[0] = MSG_SIGN_OFF;
+X	bcopy( buf, tbuf+1, buf_len );
+X	DEBUG(("   Dropping client %d.\n",client_num));
+X	send_client( client_num, tbuf, buf_len+1, flags );
+X	inactive_client(client_num);
+X    }
+X}
+X
+X/*
+X *	int find_client( struct sockaddr *addr, int addr_len )
+X *
+X *	Find the client number of a client given the client's address.  If the
+X *	client hasn't signed on, then return a negative value.
+X */
+X
+Xstatic int
+Xfind_client( addr, addr_len )
+Xstruct sockaddr *addr;
+Xint addr_len;
+X{
+X    register int i;
+X
+X    DEBUG(("   Looking for address %s [%d]\n",
+X	   inet_ntoa(((struct sockaddr_in *)addr)->sin_addr),
+X	   ntohs(((struct sockaddr_in *)addr)->sin_port)));
+X	   
+X    for ( i = 0; i < num_clients; ++i ) {
+X	if ( all_clients[i].active &&
+X	     addr_len == all_clients[i].addr_len &&
+X	     !bcmp( (char *) addr, (char *) &all_clients[i].addr, addr_len) ) {
+X	    DEBUG(("   Found at client %d\n", i));
+X	    return i;
+X	}
+X    }
+X    DEBUG(("   Not signed on!\n"));
+X    return -1;
+X}
+X
+X/*
+X *	int add_new_client( struct sockaddr *addr, int addr_len )
+X *
+X *	Add a new client to the client table with the given address.  Returns
+X *	the client number of the new client.
+X */
+X
+Xstatic int
+Xadd_new_client( addr, addr_len )
+Xstruct sockaddr *addr;
+Xint addr_len;
+X{
+X    char *index();
+X    struct client *next = 0;
+X    int client_num = -1;
+X    int i;
+X
+X    /* Find an inactive client */
+X    for ( i = 0; next == 0 && i < num_clients; ++i ) {
+X	if ( !all_clients[i].active ) {
+X	    next = &all_clients[i];
+X	    client_num = i;
+X	}
+X    }
+X
+X    /* If didn't find an inactive client, allocate a new one */
+X    if ( next == 0 ) {
+X	/* If we have run out of space for saving clients, then expand */
+X	if ( num_clients == num_client_spaces ) {
+X	    struct client *old_clients = all_clients;
+X	    all_clients = (struct client *)
+X	      malloc( (num_client_spaces + 5) * sizeof(struct client) );
+X	    bcopy( (char *) old_clients,
+X		   (char *) all_clients,
+X		  num_client_spaces * sizeof(struct client) );
+X	    if ( old_clients != client_space ) free( old_clients );
+X	    num_client_spaces += 5;
+X	}
+X
+X	/* Go to next client location */
+X	next = &all_clients[num_clients];
+X	client_num = num_clients;
+X	++num_clients;
+X    }
+X
+X    /* Copy the address into the new client structure */
+X    next->active = 1;
+X    next->addr = *addr;
+X    next->addr_len = addr_len;
+X
+X    /* Register the new client and return */
+X    DEBUG(("   New client %d at %s\n", client_num,
+X	   inet_ntoa(((struct sockaddr_in *)addr)->sin_addr)));
+X
+X    return client_num;
+X}
+X
+X/*
+X *	void for_each_client( void (*func)(int) )
+X *
+X *	This calls the parameter function once for each client that is still
+X *	active.  The client number is passed to the function.  This is very
+X *	useful for dropping all active clients on an interrupt, for example.
+X */
+X
+Xvoid
+Xfor_each_client( func )
+Xvoid (*func)();
+X{
+X    int i;
+X    
+X    DEBUG(("Call %#x() for each active client.\n"));
+X    for ( i = 0; i < num_clients; ++i ) {
+X	if ( all_clients[i].active ) {
+X	    DEBUG(("   Client %d is active.\n"));
+X	    (*func)(i);
+X	}
+X    }
+X}
+X
+X/*
+X *	void inactive_client( int client_num )
+X *
+X *	Mark a client as inactive.  His client number can be reused.
+X */
+X
+Xstatic void
+Xinactive_client( client_num )
+Xint client_num;
+X{
+X    if ( client_num < num_clients ) {
+X	DEBUG(("   Client %d is inactive.\n",client_num));
+X	all_clients[client_num].active = 0;
+X    }
+X}
+*-*-END-of-server.c-*-*
+echo x - server.h
+sed 's/^X//' >server.h <<'*-*-END-of-server.h-*-*'
+X/*
+X *	server.h: Copyright 1986, Lee Iverson.
+X */
+X
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X
+X#define NO_SERVICE	(-1)
+X#define NO_SOCKET	(-2)
+X#define NO_BIND		(-3)
+X
+Xextern int allow_new_clients;
+X
+Xextern int setup_server(/* char *, int */);
+X
+Xextern void set_new_client_message(/* char *, int */);
+Xextern void set_new_client_func(/* void (*)(int, char *, int) */);
+Xextern void set_dead_client_func(/* void (*)(int, char *, int) */);
+X
+Xextern int  recv_client(/* char *, int *, int */);
+Xextern void send_client(/* int, char *, int, int */);
+Xextern void drop_client(/* int, char *, int, int */);
+X
+Xextern void for_each_client(/* void (*)(int) */);
+*-*-END-of-server.h-*-*
+echo x - comm.h
+sed 's/^X//' >comm.h <<'*-*-END-of-comm.h-*-*'
+X/*
+X *	comm.h: Copyright 1986, Lee Iverson.
+X */
+X
+X#define MSG_REQUEST	((char)  0)
+X#define MSG_SIGN_ON	((char) -1)
+X#define MSG_SIGN_OFF	((char) -2)
+*-*-END-of-comm.h-*-*
+echo x - serv.c
+sed 's/^X//' >serv.c <<'*-*-END-of-serv.c-*-*'
+X#include <stdio.h>
+X#include <signal.h>
+X
+X#include <sys/types.h>
+X#include <netinet/in.h>
+X
+X#include "service.h"
+X#include "server.h"
+X
+X#define NO_CLIENTS_MSG	"We don't have any clients (yet)"
+X
+Xchar in_buf[BUFSIZ];
+X
+Xvoid
+Xchange_number_of_clients( by )
+Xint by;
+X{
+X    static char buf[64];
+X    static num_clients = 0;
+X
+X    num_clients += by;
+X    if ( num_clients != 0 ) {
+X	sprintf( buf, "We have %d clients.", num_clients );
+X    }
+X    else {
+X	strcpy( buf, "We don't have any clients." );
+X    }
+X    set_new_client_message( buf, strlen(buf)+1 );
+X}
+X
+Xvoid
+Xregister_new_client( client, msg, len )
+Xint client;
+Xchar *msg;
+Xint len;
+X{
+X    change_number_of_clients(1);
+X    printf( "   Client %d signs on: [%2d] %s\n", client, len, msg );
+X}
+X
+Xvoid
+Xclient_signed_off( client, msg, len )
+Xint client;
+Xchar *msg;
+Xint len;
+X{
+X    printf("   Client %d signed off with message: [%2d] %s\n",client,len,msg);
+X    change_number_of_clients(-1);
+X}
+X
+X#define ABNORMAL_TERM "Abnormal termination"
+X
+Xvoid
+Xdrop_client_like_hot_potato(client)
+Xint client;
+X{
+X    printf( "   Dropping client %d.\n", client );
+X    drop_client( client, ABNORMAL_TERM, sizeof(ABNORMAL_TERM), 0 );
+X    change_number_of_clients(-1);
+X}
+X
+Xvoid
+Xdrop_all_clients_and_exit(exit_val)
+Xint exit_val;
+X{
+X    printf("Drop all clients, then exit with value %d\n",exit_val);
+X    for_each_client( drop_client_like_hot_potato );
+X    exit(exit_val);
+X}
+X
+Xmain()
+X{
+X    setlinebuf( stdout );
+X    setlinebuf( stderr );
+X
+X    set_new_client_message( NO_CLIENTS_MSG, sizeof(NO_CLIENTS_MSG) );
+X    set_new_client_func( register_new_client );
+X    set_dead_client_func( client_signed_off );
+X
+X    signal( SIGINT,  drop_all_clients_and_exit );
+X    signal( SIGTERM, drop_all_clients_and_exit );
+X
+X    change_number_of_clients(0);
+X
+X    if ( setup_server( SERV_NAME, SERV_PORT ) < 0 ) {
+X	perror( "setup_server" );
+X	exit(1);
+X    }
+X
+X    for ( ;; ) {
+X	int recv_size, client_num;
+X
+X	recv_size = sizeof(in_buf);
+X	if ( (client_num = recv_client( in_buf, &recv_size, 0 )) < 0 ) {
+X	    perror( "receive" );
+X	    continue;
+X	}
+X
+X	/* Data received, display it. */
+X	printf( "From client %2d: [%2d] %s\n", client_num, recv_size, in_buf );
+X
+X	/* Reply to the bugger. */
+X#define MSG "Hello."
+X	send_client( client_num, MSG, sizeof(MSG), 0 );
+X    }
+X}
+*-*-END-of-serv.c-*-*
+echo x - findserv.c
+sed 's/^X//' >findserv.c <<'*-*-END-of-findserv.c-*-*'
+X#include <stdio.h>
+X
+X#include <sys/file.h>
+X
+X#include "service.h"
+X#include "client.h"
+X
+X#define TIMEOUT 3
+X
+X#define SIGN_ON	    "sign on."
+X#define NUM_MSGS 5
+X
+Xchar in_buf[BUFSIZ];
+X
+Xstruct server *
+Xselect_server( server_table, num_servers )
+Xstruct server *server_table;
+Xint num_servers;
+X{
+X    int i;
+X
+X    if ( num_servers == 1 ) {
+X	printf( "Server message: [%2d] %s\n",
+X	        server_table[0].msg_len, server_table[0].msg );
+X	return &server_table[0];
+X    }
+X    for ( i = 0; i < num_servers; ++i ) {
+X	printf( "%2d: [%2d] %s\n", i,
+X	        server_table[i].msg_len, server_table[i].msg );
+X    }
+X    while ( i < 0 || i >= num_servers ) {
+X	printf( "Which one? " ); fflush(stdout);
+X	if ( scanf( "%d", &i ) == 0 ) {
+X	    printf( "All right, none of them!\n" );
+X	    return 0;
+X	}
+X    }
+X    printf("Selected %d\n", i); fflush(stdout);
+X    return &server_table[i];
+X}
+X
+Xvoid
+Xdropped_by_server( msg, len )
+Xchar *msg;
+Xint len;
+X{
+X    printf( "Dropped by server process: [%2d] %s\n", len, msg );
+X    exit(1);
+X}
+X
+Xmain( argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X    int i;
+X    int sock_status;
+X    char *msg = "They're here!";
+X    char *sign_off_msg = "Bye bye";
+X    char buf[512];
+X    int chars;
+X
+X    set_dropped_func( dropped_by_server );
+X    set_select_server( select_server );
+X
+X    if ( argc > 1 ) msg = argv[1];
+X
+X    if ( obtain_service( SERV_NAME, SERV_PORT, TIMEOUT, 0,
+X			 SIGN_ON, sizeof(SIGN_ON) ) < 0 ) {
+X	fprintf( stderr, "Service request timed out\n" );
+X	exit(1);
+X    }
+X    printf( "Client side started\n" );
+X
+X    /* Set the socket to do non-blocking reads */
+X    sock_status = fcntl( server_socket(), F_GETFL, 0 );
+X    sock_status |= FNDELAY;
+X    fcntl( server_socket(), F_SETFL, sock_status );
+X
+X    /* Start into the main loop of send/receive */
+X    for ( i = 0; i < NUM_MSGS; ++i ) {
+X	if ( (chars = recv_server( buf, 512, 0 )) > 0 ) {
+X	    printf( "Received [%d bytes] '%s'\n", chars, buf );
+X	}
+X	send_server( msg, strlen(msg)+1, 0 );
+X	printf( "Sent message #%d\n", i );
+X	sleep(2);
+X    }
+X    if ( (chars = recv_server( buf, 512, 0 )) > 0 ) {
+X	printf( "Received [%d bytes] '%s'\n", chars, buf );
+X    }
+X    sign_off( sign_off_msg, strlen(sign_off_msg)+1, 0 );
+X}
+X
+*-*-END-of-findserv.c-*-*
+echo x - service.h
+sed 's/^X//' >service.h <<'*-*-END-of-service.h-*-*'
+X#define SERV_PORT   (1080)
+X#define SERV_NAME   "brd-test"
+*-*-END-of-service.h-*-*
+exit
+-- 
+				Lee Iverson
+				utcsri!larry.ee.mcgill.edu!leei
+				leei%larry.ee.mcgill.edu.UUCP@uw-beaver.ARPA
+				Mcgill University, Montreal
+				Computer Vision and Robotics Lab
+
+

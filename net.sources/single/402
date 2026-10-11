@@ -1,0 +1,1115 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,86a9beb2747f29b5,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-07-03 00:16:29 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site umcp-cs.UUCP
+Path: utzoo!linus!philabs!seismo!rlgvax!cvl!umcp-cs!chris
+From: chris@umcp-cs.UUCP
+Newsgroups: net.sources
+Subject: Window source #4 [of 0-7]: display.c
+Message-ID: <424@umcp-cs.UUCP>
+Date: Sun, 3-Jul-83 03:16:29 EDT
+Article-I.D.: umcp-cs.424
+Posted: Sun Jul  3 03:16:29 1983
+Date-Received: Sun, 3-Jul-83 17:27:10 EDT
+Organization: Univ. of Maryland, Computer Science Dept.
+Lines: 1095
+
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting display.c'
+sed 's/^X//' <<'//go.sysin dd *' >display.c
+X/* Copyright (c) 1983 University of Maryland Computer Science Department */
+X
+X/* Ultra-hot screen management package
+X   Original code copyright (c) James Gosling, January 1980 */
+X
+X/* Severe munging and destruction by Chris Torek, 1982,1983 */
+X
+X/****************************************************************
+X
+X
+X
+X			 /-------------\
+X			/		\
+X		       /		 \
+X		      /			  \
+X		      |	  XXXX	   XXXX	  |
+X		      |	  XXXX	   XXXX	  |
+X		      |	  XXX	    XXX	  |
+X		      \		X	  /
+X		       --\     XXX     /--
+X			| |    XXX    | |
+X			| |	      | |
+X			| I I I I I I I |
+X			|  I I I I I I	|
+X			 \	       /
+X			  --	     --
+X			    \-------/
+X		    XXX			   XXX
+X		   XXXXX		  XXXXX
+X		   XXXXXXXXX	     XXXXXXXXXX
+X			  XXXXX	  XXXXX
+X			     XXXXXXX
+X			  XXXXX	  XXXXX
+X		   XXXXXXXXX	     XXXXXXXXXX
+X		   XXXXX		  XXXXX
+X		    XXX			   XXX
+X
+X			  **************
+X			  *  BEWARE!!  *
+X			  **************
+X
+X			All ye who enter here:
+X		    Most of the code in this module
+X		       is twisted beyond belief!
+X
+X			   Tread carefully.
+X
+X		    If you think you understand it,
+X			      You Don't,
+X			    So Look Again.
+X
+X ****************************************************************/
+X
+X/* DJH -- Added Ding() for bell */
+X
+X#include "win.h"
+X#include "Trm.h"
+X#include <stdio.h>
+X#include <sgtty.h>
+X
+X#ifdef lint
+X#undef	VAX		/* Don't let lint know about Vax dependent stuff */
+X#endif
+X
+X/* the following macros are used to access terminal specific routines.
+X   Really, no one outside of display.c should be using them, except for
+X   the initialize/cleanup routines */
+X#define topos (*W_tt.t_topos)
+X#define reset (*W_tt.t_reset)
+X#define INSmode (*W_tt.t_INSmode)
+X#define insertlines (*W_tt.t_inslines)
+X#define deletelines (*W_tt.t_dellines)
+X#define blanks (*W_tt.t_blanks)
+X#define wipeline (*W_tt.t_wipeline)
+X#define wipescreen (*W_tt.t_wipescreen)
+X#define deletechars (*W_tt.t_delchars)
+X#define	ScreenWidth (W_tt.t_width)
+X#define ScreenLength (W_tt.t_length)
+X
+X#define MScreenWidth 135
+X#define MScreenLength 60
+X#define min(a,b) (a<b ? a : b)
+X#define max(a,b) (a>b ? a : b)
+X#define hidden static
+X#define visible
+X#define procedure
+X#define function
+X
+Xhidden struct line {		/* a line as it appears in a list of
+X				   lines (as in the physical and virtual
+X				   display lists) */
+X    int     hash;		/* hash value for this line, 0 if not
+X				   known */
+X    struct line *next;		/* pointer to the next line in a list of
+X				   lines */
+X    short   DrawCost;		/* the cost of redrawing this line */
+X    short   length;		/* the number of valid characters in the
+X				   line */
+X    short   touched;		/* true iff UpdateLine should be done */
+X    Ch      body[MScreenWidth];	/* the actual text of the line */
+X}
+X		   *FreeLines;	/* free space list */
+X
+Xhidden WindowSize;		/* the number of lines on which line ID
+X				   operations should be done */
+Xhidden Ch NullStr[MScreenWidth];/* type Ch equivalent of line of blanks */
+Xint baud_rate;			/* Terminal speed, so we can calculate
+X				   the number of characters required to
+X				   make the cursor sit still for n secs. */
+Xhidden CheckForInput;		/* -ve iff UpdateLine should bother
+X				   checking for input */
+Xhidden char OneLineBuf[MScreenWidth];/* For use by dumpstring and
+X				        UpdateEasyLine */
+X
+X/* 'newline' returns a pointer to a new line object, either from the
+X   free list or from the general unix pool */
+Xhidden struct line *newline ()
+X{
+X    register struct line   *p = FreeLines;
+X    register Ch *c;
+X
+X    if (p) {
+X	FreeLines = p -> next;
+X#ifdef DEBUG
+X	if (p -> hash != 12345) {
+X/*	    register FILE *f = fopen ("EMACS_TRACE", "w");
+X	    topos (23, 1);
+X	    printf ("*****Bogus value in display free list"); */
+X	    FreeLines = 0;
+X/*	    if (f) {
+X		register int *p1 = ((int *) p) - 10;
+X		register char *p2 = (char *) p1;
+X		register i;
+X		fprintf (f, "Bogus value in display free list at %o\n", p);
+X		for (i=0; i<25; i++) {
+X		    fprintf (f, "%11o: %011o %9d  %03o %03o %03o %03o\n",
+X				p1, *p1, *p1,
+X				p2[0], p2[1], p2[2], p2[3]);
+X		    p1++; p2 += 4;
+X		}
+X		fclose (f);
+X	    } */
+X	    return newline ();
+X	}
+X#endif
+X    }
+X    else {
+X	static Leakage;
+X	p = (struct line   *) malloc (sizeof *p);
+X	if (++Leakage>(2*MScreenLength)) printf ("*****Display core leakage!");
+X    }
+X    p -> length = 0;
+X    p -> hash = 0;
+X    p -> touched = 1;
+X    for (c = &p -> body[ScreenWidth]; c > p -> body;)
+X	(--c) -> ch_all = ' ';
+X    return p;
+X}
+X
+X/* 'ReleaseLine' returns a line object to the free list */
+Xhidden procedure ReleaseLine (p)
+Xregister struct line   *p; {
+X    if (p) {
+X	if (p -> hash == 12345) {
+X	    printf("\rBogus re-release!");
+X	    fflush(stdout);
+X	    /* abort(); */
+X	    return;
+X	}
+X	p -> next = FreeLines;
+X	p -> hash = 12345;
+X	FreeLines = p;
+X    }
+X}
+X
+Xhidden struct line *PhysScreen[MScreenLength + 1];
+X /* the current (physical) screen */
+Xhidden struct line *DesiredScreen[MScreenLength + 1];
+X /* the desired (virtual) screen */
+X
+Xvisible int
+X	    ScreenGarbaged,	/* set to 1 iff screen content is
+X				   uncertain. */
+X	    InputPending,	/* true iff input is known to be pending */
+X	    LastRedisplayPaused,/* true iff last redisplay paused */
+X#ifdef DEBUG
+X	    RDdebug,		/* line redraw debug switch */
+X	    IDdebug,		/* line insertion/deletion debug */
+X#endif DEBUG
+X	    WDCurrentLine,	/* current line for writing to the
+X				   virtual screen. */
+X	    WDleft;		/* number of columns left on the current
+X				   line of the virtual screen. */
+Xvisible Ch
+X	    *WDcursor;		/* pointer into a line object, indicates
+X				   where to put the next character */
+X
+X/* 'WDCharAt' returns a pointer to the Ch at position (row,col) in the
+X   virtual screen.  This is purely for the grotesque attributes in
+X   HP264?s where one must know what attribute is desired after the end
+X   of a string. */
+Xvisible Ch *WDCharAt (row, col) {
+X    register struct line *p;
+X
+X    if ((p = DesiredScreen[row]) == 0 || p -> length < col)
+X	return &NullStr[0];	/* blank */
+X    else
+X	return &p -> body[col - 1];
+X}
+X
+X/* 'WDsetpos' positions the cursor at position (row,col) in the virtual
+X   screen */
+Xvisible procedure WDsetpos (row, col)
+Xregister    row,
+X	    col; {
+X    register struct line   *p;
+X    register    n;
+X
+X    if (WDCurrentLine >= 0
+X	    && (p = DesiredScreen[WDCurrentLine]) -> length
+X	    <= (n = ScreenWidth - WDleft))
+X	p -> length = WDleft > 0 ? n : ScreenWidth;
+X    if (!DesiredScreen[row])
+X	DesiredScreen[row] = newline ();
+X    (p = DesiredScreen[row]) -> hash = 0;
+X    p -> touched = 1;
+X    WDcursor = &p -> body[col - 1];
+X    WDCurrentLine = row;
+X    WDleft = ScreenWidth + 1 - col;
+X}
+X
+X/* 'WDclearline' positions the cursor at the beginning of the
+X   indicated line and clears the line (in the image) */
+Xvisible procedure WDclearline (row) {
+X    register Ch *c;
+X    register struct line *p;
+X    WDsetpos (row, 1);
+X    (p = DesiredScreen[row]) -> length = 0;
+X    for (c = &p -> body[ScreenWidth]; c > p -> body;)
+X	(--c) -> ch_all = ' ';
+X}
+X
+X
+X/* 'hashline' computes a hash value for a line, unless the hash value
+X   is already known.  This hash code has a few important properties:
+X	- it is independant of the number of leading and trailing spaces
+X	- it will never be zero
+X 
+X   As a side effect, an estimate of the cost of redrawing the line is
+X   calculated */
+Xhidden procedure hashline (p)
+Xregister struct line   *p; {
+X    register Ch    *c,
+X		   *l;
+X    register    h;
+X
+X    if (!p || p -> hash) {
+X	if (p && p->hash==12345) printf ("****Free line in screen");
+X	return;
+X    }
+X    h = 0;
+X    c = p -> body;
+X    l = &p -> body[p -> length];
+X    while (--l > c && l -> ch_all == ' ');
+X    while (c <= l && c -> ch_all == ' ')
+X	c++;
+X    p -> DrawCost = l - c + 1;
+X    while (c <= l)
+X	h = (h << 5) + h + c++ -> ch_all;
+X    p -> hash = h!=12345 && h ? h : 1;
+X}
+X
+X/*	1   2   3   4   ....	Each Mij represents the minumum cost of
+X      +---+---+---+---+-----	rearranging the first i lines to map onto
+X    1 |   |   |   |   |		the first j lines (the j direction
+X      +---+---+---+---+-----	represents the desired contents of a line,
+X    2 |   |  \| ^ |   |		i the current contents).  The algorithm
+X      +---+---\-|-+---+-----	used is a dynamic programming one, where
+X    3 |   | <-+Mij|   |		M[i,j] = min( M[i-1,j],
+X      +---+---+---+---+-----		      M[i,j-1]+redraw cost for j,2
+X    4 |   |   |   |   |			      M[i-1,j-1]+the cost of
+X      +---+---+---+---+-----			converting line i to line j);
+X    . |   |   |   |   |		Line i can be converted to line j by either
+X    .				just drawing j, or if they match, by moving
+X    .				line i to line j (with insert/delete line)
+X */
+X
+Xhidden struct Msquare {
+X    short   cost;		/* the value of Mij */
+X    char    fromi,
+X	    fromj;		/* the coordinates of the square that
+X				   the optimal move comes from */
+X}                       M[MScreenLength + 1][MScreenLength + 1];
+X
+Xhidden procedure calcM () {
+X    register struct Msquare *p;
+X    register    i,
+X		j,
+X		movecost,
+X		cost;
+X    int     reDrawCost,
+X	    idcost,
+X	    leftcost;
+X    double  fidcost;
+X
+X    cost = 0;
+X    movecost = 0;
+X    for (i = 0; i <= ScreenLength; i++) {
+X	p = &M[i][0];
+X/*	M[i][i].cost = 0;  */
+X	p[i].cost = 0;
+X	M[0][i].cost = cost + movecost;
+X/*	M[i][0].cost = movecost;  */
+X	p[0].cost = movecost;
+X	M[0][i].fromi = 0; 
+X/*	M[0][i].fromj = M[i][i].fromj = i - 1;  */
+X	M[0][i].fromj = p[i].fromj = i - 1;
+X/*	M[i][0].fromi = M[i][i].fromi = i - 1;  */
+X	p[0].fromi = p[i].fromi = i - 1;
+X/*	M[i][0].fromj = 0;  */
+X	p[0].fromj = 0;
+X	movecost += W_tt.t_ILmf * (ScreenLength - i) + W_tt.t_ILov;
+X	if (DesiredScreen[i + 1])
+X	    cost += DesiredScreen[i + 1] -> DrawCost;
+X    }
+X
+X    fidcost = W_tt.t_ILmf * (WindowSize + 1) + W_tt.t_ILov;
+X    for (i = 1; i <= WindowSize; i++)
+X    {
+X	p = &M[i][0];
+X	fidcost -= W_tt.t_ILmf;
+X	idcost = fidcost;
+X	for (j = 1; j <= WindowSize; j++) {
+X	    p++; 
+X/*	    p = &M[i][j]; */
+X	    cost =  DesiredScreen[j] ? DesiredScreen[j] -> DrawCost : 0;
+X	    reDrawCost = cost;
+X	    if (PhysScreen[i] && DesiredScreen[j]
+X		    && PhysScreen[i] -> hash == DesiredScreen[j] -> hash)
+X		cost = 0;
+X/*	    idcost = W_tt.t_ILmf * (WindowSize - i + 1) + W_tt.t_ILov; */
+X/*	    movecost = M[i - 1][j].cost + (j == WindowSize ? 0 : idcost); */
+X	    movecost = p[-MScreenLength-1].cost
+X				+ (j == WindowSize ? 0 : idcost);
+X	    p -> fromi = i - 1;	/* now using movecost for */
+X	    p -> fromj = j;	/* the minumum cost. */
+X	    if ((
+X/*			leftcost = M[i][j - 1].cost */
+X			leftcost = p[-1].cost
+X				+ (i == WindowSize ? 0 : idcost) + reDrawCost
+X		    ) < movecost) {
+X		movecost = leftcost;
+X		p -> fromi = i;
+X		p -> fromj = j - 1;
+X	    }
+X/*	    cost += M[i - 1][j - 1].cost; */
+X	    cost += p[-MScreenLength-2].cost;
+X	    if (cost < movecost)
+X		movecost = cost,
+X		    p -> fromi = i - 1, p -> fromj = j - 1;
+X	    p -> cost = movecost;
+X	}
+X    }
+X}
+X
+X/* calculate and perform the optimal sequence of insertions/deltions
+X   given the matrix M from routine calcM */
+X
+Xhidden procedure CalcID (i, j, InsertsDesired)
+Xregister    i,
+X	    j; {
+X    register    ni,
+X		nj;
+X    register struct Msquare *p = &M[i][j];
+X    if (i > 0 || j > 0) {
+X	ni = p -> fromi;
+X	nj = p -> fromj;
+X	if (ni == i) {
+X	    CalcID (ni, nj, i != WindowSize ? InsertsDesired + 1 : 0);
+X	    InsertsDesired = 0;
+X	    if (InputPending) {
+X		if (PhysScreen[j] != DesiredScreen[j])
+X		    ReleaseLine (PhysScreen[j]);
+X		PhysScreen[j] = 0;
+X		ReleaseLine (DesiredScreen[j]);
+X		DesiredScreen[j] = 0;
+X		LastRedisplayPaused++;
+X	    }
+X	    else {
+X		UpdateLine ((struct line *) 0, DesiredScreen[j], j);
+X		if (PhysScreen[j] != DesiredScreen[j])
+X		    ReleaseLine (PhysScreen[j]);
+X		PhysScreen[j] = DesiredScreen[j];
+X		DesiredScreen[j] = 0;
+X	    }
+X	}
+X	else
+X	    if (nj == j) {
+X		if (j != WindowSize) {
+X		    register    nni,
+X				dlc = 1;
+X		    for (; ni;) {
+X			p = &M[ni][nj];
+X			nni = p -> fromi;
+X			if (p -> fromj == nj) {
+X			    dlc++;
+X			    ni = nni;
+X			}
+X			else
+X			    break;
+X		    }
+X		    topos (i - dlc + 1, 1);
+X		    deletelines (dlc);
+X		}
+X		CalcID (ni, nj, 0);
+X	    }
+X	    else {
+X		register struct line   *old = PhysScreen[i];
+X#ifdef DOEARLY
+X		register    DoneEarly = 0;
+X#endif
+X		if (old == DesiredScreen[i]) DesiredScreen[i] = 0;
+X		PhysScreen[i] = 0;
+X
+X#ifdef DOEARLY
+X	    /* The following hack and all following lines involving the
+X	       variable "DoneEarly" cause the bottom line of the screen to
+X	       be redisplayed before any others if it has changed and it
+X	       would be redrawn in-place.  This is purely for Emacs,
+X	       people using this package for other things might want to
+X	       lobotomize this section. */
+X		if (i == ScreenLength && j == ScreenLength
+X/*			&& old != PhysScreen[j]) { */
+X			&& DesiredScreen[j]) {
+X		    DoneEarly++;
+X		    UpdateLine (old, DesiredScreen[j], j);
+X		}
+X#endif
+X		CalcID (ni, nj, 0);
+X		if (InputPending
+X#ifdef DOEARLY
+X				 && !DoneEarly
+X#endif
+X						) {
+X		    if (PhysScreen[j] != old)
+X			ReleaseLine (PhysScreen[j]);
+X		    if (DesiredScreen[j] != old
+X			    && DesiredScreen[j] != PhysScreen[j])
+X			ReleaseLine (DesiredScreen[j]);
+X		    PhysScreen[j] = old;
+X		    DesiredScreen[j] = 0;
+X		    LastRedisplayPaused++;
+X		}
+X		else {
+X		    if (
+X#ifdef DOEARLY
+X			!DoneEarly &&
+X#endif
+X					(DesiredScreen[j] || i != j))
+X			UpdateLine (old, DesiredScreen[j], j);
+X		    if (PhysScreen[j] != DesiredScreen[j])
+X			ReleaseLine (PhysScreen[j]);
+X		    if (old != DesiredScreen[j] && old != PhysScreen[j])
+X			ReleaseLine (old);
+X		    PhysScreen[j] = DesiredScreen[j];
+X		    DesiredScreen[j] = 0;
+X		}
+X	    }
+X    }
+X    if (InsertsDesired) {
+X	topos (j + 1, 1);
+X	insertlines (InsertsDesired);
+X    }
+X}
+X
+X/* modify current screen line 'old' to match desired line 'new',
+X   the old line is at position ln.  Each line
+X   is scanned and partitioned into 4 regions:
+X
+X	     <osp><----m1-----><-od--><----m2----->
+X    old:    "     Twas brillig and the slithy toves"
+X    new:    "        Twas brillig where a slithy toves"
+X	     <-nsp--><----m1-----><-nd--><----m2----->
+X
+X	nsp, osp	- number of leading spaces on each line
+X	m1		- length of a leading matching sequence
+X	m2		- length of a trailing matching sequence
+X	nd, od		- length of the differing sequences
+X */
+Xhidden procedure UpdateLine (old, new, ln)
+Xregister struct line	*old,
+X			*new; {
+X    register Ch		*op,
+X			*np,
+X			*ol,
+X			*nl;
+X    Ch *Iop, *Inp;		/* for saving initial values */
+X    int	osp,
+X	nsp,
+X	m1,
+X	m2,
+X	od,
+X	nd,
+X	t,
+X	OldLineWipeTo,
+X	rv = 1;
+X
+X    if (old == new)
+X	return 0;		/* did nothing */
+X    if (old) {
+X	op = old -> body;
+X	ol = &old -> body[OldLineWipeTo = old -> length];
+X    }
+X    else
+X	op = NullStr, ol = op, OldLineWipeTo = 1;
+X    if (new) {
+X	np = new -> body;
+X	nl = &new -> body[new -> length];
+X    }
+X    else
+X	np = NullStr, nl = np;
+X
+X/* ACT 11-Nov-1982 Do cheap update if obvious that fanciness goes nowhere */
+X
+X    if (!W_tt.t_needspaces && np != NullStr && op == NullStr) {
+X	UpdateEasyLine (ln, np, nl);
+X	goto cleanup;
+X    }
+X    Inp = np, Iop = op;
+X    osp = 0, nsp = 0, m1 = 0, m2 = 0;
+X
+X/* calculate the magic parameters */
+X    while ((--ol) -> ch_all == ' ' && ol >= op)
+X	--OldLineWipeTo;
+X    while ((--nl) -> ch_all == ' ' && nl >= np)
+X	--new -> length;
+X    while (op -> ch_all == ' ' && op <= ol)
+X	op++, osp++;
+X    while (np -> ch_all == ' ' && np <= nl)
+X	np++, nsp++;
+X    if (ol < op && !W_tt.t_needspaces)
+X	osp = nsp;
+X    while (op -> ch_all == np -> ch_all && op <= ol && np <= nl)
+X	    op++, np++, m1++;
+X    while (ol -> ch_all == nl -> ch_all && op <= ol && np <= nl)
+X	ol--, nl--, m2++;
+X    od = ol - op + 1;
+X    nd = nl - np + 1;
+X
+X/* forget matches which would be expensive to capitalize on */
+X    if (m1 || m2) {
+X	register int    c0,
+X			c1,
+X			c2,
+X			c3;
+X	c0 = nsp + m1 + m2;
+X	if (c1 = nsp - osp)
+X	    c1 = c1<0 ? W_tt.t_DCov - c1*W_tt.t_DCmf
+X		      : W_tt.t_ICov + c1*W_tt.t_ICmf;
+X	if (c3 = nd - od)
+X	    c3 = c3<0 ? W_tt.t_DCov - c3*W_tt.t_DCmf
+X		      : W_tt.t_ICov + c3*W_tt.t_ICmf;
+X	if (c2 = (nsp + nd) - (osp + od))
+X	    c2 = c2<0 ? W_tt.t_DCov - c2*W_tt.t_DCmf
+X		      : W_tt.t_ICov + c2*W_tt.t_ICmf;
+X	c3 += c1;
+X	c1 += m2;
+X	c2 += m1;
+X	if (m2 && (c0 < c2 && c0 < c3 || c1 < c2 && c1 < c3)) {
+X	    nd += m2;
+X	    od += m2;
+X	    ol += m2;
+X	    nl += m2;
+X	    m2 = 0;
+X	}
+X	if (m1 && (c0 < c1 && c0 < c3 || c2 < c1 && c2 < c3)) {
+X	    nd += m1;
+X	    od += m1;
+X	    np -= m1;
+X	    op -= m1;
+X	    m1 = 0;
+X	}
+X    }
+X#ifdef DEBUG
+X    if (RDdebug && (m1 || m2 || nd || od)) {
+X	fprintf (stderr,"%2d nsp=%2d osp=%2d m1=%2d nd=%2d od=%2d m2=%2d\n",
+X		ln, nsp, osp, m1, nd, od, m2);
+X    }
+X#endif
+X    if (m1 == 0)
+X	if (m2 == 0) {
+X	    if (od == 0 && nd == 0) {
+X		rv = 0;		/* Jackpot! */
+X		goto cleanup;
+X	    }
+X	    INSmode (0);
+X	    if (W_tt.t_needspaces) {
+X		if (nsp > osp) {
+X		    topos (ln, min (nsp, osp) + 1);
+X		    (*W_tt.t_modes) (0);
+X		    blanks (nsp - osp);
+X		}
+X		dumpstring (np, nl);
+X	    }
+X	    else
+X		dumps2 (Inp, nl, Iop, ln, 0);
+X	    if (nsp + nd < osp + od) {
+X		topos (ln, nsp + nd + 1);
+X		wipeline (0, OldLineWipeTo);
+X	    }
+X	}
+X	else {			/* m1==0 && m2!=0 && (nd!=0 || od!=0) */
+X	    t = (nsp + nd) - (osp + od);
+X	    topos (ln, min (nsp, osp) + 1);
+X	    if (nsp > osp)
+X		np -= nsp - osp;
+X	    if (t >= 0) {
+X		if (nl - t >= np) {
+X		    INSmode (0);
+X		    if (W_tt.t_needspaces)
+X			dumpstring (np, nl - t);
+X		    else
+X			dumps2 (Inp, nl - t, Iop, ln, np - Inp);
+X		    if (t > 0)
+X			topos (ln, nl - t - Inp + 1);
+X		}
+X		if (t > 0)
+X		    INSmode (1), dumpstring (nl - t + 1, nl);
+X	    }
+X	    else {
+X		INSmode (0);
+X		if (W_tt.t_needspaces)
+X		    dumpstring (np, nl);
+X		else
+X		    dumps2 (Inp, nl, Iop, ln, np - Inp);
+X		topos (ln, nsp + nd + 1);
+X		deletechars (-t);
+X	    }
+X	}
+X    else {			/* m1!=0 */
+X	register    lsp = osp;
+X	if (nsp < osp) {
+X	    topos (ln, 1);
+X	    deletechars (osp - nsp);
+X	    lsp = nsp;
+X	}
+X	if (m2 == 0) {
+X	    if (nd == 0 && od == 0) {
+X		if (nsp > osp) {
+X		    topos (ln, 1);
+X		    INSmode (1);
+X		    (*W_tt.t_modes) (0);
+X		    blanks (nsp - osp);
+X		}
+X		goto cleanup;
+X	    }
+X#ifndef notdef
+X	    if (od == 0 && !W_tt.t_needspaces)
+X		while (np -> ch_all == ' ' && np <= nl) np++, m1++;
+X#endif
+X	    topos (ln, lsp + m1 + 1);
+X	    INSmode (0);
+X	    if (nsp != osp || W_tt.t_needspaces)
+X		dumpstring (np, nl);
+X	    else
+X		dumps2 (Inp, nl, Iop, ln, np - Inp);
+X	    if (nd < od) {
+X		topos (ln, lsp + m1 + nd + 1);
+X		wipeline (0, OldLineWipeTo);
+X	    }
+X	    if (nsp > osp) {
+X		topos (ln, 1);
+X		INSmode (1);
+X		(*W_tt.t_modes) (0);
+X		blanks (nsp - osp);
+X	    }
+X	}
+X	else {			/* m1!=0 && m2!=0 && (nd!=0 || od!=0) */
+X	    topos (ln, lsp + m1 + 1);
+X	    t = nd - od;
+X	    if (nd > 0 && od > 0) {
+X		INSmode (0);
+X		if (nsp == osp && !W_tt.t_needspaces) {
+X		    dumps2 (Inp, np + min (nd, od) - 1, Iop, ln, np - Inp);
+X		    if (nd != od)
+X			topos (ln, lsp + m1 + min (nd, od) + 1);
+X		}
+X		else
+X		    dumpstring (np, np + min (nd, od) - 1);
+X	    }
+X	    if (nd < od)
+X		deletechars (od - nd);
+X	    else
+X		if (nd > od)
+X		    INSmode (1), dumpstring (np + od, nl);
+X	    if (nsp > osp) {
+X		topos (ln, 1);
+X		INSmode (1);
+X		(*W_tt.t_modes) (0);
+X		blanks (nsp - osp);
+X	    }
+X	}
+X    }
+Xcleanup:;
+X#ifdef FIONREAD
+X    if(--CheckForInput<0 && !InputPending &&
+X				((stdout->_ptr - stdout->_base) > 20)){
+X	fflush (stdout);
+X#ifdef TIOCOUTQ			/* prevent system I/O buffering */
+X	if (baud_rate < 2400) {
+X	    int out1;
+X	    float outtime;
+X	    if (ioctl (fileno(stdin), TIOCOUTQ, &out1))
+X		out1 = 0;
+X	    out1 *= 10;
+X	    outtime = ((float) out1) / ((float) baud_rate);
+X	    if (outtime >= 1.5) sleep ((unsigned) (outtime - .5));
+X	}
+X#endif
+X	ioctl (fileno(stdin), FIONREAD, &InputPending);
+X	CheckForInput = baud_rate / 2400;
+X    }
+X#endif
+X    return rv;
+X}
+X
+X/* Update a line that used to be completely blank */
+Xhidden procedure UpdateEasyLine (ln, st, en)
+Xregister Ch *st, *en;
+X{
+X    register char *p;
+X    register mode;
+X    Ch *xstart = st, *ostart;
+X
+X    INSmode (0);
+X    while (st < en) {
+X	if (st -> ch_all == ' ' && (st+1) < en && (st+1) -> ch_all == ' ') {
+X	    while (st < en && st -> ch_all == ' ')
+X		st++;
+X	    continue;
+X	}
+X	ostart = st;
+X	mode = st -> Mode;
+X	p = OneLineBuf;
+X	while (st < en && st -> Mode == mode) {
+X	    if (st -> ch_all == ' ' && (st+2) < en && (st+1) -> ch_all == ' '
+X	        && (st+2) -> ch_all == ' ')
+X		break;
+X	    *p++ = st++ -> Char;
+X	}
+X	topos (ln, ostart-xstart+1);
+X	(*W_tt.t_modes) (mode);
+X	(*W_tt.t_writechars) (OneLineBuf, p - 1);
+X    }
+X}
+X
+Xvisible procedure WDUpdateScreen (SlowUpdate, NoInputCheck) {
+X    register    n,		/* NOTE: n MUST be first register! */
+X		c;
+X
+X    CheckForInput = 9999;
+X    if (ScreenGarbaged) {
+X	reset ();
+X	ScreenGarbaged = 0;
+X	SlowUpdate = 0;
+X	for (n = 0; n <= ScreenLength; n++) {
+X	    ReleaseLine (PhysScreen[n]);
+X	    PhysScreen[n] = 0;
+X	}
+X    }
+X#ifdef FIONREAD			/* one quick test */
+X    if (!NoInputCheck && !InputPending)
+X	ioctl (fileno(stdin), FIONREAD, &InputPending);
+X#endif
+X    if (WDCurrentLine >= 0
+X	    && DesiredScreen[WDCurrentLine] -> length <= ScreenWidth - WDleft)
+X	DesiredScreen[WDCurrentLine] -> length =
+X	    WDleft > 0 ? ScreenWidth - WDleft : ScreenWidth;
+X    WDCurrentLine = -1;
+X    if (W_tt.t_ILov == MissingFeature)
+X	SlowUpdate = 0;
+X    if (SlowUpdate) {
+X	for (n = 1; n <= ScreenLength; n++) {
+X/*	    if (DesiredScreen[n] == 0)/* Fortunately for my current hacking,
+X/*					 this is never true. ACT 24-Mar-83 */
+X/*		DesiredScreen[n] = PhysScreen[n];
+X/*	    else */
+X		hashline (DesiredScreen[n]);
+X	    hashline (PhysScreen[n]);
+X	}
+X	c = 0;
+X	for (n = ScreenLength; n >= 1 && c <= 2; n--)
+X	    if (PhysScreen[n] != DesiredScreen[n]
+X		    && PhysScreen[n]
+X		    && DesiredScreen[n] -> hash != PhysScreen[n] -> hash)
+X		c++;
+X	if (c <= 2)
+X	    SlowUpdate = 0;
+X	else {
+X	    if (W_tt.t_window) {
+X		for (n = ScreenLength;
+X			n >= 1
+X			&& (PhysScreen[n] == DesiredScreen[n]
+X			    || PhysScreen[n]
+X			    && DesiredScreen[n] -> hash == PhysScreen[n] -> hash);
+X			n--);
+X		WindowSize = n;
+X		(*W_tt.t_window) (n);
+X	    }
+X	    else
+X		WindowSize = ScreenLength;
+X	    calcM ();
+X	    CheckForInput = NoInputCheck ? 9999 : baud_rate / 2400;
+X	    CalcID (ScreenLength, ScreenLength, 0);
+X/*	for (n = 1; n <= ScreenLength; n++) {
+X	    if (DesiredScreen[n] != PhysScreen[n]) {
+X		ReleaseLine (PhysScreen[n]);
+X		PhysScreen[n] = DesiredScreen[n];
+X	    }
+X	    DesiredScreen[n] = 0;
+X	} */
+X	}
+X    }
+X    if (!SlowUpdate) {		/* fast update */
+X	for (n = 1; n <= ScreenLength; n++)
+X	    if (DesiredScreen[n] && DesiredScreen[n] -> touched) {
+X		if (UpdateLine (PhysScreen[n], DesiredScreen[n], n)) {
+X/*		    if (PhysScreen[n] != DesiredScreen[n]) */
+X			ReleaseLine (PhysScreen[n]);
+X		    PhysScreen[n] = DesiredScreen[n];
+X		    DesiredScreen[n] = 0;
+X		}
+X	    }
+X    }
+X    if (WSetRealCursor && !InputPending)
+X	topos (WRCurRow + 1, WRCurCol + 1);
+X    if (W_tt.t_donerefresh)
+X	(*W_tt.t_donerefresh) ();
+X    for (n = 1; n <= ScreenLength; n++) {
+X	if (PhysScreen[n] != 0 && DesiredScreen[n] == 0) {
+X	    DesiredScreen[n] = newline ();
+X#ifdef VAX
+X	    /* This bit of trickery helps a LOT. */
+X	    asm ("movl	_PhysScreen[r11],r1");	/*r1=from, r0=to*/
+X	    asm ("clrw	12(r0)");		/*r0->touched=0*/
+X	    asm ("movw	10(r1),10(r0)");	/*r0->length=r1->length*/
+X	    asm ("cvtwl	10(r1),r2");		/*r2=2*r1->length*/
+X	    asm ("addl2	r2,r2");
+X	    asm ("movc3	r2,14(r1),14(r0)");	/*bcopy(r1->body,r0->body,r2)*/
+X#else
+X	    CopyLine (PhysScreen[n], DesiredScreen[n]);
+X#endif
+X	}
+X    }
+X}
+X
+X#ifndef VAX
+Xhidden procedure CopyLine (from, to)
+Xregister struct line *from, *to;
+X{
+X    register Ch *cp = from -> body, *tp = to -> body;
+X    register n = from -> length;
+X    to -> touched = 0;
+X    to -> length = from -> length;
+X    while (--n>=0) *tp++ = *cp++;
+X}
+X#endif
+X
+Xvisible int VisibleBell;	/* If true and the terminal will support it
+X				   then the screen will flash instead of
+X				   feeping when an error occurs */
+Xvisible int InverseVideo;	/* If true and the terminal will support it
+X				   then we will use inverse video */
+X
+X/* DJH common routine for a feep */
+XDing () {			/* BOGUS!  this should really be terminal
+X				   type specific! */
+X    if (VisibleBell && W_tt.t_flash) (*W_tt.t_flash) ();
+X    else putchar (07);
+X    fflush (stdout);		/* 23 May 1983 ACT */
+X}
+X
+X/* initialize the teminal package */
+XWDterm_init () {
+X    static short    baud_convert[] =
+X    {
+X	0, 50, 75, 110, 135, 150, 200, 300, 600, 1200,
+X	1800, 2400, 4800, 9600, 19200
+X    };
+X    int		    rv = 0;	/* Return value: 0 = OK */
+X    struct sgttyb   sg;
+X    extern short    ospeed;
+X    extern  WTtyFd;		/* For gttying on the terminal */
+X    static  BeenHere;		/* true iff we've been here before (some
+X				   things must only be done once!) */
+X
+X#ifdef DEBUG
+X    RDdebug = 0;		/* line redraw debug switch */
+X    IDdebug = 0;		/* line insertion/deletion debug */
+X#endif DEBUG
+X    WDCurrentLine = -1;		/* current line for writing to the
+X				   virtual screen. */
+X    WDleft = -1;		/* number of columns left on the current
+X				   line of the virtual screen. */
+X    gtty (WTtyFd, &sg);
+X    ospeed = sg.sg_ospeed;
+X    baud_rate = sg.sg_ospeed == 0 ? 1200
+X	: sg.sg_ospeed < sizeof baud_convert / sizeof baud_convert[0]
+X	? baud_convert[sg.sg_ospeed] : 9600;
+X    if (!BeenHere) {
+X	char   *tname = (char *) getenv ("TERM");
+X	struct termtype {
+X	    char   *name;
+X	    int     cmplen;
+X	    int     (*startup) ();
+X	};
+X    /* A terminal driver is selected by looking up the value of the
+X       environment variable TERM in the following table.  The string is
+X       matched against the name, considering at most "cmplen" characters
+X       to be significant.  "startup" points to the function that sets up
+X       the terminal driver.  The driver is called with the terminal type
+X       as a parameter and is free to use that to specialize itself. */
+X    /* NOTE: The driver should return 0 if the terminal is useable.  For
+X       now, only the TrmTERM driver does so. */
+X	struct termtype *p;
+X	extern  TrmTEK4025 ();
+X	extern  TrmAmb ();
+X/*	extern  TrmC100 (); */
+X/*	extern  TrmI400 (); */
+X/*	extern  TrmMiniB (); */
+X/*	extern  TrmPERQ (); */
+X	extern  TrmVT100 ();
+X	extern	TrmBitG ();
+X/*	extern	TrmGT40 (); */
+X/*	extern	TrmGigi (); */
+X	static struct termtype  termtable[] = {
+X	    "4025",	99, TrmTEK4025,
+X	    "aaa",	99, TrmAmb,
+X	    "amb",	99, TrmAmb,
+X	    "ambassador",99, TrmAmb,
+X	    "BG",	99, TrmBitG,
+X	    "Bit",	3,  TrmBitG,
+X/*	    "C10",	3,  TrmC100, */
+X/*	    "c10",	3,  TrmC100, */
+X/*	    "Concept",	7,  TrmC100, */
+X/*	    "concept",	7,  TrmC100, */
+X/*	    "d4",	99, TrmGT40, */
+X	    "D5",	99, TrmVT100,
+X	    "Dq",	2,  TrmVT100,
+X	    "DT80",	99, TrmVT100,
+X/*	    "GG",	99, TrmGigi, */
+X/*	    "Gigi",	4,  TrmGigi, */
+X/*	    "gt40",	99, TrmGT40, */
+X/*	    "GT40",	99, TrmGT40, */
+X/*	    "perq",	4,  TrmC100, */
+X/*	    "i400",	99, TrmI400, */
+X	    "Mb",	99, TrmAmb,
+X/*	    "minibee",	99, TrmMiniB, */
+X	    "tek4025",	99, TrmTEK4025,
+X	    "VT1",	3,  TrmVT100,
+X	    "vt1",	3,  TrmVT100,
+X	    "X5",	99, TrmTEK4025,
+X	    0, 0, 0
+X	};
+X	BeenHere++;
+X	if (tname == 0)
+X	    tname = "sd";
+X	{			/* Initialize NullStr */
+X	    register Ch *p;
+X	    for (p = NullStr; p < &NullStr[MScreenWidth]; )
+X		p++ -> ch_all = ' ';
+X	}
+X	W_tt.t_frames[0] = '+', W_tt.t_frames[2] = '+';
+X	W_tt.t_frames[5] = '+', W_tt.t_frames[7] = '+';
+X	W_tt.t_frames[1] = '-', W_tt.t_frames[6] = '-';
+X	W_tt.t_frames[3] = '|', W_tt.t_frames[4] = '|';
+X
+X	for (p = termtable; p -> name; p++)
+X	    if (strcmpn (p -> name, tname, p -> cmplen) == 0) {
+X		rv = (*p -> startup) (tname);
+X		break;
+X	    }
+X	if (p -> name == 0)
+X	    rv = TrmTERM (tname);
+X	if (rv)
+X	    return rv;
+X    }
+X    rv = (*W_tt.t_init) (baud_rate);
+X    if (rv)
+X	return rv;
+X    if (W_tt.t_length > MScreenLength)
+X	W_tt.t_length = MScreenLength;
+X    if (W_tt.t_width > MScreenWidth)
+X	W_tt.t_width = MScreenWidth;
+X    (*W_tt.t_reset) ();
+X    return 0;
+X}
+X
+X/* Debugging routines -- called from sdb only */
+X
+X/* print out the insert/delete cost matrix */
+X#ifdef DEBUG
+XPrintM () {
+X    register    i,
+X		j;
+X    register struct Msquare *p;
+X    for (i = 0; i <= ScreenLength; i++) {
+X	for (j = 0; j <= ScreenLength; j++) {
+X	    p = &M[i][j];
+X	    fprintf (stderr, "%4d%c", p -> cost,
+X		    p -> fromi < i && p -> fromj < j ? '\\' :
+X		    p -> fromi < i ? '^' :
+X		    p -> fromj < j ? '<' : ' ');
+X	}
+X	fprintf (stderr, "\n");
+X    }
+X    fprintf (stderr, "\014");
+X}
+X#endif
+X
+Xvisible procedure
+XNoOperation () {}
+X
+Xhidden procedure dumpstring (start, end)
+Xregister Ch *start, *end;
+X{
+X    register char *p;
+X    register mode;
+X
+X    do {
+X	mode = start -> Mode;
+X	p = OneLineBuf;
+X	while (start <= end && start -> Mode == mode)
+X	    *p++ = start++ -> Char;
+X	(*W_tt.t_modes) (mode);
+X	(*W_tt.t_writechars) (OneLineBuf, p - 1);
+X    } while (start <= end);
+X}
+X
+X/* Update a line that hasn't shifted left or right -- can compare char by
+X   char and skip over equal chunks */
+X/* NOTE: We have carefully guaranteed that whenever st<=en, os<=(the end of
+X   the line that os pointed to) and that all "extra" chars in a line (ie
+X   past the "end") are (type Ch) blanks */
+Xhidden procedure dumps2 (st, en, os, ln, skip)
+Xregister Ch *st, *en, *os;
+X{
+X    register char *p;
+X    register mode;
+X    Ch *xstart = st, *ostart;
+X
+X    st += skip;
+X    os += skip;
+X    while (st <= en) {
+X	if (st -> ch_all == os -> ch_all && st+1 <= en &&
+X			(st+1)->ch_all == (os+1)->ch_all) {
+X	    while (st <= en && st -> ch_all == os -> ch_all)
+X		st++, os++;
+X	    continue;
+X	}
+X	ostart = st;
+X	mode = st -> Mode;
+X	p = OneLineBuf;
+X	while (st <= en && st -> Mode == mode) {
+X	    if (st->ch_all == os->ch_all && st+2 <= en &&
+X			(st+1)->ch_all == (os+1)->ch_all &&
+X			(st+2)->ch_all == (os+2)->ch_all)
+X		break;
+X	    *p++ = st++ -> Char;
+X	    os++;
+X	}
+X	topos (ln, ostart-xstart+1);
+X	(*W_tt.t_modes) (mode);
+X	(*W_tt.t_writechars) (OneLineBuf, p - 1);
+X    }
+X}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 display.c
+	/bin/echo -n '	'; /bin/ls -ld display.c
+fi
+-- 
+UUCP:	{seismo,allegra,brl-bmd}!umcp-cs!chris
+CSNet:	chris@umcp-cs
+ARPA:	chris.umcp-cs@UDel-Relay
+
+

@@ -1,0 +1,3402 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,207fc36a2391af08,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-06-01 07:22:18 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1.chuqui 4/7/84; site nsc.UUCP
+Path: utzoo!linus!vaxine!wjh12!genrad!decvax!ittvax!dcdwest!sdcsvax!sdcrdcf!hplabs!zehntel!dual!nsc!chuqui
+From: chuqui@nsc.UUCP
+Newsgroups: net.sources
+Subject: vnews bug fixes (visual.c)
+Message-ID: <1012@nsc.UUCP>
+Date: Fri, 1-Jun-84 10:22:18 EDT
+Article-I.D.: nsc.1012
+Posted: Fri Jun  1 10:22:18 1984
+Date-Received: Wed, 6-Jun-84 02:34:05 EDT
+Organization: The Warlocks Cave
+Lines: 2432
+
+There have been a large number of bug fixes to vnews. Rather than to try to
+figure out how to diff it and things, I'm going to post my copy which has
+all of the bug fixes I've seen that I found to work. This version should
+run on all associated systems if the proper ifdefs are set up including 4.2
+with the wonderful new signal mechanisms. This file is visual.c, the next
+message will contain virtterm.c.
+
+
+chuq
+----- visual.c -----
+/*
+ * readr - visual news interface.
+ */
+
+static char SccsId[] = "@(#)visual.c	2.26.1	7/12/83";
+static char Author[] = "@(#)visual interface written by Kenneth Almquist";
+/*
+ * visual.c: version 1.7 of 5/25/84
+ * 
+ */
+# ifdef SCCS
+static char *sccsid = "@(#)visual.c	1.7 (NSC) 5/25/84";
+# endif
+
+/*
+ *  Changes to visual.c (W. Sebok astrovax!wls)
+ *
+ * 1) Added 'H' command to print out full header.
+ * 2) Interrupt character was hard-wired to Rubout.  Replaced this with
+ *    interrupt (and quit) characters obtained from terminal ioctl's.
+ * 3) fixed 4.1 BSD bug which would cause the interrupt character to be
+ *    ignored anyway unless set differently than vnews is expecting. This
+ *    bug is produced by the fact that the terminal read is *not* aborted
+ *    by an interrupt signal in 4.1 BSD when the new signal mechanism is used.
+ * 4) Added handling of delete and kill characters to the entry of a number
+ *    used as a command parameter.
+ * 5) Cleaned up behavior of `s' command when environment variable NEWSBOX
+ *    is present:
+ *   a) when %s is present in NEWSBOX string added directory creation when
+ *      directory is not present.  It also recognizes and rejects the case
+ *      when the "directory" is present but not a directory.
+ *   b) formerly, saving at article at ~/file would cause the article to
+ *      saved at newsdir/groupname/~/file  where "newsdir" is the news
+ *      directory and groupname is the name of the news group.  This has
+ *	been fixed to instead save the article at $HOME/file.
+ * 6) Applied many of the bug fixes given on the net.  This includes the bug fix
+ *    I posted to make ^Z not hang vnews when given from the editor invoked by
+ *    the "r" or "f" commands.
+ * 
+ * 7) Fixed it for 4.2 signal package. All sigsets()'s chaned to signal.
+ *    Added statement to clear sigmask in SIGSTP handler. Changed
+ *    vgetc to use select since that is interrupted by a signal whereas
+ *    read isn't (from Mark Calloe -- qubix!msc)
+ *
+ * 8) Added code from W. Sebok to access pathalias data base for return 
+ *    addresses.
+ */
+
+#ifdef NETPATHS
+#include <dbm.h>
+#endif NETPATHS
+/* ack! dbm defines null, and causes compiler noises. This shuts it up! */
+#ifdef NULL
+#undef NULL
+#endif NULL
+
+#define STATTOP
+#ifdef USG
+#include <termio.h>
+#include <fcntl.h>
+#else
+#include <sgtty.h>
+#ifdef CBREAK		/* is this BSD or V7? */
+#   define BSD 1
+#else
+#   define V7 1
+#endif
+#endif USG
+
+#define BSD4_2 1	 /* remember to turn this off for non 4.2 sites! */
+
+#ifdef BSD4_2
+#    define BIT(_a) (1<<((_a)-1))
+#endif
+
+#include <errno.h>
+#include "rparams.h"
+#include "dir.h"
+#ifdef MYDB
+#include "db.h"
+#endif
+
+#define even(cols) ((cols&1) ? cols + 1 : cols)
+
+#define ARTWLEN	(ROWS-2)/* number of lines used to display article */
+#ifdef STATTOP
+#define PRLINE	0	/* prompter line */
+#define SPLINE	1	/* secondary prompt line */
+#define ARTWIN	2	/* first line of article window */
+#define SECPRLEN 81	/* length of secondary prompter */
+#else
+#define PRLINE	(ROWS-1)/* prompter line */
+#define SPLINE	(ROWS-2)/* secondary prompt line */
+#define ARTWIN	0	/* first line of article window */
+#define SECPRLEN 100	/* length of secondary prompter */
+#endif
+#define PIPECHAR '|'	/* indicate save command should pipe to program */
+/* #define INTR	0177	/* returned by vgetc on interrupt */
+#define META	0200	/* meta chatacter bit (as in emacs) */
+/* print (display) flags */
+#define HDRONLY	0001	/* print header only */
+#define NOPRT	0002	/* don't print at all */
+#define NEWART	0004	/* force article display to be regenerated */
+#define HELPMSG	0010	/* display currently contains help message */
+/* prun flags */
+#define CWAIT	0001	/* type "continue?" and wait for return */
+#define BKGRND	0002	/* run process in the background */
+/* values of curflag */
+#define CURP1	1	/* cursor after prompt */
+#define CURP2	2	/* cursor after secondary prompt */
+#define CURHOME	3	/* cursor at home position */
+/* flags for vsave routine */
+#define SVHEAD	01	/* write out article header */
+#define OVWRITE	02	/* overwrite the file if it already exists */
+/* shell procedures to reply and post followups */
+#ifndef REPLYPROG
+#define REPLYPROG "reply"
+#endif
+#ifndef FOLLOWPROG
+#define FOLLOWPROG "follow"
+#endif
+/* other files */
+#ifndef VHELP
+#define VHELP "/usr/lib/news/vnews.help"
+#endif
+
+
+
+#define	saveart	oobit = bit;strcpy(ofilename1, filename);strcpy(ogroupdir, groupdir);hbufcp(&hbuf1, &h);ongsize = pngsize
+#define NLINES(h, fp) (h.numlines[0] ? h.intnumlines : (h.intnumlines=linecnt(fp),sprintf(h.numlines, "%d", h.intnumlines), h.intnumlines))
+
+/* terminal handler stuff */
+extern int _junked;
+#define clearok(xxx, flag) _junked = flag
+extern int COLS;
+extern int ROWS;
+extern int hasscroll;
+
+extern int errno;
+FILE *tmpfile();
+char *getmailname();
+char *findparent();
+int onint(), onquit();
+int onstop(), catchcont();
+
+/*
+ * Kludge: space so that routines can access beyond
+ * the end of arrays without messing me up.
+ */
+static char junk[64];
+
+/* variables shared between vnews routines */
+static char linebuf[LBUFLEN];		/* temporary workspace */
+static FILE *tfp;			/* temporary file */
+static char tfname[] = "/tmp/vnXXXXXX";	/* name of temp file */
+static long artbody;			/* offset of body into article */
+static int quitflg;			/* if set, then quit */
+static int erased;			/* current article has been erased */
+static int artlines;			/* # lines in article body */
+static int artread;			/* entire article has been read */
+static int hdrstart;			/* beginning of header */
+static int hdrend;			/* end of header */
+static int lastlin;			/* number of lines in tempfile */
+static int tflinno = 0;			/* next line in tempfile */
+static char secpr[SECPRLEN];		/* secondary prompt */
+static char prompt[30];			/* prompter */
+static short prflags;			/* print flags (controls updscr) */
+static short curflag;			/* where to locate cursor */
+static int dlinno;			/* top line on screen */
+static char timestr[20];		/* current time */
+static int ismail;			/* true if user has mail */
+static char *mailf;			/* user's mail file */
+static int alflag;			/* set if unprocessed alarm signal */
+static int atend;			/* set if at end of article */
+static char cerase;			/* erase character */
+static char ckill;			/* kill character */
+static char cintr = 0177;  /* (WLS) */	/* interrupt character */
+       int ospeed;			/* terminal speed */
+static int pstatus;			/* status return form process */
+static int intflag;			/* set if interrupt received */
+#ifdef MYDB
+static int hasdb;			/* true if article data base exists */
+#endif
+#ifdef DIGPAGE
+static int endsuba;			/* end of sub-article in digest */
+#endif
+#ifdef MYDEBUG
+FILE *debugf;				/* file to write debugging info on */
+#endif
+
+
+char *tft = "/tmp/folXXXXXX";
+
+
+/*
+ * These were made static for u370 with its buggy cc.
+ * I judged it better to have one copy with no ifdefs than
+ * to conditionally compile them as automatic variables
+ * in readr (which they originally were).  Performance
+ * considerations might warrent moving some of the simple
+ * things into register variables, but I don't know what
+ * breaks the u370 cc.
+ */
+static char goodone[BUFLEN];		/* last decent article		*/
+static char ogroupdir[BUFLEN];		/* last groupdir		*/
+static int rfq = 0;			/* for last article		*/
+static long ongsize;			/* Previous ngsize		*/
+static long pngsize;			/* Printing ngsize		*/
+static char *bptr;			/* temp pointer.		*/
+static char *tfilename;			/* temporary file name 		*/
+static char ofilename1[BUFLEN];		/* previous file name		*/
+static struct hbuf hbuf1, hbuf2, *hptr;	/* for minusing			*/
+static char *ptr1, *ptr2, *ptr3;	/* for reply manipulation	*/
+static int  news = 0;
+static int  aabs = FALSE;		/* TRUE if we asked absolutely	*/
+static char *ed, tf[100];
+static struct hbuf h;			/* ditto.			*/
+static int i;
+static int oobit;			/* last bit, really		*/
+static char *oldsig;
+static int dgest = 0;
+static FILE *fp;			/* current article to be printed*/
+static int holdup;			/* 1 iff should stop before hdr */
+
+
+readr()
+{
+
+#ifdef MYDEBUG
+	debugf = fopen("DEBUG", "w");
+	setbuf(debugf, NULL);
+#endif
+	if (aflag) {
+		if (*datebuf) {
+			if ((atime = cgtdate(datebuf)) == -1)
+				xerror("Cannot parse date string");
+		} else 
+			atime = 0L;
+	}
+
+	if (sigtrap)
+		xxit(1);
+	mktemp(tfname);
+	if ((tfp = fopen(tfname, "w+")) == NULL)
+		xerror("Can't create temp file");
+	unlink(tfname);
+	mailf = getmailname();
+#ifdef MYDB
+	if (opendb() >= 0) {
+		hasdb = 1;
+		fputs("Using article data base\n", stderr);	/*DEBUG*/
+		getng();
+	}
+#endif
+	ttysave();
+	signal(SIGINT, onint);
+	signal(SIGQUIT, onquit);
+	if (sigtrap)
+		xxit(1);
+	ttyraw();
+	timer();
+
+	/* loop reading articles. */
+	fp = NULL;
+	obit = -1;
+	nextng();
+	quitflg = 0;
+	while (quitflg == 0) {
+		if (getnextart(FALSE))
+			break;
+		strcpy(goodone, filename);
+		if (sigtrap)
+			return;
+		vcmd();
+	}
+
+	if (news)
+		botscreen();
+	ttycooked();
+	if (!news)
+		fprintf(stderr, "No news.\n");
+}
+
+/*
+ * Read and execute a command.
+ */
+
+vcmd() {
+	register c;
+	char *p;
+	int count;
+	int countset;
+
+#ifdef DIGPAGE
+	appfile(fp, dlinno + ARTWLEN + 1);
+	endsuba = findend(dlinno);
+	if (artlines > dlinno + ARTWLEN
+	 || endsuba > 0 && endsuba < artlines
+#else
+	if ((appfile(fp, dlinno + ARTWLEN + 1), artlines > dlinno + ARTWLEN)
+#endif
+	 || (prflags & HDRONLY) && artlines > hdrend) {
+		atend = 0;
+		strcpy(prompt, "more? ");
+	} else {
+		atend = 1;
+		strcpy(prompt, "next? ");
+		if (! erased)
+			clear(bit);		/* article read */
+	}
+	curflag = CURP1;
+	p = prompt + strlen(prompt);
+	count = 0;
+	countset = 0;
+
+	while ( ( (c = vgetc()) >= '0' && c <= '9') || c==cerase || c==ckill) {
+		if (c==cerase) {
+			count /= 10;
+		}
+
+		if (c==ckill || count==0) {
+			countset = 0;
+			count = 0;
+		}
+
+		if (c!=cerase && c!=ckill) {
+			count = (count * 10) + (c - '0');
+			countset = 1;
+		}
+		*p = '\0';
+		if (count!=0)
+			sprintf(p, "%d", count);
+	}
+
+	if (c == '\033') {			/* escape */
+		strcat(prompt, "M-");
+		c = vgetc();
+		if (c != cintr)
+			c |= META;
+	}
+	secpr[0] = '\0';
+	if (countset == 0)
+		count = 1;
+	docmd(c, count);
+	if (c != '?' && c != 'H')		/* UGGH */
+		prflags &=~ HELPMSG;
+	if (dlinno > hdrstart)
+		prflags &=~ HDRONLY;
+}
+
+
+/*
+ * Process one command, which has already been typed in.
+ */
+docmd(c, count)
+{
+	int i;
+	char *findhist();
+
+	switch (c) {
+
+	/* Show more of current article, or advance to next article */
+	case '\n':
+	case ' ':
+		prflags &=~ NOPRT;
+		if (atend)
+			goto next;
+		else if (prflags & HDRONLY) {
+			prflags &=~ HDRONLY;
+			if (hasscroll)
+				dlinno = hdrstart;}
+#ifdef DIGPAGE
+		else if (endsuba > 0)
+			dlinno = endsuba;
+#endif
+		else if ((appfile(fp, dlinno + 2 * ARTWLEN), artread)
+		 && hasscroll && artlines - dlinno <= ARTWLEN + 2)
+			dlinno = artlines - ARTWLEN;
+		else
+			dlinno += ARTWLEN;
+		break;
+
+	/* No.  Go on to next article. */
+next:	case 'n':
+		readmode = NEXT;
+		if (fp != NULL) {	/* always false? */
+			fclose(fp);
+			fp = NULL;
+		}
+		clear(bit);
+		saveart;
+		nextbit();
+		break;
+
+
+	/* Back up count pages */
+	case META|'v':
+	case '\2':	/* Control-B */
+		dlinno -= ARTWLEN * count;
+		if (dlinno < 0)
+			dlinno = 0;
+		break;
+
+	/* forward half a page */
+	case '\4':	/* Control-D, as in vi */
+		dlinno += ARTWLEN/2 * count;
+		break;
+
+	/* backward half a page */
+	case '\25':	/* Control-U */
+		dlinno -= ARTWLEN/2 * count;
+		if (dlinno < 0)
+			dlinno = 0;
+		break;
+
+	/* forward count lines */
+	case '\16':	/* Control-N */
+	case '\32':	/* Control-Z */
+		dlinno += count;
+		break;
+
+	/* backwards count lines */
+	case '\20':	/* Control-P */
+	case '\31':	/* Control-Y */
+		dlinno -= count;
+		if (dlinno < 0)
+			dlinno = 0;
+		break;
+
+	/* Turn displaying of article back on */
+	case 'l':
+	case 'd':
+		prflags &=~ NOPRT;
+		break;
+
+	/* display header */
+	case 'h':
+		dlinno = hdrstart;
+		prflags |= HDRONLY;
+		prflags &=~ NOPRT;
+		break;
+
+	/*
+	 * Unsubscribe to the newsgroup and go on to next group
+	 */
+
+	case 'U':
+	case 'u':
+		strcat(prompt, "u");
+		c = vgetc();
+		if (c == 'g') {
+			obit = -1;
+			if (fp != NULL) {
+				fclose(fp);
+				fp = NULL;
+			}
+			zapng = TRUE;
+			saveart;
+			if (nextng()) {
+				if (actdirect == BACKWARD)
+					msg("Can't back up.");
+				else
+					quitflg = 1;  /* probably unnecessary */
+			}
+		} else {
+			if (c != cintr && c != ckill)
+				msg("Illegal command");
+		}
+		break;
+
+		/* Print the current version of news */
+	case 'v':
+		msg("News version: %s", news_version);
+		break;
+
+
+	/* Decrypt joke.  Always does rot 13 */
+	case 'D':
+		appfile(fp, 32767);
+		for (i = hdrend ; i < artlines ; i++) {
+			register char c, *p;
+			tfget(linebuf, i);
+			for (p = linebuf ; (c = *p) != '\0' ; p++) {
+				if (c >= 'a' && c <= 'z')
+					*p = (c - 'a' + 13) % 26 + 'a';
+				else if (c >= 'A' && c <= 'Z')
+					*p = (c - 'A' + 13) % 26 + 'A';
+			}
+			tfput(linebuf, i);
+		}
+		prflags |= NEWART;
+		prflags &=~ (HDRONLY|NOPRT);
+		break;
+
+		/* write out the article someplace */
+		/* w writes out without the header */
+	case 's':
+	case 'w': {
+		char *grn = groupdir;
+		int wflags;
+
+		msg("file: ");
+		curflag = CURP2;
+		while ((wflags = vgetc()) == ' ');
+		if (wflags == cintr) {
+			secpr[0] = '\0';
+			break;
+		}
+		if (wflags == '|') {
+			linebuf[0] = '|';
+			if (prget("| ", linebuf+1))
+				break;
+		} else {
+			pushback(wflags);
+			if (prget("file: ", linebuf))
+				break;
+		}
+		wflags = 0;
+		if (c == 's')
+			wflags |= SVHEAD;
+		if (count != 1)
+			wflags |= OVWRITE;
+		bptr = linebuf;
+		if (*bptr != PIPECHAR && *bptr != '/') {
+			char	hetyped[BUFLEN];
+			char	*boxptr;
+			struct stat stbf;
+			strcpy(hetyped, bptr);
+			if (hetyped[0] == '~' && hetyped[1] == '/') {
+				strcpy(hetyped, bptr+2);
+				strcpy(bptr, userhome);
+			} else {
+				if (boxptr = getenv("NEWSBOX")) {
+					if (index(boxptr, '%')) {
+					    sprintf(bptr, boxptr, grn);
+					    if (stat(bptr,&stbf)<0) {
+						int status, pid;
+						if ((pid=fork())<=0) {
+						    setuid(getuid());
+						    setgid(getgid());
+						    close(1); close(2);
+						    open("/dev/null",2); dup(1);
+						    execl("/bin/mkdir","mkdir",
+							bptr,0);
+						    exit(127);
+						}
+						while ( wait(&status) != pid);
+						if (status != 0) {
+					msg("Cannot create directory %s",bptr);
+						    break;
+						}
+					    } else {
+						if ((stbf.st_mode&S_IFMT)
+						 !=  S_IFDIR ) {
+						 msg("%s not a directory",bptr);
+						 break;
+						}
+					    }
+					} else {
+					    strcpy(bptr, boxptr);
+					}
+				} else {
+					bptr[0] = '\0';
+				}
+			}
+			if (bptr[0])
+				strcat(bptr, "/");
+			if (hetyped[0] != '\0')
+				strcat(bptr, hetyped);
+			else
+				strcat(bptr, "Articles");
+		}
+		vsave(bptr, wflags);
+		break;
+	}
+
+		/* back up  */
+	case '-':
+	case 'b':
+minus:
+		aabs = TRUE;
+		if (!*ofilename1) {
+			msg("Can't back up.");
+			break;
+		}
+		if (fp != NULL) {	/* always true? */
+			fclose(fp);
+			fp = NULL;
+		}
+		hbufcp(&hbuf2, &h);
+		hbufcp(&h, &hbuf1);
+		hbufcp(&hbuf1, &hbuf2);
+		strcpy(bfr, filename);
+		strcpy(filename, ofilename1);
+		strcpy(ofilename1, bfr);
+		obit = bit;
+		if (strcmp(groupdir, ogroupdir)) {
+			strcpy(bfr, groupdir);
+			selectng(ogroupdir);
+			strcpy(groupdir, ogroupdir);
+			strcpy(ogroupdir, bfr);
+			ngrp = 1;
+			back();
+		}
+		bit = oobit;
+		oobit = obit;
+		obit = -1;
+		getnextart(TRUE);
+		return FALSE;
+
+		/* skip forwards */
+	case '+':
+caseplus:	if (count == 0)
+			break;
+		saveart;
+		last = bit;
+		for (i = 0; i < count; i++) {
+			nextbit();
+			if ((bit > pngsize) || (rflag && bit < 1))
+				break;
+		}
+		if (fp != NULL) {	/* always true? */
+			fclose(fp);
+			fp = NULL;
+		}
+		obit = -1;
+		break;
+
+	/* exit - time updated to that of most recently read article */
+	case 'q':
+		quitflg = 1;
+		break;
+
+
+	/* cancel the article. */
+	case 'c':
+		strcpy(prompt, "cancel [n]? ");
+		if (vgetc() != 'y') {
+			msg("article not cancelled");
+			break;
+		}
+		cancel_command();
+		break;
+
+	/* escape to shell */
+	case '!': {
+		register char *p;
+		int flags;
+
+		p = linebuf;
+		if (prget("!", p))
+			break;
+		flags = CWAIT;
+		if (*p == '\0') {
+			strcpy(linebuf, SHELL);
+			flags = 0;
+		}
+		while (*p) p++;
+		while (p > linebuf && p[-1] == ' ')
+			p--;
+		if (*--p == '&') {
+			*p = '\0';
+			flags = BKGRND;
+		} else if (*p == '|') {
+			*p = '\0';
+			sprintf(bfr, "(%s)|mail '%s'", linebuf, username);
+			strcpy(linebuf, bfr);
+			flags |= BKGRND;
+		} else {
+			prflags |= NOPRT;
+		}
+		shcmd(linebuf, flags);
+		break;
+	}
+
+	/* mail reply */
+	case 'r':
+		reply(0);
+		break;
+
+	/* punt rest of newsgroup */
+
+	case 'K':
+		saveart;
+		while (bit <= ngsize && bit > 0) {
+			clear(bit);
+			nextbit();
+		}
+		break;
+
+
+	/* next newsgroup */
+	case 'N':
+		if (fp != NULL) {
+			fclose(fp);
+			fp = NULL;
+		}
+		if (next_ng_command())
+			quitflg = 1;
+		break;
+
+	/* sepecific number */
+	case 'A':
+		if (count > pngsize) {
+			msg("not that many articles");
+			break;
+		}
+		readmode = SPEC;
+		aabs = TRUE;
+		bit = count;
+		obit = -1;
+		if (fp) {
+			fclose(fp);
+			fp = NULL;
+		}
+		break;
+
+	/* display parent article */
+	case 'p':
+#ifdef MYDB
+		if (hasdb && (ptr3 = findparent(h.ident, &i)) != NULL) {
+			msg("parent: %s/%d", ptr3, i);		/*DEBUG*/
+			updscr();				/*DEBUG*/
+			goto selectart;
+		}
+#endif
+		if (h.followid[0] == '\0') {
+			msg("no references line");
+			break;
+		}
+		if ((ptr1 = rindex(h.followid, ' ')) != NULL)
+			ptr1++;
+		else
+			ptr1 = h.followid;
+		strcpy(linebuf, ptr1);
+		msg("%s", linebuf);
+		curflag = CURP2;
+		updscr();		/* may take this out later */
+		goto searchid;
+
+	/* specific message ID. */
+	case '<':
+		/* could improve this */
+		linebuf[0] = '<';
+		if (prget("<", linebuf+1))
+			break;
+searchid:	secpr[0] = '\0';
+		if (index(linebuf, '@') == NULL && index(linebuf, '>') == NULL) {
+			ptr1 = linebuf;
+			if (*ptr1 == '<')
+				ptr1++;
+			ptr2 = index(ptr1, '.');
+			if (ptr2 != NULL) {
+				*ptr2++ = '\0';
+				sprintf(bfr, "<%s@%s.UUCP>", ptr2, ptr1);
+				strcpy(linebuf, bfr);
+			}
+		}
+		if (index(linebuf, '>') == NULL)
+			strcat(linebuf, ">");
+
+		ptr1 = findhist(linebuf);
+		if (ptr1 == NULL) {
+			msg("%s not found", linebuf);
+			break;
+		}
+		ptr2 = index(ptr1, '\t');
+		ptr3 = index(++ptr2, '\t');
+		ptr2 = index(++ptr3, ' ');
+		if (ptr2)
+			*ptr2 = '\0';
+		ptr2 = index(ptr3, '/');
+		*ptr2++ = '\0';
+		sscanf(ptr2, "%d", &i);
+
+		/*
+		 * Go to a given article.  Ptr3 specifies the newsgroup
+		 * and i specifies the article number.
+		 */
+selectart:	aabs = TRUE;
+		if (fp != NULL) {	/* always true */
+			fclose(fp);
+			fp = NULL;
+		}
+		hbufcp(&hbuf1, &h);
+		saveart;
+		strcpy(ogroupdir, ptr3);
+		if (strcmp(groupdir, ogroupdir)) {
+			strcpy(bfr, groupdir);
+			selectng(ogroupdir);
+			strcpy(groupdir, ogroupdir);
+			strcpy(ogroupdir, bfr);
+			back();
+		}
+		bit = i;
+		oobit = obit;
+		obit = -1;
+		getnextart(TRUE);
+		rfq = 0;
+		break;
+
+	/* follow-up article */
+	case 'f':
+		reply(1);
+		break;
+
+	/* erase - pretend we haven't seen this article. */
+	case 'e':
+			erased = 1;
+			set(bit);
+			goto caseplus;	/* skip this article for now */
+		break;
+
+
+	case '#':
+		msg("Article %d of %ld",
+			rfq ? oobit : bit, pngsize);
+		break;
+
+		/* error */
+	case '?':
+		{
+			FILE *helpf;
+			if ((helpf = fopen(VHELP, "r")) == NULL) {
+				msg("Can't open help file");
+				break;
+			}
+			move(ARTWIN, 0);
+			while (fgets(linebuf, 1000, helpf) != NULL)
+				addstr(linebuf);
+			fclose(helpf);
+			prflags |= HELPMSG|NEWART;
+		}
+		break;
+
+	case 'H':
+		{
+			long oldpos, ftell();
+			if (fp == NULL) {
+				msg("Bad FP");
+				break;
+			}
+			move(ARTWIN, 0);
+			oldpos = ftell(fp);
+			fseek(fp,0l,0);
+			for (i=0; i<ARTWLEN ; i++)  {
+				if (fgets(linebuf, COLS, fp) == NULL) break;
+				if (linebuf[0] == '\n') break;
+				linebuf[COLS] = '\0';
+				addstr(linebuf);
+			}
+			for (; i<ARTWLEN ; i++) {
+				addstr("\n");
+			}
+			fseek(fp,oldpos,0);
+			prflags |= HELPMSG|NEWART;
+		}
+		break;
+
+	default:
+		if (c != ckill && c != cintr)
+			msg("Illegal command");
+		break;
+	}
+
+	return FALSE;
+}
+
+cancel_command()
+{
+	tfilename = filename;
+	hptr = &h;
+	readmode = SPEC;
+	strcpy(rcbuf, hptr->path);
+	ptr1 = index(rcbuf, ' ');
+	if (ptr1)
+		*ptr1 = 0;
+	if (uid == ROOTID)
+		i = 0;		/* root gets to cancel */
+	else
+		i = strcmp(username, rcbuf);
+	if (i != 0) {
+		msg("Can't cancel what you didn't write.");
+		return;
+	}
+	if (!cancel(stderr, hptr, i) && hptr == &h) {
+		clear(bit);
+		saveart;
+		nextbit();
+		obit = -1;
+		/* fix suggested by watcgl!dmmartindale */
+		if (fp != NULL)
+			fclose(fp);
+		fp = NULL;
+		/* end fix */
+	}
+}
+
+/*
+ * Generate replies and followups.
+ * We generate a file and then call a shell procedure to do the work.
+ */
+
+#define MODGROUPS	"fa.all,mod.all,all.mod,all.announce,"
+
+reply(followup) {
+	char *arg[8];
+	FILE *tfp;
+	char subj[132];
+	char frprog[64];
+	char *p;
+	char *replyname();
+
+#ifdef NETPATHS
+	/* Stuff for finding paths in data base */
+	static int dbmopen = 0;
+	static char newspaths[] = NETPATHS;
+	datum key, result;
+	register char *p1, *p2;
+	char sitename[100];
+	/* end of stuff for finding paths in data base */
+#endif NETPATHS
+
+	strcpy(tf, tft);
+	mktemp(tf);
+	if ((tfp = fopen(tf, "w")) == NULL) {
+		msg("Can't create %s", tf) ;
+		return;
+	}
+	strcpy(subj, h.title);
+	if (!prefix(subj, "Re:") && !prefix(subj, "re:")) {
+		strcpy(bfr, subj);
+		sprintf(subj, "Re: %s", bfr);
+	}
+	arg[0] = "/bin/sh";
+
+	/* test for moderated group */
+	if (followup) {
+		strcpy(linebuf, h.nbuf);
+		ngcat(linebuf);
+		if (ngmatch(linebuf, MODGROUPS))
+			followup = 2;
+	}
+
+	if (followup != 1) {		/* send mail */
+#ifdef INTERNET
+		if (followup == 2 && h.sender[0])
+			p = h.sender;
+		else
+#endif
+			p = replyname(&h);
+#ifdef NETPATHS
+		/* Use data base to find a return path to a site */
+		/* W. Sebok, 11/13/83 */
+		if (Oflag && dbmopen == 0)
+		    dbmopen = (dbminit(newspaths)==0) ? 1 : -1 ;
+
+		if (dbmopen > 0) { 
+		    for (p1=p; (p2 = index(p1,'!'))!= NULL; p1 = p2+1);
+		    if (p!= p1) {
+			key.dptr = sitename;
+			p1--;
+			do {
+			    for (p2 = p1 ; (p1 != p) && (*--p1!='!'); );
+			    key.dsize = p2 - p1;
+			    strncpy(sitename,p1+1, key.dsize);
+			    sitename[key.dsize-1] = '\0';
+			    result = fetch(key);
+			} while ( (p1 != p) && result.dptr == NULL);
+		    }
+		}
+		if (dbmopen > 0 && result.dptr != NULL) {
+		    fprintf(tfp,"To: ");
+		    fprintf(tfp,result.dptr,p2+1);
+		    fprintf(tfp,"\nSubject: %s\n",subj);
+		    if (followup != 2)
+			fprintf(tfp,"In-reply-to: your article %s\n",h.ident);
+		} else
+#endif NETPATHS
+		{
+		    fprintf(tfp, "To: %s\n", p);
+		    fprintf(tfp, "Subject: %s\n", subj);
+		    if (followup != 2)
+			fprintf(tfp, "In-reply-to: your article %s\n", h.ident);
+		}
+		/* end of stuff for finding return paths in data base */
+		sprintf(frprog,"%s/%s",LIB,REPLYPROG);
+		arg[1] = frprog;;
+		arg[4] = p;
+	} else {
+		p = h.nbuf;
+		if (h.followto[0])
+			p = h.followto;
+		strcpy(linebuf, p);
+		launder(linebuf);
+		fprintf(tfp, "Newsgroups: %s\n", linebuf);
+		fprintf(tfp, "Subject: %s\n", subj);
+		if (h.keywords[0])
+			fprintf(tfp, "Keywords: %s\n", h.keywords);
+		if (h.distribution[0])
+			fprintf(tfp, "Distribution: %s\n", h.distribution);
+		sprintf(frprog,"%s/%s",LIB,FOLLOWPROG);
+		arg[1] = frprog;
+		arg[4] = linebuf;
+	}
+	if (followup != 0) {
+		bfr[0] = 0;				/* References */
+		if (h.followid[0]) {
+			strcpy(bfr, h.followid);
+			strcat(bfr, " ");
+		}
+		strcat(bfr, h.ident);
+		fprintf(tfp, "References: %s\n", bfr);
+	}
+	putc('\n', tfp);
+	fclose(tfp);
+
+	arg[2] = tf;
+	arg[3] = filename;
+	/* arg[4] (name or newsgroup) set above */
+	arg[5] = NULL;
+	prun(arg, 0);
+	if (pstatus != 0) {
+		if (pstatus != 22 << 8)
+			p = "Command failed";
+		else if (followup == 1)
+			p = "Article not posted";
+		else
+			p = "Mail not sent";
+		msg(p);
+	}
+	prflags |= NOPRT;
+}
+
+next_ng_command()
+{
+	if (prget("group? ", linebuf))
+		return FALSE;
+	bptr = linebuf;
+	if (!*bptr || *bptr == '-') {
+		obit = -1;
+		if (*bptr)
+			actdirect = BACKWARD;
+		saveart;
+		if (nextng()) {
+			if (actdirect == BACKWARD)
+				msg("Can't back up.");
+			else
+				return TRUE;
+		}
+		return FALSE;
+	}
+	while (isspace(*bptr))
+		bptr++;
+	if (!validng(bptr)) {
+		msg("No such group.");
+		return FALSE;
+	}
+	obit = -1;
+/*	readmode = SPEC;	tekgds!charliep thinks this is a bug */
+	saveart;
+	back();
+	selectng(bptr);
+	return FALSE;
+}
+
+/*
+ * Find the next article we want to consider, if we're done with
+ * the last one, and show the header.
+ */
+getnextart(minus)
+int minus;
+{
+	int noaccess;
+	register DIR *dirp;
+	register struct direct *dir;
+	long nextnum, tnum;
+	long atol();
+
+	noaccess = 0;
+	if (minus)
+		goto nextart2;	/* Kludge for "-" command. */
+
+	if (bit == obit)     /* Return if still on same article as last time */
+		return 0;
+
+nextart:
+	if (news) {
+		curflag = CURHOME;
+		_amove(0, 0);
+		vflush();
+	}
+	dgest = 0;
+
+	/* If done with this newsgroup, find the next one. */
+	while ((!rflag && (long) bit > ngsize) || (rflag && bit < 1)) {
+
+/*	tekgds!charliep thinks these two lines are in error 
+	while (((long) bit > ngsize) || (rflag && bit < 1)) {
+		int i;
+ */
+		if (i=nextng()) {
+			if (actdirect == BACKWARD) {
+				msg("Can't back up.");
+				actdirect = FORWARD;
+				continue;
+			} 
+			else /* if (rfq++ || pflag || cflag) */
+				return 1;
+		}
+		if (rflag)
+			bit = ngsize + 1L;
+		else
+			bit = -1;
+		noaccess = 2;
+	}
+
+	/* speed things up by not searching for article -1 */
+	if (bit < 0) {
+		bit = 0;
+		nextbit();
+		aabs = FALSE;
+		goto nextart;
+	}
+
+nextart2:
+	if (rcreadok)
+		rcreadok = 2;	/* have seen >= 1 article */
+	sprintf(filename, "%s/%d", dirname(groupdir), bit);
+	if (rfq && goodone[0])	/* ??? */
+		strcpy(filename, goodone);
+	if (sigtrap == SIGHUP)
+		return 1;
+	/* Decide if we want to show this article. */
+	if ((fp = fopen(filename, "r")) == NULL) {
+		/* since there can be holes in legal article numbers, */
+		/* we wait till we hit 5 consecutive bad articles */
+		/* before we haul off and scan the directory */
+		if (++noaccess < 5)
+			goto badart;
+		dirp = opendir(dirname(groupdir));
+		if (dirp == NULL) {
+			msg("Can't open %s", dirname(groupdir));
+			noaccess = 0;
+			goto badart;
+		}
+		nextnum = rflag ? 0 : ngsize + 1;
+		while ((dir = readdir(dirp)) != NULL) {
+			if (!dir->d_ino)
+				continue;
+			tnum = atol(dir->d_name);
+			if (tnum <= 0)
+				continue;
+			if (rflag ? (tnum > nextnum && tnum < bit)
+				  : (tnum < nextnum && tnum > bit))
+				nextnum = tnum;
+		}
+		closedir(dirp);
+		if (rflag ? (nextnum >= bit) : (nextnum <= bit))
+			goto badart;
+		do {
+			clear(bit);
+			nextbit();
+		} while (rflag ? (nextnum < bit) : (nextnum > bit));
+		obit = -1;
+		aabs = FALSE;
+		goto nextart;
+	} else
+		noaccess = 0;
+		
+	if (hread(&h, fp, TRUE) == NULL
+	|| (!rfq && !vselect(&h, aabs))) {
+badart:
+		if (fp != NULL) {
+			fclose(fp);
+			fp = NULL;
+		}
+		clear(bit);
+		obit = -1;
+		nextbit();
+		aabs = FALSE;
+		goto nextart;
+	}
+	aabs = FALSE;
+	actdirect = FORWARD;
+	news = TRUE;
+	{	/* strip off any notesfile header */
+		register c;
+		register char *p = h.title + strlen(h.title) - 5;
+		if (p > h.title
+		 && (strcmp(p, " (nf)") == 0 || strcmp(p, "(nf)\"") == 0)) {
+			if ((c = getc(fp)) != '#') {
+				ungetc(c, fp);
+			} else {
+				while ((c = getc(fp)) != '\n' && c != EOF);
+				while ((c = getc(fp)) != '\n' && c != EOF);
+				while ((c = getc(fp)) != '\n' && c != EOF);
+			}
+		}
+	}
+	artbody = ftell(fp);
+	fmthdr();
+	artlines = lastlin;
+	artread = 0;
+	prflags |= NEWART;
+	prflags &=~ NOPRT;
+	if (! cflag && hdrend < ARTWLEN && !cflag)
+		prflags |= HDRONLY;
+	dlinno = 0;
+	erased = 0;
+	
+	obit = bit;
+	return 0;
+}
+
+/*
+ * Print out whatever the appropriate header is
+ */
+hdr() { abort(); }
+
+fmthdr() {
+	char *vbriefdate();
+
+	lastlin = 0;
+	if (ngrp) {
+		pngsize = ngsize;
+		ngrp--;
+		if (!hflag) {
+			sprintf(linebuf, "Newsgroup %s", groupdir);  tfappend(linebuf);
+			tfappend("");
+		}
+	}
+	hdrstart = lastlin;
+	if (!hflag) {
+		sprintf(linebuf, "Article %s %s",
+			h.ident, vbriefdate(h.subdate));
+		tfappend(linebuf);
+	}
+	vhprint(&h, pflag ? 1 : 0);
+	sprintf(linebuf, "(%d lines)", NLINES(h, fp)); tfappend(linebuf);
+	tfappend("");
+	hdrend = lastlin;
+}
+
+
+
+/* Arpa format: Sat, 14-May-83 03:45:14 EDT */
+/* Bugs: doesn't work on article with non-arpa dates */
+char *
+vbriefdate(q)
+	register char *q;
+	{
+	register char *p;
+	register i;
+	char day[2];
+
+	p = bfr;
+	for (i = 3 ; --i >= 0 ; )
+		*p++ = *q++;
+	*p++ = ' ';
+	q += 2;
+	day[0] = *q++;
+	if (*q != '-') day[1] = *q++;
+	else day[1] = '\0';
+	q++;
+	for (i = 3 ; --i >= 0 ; )
+		*p++ = *q++;
+	*p++ = ' ';
+	*p++ = day[0];
+	if (day[1]) *p++ = day[1];
+	q += 5;
+	*p++ = ' ';
+	if (q[-1] != '0') *p++ = q[-1];
+	for (i = 4 ; --i >= 0 ; )
+		*p++ = *q++;
+	*p++ = '\0';
+	return bfr;
+}		
+
+/*
+ * Print the file header to the temp file.
+ */
+vhprint(hp, verbose)
+register struct hbuf *hp;
+int	verbose;
+{
+	register char	*p1, *p2;
+	int	i;
+	char	fname[BUFLEN];
+	char *tailpath();
+
+	fname[0] = '\0';		/* init name holder */
+
+	p1 = index(hp->from, '(');	/* Find the sender's full name. */
+	if (p1 == NULL && hp->path[0])
+		p1 = index(hp->path, '(');
+	if (p1 != NULL) {
+		strcpy(fname, p1+1);
+		p2 = index(fname, ')');
+		if (p2 != NULL)
+			*p2 = '\0';
+	}
+
+	sprintf(linebuf, "Subject: %s", hp->title);
+	if ((i = strlen(linebuf) - 7) > 9
+	 && strcmp(linebuf + i, " - (nf)") == 0
+	 && (strncmp(linebuf+9, "Re: ", 4) != 0 || i < 9+39))
+		linebuf[i] = '\0';		/* clobber "- (nf)" */
+	tfappend(linebuf);
+	if (!hflag && hp->keywords[0])
+		sprintf(linebuf, "Keywords: %s", hp->keywords), tfappend(linebuf);
+	if (verbose) {
+		sprintf(linebuf, "From: %s", hp->from); tfappend(linebuf);
+		sprintf(linebuf, "Path: %s", hp->path); tfappend(linebuf);
+		if (hp->organization[0])
+			sprintf(linebuf, "Organization: %s", hp->organization), tfappend(linebuf);
+	}
+	else {
+		if (p1 != NULL)
+			*--p1 = '\0';		/* bump over the '(' */
+#ifdef INTERNET
+		/*
+		 * Prefer Path line if it's in internet format, or if we don't
+		 * understand internet format here, or if there is no reply-to.
+		 */
+		sprintf(linebuf, "From: %s", hp->from);
+#else
+		sprintf(linebuf, "Path: %s", tailpath(hp));
+#endif
+		if (fname[0] != '\0') {
+			strcat(linebuf, " (");
+			strcat(linebuf, fname);
+			if (hp->organization[0] && !hflag) {
+				strcat(linebuf, " @ ");
+				strcat(linebuf, hp->organization);
+			}
+			strcat(linebuf, ")");
+		}
+		tfappend(linebuf);
+		if (p1 != NULL)
+			*p1 = ' ';
+		if (hp->ctlmsg[0]) {
+			sprintf(linebuf, "Control: %s", hp->ctlmsg);
+			tfappend(linebuf);
+		}
+	}
+
+	ngdel(strcpy(bfr, hp->nbuf));
+	if (verbose) {
+		sprintf(linebuf, "Newsgroups: %s", bfr); tfappend(linebuf);
+		sprintf(linebuf, "Date: %s", hp->subdate); tfappend(linebuf);
+		if (hp->sender[0])
+			sprintf(linebuf, "Sender: %s", hp->sender), tfappend(linebuf);
+		if (hp->replyto[0])
+			sprintf(linebuf, "Reply-To: %s", hp->replyto), tfappend(linebuf);
+		if (hp->followto[0])
+			sprintf(linebuf, "Followup-To: %s", hp->followto), tfappend(linebuf);
+	}
+	else if (strcmp(bfr, groupdir) != 0)
+		sprintf(linebuf, "Newsgroups: %s", bfr), tfappend(linebuf);
+}
+
+
+
+
+#ifdef MYDB
+
+
+char *
+findparent(id, num)
+	char *id;
+	int (*num);
+	{
+	struct artrec a;
+	char *ngname();
+
+	if (lookart(id, &a) == DNULL)
+		return NULL;
+	if (a.parent == DNULL)
+		return NULL;
+	readrec(a.parent, &a);
+	(*num) = a.groups[0].artno;
+	return ngname(a.groups[0].newsgroup);
+}
+
+#endif
+
+
+/*
+ * Append file to temp file, handling control characters, folding lines, etc.
+ * We don't grow the temp file to more than nlines so that a user won't have
+ * to wait for 20 seconds to read in a monster file from net.sources.
+ * What we really want is coroutines--any year now.
+ */
+
+#define ULINE 0200
+static char *maxcol;
+
+
+appfile(iop, nlines)
+	register FILE *iop;
+	{
+	register int c;
+	register char *icol;	/* &linebuf[0] <= icol <= maxcol */
+
+	if (artread || artlines >= nlines)
+		return;
+	maxcol = linebuf;
+	icol = linebuf;
+	while ((c = getc(iop)) != EOF) {
+		switch (c) {
+		case ' ':
+			if (icol == maxcol && icol < linebuf + LBUFLEN - 1) {
+				*icol++ = ' ';
+				maxcol = icol;
+			} else {
+				icol++;
+			}
+			break;
+		case '\t':
+			icol = (icol - linebuf &~ 07) + 8 + linebuf;
+			growline(icol);
+			break;
+		case '\b':
+			if (icol > linebuf) --icol;
+			break;
+		case '\n':
+			outline();
+			if (artlines >= nlines)
+				return;
+			icol = linebuf;
+			break;
+		case '\r':
+			icol = linebuf;
+			break;
+		case '\f':
+			outline(); outline(); outline();
+			if (artlines >= nlines)
+				return;
+			icol = linebuf;
+			break;
+		default:
+			if (c < ' ' || c > '~')
+				break;
+			else if (icol >= linebuf + LBUFLEN - 1)
+				icol++;
+			else if (icol == maxcol) {
+				*icol++ = c;
+				maxcol = icol; }
+			else if (*icol == ' ')
+				*icol++ = c;
+			else if (c == '_')
+				*icol++ |= ULINE;
+			else
+				*icol++ = (c | ULINE);
+			break;
+		}
+	}
+	if (maxcol != linebuf)		/* file not terminated with newline */
+		outline();
+	artread++;
+}
+
+
+
+growline(col)
+	char *col;
+	{
+	while (maxcol < col && maxcol < linebuf + LBUFLEN - 1)
+		*maxcol++ = ' ';
+}
+
+
+outline() {
+	*maxcol = '\0';
+	if (strncmp(linebuf, ">From ", 6) == 0) {
+		register char *p;
+		for (p = linebuf ; (*p = p[1]) != '\0' ; p++);
+	}
+	tfappend(linebuf);
+	if (maxcol > linebuf)
+		artlines = lastlin;
+	maxcol = linebuf;
+}
+
+
+
+prget(prompter, buf)
+	char *prompter, *buf;
+	{
+	char *p, *q, *r;
+	int c, lastc;
+
+	curflag = CURP2;
+	r = buf;
+	lastc = '\0';
+	for (;;) {
+		*r = '\0';
+		p = secpr;
+		for (q = prompter ; *q ; q++)
+			*p++ = *q;
+		for (q = buf ; *q ; q++) {
+			if (p < &secpr[SECPRLEN-1] && *q >= ' ' && *p <= '~')
+				*p++ = *q;
+		}
+		*p = '\0';
+		c = vgetc();
+		if (c == '\n' || c == cintr) {
+			break;
+		}
+		if (c == cerase) {
+			if (lastc == '\\')
+				r[-1] = c;
+			else if (r > buf)
+				r--;
+		} else if (c == ckill) {
+			if (lastc == '\\')
+				r[-1] = c;
+			else
+				r = buf;
+		} else {
+			*r++ = c;
+		}
+		lastc = c;
+	}
+	curflag = CURHOME;
+	secpr[0] = '\0';
+	return (c == cintr);
+}
+
+
+
+/*
+ * Execute a shell command.
+ */
+
+shcmd(cmd, flags)
+	char *cmd;
+	{
+	char *arg[4];
+
+	arg[0] = SHELL, arg[1] = "-c", arg[2] = cmd, arg[3] = NULL;
+	prun(arg, flags);
+}
+
+
+prun(args, flags)
+	char **args;
+	{
+	int pid;
+	int i;
+	int (*savequit)();
+	char *env[100], **envp;
+	char a[BUFLEN + 2];
+	extern char **environ;
+
+#ifdef SIGTSTP/* ^Z bug fix Sept 17,1983 W.Sebok */
+		signal(SIGTSTP, SIG_DFL);
+		signal(SIGTTIN, SIG_DFL);
+		signal(SIGTTOU, SIG_DFL);
+#endif
+	if (!(flags & BKGRND)) {
+		botscreen();
+		ttycooked();
+	}
+	while ((pid = fork()) == -1)
+		sleep(1);		/* must not clear alarm */
+	if (pid == 0) {
+		for (i = 3 ; i < 20 ; i++)
+			close(i);
+		if (flags & BKGRND) {
+			signal(SIGINT, SIG_IGN);
+			signal(SIGQUIT, SIG_IGN);
+			close(0), close(1), close(2);
+			open("/dev/null", 2);
+			dup(0), dup(0);
+		}
+		/* set $A */
+		sprintf(a, "A=%s", filename);
+		env[0] = a;
+		for (envp = env + 1 ; *environ != NULL && envp < env + 98 ; environ++)
+			if ((*environ)[0] != 'A' || (*environ)[1] != '=')
+				*envp++ = *environ;
+		*envp = NULL;
+
+		umask(savmask);
+		execve(args[0], args, env);
+		fprintf(stderr, "%s: not found\n", args[0]);
+		exit(20);
+	}
+	if (!(flags & BKGRND)) {
+		savequit = signal(SIGQUIT, SIG_IGN);
+		while ((i = wait(&pstatus)) != pid && (i != -1 || errno == EINTR));
+		if (flags & CWAIT) {
+			fprintf(stderr, "continue? ");
+			while ((errno = 0, i = getchar()) != '\n'
+				&& (i != EOF || errno == EINTR));
+		}
+		signal(SIGQUIT, savequit);
+		ttyraw();
+		clearok(curscr, 1);
+#ifdef SIGTSTP/* ^Z bug fix Sept 17,1983 W.Sebok */
+		signal(SIGTSTP, onstop);
+		signal(SIGTTIN, onstop);
+		signal(SIGTTOU, onstop);
+#endif
+	}
+}
+
+#ifdef DIGPAGE
+
+
+/*
+ * Find end of current subarticle in digest.
+ */
+
+findend(l) {
+	register i;
+	register char *p;
+
+	for (i = l ; i < l + ARTWLEN && i < lastlin ; i++) {
+		tfget(linebuf, i);
+		for (p = linebuf ; *p == '-' ; p++);
+		if (p > linebuf + 24)
+			return i + 1;
+	}
+	return 0;
+}
+
+#endif
+
+
+/*** Routines for handling temporary file ***/
+
+/*
+ * Append to temp file.
+ * Long lines are folded.
+ */
+
+tfappend(line)
+	char *line;
+	{
+	while (strlen(line) > COLS) {
+		tfput(line, lastlin++);
+		line += COLS;
+	}
+	tfput(line, lastlin++);
+}
+
+
+tfput(line, linno)
+	char *line;
+	{
+	register char *p;
+	register FILE *rtfp;		/* try to make it a litte faster */
+	register int i;
+
+	p = line, i = even(COLS);
+	tfseek(linno, 1);
+	rtfp = tfp;
+	while (--i >= 0) {
+		if (*p)
+			putc(*p++, rtfp);
+		else
+			putc('\0', rtfp);
+	}
+	tflinno++;
+}
+
+
+tfget(line, linno)
+	char *line;
+	{
+	tfseek(linno, 0);
+	fread(line, even(COLS), 1, tfp);
+	line[COLS] = '\0';
+	tflinno++;
+}
+
+
+tfseek(linno, wrflag) {
+	static int last = 1;
+
+	if (linno != tflinno || wrflag != last) {
+		fseek(tfp, (long)linno * even(COLS), 0);
+		tflinno = linno;
+		last = wrflag;
+	}
+}
+
+
+
+msg(s, a1, a2, a3, a4) char *s; {
+	sprintf(secpr, s, a1, a2, a3, a4);
+}
+
+
+/*
+ * Update the display.
+ * The display is entirely controlled by this routine,
+ * which means that this routine may get pretty snarled.
+ */
+
+static int savelinno = -1;		/* dlinno on last call to updscr */
+static int savepr;			/* prflags on last call */
+
+updscr() {
+	int count;
+	int i;
+
+	if (checkin())
+		return;
+	if ((prflags & HELPMSG) == 0
+	 && (dlinno != savelinno || savepr != prflags)
+	 && quitflg == 0) {
+		if (dlinno != savelinno)
+			prflags &=~ NOPRT;
+		count = ARTWLEN;
+		if (prflags & NOPRT)
+			count = 0;
+		if ((prflags & HDRONLY) && count > hdrend)
+			count = hdrend - dlinno;
+#ifdef DIGPAGE
+		if (endsuba > 0 && count > endsuba - dlinno)
+			count = endsuba - dlinno;
+#endif
+		if ((prflags & NEWART) == 0)
+			ushift(ARTWIN, ARTWIN+ARTWLEN-1, dlinno - savelinno);
+		if (count > lastlin - dlinno)
+			count = lastlin - dlinno;
+		for (i = ARTWIN ; i < ARTWIN + ARTWLEN ; i++)
+			clrline(i);
+		for (i = 0 ; i < count ; i++) {
+			tfget(linebuf, dlinno + i);
+			mvaddstr(ARTWIN + i, 0, linebuf);
+		}
+		prflags &=~ NEWART;
+		savepr = prflags;
+		savelinno = dlinno;
+	}
+	clrline(SPLINE), clrline(PRLINE);
+#ifdef STATTOP
+	mvaddstr(PRLINE, 0, prompt);
+#else
+	if (strlen(secpr) <= COLS)
+		mvaddstr(PRLINE, 0, prompt);
+#endif
+	mvaddstr(PRLINE, 48, timestr);
+	mvaddstr(PRLINE, 20, groupdir);
+	addch(' '); addnum(bit); addch('/'); addnum((int)pngsize); addch(' ');
+	if (ismail)
+		mvaddstr(PRLINE, 62, ismail > 1? "MAIL" : "mail");
+	mvaddstr(SPLINE, 0, secpr);
+	if (curflag == CURP1)
+		move(PRLINE, strlen(prompt));
+	else if (curflag == CURHOME)
+		move(0, 0);
+	refresh();
+}
+
+
+addnum(n) {
+	if (n >= 10)
+		addnum(n / 10);
+	addch(n % 10 + '0');
+}
+
+
+
+/*** alarm handler ***/
+
+/* #include <time.h> */
+
+
+/*
+ * Called on alarm signal.
+ * Simply sets flag, signal processed later.
+ */
+
+onalarm() {
+	alflag++;
+}
+
+
+/*
+ * Process alarm signal (or start clock)
+ */
+
+timer() {
+	long tod;
+	int hour;
+	int i;
+	struct tm *t, *localtime();
+	struct stat statb;
+	long time();
+	static char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+	static long oldmsize = 1000000L;
+	static int rccount = 10;
+
+	alflag = 0;
+	signal(SIGALRM, onalarm);
+	time(&tod);
+	t = localtime(&tod);
+	i = 60 - t->tm_sec;
+	alarm(i > 30? 30 : i);			/* reset alarm */
+	hour = t->tm_hour % 12;
+	if (hour == 0)  hour = 12;
+	sprintf(timestr, "%.3s %d %d:%02d",
+		months + 3 * t->tm_mon, t->tm_mday, hour, t->tm_min);
+#ifdef GGRMAIL
+	if (mailf == NULL || stat(mailf, &statb) < 0) {
+		statb.st_size = 0;
+	}
+	if(statb.st_size > oldmsize) {
+		ismail = 1;
+		beep();
+	} else if (statb.st_size < oldmsize) {
+		ismail = 0;
+	}
+	oldmsize = statb.st_size;
+#else
+	ismail = 0;
+	if (mailf != NULL && stat(mailf, &statb) >= 0 && statb.st_size > 0L) {
+		ismail = 1;
+		if (oldmsize < statb.st_size) {
+			ismail = 2;		/* new mail */
+			beep();
+		}
+	} else {
+		statb.st_size = 0L;
+	}
+	oldmsize = statb.st_size;
+#endif
+	if (uflag && !xflag && --rccount < 0) {
+		writeoutrc();
+		if (secpr[0] == '\0')
+			strcpy(secpr, ".newsrc updated");
+		rccount = 10;
+	}
+}
+
+
+char *
+getmailname() {
+	static char mailname[32];
+	register char *p;
+
+	if( (p = getenv("MAIL")) != NULL)
+		return p;
+	if (username[0] == '\0' || strlen(username) > 15)
+		return NULL;
+#ifdef BSD
+	sprintf(mailname, "/usr/spool/mail/%s", username);
+#else
+	sprintf(mailname, "/usr/mail/%s", username);
+#endif
+	return mailname;
+}
+
+
+
+/*** Terminal I/O ***/
+
+#define INBUFSIZ 8
+
+char inbuf[INBUFSIZ];			/* input buffer */
+char outbuf[BUFSIZ];			/* output buffer */
+int innleft = 0;			/* # of chars in input buffer */
+int outnleft = BUFSIZ;			/* room left in output buffer */
+char *innext;				/* next input character */
+char *outnext = outbuf;			/* next space in output buffer */
+#ifdef USG
+int oflags;				/* fcntl flags (for nodelay read) */
+#endif
+
+
+/*
+ * Input a character
+ */
+
+vgetc() {
+	register c;
+#ifdef BSD4_2
+	int readfds, exceptfds;
+#endif
+
+recurse:
+	if (--innleft >= 0) {
+		c = *innext++;
+	} else {
+		if (alflag)
+			timer();
+		updscr();	/* update the display */
+		for (;;) {
+			if (innleft > 0 || alflag)
+				goto recurse;
+			intflag = 0;
+#ifdef USG
+			if (oflags & O_NDELAY) {
+				oflags &=~ O_NDELAY;
+				fcntl(0, F_SETFL, oflags);
+			}
+#endif
+#ifdef BSD4_2
+			/* use a read because it can be interrupted */
+			readfds = 1; exceptfds = 1;
+			select(1,&readfds,0,&exceptfds,0);
+			if (readfds & 1) { /* got a key, go ahead and get it */
+				innleft = read(0,inbuf,INBUFSIZ);
+#else
+			if ((innleft = read(0, inbuf, INBUFSIZ)) > 0) {
+#endif
+#ifdef BSD
+				if (intflag) {
+					intflag--;
+					inbuf[0] = cintr;
+					clearin(); /* flush input queue */
+					return cintr;
+				}
+#endif
+				break;
+			}
+			if (innleft == 0) {
+				quitflg++;
+				return cintr;
+			}
+			if (errno != EINTR)
+				abort();	/* "Can't happen" */
+			if (intflag) {
+				intflag--;
+				return cintr;
+			}
+		}
+		innext = inbuf + 1;
+		innleft--;
+		c = inbuf[0];
+	}
+#ifdef V7
+	c &= 0177;
+	if (c == '\034')	/* FS character */
+		onquit();
+#endif
+	if (c == '\f') {
+		clearok(curscr, 1);
+		goto recurse;
+	}
+	if (c == '\r')
+		c = '\n';
+	return c;
+}
+
+
+/*
+ * Push a character back onto the input stream.
+ */
+
+pushback(c) {
+	if (innext <= inbuf)
+		abort();
+	*--innext = c;
+	innleft++;
+}
+
+
+
+/*
+ * Check for terminal input
+ */
+
+checkin() {
+#ifdef BSD
+	long count;
+
+#endif
+#ifdef STATTOP
+	if (innleft > 0)
+#else
+	if (innleft > 0 || alflag)
+#endif
+		return 1;
+#if !0 && !defined(V7)
+	if (ospeed == B9600)
+		return 0;
+	vflush();
+	if (ospeed <= B300)
+		ttyowait();
+#ifdef USG
+	if ((oflags & O_NDELAY) == 0) {
+		oflags |= O_NDELAY;
+		fcntl(0, F_SETFL, oflags);
+	}
+	if ((innleft = read(0, inbuf, INBUFSIZ)) > 0) {
+		innext = inbuf;
+		return 1;
+	}
+#else
+	count = 0;			/* in case FIONREAD fails */
+	ioctl(0, FIONREAD, &count);
+	if (count)
+		return 1;
+#endif
+#endif
+	return 0;
+}
+
+
+
+/*
+ * flush terminal input queue.
+ */
+
+clearin() {
+#ifdef USG
+	ioctl(0, TCFLSH, 0);
+#else
+#ifdef TIOCFLUSH
+	ioctl(0, TIOCFLUSH, 0);
+#else
+	struct sgttyb tty;
+	gtty(0, &tty);
+	stty(0, &tty);
+#endif
+#endif
+	innleft = 0;
+}
+
+
+vputc(c) {
+	if (--outnleft < 0) {
+		vflush();
+		outnleft--;
+	}
+	*outnext++ = c;
+}
+
+
+/*
+ * Flush the output buffer
+ */
+
+vflush() {
+	register char *p;
+	register int i;
+
+	for (p = outbuf ; p < outnext ; p += i) {
+		if ((i = write(1, p, outnext - p)) < 0) {
+			if (errno != EINTR)
+				abort();	/* "Can't happen" */
+			i = 0;
+		}
+	}
+	outnleft = BUFSIZ;
+	outnext = outbuf;
+}
+
+
+
+
+/*** terminal modes ***/
+
+#ifdef USG
+static struct termio oldtty, newtty;
+
+
+/*
+ * Save tty modes
+ */
+
+ttysave() {
+	if (ioctl(1, TCGETA, &oldtty) < 0)
+		xerror("Can't get tty modes");
+	newtty = oldtty;
+	newtty.c_iflag &=~ (INLCR|IGNCR|ICRNL);
+	newtty.c_oflag &=~ (OPOST);
+	newtty.c_lflag &=~ (ICANON|ECHO|ECHOE|ECHOK|ECHONL);
+	newtty.c_lflag |=  (NOFLSH);
+	newtty.c_cc[VMIN] = 1;
+	newtty.c_cc[VTIME] = 0;
+	cerase = oldtty.c_cc[VERASE];
+	cintr = oldtty.c_cc[VINTR];	/* (WLS) */
+	ckill = oldtty.c_cc[VKILL];
+	ospeed = oldtty.c_cflag & CBAUD;
+	initterm();
+}
+
+
+/*
+ * Set tty modes for visual processing
+ */
+
+ttyraw() {
+	while (ioctl(1, TCSETAF, &newtty) < 0 && errno == EINTR);
+	rawterm();
+}
+
+
+
+ttyowait() {	/* wait for output queue to drain */
+	while (ioctl(1, TCSETAW, &newtty) < 0 && errno == EINTR);
+}
+
+
+/*
+ * Restore tty modes
+ */
+
+ttycooked() {
+	cookedterm();
+	while (ioctl(1, TCSETAF, &oldtty) < 0 && errno == EINTR);
+	oflags &=~ O_NDELAY;
+	fcntl(0, F_SETFL, oflags) ;
+}
+
+#else
+
+static struct sgttyb oldtty, newtty;
+#ifdef TIOCGETC
+static struct tchars tchars;
+#endif
+
+
+/*
+ * Save tty modes
+ */
+
+ttysave() {
+#ifdef SIGTSTP
+	/* How to get/change terminal modes in a job control environment.
+	   This code is right from the 4.1 bsd jobs(3) manual page.
+	 */
+	short tpgrp, getpgrp();
+
+retry:
+#ifdef BSD4_2
+	sigblock(BIT(SIGTSTP)|BIT(SIGTTIN)|BIT(SIGTTOU));
+#else
+	signal(SIGTSTP, SIG_HOLD);
+	signal(SIGTTIN, SIG_HOLD);
+	signal(SIGTTOU, SIG_HOLD);
+#endif
+	if (ioctl(2, TIOCGPGRP, &tpgrp) != 0)
+		goto nottty;
+	if (tpgrp != getpgrp(0)) { /* not in foreground */
+		signal(SIGTTOU, SIG_DFL);
+#ifdef BSD4_2
+		sigsetmask(sigblock(0) & ~BIT(SIGTTOU));
+#endif
+		kill(0, SIGTTOU);
+		/* job stops here waiting for SIGCONT */
+		goto retry;
+	}
+	signal(SIGTTIN, onstop);
+	signal(SIGTTOU, onstop);
+	signal(SIGTSTP, onstop);
+#ifdef BSD4_2
+	sigsetmask(sigblock(0) & ~(BIT(SIGTSTP)|BIT(SIGTTIN)|BIT(SIGTTOU)));
+#endif BSD4_2
+#endif SIGTSTP
+	if (gtty(1, &oldtty) < 0)
+nottty:		xerror("Can't get tty modes");
+	newtty = oldtty;
+	newtty.sg_flags &=~ (CRMOD|ECHO|XTABS);
+#ifdef BSD
+	newtty.sg_flags |= CBREAK;
+#else
+	newtty.sg_flags |= RAW;
+#endif
+#ifdef TIOCGETC
+	if (ioctl(1,TIOCGETC,&tchars)<0)
+		xerror("Can't get special tty characters");
+	cintr = tchars.t_intrc;
+#endif
+	cerase = oldtty.sg_erase;
+	ckill = oldtty.sg_kill;
+	ospeed = oldtty.sg_ospeed;
+	initterm();
+}
+
+
+/*
+ * Set tty modes for visual processing
+ */
+
+ttyraw() {
+	while (stty(1, &newtty) < 0 && errno == EINTR);
+	rawterm();
+}
+
+
+
+ttyowait() {	/* wait for output queue to drain */
+#ifdef TIOCDRAIN	/* This ioctl is a local mod on linus */
+	ioctl(1, TIOCDRAIN, 0);
+#endif
+}
+
+
+/*
+ * Restore tty modes
+ */
+
+ttycooked() {
+	cookedterm();
+	while (stty(1, &oldtty) < 0 && errno == EINTR);
+}
+
+#endif
+
+
+
+/*** signal handlers ***/
+
+onint() {
+	if (!news) {
+		ttycooked();
+		xxit(1);
+	}
+	signal(SIGINT, onint);
+	clearin();			/* flush input queue */
+	intflag++;
+#ifdef BSD
+	ioctl(0,TIOCSTI,"\0");
+#endif
+}
+
+
+onquit() {
+	botscreen();
+	vflush();
+	ttycooked();
+#ifdef COREDUMP
+	abort();
+#else
+	exit(0);
+#endif
+}
+
+#ifdef SIGTSTP
+
+onstop(signo)
+	int signo;
+{
+	/* restore old terminal state */
+	botscreen();
+	vflush();
+	ttycooked();
+	signal(signo, SIG_DFL);
+#ifdef BSD4_2
+	/* clear SIGSTP mask bit */
+	sigsetmask(sigblock(0) & ~BIT(signo));
+#endif
+	kill(getpid(), signo);	/* stop here until continued */
+
+	fprintf(stderr,"Vnews restarted.");
+	signal(signo, onstop);
+	/* restore our special terminal state */
+	ttyraw();
+	clearok(curscr, 1);
+}
+
+#endif
+
+
+/*** stolen from rfuncs2.c and modified ***/
+
+vsave(to, flags)
+register char *to;
+{
+	register FILE *ufp;
+	int	isprogram = 0;
+	int	isnew = 1;
+	long	saveoff;
+	char	temp[20];
+	char	*fname;
+	char	prog[BUFLEN + 24];
+	int	(*svpipe)();
+
+#define hh h
+#define hfp fp
+	saveoff = ftell(fp);
+	fseek(fp, artbody, 0);
+	fname = to;
+	if (*to == PIPECHAR) {
+		if (strlen(to) > BUFLEN) {
+			msg("Command name too long");
+			goto out;
+		}
+		flags |= OVWRITE;
+		strcpy(temp, "/tmp/vnXXXXXX");
+		mktemp(temp);
+		fname = temp;
+		_amove(ROWS - 1, 0);
+		vflush();
+	}
+	if ((flags & OVWRITE) == 0) {
+		ufp = fopen(fname, "r");
+		if (ufp != NULL) {
+			fclose(ufp);
+			isnew = 0;
+		}
+	}
+	umask(savmask);
+
+	if (*to == PIPECHAR)
+		isprogram++;
+	if ((ufp = fopen(fname, (flags & OVWRITE) == 0? "a" : "w")) == NULL) {
+		msg("Cannot open %s", fname);
+		goto out;
+	}
+	/*
+	 * V7MAIL code is here to conform to V7 mail format.
+	 * If you need a different format to be able to
+	 * use your local mail command (such as four ^A's
+	 * on the end of articles) substitute it here.
+	 */
+	if (flags & SVHEAD) {
+#ifdef V7MAIL
+		hh.subtime = cgtdate(hh.subdate);
+		fprintf(ufp, "From %s %s",
+#ifdef INTERNET
+				hh.from,
+#else
+				hh.path,
+#endif
+					ctime(&hh.subtime));
+#endif
+		hprint(&hh, ufp, 2);
+#ifdef V7MAIL
+		tprint(hfp, ufp, TRUE);
+		putc('\n', ufp);	/* force blank line at end (ugh) */
+#else
+		tprint(hfp, ufp, FALSE);
+#endif
+	} else {
+		tprint(hfp, ufp, FALSE);
+	}
+
+	fclose(ufp);
+	if (isprogram) {
+		sprintf(prog, "(%s)<%s", to + 1, fname);
+		shcmd(prog, CWAIT);
+		prflags |= NOPRT;
+	} else {
+		if ((flags & OVWRITE) == 0)
+			msg("file: %s %s", to, isnew ? "created" : "appended");
+		else
+			msg("file: %s written", to);
+	}
+
+out:
+	if (isprogram) {
+		unlink(fname);
+	}
+	umask(N_UMASK);
+	fseek(fp, saveoff, 0);
+}
+
+
+/*** stolen from rfuncs.c ***/
+
+/*
+ * Return TRUE if the user has not ruled out this article.
+ */
+vselect(hp, insist)
+register struct hbuf *hp;
+int	insist;
+{
+	if (insist)
+		return TRUE;
+	if (tflag && !titmat(hp, header.title))
+		return FALSE;
+	if (aflag && cgtdate(hp->recdate) < atime)
+		return FALSE;
+	if (index(hp->nbuf, ',') && !rightgroup(hp))
+		return FALSE;
+	if (fflag && isfol(hp))
+		return FALSE;
+	return TRUE;
+}
+
+
+
+/*
+ * Code to avoid showing multiple articles for vnews.
+ * Works even if you exit vnews.
+ * Returns nonzero if we should show this article.
+ */
+rightgroup(hp)
+	struct hbuf *hp;
+	{
+	char ng[BUFLEN];
+	char temp[BUFLEN];	/* genrad!john (WLS) */
+	register char *p, *g;
+	int i, flag;
+
+	strcpy(ng, hp->nbuf);
+	ngcat(ng);
+	g = ng;
+	flag = 1;
+	while ((p = index(g, ',')) != NULL) {
+		*p++ = '\0';
+		while (*p == ' ')
+			p++;
+		if (strcmp(g, groupdir) == 0) {
+			return flag;
+		}
+		/* this hack is required because ngmatch expects trailing ','*/
+		strcpy(temp, g);		/* genrad!john (WLS) */
+		strcat(temp, ",");		/* genrad!john (WLS) */
+		if (ngmatch(temp, header.nbuf)	/* genrad!john (WLS) */
+		 && ((i = findrcline(g)) < 0 || index(rcline[i], '!') == NULL)) {
+			flag = 0;
+		}
+		g = p;
+	}
+	/* we must be in "junk" or "control" */
+	return 1;
+}
+-- 
+>From the closet of anxieties of:			Chuq Von Rospach
+{amd70,fortune,hplabs,ihnp4}!nsc!chuqui			(408) 733-2600 x242
+
+I'm sure I have my death ray in here somewhere...__GoOgLE_
+X-Google-ArrivalTime: 1984-06-01 07:27:12 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1.chuqui 4/7/84; site nsc.UUCP
+Path: utzoo!linus!vaxine!wjh12!genrad!decvax!ittvax!dcdwest!sdcsvax!sdcrdcf!hplabs!zehntel!dual!nsc!chuqui
+From: chuqui@nsc.UUCP
+Newsgroups: net.sources
+Subject: vnews bug fixes (virtterm.c)
+Message-ID: <1013@nsc.UUCP>
+Date: Fri, 1-Jun-84 10:27:12 EDT
+Article-I.D.: nsc.1013
+Posted: Fri Jun  1 10:27:12 1984
+Date-Received: Wed, 6-Jun-84 02:34:30 EDT
+Organization: The Warlocks Cave
+Lines: 891
+
+This is the other half of vnews, virtterm.c.
+
+---- virtterm.c ----
+
+/*
+ *  Virtual terminal handler for the HP-2621 terminal.
+ *  Written by Kenneth Almquist, AGS Computers  (HO 4C601, X7105).
+ *  Modified by Stephen Hemminger, to use TERMCAP (without curses)
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+
+#define MAXPLEN 24
+#define MAXLLEN 80
+#define BOTLINE (ROWS - 1)
+#define DIRTY 01
+
+/* terminal escape sequences from termcap */
+#define HO _tstr[0]		/* home */
+#define CL _tstr[1]		/* clear screen */
+#define CD _tstr[2]		/* clear to end of screen */
+#define CE _tstr[3]		/* clear to end of line */
+#define UP _tstr[4]		/* up one line */
+#define DO _tstr[5]		/* down one line */
+#define US _tstr[6]		/* underline */
+#define UE _tstr[7]		/* underline end */
+#define BT _tstr[8]		/* backtab */
+#define BC _tstr[9]		/* backspace */
+#define AL _tstr[10]		/* insert line */
+#define DL _tstr[11]		/* delete line */
+#define CM _tstr[12]		/* cursor move */
+#define CH _tstr[13]		/* cursor horizontal move */
+#define CV _tstr[14]		/* cursor vertical move */
+#define CS _tstr[15]		/* scrolling region */
+#define SF _tstr[16]		/* scroll forwards */
+#define SR _tstr[17]		/* scroll backwards */
+#define TI _tstr[18]		/* start cursor mode */
+#define TE _tstr[19]		/* end cursor mode */
+#define TA _tstr[20]		/* tab char (if not \t) */
+#define CR _tstr[21]		/* carriage return (if not \r) */
+#define xPC _tstr[22]		/* for reading pad character */
+char PC;			/* pad character */
+
+static char sname[] = "hoclcdceupdousuebtbcaldlcmchcvcssfsrtitetacrpc";
+char *_tstr[23];
+int     HOlen;			/* length of HO string */
+
+
+/* terminal flags */
+#define BS _tflg[0]		/* can backspace */
+#define AM _tflg[1]		/* has auto margins */
+#define XN _tflg[2]		/* no newline after wrap */
+#define RET !_tflg[3]		/* has carriage return */
+#define NS _tflg[4]		/* has SF (scroll forward) */
+#define PT _tflg[5]		/* has tabs */
+#define XT _tflg[6]		/* tabs are destructive */
+int	GT = 1;			/* tab stops on terminal are set */
+
+static char bname[] = "bsamxnncnsptxt";
+char _tflg[7];
+
+
+extern char *tgoto(), *tgetstr();
+extern char *getenv(), *strcpy();
+
+#define ULINE 0200
+#define CURSEEN 1
+
+/* Constants accessable by user */
+int     hasscroll;		/* scrolling type, 0 == no scrolling */
+int     ROWS;			/* number of lines on screen */
+int     COLS;			/* width of screen */
+
+struct line {
+	char    len;
+	char    flags;
+	char    l[MAXLLEN];
+};
+
+int     _row, _col;
+int     _srow, _scol;
+struct line _virt[MAXPLEN], _actual[MAXPLEN];
+int     _uline = 0;
+int     _junked = 1;
+int     _curjunked;
+int     _dir = 1;
+int	_shifttop, _shiftbot;
+int	_shift;
+int	_scratched;
+int     vputc();
+
+
+
+/*
+ * Tell refresh to shift lines in region upwards count lines.  Count
+ * may be negative.  The virtual image is not shifted; this may change
+ * later.  The variable _scratched is set to supress all attempts to
+ * shift.
+ */
+
+ushift(top, bot, count) {
+	if (_scratched)
+		return;
+	if (_shift != 0 && (_shifttop != top || _shiftbot != bot)) {
+		_scratched++;
+		return;
+	}
+	_shifttop = top;
+	_shiftbot = bot;
+	_shift += count;
+}
+
+
+
+/*
+ * generate a beep on the terminal
+ */
+
+beep() {
+	vputc('\7');
+}
+
+/*
+ * Move to one line below the bottom of the screen.
+ */
+
+botscreen() {
+	_amove(BOTLINE, 0);
+	vputc('\n');
+	vflush();
+}
+
+
+
+move(row, col) {
+	if (row < 0 || row >= ROWS || col < 0 || col >= COLS)
+		return;
+	_row = row;
+	_col = col;
+}
+
+
+
+/*
+ * Output string at specified location.
+ */
+
+mvaddstr(row, col, str)
+	char *str;
+	{
+	move(row, col);
+	addstr(str);
+}
+
+
+addstr(s)
+char   *s;
+{
+	register char  *p;
+	register struct line   *lp;
+	register int    col = _col;
+
+	lp = &_virt[_row];
+	if (lp->len < col) {
+		p = &lp->l[lp->len];
+		while (lp->len < col) {
+			*p++ = ' ';
+			lp->len++;
+		}
+	}
+	for (p = s; *p != '\0'; p++) {
+		if (*p == '\n') {
+			lp->len = col;
+			lp->flags |= DIRTY;
+			col = 0;
+			if (++_row >= ROWS)
+				_row = 0;
+			lp = &_virt[_row];
+		}
+		else {
+			lp->l[col] = *p;
+			lp->flags |= DIRTY;
+			if (++col >= COLS) {
+				lp->len = COLS;
+				col = 0;
+				if (++_row >= ROWS)
+					_row = 0;
+				lp = &_virt[_row];
+			}
+		}
+	}
+	if (lp->len <= col)
+		lp->len = col;
+	_col = col;
+}
+
+
+
+addch (c) {
+	register struct line   *lp;
+	register char  *p;
+
+	lp = &_virt[_row];
+	if (lp->len < _col) {
+		p = &lp->l[lp->len];
+		while (lp->len < _col) {
+			*p++ = ' ';
+			lp->len++;
+		}
+	}
+	lp->l[_col] = c;
+	if (lp->len == _col)
+		lp->len++;
+	if (++_col >= COLS) {
+		_col = 0;
+		if (++_row >= ROWS)
+			_row = 0;
+	}
+	lp->flags |= DIRTY;
+}
+
+
+
+clrtoeol() {
+	register struct line   *lp;
+
+	lp = &_virt[_row];
+	if (lp->len > _col) {
+		lp->len = _col;
+		lp->flags |= DIRTY;
+	}
+}
+
+
+/*
+ * Clear an entire line.
+ */
+
+clrline(row) {
+	register struct line   *lp;
+
+	lp = &_virt[row];
+	if (lp->len > 0) {
+		lp->len = 0;
+		lp->flags |= DIRTY;
+	}
+}
+
+
+
+clear() {
+	erase();
+	_junked++;
+}
+
+
+
+erase() {
+	register    i;
+
+	for (i = 0; i < ROWS; i++) {
+		_virt[i].len = 0;
+		_virt[i].flags |= DIRTY;
+	}
+}
+
+
+
+refresh() {
+	register i;
+	int j, len;
+	register char *p, *q;
+
+	if (checkin())
+		return;
+	i = 1;
+	if (_junked) {
+		_sclear();
+		_junked = 0;
+	} else if (! _scratched) {
+		if (_shift > 0) {
+			_ushift(_shifttop, _shiftbot, _shift);
+		} else if (_shift < 0) {
+			i = _dshift(_shifttop, _shiftbot, -_shift);
+		} else {
+			i = _dir;
+		}
+	} 
+	_dir = i;
+	_shift = 0;
+	if (checkin())
+		return;
+	_fixlines();
+	for (i = _dir > 0 ? 0 : BOTLINE; i >= 0 && i < ROWS; i += _dir) {
+		if ((_virt[i].flags & DIRTY) == 0)
+			continue;
+		_ckclrlin(i);		/* decide whether to do a clear line */
+					/* probably should consider cd as well */
+		len = _virt[i].len;
+		if (_actual[i].len < len)
+			len = _actual[i].len;
+		p = _virt[i].l;
+		q = _actual[i].l;
+		for (j = 0; j < len; j++) {
+			if (*p != *q) {
+				_amove(i, j);
+				_aputc(*p);
+				*q = *p;
+			}
+			p++, q++;
+		}
+		len = _virt[i].len;
+		if (_actual[i].len > len) {
+			_clrtoeol(i, len);
+		}
+		else {
+			for (; j < len; j++) {
+				if (*p != ' ') {
+					_amove(i, j);
+					_aputc(*p);
+				}
+				*q++ = *p++;
+			}
+			_actual[i].len = len;
+		}
+		if (checkin())
+			return;
+	}
+	_dir = 1;
+	if (CURSEEN)
+		_amove(_row, _col);
+	vflush();			/* flush output buffer */
+	_scratched = 0;
+}
+
+
+_dshift(top, bot, count) {
+	register    i;
+
+	if (count >= bot - top || hasscroll < 4) {  /* must have CS or AL/DL */
+		_scratched++;
+		return 1;
+	}
+	for (i = bot - count; _actual[i].len == 0; i--)
+		if (i == top)
+			return 1;
+	for (i = top; i <= bot; i++)
+		_virt[i].flags |= DIRTY;
+	for (i = bot; i >= top + count; i--)
+		_actual[i] = _actual[i - count];
+	for (; i >= top; i--)
+		_actual[i].len = 0;
+
+	if (hasscroll != 5) {		/* can we define scrolling region, and scroll back */
+		tputs(tgoto(CS, bot, top), 1, vputc);/* define scroll region */
+		_curjunked = 1;
+		_amove(top, 0);
+		for (i = count; --i >= 0;)
+			tputs(SR, 1, vputc);/* scroll back */
+		tputs(tgoto(CS, BOTLINE, 0), 1, vputc);
+		_curjunked = 1;
+	} else {
+		_amove(bot - count + 1, 0);
+		if (CD && bot == BOTLINE)
+			tputs(CD, 1, vputc);
+		else {
+			for (i = count; --i >= 0;)
+				tputs(DL, ROWS - _srow, vputc);
+		}
+		_amove(top, 0);
+		for (i = count; --i >= 0;)
+			tputs(AL, ROWS - _srow, vputc);
+	}
+	return -1;
+}
+
+
+_ushift(top, bot, count) {
+	register    i;
+
+	if (count >= bot - top || hasscroll == 0) {
+		_scratched++;
+		return;
+	}
+	for (i = top + count; _actual[i].len == 0; i++)
+		if (i == bot)
+			return;
+	if (hasscroll == 1 || hasscroll == 3) {
+		/* we cheat and shift the entire screen */
+		/* be sure we are shifting more lines into than out of position */
+		if ((bot - top + 1) - count <= ROWS - (bot - top + 1))
+			return;
+		top = 0, bot = BOTLINE;
+	}
+	for (i = top; i <= bot; i++)
+		_virt[i].flags |= DIRTY;
+	for (i = top; i <= bot - count; i++)
+		_actual[i] = _actual[i + count];
+	for (; i <= bot; i++)
+		_actual[i].len = 0;
+
+	if (hasscroll != 5) {
+		if (top != 0 || bot != BOTLINE) {
+			tputs(tgoto(CS, bot, top), 0, vputc);
+			_curjunked = 1;
+		}
+		_amove(bot, 0);	/* move to bottom */
+		for (i = 0; i < count; i++) {
+			if (SF)		/* scroll forward */
+				tputs(SF, 1, vputc);
+			else
+				vputc('\n');
+		}
+		if (top != 0 || bot != BOTLINE) {
+			tputs(tgoto(CS, BOTLINE, 0), 0, vputc);
+			_curjunked = 1;
+		}
+	} else {
+		_amove(top, 0);
+		for (i = count; --i >= 0;)
+			tputs(DL, ROWS - _srow, vputc);
+		if (bot < BOTLINE) {
+			_amove(bot - count + 1, 0);
+			for (i = count; --i >= 0;)
+				tputs(AL, ROWS - _srow, vputc);
+		}
+	}
+}
+
+
+_sclear() {
+	register struct line   *lp;
+
+	tputs(CL, 0, vputc);
+	_srow = _scol = 0;
+	for (lp = _actual; lp < &_actual[ROWS]; lp++) {
+		lp->len = 0;
+	}
+	for (lp = _virt; lp < &_virt[ROWS]; lp++) {
+		if (lp->len != 0)
+			lp->flags |= DIRTY;
+	}
+}
+
+
+_clrtoeol(row, col) {
+	register struct line *lp = &_actual[row];
+	register i;
+
+	if (CE && lp->len > col + 1) {
+		_amove(row, col);
+		tputs(CE, 1, vputc);
+	} else {
+		for (i = col ; i < lp->len ; i++) {
+			if (lp->l[i] != ' ') {
+				_amove(row, i);
+				_aputc(' ');
+			}
+		}
+	}
+	lp->len = col;
+}
+
+
+_fixlines() {
+	register struct line   *lp;
+	register char  *p;
+	register int    i;
+
+	for (i = 0; i < ROWS; i++) {
+		lp = &_virt[i];
+		if (lp->flags & DIRTY) {
+			lp = &_virt[i];
+			for (p = &lp->l[lp->len]; --p >= lp->l && *p == ' ';);
+			lp->len = p + 1 - lp->l;
+			if (lp->len == _actual[i].len && strncmp(lp->l, _actual[i].l, lp->len) == 0)
+				lp->flags &= ~DIRTY;
+		}
+	}
+}
+
+
+/*
+ * Consider clearing the line before overwriting it.
+ * We always clear a line if it has underlined characters in it
+ * because these can cause problems.  Otherwise decide whether
+ * that will decrease the number of characters to change.  This
+ * routine could probably be simplified with no great loss.
+ */
+
+_ckclrlin(i) {
+	int     eval;
+	int     len;
+	int     first;
+	register struct line   *vp, *ap;
+	register int    j;
+
+	if (!CE)
+		return;
+	ap = &_actual[i];
+	vp = &_virt[i];
+	len = ap->len;
+	eval = -strlen(CE);
+	if (len > vp->len) {
+		len = vp->len;
+		eval = 0;
+	}
+	for (j = 0; j < len && vp->l[j] == ap->l[j]; j++);
+	if (j == len)
+		return;
+	first = j;
+	while (j < len) {
+		if (vp->l[j] == ' ') {
+			if (ap->l[j] != ' ') {
+				while (++j < len && vp->l[j] == ' ' && ap->l[j] != ' ') {
+					eval++;
+				}
+				if (j == len)
+					eval++;
+				continue;
+			}
+		}
+		else {
+			if (vp->l[j] == ap->l[j]) {
+				while (++j < len && vp->l[j] == ap->l[j]) {
+					eval--;
+				}
+				continue;
+			}
+		}
+		j++;
+	}
+	if (US) {
+		for (j = 0 ; j < ap->len ; j++) {
+			if (ap->l[j] & ULINE) {
+				eval = 999;
+				if (first > j)
+					first = j;
+				break;
+			}
+		}
+	}
+	for (j = first; --j >= 0;)
+		if (vp->l[j] != ' ')
+			break;
+	if (j < 0)
+		first = 0;
+	if (eval > 0) {
+		_amove(i, first);
+		tputs(CE, 0, vputc);
+		_actual[i].len = first;
+	}
+}
+
+
+
+/*
+ * Move routine
+ * 	first compute direct cursor address string and cost
+ *	then relative motion string and cost,
+ *	then home then relative and cost
+ *	choose smallest and do it.
+ *
+ *	The plod stuff is to build the strings (with padding) then decide
+ */
+static char *plodstr;		/* current location in relmove string */
+
+plodput(c) { *plodstr++ = c; }
+
+_amove(row, col) {
+	char direct[20];
+	char rel[MAXPLEN + MAXLLEN + 50];    /* longest move is full screen */
+	char ho[MAXPLEN + MAXLLEN + 50];
+	int cost, newcost;
+	register char *movstr;
+
+	if (row == _srow && col == _scol && _curjunked == 0)
+		return;
+	_setul(0);
+
+	cost = 999;
+	if (CM) {
+		plodstr = direct;
+		tputs(tgoto(CM, col, row), 0, plodput);
+		*plodstr = '\0';
+		cost = plodstr - direct;
+		movstr = direct;
+	}
+	if (_curjunked == 0) {
+		plodstr = rel;
+		if (_vmove(_srow, row) >= 0
+		 && _hmove(_scol, col, row) >= 0
+		 && (newcost = plodstr - rel) < cost) {
+			*plodstr = '\0';
+			cost = newcost;
+			movstr = rel;
+		}
+	}
+	if (cost > HOlen) {	/* is it worth calculating */
+		plodstr = ho;
+		tputs(HO, 0, plodput);
+		if (_vmove(0, row) >= 0
+		 && _hmove(0, col, row) >= 0
+		 && (newcost = plodstr - ho) < cost) {
+			*plodstr = '\0';
+			cost = newcost;
+			movstr = ho;
+		}
+	}
+
+	while (--cost >= 0) {
+		vputc(*movstr++);
+	}
+	_srow = row, _scol = col;
+	_curjunked = 0;
+}
+
+
+_vmove(orow, nrow) {
+	char direct[20];
+	char *saveplod = plodstr;
+
+	if (CV) {
+		plodstr = direct;
+		tputs(tgoto(CV, nrow, nrow), 0, plodput);
+		*plodstr = '\0';
+		plodstr = saveplod;
+	}
+	if (orow > nrow) {		/* cursor up */
+		if (! UP)
+			return -1;
+		while (orow > nrow) {
+			tputs(UP, 1, plodput);
+			orow--;
+		}
+	}
+	while (orow < nrow) {		/* cursor down */
+		if (DO)
+			tputs(DO, 1, plodput);
+		else
+			*plodstr++ = '\n';
+		orow++;
+	}
+	if (CV && plodstr - saveplod >= strlen(direct)) {
+		register char *p;
+		plodstr = saveplod;
+		for (p = direct ; *plodstr = *p++ ; plodstr++);
+	}
+	return 0;
+}
+
+
+_hmove(ocol, ncol, row) {
+	char direct[20];
+	char ret[MAXLLEN + 50];
+	char *saveplod = plodstr;
+	char *movstr;
+	int cost, newcost;
+
+	cost = 999;
+	if (CH) {
+		plodstr = direct;
+		tputs(tgoto(CH, ncol, ncol), 0, plodput);
+		cost = plodstr - direct;
+		movstr = direct;
+		plodstr = saveplod;
+	}
+	if (RET && ocol > ncol) {	/* consider doing carriage return */
+		plodstr = ret;
+		if (CR)
+			tputs(CR, 1, plodput);
+		else
+			*plodstr++ = '\r';
+		if (_relhmove(0, ncol, row) >= 0
+		 && (newcost = plodstr - ret) < cost) {
+			cost = newcost;
+			movstr = ret;
+		}
+		plodstr = saveplod;
+	}
+	if (_relhmove(ocol, ncol, row) < 0) {
+		if (cost == 999)
+			return -1;
+		goto copy;
+	}
+	if (plodstr - saveplod > cost) {
+copy:		plodstr = saveplod;
+		while (--cost >= 0)
+			*plodstr++ = *movstr++;
+	}
+	return 0;
+}
+
+
+
+_relhmove(ocol, ncol, row) {
+	int tab;
+
+	if (ocol < ncol && PT && GT) {	/* tab (nondestructive) */
+		while ((tab = (ocol + 8) & ~07) <= ncol) {
+			if (TA)
+				tputs(TA, 1, plodput);
+			else
+				*plodstr++ = '\t';
+			ocol = tab;
+		}
+		if (tab < COLS && tab - ncol < ncol - ocol) {
+			if (TA)
+				tputs(TA, 1, plodput);
+			else
+				*plodstr++ = '\t';
+			ocol = tab;
+		}
+	} else if (BT && GT && ocol > ncol) {	/* backwards tab */
+		while ((tab = (ocol - 1) &~ 07) >= ncol) {
+			if (BS && tab == ocol - 1) {
+				if (BC)
+					tputs(BC, 1, plodput);
+				else
+					*plodstr++ = '\b';
+			} else
+				tputs(BT, 1, plodput);
+			ocol = tab;
+		}
+		if (ncol - tab + 1 < ocol - ncol) {
+			tputs(BT, 1, plodput);
+			ocol = tab;
+		}
+	}
+	if (ocol > ncol) {			/* cursor left */
+		if (! BS)
+			return -1;
+		while (ocol > ncol) {
+			if (BC != NULL)
+				tputs(BC, 1, plodput);
+			else
+				*plodstr++ = '\b';
+			ocol--;
+		}
+	}
+	if (ocol < ncol) {			/* cursor right */
+		register struct line *lp = &_actual[row];
+		/*
+		 * This code doesn't move over underlined characters properly,
+		 * but in practice this doesn't seem to matter.
+		 */
+		while (ocol < ncol) {
+			if (ocol < lp->len)
+				*plodstr++ = lp->l[ocol];
+			else
+				*plodstr++ = ' ';
+			ocol++;
+		}
+	}
+	return 0;
+}
+
+
+
+_aputc(c) {
+	if (AM && _scol == COLS - 1 && _srow == ROWS - 1)
+		return;
+	_setul(c & ULINE);
+	vputc(c & ~ULINE);
+	if (++_scol >= COLS) {
+		if (! AM) {
+			_scol--;
+		} else  if (XN) {
+			_curjunked++;
+		} else {
+			_scol = 0;
+			++_srow;
+		}
+	}
+}
+
+
+_setul(on) {
+	if (on) {
+		if (_uline == 0 && US != NULL) {
+			tputs(US, 1, vputc);
+			_uline = 1;
+		}
+	}
+	else {
+		if (_uline != 0 && UE != NULL) {
+			tputs(UE, 1, vputc);
+			_uline = 0;
+		}
+	}
+}
+
+
+/*
+ * Initialize termcap strings for later use.
+ */
+initterm() {
+	static char tcbuf[1024];	/* termcap buffer */
+	register char  *cp;
+
+	if ((cp = getenv("TERM")) == NULL)
+		xerror("TERM not set in environment");
+
+	switch (tgetent(tcbuf, cp)) {
+		case 0: 
+			xerror("Terminal not found in TERMCAP");
+		case -1: 
+			xerror("Can't open /etc/termcap");
+		case 1: 
+			break;
+	}
+
+	if ((ROWS = tgetnum("li")) == -1
+	 || (COLS = tgetnum("co")) == -1)
+		xerror("Can't get screen size");
+	_zap();
+
+	if (CL == NULL)
+		xerror ("No clear screen defined");
+
+	if (HO == NULL && CM == NULL)
+		xerror("No home or cursor addressing");
+	if (HO)
+		HOlen = strlen(HO);
+	else
+		HOlen = 999;
+
+	PC = xPC ? xPC[0] : 0;
+
+	if (tgetnum("ug") > 0)
+		US = UE = NULL;
+
+	if (XT)				/* Destructive tab code not included */
+		PT = 0;			/* to keep things simple */
+
+	if (ROWS > MAXPLEN)
+		ROWS = MAXPLEN;
+	if (COLS > MAXLLEN) {
+		COLS = MAXLLEN;
+		AM = XN = 1;
+	}
+
+	/* Select article scrolling algorithm.  We prefer scrolling region
+	   over insert/delete line because it's faster on the HP */
+	hasscroll = 0;
+	if (!NS) {
+		hasscroll = 1;
+		if (SR)
+			hasscroll = 3;
+		if (CS)
+			hasscroll++;
+	}
+	if (AL && DL && hasscroll != 4)
+		hasscroll = 5;
+}
+
+
+rawterm() {
+	if (TI != NULL)
+		tputs(TI, 0, vputc);
+}
+
+
+cookedterm() {
+	if (TE != NULL)
+		tputs(TE, 0, vputc);
+}
+
+
+/* get strings from termcap */
+_zap() {
+	static char tstrbuf[1024];
+	static char *tp;
+	register char  *namp, **sp, *bp;
+
+	tp = tstrbuf;
+	sp = _tstr;
+	for (namp = sname; *namp; namp += 2) {
+		*sp++ = tgetstr(namp, &tp);
+	}
+	bp = _tflg;
+	for (namp = bname; *namp; namp += 2) {
+		*bp++ = tgetflag(namp, &tp);
+	}
+}
+
+-- 
+>From the closet of anxieties of:			Chuq Von Rospach
+{amd70,fortune,hplabs,ihnp4}!nsc!chuqui			(408) 733-2600 x242
+
+I'm sure I have my death ray in here somewhere...__GoOgLE_
+X-Google-ArrivalTime: 1984-06-01 07:32:19 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site decwrl.UUCP
+Path: utzoo!linus!vaxine!wjh12!genrad!decvax!decwrl!dec-rhea!dec-mrvax!ddb
+From: ddb@mrvax.DEC (DAVID DYER-BENNET MRO1-2/L14 DTN 231-4076)
+Newsgroups: net.lang
+Subject: GOTO alternatives
+Message-ID: <930@decwrl.UUCP>
+Date: Fri, 1-Jun-84 10:32:19 EDT
+Article-I.D.: decwrl.930
+Posted: Fri Jun  1 10:32:19 1984
+Date-Received: Wed, 6-Jun-84 02:29:52 EDT
+Organization: DEC Engineering Network
+Lines: 27
+
+BLISS has an interesting GOTO-substitute:  A block (standard begin-end
+type of block) can be given a "label" which identifies it; this label
+is used to identify that block in a "leave" expression.  Anywhere
+within that block, you can say "LEAVE <name>" and you will have exited
+from the named block (you can also specify the value of the block in the
+leave expression).  I find this considerably superior to the "EXITLOOP 3"
+approach to leaving a block other than the innermost, because the label
+makes it clear to humans exactly which block is meant, and doesn't vary
+if another layer of blocks is inserted later.
+
+(Bliss also has an EXITLOOP to get you out of the innermost
+loop.  It can't go out beyond that.)
+
+As long as I'm discussing Bliss, I'd advise anybody interested in macro
+pre-processors for languages to look at the Bliss compile-time facilities.
+I find them orders of magnitude beyond anything I've seen supported anywhere
+else, and very useful.
+
+For flame protection, I should add that there are a number of things I
+DON'T like about BLISS, it's just coincidence that this message discusses
+the good points.  I find Bliss very frustrating, because parts of it are
+so good and parts of it are so bad.
+
+			David Dyer-Bennet
+			...decwrl!rhea!mrvax!ddb
+
+	Remember, Bliss is ignorance...or is it the other way?
+
+

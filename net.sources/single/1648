@@ -1,0 +1,1320 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,1207baed7f41d35a,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-09-07 18:00:21 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site seismo.UUCP
+Path: utzoo!watmath!clyde!burl!mgnetp!ihnp4!cbosgd!seismo!rick
+From: rick@seismo.UUCP (Rick Adams)
+Newsgroups: net.sources
+Subject: news 2.10.2 src part 8 (reposting)
+Message-ID: <3787@seismo.UUCP>
+Date: Fri, 7-Sep-84 21:00:21 EDT
+Article-I.D.: seismo.3787
+Posted: Fri Sep  7 21:00:21 1984
+Date-Received: Thu, 13-Sep-84 07:21:41 EDT
+References: <3687@seismo.UUCP>
+Distribution: net
+Organization: Center for Seismic Studies, Arlington, VA
+Lines: 1298
+
+if test ! -d src
+then
+	mkdir src
+	echo mkdir src
+fi
+echo x - src/compress.c
+sed 's/^X//' >src/compress.c <<'*-*-END-of-src/compress.c-*-*'
+X/*
+X * Define NO_UCHAR if "unsigned char" functions as signed char on your
+X * machine.
+X */
+X#define STATS
+X#undef STATS
+X#define DEBUG
+X#undef DEBUG
+X/*
+X * compress.c - File compression ala IEEE Computer June 1984.
+X *
+X * Authors:	Spencer W. Thomas	(decvax!harpo!utah-cs!utah-gr!thomas)
+X * 		Computer Science Dept.
+X * 		University of Utah
+X * 		Copyright (c) 1984 Spencer W. Thomas
+X *
+X *		Jim McKie	(decvax!mcvax!jim)
+X *		Steve Davies	(decvax!vax135!petsd!peora!srd)
+X *		Ken Turkowski	(decvax!decwrl!turtlevax!ken)
+X *		Joe Orost	(decvax!vax135!petsd!joe)
+X *
+X */
+X#ifndef lint
+Xstatic char	*SccsId = "@(#)compress.c	1.5	9/4/84";
+X#endif !lint
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <signal.h>
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X
+X#define ARGVAL() (*++(*argv) || (--argc && *++argv))
+X
+X#ifdef pdp11
+X#define	BITS	12			/* maximum number of bits/code */
+X#define NO_UCHAR
+X#else !pdp11
+X#define	BITS	16			/* maximum number of bits/code */
+X/* #define NO_UCHAR */
+X#endif !pdp11
+X
+X#ifdef NO_UCHAR
+Xtypedef char	char_type;
+X#else UCHAR
+Xtypedef	unsigned char	char_type;
+X#endif UCAHR
+Xchar_type magic_header[] = { "\037\235" };	/* 1F 9D */
+X#define INIT_BITS 9			/* initial number of bits/code */
+Xint n_bits;				/* number of bits/code */
+Xint maxbits = BITS;			/* user settable max # bits/code */
+Xlong int maxcode;			/* maximum code, given n_bits */
+Xlong int maxmaxcode = 1 << BITS;	/* should NEVER generate this code */
+X#ifdef COMPATIBLE		/* But wrong! */
+X# define MAXCODE(n_bits)	(1 << (n_bits) - 1)
+X#else COMPATIBLE
+X# define MAXCODE(n_bits)	((1 << (n_bits)) - 1)
+X#endif COMPATIBLE
+X
+X/*
+X * One code could conceivably represent (1<<BITS) characters, but
+X * to get a code of length N requires an input string of at least
+X * N*(N-1)/2 characters.  With 8000 chars in the stack, an input
+X * file would have to contain a 40Mb string of a single character.
+X * This seems unlikely.
+X */
+X#define MAXSTACK    8000		/* size of output stack */
+X
+Xunsigned short tab_next[1<<BITS];	/* chain of entries with same prefix */
+Xunsigned short tab_chain[1<<BITS];	/* chain prefixed with this entry */
+Xunsigned short tab_prefix[1<<BITS];	/* prefix code for this entry */
+X	 char  tab_suffix[1<<BITS];	/* last char in this entry */
+X
+Xlong int free_ent = 0;			/* first unused entry */
+Xint exit_stat = 0;
+X
+Xlong int getcode();
+X
+XUsage() {
+X#ifdef DEBUG
+Xfprintf(stderr,"Usage: compress [-dDvqfc] [-b maxbits] [file ...]\n");
+X}
+Xint debug = 0;
+X#else DEBUG
+Xfprintf(stderr,"Usage: compress [-dfqc] [-b maxbits] [file ...]\n");
+X}
+X#endif DEBUG
+Xint nomagic = 0;	/* Use a 2 byte magic number header, unless old file */
+Xint zcat_flg = 0;	/* Write output on stdout, suppress messages */
+Xint quiet = 0;		/* don't tell me about compression */
+X
+X/*****************************************************************
+X * TAG( main )
+X *
+X * Algorithm from "A Technique for High Performance Data Compression",
+X * Terry A. Welch, IEEE Computer Vol 17, No 6 (June 1984), pp 8-19.
+X *
+X * Usage: compress [-d] [-c] [-f] [-b bits] [file ...]
+X * Inputs:
+X *	-d:	    If given, decompression is done instead.
+X *
+X *      -c:         Write output on stdout.
+X *
+X *      -b:         Limits the max number of bits/code.
+X *
+X *	-f:	    Forces output file to be generated, even if one already
+X *		    exists; if -f is not used, the user will be prompted if
+X *		    the stdin is a tty, otherwise, the output file will not
+X *		    be overwritten.
+X *
+X *	-q:	    No output, unless error
+X *
+X * 	file ...:   Files to be compressed.  If none specified, stdin
+X *		    is used.
+X * Outputs:
+X *	file.Z:	    Compressed form of file with same mode, owner, and utimes
+X * 	or stdout   (if stdin used as input)
+X *
+X * Assumptions:
+X *	When filenames are given, replaces with the compressed version
+X *	(.Z suffix) only if the file decreased in size.
+X * Algorithm:
+X * 	Modified Lempel-Ziv method (LZW).  Basically finds common
+X * substrings and replaces them with a variable size code.  This is
+X * deterministic, and can be done on the fly.  Thus, the decompression
+X * procedure needs no input table, but tracks the way the table was
+X * built.
+X */
+X
+X
+Xmain( argc, argv )
+Xregister int argc; char **argv;
+X{
+X    int do_decompress = 0;
+X    int overwrite = 0;	/* Do not overwrite unless given -f flag */
+X    char ofname[100], tempname[100];
+X    char **filelist, **fileptr;
+X    char *cp, *rindex();
+X    struct stat statbuf;
+X
+X#ifdef DEBUG
+X    int verbose = 0;
+X#endif DEBUG
+X#ifdef COMPATIBLE
+X    nomagic = 1;	/* Original didn't have a magic number */
+X#endif COMPATIBLE
+X
+X    filelist = fileptr = (char **)(malloc(argc * sizeof(*argv)));
+X    *filelist = NULL;
+X
+X    if((cp = rindex(argv[0], '/')) != 0) {
+X	cp++;
+X    } else {
+X	cp = argv[0];
+X    }
+X    if(strcmp(cp, "uncompress") == 0) {
+X	do_decompress = 1;
+X    } else if(strcmp(cp, "zcat") == 0) {
+X	do_decompress = 1;
+X	zcat_flg = 1;
+X    }
+X
+X#ifdef BSD42
+X    /* 4.2BSD dependent - take it out if not */
+X    setlinebuf( stderr );
+X#endif BSD42
+X
+X    /* Argument Processing
+X     * All flags are optional.
+X     * -D => debug
+X     * -d => do_decompress
+X     * -v => verbose
+X     * -f => force overwrite of output file
+X     * -n => no header: useful to uncompress old files
+X     * -b maxbits => maxbits.  If -b is specified, then maxbits MUST be
+X     *	    given also.
+X     * -c => cat all output to stdout
+X     * if a string is left, must be an input filename.
+X     */
+X    for (argc--, argv++; argc > 0; argc--, argv++) {
+X	if (**argv == '-') {	/* A flag argument */
+X	    while (*++(*argv)) {	/* Process all flags in this arg */
+X		switch (**argv) {
+X#ifdef DEBUG
+X		    case 'D':
+X			debug = 1;
+X			break;
+X		    case 'v':
+X			verbose = 1;
+X			break;
+X#endif DEBUG
+X		    case 'd':
+X			do_decompress = 1;
+X			break;
+X		    case 'f':
+X			overwrite = 1;
+X			break;
+X		    case 'n':
+X			nomagic = 1;
+X			break;
+X		    case 'b':
+X			if (!ARGVAL()) {
+X			    fprintf(stderr, "Missing maxbits\n");
+X			    Usage();
+X			    exit(1);
+X			}
+X			maxbits = atoi(*argv);
+X			goto nextarg;
+X		    case 'c':
+X			zcat_flg = 1;
+X			break;
+X		    case 'q':
+X			quiet = 1;
+X			break;
+X		    default:
+X			fprintf(stderr, "Unknown flag: '%c'; ", **argv);
+X			Usage();
+X			exit(1);
+X		}
+X	    }
+X	}
+X	else {		/* Input file name */
+X	    *fileptr++ = *argv;	/* Build input file list */
+X	    *fileptr = NULL;
+X	    /* goto nextarg; */
+X	}
+X	nextarg: continue;
+X    }
+X
+X    if (maxbits > BITS) maxbits = BITS;
+X    maxmaxcode = 1 << maxbits;
+X
+X    if (*filelist != NULL) {
+X	for (fileptr = filelist; *fileptr; fileptr++) {
+X	    exit_stat = 0;
+X	    if (do_decompress != 0) {			/* DECOMPRESSION */
+X		/* Check for .Z suffix */
+X		if (strcmp(*fileptr + strlen(*fileptr) - 2, ".Z") != 0) {
+X		    /* No .Z: tack one on */
+X		    strcpy(tempname, *fileptr);
+X		    strcat(tempname, ".Z");
+X		    *fileptr = tempname;
+X		}
+X		/* Open input file */
+X		if ((freopen(*fileptr, "r", stdin)) == NULL) {
+X			perror(*fileptr); continue;
+X		}
+X		/* Check the magic number */
+X		if (nomagic == 0) {
+X		    if ((getchar() != (magic_header[0] & 0xFF))
+X		     || (getchar() != (magic_header[1] & 0xFF))) {
+X			fprintf(stderr, "%s: not in compressed format\n",
+X			    *fileptr);
+X		    continue;
+X		    }
+X		    maxbits = getchar();	/* set -b from file */
+X		    maxmaxcode = 1 << maxbits;
+X		    if(maxbits > BITS) {
+X			fprintf(stderr,
+X			"%s: compressed with %d bits, can only handle %d bits\n",
+X			*fileptr, maxbits, BITS);
+X			continue;
+X		    }
+X		}
+X		/* Generate output filename */
+X		strcpy(ofname, *fileptr);
+X		ofname[strlen(*fileptr) - 2] = '\0';  /* Strip off .Z */
+X	    }
+X	    else {					/* COMPRESSION */
+X		if (strcmp(*fileptr + strlen(*fileptr) - 2, ".Z") == 0) {
+X		    fprintf(stderr, "%s: already has .Z suffix -- no change\n",
+X			    *fileptr);
+X		    continue;
+X		}
+X		/* Open input file */
+X		if ((freopen(*fileptr, "r", stdin)) == NULL) {
+X		    perror(*fileptr); continue;
+X		}
+X		/* Generate output filename */
+X		strcpy(ofname, *fileptr);
+X#ifndef BSD42		/* Short filenames */
+X		if ((cp=rindex(ofname,'/')) != NULL)	cp++;
+X		else					cp = ofname;
+X		if (strlen(cp) > 12) {
+X		    fprintf(stderr,"%s: filename too long to tack on .Z\n",cp);
+X		    continue;
+X		}
+X#endif  BSD42		/* Long filenames allowed */
+X		strcat(ofname, ".Z");
+X	    }
+X	    /* Check for overwrite of existing file */
+X	    if (overwrite == 0 && zcat_flg == 0) {
+X		if (stat(ofname, &statbuf) == 0) {
+X		    char response[2];
+X		    response[0] = 'n';
+X		    fprintf(stderr, "%s already exists;", ofname);
+X		    if (foreground()) {
+X			fprintf(stderr, " do you wish to overwrite (y or n)? ",
+X			ofname);
+X			fflush(stderr);
+X			read(2, response, 2);
+X			while (response[1] != '\n') {
+X			    if (read(2, response+1, 1) < 0) {	/* Ack! */
+X				perror("stderr"); break;
+X			    }
+X			}
+X		    }
+X		    if (response[0] != 'y') {
+X			fprintf(stderr, "\tnot overwritten\n");
+X			continue;
+X		    }
+X		}
+X	    }
+X	    if(zcat_flg == 0) {		/* Open output file */
+X	        if (freopen(ofname, "w", stdout) == NULL) {
+X		    perror(ofname);
+X		    continue;
+X	        }
+X	        fprintf(stderr, "%s: ", *fileptr);
+X	    }
+X
+X	    /* Actually do the compression/decompression */
+X	    if (do_decompress == 0)	compress();
+X#ifndef DEBUG
+X	    else			decompress();
+X#else   DEBUG
+X	    else if (debug == 0)	decompress();
+X	    else			printcodes();
+X	    if (verbose)		dump_tab();
+X#endif DEBUG
+X	    if(zcat_flg == 0) {
+X	        copystat(*fileptr, ofname);	/* Copy stats */
+X	        putc('\n', stderr);
+X	    }
+X	}
+X    } else {		/* Standard input */
+X	if (do_decompress == 0) {
+X		compress();
+X		putc('\n', stderr);
+X	} else {
+X	    /* Check the magic number */
+X	    if (nomagic == 0) {
+X		if ((getchar()!=(magic_header[0] & 0xFF))
+X		 || (getchar()!=(magic_header[1] & 0xFF))) {
+X		    fprintf(stderr, "stdin: not in compressed format\n");
+X		    exit(1);
+X		}
+X		maxbits = getchar();	/* set -b from file */
+X    		maxmaxcode = 1 << maxbits;
+X		if(maxbits > BITS) {
+X			fprintf(stderr,
+X			"stdin: compressed with %d bits, can only handle %d bits\n",
+X			maxbits, BITS);
+X			exit(1);
+X		}
+X	    }
+X#ifndef DEBUG
+X	    decompress();
+X#else   DEBUG
+X	    if (debug == 0)	decompress();
+X	    else		printcodes();
+X	    if (verbose)	dump_tab();
+X#endif DEBUG
+X	}
+X    }
+X
+X    exit(exit_stat);
+X}
+X
+X
+X/*****************************************************************
+X * TAG( compress )
+X *
+X * Actually does the compression.
+X * Inputs:
+X * 	Compresses file on stdin.
+X * Outputs:
+X * 	Writes compressed file to stdout.
+X * Assumptions:
+X *	[None]
+X * Algorithm:
+X * 	See above.
+X */
+Xstatic int offset;
+Xlong int bytes_out;			/* count how many are written */
+X
+Xcompress() {
+X    register c;
+X    register long ent, n_ent;
+X    register long int in_count = 1;
+X#ifdef STATS
+X    int out_count = 0;
+X#endif STATS
+X
+X    /*
+X     * Initialize the compression table to contain all 8-bit values
+X     * initially.  These don't need to be chained, they can be looked
+X     * up directly.
+X     */
+X    offset = 0;
+X    bytes_out = 0;
+X    maxcode = MAXCODE(n_bits = INIT_BITS);
+X    for ( ent = 0; ent < 256; ent++ ) {
+X	tab_next[ent] = tab_chain[ent] = NULL;
+X	tab_suffix[ent] = ent;
+X    }
+X    free_ent = 256;
+X
+X#ifndef COMPATIBLE
+X    if (nomagic == 0) {
+X	putchar(magic_header[0]); putchar(magic_header[1]);
+X	putchar((char)maxbits);
+X    }
+X#endif COMPATIBLE
+X
+X    ent = getchar();		/* initial entry */
+X    while ( !feof( stdin ) && (c = getchar()) != (unsigned)EOF ) {
+X	in_count++;
+X	/*
+X	 * Find the entry corresponding to the current entry suffixed
+X	 * with this char.  Since the entries are sorted, stop when
+X	 * the suffix >= c.
+X	 */
+X	for (n_ent = tab_chain[ent]; n_ent != NULL; n_ent = tab_next[n_ent])
+X	    if ( tab_suffix[n_ent] >= (unsigned)c )
+X		goto found;			/* found it */
+X
+Xnot_found:
+X	/*
+X	 * If no such entry, do 2 things:
+X	 * 1. Put out code for current prefix string.
+X	 * 2. Add the new string to the table.
+X	 *    If the table is full, just start over with current input
+X	 *    character.
+X	 */
+X	    output( (long)ent );
+X#ifdef STATS
+X	    out_count++;
+X#endif STATS
+X	    if ( (n_ent=free_ent) < maxmaxcode ) {
+X		/* Chain the new entry in 'c' order, so the aborted check
+X		   above works */
+X
+X		register p_ent;
+X
+X		tab_chain[n_ent] = NULL;
+X		tab_suffix[n_ent] = c;
+X		if((p_ent=tab_chain[ent]) == NULL ||
+X		   ((unsigned) c) < tab_suffix[p_ent]) {
+X			tab_next[n_ent] = p_ent;
+X			tab_chain[ent] = n_ent;
+X		} else {
+X			for(;;) {
+X				ent = tab_next[p_ent];
+X				if(ent == NULL ||
+X				   ((unsigned) c) < tab_suffix[ent]) break;
+X				p_ent = ent;
+X			}
+X			tab_next[n_ent] = ent;
+X			tab_next[p_ent] = n_ent;
+X		}
+X		free_ent = n_ent+1;
+X	    }
+X	    n_ent = c;
+Xcont:
+X	ent = n_ent;
+X    }
+X    /*
+X     * Put out the final code.
+X     */
+X    output( (long)ent );
+X#ifdef STATS
+X    out_count++;
+X#endif STATS
+X    output( -1L );			/* finish up output if necessary */
+X
+X    /*
+X     * Print out stats on stderr
+X     */
+X    if(zcat_flg == 0 && !quiet) {
+X#ifdef STATS
+X        fprintf( stderr,
+X	"%ld chars in, %ld codes (%ld bytes) out, compression factor %g\n",
+X		in_count, out_count, bytes_out,
+X		(double)in_count / (double)bytes_out );
+X        fprintf( stderr, "\tCompression as in compact: %5.2f%%\n",
+X		100.0 * ( in_count - bytes_out ) / (double) in_count );
+X        fprintf( stderr, "\tLargest code was %d (%d bits)\n", free_ent - 1, n_bits );
+X#else STATS
+X        fprintf( stderr, "Compression: %5.2f%%",
+X		100.0 * ( in_count - bytes_out ) / (double) in_count );
+X#endif STATS
+X    }
+X    if(bytes_out > in_count)	/* exit(2) if no savings */
+X	exit_stat = 2;
+X    return;
+X
+Xfound:
+X	/* either we found the entry, or we skipped past it */
+X
+X	if(tab_suffix[n_ent] == (unsigned) c) {
+X		goto cont;
+X	} else {
+X		goto not_found;
+X	}
+X}
+X
+X
+X/*****************************************************************
+X * TAG( output )
+X *
+X * Output the given code.
+X * Inputs:
+X * 	code:	A n_bits-bit integer.  If == -1, then EOF.  This assumes
+X *		that n_bits =< (long)wordsize - 1.
+X *
+X * Outputs:
+X * 	Outputs code to the file.
+X * Assumptions:
+X *	Chars are 8 bits long.
+X * Algorithm:
+X * 	Maintain a BITS character long buffer (so that 8 codes will
+X * fit in it exactly).  Use the VAX insv instruction to insert each
+X * code in turn.  When the buffer fills up empty it and start over.
+X */
+X
+Xstatic char buf[BITS];
+X
+Xchar_type lmask[9] = {0xff, 0xfe, 0xfc, 0xf8, 0xf0, 0xe0, 0xc0, 0x80, 0x00};
+Xchar_type rmask[9] = {0x00, 0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff};
+X
+Xoutput( code )
+Xlong int  code;
+X{
+X#ifdef DEBUG
+X    static int col = 0;
+X#endif DEBUG
+X
+X    /*
+X     * On the VAX, it is important to have the register declarations
+X     * in exactly the order given, or the asm will break.
+X     */
+X    register int r_off = offset, bits= n_bits;
+X    register char * bp = buf;
+X
+X    if ( code >= 0 ) {
+X#ifdef vax
+X	/* VAX DEPENDENT!! Implementation on other machines may be
+X	 * difficult.
+X	 *
+X	 * Translation: Insert BITS bits from the argument starting at
+X	 * offset bits from the beginning of buf.
+X	 */
+X	0;	/* C compiler bug ?? */
+X	asm( "insv	4(ap),r11,r10,(r9)" );
+X#else not a vax
+X/* WARNING: byte/bit numbering on the vax is simulated by the following code
+X*/
+X	/*
+X	 * Get to the first byte.
+X	 */
+X	bp += (r_off >> 3);
+X	r_off &= 7;
+X	/*
+X	 * Since code is always >= 8 bits, only need to mask the first
+X	 * hunk on the left.
+X	 */
+X	*bp = (*bp & rmask[r_off]) | (code << r_off) & lmask[r_off];
+X	bp++;
+X	bits -= (8 - r_off);
+X	code >>= 8 - r_off;
+X	/* Get any 8 bit parts in the middle (<=1 for up to 16 bits). */
+X	if ( bits >= 8 ) {
+X	    *bp++ = code;
+X	    code >>= 8;
+X	    bits -= 8;
+X	}
+X	/* Last bits. */
+X	*bp = code;
+X#endif vax
+X	offset += n_bits;
+X	if ( offset == (n_bits << 3) ) {
+X	    if( fwrite( buf, 1, n_bits, stdout ) != n_bits)
+X		writeerr();
+X	    offset = 0;
+X	    bytes_out += n_bits;
+X	}
+X#ifdef DEBUG
+X	if ( debug )
+X	    fprintf( stderr, "%5d%c", code,
+X		    (col+=6) >= 74 ? (col = 0, '\n') : ' ' );
+X#endif DEBUG
+X
+X	/*
+X	 * If the next entry is going to be too big for the code size,
+X	 * then increase it, if possible.
+X	 */
+X	if ( free_ent > maxcode )
+X	{
+X	    /*
+X	     * Write the whole buffer, because the input side won't
+X	     * discover the size increase until after it has read it.
+X	     */
+X	    if ( offset > 0 )
+X	    {
+X		if( fwrite( buf, 1, n_bits, stdout ) != n_bits)
+X			writeerr();
+X		bytes_out += n_bits;
+X	    }
+X	    offset = 0;
+X
+X	    n_bits++;
+X	    if ( n_bits == maxbits )
+X		maxcode = maxmaxcode;
+X	    else
+X		maxcode = MAXCODE(n_bits);
+X#ifdef DEBUG
+X	    if ( debug ) {
+X		fprintf( stderr, "\nChange to %d bits\n", n_bits );
+X		col = 0;
+X	    }
+X#endif DEBUG
+X	}
+X    } else {
+X	/*
+X	 * At EOF, write the rest of the buffer.
+X	 */
+X	if ( offset > 0 )
+X	    fwrite( buf, 1, (offset + 7) / 8, stdout );
+X	bytes_out += (offset + 7) / 8;
+X	offset = 0;
+X	fflush( stdout );
+X#ifdef DEBUG
+X	if ( debug )
+X	    fprintf( stderr, "\n" );
+X#endif DEBUG
+X	if( ferror( stdout ) )
+X		writeerr();
+X    }
+X}
+X
+X
+X/*****************************************************************
+X * TAG( decompress )
+X *
+X * Decompress the input file.
+X *
+X * Inputs:
+X *	Decompresses file on stdin.
+X * Outputs:
+X * 	Writes decompressed file to stdout.
+X * Algorithm:
+X * 	See article cited above.
+X */
+X
+Xdecompress() {
+X    register int stack_top = MAXSTACK;
+X    register long int code, oldcode, incode;
+X    register int finchar;
+X    char stack[MAXSTACK];
+X
+X    /*
+X     * As above, initialize the first 256 entries in the table.
+X     */
+X    maxcode = MAXCODE(n_bits = INIT_BITS);
+X    for ( free_ent = 0; free_ent < 256; free_ent++ ) {
+X	tab_next[free_ent] = tab_chain[free_ent] = NULL;
+X	tab_prefix[free_ent] = 0;
+X	tab_suffix[free_ent] = free_ent;
+X    }
+X
+X    finchar = oldcode = getcode();
+X    putchar( (char)finchar );		/* first code must be 8 bits = char */
+X
+X    while ( ( code = getcode() ) != -1 ) {
+X	incode = code;
+X	/*
+X	 * Special case for KwKwK string.
+X	 */
+X	if ( code >= free_ent ) {
+X	    stack[--stack_top] = finchar;
+X	    code = oldcode;
+X	}
+X
+X	/*
+X	 * Generate output characters in reverse order
+X	 */
+X	while ( code >= 256 ) {
+X	    stack[--stack_top] = tab_suffix[code];
+X	    code = tab_prefix[code];
+X	}
+X	stack[--stack_top] = finchar = tab_suffix[code];
+X
+X	/*
+X	 * And put them out in forward order
+X	 */
+X	if(fwrite( &stack[stack_top], 1, MAXSTACK - stack_top, stdout ) !=
+X	MAXSTACK - stack_top) writeerr();
+X	stack_top = MAXSTACK;
+X
+X	/*
+X	 * Generate the new entry.
+X	 */
+X	if ( (code=free_ent) < maxmaxcode ) {
+X	    tab_prefix[code] = oldcode;
+X	    tab_suffix[code] = finchar;
+X	    free_ent = code+1;
+X	}
+X	/*
+X	 * Remember previous code.
+X	 */
+X	oldcode = incode;
+X    }
+X    fflush( stdout );
+X    if(ferror(stdout))
+X	writeerr();
+X}
+X
+X
+X/*****************************************************************
+X * TAG( getcode )
+X *
+X * Read one code from the standard input.  If EOF, return -1.
+X * Inputs:
+X * 	stdin
+X * Outputs:
+X * 	code or -1 is returned.
+X * Assumptions:
+X *	[None]
+X * Algorithm:
+X * 	For now, use scanf to read ascii input.
+X */
+X
+Xlong int
+Xgetcode() {
+X    /*
+X     * On the VAX, it is important to have the register declarations
+X     * in exactly the order given, or the asm will break.
+X     */
+X    register long int code;
+X    static int offset = 0, size = 0;
+X    static char_type buf[BITS];
+X    register int r_off, bits;
+X    register char_type *bp = buf;
+X
+X    if ( offset >= size || free_ent > maxcode ) {
+X	/*
+X	 * If the next entry will be too big for the current code
+X	 * size, then we must increase the size.  This implies reading
+X	 * a new buffer full, too.
+X	 */
+X	if ( free_ent > maxcode ) {
+X	    n_bits++;
+X	    if ( n_bits == maxbits )
+X		maxcode = maxmaxcode;	/* won't get any bigger now */
+X	    else
+X		maxcode = MAXCODE(n_bits);
+X	}
+X	size = fread( buf, 1, n_bits, stdin );
+X	if ( size <= 0 )
+X	    return -1;			/* end of file */
+X	offset = 0;
+X	/* Round size down to integral number of codes */
+X	size = (size << 3) - (n_bits - 1);
+X    }
+X    r_off = offset;
+X    bits = n_bits;
+X#ifdef vax
+X    asm( "extzv   r10,r9,(r8),r11" );
+X#else not a vax
+X	/*
+X	 * Get to the first byte.
+X	 */
+X	bp += (r_off >> 3);
+X	r_off &= 7;
+X	/* Get first part (low order bits) */
+X#ifdef NO_UCHAR
+X	code = ((*bp++ >> r_off) & rmask[8 - r_off]) & 0xff;
+X#else  NO_UCHAR
+X	code = (*bp++ >> r_off);
+X#endif NO_UCHAR
+X	bits -= (8 - r_off);
+X	r_off = 8 - r_off;		/* now, offset into code word */
+X	/* Get any 8 bit parts in the middle (<=1 for up to 16 bits). */
+X	if ( bits >= 8 ) {
+X#ifdef NO_UCHAR
+X	    code |= (*bp++ & 0xff) << r_off;
+X#else  NO_UCHAR
+X	    code |= *bp++ << r_off;
+X#endif NO_UCHAR
+X	    r_off += 8;
+X	    bits -= 8;
+X	}
+X	/* high order bits. */
+X	code |= (*bp & rmask[bits]) << r_off;
+X#endif vax
+X    offset += n_bits;
+X
+X    return code;
+X}
+X
+Xchar *
+Xrindex(s, c)		/* For those who don't have it in libc.a */
+Xregister char *s, c;
+X{
+X	char *p;
+X	for (p = NULL; *s; s++)
+X	    if (*s == c)
+X		p = s;
+X	return(p);
+X}
+X
+X#ifdef DEBUG
+Xprintcodes()
+X{
+X    /*
+X     * Just print out codes from input file.  Mostly for debugging.
+X     */
+X    long int code;
+X    int col = 0, bits;
+X
+X    bits = n_bits = INIT_BITS;
+X    maxcode = MAXCODE(n_bits);
+X    free_ent = 255;
+X    while ( ( code = getcode() ) >= 0 ) {
+X	if ( free_ent < maxmaxcode )
+X	    free_ent++;
+X	if ( bits != n_bits ) {
+X	    printf( "\nChange to %d bits\n", n_bits );
+X	    bits = n_bits;
+X	    col = 0;
+X	}
+X	printf( "%5d%c", code, (col+=6) >= 74 ? (col = 0, '\n') : ' ' );
+X    }
+X    putchar( '\n' );
+X    exit( 0 );
+X}
+X
+X/*****************************************************************
+X * TAG( dump_tab )
+X *
+X * Dump the string table.
+X * Inputs:
+X *	[None]
+X * Outputs:
+X *	[None]
+X * Assumptions:
+X *	[None]
+X * Algorithm:
+X *	[None]
+X */
+X
+Xdump_tab()
+X{
+X    register int i;
+X    register ent;
+X    char stack[4 * MAXSTACK];	/* \nnn makes it 4 times bigger */
+X    int stack_top = 4 * MAXSTACK;
+X
+X    for ( i = 0; i < free_ent; i++ ) {
+X	ent = i;
+X	if ( isascii(tab_suffix[ent]) && isprint(tab_suffix[ent]) )
+X	    fprintf( stderr, "%5d: %5d/'%c'  \"",
+X			ent, tab_prefix[ent], tab_suffix[ent] );
+X	else
+X	    fprintf( stderr, "%5d: %5d/\\%03o \"",
+X			ent, tab_prefix[ent], tab_suffix[ent] );
+X	stack[--stack_top] = '\n';
+X	stack[--stack_top] = '"';
+X	for ( ; ent != NULL;
+X		ent = (ent >= 256 ? tab_prefix[ent] : NULL) ) {
+X	    if ( isascii(tab_suffix[ent]) && isprint(tab_suffix[ent]) )
+X		stack[--stack_top] = tab_suffix[ent];
+X	    else {
+X		switch( tab_suffix[ent] ) {
+X		case '\n': stack[--stack_top] = 'n'; break;
+X		case '\t': stack[--stack_top] = 't'; break;
+X		case '\b': stack[--stack_top] = 'b'; break;
+X		case '\f': stack[--stack_top] = 'f'; break;
+X		case '\r': stack[--stack_top] = 'r'; break;
+X		default:
+X		    stack[--stack_top] = '0' + tab_suffix[ent] % 8;
+X		    stack[--stack_top] = '0' + (tab_suffix[ent] / 8) % 8;
+X		    stack[--stack_top] = '0' + tab_suffix[ent] / 64;
+X		    break;
+X		}
+X		stack[--stack_top] = '\\';
+X	    }
+X	}
+X	fwrite( &stack[stack_top], 1, 4 * MAXSTACK - stack_top, stderr );
+X	stack_top = 4 * MAXSTACK;
+X    }
+X}
+X#endif DEBUG
+X
+X/*****************************************************************
+X * TAG( writeerr )
+X *
+X * Exits with a message.  We only check for write errors often enough
+X * to avoid a lot of "file system full" messages, not on every write.
+X * ferror() check after fflush will catch any others (I trust).
+X *
+X * Inputs:
+X *	[None]
+X * Outputs:
+X *	[None]
+X * Assumptions:
+X *	[None]
+X * Algorithm:
+X *	[None]
+X */
+X
+Xwriteerr()
+X{
+X    perror( "goodbye, write error" );
+X    exit( 1 );
+X}
+X
+Xcopystat(ifname, ofname)
+Xchar *ifname, *ofname;
+X{
+X    struct stat statbuf;
+X    int mode;
+X    time_t timep[2];
+X
+X    fclose(stdout);
+X    if (stat(ifname, &statbuf)) {		/* Get stat on input file */
+X	perror(ifname);
+X	return;
+X    }
+X    if ((statbuf.st_mode & S_IFMT/*0170000*/) != S_IFREG/*0100000*/) {
+X	fprintf(stderr, " -- not a regular file: unchanged");
+X	exit_stat = 1;
+X    } else if (statbuf.st_nlink > 1) {
+X	fprintf(stderr, " -- has %d other links: unchanged",
+X		statbuf.st_nlink - 1);
+X	exit_stat = 1;
+X    } else if (exit_stat == 2) {	/* No compression: remove file.Z */
+X	fprintf(stderr, " -- file unchanged");
+X    } else {			/* ***** Successful Compression ***** */
+X	mode = statbuf.st_mode & 07777;
+X	if (chmod(ofname, mode))		/* Copy modes */
+X	    perror(ofname);
+X	chown(ofname, statbuf.st_uid, statbuf.st_gid);	/* Copy ownership */
+X	timep[0] = statbuf.st_atime;
+X	timep[1] = statbuf.st_mtime;
+X	utime(ofname, timep);	/* Update last accessed and modified times */
+X	if (unlink(ifname))	/* Remove input file */
+X	    perror(ifname);
+X	fprintf(stderr, " -- replaced with %s", ofname);
+X	return;		/* Successful return */
+X    }
+X
+X    /* Unsuccessful return -- one of the tests failed */
+X    if (unlink(ofname))
+X	perror(ofname);
+X}
+X/*
+X * This routine returns 1 if we are running in the foreground and stderr
+X * is a tty.
+X */
+Xforeground()
+X{
+X	register int (*tmp)();
+X	dummy();
+X
+X	if((tmp = signal(SIGINT, dummy))) {	/* background? */
+X		signal(SIGINT, tmp);
+X		return(0);
+X	} else {			/* foreground */
+X		if(isatty(2)) {		/* and stderr is a tty */
+X			return(1);
+X		} else {
+X			return(0);
+X		}
+X	}
+X}
+X
+Xdummy()
+X{
+X	;
+X}
+*-*-END-of-src/compress.c-*-*
+echo x - src/makeactive.sh
+sed 's/^X//' >src/makeactive.sh <<'*-*-END-of-src/makeactive.sh-*-*'
+X: "Create active file and newsgroup hierarchy for new machine"
+X: "Usage: sh makeactive.sh LIBDIR SPOOLDIR NEWSUSR NEWSGRP"
+X: '@(#)makeactive	1.9	9/4/84'
+XLIBDIR=$1
+XSPOOLDIR=$2
+XNEWSUSR=$3
+XNEWSGRP=$4
+Xif test ! -s $LIBDIR/localgroups
+Xthen
+X	cat <<"E_O_F" >$LIBDIR/localgroups
+Xgeneral	Articles that should be read by everyone on your local system
+XE_O_F
+Xfi
+Xcat <<"E_O_F" > /tmp/$$groups
+Xnet.abortion		Abortion.
+Xnet.adm.site		Automatic maintenance of the USENET directory.
+Xnet.ai			Artificial intelligence.
+Xnet.analog		Analog design developments, ideas, and components.
+Xnet.announce		General announcements of interest to all.
+Xnet.announce.newusers	General announcements for new users.
+Xnet.arch		Computer architecture.
+Xnet.astro		Astronomy.
+Xnet.astro.expert	Astronomy for experts.
+Xnet.audio		High fidelity audio.
+Xnet.auto		Automobiles, automotive products and laws.
+Xnet.aviation		Aviation rules, means, and methods.
+Xnet.bicycle		Bicycles, related products and laws.
+Xnet.bio			Biology and related sciences.
+Xnet.books		Books of all genres, shapes, and sizes.
+Xnet.bugs		General bug reports and fixes.
+Xnet.bugs.2bsd		UNIX version 2BSD related bugs.
+Xnet.bugs.4bsd		UNIX version 4BSD related bugs.
+Xnet.bugs.usg		USG UNIX (System III, V, etc.) related bugs.
+Xnet.bugs.uucp		UUCP related bugs.
+Xnet.bugs.v7		UNIX V7 related bugs.
+Xnet.chess		Chess and computer chess.
+Xnet.cog-eng		Cognitive engineering.
+Xnet.college		College, college activities, campus life, etc.
+Xnet.columbia		The space shuttle and the STS program.
+Xnet.comics		The funnies, old and new.
+Xnet.consumers		Consumer interests, product reviews, etc.
+Xnet.cooks		Food, cooking, cookbooks, and recipes.
+Xnet.crypt		Different methods of data en/decryption.
+Xnet.cse			Computer science education.
+Xnet.cycle		Motorcycles and related products and laws.
+Xnet.dcom		Data communications hardware and software.
+Xnet.decus		DEC User's Society newsgroup.
+Xnet.emacs		EMACS editors of different flavors.
+Xnet.eunice		The Eunice system.
+Xnet.flame		Flaming on any topic.
+Xnet.followup		Followups to articles in net.general.
+Xnet.games		Games and computer games.
+Xnet.games.emp		The computer game Empire.
+Xnet.games.frp		Fantasy Role Playing games.
+Xnet.games.go		Go.
+Xnet.games.pbm		Play by Mail games.
+Xnet.games.rogue		Rogue.
+Xnet.games.trivia	Trivia.
+Xnet.games.video		Video games.
+Xnet.garden		Gardening, methods and results.
+Xnet.general		*Important* and timely announcements of interest to all.
+Xnet.graphics		Computer graphics, art, and animation.
+Xnet.ham-radio		Amateur Radio practices, contests, events, rules, etc.
+Xnet.info-terms		All sorts of terminals.
+Xnet.invest		Investments and the handling of money.
+Xnet.jobs		Job announcements, requests, etc.
+Xnet.jokes		Jokes and other humor.  Some may be offensive.
+Xnet.jokes.d		Discussions on the content of net.jokes.
+Xnet.kids		Children, their behavior and activities.
+Xnet.lan			Local area network hardware and software.
+Xnet.lang		Computer languages in general.
+Xnet.lang.ada		The computer language Ada.
+Xnet.lang.apl		The computer language APL.
+Xnet.lang.c		The computer language C.
+Xnet.lang.f77		The computer language FORTRAN.
+Xnet.lang.forth		The computer language Forth.
+Xnet.lang.lisp		The computer language LISP.
+Xnet.lang.mod2		The computer language Modula-2.
+Xnet.lang.pascal		The computer language Pascal.
+Xnet.lang.prolog		The computer language PROLOG.
+Xnet.lang.st80		The computer language Smalltalk 80.
+Xnet.legal		Legalities and the ethics of law.
+Xnet.lsi			Large scale integrated circuits.
+Xnet.mag			Magazine summaries, tables of contents, etc.
+Xnet.mail		Proposed new mail/network standards.
+Xnet.mail.headers	The ARPA header-people list.
+Xnet.mail.msggroup	The ARPA MsgGroup list.
+Xnet.math		Mathematical discussions and puzzles.
+Xnet.math.stat		Statistics.
+Xnet.med			Medicine and its related products and regulations.
+Xnet.micro		Micro computers of all kinds.
+Xnet.micro.16k		National 16000 & 32000 processors.
+Xnet.micro.432		Intel 432 processors.
+Xnet.micro.6809		Motorola 6809 processors.
+Xnet.micro.68k		Motorola 68000 processors.
+Xnet.micro.apple		Apple computers.
+Xnet.micro.atari		Atari computers.
+Xnet.micro.cbm		Commodore computers.
+Xnet.micro.cpm		The CP/M operating system.
+Xnet.micro.hp		Hewlett/Packard computers.
+Xnet.micro.pc		IBM personal computers.
+Xnet.micro.ti		Texas Instruments processors.
+Xnet.micro.trs-80	TRS-80 computers.
+Xnet.micro.zx		Sinclair zx computers.
+Xnet.misc		Miscellaneous discussions that don't belong elsewhere.
+Xnet.motss		Issues pertaining to homosexuality.
+Xnet.movies		Reviews and discussions of movies.
+Xnet.movies.sw		Subgroup for the Star Wars saga(s).
+Xnet.music		Music lovers.
+Xnet.music.classical	Classical music lovers.
+Xnet.net-people		Announcements, etc. concerning people on the net.
+Xnet.news		Discussions of USENET itself.
+Xnet.news.adm		For news administrators.
+Xnet.news.b		B news software.
+Xnet.news.config		Computer down times and network interruptions.
+Xnet.news.group		Discussions and lists of newsgroups.
+Xnet.news.map		Connectivity maps.
+Xnet.news.newsite	New site announcements.
+Xnet.news.sa		For system administrators.
+Xnet.nlang		Natural languages, cultures, heritages, etc.
+Xnet.nlang.celts		The Celtic culture.
+Xnet.nlang.greek		The Greek culture.
+Xnet.notes		Notesfile software from the University of Illinois.
+Xnet.origins		Evolution versus creationism.
+Xnet.periphs		Peripheral devices.
+Xnet.pets		Pets, pet care, and household animals in general.
+Xnet.philosophy		Philosophical discussions.
+Xnet.physics		Physical laws, properties, etc.
+Xnet.poems		For the posting of poems.
+Xnet.politics		Political discussions.
+Xnet.puzzle		Puzzles, problems, and quizes.
+Xnet.railroad		Real and model trains.
+Xnet.rec			Recreational/participant sports.
+Xnet.rec.birds		Bird watching.
+Xnet.rec.boat		Boating.
+Xnet.rec.bridge		Bridge.
+Xnet.rec.coins		Coin collecting.
+Xnet.rec.disc		Disc activities (Frisbee, etc).
+Xnet.rec.nude		Naturalist/nudist activities.
+Xnet.rec.photo		Photography.
+Xnet.rec.scuba		SCUBA diving.
+Xnet.rec.ski		Skiing.
+Xnet.rec.skydive		Skydiving.
+Xnet.rec.wood		Woodworking.
+Xnet.religion		Religious, ethical, and moral implications of actions.
+Xnet.religion.jewish	Judaism.
+Xnet.research		Research and computer research.
+Xnet.roots		Genealogical matters.
+Xnet.rumor		Rumors.
+Xnet.sci			General purpose scientific discussions.
+Xnet.sf-lovers		Science fiction lovers.
+Xnet.singles		Single people, their activities, etc.
+Xnet.social		Social activities.
+Xnet.sources		Submittion of Software packages.
+Xnet.space		Space, space programs, space related research, etc.
+Xnet.sport		Spectator sports.
+Xnet.sport.baseball	Baseball.
+Xnet.sport.football	Football.
+Xnet.sport.hockey	Hockey.
+Xnet.sport.hoops		Basketball.
+Xnet.startrek		Star Trek, the TV show and the movies.
+Xnet.std			All sorts of standards.
+Xnet.suicide		Suicide, laws, ethics, and its causes and effects.
+Xnet.taxes		Tax laws and advice.
+Xnet.test		Testing of network software.
+Xnet.text		Text processing.
+Xnet.travel		Traveling all over the world.
+Xnet.tv			The boob tube, its history, and past and current shows.
+Xnet.tv.drwho		The TV show Dr. Who.
+Xnet.tv.soaps		Soap operas.
+Xnet.unix		UNIX neophytes group.
+Xnet.unix-wizards	Discussions, bug reports, and fixes on and for UNIX.
+Xnet.usenix		USENIX Association events and announcements.
+Xnet.usoft		Universal (public domain) software packages.
+Xnet.veg			Vegetarians.
+Xnet.video		Video and video components.
+Xnet.vvs			The Vortex Video System for digitized video images.
+Xnet.wanted		Requests for things that are needed.
+Xnet.wines		Wines and spirits.
+Xnet.wobegon		"The Prairie Home Companion" radio show.
+Xnet.women		Women's rights, discrimination, etc.
+Xnet.women.only		Postings by women only (read by all).
+Xnet.works		Workstations in general.
+Xnet.works.apollo	Apollo workstations.
+Xfa.arms-d		Arms discussion digest.
+Xfa.arpa-bboard		ARPANET bulletin board.
+Xfa.bitgraph		The BBN bitgraph terminal.
+Xfa.digest-p		Digest-people digest.
+Xfa.editor-p		Editor-people digest.
+Xfa.energy		Energy programs, conservation, etc.
+Xfa.human-nets		Computer aided communications digest.
+Xfa.info-mac		The Apple Macintosh computer.
+Xfa.info-terms		All sorts of terminals.
+Xfa.info-vax		DEC's VAX line of computers.
+Xfa.info-vlsi		Very large scale integrated circuits.
+Xfa.laser-lovers		Laser printers, hardware and software.
+Xfa.poli-sci		Politics and/versus science.
+Xfa.railroad		Real and model trains.
+Xfa.sf-lovers		Science fiction lovers.
+Xfa.tcp-ip		TCP and IP network protocols.
+Xfa.telecom		Telecommunications digest.
+Xfa.teletext		Teletext digest.
+Xmod.ber			Summaries of discussions from other groups.
+XE_O_F
+X: if active file is empty, run makeactive
+Xif test ! -s $LIBDIR/active
+Xthen
+X	sed 's/[ 	].*/ 00000 00001/' /tmp/$$groups > $LIBDIR/active
+X	cat <<"E_O_F" >>$LIBDIR/active
+Xgeneral 00000 00001
+Xcontrol 00000 00001
+Xjunk 00000 00001
+XE_O_F
+Xelse
+X: make sure it is in the new format
+X	set - `sed 1q $LIBDIR/active`
+X	case $# in
+X	3|4)	;;
+X	2)	ed - $LIBDIR/active << 'EOF'
+X1,$s/$/ 00001/
+Xw
+Xq
+XEOF
+X		echo
+X		echo Active file updated to new format.
+X		echo You must run expire immediately after this install
+X		echo is done to properly update the tables.;;
+X	*) echo Active file is in unrecognized format. Not upgraded.;;
+X	esac
+Xfi
+Xif test $# -eq 3 -o $3 -eq -2
+Xthen
+X	(sed '/^!net/!d
+Xs/^!//
+Xs!^!/!
+Xs!$! /s/$/ n/!
+X' $LIBDIR/ngfile
+X	echo '/^fa./s/$/ n/'
+X	echo '/ n$/!s/$/ y/') >/tmp/$$sed
+X	mv $LIBDIR/active $LIBDIR/oactive
+X	sed -f /tmp/$$sed $LIBDIR/oactive >$LIBDIR/active
+X	chown $NEWSUSR $LIBDIR/active
+X	chgrp $NEWSGRP $LIBDIR/active
+X	chmod 644 $LIBDIR/active
+Xfi
+Xsort /tmp/$$groups | $LIBDIR/checkgroups
+Xrm -f /tmp/$$*
+*-*-END-of-src/makeactive.sh-*-*
+echo x - src/checkgroups.sh
+sed 's/^X//' >src/checkgroups.sh <<'*-*-END-of-src/checkgroups.sh-*-*'
+X: check active file for missing or extra newsgroups
+X: '@(#)checkgroups	1.4	9/4/84'
+X
+Xcp LIBDIR/localgroups LIBDIR/newsgroups
+Xcat >>LIBDIR/newsgroups
+Xecho junk >/tmp/$$a
+Xecho control >>/tmp/$$a
+Xsed 's/[ \	].*//' LIBDIR/newsgroups |
+Xegrep "^net.|^fa.|^general" >>/tmp/$$a
+Xsort -u /tmp/$$a -o /tmp/$$a
+Xegrep "^net.|^fa.|^general|^junk|^control" LIBDIR/active | sed 's/ .*//' | sort  -u >/tmp/$$b
+X
+Xcomm -13 /tmp/$$a /tmp/$$b >/tmp/$$remove
+Xcomm -23 /tmp/$$a /tmp/$$b >/tmp/$$add
+X
+Xif test -s /tmp/$$remove
+Xthen
+X	(
+X	echo "The following newsgroups are not valid and should be removed."
+X	sed "s/^/	/" /tmp/$$remove
+X	echo ""
+X	echo "You can do this by executing the command:"
+X	echo \	LIBDIR/rmgroup `cat /tmp/$$remove`
+X	echo ""
+X	) 2>&1 >/tmp/$$out
+Xfi
+X
+Xif test -s /tmp/$$add
+Xthen
+X	(
+X	echo "The following newsgroups were missing and were added."
+X	sed "s/^/	/" /tmp/$$add
+X	echo ""
+X	for i in `cat /tmp/$$add`
+X	do
+X		LIBDIR/inews -n control -t "cmsg newgroup $i" </dev/null
+X	done
+X	) 2>&1 >>/tmp/$$out
+Xfi
+X
+Xif test -s /tmp/$$out
+Xthen
+X	(echo	"Subject: Problems with your active file"
+X	echo ""
+X	cat /tmp/$$out
+X	) | if test $# -gt 0
+X		then
+X			mail $1
+X		else
+X			cat
+X		fi
+Xfi
+X
+Xrm -f /tmp/$$*
+*-*-END-of-src/checkgroups.sh-*-*
+exit
+
+

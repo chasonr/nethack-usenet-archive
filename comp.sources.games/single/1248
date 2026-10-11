@@ -1,0 +1,1973 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,c468fc0bee15789f,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1992-01-10 09:39:04 PST
+Path: sparky!uunet!zephyr.ens.tek.com!master!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v13i018:  okbridge - computer-mediated bridge game, Part03/07
+Message-ID: <2277@masterCNA.TEK.COM>
+Date: 10 Jan 92 16:44:42 GMT
+Sender: news@masterCNA.TEK.COM
+Lines: 1957
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: mclegg@cs.UCSD.EDU (Matthew Clegg)
+Posting-number: Volume 13, Issue 18
+Archive-name: okbridge/Part03
+Environment: BSD-derived Unix, curses, sockets
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 7)."
+# Contents:  input.c.aa startup.c
+# Wrapped by billr@saab on Fri Jan 10 08:31:28 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'input.c.aa' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'input.c.aa'\"
+else
+echo shar: Extracting \"'input.c.aa'\" \(40095 characters\)
+sed "s/^X//" >'input.c.aa' <<'END_OF_FILE'
+X/* input.c -- Input driver for the bridge program.
+X ! 
+X ! Copyright (C) 1990,1991 by Matthew Clegg
+X ! 
+X ! This program may be copied and distributed freely.  Please do not
+X ! charge money for this program or for any program derived from it.
+X ! If you modify this program, then include a notice stating plainly
+X ! that your program is derived from the okbridge program and is not
+X ! the same as the official okbridge program.
+X !
+X ! I welcome any suggestions for improvement to okbridge, and 
+X ! I would be especially happy to receive improved source code.
+X ! If you have comments or suggestions, or if you would like to
+X ! join the okbridge mailing list, then write to
+X !
+X !   mclegg@cs.ucsd.edu
+X !
+X*/
+X 
+X#define _INPUT_
+X 
+X#ifdef __TURBOC__
+X#include <alloc.h>
+X#include <stdlib.h>
+X#else
+X  extern int errno;
+X  extern char *sys_errlist[];
+X  extern char *strdup();
+X#define random(n) ((rand()/64) % (n))
+X#endif
+X 
+X#include <ctype.h>
+X#include <stdio.h>
+X#include <string.h>
+X/* #include <time.h> */
+X#include <sys/time.h>
+X 
+X#include "globals.h"
+X#include "ps.h"
+X#include "network.h"
+X#include "terminal.h"
+X#include "display.h"
+X#include "help.h"
+X#include "input.h"
+X#include "email.h"
+X 
+X
+Xextern FILE *logfile;
+X
+Xextern int codefile_line_no;
+Xextern int server_mode;
+Xextern char *email_error_message;
+X
+Xstatic char *parsing_errmsg;
+X 
+Xstatic char *keyword_error = "ERROR IN COMMAND KEYWORD";
+Xstatic char *number_error  = "A NUMERIC ARGUMENT IS REQUIRED";
+Xstatic char *level_error   = "ERROR IN BIDDING LEVEL";
+Xstatic char *suit_error    = "ERROR IN SUIT";
+Xstatic char *rank_error    = "ERROR IN RANK";
+Xstatic char *deal_error    = "ERROR IN DEAL OF CARDS";
+Xstatic char *bid_error= 
+X  "THE FORMAT OF A CORRECT BID IS <LEVEL> <TRUMPSUIT> OR P OR X OR XX";
+Xstatic char *play_error    =
+X  "ERROR - THE FORMAT OF A CORRECT PLAY IS <SUIT> <RANK>";
+Xstatic char *ending_error  = "EXTRA JUNK AT END OF INPUT";
+Xstatic char *bell_error    = "FORMAT OF /BELL COMMAND IS /BELL [ON|OFF]";
+Xstatic char *prompt_error  = "FORMAT OF /PROMPT COMMAND IS /PROMPT [ON|OFF]";
+Xstatic char *echo_error	   = "ERROR IN ECHO RESPONSE";
+Xstatic char *resp_error    = "ERROR IN RESP COMMAND";
+Xstatic char *score_error   = "ERROR IN SCORE COMMAND";
+Xstatic char *vuln_error    = "ERROR IN VULN COMMAND";
+Xstatic char *save_error    = "SAVE COMMAND REQUIRES A filename TO BE GIVEN";
+Xstatic char *load_error    = "LOAD COMMAND REQUIRES A filename TO BE GIVEN";
+Xstatic char *replay_error  = "REPLAY COMMAND REQUIRES A filename TO BE GIVEN";
+Xstatic char *default_error = "FORMAT OF /DEFAULT COMMAND IS /DEFAULT [ON|OFF]";
+X
+X/* Most of the commands the we receive from the other players
+X . we process immediately after receiving them.  However, the
+X . bids and plays we store in a queue until we are ready to
+X . accept them.  We implement this queue as a circular array.
+X . Since the queue for a given player is never expected to
+X . contain more than one item, we see no need to implement
+X . a dynamically allocated queue.
+X .
+X */
+X
+X
+X#define QUEUE_LENGTH 50
+Xtypedef struct player_command_struct player_queue [QUEUE_LENGTH];
+X
+Xstatic player_queue command_queue [4];
+Xstatic int          queue_in  [4] = {0, 0, 0, 0};
+Xstatic int          queue_out [4] = {0, 0, 0, 0};
+X
+X#define QUEUE_EMPTY(n) (queue_in[n] == queue_out[n])
+X#define QUEUE_FULL(n)  (((queue_in[n]+1) % QUEUE_LENGTH) == queue_out[n])
+X
+Xstatic char *local_player_names [] = {"NORTH", "EAST", "SOUTH", "WEST"};
+Xint         players_here        [] = {0, 0, 0, 0};
+X  /* players_here is used to record which players have given an
+X   . acknowledgment over the network that they are ready to play.
+X   */
+Xstatic parse_string command_string = NULL;
+Xstatic input_buffer talk_buffer    = NULL;
+Xstatic input_buffer play_buffer    = NULL;
+Xstatic input_buffer ask_buffer     = NULL;
+X
+Xchar *autoload_file = NULL;     /* The name of the file from which we
+X				   will initially try to load a sequence
+X				   of boards, if we are north in email mode. */
+Xchar *autosave_file = NULL;     /* The name of the file to which we will
+X				   automatically save the boards that we
+X				   have played. */
+X
+Xint ring_my_bell = 1;		/* A boolean variable that when true causes
+X				   the terminal bell to be rung before asking
+X				   for a bid or play. */
+X
+Xstatic char *default_input = NULL; /* The input which will be given to the
+X				      program if the user asks for default. */
+Xstatic int  default_suit = -1;  /* The default suit that will be used if a
+X				   player specifies only the rank of the
+X				   card to be played.  -1 == no default. */
+Xstatic long command_disabled;
+X				   /* We only allow the local player to
+X				    . use a subset of the commands which
+X				    . the internal interpreter handles --
+X				    . the remaining commands are used
+X				    . for internal communications. */
+X
+Xstatic int forced_talk_mode =0; /* True if the player has forced the program
+X				   into talk mode, even though a bid or
+X				   play is required. */
+X
+X#define disable(x)  command_disabled |= (x)
+X#define enable(x)   command_disabled  &= ~(x)
+X#define disabled(x) (command_disabled & (x))
+X#define enabled(x)  !disabled (x)
+X
+X
+Xstatic struct timeval ping_start;  /* time at which last ping command
+X				    . was issued. */
+X
+Xstatic int waiting_for_acknowledgment = 0;
+X                              /* true if we are waiting for the user
+X				 to press RETURN.  This mode can be
+X				 interrupted by a claim request. */
+X
+Xstatic int claim_responses;   /* number of responses received so far to
+X				 the most recent claim command. */
+Xstatic int claim_rejected;    /* true if the claim offer was rejected. */
+X
+Xstatic int scoring_mode_known = 0; /* true when we know what scoring mode
+X				      will be used. */
+X
+X
+Xstatic initialize_command_queue ()
+X{
+X	int i;
+X
+X	for (i = 0; i < 4; i++)
+X		queue_in[i] = queue_out[i] = 0;
+X};
+X 
+Xstatic int command_available (player_no)
+X	int player_no;
+X/* Returns true if there is a command available from the specified player. */
+X{
+X	return (!QUEUE_EMPTY(player_no));
+X};
+X 
+Xstatic copy_player_command (dest, source)
+X	player_command dest, source;
+X{
+X	memcpy (dest, source, sizeof(struct player_command_struct));
+X};
+X
+Xstatic enqueue_command (pc)
+X	player_command pc;
+X/* Adds the player_command pc to the queue for player_no. */
+X{
+X	player_command dest;
+X	int n;
+X
+X	if (QUEUE_FULL(pc->player_no)) {
+X		Display_Player_Comment ("INTERNAL ERROR!",
+X			"COMMAND QUEUE OVERFLOW");
+X	} else {
+X	  	n = pc->player_no;
+X	  	dest = &(command_queue[n][queue_in[n]]);
+X	  	copy_player_command (dest, pc);
+X		queue_in[n] = (queue_in[n] + 1) % QUEUE_LENGTH;
+X	}
+X};
+X 
+X 
+Xstatic dequeue_command (n, pc)
+X	int n; player_command pc;
+X/* Removes the command at the head of the queue for the given player. */
+X{
+X	player_command source;
+X
+X	if (QUEUE_EMPTY(n)) {
+X		Display_Player_Comment ("INTERNAL ERROR!",
+X			"COMMAND QUEUE IS EMPTY");
+X	} else {
+X	  	source = &(command_queue[n][queue_out[n]]);
+X	  	copy_player_command (pc, source);
+X		queue_out[n] = (queue_out[n] + 1) % QUEUE_LENGTH;
+X	}
+X};
+X 
+X 
+X 
+Xstatic skip_spaces (ps)
+X	parse_string ps;
+X/* Skips characters in the parse_string ps until a nonblank character
+X . is found.
+X */
+X{
+X	while (ps_scan(ps) == ' ')
+X		ps_next(ps);
+X};
+X 
+Xstatic int parse_natural (ps)
+X	parse_string ps;
+X/* Parses a natural number.  If successful, returns the non-negative
+X . integer which is parsed.  Otherwise, returns -1 and sets error
+X . message accordingly. 
+X */
+X{
+X	int ch, n, digits;
+X
+X	n = digits = 0;
+X        skip_spaces (ps);
+X	ch = ps_scan (ps);
+X	while (('0' <= ch) && (ch <= '9')) {
+X		ps_next (ps);
+X		digits++;
+X		n = 10*n + (ch - '0');
+X		ch = ps_scan (ps);
+X	};
+X	if (digits == 0) {
+X		parsing_errmsg = number_error;
+X		return (-1);
+X	} else
+X		return (n);
+X};
+X
+Xstatic int parse_level (ps)
+X	parse_string ps;
+X/* Parses the bidding level.
+X . <level> = 1 | 2 | 3 | 4 | 5 | 6 | 7
+X . If successful, returns the level as an integer.  Otherwise,
+X . returns -1, and sets error message accordingly.
+X */
+X{
+X	int n;
+X 
+X	n = parse_natural (ps);
+X	if ((1 <= n) && (n <= 7))
+X		return (n);
+X	else if (n >= 0)
+X		parsing_errmsg = level_error;
+X	return (-1);
+X	
+X};
+X 
+Xstatic int parse_suit (ps)
+X	parse_string ps;
+X/* Parses a suit name.
+X . <suit> = C | D | H | S | CLUB[S] | DIAMOND[S] | HEART[S] | SPADE[S]
+X . If successful, then returns the suit index.  Otherwise, returns
+X . -1 and sets parsing_error accordingly.
+X */
+X{
+X	skip_spaces (ps);
+X	if (ps_matches_ic(ps, "CLUB")) {
+X		ps_matches_ic(ps, "S");
+X		return (SUIT_CLUBS);
+X	} else if (ps_matches_ic(ps, "DIAMOND")) {
+X		ps_matches_ic(ps, "S");
+X		return (SUIT_DIAMONDS);
+X	} else if (ps_matches_ic(ps, "HEART")) {
+X		ps_matches_ic(ps, "S");
+X		return (SUIT_HEARTS);
+X	} else if (ps_matches_ic(ps, "SPADE")) {
+X		ps_matches_ic(ps, "S");
+X		return (SUIT_SPADES);
+X	} else if (ps_matches_ic(ps, "C"))
+X		return (SUIT_CLUBS);
+X	else if (ps_matches_ic(ps, "D"))
+X		return (SUIT_DIAMONDS);
+X	else if (ps_matches_ic(ps, "H"))
+X		return (SUIT_HEARTS);
+X	else if (ps_matches_ic(ps, "S"))
+X		return (SUIT_SPADES);
+X	parsing_errmsg = suit_error;
+X	return (-1);
+X};
+X 
+Xstatic int parse_rank (ps)
+X	parse_string ps;
+X/* Parses the rank of a card.
+X . <rank> = 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | T | J | Q | K | A
+X .            | JACK | QUEEN | KING | ACE
+X . Returns the rank of the card, where 2 has rank 0 and A has rank 12.
+X . If an error, sets parsing_errmsg accordingly and returns -1.
+X */
+X{
+X	skip_spaces (ps);
+X	if (ps_matches(ps, "2"))
+X		return (0);
+X	else if (ps_matches(ps, "3"))
+X		return (1);
+X	else if (ps_matches(ps, "4"))
+X		return (2);
+X	else if (ps_matches(ps, "5"))
+X		return (3);
+X	else if (ps_matches(ps, "6"))
+X		return (4);
+X	else if (ps_matches(ps, "7"))
+X		return (5);
+X	else if (ps_matches(ps, "8"))
+X		return (6);
+X	else if (ps_matches(ps, "9"))
+X		return (7);
+X	else if (ps_matches(ps, "10"))
+X		return (8);
+X	else if (ps_matches_ic(ps, "TEN"))
+X		return (8);
+X	else if (ps_matches_ic(ps, "JACK"))
+X		return (9);
+X	else if (ps_matches_ic(ps, "QUEEN"))
+X		return (10);
+X	else if (ps_matches_ic(ps, "KING"))
+X		return (11);
+X	else if (ps_matches_ic(ps, "ACE"))
+X		return (12);
+X	else if (ps_matches_ic(ps, "T"))
+X		return (8);
+X	else if (ps_matches_ic(ps, "J"))
+X		return (9);
+X	else if (ps_matches_ic(ps, "Q"))
+X		return (10);
+X	else if (ps_matches_ic(ps, "K"))
+X		return (11);
+X	else if (ps_matches_ic(ps, "A"))
+X		return (12);
+X	parsing_errmsg = rank_error;
+X	return (-1);
+X};
+X 
+X 
+Xstatic parse_rdeal_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* Parses a rdeal command, which is of the format:
+X . RDEAL <cards>
+X . where <cards> is the 'shuffled' deck of cards.  That is,
+X . cards is a string of 52 characters, each of which is a 0, 1, 2 or 3.
+X . The interpretation of this is that if the j'th character is i,
+X . then player i is dealt card j.
+X */
+X{
+X	int i, ch;
+X 
+X	skip_spaces (ps);
+X	pc->command = CMD_RDEAL;
+X	for (i = 0; i < 52; i++) {
+X		ch = ps_scan (ps);
+X		if (('0' <= ch) && (ch <= '3'))
+X			pc->data.deal[i] = ch - '0';
+X		else {
+X			pc->command = CMD_ERROR;
+X			parsing_errmsg = deal_error;
+X			return;
+X		};
+X		ps_next (ps);
+X	};
+X	return;
+X};
+X 
+Xstatic parse_bid_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* Parses a bid command, which is of the form:
+X * 2. BID  (<level> (<suit> | <notrump>)) | <pass> | <double> | <redouble>
+X */
+X{
+X	int lv, cd;
+X 
+X	pc->command = CMD_BID;
+X	skip_spaces (ps);
+X	if (ps_matches_ic (ps, "P")) {
+X		ps_matches_ic (ps, "ASS");
+X		pc->data.bid = bidding_code (BID_PASS, 0, 0);
+X		return;
+X	} else if (ps_matches_ic (ps, "XX")
+X		   || ps_matches_ic (ps, "REDOUBLE")) {
+X		pc->data.bid = bidding_code (BID_REDOUBLE, 0, 0);
+X		return;
+X	} else if (ps_matches_ic (ps, "X")
+X		   || ps_matches_ic (ps, "DOUBLE")) {
+X		pc->data.bid = bidding_code (BID_DOUBLE, 0, 0);
+X		return;
+X	} else {
+X		lv = parse_level (ps);
+X		if (lv == -1) {
+X			parsing_errmsg = bid_error;
+X			pc->command = CMD_ERROR;
+X			return;
+X		};
+X		skip_spaces (ps);
+X		if      (ps_matches_ic (ps, "NOTRUMP")) cd = SUIT_NOTRUMP;
+X		else if (ps_matches_ic (ps, "NT"))   	cd = SUIT_NOTRUMP;
+X		else if (ps_matches_ic (ps, "N"))	cd = SUIT_NOTRUMP;
+X		else {
+X			cd = parse_suit (ps);
+X			if (cd == -1) {
+X				parsing_errmsg = bid_error;
+X				pc->command = CMD_ERROR;
+X				return;
+X			};
+X		};
+X		pc->data.bid = bidding_code (BID_SUIT, lv, cd);
+X		return;
+X	};
+X};
+X 
+Xstatic parse_play_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* Parses a play command:
+X . play <suit> <rank>
+X */
+X{
+X	int s, r;
+X 
+X	pc->command = CMD_PLAY;
+X	skip_spaces (ps);
+X	s = parse_suit (ps);
+X	if (s == -1) {
+X		parsing_errmsg = play_error;
+X		pc->command = CMD_ERROR;
+X		return;
+X	};
+X	r = parse_rank (ps);
+X	if (r == -1) {
+X		parsing_errmsg = play_error;
+X		pc->command = CMD_ERROR;
+X		return;
+X	};
+X	pc->data.card = card_code (s, r);
+X};
+X
+Xstatic parse_local_play_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* Parses a play command:
+X .   play [<suit>] <rank>
+X . If default_suit >= 0, then <suit> may be omitted.
+X */
+X{
+X	int s, r;
+X 
+X	pc->command = CMD_PLAY;
+X	skip_spaces (ps);
+X	s = parse_suit (ps);
+X	if ((s == -1) && (default_suit < 0)) {
+X		parsing_errmsg = play_error;
+X		pc->command = CMD_ERROR;
+X		return;
+X	} else if (s == -1)
+X	        s = default_suit;
+X
+X	r = parse_rank (ps);
+X	if (r == -1) {
+X		parsing_errmsg = play_error;
+X		pc->command = CMD_ERROR;
+X		return;
+X	};
+X	pc->data.card = card_code (s, r);
+X};
+X 
+Xstatic parse_talk_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The talk command is used to communicate messages between the players.
+X . The format of the talk command is:
+X .  talk <message>
+X . Where <message> is any sequence of (printable) characters.
+X */
+X{
+X	int ch, n;
+X 
+X	pc->command = CMD_TALK;
+X	skip_spaces (ps);
+X	n = 0;
+X	ch = ps_scan (ps);
+X	while (ch != '\0') {
+X	        if (n < MESSAGE_LENGTH-1)
+X		  pc->data.message[n++] = ch;
+X		ps_next (ps);
+X		ch = ps_scan (ps);
+X	};
+X	pc->data.message[n] = '\0';
+X};
+X 
+Xstatic parse_comment_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The comment command is used to communicate a message to all of the
+X . players, where the origin of the message is the okbridge program. 
+X . The format of the comment command is:
+X .  comment <message>
+X . Where <message> is any sequence of (printable) characters.
+X */
+X{
+X	int ch, n;
+X 
+X	pc->command = CMD_COMMENT;
+X	skip_spaces (ps);
+X	n = 0;
+X	ch = ps_scan (ps);
+X	while (ch != '\0') {
+X	        if (n < MESSAGE_LENGTH-1)
+X		  pc->data.message[n++] = ch;
+X		ps_next (ps);
+X		ch = ps_scan (ps);
+X	};
+X	pc->data.message[n] = '\0';
+X};
+X 
+Xstatic parse_hello_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The hello command is used for handshaking after when the program
+X . is first starting.  The program sends an initial 'hello' to indicate
+X . that it has joined the game.  The format of the 'hello' command is
+X .   HELLO <version> <name>
+X . where 
+X .   <version> is the major revision level of this program
+X .   <name>    is the name of the player
+X */
+X{
+X        int n, ch;
+X
+X	pc->command = CMD_HELLO;
+X	skip_spaces (ps);
+X	n = 0;
+X	ch = ps_scan (ps);
+X	while ((ch != '\0') && (ch != ' ') && (n < VERSION_LENGTH-1)) {
+X		pc->data.version_name[n++] = ch;
+X		ps_next (ps);
+X		ch = ps_scan (ps);
+X	};
+X	pc->data.version_name[n] = '\0';
+X	skip_spaces (ps);
+X	n = VERSION_LENGTH;
+X	ch = ps_scan (ps);
+X	while ((ch != '\0') && (ch != ' ')) {
+X	  if (n < VERSION_NAME_LENGTH-1)
+X	    pc->data.version_name[n++] = ch;
+X	  ps_next (ps);
+X	  ch = ps_scan (ps);
+X	};
+X	pc->data.version_name[n] = '\0';
+X};
+X 
+Xstatic parse_ack_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The 'ack' command is used to acknowledge another player's 'hello'
+X . command.  Each time we receive a hello, we return an 'ack'.
+X . The format of the 'ack' command is
+X .   ACK <version> <name>
+X . where 
+X .   <version> is the major revision level of this program
+X .   <name>    is the name of the player
+X */
+X{
+X        int n, ch;
+X
+X	pc->command = CMD_ACK;
+X	skip_spaces (ps);
+X	n = 0;
+X	ch = ps_scan (ps);
+X	while ((ch != '\0') && (ch != ' ') && (n < VERSION_LENGTH-1)) {
+X		pc->data.version_name[n++] = ch;
+X		ps_next (ps);
+X		ch = ps_scan (ps);
+X	};
+X	pc->data.version_name[n] = '\0';
+X	skip_spaces (ps);
+X	n = VERSION_LENGTH;
+X	ch = ps_scan (ps);
+X	while ((ch != '\0') && (ch != ' ') && (n < VERSION_NAME_LENGTH-1)) {
+X		pc->data.version_name[n++] = ch;
+X		ps_next (ps);
+X		ch = ps_scan (ps);
+X	};
+X	pc->data.version_name[n] = '\0';
+X};
+X 
+Xstatic parse_quit_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The 'quit' command indicates that a player has decided to quit the
+X . game.
+X */
+X{
+X	pc->command = CMD_QUIT;
+X};
+X 
+Xstatic parse_help_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The help command requests information about the program.
+X . The format of the command is:
+X .  help <topic>
+X . where <topic> is an optional word identifying the name of a topic
+X . about which the player seeks help.
+X */
+X{
+X	int ch, n;
+X 
+X	pc->command = CMD_HELP;
+X	skip_spaces (ps);
+X	n = 0;
+X	ch = ps_scan (ps);
+X	while (ch != '\0') {
+X	        if (n < TOPIC_LENGTH-1)
+X		  pc->data.topic[n++] = ch;
+X		ps_next (ps);
+X		ch = ps_scan (ps);
+X	};
+X	pc->data.topic[n] = '\0';
+X};
+X 
+Xstatic parse_ping_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The ping command tests the network connections.
+X . When the program receives a ping command, it automatically
+X . issues an "echo" command to the person who sent the "ping".
+X . The round-trip time is measured.  The ping command has no
+X . parameters.
+X */
+X{
+X	pc->command = CMD_PING;
+X};
+X
+Xstatic parse_echo_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The echo command is issued in response to the ping command.
+X . The format of the echo command is:
+X .  echo PLAYER
+X . where PLAYER is the player who issued the ping command.
+X */
+X{
+X	int ch, n;
+X 
+X	skip_spaces (ps);
+X	pc->data.ping_source = -1;
+X	for (n = 0; n < 4; n++) 
+X		if (ps_matches_ic(ps, local_player_names[n]))
+X			pc->data.ping_source = n;
+X	if (pc->data.ping_source == -1)
+X		pc->command = CMD_ERROR;
+X	else
+X		pc->command = CMD_ECHO;
+X	parsing_errmsg = echo_error;
+X};
+X 
+X 
+X 
+Xstatic parse_bell_command (ps, pc)
+X/* The BELL commands controls whether or not the terminal's bell
+X . will be rung each time it is the local player's turn to enter
+X . a bid or play.  The format of the BELL command is
+X .   BELL [ON | OFF]
+X */
+X	parse_string ps; player_command pc;
+X{
+X	int ch;
+X
+X	pc->command = CMD_BELL;
+X	skip_spaces (ps);
+X	ch = ps_scan (ps);
+X	if (ch == '\0')
+X		pc->data.bell = -1;
+X	else if (ps_matches_ic (ps, "ON"))
+X		pc->data.bell = 1;
+X	else if (ps_matches_ic (ps, "OFF"))
+X		pc->data.bell = 0;
+X	else {
+X		parsing_errmsg = bell_error;
+X		pc->command = CMD_ERROR;
+X	};
+X};
+X
+Xstatic parse_default_command (ps, pc)
+X/* The DEFAULT command controls whether or not the program will automatically
+X . provide default inputs.  The format of the DEFAULT command is
+X .   DEFAULT [ON | OFF]
+X */ 
+X	parse_string ps; player_command pc;
+X{
+X	int ch;
+X
+X	pc->command = CMD_DEFAULT;
+X	skip_spaces (ps);
+X	ch = ps_scan (ps);
+X	if (ch == '\0')
+X		pc->data.defaalt = -1;
+X	else if (ps_matches_ic (ps, "ON"))
+X		pc->data.defaalt = 1;
+X	else if (ps_matches_ic (ps, "OFF"))
+X		pc->data.defaalt = 0;
+X	else {
+X		parsing_errmsg = default_error;
+X		pc->command = CMD_ERROR;
+X	};
+X};
+X
+Xstatic parse_review_command (ps, pc)
+X        parse_string ps; player_command pc;
+X/* If we are in the playing phase of the game, then this command displays
+X   the bids which were made in the bidding phase.  Otherwise, it does
+X   nothing.
+X */
+X{
+X  pc->command = CMD_REVIEW;
+X};
+X
+Xstatic parse_claim_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The claim command is used by the declarer to claim a portion of
+X . the remaining tricks.  The defending players are asked if they
+X . agree with the claim, and if so, the hand is terminated early.
+X . The format of the claim command is:
+X .   CLAIM n
+X . where n is an integer in the range 0-13.
+X */
+X{ 
+X	int n;
+X
+X	pc->command = CMD_CLAIM;
+X	skip_spaces (ps);
+X	if (ps_scan(ps) == '\0')
+X	  n = 14 - trick;
+X	else
+X	  n = parse_natural (ps, pc);
+X
+X	if (n < 0)
+X	  pc->command = CMD_ERROR;
+X	else
+X	  pc->data.tricks = n;
+X};
+X
+Xstatic parse_respond_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The respond command is used by the defending player to indicate
+X . his/her response to the declarer's claim.  The format of the
+X . respond command is
+X .   RESP [ACCEPT | REJECT]
+X */
+X{
+X	pc->command = CMD_RESP;
+X	skip_spaces (ps);
+X	if (ps_matches_ic (ps, "ACCEPT"))
+X		pc->data.response = 1;
+X	else if (ps_matches_ic (ps, "REJECT"))
+X		pc->data.response = 0;
+X	else {
+X		parsing_errmsg = resp_error;
+X		pc->command = CMD_ERROR;
+X	};
+X};
+X
+Xstatic parse_finish_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The finish command brings the current hand to an early conclusion
+X . after the defenders have agreed to concede a number of tricks to the
+X . declarer.  The format of the finish command is:
+X .   FINISH n
+X . where n is the number of additional tricks conceded to the declarer.
+X */
+X{ 
+X	int n;
+X
+X	pc->command = CMD_FINISH; 
+X	n = parse_natural (ps, pc); 
+X	if (n < 0) 
+X		pc->command = CMD_ERROR;
+X	else
+X		pc->data.tricks = n;
+X};
+X
+X
+Xstatic parse_prompt_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The prompt command controls the prompting of the local player when
+X . he/she is the dummy.  If prompting is on, then the local player
+X . is required to press RETURN at the end of each trick.  If prompting
+X . is off, then the local player may not see all of the cards that
+X . are played by the others.  The format of the PROMPT command is:
+X .   PROMPT [ON | OFF]
+X */
+X{
+X	int ch;
+X
+X	pc->command = CMD_PROMPT;
+X	skip_spaces (ps);
+X	ch = ps_scan (ps);
+X	if (ch == '\0')
+X		pc->data.prompt = -1;
+X	else if (ps_matches_ic (ps, "ON"))
+X		pc->data.prompt = 1;
+X	else if (ps_matches_ic (ps, "OFF"))
+X		pc->data.prompt = 0;
+X	else {
+X		parsing_errmsg = prompt_error;
+X		pc->command = CMD_ERROR;
+X	};
+X};
+X
+Xstatic parse_score_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The score command is used at the beginning of the game in order
+X . to establish the scoring conventions for this game.  The format
+X . of the score command is
+X .  SCORE [RUBBER | CHICAGO | DUPLICATE | IMP]
+X */
+X{
+X	pc->command = CMD_SCORE;
+X	skip_spaces (ps);
+X	if (ps_matches_ic (ps, "RUBBER"))
+X		pc->data.scoring = RUBBER_SCORING;
+X	else if (ps_matches_ic (ps, "CHICAGO"))
+X		pc->data.scoring = CHICAGO_SCORING;
+X	else if (ps_matches_ic (ps, "DUPLICATE"))
+X	        pc->data.scoring = DUPLICATE_SCORING;
+X	else if (ps_matches_ic (ps, "EMAIL"))
+X		pc->data.scoring = EMAIL_SCORING;
+X	else if (ps_matches_ic (ps, "IMP"))
+X                pc->data.scoring = IMP_SCORING;
+X        else {
+X		parsing_errmsg = score_error;
+X		pc->command = CMD_ERROR;
+X	};
+X};
+X
+Xstatic parse_vuln_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The vuln command is used to indicate the vulnerabilities of
+X . each side.  It is used during email duplicate play.  The format
+X . of the vuln command is:
+X .  VULN [NONE | NS | EW | BOTH]
+X */
+X{
+X	pc->command = CMD_VULN;
+X	skip_spaces (ps);
+X	if (ps_matches_ic(ps, "NORTH"))
+X	  pc->data.vulnerable = PLAYER_NORTH << 2;
+X	else if (ps_matches_ic(ps, "EAST"))
+X	  pc->data.vulnerable = PLAYER_EAST << 2;
+X	else if (ps_matches_ic(ps, "SOUTH"))
+X	  pc->data.vulnerable = PLAYER_SOUTH << 2;
+X	else if (ps_matches_ic(ps, "WEST"))
+X	  pc->data.vulnerable = PLAYER_WEST << 2;
+X	else {
+X		parsing_errmsg = vuln_error;
+X		pc->command = CMD_ERROR;
+X	};
+X	skip_spaces (ps);
+X	if (ps_matches_ic(ps, "NONE"))
+X		pc->data.vulnerable |= 0;
+X	else if (ps_matches_ic(ps, "NS"))
+X		pc->data.vulnerable |= 1 << SIDE_NS;
+X	else if (ps_matches_ic(ps, "EW"))
+X		pc->data.vulnerable |= 1 << SIDE_EW;
+X	else if (ps_matches_ic(ps, "BOTH"))
+X		pc->data.vulnerable |= (1 << SIDE_NS) + (1 << SIDE_EW);
+X	else {
+X		parsing_errmsg = vuln_error;
+X		pc->command = CMD_ERROR;
+X	};
+X};
+X
+Xstatic parse_log_command (ps, pc)
+X     parse_string ps; player_command pc;
+X/* The log command establishes a log file to which the subsequent
+X . hands are written.  The format of the log command is
+X .  LOG <filename>
+X . If <filename> is empty, then logging is discontinued.
+X */
+X{
+X  int i, ch;
+X
+X  pc->command = CMD_LOG;
+X  i = 0;
+X  skip_spaces (ps);
+X  ch = ps_scan (ps);
+X  while ((ch != ' ') && (ch != '\0')) {
+X    if (i < FILENAME_LENGTH-1)
+X      pc->data.filename[i++] = ch;
+X    ps_next (ps);
+X    ch = ps_scan (ps);
+X  };
+X  pc->data.filename[i++] = '\0';
+X};
+X
+Xstatic parse_deal_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* The deal command is used by north in the email duplicate scoring
+X . option to have the program generate a series of random deals.
+X . The format of the command is
+X .   DEAL [n]
+X . where n is the number of hands which the computer should deal
+X . before requesting further action.  If n is omitted, then the
+X . computer deals continuously.
+X */
+X{ 
+X	int n;
+X
+X	pc->command = CMD_DEAL;
+X	skip_spaces (ps);
+X	if (ps_scan(ps) != '\0') {
+X		n = parse_natural (ps, pc);
+X		if (n < 0)
+X			pc->command = CMD_ERROR;
+X		else
+X			pc->data.tricks = n;
+X	} else
+X		n = -1;
+X	pc->data.nhands = n;
+X};
+X
+Xstatic parse_save_command (ps, pc)
+X     parse_string ps; player_command pc;
+X/* The save command writes a set of deals to an email duplicate
+X . file.  The format of the save command is:
+X .  SAVE <filename>
+X */
+X{
+X  int i, ch;
+X
+X  pc->command = CMD_SAVE;
+X  i = 0;
+X  skip_spaces (ps);
+X  ch = ps_scan (ps);
+X  while ((ch != ' ') && (ch != '\0')) {
+X    if (i < FILENAME_LENGTH-1)
+X      pc->data.filename[i++] = ch;
+X    ps_next (ps);
+X    ch = ps_scan (ps);
+X  };
+X  pc->data.filename[i] = '\0';
+X
+X  if (i == 0) {
+X    parsing_errmsg = save_error;
+X    pc->command = CMD_ERROR;
+X  };
+X};
+X
+Xstatic parse_load_command (ps, pc)
+X     parse_string ps; player_command pc;
+X/* The load command reads a set of deals from an email duplicate
+X . file.  The format of the load command is:
+X .  LOAD <filename>
+X */
+X{
+X  int i, ch;
+X
+X  pc->command = CMD_LOAD;
+X  i = 0;
+X  skip_spaces (ps);
+X  ch = ps_scan (ps);
+X  while ((ch != ' ') && (ch != '\0')) {
+X    if (i < FILENAME_LENGTH-1)
+X      pc->data.filename[i++] = ch;
+X    ps_next (ps);
+X    ch = ps_scan (ps);
+X  };
+X  pc->data.filename[i] = '\0';
+X
+X  if (i == 0) {
+X    parsing_errmsg = load_error;
+X    pc->command = CMD_ERROR;
+X  };
+X};
+X
+Xstatic parse_replay_command (ps, pc)
+X     parse_string ps; player_command pc;
+X/* The replay command reads a set of deals from an email duplicate
+X . file which will be automatically saved back to the file after the
+X . end of play.  The format of the load command is:
+X .  REPLAY <filename>
+X */
+X{
+X  int i, ch;
+X
+X  pc->command = CMD_REPLAY;
+X  i = 0;
+X  skip_spaces (ps);
+X  ch = ps_scan (ps);
+X  while ((ch != ' ') && (ch != '\0')) {
+X    if (i < FILENAME_LENGTH-1)
+X      pc->data.filename[i++] = ch;
+X    ps_next (ps);
+X    ch = ps_scan (ps);
+X  };
+X  pc->data.filename[i] = '\0';
+X
+X  if (i == 0) {
+X    parsing_errmsg = replay_error;
+X    pc->command = CMD_ERROR;
+X  };
+X};
+X
+Xstatic parse_player_command (ps, pc)
+X	parse_string ps; player_command pc;
+X/* parse the sting ps into a player command, which is stored in pc.
+X * If an error is encountered, then an error message is stored in the
+X * global variable parsing_errmsg.  This procedure looks at the first
+X * word of the command to decide how it should be processed, and then
+X * calls a specialized parsing routine based upon this.  The called
+X * parsing routine is expected to consume all of the input in the
+X * parse_string ps.  If it does not, then an error message is generated.
+X */
+X{
+X        char message_buf [100];
+X
+X	skip_spaces (ps);
+X	if      (ps_matches_ic(ps, "RDEAL" )) parse_rdeal_command (ps, pc);
+X	else if (ps_matches_ic(ps, "BID"  ))  parse_bid_command  (ps, pc);
+X	else if (ps_matches_ic(ps, "RPLAY" )) parse_play_command (ps, pc);
+X	else if (ps_matches_ic(ps, "PLAY"))   parse_local_play_command(ps,pc);
+X	else if (ps_matches_ic(ps, "FINISH")) parse_finish_command (ps, pc);
+X	else if (ps_matches_ic(ps, "TALK" ))  parse_talk_command (ps, pc);
+X	else if (ps_matches_ic(ps, "HELLO"))  parse_hello_command(ps, pc);
+X	else if (ps_matches_ic(ps, "ACK"  ))  parse_ack_command  (ps, pc);
+X	else if (ps_matches_ic(ps, "QUIT" ))  parse_quit_command (ps, pc);
+X	else if (ps_matches_ic(ps, "HELP" ))  parse_help_command (ps, pc);
+X	else if (ps_matches_ic(ps, "BELL" ))  parse_bell_command (ps, pc);
+X	else if (ps_matches_ic(ps, "DEFAULT"))parse_default_command (ps, pc);
+X	else if (ps_matches_ic(ps, "REVIEW")) parse_review_command (ps, pc);
+X	else if (ps_matches_ic(ps, "PROMPT")) parse_prompt_command (ps, pc);
+X	else if (ps_matches_ic(ps, "PING" ))  parse_ping_command (ps, pc);
+X	else if (ps_matches_ic(ps, "ECHO" ))  parse_echo_command (ps, pc);
+X	else if (ps_matches_ic(ps, "CLAIM"))  parse_claim_command (ps, pc);
+X	else if (ps_matches_ic(ps, "RESP"))   parse_respond_command (ps, pc);
+X	else if (ps_matches_ic(ps, "SCORE"))  parse_score_command (ps, pc);
+X	else if (ps_matches_ic(ps, "LOG"))    parse_log_command (ps, pc);
+X	else if (ps_matches_ic(ps, "DEAL"))   parse_deal_command (ps, pc);
+X	else if (ps_matches_ic(ps, "LOAD"))   parse_load_command (ps, pc);
+X	else if (ps_matches_ic(ps, "REPLAY")) parse_replay_command (ps, pc);
+X	else if (ps_matches_ic(ps, "SAVE"))   parse_save_command (ps, pc);
+X	else if (ps_matches_ic(ps, "COMMENT"))parse_comment_command (ps, pc);
+X	else if (ps_matches_ic(ps, "VULN"))   parse_vuln_command (ps, pc);
+X	else if (ps_matches_ic(ps, "SEATERR")) {
+X	  reset_network ();
+X	  Display_Player_Comment ("NETWORK",
+X	    "THE SEAT YOU REQUESTED IS ALREADY TAKEN!");
+X	  Display_Player_Comment ("NETWORK", ps + PS_OFFSET + ps[PS_POS]);
+X	  Terminate_Program ("PROGRAM TERMINATING");
+X	} else {
+X		pc->command = CMD_ERROR;
+X		parsing_errmsg = keyword_error;
+X	};
+X	skip_spaces (ps);
+X	if ((ps_scan(ps) != '\0') && (pc->command != CMD_ERROR)) {
+X		if (pc->command == CMD_BID)
+X			parsing_errmsg = bid_error;
+X		else if (pc->command == CMD_PLAY)
+X			parsing_errmsg = play_error;
+X		else
+X			parsing_errmsg = ending_error;
+X		pc->command = CMD_ERROR;
+X	};
+X};
+X 
+Xclear_input_buffer (ib)
+X	input_buffer ib;
+X/* Clears the screen display representing the input buffer, and
+X * resets the cursor position.
+X */
+X{
+X	int i;
+X 
+X	ib->buf[0]   = '\0';
+X	ib->pos      =   0;
+X 
+X	for (i = 0; i < ib->length; i++)
+X		print (ib->row, ib->col + i, " ");
+X	set_cursor (ib->row, ib->col);
+X	ib->defaulted = 0;
+X};
+X
+Xstatic Review_Bidding ()
+X/* Generates a review of the bidding. */
+X{
+X  int i, passes, round, first_bid;
+X  char msg_buf[80];
+X
+X  if ((game_mode == PLAYING_MODE) || (game_mode == REVIEW_MODE)) {
+X    sprintf (msg_buf, "OPENED BY %s: ", player_names[dealer]);
+X    i = 0; passes = round = -1; first_bid = 1;
+X    while ((passes < 3) && (strlen(msg_buf) < 72)) {
+X      if (i == dealer) round++;
+X      if (round >= 0) {
+X	sprintf (msg_buf + strlen(msg_buf), "%s%s",
+X		 first_bid? " ": "-",
+X		 bid_names[bids[i][round]]);
+X	if (bids[i][round] == BID_PASS) passes++;
+X	else passes = 0;
+X	first_bid = 0;
+X      };
+X      i = player_next [i];
+X    };
+X    if (strlen(msg_buf) > 72)
+X      sprintf (msg_buf+strlen(msg_buf), " ...");
+X    Display_Status (msg_buf);
+X  } else 
+X    Display_Status 
+X      ("THE BIDDING CANNOT BE REVIEWED NOW");
+X};
+X
+Xint update_input_buffer (pib, ch)
+X	input_buffer pib; int ch;
+X/* Adds the character ch to the input buffer, or if it is a control
+X . character, then modifies the cursor position or buffer appropriately.
+X . If the user has indicated he is through entering input, by entering
+X . i.e. <^J> or <^M>, then TRUE is returned.  Otherwise, FALSE is
+X . returned.
+X */
+X{
+X	char chbuf[2], *def, message_buf[80];
+X	input_buffer ib;
+X
+X	ib = forced_talk_mode? talk_buffer: pib;
+X 	chbuf[1] = '\0';
+X	if (isprint(ch) && (ib->pos < ib->length)) {
+X	        if (ib->defaulted)
+X		  clear_input_buffer (ib);
+X		chbuf[0] = ch;
+X		print (ib->row, ib->col+ib->pos, chbuf);
+X		ib->buf[ib->pos++] = ch;
+X		ib->buf[ib->pos] = '\0';
+X	} else if ((ch == '\010') || (ch == '\177')) {
+X	        if (ib->pos > 0) {
+X		  chbuf[0] = ' ';
+X		  ib->buf[--ib->pos] = '\0';
+X		  print (ib->row, ib->col+ib->pos, chbuf);
+X		};
+X		ib->defaulted = 0;
+X        } else if (ch == '\033') {              /* ESC - clear input buffer. */
+X		clear_input_buffer (ib);
+X		forced_talk_mode = 0;
+X		ib = pib;
+X		print (ib->row, ib->col, ib->buf);
+X        } else if (ch == '\002') {              /* ^B - review bidding. */
+X	  Clear_Status_Display ();
+X          Review_Bidding ();
+X	} else if (ch == '\004') {              /* ^D - toggle default mode */
+X	  Clear_Status_Display ();
+X	  default_plays = 1 - default_plays;
+X	  sprintf (message_buf, "DEFAULT INPUT MODE IS NOW %s",
+X		   default_plays? "ON": "OFF");
+X	  Display_Status (message_buf);
+X        } else if (ch == '\007') {              /* ^G - toggle bell. */
+X	  Clear_Status_Display ();
+X	  ring_my_bell = 1-ring_my_bell;
+X	  sprintf (message_buf, "THE BELL IS NOW %s",
+X		   ring_my_bell? "ON": "OFF");
+X	  Display_Status (message_buf);
+X	  if (ring_my_bell) ring_bell ();
+X	} else if (ch == '\020') {              /* ^P - toggle prompt mode */
+X	  Clear_Status_Display ();
+X	  prompt_dummy = 1-prompt_dummy;
+X	  sprintf (message_buf, "PROMPT MODE IS NOW %s",
+X		   prompt_dummy? "ON": "OFF");
+X	  Display_Status (message_buf);
+X	} else if (ch == '\022') {		/* ^R - refresh display. */
+X		Refresh_Display ();
+X		print (ib->row, ib->col, ib->buf);
+X        } else if (ch == '\024') {             /* ^T - forced talk mode. */
+X	       if (ib != talk_buffer)
+X		 forced_talk_mode = 1;
+X	       ib = talk_buffer;
+X	} else if (ch == '\030') {	       /* ^X  - abort program. */
+X	        Terminate_Program 
+X		  ("INTERRUPT RECEIVED -- TERMINATING PROGRAM");
+X	} else if (ch == '\0')
+X		print (ib->row, ib->col, ib->buf);
+X	else if ((ch == '\012') || (ch == '\015')) {
+X	        if ((ib->pos > 0) && !forced_talk_mode)
+X		        return (1);
+X		else if (forced_talk_mode) {
+X		  forced_talk_mode = 0;
+X		  if (!Reserved_message (ib->buf)) {
+X		    send_message_talk (ib->buf);
+X		    Display_Player_Comment (player_names[local_player],
+X					    ib->buf);
+X		  };
+X		  clear_input_buffer (ib);
+X		  ib = pib;
+X		  print (ib->row, ib->col, ib->buf);
+X		} else {
+X		  if (waiting_for_acknowledgment && !forced_talk_mode) {
+X		    waiting_for_acknowledgment = 0;
+X		    return (1);
+X		  };
+X		  if (default_plays && (default_input != NULL)) {
+X		        for (def = default_input; *def != '\0'; def++)
+X			         ib->buf[ib->pos++] = *def;
+X			ib->buf[ib->pos] = '\0';
+X			print (ib->row, ib->col, default_input);
+X			ib->defaulted = 1;
+X		      };
+X		};
+X        };
+X	set_cursor (ib->row, ib->col+ib->pos);
+X	return (0);
+X};
+X 
+Xsend_player_message (message)
+X	char *message;
+X/* Transmits the message to the other players through the network. 
+X * Prepends the name of the player to the message before transmitting.
+X */
+X{
+X	char msg_buf [100];
+X 
+X	sprintf (msg_buf,"%s %s",local_player_names[local_player], message);
+X	send_message (msg_buf);
+X 
+X};
+X 
+Xstatic receive_player_message (player_no, pm)
+X	int *player_no; parse_string pm;
+X/* Receives a player message if one is available.  Returns with
+X . player_no set to the player from whom the message was sent, and
+X . pm containing the text of the message.  If there was an error in
+X . the message, or if no message is available, then returns with
+X . player_no set to -1.
+X */
+X{
+X	int i;
+X	char msg_buf [100], error_buf [120];
+X
+X	*player_no = -1;
+X	if (!message_available()) return;
+X
+X	receive_message (msg_buf);
+X	if (strlen(msg_buf) == 0) return;
+X
+X	ps_copy (pm, msg_buf);
+X	for (i = 0; i < 4; i++) {
+X		if (ps_matches_ic(pm, local_player_names[i])) {
+X			*player_no = i;
+X			i = 4;
+X		};
+X	};
+X	if (*player_no == -1) {
+X	        sprintf (error_buf, "UNRECOGNIZED PLAYER: %s", msg_buf);
+X		Display_Player_Comment ("NETWORK ERROR", error_buf);
+X	      };
+X};
+X 
+Xstatic send_message_rdeal (current_deal)
+X	deal current_deal;
+X/* Converts the deal 'current_deal' into a string and sends it as a
+X . message to the other players.
+X */
+X{
+X	char deal_string[53], deal_command[80];
+X	int i;
+X 
+X	for (i = 0; i < 52; i++) deal_string[i] = current_deal[i] + '0';
+X	deal_string[52] = '\0';
+X 
+X	sprintf (deal_command, "RDEAL %s", deal_string);
+X	send_player_message (deal_command);
+X};
+X 
+Xstatic send_message_bid (bid)
+X	int bid;
+X{
+X	char bid_command[40];
+X 
+X	sprintf (bid_command, "BID %s", bid_names[bid]);
+X	send_player_message (bid_command);
+X};
+X 
+Xstatic send_message_play (play)
+X	int play;
+X{
+X	char play_command[40];
+X 
+X	sprintf (play_command, "RPLAY %s", card_names[play]);
+X	send_player_message (play_command);
+X};
+X 
+Xstatic send_message_talk (talk_message)
+X	char *talk_message;
+X{
+X	char talk_command[100];
+X 
+X	sprintf (talk_command, "TALK %s", talk_message);
+X	send_player_message (talk_command);
+X};
+X 
+Xstatic send_message_hello ()
+X{
+X        char hello_command [80];
+X
+X	sprintf (hello_command, "HELLO %s %s", major_revision_level,
+X		 player_names[local_player]);
+X	send_player_message (hello_command);
+X};
+X 
+Xstatic send_message_ack ()
+X{
+X        char ack_command [80];
+X
+X	sprintf (ack_command, "ACK %s %s", major_revision_level,
+X		 player_names[local_player]);
+X	send_player_message (ack_command);
+X};
+X 
+Xstatic send_message_quit ()
+X{
+X	send_player_message ("QUIT");
+X};
+X 
+Xstatic send_message_ping ()
+X{
+X	send_player_message ("PING");
+X};
+X
+Xstatic send_message_echo (player)
+X	int player;
+X{
+X	char echobuf[20];
+X
+X	sprintf (echobuf, "ECHO %s", local_player_names[player]);
+X	send_player_message (echobuf);
+X};
+X
+Xstatic send_message_claim (k)
+X     int k;
+X{
+X  char message_buf [40];
+X
+X  sprintf (message_buf, "CLAIM %d", k);
+X  send_player_message (message_buf);
+X};
+X
+Xstatic send_message_respond (r)
+X     int r;
+X{
+X  if (r)
+X    send_player_message ("RESP ACCEPT");
+X  else
+X    send_player_message ("RESP REJECT");
+X};
+X
+Xstatic send_message_finish (n)
+X     int n;
+X{
+X  char message_buf[40];
+X
+X  sprintf (message_buf, "FINISH %d", n);
+X  send_player_message (message_buf);
+X};
+X
+Xstatic send_message_score ()
+X{
+X  switch (scoring_mode) {
+X  case RUBBER_SCORING:
+X    send_player_message ("SCORE RUBBER");
+X    break;
+X  case CHICAGO_SCORING:
+X    send_player_message ("SCORE CHICAGO");
+X    break;
+X  case DUPLICATE_SCORING:
+X    send_player_message ("SCORE DUPLICATE");
+X    break;
+X  case EMAIL_SCORING:
+X    send_player_message ("SCORE EMAIL");
+X    break;
+X  case IMP_SCORING:
+X    send_player_message ("SCORE IMP");
+X    break;
+X  };
+X};
+X
+Xstatic send_message_comment (c)
+X	char *c;
+X{
+X	char comment_buf[90];
+X
+X	sprintf (comment_buf, "COMMENT %s", c);
+X	send_player_message (comment_buf);
+X};
+X    
+Xvoid Broadcast_Comment (c)
+X	char *c;
+X{
+X	send_message_comment (c);
+X	Display_Player_Comment ("MODERATOR", c);
+X};
+X
+Xstatic send_message_vuln (d, ns, ew)
+X	int d, ns, ew;
+X{
+X        char message_buf [80];
+X
+X	if (ns && ew)
+X	  sprintf (message_buf, "VULN %s BOTH", local_player_names[d]);
+X	else if (ns)
+X	  sprintf (message_buf, "VULN %s NS", local_player_names[d]);
+X	else if (ew)
+X	  sprintf (message_buf, "VULN %s EW", local_player_names[d]);
+X	else
+X	  sprintf (message_buf, "VULN %s NONE", local_player_names[d]);
+X	send_player_message (message_buf);
+X};
+X
+Xstatic receive_player_command (pc)
+X	player_command pc;
+X/* Receives a message from the network.  Parses it into pc. */
+X{
+X	int player;
+X 
+X	receive_player_message (&player, command_string);
+X	pc->player_no = player;
+X	if (player >= 0)
+X	  parse_player_command (command_string, pc);
+X};
+X 
+X
+Xstatic int verify_compatibility (remote_player, remote_version)
+X     int remote_player; char *remote_version;
+X/* This procedure compares the revision level being used by
+X . one of the remote players to the one being used by the local
+X . player.  If there is a mismatch, then an error message is
+X . generated.  If we are a client and we find that we are incompatible
+X . with the server, then the program aborts.  If we detect an
+X . incompatibility error in some other situation, we return 1.
+X . Otherwise, we return 0.
+X */
+X{
+X        char error_message [80];
+X
+X        if (!strcmp (major_revision_level, remote_version))
+X	  return;
+X
+X	sprintf (error_message, "INCOMPATIBILITY ERROR -- ");
+X	if (*remote_version == 0) {
+X	  sprintf (error_message + strlen(error_message), 
+X		   "%s IS USING VERSION 1.0",
+X		   player_names[remote_player]);
+X	} else {
+X	  sprintf (error_message + strlen(error_message), 
+X		   "%s IS USING VERSION %s",
+X		   player_names[remote_player], remote_version);
+X	};
+X	if (server_mode) {
+X	  Display_Player_Comment ("MODERATOR", error_message);
+X	  Close_Network_Connection (local_player_names[remote_player]);
+X	  players_here [remote_player] = 0;
+X	  sprintf (error_message, "%s (%s) HAS BEEN DISCONNECTED.",
+X		   player_names[remote_player],
+X		   local_player_names[remote_player]);
+X	  Broadcast_Comment (error_message);
+X	  return (1);
+X	} else if (remote_player != local_player) {
+X	  Display_Player_Comment ("MODERATOR", error_message);
+X	  players_here [remote_player] = 0;
+X	  return (1);
+X	} else
+X	  Terminate_Program (error_message);
+X
+X	return (0);
+X};	  
+X
+END_OF_FILE
+if test 40095 -ne `wc -c <'input.c.aa'`; then
+    echo shar: \"'input.c.aa'\" unpacked with wrong size!
+fi
+# end of 'input.c.aa'
+fi
+if test -f 'startup.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'startup.c'\"
+else
+echo shar: Extracting \"'startup.c'\" \(10601 characters\)
+sed "s/^X//" >'startup.c' <<'END_OF_FILE'
+X/* startup.c
+X ! 
+X ! Copyright (C) 1991 by Matthew Clegg
+X ! 
+X ! This program may be copied and distributed freely.  Please do not
+X ! charge money for this program or for any program derived from it.
+X ! If you modify this program, then include a notice stating plainly
+X ! that your program is derived from the okbridge program and is not
+X ! the same as the official okbridge program.
+X !
+X ! I welcome any suggestions for improvement to okbridge, and 
+X ! I would be especially happy to receive improved source code.
+X ! If you have comments or suggestions, or if you would like to
+X ! join the okbridge mailing list, then write to
+X !
+X !   mclegg@cs.ucsd.edu
+X !
+X *
+X * This file contains procedures for reading the okbridge startup
+X * file .okbridgerc.  Each line in this file is either a comment line
+X * or a (field, value) pair.  Comment lines begin with the pound sign
+X * '#' character.  Field, value pairs are of the format
+X *	<Field-name>	<value>
+X *
+X * The fields which are currently recognized are as follows:
+X *
+X * BELL		ON | OFF
+X *	When requesting input (a bid or a play), the terminal's
+X *	bell is rung by default.  However, this can be disabled
+X *	by specifying 'BELL OFF'.  This has the same effect as the
+X *	'/BELL OFF' command.
+X *
+X * DEFAULT      ON | OFF
+X *      This controls whether or not default inputs will be provided for
+X *      bids, plays and questions.
+X *
+X * HELPFILE	<directory-name>
+X *	This field specifies the directory to be used for reading
+X *	the okbridge help files.
+X *
+X * LOAD         <email-duplicate-filename>
+X *      This field is only valid if the position is north and the
+X *      scoring mode is email duplicate.  In this case, okbridge will
+X *      automatically read a set of email duplicate boards from the
+X *      named file.
+X *
+X * LOG		<filename>
+X *	If this statement is present in the startup file, then
+X *	the hands will automatically be logged to the given filename.
+X *      If the first character of <filename> is '+', then logs the
+X *      hands to the end of the file rather than erasing the old file.
+X *
+X * NAME		<local-player-name>
+X *	This field specifies the name that will be used to identify
+X *	the local player to the other players.
+X *
+X * POSITION	NORTH | EAST | SOUTH | WEST
+X *	This field specifies the local player's position.
+X *
+X * PORT		<positive-integer>
+X *	This field specifies the internet port number that will be
+X *	used for communications with the server.
+X *
+X * PROMPT 	NO | YES
+X *	The value of this field is only relevant in hands where the
+X *	local player is the dummy.  In this case, the dummy is
+X *	ordinarily prompted to press RETURN at the end of each trick.
+X *	This allows the dummy to see the cards that are played as they
+X *	are played.  However, if 'PROMPT NO' is specified, then the
+X *	dummy will not be prompted.
+X *
+X * REPLAY       <email-duplicate-filename>
+X *      This field is only valid if the position is north and the
+X *      scoring mode is email duplicate.  In this case, a set of
+X *      boards will automatically be read from the named file.
+X *      After they have been played, the results will automatically
+X *      be written back to the file from which the boards were read.
+X *
+X * SCORING	RUBBER | CHICAGO | DUPLICATE | EMAIL | IMP
+X *	This field is only relevant if the local player is north.
+X *	In this case, the SCORING field determines the type of scoring
+X *	that will be used by default in the game.
+X *
+X * SERVER	ME | <internet-name-or-number>
+X *	If the value of this field is 'ME', then the local player
+X *	will assume the role of server.  If the value of this field
+X *	is anything else, then it is interpreted as an internet name
+X *	or number of the machine where the server is running.
+X *
+X*/
+X
+X#include <ctype.h>
+X#include <stdio.h>
+X#include <string.h>
+X
+X#include "globals.h"
+X
+Xextern char *getenv ();
+Xextern char *strdup ();
+X
+X#ifdef HPUX
+X#define index(X,Y) strchr(X,Y)
+X#else 
+X#ifndef index
+Xextern char *index ();
+X#endif
+X#endif
+X
+X#define	MAX_LENGTH	100
+X
+Xtypedef void (*field_handler) ();
+X
+Xtypedef struct Field_Descriptor_struct {
+X	char *field_name;
+X	char *parameter_type;
+X	field_handler	handler;
+X} Field_Descriptor;
+X
+Xvoid Bell_Field (), Default_Field (), Helpfile_Field (), Load_Field (), 
+X     Log_Field (), Name_Field (), Position_Field (), Port_Field (), 
+X     Prompt_Field (), Replay_Field (), Scoring_Field (), Server_Field ();
+X
+Xstatic Field_Descriptor Fields [] = {
+X	{"BELL",	"OFF,ON",			Bell_Field},
+X	{"DEFAULT",	"OFF,ON",			Default_Field},
+X	{"HELPFILE",	"*",				Helpfile_Field},
+X	{"LOAD",        "*",                            Load_Field},
+X	{"LOG",		"*",				Log_Field},
+X	{"NAME",	"*",				Name_Field},
+X	{"POSITION",	"NORTH,EAST,SOUTH,WEST",	Position_Field},
+X	{"PORT",	"#",				Port_Field},
+X	{"PROMPT",	"NO,YES",			Prompt_Field},
+X        {"REPLAY",      "*",                            Replay_Field},
+X	{"SCORING",	"RUBBER,CHICAGO,DUPLICATE,EMAIL,IMP", 	Scoring_Field},
+X	{"SERVER",	"*",				Server_Field},
+X	{NULL,		NULL,				NULL}
+X  };
+X
+Xstatic char line_buffer [MAX_LENGTH];
+Xstatic int  current_char, last_pos;
+Xstatic int  line_length;
+Xstatic int  line_no;
+Xstatic FILE *init_file;
+Xstatic int  error_flag;
+X
+Xextern int errno;
+Xextern char *sys_errlist[];
+X
+Xextern int ring_my_bell;
+Xextern char *help_file_name;
+Xextern FILE *logfile;
+Xextern int local_player;
+Xextern int network_port;
+Xextern int server_mode;
+Xextern char *server_name;
+Xextern char *local_player_name;
+Xextern char *autoload_file, *autosave_file;
+X
+Xstatic Field_Error (error_msg)
+X	char *error_msg;
+X/* Prints out the current line from the field file along with an error
+X   message.
+X*/
+X{
+X	int i;
+X
+X	fprintf (stderr, "line %2d: %s\n", line_no, line_buffer);
+X	for (i = 0; i < last_pos + 9; i++) 
+X		fprintf (stderr, " ");
+X	fprintf (stderr, "^ %s\n", error_msg);
+X	error_flag = 1;
+X};
+X
+Xstatic void Bell_Field (i)
+X	int i;
+X{
+X	ring_my_bell = i;
+X};
+X
+Xstatic void Default_Field (i)
+X     int i;
+X{
+X  default_plays = i;
+X};
+X
+Xstatic void Helpfile_Field (s)
+X	char *s;
+X{
+X	help_file_name = strdup (s);
+X};
+X
+Xstatic void Load_Field (s)
+X     char *s;
+X{
+X  autoload_file = strdup (s);
+X};
+X
+Xstatic void Log_Field (s)
+X	char *s;
+X{
+X	char error_buf [80];
+X	char *filename;
+X
+X	if (s[0] == '+') {
+X	  filename = s + 1;
+X	  logfile = fopen (filename, "a");
+X	} else {
+X	  filename = s;
+X	  logfile = fopen (filename, "w");
+X	};
+X	if (logfile == NULL) {
+X		sprintf (error_buf, "Error opening %s: %s", filename,
+X			sys_errlist[errno]);
+X		Field_Error (error_buf);
+X	};
+X};
+X
+Xstatic void Name_Field (s)
+X	char *s;
+X{
+X	local_player_name = strdup (s);
+X};
+X
+Xstatic void Position_Field (i)
+X	int i;
+X{
+X	local_player = i;
+X};
+X
+Xstatic void Port_Field (i)
+X	int i;
+X{
+X	network_port = i;
+X};
+X
+Xstatic void Prompt_Field (i)
+X	int i;
+X{
+X	prompt_dummy = i;
+X};
+X
+Xstatic void Replay_Field (s)
+X     char *s;
+X{
+X  autoload_file = strdup (s);
+X  autosave_file = strdup (s);
+X};
+X
+Xstatic void Scoring_Field (i)
+X	int i;
+X{
+X	scoring_mode = i;
+X};
+X
+Xstatic void Server_Field (s)
+X	char *s;
+X{
+X	if (!strcasecmp(s, "ME"))
+X		server_mode = 1;
+X	else {
+X		server_mode = 0;
+X		server_name = strdup (s);
+X	};
+X};
+X
+Xstatic int Read_Field_Line ()
+X/* Reads a line from initialization file init_file and copies it into
+X   line_buffer.  Returns 1 if data is returned, or 0 if the end of file
+X   is reached.  Skips comment lines.  Strips trailing blanks from the
+X   end of the line.
+X*/
+X{
+X	int ch;
+X
+X	do {
+X		line_length = 0;
+X		ch = getc (init_file);
+X		while ((ch != EOF) && (ch != '\n')) {
+X			if (line_length < MAX_LENGTH)
+X				line_buffer [line_length++] = ch;
+X			ch = getc(init_file);
+X		};
+X		if (ch == EOF)
+X			return (0);
+X		line_no++;
+X		while (line_buffer[line_length-1] == ' ')
+X			line_length--;
+X	} while ((line_length == 0) || (line_buffer[0] == '#'));
+X
+X	current_char = 0;
+X	line_buffer[line_length] = '\0';
+X	return (1);
+X};
+X
+Xstatic int Read_Keyword (buf, buflen)
+X	char *buf; int buflen;
+X/* Reads a whitespace delimited sequence of characters from the current
+X   input line into the buffer.  Returns the number of characters
+X   transferred.
+X*/
+X{
+X	int i;
+X
+X	i = 0;
+X	while ((current_char < line_length) && 
+X	   isspace (line_buffer[current_char])) 
+X		current_char++;
+X
+X	last_pos = current_char;
+X	while ((current_char < line_length) && 
+X	  !isspace(line_buffer[current_char])) {
+X		if (i < buflen-1)
+X			buf[i++] = line_buffer[current_char++];
+X		else
+X			current_char++;
+X	};
+X	buf[i] = '\0';
+X	return (i);
+X};
+X
+Xstatic int Lookup_Keyword (lookup_string, keyword)
+X	char *lookup_string, *keyword;
+X/* Assumes that lookup_string is a comma-delimited sequence of keywords.
+X   Looks for the keyword in lookup_string which matches the given keyword.
+X   If the keyword is found, then returns its index in lookup_string,
+X   i.e.,  Lookup_Keyword ("OFF,ON", "OFF") = 0, 
+X	  Lookup_Keyword ("OFF,ON", "ON") = 1.
+X   If the keyword is not found, then returns -1.
+X*/
+X{
+X	int i, n;
+X
+X	i = 0;
+X	n = strlen (keyword);
+X	while (lookup_string != NULL) {
+X		if (!strncasecmp(lookup_string, keyword, n)) {
+X			if ((lookup_string[n] == '\0') || 
+X			    (lookup_string[n] == ','))
+X				return (i);
+X		};
+X		i += 1;
+X		lookup_string = index (lookup_string, ',');
+X		if (lookup_string != NULL) lookup_string++;
+X	};
+X	return (-1);
+X		
+X};
+X
+Xstatic int all_digits (s)
+X	char *s;
+X{
+X	while (*s)
+X		if (!isdigit(*(s++)))
+X			return (0);
+X	return (1);
+X};
+X
+Xvoid Read_Initialization_File ()
+X{
+X	char *home_dir, filename_buf[128];
+X	char name [20], value [80], message_buf[80];
+X	int i, j;
+X
+X	init_file = fopen (".okbridgerc", "r");
+X	home_dir = getenv ("HOME");
+X
+X	if ((init_file == NULL) && (home_dir != NULL)) {
+X		sprintf (filename_buf, "%s/.okbridgerc", home_dir);
+X		init_file = fopen (filename_buf, "r");
+X	};
+X
+X	if (init_file == NULL) {
+X		/* couldn't find an initialization file. */
+X		return;
+X	};
+X
+X	error_flag = 0;
+X	while (Read_Field_Line()) {
+X		Read_Keyword (name, 20);
+X		i = 0;
+X		while ((Fields[i].field_name != NULL) &&
+X		   strcmp(Fields[i].field_name, name))
+X			i++;
+X		if (Fields[i].field_name == NULL)
+X			Field_Error ("Error in field name");
+X		else {
+X		  Read_Keyword (value, 80);
+X		  if (current_char < line_length)
+X			Field_Error ("Extra data at end of line");
+X		  if (Fields[i].parameter_type[0] == '*')
+X			Fields[i].handler (value);
+X		  else if (Fields[i].parameter_type[0] == '#') {
+X			if (all_digits(value))
+X				Fields[i].handler (atoi(value));
+X			else
+X				Field_Error ("Expected a positive integer");
+X		  } else {
+X			j = Lookup_Keyword (Fields[i].parameter_type, value);
+X			if (j < 0) {
+X				sprintf (message_buf, "Expected keyword: %s",
+X					Fields[i].parameter_type);
+X				Field_Error (message_buf);
+X			} else
+X				Fields[i].handler (j);
+X		  };
+X		};
+X	};
+X
+X	fclose (init_file);
+X
+X	if (error_flag) {
+X		fprintf (stderr, "\n%s -- %s\n",
+X			"Errors in .okbridgerc initialization file",
+X			"Program terminating");
+X		exit (1);
+X	};
+X	
+X};
+END_OF_FILE
+if test 10601 -ne `wc -c <'startup.c'`; then
+    echo shar: \"'startup.c'\" unpacked with wrong size!
+fi
+# end of 'startup.c'
+fi
+echo shar: End of archive 3 \(of 7\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 7 archives.
+    rm -f ark[1-9]isdone
+    echo creating input.c from input.c.aa and input.c.ab
+    cat input.c.aa input.c.ab >input.c
+    rm -f input.c.aa input.c.ab
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

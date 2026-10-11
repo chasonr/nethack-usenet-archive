@@ -1,0 +1,550 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,c8d25c611be6f8f2,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1982-06-27 02:08:48 PST
+Message-ID: <bnews.cca.1494>
+Newsgroups: net.sources
+Path: utzoo!decvax!cca!z
+X-Path: utzoo!decvax!cca!z
+From: cca!z
+Date: Sun Jun 27 05:08:46 1982
+Subject: cref.c
+X-Google-Info: Converted from the original B-News header
+Posted: Wed Jun 23 14:19:25 1982
+Received: Sun Jun 27 05:08:46 1982
+
+/* cref - cross reference program */
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <vadvise.h>
+
+#define	HRATIO	30
+#define	LBUFSIZ	2048
+#define	LREFS	15
+#define	NKEYS	(sizeof(keytab)/sizeof(struct key))
+#define	RSEGSIZ	20
+#define	SYMSIZ	64
+#define	Perror()	perror("cref"),exit(1)
+#define	issym(c)	(isalnum(c) || c=='_' || c=='#')
+
+char	tflag;				/* Produce tags style output */
+char	*lastext;
+char	*calloc();
+char	prcom[80] = "pr -h ";
+char	linebuf[LBUFSIZ], *nextsym(), *putline(), *strcpy();
+int	file1 = 1, hconst = 1, lastline, line, nsyms;
+short	braces, bracks, parens;
+FILE	*fopen(), *fp, *popen(), *pfp;
+
+struct	{
+	unsigned blank1	  : 1;		/* First column is a blank */
+	unsigned casef	  : 1;		/* Case keyword */
+	unsigned comp	  : 1;		/* Compound statement */
+	unsigned define	  : 1;		/* "Define" type statement */
+	unsigned indent	  : 1;		/* Statement indented */
+	unsigned qmark	  : 1;		/* Question mark encountered */
+	unsigned semic	  : 1;		/* Semicolon encountered */
+	unsigned preproc  : 1;		/* Preprocessor keyword */
+} flags;
+
+struct	key	{
+	char	*keyword;
+	unsigned cflag	: 1;		/* Compound statement flag */
+	unsigned dflag	: 1;		/* Defining flag */
+} keytab[] =	{
+	"#define",	0,1,
+	"#else",	0,0,
+	"#endif",	0,0,
+	"#if",		0,0,
+	"#ifdef",	0,0,
+	"#ifndef",	0,0,
+	"#include",	0,0,
+	"#line",	0,1,
+	"#undef",	0,0,
+	"asm",		0,0,
+	"auto",		0,1,
+	"break",	0,0,
+	"case",		1,0,
+	"char",		0,1,
+	"continue",	0,0,
+	"default",	0,0,
+	"do",		1,0,
+	"double",	0,1,
+	"else",		1,0,
+	"entry",	0,0,
+	"extern",	0,1,
+	"float",	0,1,
+	"for",		1,0,
+	"goto",		0,0,
+	"if",		1,0,
+	"int",		0,1,
+	"long",		0,1,
+	"register",	0,1,
+	"return",	0,0,
+	"short",	0,1,
+	"sizeof",	0,0,
+	"static",	0,1,
+	"struct",	0,1,
+	"switch",	1,0,
+	"typedef",	0,1,
+	"union",	0,1,
+	"unsigned",	0,1,
+	"void",		0,1,
+	"while",	1,0
+};
+
+struct	refseg	{
+	struct refseg	*nseg;		/* Pointer to next segment */
+	struct	{
+		int	ref;		/* Line number of reference */
+		char	*text;		/* Text of line containing reference */
+		short	file;		/* File in which reference occurred */
+		char	deflag;		/* Define flag */
+	} refs[RSEGSIZ];
+} *pseg;
+
+struct	symbol	{
+	char	name[SYMSIZ+1];
+	int	nref;
+	struct	refseg	*firstseg;
+	struct	refseg	*curseg;
+} *htab;
+
+main(argc, argv)
+int	argc;
+char	*argv[];
+{
+	char	*p, symbol[SYMSIZ+1];
+	int	hcode, i, j, k, nslots, t, tchars;
+	short	nfile, nkey, rnum;
+	struct	stat statb;
+
+	tchars = 0;
+	if (argc < 2)
+		exit(1);		/* No filenames */
+	while (*argv[file1] == '-') {
+		if (argv[file1][1] == 't')
+			tflag++;
+		else if (!(hconst = atoi(&argv[file1][1]))) {
+			fprintf(stderr, "cref: Bad option");
+			exit(1);
+		}
+		file1++;
+	}
+	for (nfile = file1; nfile < argc; nfile++) {
+		if (stat(argv[nfile], &statb))
+			Perror();	/* File doesn't exist */
+		tchars += statb.st_size;
+	}
+	vadvise(VA_ANOM);
+	if (!(htab = (struct symbol *)calloc(nslots = hconst*tchars/HRATIO, sizeof(struct symbol)))) {
+		fprintf(stderr, "cref: Not enough memory.\n");
+		exit(1);
+	}
+
+/* Main loop for crunching down files */
+
+	for (nfile = file1; nfile < argc; nfile++) {
+		if (!(fp = fopen(argv[nfile], "r")))	/* Open input file */
+			fprintf(stderr, "cref: Can't open %s\n", argv[nfile]);
+		strcpy(&prcom[6], argv[nfile]);	/* Put name in header */
+		if (!tflag)
+			pfp = popen(prcom, "w"); /* Pipe output through "pr" */
+		while (fgets(linebuf, LBUFSIZ, fp)) {	/* Statement loop */
+			line++;
+			if (!tflag) {
+				fprintf(pfp, "%6d  ", line);
+				fputs(linebuf, pfp);
+			}
+			flags.blank1 = flags.define = flags.casef = flags.comp = flags.indent
+				= flags.semic = flags.qmark = flags.preproc = 0;
+			p = linebuf;
+			flags.blank1 = *p==' ' || *p=='\t';
+			while (p = nextsym(p)) {
+				for (i = 0; i < SYMSIZ && issym(*p); i++)
+					symbol[i] = *p++;
+				symbol[i] = '\0';
+				if ((nkey = binary(symbol, keytab, NKEYS)) >= 0) {
+					if (!parens)	/* So casts don't count as definitions */
+						flags.define |= keytab[nkey].dflag;
+					if (!strcmp(keytab[nkey].keyword, "#include")) {
+						while (*p != '\n')
+							p++;
+						p++;
+						break;
+					}
+					if (!strcmp(keytab[nkey].keyword, "case"))
+						flags.casef = 1;
+				} else {
+					if (!(braces|flags.blank1))
+						flags.define = 1;
+					flags.define |= !flags.indent;
+					if (flags.define)
+						parens = 0;
+					for (j = 0, hcode = 1; j < strlen(symbol); hcode *= symbol[j++]);
+				scan:	for (hcode = abs(hcode) % nslots; hcode >= 0 && *htab[hcode].name &&
+						strcmp(htab[hcode].name, symbol); hcode--);
+					if (hcode < 0) {
+						hcode = nslots -1;
+						goto scan;
+					}
+					if (!*htab[hcode].name) {
+						strcpy(htab[hcode].name, symbol);
+						if (!(htab[hcode].firstseg = htab[hcode].curseg =
+							(struct refseg *)calloc(1, sizeof(struct refseg)))) {
+							fprintf(stderr, "cref: Out of memory!\n");
+							exit(1);
+						}
+						htab[hcode].curseg->refs[0].ref = line;
+						if (!bracks && !parens || !flags.indent)
+							if (htab[hcode].curseg->refs[0].deflag = flags.define |
+								(*p == ':' && !flags.qmark && !flags.casef))
+								ctags(hcode, 0, nfile);
+						htab[hcode].nref++;
+						nsyms++;
+					} else {
+						if (!(htab[hcode].nref % RSEGSIZ)) {
+							if (!(htab[hcode].curseg->nseg = (struct refseg *)
+								calloc(1, sizeof(struct refseg)))) {
+								fprintf(stderr, "cref: Out of memory!\n");
+								exit(1);
+							}
+							htab[hcode].curseg = htab[hcode].curseg->nseg;
+						}
+						htab[hcode].curseg->refs[rnum = htab[hcode].nref++ % RSEGSIZ].ref = line;
+						if (!bracks && !parens || !flags.indent)
+							if (htab[hcode].curseg->refs[rnum].deflag = flags.define |
+								(*p == ':' && !flags.qmark && !flags.casef))
+								ctags(hcode, rnum, nfile);
+					}
+					if (nsyms == nslots) {
+						fprintf(stderr, "cref: Hash table overflowed!\n");
+						exit(1);
+					}
+					if (*p == ':')	/* End of label */
+						flags.define = 0;
+				}
+				flags.indent = 1;
+			}
+		}
+		fclose(fp);
+		if (!tflag)
+			pclose(pfp);
+	}
+
+/* Now print the cref table */
+
+	if (tflag) {
+		pfp = stdout;
+		sort(htab, nslots);
+		for (i = nslots - nsyms; i < nslots; i++) {
+			pseg = htab[i].firstseg;
+			for (j = 0, k = 0, t = 0; j < htab[i].nref; j++) {
+				if (pseg->refs[k].ref != t && pseg->refs[k].deflag) {
+					t = pseg->refs[k].ref;
+					fprintf(pfp, "%s	%s	?^", htab[i].name, argv[pseg->refs[k].file]);
+					fputs(pseg->refs[k].text, pfp);
+					fprintf(pfp, "$?\n");
+				}
+				if (++k == RSEGSIZ) {
+					pseg = pseg->nseg;	/* Print next segment */
+					k = 0;
+				}
+			}
+		}
+		exit(0);
+	}
+	pfp = popen("pr -h 'Cref listing'", "w");
+	sort(htab, nslots);
+	for (i = nslots - nsyms; i < nslots; i++) {
+		char lrefs;
+
+		lrefs = LREFS;		/* References per line */
+		fprintf(pfp, "%s", htab[i].name);
+		if ((t = strlen(htab[i].name)) > 12) {
+			lrefs = LREFS - (t-5)/8;
+			for (j = 0; j < 7 - (t-5)%8; j++)
+				putc(' ', pfp);	/* Space after symbol */
+		} else
+			for (j = 0; j < 12-t; j++)
+				putc(' ', pfp);	/* Space after symbol */
+		pseg = htab[i].firstseg;
+		for (j=0, k=0, t=0; j < htab[i].nref; j++) {
+			if (pseg->refs[k].ref != t) {
+				if (!lrefs--) {
+					fprintf(pfp, "\n	    ");
+					lrefs = LREFS;
+				}
+				fprintf(pfp, "%7d", t = pseg->refs[k].ref);
+				if (pseg->refs[k].deflag)
+					putc('#', pfp);
+				else
+					putc(' ', pfp);
+			}
+			if (++k == RSEGSIZ) {
+				pseg = pseg->nseg;	/* Print next segment */
+				k = 0;
+			}
+		}
+		putc('\n', pfp);
+	}
+	fprintf(pfp, "\nSymbols = %d		Hash table size = %d		Density = %f\n",
+		nsyms, nslots, (double)nsyms/(double)nslots);
+	pclose(pfp);
+}
+
+
+/* Create entry for tags file */
+
+ctags(hcode, rnum, nfile)
+register hcode, rnum, nfile;
+{
+	register len;
+	
+	if (!tflag)
+		return;
+	len = strlen(linebuf);
+	if (lastline != line) {
+		if (!(lastext = calloc(len+1, 1))) {
+			fprintf(stderr, "cref: Out of memory!\n");
+			exit(1);
+		}
+		(void) strcpy(lastext, linebuf);
+		lastext[--len] = '\0';
+		lastline = line;
+	}
+	htab[hcode].curseg->refs[rnum].text = lastext;
+	htab[hcode].curseg->refs[rnum].file = nfile;
+}
+
+
+/* Binary search for word in tab */
+
+binary(word, tab, n)
+char	*word;
+struct	key	tab[];
+int	n;
+{
+	int	low, high, mid, cond;
+
+	low = 0;
+	high = n - 1;
+	while (low <= high) {
+		mid = (low+high)/2;
+		if ((cond = strcmp(word, tab[mid].keyword)) < 0)
+			high = mid - 1;
+		else if (cond > 0)
+			low = mid + 1;
+		else
+			return(mid);
+	}
+	return(-1);
+}
+
+
+/* Find next symbol in statement, and return a pointer to it.  If end of
+ * statement is reached, return null pointer.
+ */
+
+char	*
+nextsym(p)
+char	*p;
+{
+	static symline;
+
+	for (; !issym(*p) || isdigit(*p); p++) {
+		switch (*p) {
+		case '{':
+			braces++;
+			break;
+		case '}':
+			braces--;
+			break;
+		case '\n':
+			if (!flags.semic && !flags.comp && symline == line && !flags.preproc ||
+				flags.preproc && *(p-1) == '\\') {
+				if (!fgets(linebuf, LBUFSIZ, fp))
+					return(0);
+				p = linebuf - 1;
+				flags.blank1 = *(p+1)==' ' || *(p+1)=='\t';
+				line++;
+				if (!tflag) {
+					fprintf(pfp, "%6d  ", line);
+					fputs(linebuf, pfp);
+				}
+				break;
+			} else
+				return(0);
+		case '?':
+			flags.qmark = 1;
+			break;
+		case ':':
+			flags.comp |= !flags.qmark;
+			break;
+		case ';':
+			flags.semic = 1;
+			break;
+		case '\'':
+			while (*++p != '\'' || *(p-1) == '\\' && *(p-2) != '\\');
+			break;
+		case '"':
+			while (*++p != '"' || *(p-1) == '\\')
+				if (!(p = putline(p)))
+					return(0);
+			break;
+		case '/':
+			if (*(p+1) != '*')
+				break;
+			p++;
+			while (*++p != '*' || *(p+1) != '/')
+				if (!(p = putline(p)))
+					return(0);
+			p++;
+			break;
+		case '(':
+			parens++;
+			flags.indent = 1;
+			break;
+		case ')':
+			parens--;
+			break;
+		case '[':
+			bracks++;
+			break;
+		case ']':
+			bracks--;
+			break;
+		case '0':
+			while (isalnum(*(p+1)))
+				p++;	/* Ignore hex numbers */
+			break;
+		case ' ':
+		case '\t':
+			flags.indent = 1;
+			break;
+		default:
+			;
+		}
+	}
+	if (*p == '#')
+		flags.preproc = 1;
+	symline = line;		/* Indicate symbol found on this line */
+	return(p);
+}
+
+char	*
+putline(p)
+char	*p;
+{
+	if (*p == '\n') {
+		if (!fgets(linebuf, LBUFSIZ, fp))
+			return(0);
+		p = linebuf - 1;
+		line++;
+		if (!tflag) {
+			fprintf(pfp, "%6d  ", line);
+			fputs(linebuf, pfp);
+		}
+	}
+	if (*p == '\\' && *(p-1) == '\\')
+		*p = '\0';		/* Help out parsing quoted strings */
+	return(p);
+}
+
+sort(tab, n)
+struct	symbol	*tab;
+int	n;
+{
+	int	gap, i, j;
+	struct	symbol	temp;
+
+	for (gap = n/2; gap > 0; gap /= 2)
+		for (i = gap; i < n; i++)
+			for (j = i-gap; j >= 0; j -= gap) {
+				if (strcmp(tab[j].name, tab[j+gap].name) <= 0)
+					break;
+				temp = tab[j];
+				tab[j] = tab[j+gap];
+				tab[j+gap] = temp;
+			}
+}
+
+
+.TH CREF 1 10/30/80
+.CC
+.SH NAME
+cref \- cross reference program
+.SH SYNOPSIS
+.B cref
+[ 
+.B -
+.I n
+]
+[ 
+.B -t
+]
+file...
+.SH DESCRIPTION
+.I Cref
+generates a complete cross reference listing of one or more C programs, printing
+the result on the standard output.  A listing of the programs with line numbers
+is printed first, followed by the actual cross reference listing.  This latter
+contains all the programs's symbols alphabetically arranged, one to a line,
+with each line containing the numbers of the lines in the programs where the
+symbol was referenced.  If the symbol was defined on a given line, that line
+number will be followed by a `#'.  Symbols with more than approximately 15
+references occupy multiple lines.  There is no limit on the number of symbols
+that
+.I cref
+will handle, nor on the number of references per symbol.
+.PP
+.I Cref
+stores its symbols in a hash table whose size is determined by
+.I cref
+based on the total number of characters in the files to be processed.  For
+almost all programs, this turns out to be an excellent approximation.
+However, for a few programs, generally short header files, there may be
+too many symbols for the hash table, and the diagnostic "Hash table
+overflowed!" will be printed out.  Since the output of
+.I cref
+is piped through
+.I pr,
+it is not really possible for cref to recover from this condition.  Instead,
+.I cref
+should be rerun with the
+.B -n
+option, where
+.B n
+is some number.  This will multiply the starting size of the hash table by
+.B n
+times.
+.PP
+If
+.I cref
+is invoked with the
+.B -t
+option, instead of its regular output it produces an output identical in
+form to that produced by the
+.I ctags(1)
+program.  The advantage of the 
+.I cref
+output over
+.I ctags
+is that
+.I cref
+will flag all variable and macro definitions as well as all function
+definitions.
+.SH AUTHOR
+Steve Zimmerman
+.SH SEE ALSO
+ctags(1)
+.SH BUGS
+.I Cref
+occasionally flags a reference as a definition when it really isn't.  This
+most frequently happens after a
+.B struct.
+
+

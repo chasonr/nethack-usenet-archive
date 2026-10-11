@@ -1,0 +1,707 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,854993dd09d581d5,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-03-02 04:54:10 PST
+Message-ID: <bnews.ikonas.159>
+Newsgroups: net.sources
+Path: utzoo!decvax!duke!unc!mcnc!ikonas!mcm
+X-Path: utzoo!decvax!duke!unc!mcnc!ikonas!mcm
+From: ikonas!mcm
+Date: Wed Mar  2 07:54:05 1983
+Subject: source for mkpath
+X-Google-Info: Converted from the original B-News header
+Posted: Tue Mar  1 12:29:22 1983
+Received: Wed Mar  2 07:54:05 1983
+
+
+/*
+ * Mkpath creates UUCP routing information from the Usenet directory
+ * Mark and Karen Horton send down the Usenet.  The map input should
+ * look something like :
+ *
+ *	Name:	name-of-site
+ *	(extra fields)
+ *	Usenet:	connected sites
+ *	(any extra connected sites)
+ *	UUCP:	connected sites
+ *	(any extra connected sites)
+ *	Name:
+ *
+ * The Usenet: and UUCP: fields must not have any other fields between
+ * them.  Blank lines can be used to separate fields.  The connected sites
+ * can be separated by any number of blanks, tabs, commas, or new-lines.
+ *
+ * Usage: mkpath [-lsite][-2][-dsite][-dsite1!site2][-asite1!site2] map-file(s)
+ *
+ * -lsite creates paths starting at "site".  If not supplied,
+ * the system name from the <whoami.h> file is used.
+ *
+ * -2 forces all routes to be two-way.
+ *
+ * -dsite removes "site" from the list; -dsite1!site2 removes the connection
+ * from "site1" to "site2".
+ *
+ * -asite1!site2 adds the connection from "site1" to "site2".  If the -2
+ * option is used, it adds the connection from "site2" to "site1" as well.
+ *
+ * The output goes to stdout.
+ *
+ * Version 3.0	2/12/83
+ * Version 3.1  2/21/83		added -a option
+ * Version 3.2	2/23/83		made storage for -a,-d options dynamic
+ *
+ * Written by Mike Mitchell	decvax!duke!mcnc!ikonas!mcm
+ *
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+#include <whoami.h>
+
+FILE *map;			/* map input file */
+
+struct site {			/* structure for all needed info on a site */
+	char *name;		/* name of site */
+	struct site *route;	/* route to take to get there */
+	struct path *conn;	/* who the site is connected to */
+	struct site *nxtsite;	/* pointer to next site in list */
+	};
+
+struct path {			/* structure for connection & routing info */
+	struct site *siteptr;	/* pointer to site data */
+	struct path *nxtpath;	/* pointer to next hop in route */
+	};
+
+struct site *Begsite;		/* pointer to the start of site data */
+struct site *Strsite;		/* pointer to starting point's site data */
+char *SYSNAME = sysname;	/* system name from whoami.h */
+main(argc, argv)
+int argc;
+char **argv;
+{
+	int i, dno, ano, twoflg, upcase(), getcon();
+	register struct site *curptr;	/* current site */
+	register struct path *conptr;	/* pointer to connections */
+	struct site *search(), *getsite();
+	struct site *sptr;
+	struct path *twoptr, *lnkptr;
+	struct path *ptalloc();
+	char buf[BUFSIZ], tmp[BUFSIZ], *fgets();
+	char **dsites, **asites, *stnam, *cp, *index();
+	char **calloc();
+	FILE *fopen();
+
+	if (argc < 2) {
+		fprintf(stderr,
+	"Usage: %s [-lsite][-dsite][-dsite!site][-asite!site] mapfile...\n",
+			argv[0]);
+		exit(1);
+		}
+
+	Begsite = NULL;
+	i = 0;
+	argc--;
+	dno = 0;
+	ano = 0;
+	twoflg = 0;
+	stnam = SYSNAME;
+/*
+ * scan for options we can take care of now.  Allocate space for -a and -d
+ * options.
+ */
+	while(i++ < argc) {
+		if (argv[i][0] == '-') {
+			switch(argv[i][1]) {
+				case 'l':  stnam = &argv[i][2];
+					   break;
+
+				case '2':  twoflg = 1;
+					   break;
+
+				case 'd':  dno++;
+					   break;
+
+				case 'a':  ano++;
+					   break;
+
+				default:   fprintf(stderr, "Bad option %s\n",
+						argv[i]);
+					   exit(1);
+				}
+			}
+		}
+	if (dno != 0) {
+		if ((dsites = calloc(dno, sizeof(char *))) == NULL) {
+			fprintf(stderr, "Can't get mem for -d options");
+			exit(4);
+			}
+		}
+	if (ano != 0) {
+		if ((asites = calloc(ano, sizeof(char *))) == NULL) {
+			fprintf(stderr, "Can't get mem for -a options");
+			exit(4);
+			}
+		}
+	ano = 0;
+	dno = 0;
+	i = 0;
+/*
+ * Loop through the map data files, building the site & connection data
+ */
+	while(i++ < argc) {
+
+		if (argv[i][0] == '-') {
+			switch(argv[i][1]) {
+
+				case 'd':  dsites[dno++] = &argv[i][2];
+					   break;
+
+				case 'a':  asites[ano++] = &argv[i][2];
+					   break;
+				}
+			continue;
+			}
+
+		map = fopen(argv[i], "r");
+		if (map == NULL) {
+			fprintf(stderr, "Cannot open %s for map input\n",
+				argv[i]);
+			exit(2);
+			}
+		while(fgets(buf, BUFSIZ, map) != NULL) {
+/*
+ * look for a "Name:" field
+ */
+			if ((upcase(buf))&&(strncmp(buf,"NAME:",5)==0)) {
+/*
+ * find out if the current site is in our list.  If not, add it to the
+ * list.
+ */
+			    if (sscanf(buf, "NAME: %s", tmp)!=1)
+				continue;
+			    curptr = getsite(tmp);
+			    buf[0] = '\0';
+/*
+ * now grab the first connected site name, if any.
+ */
+			    if (getcon(buf, tmp, 1)) {
+/*
+ * allocate space for the path structure, then check to see if the
+ * connection is a "known" site.  If it isn't, add it to our list
+ * of "known" sites.  Make the recently allocated path structure
+ * point to the site, and link it in with the rest of the connection
+ * info.
+ */
+				curptr->conn = ptalloc();
+				conptr = curptr->conn;
+				conptr->siteptr=getsite(tmp);
+/*
+ * now get the rest of the connected site names
+ */
+				while(getcon(buf, tmp, 0)) {
+				    conptr->nxtpath = ptalloc();
+				    conptr = conptr->nxtpath;
+				    conptr->siteptr = getsite(tmp);
+				    }
+				}
+			    }
+			}
+		fclose(map);
+		}
+/*
+ * add any connections specified on the command line
+ */
+	while(ano--) {
+		if ((cp=index(asites[ano],'!')) == NULL) {
+			fprintf(stderr,
+				"Warning: -a%s is an invalid -a command.\n",
+				asites[ano]);
+			continue;
+			}
+		*cp++ = '\0';
+		curptr = getsite(asites[ano]);
+		sptr = getsite(cp);
+/*
+ * go through connection list for site1, and make sure site2 is not already
+ * connected.
+ */
+		conptr = curptr->conn;
+		while(conptr != NULL) {
+			if (conptr->siteptr->name == sptr->name)
+				break;
+			conptr = conptr->nxtpath;
+			}
+		if (conptr == NULL) {
+/*
+ * add the site into the connection list.
+ */
+			conptr = curptr->conn;
+			curptr->conn = ptalloc();
+			curptr->conn->nxtpath = conptr;
+			curptr->conn->siteptr = sptr;
+			}
+		}
+
+/*
+ * go through the list and make sure the connections are two way.
+ */
+    if (twoflg) {
+	curptr = Begsite;
+	while(curptr != NULL) {
+		twoptr = curptr->conn;
+/*
+ * loop through each site's connection list
+ */		while(twoptr != NULL) {
+
+			conptr = twoptr->siteptr->conn;
+/*
+ * loop through the connection's connections, looking for the current
+ * site.  Add the site to the connection's connections if it is not
+ * found.
+ */
+			while((conptr != NULL) && (conptr->siteptr != curptr))
+				conptr = conptr->nxtpath;
+			if (conptr == NULL) {
+				lnkptr = ptalloc();
+				lnkptr->siteptr = curptr;
+				lnkptr->nxtpath = twoptr->siteptr->conn;
+				twoptr->siteptr->conn = lnkptr;
+				}
+			twoptr = twoptr->nxtpath;
+			}
+		curptr = curptr->nxtsite;
+		}
+	    }
+/*
+ * now handle the -d options.
+ */
+	while( dno-- ) {
+/*
+ * if a '!' is not in the argument, remove the site name.
+ */
+		if ((cp=index(dsites[dno], '!')) == NULL) {
+			curptr = search(dsites[dno]);
+			if (curptr == NULL) {
+				fprintf(stderr,
+					"Warning: site %s already removed\n",
+					dsites[dno]);
+				continue;
+				}
+			remsite(curptr);	/* remove the site */
+			}
+/*
+ * otherwise, remove the connection from the first site to the second site
+ */
+		else {
+			*cp++ = '\0';
+			curptr = search(dsites[dno]);
+			sptr = search(cp);
+			if (curptr == NULL || sptr == NULL ) {
+				fprintf(stderr,
+				   "Warning: connection %s!%s non-existent\n",
+				    dsites[dno], cp);
+				continue;
+				}
+			rempath(curptr, sptr);	/* remove the connection */
+			}
+		}
+/*
+ * look for the starting point
+ */
+	Strsite = search(stnam);
+	if (Strsite == NULL) {
+		fprintf(stderr, "cannot find site %s\n", stnam);
+		exit(3);
+		}
+/*
+ * The hard part -- create the UUCP route for every site.  Paths() is
+ * a recursive routine that wanders through the connection info
+ * looking for the best way to get somewhere.
+ */
+	paths(Strsite);
+
+/*
+ * now that paths has finished, output the routing information.
+ * All we have to do is traverse the "route" pointers!
+ */
+	curptr = Begsite;
+	while(curptr != NULL) {
+		if (curptr->route != NULL) {
+			printf("%s\t", curptr->name);
+			proute(curptr);
+			printf("%%s\n");
+			}
+		curptr = curptr->nxtsite;
+		}
+	}
+
+/*
+ * search() searches the "known" sites, looking for the site name
+ * passed to it.  If it finds it, it returns the site pointer to
+ * it. Otherwise, it returns NULL.
+ */
+
+struct site *search(nam)
+register char *nam;
+{
+	register struct site *sp;
+
+	sp = Begsite;
+	while(sp != NULL) {
+		if (strcmp(sp->name, nam) == 0)
+			return(sp);
+		sp = sp->nxtsite;
+		}
+	return(NULL);
+	}
+
+/*
+ * getsite() searchs the site list for a given site.  If the site is not
+ * found, it adds the site name passed to it to the list of "known"
+ * sites.  It allocates the site structure & space for the name,
+ * copies the name, and links everything in.  It returns a pointer to
+ * the site structure.
+ */
+
+struct site *getsite(nam)
+register char *nam;
+{
+	char *malloc(), *calloc();
+	register char *cp;
+	register struct site *sp;
+	struct site *search();
+
+	cp = nam;	/* remove any junk from the name */
+	while (*cp) {
+		if (isspace(*cp) || *cp == ',') {
+			*cp = '\0';
+			break;
+			}
+		cp++;
+		}
+
+	if ((sp = search(nam)) != NULL)
+		return(sp);
+
+	sp = (struct site *)calloc(1, sizeof(struct site));
+	if (sp == NULL) {
+		fprintf(stderr, "Cannot get mem for new site!\n");
+		exit(4);
+		}
+	cp = malloc(strlen(nam) + 1);
+	if (cp == NULL) {
+		fprintf(stderr, "Cannot get mem for name!\n");
+		exit(4);
+		}
+	strcpy(cp, nam);
+	sp->name = cp;
+	sp->nxtsite = Begsite;
+	Begsite = sp;
+	sp->route = NULL;
+	sp->conn = NULL;
+	return(sp);
+	}
+
+/*
+ * getcon() grabs a site name from the "Usenet:" field or the "UUCP:"
+ * field.  If the buffer passed is empty, it reads from the map file.
+ * if it reads a "Name:" field, it returns false.  If it reads a line
+ * with a colon in it and the passed flag is false, it returns false.
+ * It reads until there is something on the line that is not a blank,
+ * tab, comma, or a newline.  Once there is something useful in the
+ * buffer, it removes the first "word" terminated by a blank, tab, comma,
+ * or newline and returns true.
+ */
+
+getcon(buf, name, flag)
+char *buf;
+register char *name;
+int flag;
+{
+	long ftell(), pos;
+	register char *cp0, *cp1;
+	char *fgets(), *wrdpos();
+
+	cp0 = buf;
+	cp1 = wrdpos(cp0);
+	pos = ftell(map);
+/*
+ * read until there is some useful data in buf
+ */
+	while((cp1==NULL)&&((cp0=fgets(buf,BUFSIZ,map))!=NULL)) {
+/*
+ * if there is a colon on this line, see if its a "Name:" field, "Usenet:"
+ * field, or a "UUCP:" field.
+ */
+		if (upcase(cp0)) {
+			if (strncmp(cp0, "NAME:", 5) == 0) {
+				fseek(map, pos, 0);
+				return(0);
+				}
+			if (strncmp(cp0, "USENET:", 7) == 0)
+				cp0 += 7;
+			else if (strncmp(cp0, "UUCP:", 5) == 0)
+				cp0 += 5;
+			else if (!flag) {
+				fseek(map, pos, 0);
+				return(0);
+				}
+			else *cp0 = '\0';
+			}
+		else if (flag) *cp0 = '\0';
+		pos = ftell(map);
+		cp1 = wrdpos(cp0);
+		}
+	if (cp0 == NULL) {
+		fseek(map, pos, 0);
+		return(0);
+		}
+/*
+ * now that there is some data, we copy the first "word" into name, and
+ * remove the "word" from buf, returning true.
+ */
+	while((*cp1) && (!isspace(*cp1)) && (*cp1 != ','))
+		*name++ = *cp1++;
+	*name = '\0';
+	cp1 = wrdpos(cp1);
+	if (cp1 == NULL)
+		*buf = '\0';
+	else strcpy(buf, cp1);
+	return(1);
+	}
+
+/*
+ * ptalloc() allocates a path structure.
+ */
+struct path *ptalloc()
+{
+	char *calloc();
+	register struct path *ptr;
+
+	ptr = (struct path *)calloc(1, sizeof(struct path));
+	if (ptr == NULL) {
+		fprintf(stderr, "Cannot allocate memory for path\n");
+		exit(4);
+		}
+	ptr->siteptr = NULL;
+	ptr->nxtpath = NULL;
+	return(ptr);
+	}
+
+/*
+ * paths() does all the dirty work.  For each site in the connection list,
+ * it checks the hop count of the stored route and the current route.
+ * if the current route is shorter or there is no stored route, it
+ * and assigns the current route as the stored route.
+ * it then calls itself with the current site's connection list.
+ */
+
+paths(sptr)
+struct site *sptr;
+{
+	register struct path *pptr;
+	register struct site *conptr;
+	int scnt, hopcnt();
+	register int cnt;
+
+/*
+ * loop through all the connections
+ */
+#ifdef DEBUG
+/*DBG*/ printf("\npaths:  at site %s\n", sptr->name);
+#endif
+	scnt = hopcnt(sptr);
+	pptr = sptr->conn;
+	while(pptr != NULL) {
+		conptr = pptr->siteptr;
+		if (conptr != Strsite) {
+		    cnt = hopcnt(conptr->route);
+/*
+ * if there is no stored route or if the stored route is longer than
+ * the current route, replace it.
+ */
+		    if ((cnt == 0) || (cnt >= scnt)) {
+#ifdef DEBUG
+/*DBG*/ printf("changing path for %s.\nOld: ",conptr->name);
+/*DBG*/	proute(conptr->route);
+/*DBG*/	printf("\nNew:  ");
+/*DBG*/	proute(sptr);
+/*DBG*/	printf("\n");
+#endif
+			conptr->route = sptr;
+/*
+ * final step, call paths() with this site's list of connections
+ */
+			paths(conptr);
+#ifdef DEBUG
+/*DBG*/ printf("back from paths, now in %s\n", sptr->name);
+#endif
+			}
+		    }
+		pptr = pptr->nxtpath;
+		}
+	}
+
+/*
+ * upcase() first scans to see if there is a colon in the buffer passed
+ * to it.  If not, it returns false.  Otherwise, it converts everything
+ * in the buffer up to the colon to uppercase and returns true.
+ */
+
+upcase(buf)
+register char *buf;
+{
+	register char *cp;
+	char *index();
+
+	cp = index(buf, ':');
+	if (cp == NULL)
+		return(0);
+
+	while(buf != cp) {
+		if (islower(*buf))
+			*buf = toupper(*buf);
+		buf++;
+		}
+	return(1);
+	}
+
+/*
+ * wrdpos() returns a pointer to the first character that is not a
+ * blank, tab, comma, or newline.  If it can't find one, it returns
+ * NULL.
+ */
+
+char *wrdpos(buf)
+register char *buf;
+{
+	while((*buf) && (isspace(*buf)||(*buf==',')))
+		buf++;
+	if (*buf)
+		return(buf);
+	return(NULL);
+	}
+
+/*
+ * hopcnt() returns the number of site structures in the routing list its
+ * argument points to.
+ */
+
+hopcnt(sptr)
+register struct site *sptr;
+{
+	register int cnt;
+
+	cnt = 0;
+	while(sptr != NULL) {
+		cnt++;
+		sptr = sptr->route;
+		}
+	return(cnt);
+	}
+
+/*
+ * proute() prints out the way to get to the passed site.  It calls itself
+ * with a pointer to the next site in the route, then prints the current
+ * site name.
+ */
+
+proute(sptr)
+register struct site *sptr;
+{
+	if (sptr == NULL || sptr->route == NULL)
+		return;
+	proute(sptr->route);
+	printf("%s!", sptr->name);
+	}
+
+/*
+ * rempath removes the connection from its first argument to its
+ * second argument.
+ */
+
+rempath(sptr, cptr)
+register struct site *sptr, *cptr;
+{
+	register struct path *pptr;
+	struct path *pptr0;
+
+	pptr = sptr->conn;
+/*
+ * loop through connections
+ */
+	while( pptr != NULL) {
+		if (pptr->siteptr == cptr) {
+/*
+ * found the connection, now must remove it.
+ */
+			if (pptr == sptr->conn) {
+				sptr->conn = pptr->nxtpath;
+				free(pptr);
+				pptr = sptr->conn;
+				}
+			else {
+				pptr0->nxtpath = pptr->nxtpath;
+				free(pptr);
+				pptr = pptr0->nxtpath;
+				}
+			}
+		else {
+			pptr0 = pptr;
+			pptr = pptr->nxtpath;
+			}
+		}
+	}
+
+/*
+ * remsite removes a site from the data base.
+ */
+
+remsite(sptr)
+register struct site *sptr;
+{
+	register struct site *sitep, *sitep0;
+	struct path *pptr, *pptr0;
+
+	sitep = Begsite;
+/*
+ * search the site list for the one we want.
+ */
+	while( sitep != NULL) {
+		if (sitep == sptr) {
+/*
+ * we found it.  Now free up the name and the connection list.
+ */
+			free(sptr->name);
+			pptr = sptr->conn;
+			while(pptr != NULL) {
+				pptr0 = pptr->nxtpath;
+				free(pptr);
+				pptr = pptr0;
+				}
+/*
+ * now link the data around the site.
+ */
+			if (sitep == Begsite) {
+				Begsite = sitep->nxtsite;
+				free(sitep);
+				sitep = Begsite;
+				}
+			else {
+				sitep0->nxtsite = sitep->nxtsite;
+				free(sitep);
+				sitep = sitep0->nxtsite;
+				}
+			}
+		else {
+/*
+ * remove any connections between the current site & the one we are removing
+ */
+			rempath(sitep, sptr);
+			sitep0 = sitep;
+			sitep = sitep->nxtsite;
+			}
+		}
+	}
+
+

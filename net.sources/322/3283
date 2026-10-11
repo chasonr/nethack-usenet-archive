@@ -1,0 +1,404 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,5310021332fb3bf5
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-09-12 19:50:37 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site pur-ee.UUCP
+Path: utzoo!linus!decvax!bellcore!petrus!sabre!zeta!epsilon!gamma!ulysses!mhuxr!mhuxt!houxm!ihnp4!inuxc!pur-ee!davy
+From: davy@pur-ee.UUCP (Dave Curry)
+Newsgroups: net.sources
+Subject: Re: lock your terminal for lunch
+Message-ID: <3291@pur-ee.UUCP>
+Date: Thu, 12-Sep-85 22:50:37 EDT
+Article-I.D.: pur-ee.3291
+Posted: Thu Sep 12 22:50:37 1985
+Date-Received: Sat, 14-Sep-85 04:50:17 EDT
+References: <132@pyuxv.UUCP> <790@mcnc.mcnc.UUCP>
+Reply-To: davy@pur-ee.UUCP (Dave Curry)
+Organization: Electrical Engineering Department , Purdue University
+Lines: 381
+Summary: 
+
+
+Here's the program I've been using for several years now to lock
+terminals... as far as I can tell, it is uninterruptible.  On 4.2BSD
+systems, you may want to change the signal calls to sigvec calls to
+avoid the extra time spent in the library routines, but I haven't
+found it to be necessary.
+
+This program was designed primarily for public terminal rooms, thus
+the timeout.  We used to have problems with people walking off and
+forgetting they had one of these running, effectively locking the
+terminal until a super-user could be found.  If you don't like the
+idea of a timeout, set it to something huge.
+
+Note also that since only the first argument is looked at, you can
+run this as "gone 10 - went to the coffee machine" or whatever, for
+the benefit of those who want to "ps" your terminal.
+
+--Dave Curry
+
+/*---------------------------- CUT HERE ----------------------------*/
+
+/*
+ * gone - terminal hold program which permits limited command execution.
+ *
+ * Usage: gone [maxtime]
+ *
+ * This program locks up a terminal for maxtime minutes (default DEFTIME).
+ * In order to prevent "infinite" locks, maxtime is limited to no more
+ * than MAXTIME minutes.  In order to prevent the terminal from being
+ * entirely useless, the commands listed in the "valcoms" array may be
+ * executed from within the program.  Note that we only do "simple"
+ * execution, i.e., just exec the arguments as typed.
+ *
+ * When executed, the user is prompted for a password which will be used
+ * to release the terminal.  The terminal is then locked until BREAK is
+ * pressed, at which time the user is prompted for the password to
+ * release the terminal.  The terminal will only be released if the
+ * password is typed correctly.
+ *
+ * BUG: if you run this from a subshell of the c-shell, then the
+ * autologout code will only terminate you down to the parent shell,
+ * rather than logging you off all the way.  This is because we kill by
+ * process group, and the parent shell is not in this process group.
+ * Note also that if you run csh, background jobs will not be killed.
+ *
+ * David A. Curry
+ * Purdue Engineering Computer Network
+ * {decvax, ihnp4, ucbvax}!pur-ee!davy
+ * davy@purdue-ecn.arpa
+ *
+ */
+#include <sys/time.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <sgtty.h>
+#include <stdio.h>
+
+#define DEFTIME	15			/* default time until logout	*/
+#define MAXTIME 30			/* maximum time until logout	*/
+
+/*
+ * List of commands which we will allow to be executed from within
+ * the program.  Don't put anything "dangerous" in here.
+ */
+char *valcoms[] = {
+	"date",
+	"f",
+	"finger",
+	"lpc",
+	"lpq",
+	"lprm",
+	"name",
+	"tty",
+	"uid",
+	"wh",
+	"when",
+	"where",
+	"who",
+	0,
+};
+
+char *getpass(), *handler(), *asctime(), *ctime();
+struct tm *gmtime();
+
+jmp_buf env;
+char password[32];
+
+int logtime;				/* amount of secs to hold for	*/
+int pid, ppid, proid;			/* process id's of all processes*/
+long lontime, lofftime;			/* start and finish times	*/
+
+main(argc, argv)
+int argc;
+char **argv;
+{
+	char *a;
+	int i, first;
+	char c, command[1024];
+	char stdoutbuf[BUFSIZ];
+
+	setbuf(stdout, stdoutbuf);
+	
+	first = 0;
+
+	if (argc > 1) {
+		logtime = atoi(argv[1]);
+
+		if (logtime < 5)
+			logtime = 5;
+	}
+	else {
+		logtime = DEFTIME;
+	}
+
+	if (logtime > MAXTIME)
+		logtime = MAXTIME;
+
+	logtime *= 60;			/* convert minutes to seconds 	*/
+
+	time(&lontime);			/* get the starting time      	*/
+
+
+	/*
+	 * Don't permit running from non-ttys.
+	 */
+	if (nottty())
+		exit(1);
+
+	signal(SIGTSTP, SIG_IGN);
+
+	/*
+	 * Get the locking password.
+	 */
+	a = getpass("Password: ");
+	strcpy(password, a);
+	
+	a = getpass("Retype: ");
+
+	if (strcmp(password, a) != 0) {
+		printf("Abort - passwords do not match\n");
+		exit(1);
+	}
+
+	ppid = getppid();		/* get shell's process id	*/
+	proid = getpid();		/* get this process id		*/
+
+	while ((pid = fork()) < 0) {
+		printf("Cannot fork -- retrying...\n");
+		fflush(stdout);
+		sleep(5);
+	}
+
+	if (pid == 0) {			/* we're in the fork		*/
+		/*
+		 * Ignore all signals.
+		 */
+		for (i=0; i < NSIG; i++)
+			signal(i, SIG_IGN);
+
+		signal(SIGALRM, SIG_DFL);
+
+		sleep(logtime - 120);
+
+		printf("\nTimeout in 2 minutes\n");
+		fflush(stdout);
+		sleep(60);
+
+		printf("\nTimeout in 60 seconds\n");
+		fflush(stdout);
+		sleep(60);
+
+		printf("\nTerminal timeout\n");
+		fflush(stdout);
+
+		kill(ppid, SIGKILL);		/* kill the shell */
+		kill(proid, SIGKILL);		/* kill the first gone */
+
+		exit(0);			/* die */
+	}
+
+	signal(SIGHUP, SIG_IGN);
+	signal(SIGINT, SIG_IGN);
+	signal(SIGQUIT, SIG_IGN);
+	signal(SIGTERM, SIG_IGN);
+	signal(SIGTSTP, SIG_IGN);
+
+	setjmp(env);			/* we come back to here each time */
+
+	signal(SIGINT, handler);
+
+	/*
+	 * Clear the screen.  Stupidly, we assume ^L or ^Z
+	 * will clear it.
+	 */
+	printf("\014\032");
+
+	/*
+	 * Print the info about how long we're holding for.
+	 */
+	if (first == 0) {
+		printf("%d min. hold initialized at ", logtime/60);
+		printf("%8.8s\n", (ctime(&lontime)+11));
+		first = 1;
+	}
+
+	/*
+	 * Print an in-use message.
+	 */
+	inuse();
+
+	/*
+	 * Loop, looking like a shell.
+	 */
+loop:	printf("$ ");
+	fflush(stdout);
+	*command = NULL;
+	
+	if (gets(command) == NULL) {
+		clearerr(stdin);
+		printf("\n");
+		goto loop;
+	}
+
+	if ((*command != '\n') && (*command != NULL))
+		runcom(command);
+
+	signal(SIGINT, handler);
+	goto loop;
+}
+
+/*
+ * runcom - run the command.
+ */
+runcom(command)
+char *command;
+{
+	char *args[32];
+	char com[1024];
+	register int i, j;
+
+	strcpy(com, command);
+
+	j = 0;
+	args[j++] = com;
+
+	/*
+	 * Split up the arguments.
+	 */
+	for (i=0; com[i] != NULL; i++) {
+		if (com[i] == ' ') {
+			com[i++] = NULL;
+			
+			if (j < 24)
+				args[j++] = (com+i);
+		}
+	}
+
+	args[j] = NULL;
+
+	/*
+	 * If it's not legal, don't run the command.
+	 */
+	if (lookup(args[0]) < 0) {
+		printf("That command is not permitted from this shell.\n");
+		return;
+	}
+
+	execute(command, args);
+}
+
+/*
+ * lookup - look up the command in the valid commands list.
+ */
+lookup(name)
+char *name;
+{
+	int i;
+
+	for (i=0; valcoms[i] != NULL; i++) {
+		if (!strcmp(name, valcoms[i]))
+			return(1);
+	}
+
+	return(-1);
+}
+
+/*
+ * execute - execute the command.
+ */
+execute(command, args)
+char *command;
+char **args;
+{
+	int zid;
+
+	while ((zid = fork()) < 0) {
+		printf("Cannot fork -- retrying...\n");
+		fflush(stdout);
+		sleep(5);
+	}
+
+	/*
+	 * The child tries the exec; if this fails,
+	 * we bag it and use system.
+	 */
+	if (zid == 0) {
+		execvp(args[0], args);
+
+		system(command);
+	}
+
+	while (wait((int *)0) != zid)
+		;
+}
+
+/*
+ * handler - handle interrupts.
+ */
+char *handler()
+{
+	char *attempt;
+	long ttime;
+
+	signal(SIGINT, SIG_IGN);
+	signal(SIGALRM, SIG_IGN);
+
+	/*
+	 * Get the password.
+	 */
+	printf("\n");
+	fflush(stdout);
+	attempt = getpass("Password: ");
+
+	/*
+	 * If valid, release the terminal.
+	 */
+	if (strcmp(attempt, password) == 0) {
+		kill(pid, SIGKILL);		/* kill the child */
+
+		time(&lofftime);
+
+		ttime = lofftime - lontime;
+
+		printf("Gone for: %5.5s\n\n", (asctime(gmtime(&ttime))+14));
+		exit(0);
+	}
+	else {
+		signal(SIGALRM, SIG_DFL);
+		longjmp(env);
+		return;
+	}
+}
+
+/*
+ * inuse - print the in use banner.
+ */
+inuse()
+{
+	printf("\n\n\n\n\n\n\n\n");
+	printf("\t\t   XXXXX  XX    X        X    X  XXXXX  XXXXX\n");
+	printf("\t\t     X    X X   X        X    X  X      X    \n");
+	printf("\t\t     X    X  X  X        X    X  XXXXX  XXX  \n");
+	printf("\t\t     X    X   X X        X    X      X  X    \n");
+	printf("\t\t   XXXXX  X    XX        XXXXXX  XXXXX  XXXXX\n");
+}
+
+/*
+ * nottty - return 1 if this isn't a tty.
+ */
+nottty()
+{
+	signal(SIGTSTP, SIG_IGN);
+
+	if (isatty(2) == 0) {
+		printf("Cannot run gone without a tty.\n");
+		fflush(stdout);
+		return(1);
+	}
+
+	return(0);
+}
+
+

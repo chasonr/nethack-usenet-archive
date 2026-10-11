@@ -1,0 +1,1074 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,e2bcd3c0766dd2ad
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1987-02-02 18:14:03 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!watmath!clyde!rutgers!ucla-cs!sdcrdcf!psivax!csun!aeusemrs
+From: aeusemrs@csun.UUCP
+Newsgroups: net.sources
+Subject: ARC for System V R2 (3 of 3)
+Message-ID: <543@csun.UUCP>
+Date: Mon, 2-Feb-87 21:14:03 EST
+Article-I.D.: csun.543
+Posted: Mon Feb  2 21:14:03 1987
+Date-Received: Wed, 4-Feb-87 07:06:03 EST
+References: <542@csun.UUCP>
+Reply-To: aeusemrs@csun.UUCP (Mike Stump)
+Organization: California State University, Northridge
+Lines: 1053
+
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#	arcs.h
+#	arcsq.c
+#	arcsvc.c
+#	arctst.c
+#	arcunp.c
+#	arcusq.c
+# This archive created: Mon Feb  2 18:00:36 1987
+export PATH; PATH=/bin:$PATH
+if test -f 'arcs.h'
+then
+	echo shar: will not over-write existing file "'arcs.h'"
+else
+cat << \SHAR_EOF > 'arcs.h'
+/*  ARC - Archive utility - Archive file header format
+
+System V Version 1.0 based upon:
+    Version 2.12, created on 12/17/85 at 14:40:26
+
+(C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+
+    By:  Thom Henderson
+
+    Description:
+         This file defines the format of an archive file header, excluding
+         the archive marker and the header version number.
+
+         Each entry in an archive begins with a one byte archive marker,
+         which is set to 26.  The marker is followed by a one byte
+         header type code, from zero to 7.
+
+         If the header type code is zero, then it is an end marker, and
+         no more data should be read from the archive.
+
+         If the header type code is in the range 2 to 7, then it is
+         followed by a standard archive header, which is defined below.
+
+         If the header type code is one, then it is followed by an older
+         format archive header.  The older format header does not contain
+         the true length.  A header should be read for a length of
+         sizeof(struct heads)-sizeof(long).  Then set length equal to size
+         and change the header version to 2.
+
+    Programming note:
+         The crc value given in the header is based on the unpacked data.
+*/
+
+struct heads                           /* archive entry header format */
+{   char name[FNLEN];                  /* file name */
+    long size;                         /* size of file, in bytes */
+    unsigned INT date;                 /* creation date */
+    unsigned INT time;                 /* creation time */
+    INT crc;                           /* cyclic redundancy check */
+    long length;                       /* true file length */
+}   ;
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'arcsq.c'
+then
+	echo shar: will not over-write existing file "'arcsq.c'"
+else
+cat << \SHAR_EOF > 'arcsq.c'
+/*  ARC - Archive utility - ARCSQ
+
+System V Version 1.0 based upon:
+    Version 3.10, created on 01/30/86 at 20:10:46
+
+(C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+
+    By:  Thom Henderson
+
+    Description:
+         This file contains the routines used to squeeze a file
+         when placing it in an archive.
+
+    Programming notes:
+         Most of the routines used for the Huffman squeezing algorithm
+         were lifted from the SQ program by Dick Greenlaw, as adapted
+         to CI-C86 by Robert J. Beilstein.
+*/
+#include "arc.h"
+
+/* stuff for Huffman squeezing */
+
+#define TRUE 1
+#define FALSE 0
+#define ERROR (-1)
+#define SPEOF 256                      /* special endfile token */
+#define NOCHILD (-1)                   /* marks end of path through tree */
+#define NUMVALS 257                    /* 256 data values plus SPEOF*/
+#define NUMNODES (NUMVALS+NUMVALS-1)   /* number of nodes */
+#define MAXCOUNT (unsigned INT) 65535      /* biggest unsigned integer */
+
+/* The following array of structures are the nodes of the
+   binary trees. The first NUMVALS nodes become the leaves of the
+   final tree and represent the values of the data bytes being
+   encoded and the special endfile, SPEOF.
+   The remaining nodes become the internal nodes of the final tree.
+*/
+
+struct nd                              /* shared by unsqueezer */
+{   unsigned INT weight;                   /* number of appearances */
+ INT tdepth;                        /* length on longest path in tree */
+ INT lchild, rchild;                /* indices to next level */
+}   node[NUMNODES];                    /* use large buffer */
+
+static INT dctreehd;                   /* index to head of final tree */
+
+/* This is the encoding table:
+   The bit strings have first bit in low bit.
+   Note that counts were scaled so code fits unsigned integer.
+*/
+
+static INT codelen[NUMVALS];           /* number of bits in code */
+static unsigned INT code[NUMVALS];         /* code itself, right adjusted */
+static unsigned INT tcode;                 /* temporary code value */
+static long valcount[NUMVALS];         /* actual count of times seen */
+
+/* Variables used by encoding process */
+
+static INT curin;                      /* value currently being encoded */
+static INT cbitsrem;                   /* # of code string bits left */
+static unsigned INT ccode;                 /* current code right justified */
+
+INT init_sq()                              /* prepare for scanning pass */
+{
+ INT i;                             /* node index */
+
+    /* Initialize all nodes to single element binary trees
+       with zero weight and depth.
+    */
+
+    for(i=0; i<NUMNODES; ++i)
+    {    node[i].weight = 0;
+         node[i].tdepth = 0;
+         node[i].lchild = NOCHILD;
+         node[i].rchild = NOCHILD;
+    }
+
+    for(i=0; i<NUMVALS; i++)
+         valcount[i] = 0;
+}
+
+INT scan_sq(c)                             /* add a byte to the tables */
+INT c;                                 /* byte to add */
+{
+    unsigned INT *wp;                      /* speeds up weight counting */
+
+    /* Build frequency info in tree */
+
+    if(c == EOF)                       /* it's traditional */
+         c = SPEOF;                    /* dumb, but traditional */
+
+    if(*(wp = &node[c].weight) !=  MAXCOUNT)
+         ++(*wp);                      /* bump weight counter */
+
+    valcount[c]++;                     /* bump byte counter */
+}
+
+long pred_sq()                         /* predict size of squeezed file */
+{
+ INT i;
+ INT btlist[NUMVALS];               /* list of intermediate b-trees */
+ INT listlen;                       /* length of btlist */
+    unsigned INT ceiling;                  /* limit for scaling */
+    long size = 0;                     /* predicted size */
+ INT numnodes;                      /* # of nodes in simplified tree */
+    INT scale();
+    INT heap();
+    INT bld_tree();
+    INT buildenc();
+    INT init_enc();
+
+    scan_sq(EOF);                      /* signal end of input */
+
+    ceiling = MAXCOUNT;
+
+    /* Keep trying to scale and encode */
+
+    do
+    {    scale(ceiling);
+         ceiling /= 2;                 /* in case we rescale */
+
+         /* Build list of single node binary trees having
+            leaves for the input values with non-zero counts
+         */
+
+         for(i=listlen=0; i<NUMVALS; ++i)
+         {    if(node[i].weight != 0)
+              {    node[i].tdepth = 0;
+                   btlist[listlen++] = i;
+              }
+         }
+
+         /* Arrange list of trees into a heap with the entry
+            indexing the node with the least weight at the top.
+         */
+
+         heap(btlist,listlen);
+
+         /* Convert the list of trees to a single decoding tree */
+
+         bld_tree(btlist,listlen);
+
+         /* Initialize the encoding table */
+
+         init_enc();
+
+         /* Try to build encoding table.
+            Fail if any code is > 16 bits long.
+         */
+    }    while(buildenc(0,dctreehd) == ERROR);
+
+    /* Initialize encoding variables */
+
+    cbitsrem = 0;                      /* force initial read */
+    curin = 0;                         /* anything but endfile */
+
+    for(i=0; i<NUMVALS; i++)           /* add bits for each code */
+         size += valcount[i] * codelen[i];
+
+    size = (size+7)/8;                 /* reduce to number of bytes */
+
+    numnodes = dctreehd<NUMVALS ? 0 : dctreehd-(NUMVALS-1);
+
+    size += sizeof(INT) + 2*numnodes*sizeof(INT);
+
+    return size;
+}
+
+/* The count of number of occurrances of each input value
+   have already been prevented from exceeding MAXCOUNT.
+   Now we must scale them so that their sum doesn't exceed
+   ceiling and yet no non-zero count can become zero.
+   This scaling prevents errors in the weights of the
+   interior nodes of the Huffman tree and also ensures that
+   the codes will fit in an unsigned integer. Rescaling is
+   used if necessary to limit the code length.
+*/
+
+static INT scale(ceil)
+unsigned INT ceil;                         /* upper limit on total weight */
+{
+    register INT i,c;
+ INT ovflw, divisor;
+    unsigned INT w, sum;
+    unsigned char increased;           /* flag */
+
+    do
+    {    for(i=sum=ovflw=0; i<NUMVALS; ++i)
+         {    if(node[i].weight > (ceil-sum))
+                   ++ovflw;
+              sum += node[i].weight;
+         }
+
+         divisor = ovflw + 1;
+
+         /* Ensure no non-zero values are lost */
+
+         increased = FALSE;
+         for(i=0; i<NUMVALS; ++i)
+         {    w = node[i].weight;
+              if(w<divisor && w!=0)
+              {    /* Don't fail to provide a code if it's used at all */
+
+                   node[i].weight = divisor;
+                   increased = TRUE;
+              }
+         }
+    }    while(increased);
+
+    /* Scaling factor choosen, now scale */
+
+    if(divisor>1)
+         for(i=0; i<NUMVALS; ++i)
+              node[i].weight /= divisor;
+}
+
+/* heap() and adjust() maintain a list of binary trees as a
+   heap with the top indexing the binary tree on the list
+   which has the least weight or, in case of equal weights,
+   least depth in its longest path. The depth part is not
+   strictly necessary, but tends to avoid long codes which
+   might provoke rescaling.
+*/
+
+static INT heap(list,length)
+INT list[], length;
+{
+    register INT i;
+    INT adjust();
+
+    for(i=(length-2)/2; i>=0; --i)
+         adjust(list,i,length-1);
+}
+
+/* Make a heap from a heap with a new top */
+
+static INT adjust(list,top,bottom)
+INT list[], top, bottom;
+{
+    register INT k, temp;
+    INT cmptrees();
+
+    k = 2 * top + 1;                   /* left child of top */
+    temp = list[top];                  /* remember root node of top tree */
+
+    if(k<=bottom)
+    {    if(k<bottom && cmptrees(list[k],list[k+1]))
+              ++k;
+
+         /* k indexes "smaller" child (in heap of trees) of top */
+         /* now make top index "smaller" of old top and smallest child */
+
+         if(cmptrees(temp,list[k]))
+         {    list[top] = list[k];
+              list[k] = temp;
+
+              /* Make the changed list a heap */
+
+              adjust(list,k,bottom);   /* recursive */
+         }
+    }
+}
+
+/* Compare two trees, if a > b return true, else return false.
+   Note comparison rules in previous comments.
+*/
+
+static INT cmptrees(a,b)
+INT a, b;                              /* root nodes of trees */
+{
+    if(node[a].weight > node[b].weight)
+         return TRUE;
+    if(node[a].weight == node[b].weight)
+         if(node[a].tdepth > node[b].tdepth)
+              return TRUE;
+    return FALSE;
+}
+
+/* HUFFMAN ALGORITHM: develops the single element trees
+   into a single binary tree by forming subtrees rooted in
+   interior nodes having weights equal to the sum of weights of all
+   their descendents and having depth counts indicating the
+   depth of their longest paths.
+
+   When all trees have been formed into a single tree satisfying
+   the heap property (on weight, with depth as a tie breaker)
+   then the binary code assigned to a leaf (value to be encoded)
+   is then the series of left (0) and right (1)
+   paths leading from the root to the leaf.
+   Note that trees are removed from the heaped list by
+   moving the last element over the top element and
+   reheaping the shorter list.
+*/
+
+static INT bld_tree(list,len)
+INT list[];
+INT len;
+{
+    register INT freenode;             /* next free node in tree */
+    register struct nd *frnp;          /* free node pointer */
+ INT lch, rch;                      /* temps for left, right children */
+ INT i;
+    INT maxchar();
+
+    /* Initialize index to next available (non-leaf) node.
+       Lower numbered nodes correspond to leaves (data values).
+    */
+
+    freenode = NUMVALS;
+
+    while(len>1)
+    {    /* Take from list two btrees with least weight
+            and build an interior node pointing to them.
+            This forms a new tree.
+         */
+
+         lch = list[0];                /* This one will be left child */
+
+         /* delete top (least) tree from the list of trees */
+
+         list[0] = list[--len];
+         adjust(list,0,len-1);
+
+         /* Take new top (least) tree. Reuse list slot later */
+
+         rch = list[0];                /* This one will be right child */
+
+         /* Form new tree from the two least trees using
+            a free node as root. Put the new tree in the list.
+         */
+
+         frnp = &node[freenode];       /* address of next free node */
+         list[0] = freenode++;         /* put at top for now */
+         frnp->lchild = lch;
+         frnp->rchild = rch;
+         frnp->weight = node[lch].weight + node[rch].weight;
+         frnp->tdepth = 1 + maxchar(node[lch].tdepth, node[rch].tdepth);
+
+         /* reheap list  to get least tree at top */
+
+         adjust(list,0,len-1);
+    }
+    dctreehd = list[0];                /* head of final tree */
+}
+
+static INT maxchar(a,b)
+{
+    return a>b ? a : b;
+}
+
+static INT init_enc()
+{
+    register INT i;
+
+    /* Initialize encoding table */
+
+    for(i=0; i<NUMVALS; ++i)
+         codelen[i] = 0;
+}
+
+/* Recursive routine to walk the indicated subtree and level
+   and maintain the current path code in bstree. When a leaf
+   is found the entire code string and length are put into
+   the encoding table entry for the leaf's data value .
+
+   Returns ERROR if codes are too long.
+*/
+
+static INT buildenc(level,root)
+INT level;              /* level of tree being examined, from zero */
+INT root;               /* root of subtree is also data value if leaf */
+{
+    register INT l, r;
+
+    l = node[root].lchild;
+    r = node[root].rchild;
+
+    if(l==NOCHILD && r==NOCHILD)
+    {    /* Leaf. Previous path determines bit string
+            code of length level (bits 0 to level - 1).
+            Ensures unused code bits are zero.
+         */
+
+         codelen[root] = level;
+         code[root] = tcode & (((unsigned INT)~0) >> (16-level));
+         return (level>16) ? ERROR : NULL;
+    }
+
+    else
+    {    if(l!=NOCHILD)
+         {    /* Clear path bit and continue deeper */
+
+              tcode &= ~(1 << level);
+              if(buildenc(level+1,l)==ERROR)
+                   return ERROR;       /* pass back bad statuses */
+         }
+         if(r!=NOCHILD)
+         {    /* Set path bit and continue deeper */
+
+              tcode |= 1 << level;
+              if(buildenc(level+1,r)==ERROR)
+                   return ERROR;       /* pass back bad statuses */
+         }
+    }
+    return NULL;                       /* it worked if we reach here */
+}
+
+static INT put_int(n,f)                    /* output an integer */
+INT n;                                 /* integer to output */
+FILE *f;                               /* file to put it to */
+{
+    putc_pak(n&0xff,f);                /* first the low byte */
+    putc_pak(n>>8,f);                  /* then the high byte */
+}
+
+/* Write out the header of the compressed file */
+
+static long wrt_head(ob)
+FILE *ob;
+{
+    register INT l,r;
+ INT i, k;
+ INT numnodes;                      /* # of nodes in simplified tree */
+
+    /* Write out a simplified decoding tree. Only the interior
+       nodes are written. When a child is a leaf index
+       (representing a data value) it is recoded as
+       -(index + 1) to distinguish it from interior indexes
+       which are recoded as positive indexes in the new tree.
+
+       Note that this tree will be empty for an empty file.
+    */
+
+    numnodes = dctreehd<NUMVALS ? 0 : dctreehd-(NUMVALS-1);
+    put_int(numnodes,ob);
+
+    for(k=0, i=dctreehd; k<numnodes; ++k, --i)
+    {    l = node[i].lchild;
+         r = node[i].rchild;
+         l = l<NUMVALS ? -(l+1) : dctreehd-l;
+         r = r<NUMVALS ? -(r+1) : dctreehd-r;
+         put_int(l,ob);
+         put_int(r,ob);
+    }
+
+    return sizeof(INT) + numnodes*2*sizeof(INT);
+}
+
+/* Get an encoded byte or EOF. Reads from specified stream AS NEEDED.
+
+   There are two unsynchronized bit-byte relationships here.
+   The input stream bytes are converted to bit strings of
+   various lengths via the static variables named c...
+   These bit strings are concatenated without padding to
+   become the stream of encoded result bytes, which this
+   function returns one at a time. The EOF (end of file) is
+   converted to SPEOF for convenience and encoded like any
+   other input value. True EOF is returned after that.
+*/
+
+static INT gethuff(ib)                 /* Returns bytes except for EOF */
+FILE *ib;
+{
+ INT rbyte;                         /* Result byte value */
+ INT need, take;                    /* numbers of bits */
+
+    rbyte = 0;
+    need = 8;                          /* build one byte per call */
+
+    /* Loop to build a byte of encoded data.
+       Initialization forces read the first time.
+    */
+
+loop:
+    if(cbitsrem>=need)                 /* if current code is big enough */
+    {    if(need==0)
+              return rbyte;
+
+         rbyte |= ccode << (8-need);   /* take what we need */
+         ccode >>= need;               /* and leave the rest */
+         cbitsrem -= need;
+         return rbyte & 0xff;
+    }
+
+    /* We need more than current code */
+
+    if(cbitsrem>0)
+    {    rbyte |= ccode << (8-need);   /* take what there is */
+         need -= cbitsrem;
+    }
+
+    /* No more bits in current code string */
+
+    if(curin==SPEOF)
+    {    /* The end of file token has been encoded. If
+            result byte has data return it and do EOF next time.
+         */
+
+         cbitsrem = 0;
+         return (need==8) ? EOF : rbyte + 0;
+    }
+
+    /* Get an input byte */
+
+    if((curin=getc_ncr(ib)) == EOF)
+         curin = SPEOF;                /* convenient for encoding */
+
+    ccode = code[curin];               /* get the new byte's code */
+    cbitsrem = codelen[curin];
+
+    goto loop;
+}
+
+/*  This routine is used to perform the actual squeeze operation.  It can
+    only be called after the file has been scanned.  It returns the true
+    length of the squeezed entry.
+*/
+
+long file_sq(f,t)                      /* squeeze a file into an archive */
+FILE *f;                               /* file to squeeze */
+FILE *t;                               /* archive to receive file */
+{
+ INT c;                             /* one byte of squeezed data */
+    long size;                         /* size after squeezing */
+
+    size = wrt_head(t);                /* write out the decode tree */
+
+    while((c=gethuff(f))!=EOF)
+    {    putc_pak(c,t);
+         size++;
+    }
+
+    return size;                       /* report true size */
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'arcsvc.c'
+then
+	echo shar: will not over-write existing file "'arcsvc.c'"
+else
+cat << \SHAR_EOF > 'arcsvc.c'
+/*  ARC - Archive utility - ARCSVC
+
+System V Version 1.0 based upon:
+    Version 2.15, created on 12/17/85 at 15:17:16
+
+(C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+
+    By:  Thom Henderson
+
+    Description:
+         This file contains service routines needed to maintain an archive.
+*/
+#include "arc.h"
+
+INT openarc(chg)                       /* open archive */
+INT chg;                               /* true to open for changes */
+{
+    FILE *fopen();                     /* file opener */
+
+    if(!(arc=fopen(arcname,"r")))
+    {    if(chg)
+              printf("Creating new archive: %s\n",arcname);
+         else abort("Cannot read archive: %s",arcname);
+    }
+
+    if(chg)                            /* if opening for changes */
+         if(!(new=fopen(newname,"w")))
+              abort("Cannot create archive copy: %s",newname);
+}
+
+INT closearc(chg)                          /* close an archive */
+INT chg;                               /* true if archive was changed */
+{
+    if(arc)                            /* if we had an initial archive */
+         fclose(arc);                  /* then close it */
+
+    if(chg)                            /* if things have changed */
+    {    setstamp(new,arcdate,arctime);/* archive matches newest file */
+         fclose(new);                  /* close the new copy */
+
+         if(arc)                       /* if we had an original archive */
+         {    if(keepbak)              /* if a backup is wanted */
+              {    unlink(bakname);    /* erase any old copies */
+                   if(rename(arcname,bakname))
+                        abort("Cannot rename %s to %s",arcname,bakname);
+                   printf("Keeping backup archive: %s\n",bakname);
+              }
+              else if(unlink(arcname))
+                   abort("Cannot delete old archive: %s",arcname);
+         }
+
+         if(rename(newname,arcname))
+              abort("Cannot rename %s to %s",newname,arcname);
+    }
+}
+
+/* CRC computation logic
+
+   The logic for this method of calculating the CRC 16 bit polynomial
+   is taken from an article by David Schwaderer in the April 1985
+   issue of PC Tech Journal.
+*/
+
+static INT crctab[] =                  /* CRC lookup table */
+{   0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
+    0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
+    0xCC01, 0x0CC0, 0x0D80, 0xCD41, 0x0F00, 0xCFC1, 0xCE81, 0x0E40,
+    0x0A00, 0xCAC1, 0xCB81, 0x0B40, 0xC901, 0x09C0, 0x0880, 0xC841,
+    0xD801, 0x18C0, 0x1980, 0xD941, 0x1B00, 0xDBC1, 0xDA81, 0x1A40,
+    0x1E00, 0xDEC1, 0xDF81, 0x1F40, 0xDD01, 0x1DC0, 0x1C80, 0xDC41,
+    0x1400, 0xD4C1, 0xD581, 0x1540, 0xD701, 0x17C0, 0x1680, 0xD641,
+    0xD201, 0x12C0, 0x1380, 0xD341, 0x1100, 0xD1C1, 0xD081, 0x1040,
+    0xF001, 0x30C0, 0x3180, 0xF141, 0x3300, 0xF3C1, 0xF281, 0x3240,
+    0x3600, 0xF6C1, 0xF781, 0x3740, 0xF501, 0x35C0, 0x3480, 0xF441,
+    0x3C00, 0xFCC1, 0xFD81, 0x3D40, 0xFF01, 0x3FC0, 0x3E80, 0xFE41,
+    0xFA01, 0x3AC0, 0x3B80, 0xFB41, 0x3900, 0xF9C1, 0xF881, 0x3840,
+    0x2800, 0xE8C1, 0xE981, 0x2940, 0xEB01, 0x2BC0, 0x2A80, 0xEA41,
+    0xEE01, 0x2EC0, 0x2F80, 0xEF41, 0x2D00, 0xEDC1, 0xEC81, 0x2C40,
+    0xE401, 0x24C0, 0x2580, 0xE541, 0x2700, 0xE7C1, 0xE681, 0x2640,
+    0x2200, 0xE2C1, 0xE381, 0x2340, 0xE101, 0x21C0, 0x2080, 0xE041,
+    0xA001, 0x60C0, 0x6180, 0xA141, 0x6300, 0xA3C1, 0xA281, 0x6240,
+    0x6600, 0xA6C1, 0xA781, 0x6740, 0xA501, 0x65C0, 0x6480, 0xA441,
+    0x6C00, 0xACC1, 0xAD81, 0x6D40, 0xAF01, 0x6FC0, 0x6E80, 0xAE41,
+    0xAA01, 0x6AC0, 0x6B80, 0xAB41, 0x6900, 0xA9C1, 0xA881, 0x6840,
+    0x7800, 0xB8C1, 0xB981, 0x7940, 0xBB01, 0x7BC0, 0x7A80, 0xBA41,
+    0xBE01, 0x7EC0, 0x7F80, 0xBF41, 0x7D00, 0xBDC1, 0xBC81, 0x7C40,
+    0xB401, 0x74C0, 0x7580, 0xB541, 0x7700, 0xB7C1, 0xB681, 0x7640,
+    0x7200, 0xB2C1, 0xB381, 0x7340, 0xB101, 0x71C0, 0x7080, 0xB041,
+    0x5000, 0x90C1, 0x9181, 0x5140, 0x9301, 0x53C0, 0x5280, 0x9241,
+    0x9601, 0x56C0, 0x5780, 0x9741, 0x5500, 0x95C1, 0x9481, 0x5440,
+    0x9C01, 0x5CC0, 0x5D80, 0x9D41, 0x5F00, 0x9FC1, 0x9E81, 0x5E40,
+    0x5A00, 0x9AC1, 0x9B81, 0x5B40, 0x9901, 0x59C0, 0x5880, 0x9841,
+    0x8801, 0x48C0, 0x4980, 0x8941, 0x4B00, 0x8BC1, 0x8A81, 0x4A40,
+    0x4E00, 0x8EC1, 0x8F81, 0x4F40, 0x8D01, 0x4DC0, 0x4C80, 0x8C41,
+    0x4400, 0x84C1, 0x8581, 0x4540, 0x8701, 0x47C0, 0x4680, 0x8641,
+    0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040
+};
+INT addcrc(crc,c)                      /* update a CRC check */
+INT crc;                               /* running CRC value */
+unsigned char c;                       /* character to add */
+{
+    return (((crc>>8)&0x00ff) ^ crctab[(crc^c)&0x00ff]) & 0x0000ffff;
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'arctst.c'
+then
+	echo shar: will not over-write existing file "'arctst.c'"
+else
+cat << \SHAR_EOF > 'arctst.c'
+/*  ARC - Archive utility - ARCTST
+
+System V Version 1.0 based upon:
+    Version 2.12, created on 02/03/86 at 23:00:40
+
+(C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+
+    By:  Thom Henderson
+
+    Description:
+         This file contains the routines used to test archive integrity.
+*/
+#include "arc.h"
+
+INT tstarc()                               /* test integrity of an archive */
+{
+    struct heads hdr;                  /* file header */
+    long arcsize, ftell();             /* archive size */
+
+    openarc(0);                        /* open archive for reading */
+    fseek(arc,0L,2);                   /* move to end of archive */
+    arcsize = ftell(arc);              /* see how big it is */
+    fseek(arc,0L,0);                   /* return to top of archive */
+
+    printf ("Testing archive...\n");
+    while(readhdr(&hdr,arc))
+    {    if(ftell(arc)+hdr.size>arcsize)
+         {    printf("Archive truncated in file %s\n",hdr.name);
+              nerrs++;
+              break;
+         }
+
+         else
+         {    printf("    File: %-12s  ",hdr.name);
+              fflush(stdout);
+              if(unpack(arc,NULL,&hdr))
+                   nerrs++;
+              else printf("okay\n");
+         }
+    }
+
+    if(nerrs<1)
+         printf("No errors detected\n");
+    else if(nerrs==1)
+         printf("One error detected\n");
+    else printf("%d errors detected\n",nerrs);
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'arcunp.c'
+then
+	echo shar: will not over-write existing file "'arcunp.c'"
+else
+cat << \SHAR_EOF > 'arcunp.c'
+/*  ARC - Archive utility - ARCUNP
+
+System V Version 1.0 based upon:
+    Version 3.16, created on 02/03/86 at 23:01:16
+
+(C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+
+    By:  Thom Henderson
+
+    Description:
+         This file contains the routines used to expand a file
+         when taking it out of an archive.
+*/
+#include "arc.h"
+
+/* stuff for repeat unpacking */
+
+#define DLE 0x90                       /* repeat byte flag */
+
+static INT state;                      /* repeat unpacking state */
+
+/* repeat unpacking states */
+
+#define NOHIST 0                       /* no relevant history */
+#define INREP 1                        /* sending a repeated value */
+
+static INT crcval;                     /* CRC check value */
+static long size;                      /* bytes to read */
+
+INT unpack(f,t,hdr)                    /* unpack an archive entry */
+FILE *f, *t;                           /* source, destination */
+struct heads *hdr;                     /* pointer to file header data */
+{
+ INT c;                             /* one char of stream */
+    INT putc_unp();
+    INT putc_ncr();
+    INT getc_unp();
+
+    /* setups common to all methods */
+
+    crcval = 0;                        /* reset CRC check value */
+    size = hdr->size;                  /* set input byte counter */
+    state = NOHIST;                    /* initial repeat unpacking state */
+    setcode();                         /* set up for decoding */
+
+    /* use whatever method is appropriate */
+
+    switch(hdrver)                     /* choose proper unpack method */
+    {
+    case 1:                            /* standard packing */
+    case 2:
+         while((c=getc_unp(f))!=EOF)
+              putc_unp(c,t);
+         break;
+
+    case 3:                            /* non-repeat packing */
+         while((c=getc_unp(f))!=EOF)
+              putc_ncr(c,t);
+         break;
+
+    case 4:                            /* Huffman squeezing */
+         init_usq(f);
+         while((c=getc_usq(f))!=EOF)
+              putc_ncr(c,t);
+         break;
+
+    case 5:                            /* Lempel-Zev compression */
+         init_ucr(0);
+         while((c=getc_ucr(f))!=EOF)
+              putc_unp(c,t);
+         break;
+
+    case 6:                            /* Lempel-Zev plus non-repeat */
+         init_ucr(0);
+         while((c=getc_ucr(f))!=EOF)
+              putc_ncr(c,t);
+         break;
+
+    case 7:                            /* L-Z plus ncr with new hash */
+         init_ucr(1);
+         while((c=getc_ucr(f))!=EOF)
+              putc_ncr(c,t);
+         break;
+
+    case 8:                            /* dynamic Lempel-Zev */
+         decomp(f,t);
+         break;
+
+    default:                           /* unknown method */
+         if(warn)
+         {    printf("I don't know how to unpack file %s\n",hdr->name);
+              printf("I think you need a newer version of ARC\n");
+              nerrs++;
+         }
+         fseek(f,hdr->size,1);         /* skip over bad file */
+         return 1;                     /* note defective file */
+    }
+
+    /* cleanups common to all methods */
+
+    if((crcval&0xffff)!=(hdr->crc&0x0000ffff))
+    {    if(warn)
+         {    printf("WARNING: File %s fails CRC check\n",hdr->name);
+              nerrs++;
+         }
+         return 1;                     /* note defective file */
+    }
+    return 0;                          /* file is okay */
+}
+
+/*  This routine is used to put bytes in the output file.  It also
+    performs various housekeeping functions, such as maintaining the
+    CRC check value.
+*/
+
+static INT putc_unp(c,t)                   /* output an unpacked byte */
+char c;                                /* byte to output */
+FILE *t;                               /* file to output to */
+{
+    crcval = addcrc(crcval,c);         /* update the CRC check value */
+    putc_tst(c,t);
+}
+
+/*  This routine is used to decode non-repeat compression.  Bytes are
+    passed one at a time in coded format, and are written out uncoded.
+    The data is stored normally, except that runs of more than two
+    characters are represented as:
+
+         <char> <DLE> <count>
+
+    With a special case that a count of zero indicates a DLE as data,
+    not as a repeat marker.
+*/
+
+INT putc_ncr(c,t)                          /* put NCR coded bytes */
+unsigned char c;                       /* next byte of stream */
+FILE *t;                               /* file to receive data */
+{
+    static INT lastc;                  /* last character seen */
+
+    switch(state)                      /* action depends on our state */
+    {
+    case NOHIST:                       /* no previous history */
+         if(c==DLE)                    /* if starting a series */
+              state = INREP;           /* then remember it next time */
+         else putc_unp(lastc=c,t);     /* else nothing unusual */
+         return;
+
+    case INREP:                        /* in a repeat */
+         if(c)                         /* if count is nonzero */
+              while(--c)               /* then repeatedly ... */
+                   putc_unp(lastc,t);  /* ... output the byte */
+         else putc_unp(DLE,t);         /* else output DLE as data */
+         state = NOHIST;               /* back to no history */
+         return;
+
+    default:
+         abort("Bad NCR unpacking state (%d)",state);
+    }
+}
+
+/*  This routine provides low-level byte input from an archive.  This
+    routine MUST be used, as end-of-file is simulated at the end of
+    the archive entry.
+*/
+
+INT getc_unp(f)                        /* get a byte from an archive */
+FILE *f;                               /* archive file to read */
+{
+    if(!size)                          /* if no data left */
+         return EOF;                   /* then pretend end of file */
+
+    size--;                            /* deduct from input counter */
+    return code(fgetc(f));             /* and return next decoded byte */
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'arcusq.c'
+then
+	echo shar: will not over-write existing file "'arcusq.c'"
+else
+cat << \SHAR_EOF > 'arcusq.c'
+/*  ARC - Archive utility - ARCUSQ
+
+System V Version 1.0 based upon:
+    Version 3.13, created on 01/30/86 at 20:11:42
+
+(C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+
+    By:  Thom Henderson
+
+    Description:
+         This file contains the routines used to expand a file
+         which was packed using Huffman squeezing.
+
+         Most of this code is taken from an USQ program by Richard
+         Greenlaw, which was adapted to CI-C86 by Robert J. Beilstein.
+*/
+#include "arc.h"
+
+/* stuff for Huffman unsqueezing */
+
+#define ERROR (-1)
+
+#define SPEOF 256                      /* special endfile token */
+#define NUMVALS 257                    /* 256 data values plus SPEOF */
+
+EXTERN struct nd                       /* decoding tree */
+{ INT child[2];                      /* left, right */
+}   node[NUMVALS];                     /* use large buffer */
+
+static INT bpos;                       /* last bit position read */
+static INT curin;                      /* last byte value read */
+static INT numnodes;                   /* number of nodes in decode tree */
+
+static INT get_int(f)                  /* get an integer */
+FILE *f;                               /* file to get it from */
+{
+    INT i;
+
+    i = getc_unp(f);
+    return (short)(i | (getc_unp(f)<<8));
+}
+
+INT init_usq(f)                            /* initialize Huffman unsqueezing */
+FILE *f;                               /* file containing squeezed data */
+{
+ INT i;                             /* node index */
+
+    bpos = 99;                         /* force initial read */
+
+    numnodes = get_int(f);
+
+    if(numnodes<0 || numnodes>=NUMVALS)
+         abort("File has an invalid decode tree");
+
+    /* initialize for possible empty tree (SPEOF only) */
+
+    node[0].child[0] = -(SPEOF + 1);
+    node[0].child[1] = -(SPEOF + 1);
+
+    for(i=0; i<numnodes; ++i)          /* get decoding tree from file */
+    {    node[i].child[0] = get_int(f);
+         node[i].child[1] = get_int(f);
+    }
+}
+
+INT getc_usq(f)                        /* get byte from squeezed file */
+FILE *f;                               /* file containing squeezed data */
+{
+ INT i;                             /* tree index */
+
+    /* follow bit stream in tree to a leaf */
+
+    for(i=0; i>=0; )                   /* work down(up?) from root */
+    {    if(++bpos>7)
+         {    if((curin=getc_unp(f)) == ERROR)
+                   return(ERROR);
+              bpos = 0;
+
+              /* move a level deeper in tree */
+              i = node[i].child[1&curin];
+         }
+         else i = node[i].child[1 & (curin >>= 1)];
+    }
+
+    /* decode fake node index to original data value */
+
+    i = -(i + 1);
+
+    /* decode special endfile token to normal EOF */
+
+    i = (i==SPEOF) ? EOF : i;
+    return i;
+}
+SHAR_EOF
+fi # end of overwriting check
+#	End of shell archive
+exit 0
+-- 
+Mike Stump, Cal State Univ, Northridge Comp Sci Department
+uucp: {sdcrdcf, ihnp4, hplabs, ttidca, psivax, csustan}!csun!aeusemrs
+
+

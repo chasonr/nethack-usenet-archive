@@ -1,0 +1,199 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,eba86c0459381f4d,start
+X-Google-Attributes: gid159752,public
+X-Google-Thread: 12da6b,228b1e301e6a4060
+X-Google-Attributes: gid12da6b,public
+X-Google-ArrivalTime: 1984-12-28 20:35:03 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/12/84; site desint.UUCP
+Path: utzoo!watmath!clyde!bonnie!akgua!sdcsvax!sdcrdcf!trwrb!desint!geoff
+From: geoff@desint.UUCP (Geoff Kuenning)
+Newsgroups: net.lang.c,net.sources
+Subject: Re: pipes and the sort command
+Message-ID: <283@desint.UUCP>
+Date: Fri, 28-Dec-84 23:35:03 EST
+Article-I.D.: desint.283
+Posted: Fri Dec 28 23:35:03 1984
+Date-Received: Mon, 31-Dec-84 02:00:16 EST
+References: <1650@drutx.UUCP> <6770@brl-tgr.ARPA>
+Organization: his home computer, Manhattan Beach, CA
+Lines: 172
+Keywords: pipes
+Xref: watmath net.lang.c:3619 net.sources:2258
+Summary: a suggested way to do pipes to/from a program
+Follup-To: net.lang.c
+
+***                                ******                                  ***
+*** If you follow this article up, PLEASE remove net.sources from the list ***
+***                                ******                                  ***
+
+In article <6770@brl-tgr.ARPA> gwyn@brl-tgr.ARPA (Doug Gwyn <gwyn>) writes:
+
+>It is very hard to manage both ends of a piped filter from a program.
+>
+>Have you considered using the qsort() library routine to sort your data?
+
+Doug's second point seems hard to argue.  Nevertheless, there are applications
+besides sorting that require being able to pipe an array through a program and
+back into that same array.  Vi, provides this feature, for example.  Sort is
+easier than most, because it buffers its output and thus cannot hang a pipe.
+
+The following example is extracted from a program I wrote that provides
+this feature.  I have removed a lot of clutter, which has the unfortunate
+side effect that I may have broken it in the process (I have collapsed some
+subroutines whose division have nothing to do with the problem at hand, and
+I may have blown the argument substitution).
+
+Don't forget to remove my .signature!
+
+-----------------------------------cut here-------------------------------
+#include <signal.h>
+
+/*
+ * pipethru will pipe the "n" bytes in "ibuf" through "command".  The result
+ * is placed in "obuf," but is limited to "lim" bytes.  The return value is
+ * the number of bytes read, or -1 if an error occurs.
+ *
+ * "ibuf" and "obuf" may overlap in any fashion without difficulty.
+ */
+int pipethru (command, ibuf, n, obuf, lim)
+    char *	command;
+    char *	ibuf;
+    int		n;
+    char *	obuf;
+    int		lim;
+    {
+    int		fd;			/* Loop counter for closing files */
+    int		inpipes[2];		/* Descriptors for the input pipe */
+    int		outpipes[2];		/* Descriptors for the output pipe */
+    int		pipe_pid;		/* Pid of the process we pipe thru */
+    char *	shellname;		/* Shell to use to run "command" */
+
+    if (pipe (inpipes) < 0)		/* Set up the pipes we will use */
+	return -1;
+    if (pipe (outpipes) < 0)
+	{
+	close (inpipes[0]);
+	close (inpipes[1]);
+	return -1;
+	}
+    /* (You may want to change the following code to retry if the error
+     * is EAGAIN.  Also, bsd systems should use vfork here (but *not* in
+     * handlepipe, below */
+    if ((pipe_pid = fork ()) < 0)	/* Make a kid - quit if can't */
+	{
+	close (inpipes[0]);
+	close (inpipes[1]);
+	close (outpipes[0]);
+	close (outpipes[1]);
+	return -1;
+	}
+    else if (pipe_pid > 0)		/* Parent */
+	{
+	close (outpipes[0]);		/* Close unused ends of pipes */
+	close (inpipes[1]);
+	return
+	  handlepipe (pipe_pid, inpipes[0], outpipes[1], ibuf, n, obuf, lim);
+	}
+    else				/* Child */
+	{
+	close (0);			/* Set up stdin as read end of the */
+	dup (outpipes[0]);		/* ..output pipe */
+	close (outpipes[0]);
+	close (outpipes[1]);		/* Close unused end of pipe */
+
+	close (1);			/* Set up stdout as write end of the */
+	dup (inpipes[1]);		/* ..input pipe */
+	close (inpipes[0]);
+	close (inpipes[1]);
+
+	for (fd = 3;  fd < 20;  )	/* Close all others except stderr */
+		close (fd++);
+/*
+	At this point, standard input is the data coming from the buffer,
+	and standard output is the data that will go back.  All we need to
+	do is exec the command in question.
+*/
+	if ((shellname = getenv ("SHELL")) == NULL)
+	    shellname = "/bin/sh";
+	execl (shellname, shellname, "-c", command, (char *) NULL);
+	exit (127);
+	}
+    }
+
+/*
+ * handlepipe is called once we have the command running at the end of a pair
+ * of pipes.  Handlepipe will do the real work, writing "buf" to the output
+ * pipe and reading the result into the input pipe.  To avoid hanging due to
+ * full pipes, we fork into two processes.  The child will write, and the
+ * parent will read.
+ */
+int handlepipe (pipe_pid, inpipe, outpipe, ibuf, n, obuf, lim)
+    int		pipe_pid;		/* Pid of the process we pipe thru */
+    int		inpipe;			/* Pipe we read from */
+    int		outpipe;		/* Pipe we write to */
+    char *	ibuf;
+    int		n;
+    char *	obuf;
+    int		lim;
+    {
+    int		exit_pid;		/* Pid of last child to exit */
+    int		exit_stat;		/* Return status of child */
+    int		(*saveint) ();		/* Places to save some signals */
+    int		(*savequit) ();
+    int		write_pid;		/* Pid of child who is writing */
+
+    saveint = signal (SIGINT, SIG_IGN); /* Ignore signals the command sees */
+    savequit = signal (SIGQUIT, SIG_IGN);
+
+    /* Don't use vfork here! */
+    if ((write_pid = fork ()) < 0)	/* Make a kid to write */
+	{				/* Failure! */
+	close (outpipe);		/* Clean up pipes */
+	close (inpipe);			/* ..this also kills the command */
+	signal (SIGINT, saveint);	/* Put the signals back */
+	signal (SIGQUIT, savequit);
+
+	while ((exit_pid = wait ((int *) NULL)) != pipe_pid  &&  exit_pid > 0)
+	    ;
+	return -1;
+	}
+    else if (write_pid == 0)		/* Child */
+	{
+	close (inpipe);			/* Close unused pipe */
+	exit_stat = (write (outpipe, buf, n) == n) ? 0 : 1;
+	close (outpipe);
+	exit (exit_stat);
+	}
+    else if (write_pid > 0)		/* Parent? */
+	{
+	close (outpipe);		/* Close unused pipe */
+	n = read (inpipe, buf, lim);	/* Read back the command output */
+	close (inpipe);
+	signal (SIGINT, saveint);	/* Put the signals back */
+	signal (SIGQUIT, savequit);
+	/*
+	 * The only thing left now is to wait for both children to exit.
+	 */
+	while ((pipe_pid > 0  ||  write_pid > 0)
+	  &&  (exit_pid = wait (&exit_stat)) > 0)
+	    {
+	    if (exit_pid == pipe_pid)
+		pipe_pid = exit_stat ? -1 : 0;
+	    else if (exit_pid == write_pid)
+		write_pid = exit_stat ? -1 : 0;
+	    }
+	if (write_pid < 0		/* This means you can't write pipe */
+	  ||  pipe_pid < 0)		/* This means command failed */
+	    return -1;
+	else
+	    return n;			/* All is well, return no. read */
+	}
+    }
+-----------------------------cut again-------------------------------
+-- 
+
+	Geoff Kuenning
+	...!ihnp4!trwrb!desint!geoff
+
+

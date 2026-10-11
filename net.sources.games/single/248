@@ -1,0 +1,1181 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 162299,138031e2017f71da,start
+X-Google-Attributes: gid162299,public
+X-Google-ArrivalTime: 1985-08-10 21:21:54 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site oddjob.UUCP
+Path: utzoo!linus!philabs!cmcl2!seismo!lll-crg!dual!qantel!ihnp4!gargoyle!oddjob!matt
+From: matt@oddjob.UUCP (Matt Crawford)
+Newsgroups: net.sources.games
+Subject: search -- part 3 of 6
+Message-ID: <901@oddjob.UUCP>
+Date: Sun, 11-Aug-85 00:21:54 EDT
+Article-I.D.: oddjob.901
+Posted: Sun Aug 11 00:21:54 1985
+Date-Received: Wed, 14-Aug-85 21:39:05 EDT
+Reply-To: matt@oddjob.UUCP (Matt Crawford)
+Followup-To: net.games
+Organization: U. Chicago, Astronomy & Astrophysics
+Lines: 1159
+
+: This is a shar archive.  Extract with sh, not csh.
+echo x - main.c
+sed -e 's/^X//' > main.c << '!xxENDITxx!'
+X#ifndef lint
+Xstatic char rcsid[] = "$Header: main.c,v 2.2 85/08/06 22:26:37 matt Exp $";
+X#endif
+X/*
+X *
+X * search
+X *
+X * multi-player and multi-system search and destroy.
+X *
+X * Original by Greg Ordy	1979
+X * Rewrite by Sam Leffler	1981
+X * Socket code by Dave Pare	1983
+X * Ported & improved
+X *      by Matt Crawford	1985
+X *
+X * main game iteration loop
+X *
+X * Copyright (c) 1979
+X *
+X * $Log:	main.c,v $
+X * Revision 2.2  85/08/06  22:26:37  matt
+X * Victims lose 20% of their points to their killers.
+X * 
+X * Change handling of messages to provide echo of text.
+X * (per hastings@navajo)
+X * 
+X * Revision 2.1  85/04/10  17:31:23  matt
+X * Major de-linting and minor restructuring.
+X * 
+X * Revision 1.6  85/02/11  15:02:50  matt
+X * Inform new player that game is in GUTS mode
+X * 
+X * Revision 1.5  85/02/11  12:46:33  matt
+X * fixed spelling of "bonzai"
+X * 
+X * Revision 1.4  85/02/11  12:43:54  matt
+X * added GUTS mode
+X * 
+X * Revision 1.3  85/02/10  19:18:59  matt
+X * Added more realistic orbiting.
+X * 
+X * Revision 1.2  85/02/09  23:49:49  matt
+X * Eliminated the dependence on the value of the mask after
+X * select() times out.  Use the return value to distinguish
+X * a timeout!!
+X * 
+X */
+X
+X#include <stdio.h>
+X#include <sgtty.h>
+X#include <sys/types.h>
+X#include <sys/ioctl.h>
+X#include <errno.h>
+X#include <sys/socket.h>
+X#include <netinet/in.h>
+X#include <sys/un.h>
+X#include <netdb.h>
+X#include <sys/file.h>
+X#include <sys/time.h>
+X
+X#include "defines.h"
+X#include "structs.h"
+X
+X/*
+X * Major data bases
+X */
+Xt_torps		torps[NTORP];		/* torpedoes data base */
+Xt_sbase		sbase[NBASE];		/* star bases data base */
+Xt_planet	planet;			/* planet data base */
+Xt_alien		alien[NALIEN];		/* aliens data base */
+Xt_burst		bursts[NBURST];		/* shrapnel data base */
+Xt_player	player[NPLAYER];	/* players */
+X
+Xint		dtabsiz;		/* descriptor table size */
+Xint		pfd;			/* playerfile fd */
+Xint		loc_sock;		/* local socket */
+Xint		errfile;		/* error log file */
+Xint		nplayer;		/* # of players currently in game */
+Xint		nobody;			/* is anybody playing? */
+X#ifdef INET
+Xint		in_sock;		/* internet socket */
+X#endif
+X
+Xt_player	*whoscab;		/* identity of current scab */
+Xint		TDIST;			/* max distance a torpedo can go */
+Xchar		xxi;
+Xchar		yyi;
+Xchar		ppx;			/* planet x-coord */
+Xchar		ppy;			/* planet y-coord */
+Xchar		dx;
+Xchar		dy;
+Xlong		ptime;			/* search playing time counter */
+X
+Xint		NALIENS = NALIEN;
+Xextern		int errno;
+X/*
+X * Solar flare stuff
+X */
+Xint		sfcount;		/* solar flare timer */
+Xint		sfflag;			/* solar flare in progress */
+X
+Xint		gutsflag;		/* playing in guts mode */
+X
+Xint		numbnode;
+Xstruct plist	*avl;
+Xt_player	*wholist;
+Xchar		visual[NPLAYER][NPLAYER];/* group visibility matrix */
+Xstruct		timeval tim_inp;
+X
+X
+Xmain(argc, argv)
+Xint argc;
+Xchar  *argv[];
+X{
+X	extern	t_player *newplayer();
+X	extern	void	apilot(),
+X			autopi(),
+X			bcast(),
+X			bflush(),
+X			cput(),
+X			dock(),
+X			done(),
+X			enteritem(),
+X			facts(),
+X			fnode(),
+X			gathermsg(),
+X			groupm(),
+X			home(),
+X			init(),
+X			initplayer(),
+X			invisible(),
+X			joing(),
+X			launch(),
+X			lookg(),
+X			magnif(),
+X			makeburst(),
+X			makeflare(),
+X			makescab(),
+X			movealien(),
+X			moveburst(),
+X			nuke(),
+X			orbit(),
+X			orbmove(),
+X			outgame(),
+X			phaser(),
+X			pmesg(),
+X			prompt(),
+X			pstatus(),
+X			quitg(),
+X			rmsg(),
+X			seeall(),
+X			seescab(),
+X			sethome(),
+X			set_delay(),
+X			uplst(),
+X			xploit();
+X			
+X	register t_player *p;
+X	register t_player *pl;
+X	register t_alien *pa;
+X	register t_burst *pb;
+X	register t_sbase *ps;
+X	register t_torps *pt;
+X	t_player *np;
+X	char	x, y;
+X	int	mf;
+X	int	gutsvote;
+X	char	buf[255];
+X	char	xx, yy, c;
+X	int	port_num = DEFAULT_IN_PORT;
+X	int	nfds;
+X	int	mask;
+X	int	save_mask;
+X
+X	dtabsiz = getdtablesize();
+X
+X#ifdef INET
+X	if (argc > 2) {
+X		printf("searchd: arg count error\n");
+X		exit(1);
+X	}
+X	if (argc == 2)
+X		port_num = atoi(argv[1]);
+X#endif
+X#ifndef DEBUG
+X	if (fork())
+X		exit(0);
+X	{ int s;
+X	  for (s = 0; s < dtabsiz; s++)
+X		(void) close(s);
+X	  (void) open("/", 0);
+X	  (void) dup2(0, 1);
+X	  (void) dup2(0, 2);
+X	  s = open("/dev/tty", 2);
+X	  if (s >= 0) {
+X		(void)ioctl(s, TIOCNOTTY, NULLCH);
+X		(void)close(s);
+X	  }
+X	}
+X#endif
+X	/*
+X	 * set up data bases
+X	 */
+X	init();
+X	/*
+X	 * set up sockets: port number doesn't matter
+X	 * if INET isn't defined
+X	 */
+X	if (!initsocks(port_num))
+X		exit(1);
+X	/*
+X	 * block indefinitely until the first player enters the game
+X	 * then start the player loop
+X	 */
+X	save_mask = 0;
+X#ifdef INET
+X	save_mask = 01<<loc_sock | 01<<in_sock;
+X#else
+X	save_mask = 01<<loc_sock;
+X#endif
+X	nobody = 1;
+X	/*
+X	 * Main loop -- works in a hard run polling the input socket
+X	 * of each player.  Each turn around the loop defines a time
+X	 * unit in search.
+X	 */
+X	for (;;) {
+X		ptime++;		/* time marches on ... */
+X		if (--sfcount == 0) {	/* ring a ding, time for a flare */
+X			makeflare();
+X			NALIENS = NALIEN-nplayer;
+X		}
+X		/*
+X		 * if nobody's playing, wait until someone generates
+X		 * some sort of request
+X		 */
+X		if (nobody || !nplayer) {
+X			gutsflag = FALSE;
+X			tim_inp.tv_usec = 0L;
+X			tim_inp.tv_sec = 3600L;
+X			do {
+X				mask = save_mask;
+X				nfds = select(dtabsiz, &mask, NULLINT, NULLINT, &tim_inp);
+X			} while (nfds == 0);
+X			tim_inp.tv_sec = 0L;
+X			nobody = 0;
+X		}
+X		if ((ptime % 16) == 0) {
+X			np = newplayer(save_mask);
+X			if (np != NULL) {
+X				nplayer++;
+X				initplayer(np);
+X				sprintf(buf, "new player %s\n", np->plname);
+X				errlog(buf);
+X				for (p = player; p < &player[NPLAYER]; p++)
+X					if (p->status.alive == TRUE && p != np)
+X						pmesg(p, "From scanners-- NEW PLAYER");
+X				if (gutsflag)
+X					pmesg(np, "This game is in GUTS mode");
+X			}
+X		} else
+X			set_delay();
+X		/*
+X		 * Command scanning loop...
+X		 */
+X		nobody = 0;
+X		gutsvote = !gutsflag;
+X		for (p = player; p < &player[NPLAYER]; p++) {
+X			if (p->status.alive == FALSE) {
+X				nobody++;
+X				continue;
+X			}
+X			gutsvote = gutsflag ? gutsvote || p->status.guts
+X					    : gutsvote && p->status.guts;
+X			if (p->status.ap == TRUE)	/* update autopilot */
+X				apilot(p);
+X			if (p->status.orb == TRUE)	/* update orbiting */
+X				orbmove(p);
+X			x = p->offx;
+X			y = p->offy;
+X			if (!p->ninput)
+X				if (pinput(p) < 0)
+X					continue;
+X			if (p->ninput <= 0)
+X				goto constvel;
+X			c = (*p->pinputq++)&0177;
+X			p->ninput--;
+X			/*
+X			 * Two letter commands (e.g. launch torpedo) are
+X			 *  marked as a command pending, so that when the
+X			 *  second char comes in it can be processed entirely.
+X			 */
+X			if (p->cmdpend > 0) {
+X				switch (p->cmd) {
+X				case 'h': 
+X					home(p, c);
+X					break;
+X				case '5':
+X				case 't': 
+X					p->status.ap = FALSE;
+X					launch((thing *)p, c, PLAYER, x, y,
+X						1, p->curx, p->cury, 0);
+X					break;
+X				case 'g':
+X					groupm(p, c);
+X					break;
+X				case 'q':
+X					quitg(p, c);
+X					break;
+X				case 'n':
+X					nuke(p, c);
+X					break;
+X				case 'j':
+X					joing(p, c);
+X					break;
+X				case 's': 
+X					sethome(p, c);
+X					break;
+X				case 'b': 
+X					bcast(p, c);
+X					break;
+X				case 'a': 
+X					autopi(p, c);
+X					break;
+X				case 'r': 
+X					rmsg(p, c);
+X					break;
+X				case 'm': 
+X					magnif(p, c);
+X					break;
+X				case 'Q':
+X					if (c != 'Y' && c != 'y') {
+X						p->cmd = p->cmdpend = 0;
+X						prompt(p, "");
+X						goto constvel;
+X					}
+X					done(p);
+X					break;
+X				}
+X				goto constvel;
+X			}
+X			switch (c) {
+X			case 'e': 
+X				if (p->energy != p->preve) {
+X					cput(EGYDATA, p, "%d", p->energy);
+X					p->preve = p->energy;
+X				}
+X				break;
+X			case 'p': 
+X				if (p->points != p->prevp) {
+X					cput(PTDATA, p, "%d", p->points);
+X					p->prevp = p->points;
+X				}
+X				break;
+X			case 'f': 
+X				facts(p);
+X				break;
+X			case 'l':
+X				lookg(p);
+X				break;
+X			case 'x': 
+X				xploit(p);
+X				break;
+X			case '0': 
+X				if (p->whocent == 0)
+X					break;
+X				if (isalien(p->whocent)) {
+X					pa = (t_alien *)p->whocent;
+X					/*
+X					 * Register a hit on an alien
+X					 */
+X					pa->hit++;
+X					if (pa->hit > 25)
+X						pa->stats = DEAD;
+X					pa->cix = -1;
+X					pa->ciy = (rand()%3)-1;
+X					p->points = p->points+4;
+X					write(p->socket, "\007", 1);
+X				}
+X				break;
+X			case 'i': 
+X				invisible(p);
+X				break;
+X			case 'c': 
+X				cput(TMDATA, p, "%d", (int)ptime);
+X				break;
+X			case 'o': 
+X				orbit(p);
+X				x = p->offx;
+X				y = p->offy;
+X				break;
+X			case 'z': 
+X				seescab(p);
+X				break;
+X			case 'd': 
+X				dock(p);
+X				break;
+X			case 'v': 
+X				cput(VLDATA, p, "%d %d", p->offx, p->offy);
+X				break;
+X			case 'G':
+X				p->status.guts = TRUE;
+X				break;
+X			case 'W':
+X				p->status.guts = FALSE;
+X				break;
+X			case '\014':	/* ^L */
+X			case '@': 
+X				fnode(p->plstp);
+X				initplayer(p);
+X				break;
+X			case 'Q':
+X				prompt(p, "Really quit?");
+X				goto savecmd;
+X			case 'q':
+X			case 'j':
+X				prompt(p, "enter group members");
+X				goto savecmd;
+X			case 'b':
+X			case 'g':
+X				gathermsg(p);
+X				/*FALL THRU*/
+X			case 'r':
+X			case 'h':
+X			case 't':
+X			case 'a':
+X			case 'm':
+X			case 's':
+X			case 'n':
+X			case '5':
+X			savecmd:
+X				p->cmdpend++;
+X				p->cmd = c;
+X				break;
+X			default: 
+X				goto vel;
+X			}
+X			goto constvel;
+X		vel: 
+X			/*
+X			 * Velocity changes handled here...
+X			 */
+X			p->status.ap = p->status.orb = FALSE;
+X			switch (c) {
+X			case NO: 
+X				y--;
+X				break;
+X			case NE: 
+X				x++;
+X				y--;
+X				break;
+X			case EA: 
+X				x++;
+X				break;
+X			case SE: 
+X				x++;
+X				y++;
+X				break;
+X			case SO: 
+X				y++;
+X				break;
+X			case SW: 
+X				x--;
+X				y++;
+X				break;
+X			case WE: 
+X				x--;
+X				break;
+X			case NW: 
+X				x--;
+X				y--;
+X				break;
+X			default:
+X				goto constvel;
+X			}
+X			p->offx = x;
+X			p->offy = y;
+X			cput(VLDATA, p, "%d %d", p->offx, p->offy);
+X	constvel:
+X			/*
+X			 * Update energy total for player:
+X			 *  standing still adds one unit/iteration
+X			 *  magnification costs energy proportional to M-factor
+X			 *  velocity > 1 in any direction costs one unit/iter
+X			 *  invisibility costs INCOST/iteration
+X			 */
+X			p->curx = p->curx+x;
+X			p->cury = p->cury+y;
+X			if ((x > 1 || x < -1) || (y > 1 || y < -1))
+X				p->energy--;
+X			if (x == 0 && y == 0)
+X				p->energy++;
+X			if (p->mflg > 1)
+X				p->energy -= p->mflg;
+X			if (p->status.invis == TRUE)
+X				p->energy = p->energy-INCOST;
+X			if (p->energy > p->maxe)
+X				p->energy = p->maxe;
+X			if (p->energy <= 0)
+X				outgame(p);
+X			if (p->status.crash == TRUE) {
+X				pstatus(p, "Crash into planet--all is lost!!");
+X				if (p->points >= 50)
+X					p->points -= 50;
+X				p->status.killed = TRUE;
+X				done(p);
+X			}
+X			/*
+X			 * Update energy display only every 16 iterations --
+X			 *  otherwise, it would be constantly updated at
+X			 *  great expense
+X			 */
+X			if (p->energy != p->preve && (ptime&017) == 0) {
+X				cput(EGYDATA, p, "%d", p->energy);
+X				p->preve = p->energy;
+X			}
+X			if (p->points != p->prevp) {
+X				cput(PTDATA, p, "%d", p->points);
+X				p->prevp = p->points;
+X			}
+X		}
+X		if (nobody < NPLAYER)
+X			nobody = 0;
+X		if (gutsvote && !gutsflag)
+X			seeall("\07Entering GUTS mode-- beware!");
+X		else if (gutsflag && !gutsvote)
+X			for (p = player; p < &player[NPLAYER]; p++)
+X				if (p->status.alive == TRUE)
+X					pmesg(p, "Entering WIMP mode");
+X		gutsflag = gutsvote;
+X		moveburst();
+X		/*
+X		 * Update the state of the aliens...
+X		 */
+X		for (pa = alien; pa < &alien[NALIEN]; pa++) {
+X			if (pa->stats == DEAD)
+X				continue;
+X			if (pa->type == WANDER) {
+X				pa->count--;
+X				/* time to change direction */
+X				if (pa->count == 0) {
+X					pa->cix = (rand()%3)-1;
+X					pa->ciy = (rand()%3)-1;
+X					pa->count = (rand()%50)+30;
+X				}
+X			}
+X			/* shankers "dance" */
+X			if (pa->type == SHANK && pa->aname == NAMESH)
+X				movealien(pa);
+X			else {
+X				pa->cx = pa->cx + pa->cix;
+X				pa->cy = pa->cy + pa->ciy;
+X			}
+X		}
+X		/*
+X		 * Update motion of torpedoes
+X		 */
+X		for (pt = torps; pt < &torps[NTORP]; pt++) {
+X			if (pt->owner == 0)
+X				continue;
+X			pt->torx += pt->xinc;
+X			pt->tory += pt->yinc;
+X			pt->tcount--;
+X			/*
+X			 * Check for alien hits
+X			 */
+X			for (pa = alien; pa < &alien[NALIEN]; pa++) {
+X				if (pa->stats == DEAD)
+X					continue;
+X				if (pa->cx == pt->torx && pa->cy == pt->tory) {
+X					/* shot by a shanker */
+X					if(isalien(pt->owner))
+X						continue;
+X					pa->hit++;
+X					if (pa->hit > 25) {
+X						makeburst(pa->cx, pa->cy);
+X						pa->stats = DEAD;
+X					}
+X					pl = (t_player *)pt->owner;
+X					/* 6 points for any hit on an alien */
+X					pl->points += 6;
+X					pl->ahits++;
+X					/* X-aliens are worth 20 points */
+X					if (pa->type == WANDER)
+X						pl->points += 20;
+X					/*
+X					 * move off in a random direction
+X					 *  after a hit
+X					 */
+X					pa->cix = (rand()%3)-1;
+X					pa->ciy = (rand()%3)-1;
+X					if (pa->cix == 0 && pa->ciy == 0)
+X						pa->cix = pa->ciy = 1;
+X					/*
+X					 * Hit a shanker -- they fight back
+X					 */
+X					if (pa->type == SHANK) {
+X						pa->aname = NAMESH;
+X						pa->whotoget = pt->owner;
+X						pl->points += 20;
+X						pa->count = 0;
+X						pmesg(pl, "From a shanker-- bonzai!");
+X					}
+X					pstatus(pl, "\007Torpedo hit on alien!");
+X					pt->owner = 0;
+X				}
+X			}
+X			if (pt->tcount == 0)
+X				pt->owner = 0;
+X		}
+X		/*
+X		 * Main screen update loop...
+X		 */
+X		for (p = player; p < &player[NPLAYER]; p++) {
+X			if (p->status.alive == FALSE)
+X				continue;
+X			wholist = p;
+X			x = p->curx;
+X			y = p->cury;
+X			mf = p->mflg;
+X			p->whocent = 0;
+X			dx = x-ppx;
+X			dy = y-ppy;
+X			/*
+X			 * Display any portion of Quartone visible
+X			 */
+X			if (dx > -18 && dx < 18 && dy > -10 && dy < 10) {
+X				register int pp;
+X
+X				for (pp = 0; pp != 17; pp++) {
+X					dx = planet.places[pp][0];
+X					dy = planet.places[pp][1];
+X					if (!onscreen (dx, dy, x, y))
+X						continue;
+X					if (dx == x && dy == y)
+X						p->status.crash = TRUE;
+X					xx = (dx-x)/mf+XWIND;
+X					yy = (dy-y)/mf+YWIND;
+X					enteritem(xx, yy, NAMEP);
+X				}
+X			}
+X			/*
+X			 * Shrapnel around?
+X			 */
+X			for (pb = bursts; pb < &bursts[NBURST]; pb++) {
+X				if (pb->cbactive == 0)
+X					continue;
+X				dx = x-pb->cbx;
+X				dy = y-pb->cby;
+X				if (dx > -21 && dx < 21 && dy > -13 && dy < 13) {
+X					register int is;
+X
+X					for (is = 0; is != 9; is++) {
+X						dx = pb->shrap[is][0];
+X						dy = pb->shrap[is][1];
+X						if (dx == 0 && dy == 0)
+X							continue;
+X						if (!onscreen (dx, dy, x, y))
+X							continue;
+X						/* a piece hit -- mark it */
+X						if (dx == x && dy == y)
+X							p->status.bur = TRUE;
+X						xx = (dx-x)/mf+XWIND;
+X						yy = (dy-y)/mf+YWIND;
+X						enteritem(xx, yy, '.');
+X					}
+X				}
+X			}
+X			/*
+X			 * Any star bases visible?
+X			 */
+X			for (ps = sbase; ps < &sbase[NBASE]; ps++) {
+X				if (!onscreen (ps->xpos, ps->ypos, x, y))
+X					continue;
+X				if (ps->xpos == x && ps->ypos == y)
+X					p->whocent = (thing *)ps;
+X				xx = (ps->xpos-x)/mf+XWIND;
+X				yy = (ps->ypos-y)/mf+YWIND;
+X				enteritem(xx, yy, '*');
+X			}
+X			/*
+X			 * Show other players -- take care of groups
+X			 */
+X			for (pl = player; pl < &player[NPLAYER]; pl++) {
+X				register int shift;
+X
+X				if (pl == p)
+X					continue;
+X				if (pl->status.alive == FALSE)
+X					continue;
+X				if (!onscreen (pl->curx, pl->cury, x, y))
+X					continue;
+X				if (pl->status.invis == TRUE) {
+X					if (!visual[pl-player][p-player])
+X						continue;
+X					shift = 'a'-'A';
+X				} else
+X					shift = 0;
+X				if (pl->curx == x && pl->cury == y) {
+X					p->whocent = (thing *)pl;
+X					pl->whocent = (thing *)p;
+X				}
+X				xx = (pl->curx-x)/mf+XWIND;
+X				yy = (pl->cury-y)/mf+YWIND;
+X				c = (pl-player)+'A'+shift;
+X				enteritem(xx, yy, c);
+X			}
+X			/*
+X			 * Show visible aliens...
+X			 */
+X			for (pa = alien; pa < &alien[NALIEN]; pa++) {
+X				if (pa->stats == DEAD)
+X					continue;
+X				if (!onscreen (pa->cx, pa->cy, x, y))
+X					continue;
+X				if (pa->cx == x && pa->cy == y)
+X					p->whocent = (thing *)pa;
+X				xx = (pa->cx-x)/mf+XWIND;
+X				yy = (pa->cy-y)/mf+YWIND;
+X				enteritem(xx, yy, pa->aname);
+X				if (pa->type == SHANK && (t_player *)(pa->whotoget) == p)
+X					pa->onscr = ON;
+X			}
+X			/*
+X			 * Track torpedoes...
+X			 */
+X			for (pt = torps; pt < &torps[NTORP]; pt++) {
+X				if (pt->owner == 0)
+X					continue;
+X				if (!onscreen (pt->torx, pt->tory, x, y))
+X					continue;
+X				if (pt->torx == x && pt->tory == y)
+X					p->whocent = (thing *)pt;
+X				xx = (pt->torx-x)/mf+XWIND;
+X				yy = (pt->tory-y)/mf+YWIND;
+X				enteritem(xx, yy, '+');
+X			}
+X			/*
+X			 * Update the display -- attempts minimal changes
+X			 */
+X			uplst();
+X			if (p->offx != 0)
+X				cput(POS1DATA, p, "%d", p->curx); 
+X			if (p->offy != 0)
+X				cput(POS2DATA, p, "%d", p->cury);
+X			if (p->status.bur == TRUE) {	/* shrapnel damage */
+X				pmesg(p, "From damage control-- Shrapnel!!");
+X				cput(INDATA, p, "off");
+X				p->status.bur = FALSE;
+X				p->status.invis = FALSE;
+X				p->energy -= SHRAPCOST;
+X				if (p->energy < 0)
+X					p->energy = 0;
+X				p->maxe -= SHRAPCOST;
+X			}
+X			/*
+X			 * Check for damage
+X			 */
+X			if (isalien(p->whocent) && ((t_alien *)p->whocent)->type == WANDER) {
+X				/*
+X				 * X-alien collision
+X				 */
+X				p->maxe = p->maxe-15;
+X				if (p->energy > p->maxe)
+X					p->energy = p->maxe;
+X				pmesg(p, "From engine room-- Collision!!");
+X			}
+X			/*
+X			 * Torpedo hit, and not in orbit
+X			 */
+X			if (istorp(p->whocent) &&
+X			    (gutsflag || p->status.orb == FALSE)) {
+X				pt = (t_torps *)p->whocent;
+X				/*
+X				 * If it's a shanker, let it get back to
+X				 *  wandering -- it's done its job
+X				 */
+X				if (isalien(pt->owner)) {
+X					phaser((t_alien *)pt->owner, p);
+X					pt->owner = 0;
+X					continue;
+X				}
+X				/*
+X				 * Torpedo hit by a player
+X				 */
+X				pl = (t_player *)pt->owner;
+X				if (pl == p) {
+X					pt->owner = 0;
+X					pmesg(p, "From damage control-- SELF HIT!!!");
+X					p->points -= 75;
+X					if (p->points < 0)
+X						p->points = 0;
+X					continue;
+X				}
+X				pt->owner = 0;
+X				pstatus(pl, "\007Hit on %c", (p-player)+'A');
+X				pstatus(p, "\007Torpedo damage suffered!");
+X				pl->points += 50;
+X				pl->phits++;
+X				p->maxe -= 50;
+X				if (p->energy > p->maxe)
+X					p->energy = p->maxe;
+X				if (p->maxe <= 0) {
+X					int	booty = p->points / 5;
+X					pmesg(p, "From damage control-- FATAL HIT!");
+X					pmesg(pl, "From navigation-- TOTAL DESTRUCTION!");
+X					pl->points += 5 + booty;
+X					pl->pkills++;
+X					p->points -= booty;
+X					/*
+X					 * Time for a new scab??
+X					 */
+X					if ((pl->pkills%4) == 0)
+X						makescab(pl);
+X					makeburst(p->curx, p->cury);
+X					p->status.killed = TRUE;
+X					done(p);
+X				}
+X			}
+X		}
+X		/*
+X		 * trying to minimize the number of writes to the sockets.
+X		 */
+X		for (p = player; p < &player[NPLAYER]; p++) {
+X			if (p->status.alive == TRUE)
+X				bflush(p);
+X		}
+X	}
+X}
+!xxENDITxx!
+echo x - ipc.c
+sed -e 's/^X//' > ipc.c << '!xxENDITxx!'
+X#ifndef lint
+Xstatic char rcsid[] = "$Header: ipc.c,v 2.1 85/04/10 17:31:13 matt Stab $";
+X#endif
+X/*
+X *
+X * search
+X *
+X * multi-player and multi-system search and destroy.
+X *
+X * Original by Dave Pare	1984
+X * Ported & improved
+X *      by Matt Crawford	1985
+X *
+X * routines to initialize and watch the communications sockets
+X * for new players, "searchwho" and "sdata" requests.
+X *
+X * Copyright (c) 1984
+X *
+X * $Log:	ipc.c,v $
+X * Revision 2.1  85/04/10  17:31:13  matt
+X * Major de-linting and minor restructuring.
+X * 
+X * Revision 1.6  85/02/24  22:50:47  matt
+X * Make the select() polls into real polls by setting the timeouts
+X * to zero.  This cuts down on context switches and speeds the game
+X * up IMMENSELY!
+X * 
+X * Revision 1.5  85/02/11  14:59:28  matt
+X * Tell searchwho that game is in GUTS mode
+X * 
+X * Revision 1.4  85/02/09  23:48:52  matt
+X * Eliminated the dependence on the value of the mask after
+X * select() times out.  Use the return value to distinguish
+X * a timeout!!
+X * 
+X * Revision 1.3  84/07/08  17:03:41  matt
+X * Added Log
+X * 
+X * Revision 1.2  84/07/07  18:20:50  matt
+X * Put new->p_speed into host byte order after reading from client
+X */
+X
+X#include <stdio.h>
+X#include <sgtty.h>
+X#include <sys/types.h>
+X#include <sys/ioctl.h>
+X#include <errno.h>
+X#include <sys/socket.h>
+X#include <sys/un.h>
+X#include <sys/file.h>
+X#include <sys/time.h>
+X
+X#ifdef INET
+X#include <netinet/in.h>
+X#include <netdb.h>
+X#endif
+X
+X#include "defines.h"
+X#include "structs.h"
+X
+X#ifdef INET
+Xstruct	sockaddr_in in_addr;
+X#endif
+Xstruct	sockaddr loc_addr;
+X
+Xextern	int	dtabsiz;
+X
+X/*
+X * newplayer checks to see if there is a new player waiting
+X * on one of the communication sockets.  If there is some input
+X * waiting, newplayer() checks to see if it's a request from
+X * "searchwho", or if it's an actual player requesting to
+X * enter the game.
+X *
+X * newplayer() returns the new player, or a NULL if no new player
+X * was found.
+X */
+X
+Xt_player *newplayer(mask)
+Xint mask;
+X{
+X	extern	void	core_dump();
+X	extern	char	*strcpy();
+X	extern	t_player	*startup();
+X	extern	t_player	player[NPLAYER];
+X	extern	int	errno,
+X			loc_sock,
+X			nobody,
+X			gutsflag;
+X#ifdef INET
+X	extern	int	in_sock;
+X#endif
+X	extern	struct	timeval	tim_inp;
+X	register	t_player	*p,	*np;
+X	t_file	*new;
+X	long	lbuf[1024];	/* Try to force alignment */
+X	char	*buf = (char *)lbuf;
+X	int	newsock,
+X		nfds,
+X		namelen,
+X		i;
+X	struct	sockaddr	muck_loc_addr;
+X#ifdef INET
+X	struct	sockaddr_in	muck_in_addr;
+X#endif
+X
+X
+X	tim_inp.tv_sec = tim_inp.tv_usec = 0L;
+X	nfds = select(dtabsiz, &mask, NULLINT, NULLINT, &tim_inp);
+X	if (nfds < 0 && errno != EINTR)
+X		errlog("select error in newplayer()\n");
+X	if (nfds == 0) 
+X		return 0;
+X#ifdef INET
+X	if (mask & 01<<loc_sock) {
+X		namelen = sizeof(loc_addr);
+X		newsock = accept(loc_sock, &muck_loc_addr, &namelen);
+X	} else {
+X		namelen = sizeof(in_addr);
+X		newsock = accept(in_sock, (struct sockaddr *)&muck_in_addr,
+X				 &namelen);
+X	}
+X#else
+X	namelen = sizeof(loc_addr);
+X	newsock = accept(loc_sock, &muck_loc_addr, &namelen);
+X#endif
+X	if (newsock < 0) {
+X		sprintf(buf,"accept error: %d, errno: %d\n", errno);
+X		errlog(buf);
+X		core_dump();
+X	}
+X	/*
+X	 * don't take forever when we close the socket!
+X	 */
+X	if (setsockopt(newsock, SOL_SOCKET, SO_DONTLINGER, 0, 0))
+X		errlog("error in setsockopt call\n");
+X	/*
+X	 * Sure hope the following read gives all the data in
+X	 * one shot.  It isn't guaranteed to, you know!
+X	 */
+X	i = read(newsock, buf, sizeof(lbuf));
+X	if ( i == 1 ) {	/* Special Request */
+X		switch ( *buf ) {
+X		case 'w':	/* "who's playing search?" */
+X			buf[0] = NULL;
+X			for (p=player; p < &player[NPLAYER]; p++) {
+X				if (p->status.alive == FALSE)
+X					continue;
+X				if (*buf == NULL)
+X					sprintf(buf, "%s  player   points\n",
+X					 gutsflag?"*game in GUTS mode*\n":"");
+X				sprintf(buf,"%s\n%-16s %-5d", buf,
+X						p->plname,p->points);
+X			}
+X			if (buf[0] == NULL) {
+X				(void)strcpy(buf, "nobody playing");
+X				nobody++;
+X			}
+X			write(newsock, buf, strlen(buf));
+X			errlog("searchwho request\n");
+X	        break;
+X		case '#':	/* "dump the player list" (top secret) */
+X			for (p=player; p < &player[NPLAYER]; p++)
+X				if (p->status.alive == TRUE)
+X					write(newsock, (char *)p,
+X						sizeof(t_player));
+X			errlog("sdata request\n");
+X	        break;
+X		default:	/* garbage! */
+X			write(newsock, "What?\n", 6);
+X			errlog("garbage request\n");
+X	        break;
+X		}
+X		shutdown(newsock, 2);
+X		close(newsock);
+X		return 0;
+X	} else if (i != sizeof(t_file)) {
+X		/*
+X		 * some sort of flaky number
+X		 */
+X		write(newsock, "You didn't send a complete packet!\n", 35);
+X		shutdown(newsock, 2);
+X		close(newsock);
+X		{
+X			char	errbuf[1024];
+X
+X			sprintf(errbuf, "bad new-player read, %d bytes\n");
+X			errlog(errbuf);
+X		}
+X		return 0;
+X	}
+X	/*
+X	 * use buf as the t_file structure
+X	 */
+X	new = (t_file *)lbuf;
+X	new->p_speed = ntohl(new->p_speed);
+X	if ((np = startup(newsock, new)) == NULL) {
+X		errlog("startup returned NULL in newplayer()\n");
+X		shutdown(newsock, 2);
+X		close(newsock);
+X		return 0;
+X	}
+X	return np;
+X}
+X
+X
+X/*
+X * initsocks initializes the two "new player" communications
+X * sockets.  It returns 1 if everything is ok, and 0 if not.
+X * Argument is passed in host byte order.
+X */
+X
+Xint initsocks(port)
+Xint port;
+X{
+X	extern	char	*rindex(),	*strcpy();
+X	extern	int loc_sock;
+X#ifdef INET
+X	extern	int in_sock;
+X	char	hostname[40];
+X	struct	servent *serv;
+X#endif
+X	char	buf[255];
+X
+X#ifdef INET
+X	/*
+X	 * connect to the internet address for our search daemon
+X	 * complain if we can't connect (for whatever reason)
+X	 */
+X	in_sock = socket(AF_INET, SOCK_STREAM, 0);
+X	if (in_sock < 0) {
+X		errlog("error creating internet socket\n");
+X		return 0;
+X	}
+X	if (gethostname(hostname, sizeof(hostname))) {
+X		errlog("error getting host name\n");
+X		return 0;
+X	}
+X	serv = getservbyname("search", "tcp");
+X	if (serv == NULL || htons((short)port) != serv->s_port) {
+X		sprintf(buf, "listening at port %d\n", port);
+X		errlog(buf);
+X		in_addr.sin_port = htons((short)port);
+X	} else
+X		in_addr.sin_port = serv->s_port;
+X	if (setsockopt(in_sock, SOL_SOCKET, SO_REUSEADDR, 0, 0) < 0)
+X		errlog("error in setsockopt (SO_REUSEADDR)\n");
+X	if (bind(in_sock, (struct sockaddr *)&in_addr, sizeof(in_addr))) {
+X		errlog("error binding internet port\n");
+X		return 0;
+X	}
+X	listen(in_sock, 5);
+X#endif
+X	/*
+X	 * bind and listen at the local socket "/tmp/slock"
+X	 */
+X	loc_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+X	if (loc_sock < 0) {
+X		errlog("error making local socket\n");
+X		return 0;
+X	}
+X	(void)strcpy(loc_addr.sa_data, SLOCK);
+X	/*
+X	 * get rid of the old one.
+X	 */
+X	unlink(loc_addr.sa_data);
+X	if (bind(loc_sock, &loc_addr, strlen(loc_addr.sa_data)+2)) {
+X		errlog("error binding local socket\n");
+X		return 0;
+X	}
+X	chmod(loc_addr.sa_data, 0666);
+X	listen(loc_sock, 5);
+X	return 1;
+X}
+X
+X/*
+X * read input from the socket
+X *
+X */
+X
+Xint pinput(p)
+Xregister t_player *p;
+X{
+X	extern	int	errlog();
+X	extern	void	done();
+X	extern	int	errno;
+X	register	int	i = 0;
+X	int	mask;
+X	extern	struct	timeval	tim_inp;
+X	int	nfds;
+X
+X	if (p->socket < 0) {
+X		errlog("bad socket number\n");
+X		done(p);
+X		return -1;
+X	}
+X	mask = 0;
+X	mask = 01 << p->socket;
+X	/*
+X	 * poll the socket for input
+X	 */
+X	tim_inp.tv_sec = tim_inp.tv_usec = 0L;
+X	nfds = select(dtabsiz, &mask, NULLINT, NULLINT, &tim_inp);
+X	if (nfds < 0 && errno != EINTR) {
+X		errlog("error, input select\n");
+X		return -1;
+X	}
+X	if (nfds > 0) {
+X		i = read(p->socket, p->inputq, QSIZE);
+X		/*
+X		 * socket shut down from other side
+X		 * clean up after the player
+X		 */
+X		if (i <= 0) {
+X			errlog("player died\n");
+X			done(p);
+X			return -1;
+X		}
+X		p->ninput = i;
+X		p->pinputq = p->inputq;
+X	}
+X	return i;
+X}
+!xxENDITxx!
+
+

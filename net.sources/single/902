@@ -1,0 +1,392 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,f2d9fa43937f810b,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-12-21 22:42:51 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!philabs!seismo!hao!hplabs!hpda!fortune!amd70!decwrl!flairvax!turtleva!ken
+From: ken@turtleva.UUCP (Ken Turkowski)
+Newsgroups: net.sources
+Subject: Graphics source in C: hsalgs/tiler.c
+Message-ID: <297@turtleva.UUCP>
+Date: Thu, 22-Dec-83 01:42:51 EST
+Article-I.D.: turtleva.297
+Posted: Thu Dec 22 01:42:51 1983
+Date-Received: Sun, 18-Dec-83 09:04:15 EST
+Lines: 374
+
+echo x - hsalgs/tiler.c
+cat >hsalgs/tiler.c <<'!Funky!Stuff!'
+
+
+
+
+
+
+
+/* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    tiler.c - tiler for convex polygons - takes piped input with -1 < x < 1
+	      -.75 < y < .75 and scan converts to the specified device
+        Keywords:
+      - device <dvc> <bits> <divisions> <frmnum>
+      - polygon <npts> (followed by appropriate number of vertices)
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+
+#include <stdio.h>
+
+#define TRUE   1
+#define FALSE  0
+#define NULLCHAR	'\0'
+#define LINE_LENGTH	 81
+#define POLYSIZE	 64
+#define HRES 		640
+#define VRES 		484
+#define SUBPIX 		.01              /* minimum allowable width or height */
+#define MAXLONG 0x7FFFFFFF
+#define MAXFLOAT 0xFFFF7FFF     /* yes, that's right (look in the VAX manual) */
+#define SQR(x) ((x)*(x))
+
+/* parameters for image placement in big buffer memory */
+static short Xofset,Yofset/*,rgb_24bit,rgb_16bit,bw_8bit,bw_4bit*/,field;
+static short hres,vres/*,Y_pos,xleft,xrght*/;
+static short xofset,yofset,maxY,fb,aed,byte;
+
+
+
+/* +++++++++++++++++++++++++ MAIN +++++++++++++++++++++++++++++++++++++++++ */
+main()
+{
+    char instrg[LINE_LENGTH],keywd[LINE_LENGTH],remainder[LINE_LENGTH],dvc[3];
+    char *eofchk,*gets();
+    short i;
+    double atof(),sqrt(),fabs();
+
+    /* scan input for keywords */
+    do
+    {   short bits,divisions,frmnum;
+	eofchk = gets(instrg);
+	if (eofchk != NULL) get_term(instrg,keywd,remainder);  /* get keyword */
+	else   continue;
+
+    	if      ( strcmp(keywd,"device") == 0 ) 	/* device description */
+		{   sscanf(remainder,"%s %hd %hd %hd",dvc,&bits,&divisions,
+							       	      &frmnum);
+		    if      (bits == 32)  rgbtilinit(bits,divisions,frmnum);
+		    else if (strcmp(dvc,"bb") == 0) bptilinit(frmnum,divisions);
+		    else if (strcmp(dvc,"fb") == 0) ptilinit(bits);
+		    else if (strcmp(dvc,"aed") == 0) aptilinit(0);
+		    else error(" bad device name - %s\n",dvc);
+		}
+    	else if ( strcmp(keywd,"polygon") == 0 ) /* begin polygon description */
+		{   short npts;    struct { double x,y,z,r,g,b; } pts[POLYSIZE];
+		    sscanf(remainder,"%hd",&npts);
+		    if (bits == 32) 				/* full color */
+		    {   for (i=0; i<npts; i++)
+			    sscanf(gets(instrg),"%f %f %f %f %f",&pts[i].x,
+				      &pts[i].y,&pts[i].r,&pts[i].g,&pts[i].b);
+			rgbtiler(npts,pts);
+		    }
+		    else				       /* pseudocolor */
+		    {   for (i=0; i<npts; i++)
+			    sscanf(gets(instrg),"%f %f %f",&pts[i].x,&pts[i].y,
+							   &pts[i].r);
+			ptiler(npts,pts);
+		    }
+		}
+	else    fprintf(stderr,"tiler - bad keyword %s\n",instrg);
+
+    }   while (eofchk != NULL);		/* continue until input exhausted */
+}   /* done with main program */
+
+
+
+
+
+
+
+/* +++++++++++++++++++++ GET_TERM +++++++++++++++++++++++++++++++++ */
+get_term(instrg,term,remainder)		/* remove first term from string */
+char *instrg,*term,*remainder;  /* blanks, tabs, nulls, commas are separators */
+{   short i,index1,index2;
+    index1 = 0;				/* find first non-separator */
+    while ((instrg[index1] == ' ') 	|| (instrg[index1] == '\t') ||
+	   (instrg[index1] == NULLCHAR) || (instrg[index1] == ',' )) index1++;
+    index2 = index1;			/* find next separator */
+    while ((instrg[index2] != ' ') 	&& (instrg[index2] != '\t') &&
+	   (instrg[index2] != NULLCHAR) && (instrg[index2] != ',' ) &&
+	   (instrg[index2] != '\n'))				     index2++;
+    for (i=index1; i<index2; i++)  term[i-index1] = instrg[i];
+    term[i-index1] = NULLCHAR;
+    while ((instrg[i] != NULLCHAR) && (instrg[i] != '\n'))
+	{  remainder[i-index2] = instrg[i];  i++;  }
+    remainder[i-index2] = NULLCHAR;
+}
+
+
+
+
+/* +++++++++++++++++++++++++ RGBTILINIT ++++++++++++++++++++++++++++++++++++ */
+
+rgbtilinit(bits,divisions,frmnum)  /* init tiler, set pointer to frame buffer */
+short bits,divisions,frmnum;
+{   /* short i; */  double pow(),sqrt();    long array[4];
+    /* static short palred[256],palgrn[256],palblu[256];   /* pallette */
+
+    if (frmnum == 0)  system("bbreset");
+    if (bbopen() < 0)  exit();			/* give up if bb won't open */
+
+    array[0] = frmnum;  array[1] = divisions;  array[2] = bits;  array[3] = 1;
+    bbwrite(0,502,array,4);    /* load animation control */
+    divisions = sqrt((double)divisions);
+    hres = (32/divisions)*20;           vres = 484/divisions;
+    field = frmnum % (32/bits);         frmnum /= 32/bits;
+    Xofset = (frmnum % divisions) * hres;
+    Yofset = (divisions-1 - (frmnum / divisions)) * vres;
+    hres /= 2;  vres /= 2;      /* use half-res for scaling later */
+    bbzoom(divisions, Xofset + hres, Yofset + vres + 1);
+}
+
+
+
+
+/* +++++++++++++++++++++++++ RGBTILER ++++++++++++++++++++++++++++++++++++++ */
+
+rgbtiler(npts,pts)     /* tile a convex polygon with vertices taken clockwise */
+    short npts;    struct { double x,y,z,r,g,b; } pts[];
+{
+    struct { double x,r,g,b; } l_edge,r_edge,l_incr,r_incr;
+    short i,iy,l_lnth,r_lnth,lpt,rpt,ptcnt,top_pt;
+    double top,ceil(),floor();
+
+    if (npts < 3) {  printf(" degenerate polygon\n");    return;   }
+
+    top = 0.0;
+    for(i=0; i<npts; i++)          /* scale for resolution & find top vertex */
+    {   pts[i].x = hres * (pts[i].x + 1.) + Xofset + SUBPIX;
+	pts[i].y = vres * (pts[i].y + 1.) + Yofset + SUBPIX;
+        if(pts[i].y > top) { top = pts[i].y; top_pt = i; }
+	pts[i].r *= 255.;    pts[i].g *= 255.;    pts[i].b *= 255.;
+    }
+
+    l_lnth = r_lnth = 0;                                /* scanlines left */
+    lpt = rpt = top_pt;  ptcnt = 0;                     /* vertex pointers */
+    iy = floor(top);                                     /* top scanline */
+
+    while(ptcnt <= npts)
+
+
+    {   short ix,xlft,xrgt,numpix; double r,rxinc,g,gxinc,b,bxinc;
+        long line[HRES];
+
+        while((l_lnth == 0) && (ptcnt <= npts))
+        {  bmkedge(&lpt,pts,&l_edge,&l_incr,&l_lnth,npts-1,npts);
+	   if (l_lnth >= 0) ptcnt++;  else break;   }
+        while((r_lnth == 0) && (ptcnt <= npts))
+        {  bmkedge(&rpt,pts,&r_edge,&r_incr,&r_lnth,npts+1,npts);
+	   if (r_lnth >= 0) ptcnt++;  else break;   }
+
+	xlft = floor(l_edge.x);  xrgt = floor(r_edge.x);
+        numpix = xrgt - xlft;
+        r = l_edge.r;   if (numpix>0) rxinc = (r_edge.r - r)/numpix;
+        g = l_edge.g;   if (numpix>0) gxinc = (r_edge.g - g)/numpix;
+        b = l_edge.b;   if (numpix>0) bxinc = (r_edge.b - b)/numpix;
+
+        for (ix=xlft; ix<xrgt; ix++)                  /* write scan segment */
+        {   line[ix] = (long)b + ((long)g << 8) + ((long)r << 16);
+	    r += rxinc;   g += gxinc;   b += bxinc;
+	}
+	bbwrite(xlft,iy,&line[xlft],numpix);   /* write to BB */
+
+        if ((l_lnth < 0) && (r_lnth < 0))  break;  /* done if at bottom vtx */
+	--iy;  --l_lnth;  --r_lnth;
+        l_edge.x += l_incr.x;        r_edge.x += r_incr.x;
+        l_edge.r += l_incr.r;    r_edge.r += r_incr.r;
+        l_edge.g += l_incr.g;    r_edge.g += r_incr.g;
+        l_edge.b += l_incr.b;    r_edge.b += r_incr.b;
+    }
+}
+
+
+/* ++++++++++++++++++++++++++ BMKEDGE +++++++++++++++++++++++++++++++++++++ */
+
+/* calculate edge block for tiler */
+bmkedge(ptr,pts,edge,incmnts,lnth,ptrinc,npts)
+    short *ptr,*lnth,ptrinc,npts;
+    struct { double x,y,z,r,g,b; } pts[];
+    struct { double x,r,g,b; } *edge,*incmnts;
+{
+    short opt;  double floor(),ydif;
+
+    opt = *ptr; *ptr = (*ptr + ptrinc) % npts;  /* increment vertex ptr. */
+    edge->x = pts[opt].x;
+    edge->r = pts[opt].r;
+    edge->g = pts[opt].g;
+    edge->b = pts[opt].b;
+
+    if (pts[opt].y < pts[*ptr].y) {  *lnth = -1;  return;  }  /* bottom vtx */
+
+    *lnth = floor(pts[opt].y) - floor(pts[*ptr].y);
+
+    if (*lnth > 1)
+    {   ydif = *lnth;
+	incmnts->x = (pts[*ptr].x - pts[opt].x) / ydif;
+	incmnts->r = (pts[*ptr].r - pts[opt].r) / ydif;
+	incmnts->g = (pts[*ptr].g - pts[opt].g) / ydif;
+	incmnts->b = (pts[*ptr].b - pts[opt].b) / ydif;
+    }
+    else
+    {   incmnts->x = pts[*ptr].x - pts[opt].x;
+	incmnts->r = pts[*ptr].r - pts[opt].r;
+	incmnts->g = pts[*ptr].g - pts[opt].g;
+	incmnts->b = pts[*ptr].b - pts[opt].b;
+    }
+}
+
+
+
+
+
+/* ++++++++++++++++++++++ PTILINIT +++++++++++++++++++++++++++++++++++++ */
+
+ptilinit(quad)			 /* initialize tiler (set up quadrant) */
+short quad;
+{   fbquad(quad);		/* open frame buffer */
+    xofset = yofset = 0;
+    hres = (quad == 0)?  512/2 : 256/2;
+    vres = (quad == 0)?  486/2 : 243/2;
+    maxY = vres * 2;
+    fb = TRUE;    aed = FALSE;
+}
+
+
+
+
+/* ++++++++++++++++++++++++ APTILINIT +++++++++++++++++++++++++++++++++++++ */
+
+aptilinit(quad)			 /* initialize tiler for aed display */
+short quad;
+{   aed_init(0);		/* open aed frame buffer */
+    xofset = yofset = 0;
+    hres = 512/2;
+    vres = 483/2;
+    maxY = vres * 2;
+    aed = TRUE;    fb = FALSE;
+}
+
+
+
+/* ++++++++++++++++++++++++ BPTILINIT +++++++++++++++++++++++++++++++++++++ */
+
+bptilinit(frmnum,divisions)	 /* initialize for animation on big buffer */
+short frmnum,divisions;
+{   long array[4];   long byte,mult;    double sqrt();
+
+    if (frmnum == 0) bbinit();	else bbopen();	/* init if 1st frame in seq. */
+    array[0] = frmnum;   array[1] = divisions;   array[2] = 8;   array[3] = 1;
+    bbwrite(0,502,array,4);	/* load animation control */
+    byte = ((3 - frmnum%4) << 6) | 0x3F;  bbwrite(2,497,&byte,1);/* set byte */
+    mult = sqrt((double)divisions);  array[0] = mult;
+    array[1] = ((frmnum/4)%mult) * 32/mult;
+    array[2] = ((frmnum/4)/mult) * 2 * 242/mult;
+    bbwrite(1,501,array,3);		/* set zoom and pan */
+
+    divisions = sqrt((double)divisions);
+    hres = (32/divisions)*20;   vres = 484/divisions;
+    byte = frmnum % 4;	  frmnum /= 4;
+    xofset = (frmnum % divisions) * hres;
+    yofset = (divisions-1 - (frmnum / divisions)) * vres;
+    hres = hres/2;	vres = vres/2;
+    fb = FALSE;    aed = FALSE;
+}
+
+
+
+
+/* ++++++++++++++++++++++++++ PTILER ++++++++++++++++++++++++++++++++++++++++ */
+
+ptiler(npts,pts)       /* tile a convex polygon with vertices taken clockwise */
+    short npts;
+    struct { double x, y, z, tns, g, b; } pts[];
+{
+    struct { double x, y, z, tns; } l_edge,r_edge,l_incr,r_incr;
+    short i,iy,l_lnth,r_lnth,lpt,rpt,ptcnt,top_pt;
+    double top,ceil(),floor();
+
+    top = 0.0;
+    for(i=0; i<npts; i++)          /* scale for resolution & find top vertex */
+    {   pts[i].x = hres * (pts[i].x + 1.) + xofset + SUBPIX;
+	pts[i].y = vres * (pts[i].y + 1.) + yofset + SUBPIX;
+        if(pts[i].y > top) { top = pts[i].y; top_pt = i; }
+    }
+
+    l_lnth = r_lnth = 0;                                /* scanlines left */
+    lpt = rpt = top_pt;  ptcnt = 0;                     /* vertex pointers */
+    iy = floor(top);                                     /* top scanline */
+
+    while(ptcnt <= npts)
+
+    {   short ix,xlft,xrgt,numpix; double t,txinc;
+        short line[HRES];    unsigned char linbuf[HRES];
+
+        while((l_lnth == 0) && (ptcnt <= npts))
+        {  mkedge(&lpt,pts,&l_edge,&l_incr,&l_lnth,npts-1,npts);
+	   if (l_lnth >= 0) ptcnt++;  else break;   }
+        while((r_lnth == 0) && (ptcnt <= npts))
+        {  mkedge(&rpt,pts,&r_edge,&r_incr,&r_lnth,npts+1,npts);
+	   if (r_lnth >= 0) ptcnt++;  else break;   }
+
+	xlft = floor(l_edge.x);  xrgt = floor(r_edge.x);
+        numpix = xrgt - xlft;
+        t = l_edge.tns;   if (numpix>0) txinc = (r_edge.tns - t)/numpix;
+
+        for (ix=xlft; ix<xrgt; ix++)                  /* write scan segment */
+        {   line[ix] = t; t += txinc;   }
+        if (fb) fbwrite(xlft,maxY-iy,&line[xlft],numpix);     /* write to FB */
+        else if (aed) {
+	    for (ix=xlft; ix<xrgt; ix++) {
+		linbuf[ix] = line[ix];
+		aed_mov(ix,iy);    aed_wpx(linbuf[ix]);
+	    }
+	    /* aed_write(xlft, iy, line, xrgt-xlft); /* aed dma makes errors */
+	}
+	else    bbwbyte(byte,xlft,iy,&line[xlft],numpix);     /* write to BB */
+
+        if ((l_lnth < 0) && (r_lnth < 0))  break;  /* done if at bottom vtx */
+	--iy;  --l_lnth;  --r_lnth;
+        l_edge.x += l_incr.x;        r_edge.x += r_incr.x;
+        l_edge.tns += l_incr.tns;    r_edge.tns += r_incr.tns;
+    }
+}
+
+
+
+/* +++++++++++++++++++++++++++ MKEDGE +++++++++++++++++++++++++++++++++++++++ */
+
+mkedge(ptr,pts,edge,incmnts,lnth,ptrinc,npts) /*calculate edge block for tiler*/
+    short *ptr,*lnth,ptrinc,npts;
+    struct { double x,y,z,t,g,b; } pts[];
+    struct { double x,y,z,t; } *edge,*incmnts;
+{
+    short opt;  double floor(),ydif;
+
+    opt = *ptr; *ptr = (*ptr + ptrinc) % npts;  /* increment vertex ptr. */
+    edge->x = pts[opt].x;
+    edge->t = pts[opt].t;
+
+    if (pts[opt].y < pts[*ptr].y) {  *lnth = -1;  return;  }  /* bottom vtx */
+
+    *lnth = floor(pts[opt].y) - floor(pts[*ptr].y);
+
+    if (*lnth > 1)
+    {   ydif = *lnth;
+	incmnts->x = (pts[*ptr].x - pts[opt].x) / ydif;
+	incmnts->t = (pts[*ptr].t - pts[opt].t) / ydif;
+    }
+    else
+    {   incmnts->x = pts[*ptr].x - pts[opt].x;
+	incmnts->t = pts[*ptr].t - pts[opt].t;
+    }
+}
+
+!Funky!Stuff!
+
+

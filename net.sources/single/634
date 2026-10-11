@@ -1,0 +1,146 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,2749446c92bfcca8,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-09-20 20:11:05 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site sbcs.UUCP
+Path: utzoo!linus!philabs!sbcs!perry
+From: perry@sbcs.UUCP (Perry Kivolowitz)
+Newsgroups: net.sources
+Subject: RL02 Driver for Stand Alone System (4.1BSD)
+Message-ID: <480@sbcs.UUCP>
+Date: Tue, 20-Sep-83 23:11:05 EDT
+Article-I.D.: sbcs.480
+Posted: Tue Sep 20 23:11:05 1983
+Date-Received: Thu, 22-Sep-83 00:28:23 EDT
+Organization: SUNY at Stony Brook
+Lines: 126
+
+kernel verision and rlreg.h also sent to net.sources
+this file goes in /sys/stand
+
+--------------------------------------------------------------------------
+
+/* Stand alone rl02 driver	Lory Molesky 	(lory@sbcs)		*/
+/*						(philabs!sbcs!lory)	*/
+/* Hacked from stand alone rk.c and multiuser rl.c			*/
+
+#include "../h/param.h"
+#include "../h/rlreg.h"
+#include "../h/inode.h"
+#include "../h/pte.h"
+#include "../h/ubareg.h"
+#include "saio.h"
+#include "savax.h"
+
+u_short	rlstd[] = { 0174400 };
+short	rl_off[] = { 0, 361, 0, -1, -1, -1, -1, -1 };
+
+
+/* RL02 drive structure */
+struct	RL02 {
+	short	nbpt;		/* Number of 512 byte blocks/track */
+	short	ntrak;
+	short	nbpc;		/* Number of 512 byte blocks/cylinder */
+	short	ncyl;
+	short	btrak;		/* Number of bytes/track */
+} rl02 = {
+	20,	2,	40,	512,	20*512
+};
+
+
+rlopen(io)
+	register struct iob *io;
+{
+	register struct rldevice *rladdr = (struct rldevice *)ubamem(io->i_unit, rlstd[0]);
+
+	if (rl_off[io->i_boff] == -1 ||
+	    io->i_boff < 0 || io->i_boff > 7)
+		_stop("rl bad unit");
+	io->i_boff = rl_off[io->i_boff] * NRLSECT*NRLTRKS;
+
+	rladdr->rlda.getstat = RL_RESET;
+	rlwait(rladdr);
+}
+
+
+rlstrategy(io, func)
+	register struct iob *io;
+{
+	register struct rldevice *rladdr = (struct rldevice *)ubamem(io->i_unit, rlstd[0]);
+	int com,ctr,diff,temp_mp;
+	daddr_t bn;
+	short dn, cn, sn, tn;
+	short dn_curr, cn_curr, hd_curr, hd, cc_curr, sn_curr, word_count;
+	int ubinfo, errcnt = 0;
+
+retry:
+	ubinfo = ubasetup(io, 1);
+	bn = io->i_bn << 1;
+	dn = io->i_unit;
+	/* validate drive status */
+	do {
+		rladdr->rlda.getstat = RL_RESET;
+		rladdr->rlcs = (dn <<8) | RL_GETSTAT; /* Get status*/
+		rlwait(rladdr);
+	} while( (rladdr->rlmp.getstat&RLMP_STATUS) != RLMP_STATOK && ++ctr<8 );
+	
+	cc_curr = io->i_cc;		/* current word count */
+
+search:
+
+	/* Determine disk position */
+	hd = (bn / NRLSECT) & 1;
+	cn = bn/(NRLSECT*NRLTRKS);
+	sn = bn%NRLSECT;
+	rladdr->rlcs = (dn << 8) | RL_RHDR;
+	rlwait(rladdr);
+
+	/* mpr has 0-5 sector add. 6 head select.  7-15 Cylinder Address */
+	temp_mp = rladdr->rlmp.readhdr;
+	cn_curr = (temp_mp >> 7) & 0777;
+	hd_curr = (temp_mp >> 6) & 01;
+
+	diff = cn_curr - cn;
+	if ((diff != 0) || (hd_curr != hd)) {
+		/* Do a seek */
+		if (diff < 0)
+			rladdr->rlda.seek = -diff << 7 | RLDA_HGH | hd << 4;
+		else
+			rladdr->rlda.seek = diff << 7 | RLDA_LOW | hd << 4;
+		rladdr->rlcs = (dn << 8) | RL_SEEK;
+		rlwait(rladdr);
+	}
+
+onesec:	
+	word_count = (cc_curr < 256) ? cc_curr : 256;
+	rladdr->rlmp.rw = -(word_count >> 1);
+	rladdr->rlda.rw = (cn << 7) | (hd << 6) | sn;
+	rladdr->rlba = ubinfo;
+	com = (dn << 8) ;
+	if (func == READ)
+		com |= RL_READ;
+	else
+		com |= RL_WRITE;
+	rladdr->rlcs = com;
+	rlwait(rladdr);
+	
+	cc_curr -= NRLBPSC;
+	bn +=1;
+	ubinfo += NRLBPSC;
+	if ((cc_curr <= 0) || (cn >= NRLCYLN)) goto leave;
+	goto search;
+
+leave:
+	ubafree(io, ubinfo);
+	return (io->i_cc);
+}
+
+rlwait(rladdr)
+	register struct rldevice *rladdr;
+{
+	while ((rladdr->rlcs & RL_CRDY) == 0)
+		;
+}
+
+

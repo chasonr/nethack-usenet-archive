@@ -1,0 +1,2700 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: fad06,40147529735ba1bd,start
+X-Google-Attributes: gidfad06,public
+X-Google-ArrivalTime: 1991-04-06 08:03:50 PST
+Path: gmdzi!unido!fauern!ira.uka.de!sol.ctr.columbia.edu!lll-winken!decwrl!mejac!orchard.la.locus.com!stb!michael
+From: michael@stb.info.com (Michael Gersten)
+Newsgroups: comp.sources.games.bugs
+Subject: Unofficial mdg changes, 3 of 3
+Message-ID: <1991Apr6.053908.6866@stb.info.com>
+Date: 6 Apr 91 05:39:08 GMT
+Organization: The Serial Tree BBS, +1 213 397 3137
+Lines: 2685
+
+cat > monsters.c <<  SHAR_EOF_monsters.c
+/*
+	MDG Multiuser Dungeon Game -- monsters.c monster code
+	
+	MDG is Copyright 1990 John C. Gonnerman
+	This program is subject to the general MDG 
+	copyright statement (see enclosed file, Copyright).
+*/
+
+static char *sccsvers = "@(#) monsters.c\t(1.2)\tcreated 1/12/91";
+
+#include <stdio.h>
+#include "setup.h"
+#include "struct.h"
+
+extern char *progname;
+
+extern int errno;
+extern char *sys_errlist[];
+
+extern struct map_seg *mseg;
+extern struct player_seg *pseg;
+
+extern int map_size, player_size;
+
+extern struct monster_tbl *m_table;
+
+extern int n_monster;
+
+int mon_count = 0;
+
+move_monsters()
+{
+	int i, j;
+
+	if (++mon_count < MON_TIME)
+		return;
+	mon_count = 0;
+
+	for(i = 0; i < n_monster; i++) {
+		if(m_table[i].loc.sector == LOC_NONESUCH)
+			resurrect(i);
+		else if(player_here(m_table[i].loc.sector))
+			for(j = m_table[i].mv_used; j < m_table[i].mv; j++)
+				do_a_monster(i);
+		else
+			roll_over(i);
+
+		m_table[i].mv_used = 0;
+		m_table[i].att_used = 0;
+	}
+}
+
+
+pace_monsters()
+{
+	int i;
+
+	for(i = 0; i < n_monster; i++)
+		if(m_table[i].mv_used < m_table[i].mv
+		&& player_here(m_table[i].loc.sector)) {
+			m_table[i].mv_used++;
+			do_a_monster(i);
+		}
+}
+
+
+roll_over(m_indx)
+int m_indx;
+{
+	int dir;
+
+	if((dir = at_edge(m_indx)) < 0)
+		return;
+
+	if(player_here(mseg->m[m_table[m_indx].loc.sector].links[dir]))
+		move_a_monster(m_indx, dir);
+}
+
+
+int at_edge(m_indx)
+int m_indx;
+{
+	switch(m_table[m_indx].loc.x) {
+	case 0 :
+		return L_WEST;
+	case MAPCOLS - 1 :
+		return L_EAST;
+	}
+
+	switch(m_table[m_indx].loc.y) {
+	case 0 :
+		return L_NORTH;
+	case MAPROWS - 1 :
+		return L_SOUTH;
+	}
+
+	return -1;
+}
+
+
+move_a_monster(m_indx, dir)
+int m_indx;
+unsigned char dir;
+{
+	struct location loc;
+	int sector;
+
+	if((sector = m_table[m_indx].loc.sector) < 0)
+		return;
+
+	loc.sector = m_table[m_indx].loc.sector;
+	loc.x = m_table[m_indx].loc.x;
+	loc.y = m_table[m_indx].loc.y;
+
+	mseg->m[loc.sector].map[loc.y][loc.x] = m_table[m_indx].loc.under;
+
+	if(get_dest(&loc, dir) != -1)
+		mmove_subcmd(m_indx, loc.sector, loc.x, loc.y);
+
+	move_sym(&(m_table[m_indx].loc), m_table[m_indx].m_sym);
+
+	mseg->map_sem++;
+}
+
+
+mmove_subcmd(m_indx, dest_a, dest_x, dest_y)
+int m_indx, dest_a, dest_x, dest_y;
+{
+	int rc;
+
+	rc = move_to(&(m_table[m_indx].loc), dest_a, dest_x, dest_y, -1);
+
+	if(is_player(rc))
+		mattack(m_indx, dest_a, dest_x, dest_y);
+
+	if(rc == 0) {
+		if(dest_a != m_table[m_indx].loc.sector)
+			notify(m_table[m_indx].loc.sector);
+		notify(dest_a);
+	}
+}
+
+
+int player_here(sector)
+int sector;
+{
+	int i;
+
+	if(sector < 0)
+		return 0;
+
+	for(i = 0; i < MAX_PLAYERS; i++)
+		if(pseg->p[i].playernum >= 0
+		&& pseg->p[i].loc.sector == sector)
+			return 1;
+
+	return 0;
+}
+
+int num_player_here(sector)
+int sector;
+{
+	int i, j;
+
+	j = 0;
+	if(sector < 0)
+		return 0;
+
+	for(i = 0; i < MAX_PLAYERS; i++)
+		if(pseg->p[i].playernum >= 0
+		&& pseg->p[i].loc.sector == sector)
+			j++;
+
+	return j;
+}
+
+do_a_monster(m_indx)
+int m_indx;
+{
+	int target_indx, rc;
+	int m_x, m_y, m_a, p_x, p_y, p_a;
+
+	if(m_table[m_indx].loc.sector < 0)
+		return;
+
+	m_table[m_indx].decay_cnt = 0;
+
+	m_x = m_table[m_indx].loc.x;
+	m_y = m_table[m_indx].loc.y;
+	m_a = m_table[m_indx].loc.sector;
+
+	if((target_indx = nearest(m_a, m_x, m_y)) == -1)
+		return;
+
+	p_x = pseg->p[target_indx].loc.x;
+	p_y = pseg->p[target_indx].loc.y;
+	p_a = pseg->p[target_indx].loc.sector;
+
+	mseg->m[m_a].map[m_y][m_x] = m_table[m_indx].loc.under;
+
+	if(m_x == p_x)
+		app_m_move(m_indx, (m_y < p_y ? L_SOUTH : L_NORTH ));
+	else if(m_y == p_y)
+		app_m_move(m_indx, (m_x < p_x ? L_EAST : L_WEST ));
+	else if(m_x < p_x)
+		app_m_move(m_indx, (m_y < p_y ? L_SEAST : L_NEAST ));
+	else if(m_x > p_x)
+		app_m_move(m_indx, (m_y < p_y ? L_SWEST : L_NWEST ));
+
+	move_sym(&(m_table[m_indx].loc), m_table[m_indx].m_sym);
+	mseg->map_sem++;
+
+	notify(m_a);
+}
+
+
+app_m_move(m_indx, dir)
+int m_indx, dir;
+{
+	if(rnd(100) <= m_table[m_indx].iq)
+		dir = smart_dir(m_indx, dir);
+	else
+		dir = stupid_dir(dir);
+
+	move_a_monster(m_indx, dir);
+}
+
+
+int smart_dir(m_indx, dir)
+int m_indx, dir;
+{
+	int ndir, mdir, nturn, mturn;
+
+	mturn = rnd(2) - 1;
+	nturn = mturn == 1 ? 0 : 1;
+
+	if(test_dir(m_indx, dir))
+		return dir;
+
+	if(test_dir(m_indx, (ndir = turn_it(dir, nturn))))
+		return ndir;
+
+	if(test_dir(m_indx, (mdir = turn_it(dir, mturn))))
+		return mdir;
+
+	if(test_dir(m_indx, (ndir = turn_it(ndir, nturn))))
+		return ndir;
+
+	return turn_it(mdir, mturn);
+}
+
+
+int test_dir(m_indx, dir)
+int m_indx, dir;
+{
+	struct location loc;
+	int at_spot;
+
+	loc = m_table[m_indx].loc;
+
+	if(get_dest(&loc, dir) == -1 
+	|| loc.sector < 0)
+		return 0;
+	
+	at_spot = mseg->m[loc.sector].map[loc.y][loc.x];
+
+	if(is_clear(at_spot) || is_player(at_spot))
+		return 1;
+
+	return 0;
+}
+
+
+int stupid_dir(dir)
+int dir;
+{
+	switch(rnd(7)) {
+	case 1 :
+	case 2 :
+		return turn_it(dir, 0);
+	case 3 :
+	case 4 :
+	case 5 :
+		return dir;
+	case 6 :
+	case 7 :
+		return turn_it(dir, 1);
+	}
+}
+
+
+int turn_it(dir, rot)
+int dir, rot;
+{
+	switch(dir) {
+	case L_NORTH :
+		return (rot ? L_NEAST : L_NWEST);
+	case L_NEAST :
+		return (rot ? L_EAST : L_NORTH);
+	case L_EAST :
+		return (rot ? L_SEAST : L_NEAST);
+	case L_SEAST :
+		return (rot ? L_SOUTH : L_EAST);
+	case L_SOUTH :
+		return (rot ? L_SWEST : L_SEAST);
+	case L_SWEST :
+		return (rot ? L_WEST : L_SOUTH);
+	case L_WEST :
+		return (rot ? L_NWEST : L_SWEST);
+	case L_NWEST :
+		return (rot ? L_NORTH : L_WEST);
+	}
+}
+
+
+int nearest(dest_a, dest_x, dest_y)
+int dest_a, dest_x, dest_y;
+{
+	int result, dist, n_dist, i;
+
+	result = -1;
+	dist = 100;
+
+	for(i = 0; i < MAX_PLAYERS; i++)
+		if(pseg->p[i].playernum != -1
+		&& pseg->p[i].loc.sector == dest_a
+		&& !pseg->p[i].invis
+		&& (n_dist = distance(i, dest_x, dest_y)) < dist) {
+			dist = n_dist;
+			result = i;
+		}
+
+	return result;
+}
+
+
+int distance(indx, dest_x, dest_y)
+int indx, dest_x, dest_y;
+{
+	int x_off, y_off;
+
+	x_off = pseg->p[indx].loc.x - dest_x;
+	y_off = pseg->p[indx].loc.y - dest_y;
+
+	if(x_off < 0)
+		x_off *= -1;
+
+	if(y_off < 0)
+		y_off *= -1;
+
+	return x_off + y_off;
+}
+
+
+int count_monsters(sector)
+{
+	int i, cnt;
+
+	cnt = 0;
+
+	for(i = 0; i < n_monster; i++)
+		if(m_table[i].loc.sector == sector)
+			cnt++;
+
+	return cnt;
+}
+
+addMonster(sector)
+{
+	/* Take a monster from the dead list, and put it
+	in the sector. (Idea is to normally not resurrect
+	monsters, but to add them instead). Future: Increase
+	the number of living monsters */
+
+	int lev, mon;
+	lev = mseg->m[sector].level;
+	mon = find_monster(lev);
+	if (mon != -1)
+		place_a_monster (sector, mon);
+}
+
+find_monster(lev)
+{
+	/* Look through the monster table for a monster of
+	level lev-4 to lev */
+	static int last_mon = -1;
+	int i, n, last_choice, mon;
+
+	for(i = last_choice +1, n=n_monster-1;
+			n >= 0; i++, n--)
+	{
+		if (i >= n_monster)
+			i = 0;
+		if (m_table[i].level > lev-4
+		&& m_table[i].level < lev+1
+		&& m_table[i].loc.sector == LOC_NONESUCH)
+		{
+			mon=i;
+			if (rnd(4) == 1)
+				return mon;
+		}
+	}
+	return -1;
+}
+
+resurrect(m_indx)
+int m_indx;
+{
+	int rc;
+	int dest_a, dest_x, dest_y, at_loc;
+
+	if(rnd(100) > RESURRECTION)
+		return;
+
+	dest_a = rnd(mseg->max_areas - 1); /* never at sector 0 */
+	if (dest_a == 0)
+		dest_a = mseg->max_areas - 1;
+
+	if(player_here(dest_a)
+	|| mseg->m[dest_a].level < m_table[m_indx].level
+	|| count_monsters(dest_a) >= MAX_MONSTERS
+	|| m_table[m_indx].level < (mseg->m[dest_a].level - 4)) 
+		return;
+
+	if (count_monsters(dest_a) > MAX_MONSTERS/2
+	&& rnd(4) != 1)
+		return;
+	place_a_monster(dest_a, m_indx);
+}
+
+place_a_monster(dest_a, m_indx)
+{
+	int rc;
+	int dest_x, dest_y, at_loc;
+
+	dest_x = rnd(MAPCOLS) - 1;
+	dest_y = rnd(MAPROWS) - 1;
+
+	at_loc = mseg->m[dest_a].map[dest_y][dest_x];
+
+	if(at_loc == '%' || at_loc == '~' || at_loc == '^')
+		return;
+
+	rc = move_to(&(m_table[m_indx].loc), dest_a, dest_x, dest_y, -1);
+	m_table[m_indx].decay_cnt = 0;
+		
+	if(rc == 0) {
+		move_sym(&(m_table[m_indx].loc), m_table[m_indx].m_sym);
+		m_table[m_indx].hp = m_table[m_indx].max_hp;
+		mseg->map_sem++;
+		notify(dest_a);
+	}
+}
+
+
+lift_a_monster(m_indx)
+int m_indx;
+{
+	int sector, x, y;
+
+	sector = m_table[m_indx].loc.sector;
+	x = m_table[m_indx].loc.x;
+	y = m_table[m_indx].loc.y;
+
+	mseg->m[sector].map[y][x] = m_table[m_indx].loc.under;
+}
+
+
+/* end of file. */
+SHAR_EOF_monsters.c
+cat > combat.c <<  SHAR_EOF_combat.c
+/*
+	MDG Multiuser Dungeon Game -- combat.c battle handlers
+	
+	MDG is Copyright 1990 John C. Gonnerman
+	This program is subject to the general MDG 
+	copyright statement (see enclosed file, Copyright).
+*/
+
+static char *sccsvers = "@(#) combat.c\t(1.5)\tcreated 1/13/91";
+
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+
+#include "setup.h"
+#include "struct.h"
+#include "combat.h"
+
+extern struct map_seg *mseg;
+extern struct player_seg *pseg;
+
+extern int dqid, map_size, player_size;
+
+extern struct monster_tbl *m_table;
+
+extern int n_monster;
+
+
+attack(p_indx, dest_a, dest_x, dest_y)
+int p_indx, dest_a, dest_x, dest_y;
+{
+	int i, attacker_indx;
+
+	attacker_indx = p_indx;
+
+	if(pseg->p[attacker_indx].attacks == 0)
+		return;
+
+	pseg->p[attacker_indx].attacks--;
+
+	if(is_player(mseg->m[dest_a].map[dest_y][dest_x])) {
+		for(i = 0; i < MAX_PLAYERS; i++)
+			if(pseg->p[i].loc.sector == dest_a 
+			&& pseg->p[i].loc.x == dest_x 
+			&& pseg->p[i].loc.y == dest_y)
+				pattackp(attacker_indx, i);
+	} else {
+		for(i = 0; i < n_monster; i++)
+			if(m_table[i].loc.sector == dest_a 
+			&& m_table[i].loc.x == dest_x 
+			&& m_table[i].loc.y == dest_y)
+				pattackm(attacker_indx, i);
+		pace_monsters();
+	}
+}
+
+
+mattack(m_indx, dest_a, dest_x, dest_y)
+int m_indx, dest_a, dest_x, dest_y;
+{
+	int i;
+
+	for(i = 0; i < MAX_PLAYERS; i++)
+		if(pseg->p[i].loc.sector == dest_a 
+		&& pseg->p[i].loc.x == dest_x 
+		&& pseg->p[i].loc.y == dest_y)
+			switch(m_table[m_indx].attack) {
+			case ATT_BREATH :
+				/* not done yet. */
+			case ATT_HITS :
+				mattackp(m_indx, i);
+				break;
+			case ATT_STEALS :
+				mstealp(m_indx, i);
+				break;
+			case ATT_DRAINS :
+				mdrainp(m_indx, i);
+				break;
+			case ATT_DRAINMP :
+				mdrainmp(m_indx, i);
+				break;
+			case ATT_DRAINHP :
+				mdrainhp(m_indx, i);
+				break;
+			case ATT_DRAINLIFE :
+				mdrainl(m_indx, i);
+				break;
+			}
+}
+
+
+int mhit(a_indx, v_indx)
+int a_indx, v_indx;
+{
+	int chance;
+
+	chance = 50 + m_table[a_indx].fight - pseg->p[v_indx].fighting;
+	chance = (chance + 51) / 2;
+
+	if(chance < MIN_CHANCE)
+		chance = MIN_CHANCE;
+
+	if(chance > MAX_CHANCE)
+		chance = MAX_CHANCE;
+
+	return rnd(100) <= chance;
+}
+
+
+int ccomp(odds, a_indx)
+int odds, a_indx;
+{
+	odds = (odds + 51) / 2;
+
+	if(pseg->p[a_indx].knight)
+		odds += 30;
+
+	if(odds < MIN_CHANCE)
+		odds = MIN_CHANCE;
+
+	if(odds > MAX_CHANCE)
+		odds = MAX_CHANCE;
+
+	return odds;
+}
+
+
+int phitm(a_indx, v_indx)
+int a_indx, v_indx;
+{
+	int chance, real_chance;
+
+	real_chance = 50 + pseg->p[a_indx].fighting - m_table[v_indx].fight;
+	chance = ccomp(real_chance, a_indx);
+
+	if(rnd(100) <= chance) {
+		improve_f(a_indx, real_chance);
+		return 1;
+	}
+
+	return 0;
+}
+
+
+int phitp(a_indx, v_indx)
+int a_indx, v_indx;
+{
+	int chance, real_chance;
+
+	real_chance = 50 + pseg->p[a_indx].fighting - pseg->p[v_indx].fighting;
+	chance = ccomp(real_chance, a_indx);
+
+	if(rnd(100) <= chance) {
+		improve_f(a_indx, real_chance);
+		return 1;
+	}
+
+	return 0;
+}
+
+
+int mdamage(a_indx)
+int a_indx;
+{
+	return rnd(m_table[a_indx].max_dam);
+}
+
+
+int pdamage(a_indx)
+int a_indx;
+{
+	int wpn, eff;
+
+	wpn = pseg->weapon[a_indx];
+
+	if(wpn < 0)
+		return rnd(pseg->p[a_indx].fighting / 20);
+	else if(wpn < pseg->item_count) {
+		eff = pseg->itm[wpn].effect;
+		if(pseg->itm[wpn].curse)
+			eff = 0;
+		return rnd(eff);
+	} else {
+		fprintf(stderr, 
+			"weapon range error, pnum = %d, wpn = %d\n",
+			pseg->p[a_indx].playernum, wpn);
+		pseg->weapon[a_indx] = -1;
+	}
+
+	return 0;
+}
+
+
+int ptakedamage(v_indx, damage)
+int v_indx, damage;
+{
+	if(damage < 0)
+		damage = 0;
+
+	pseg->p[v_indx].hitpoints -= damage;
+
+	pseg->player_sem++;
+	tell_player(v_indx);
+
+	if(pseg->p[v_indx].hitpoints < 1) {
+		killp(v_indx);
+		return -1;
+	}
+
+	return 0;
+}
+
+
+int pgetzapped(v_indx, damage)
+int v_indx, damage;
+{
+	if(pseg->p[v_indx].ma_count > 0)
+		damage = dcomp(damage, pseg->p[v_indx].m_armor);
+		
+	return(ptakedamage(v_indx, damage));
+}
+
+
+int pgethit(v_indx, damage)
+int v_indx, damage;
+{
+	int armor, ai, si;
+
+	armor = 0;
+
+	ai = pseg->armor[v_indx];
+
+	if(ai >= 0) {
+		if(ai >= pseg->item_count) {
+			fprintf(stderr, 
+				"Armor index out of range (%d)\n", ai);
+			pseg->armor[v_indx] = -1;
+		} else if(pseg->itm[ai].curse == 0) {
+			armor += pseg->itm[ai].effect;
+		}
+	}
+
+	si = pseg->shield[v_indx];
+
+	if(si >= 0) {
+		if(si >= pseg->item_count) {
+			fprintf(stderr, 
+				"Shield index out of range (%d)\n", si);
+			pseg->shield[v_indx] = -1;
+		} else if(pseg->itm[si].curse == 0) {
+			armor += pseg->itm[si].effect;
+		}
+	}
+
+	damage -= armor;
+
+	return(pgetzapped(v_indx, damage));
+}
+
+
+int mgethit(v_indx, damage)
+int v_indx, damage;
+{
+	if(damage < 1)
+		damage = 1;
+
+	if(m_table[v_indx].hp > m_table[v_indx].max_hp)
+		m_table[v_indx].hp = m_table[v_indx].max_hp;
+
+	m_table[v_indx].hp -= damage;
+
+	if(m_table[v_indx].hp < 1) {
+		killm(v_indx);
+		return -1;
+	}
+
+	return 0;
+}
+
+
+pattackp(a_indx, v_indx)
+int a_indx, v_indx;
+{
+	char buf[35];
+	int damage;
+
+	if(pseg->p[v_indx].loc.sector == 0)
+		return;
+
+	if(pseg->p[a_indx].partners[v_indx] == 1)
+		return;
+
+	visible(a_indx);
+
+	sprintf(buf, "%c attacked you!", '1' + a_indx);
+	dmsg_add(v_indx, buf);
+
+	if(!phitp(a_indx, v_indx)) {
+		if(pseg->p[a_indx].brief)
+			dmsg_add(a_indx, "You missed");
+		else
+			dmsg_add(a_indx, "You missed the player");
+		return;
+	}
+
+	damage = pdamage(a_indx);
+
+	if(pseg->p[a_indx].brief)
+		dmsg_add(a_indx, "Hit player!");
+	else {
+		dmsg_add(a_indx, "You hit the player!");
+		sprintf(buf, "Damage: %d", damage);
+		dmsg_add(a_indx, buf);
+	}
+
+	sprintf(buf, "%c HIT you!", '1' + a_indx);
+	dmsg_add(v_indx, buf);
+
+	if(pgethit(v_indx, damage) == -1) {
+		dmsg_add(a_indx, "You KILLED the player!");
+		pseg->p[a_indx].lives++;
+		pseg->player_sem++;
+		improve_h(a_indx, d_level(v_indx));
+	}
+}
+
+
+pattackm(a_indx, v_indx)
+int a_indx, v_indx;
+{
+	char buf[35];
+	int damage;
+
+	visible(a_indx);
+
+	if(!phitm(a_indx, v_indx)) {
+		if(pseg->p[a_indx].brief) {
+			sprintf(buf, "Missed %s", m_table[v_indx].name);
+			dmsg_add(a_indx, buf);
+		} else {
+			sprintf(buf, "You missed the %s", m_table[v_indx].name);
+			dmsg_add(a_indx, buf);
+		}
+		return;
+	}
+
+	damage = pdamage(a_indx);
+
+	if(pseg->p[a_indx].brief) {
+		sprintf(buf, "Hit %s!", m_table[v_indx].name, damage);
+		dmsg_add(a_indx, buf);
+	} else {
+		sprintf(buf, "You hit the %s!", m_table[v_indx].name, damage);
+		dmsg_add(a_indx, buf);
+		sprintf(buf, "Damage: %d", damage);
+		dmsg_add(a_indx, buf);
+	}
+
+	if(mgethit(v_indx, damage) == -1) {
+		sprintf(buf, "You KILLED the %s", m_table[v_indx].name);
+		dmsg_add(a_indx, buf);
+		improve_h(a_indx, m_table[v_indx].danger);
+	}
+}
+
+
+mattackp(a_indx, v_indx)
+int a_indx, v_indx;
+{
+	char buf[35];
+
+	if(m_table[a_indx].att_used >= M_ATTACKS)
+		return;
+
+	m_table[a_indx].att_used++;
+
+	if(!mhit(a_indx, v_indx)) {
+		if(!pseg->p[v_indx].brief) {
+			sprintf(buf, "%s missed you!", m_table[a_indx].name);
+			dmsg_add(v_indx, buf);
+		}
+		return;
+	} 
+
+	if(!pseg->p[v_indx].brief) {
+		sprintf(buf, "%s HIT you!", m_table[a_indx].name);
+		dmsg_add(v_indx, buf);
+	}
+
+	(void)pgethit(v_indx, mdamage(a_indx));
+}
+
+
+mdrainp(a_indx, v_indx)
+int a_indx, v_indx;
+{
+	char buf[35];
+
+	if(m_table[a_indx].att_used >= M_ATTACKS)
+		return;
+
+	m_table[a_indx].att_used++;
+
+	if(!mhit(a_indx, v_indx)) {
+		if(!pseg->p[v_indx].brief) {
+			sprintf(buf, "%s missed you!", m_table[a_indx].name);
+			dmsg_add(v_indx, buf);
+		}
+		return;
+	} 
+
+	if(!pseg->p[v_indx].brief) {
+		sprintf(buf, "%s HIT you!", m_table[a_indx].name);
+		dmsg_add(v_indx, buf);
+	}
+
+	pseg->p[v_indx].magicpts -= mdamage(a_indx);
+
+	if(pseg->p[v_indx].magicpts < 0) {
+		pseg->p[v_indx].magicpts = 0;
+		(void)pgetzapped(v_indx, mdamage(a_indx));
+	}
+}
+
+
+mdrainl(a_indx, v_indx)
+int a_indx, v_indx;
+{
+	char buf[35];
+
+	if(m_table[a_indx].att_used >= M_ATTACKS)
+		return;
+
+	m_table[a_indx].att_used++;
+
+	if(!mhit(a_indx, v_indx)) {
+		if(!pseg->p[v_indx].brief) {
+			sprintf(buf, "%s missed you!", m_table[a_indx].name);
+			dmsg_add(v_indx, buf);
+		}
+		return;
+	} 
+
+	if(!pseg->p[v_indx].brief) {
+		sprintf(buf, "%s HIT you!", m_table[a_indx].name);
+		dmsg_add(v_indx, buf);
+	}
+
+	pseg->p[v_indx].lives--;
+
+	if(pseg->p[v_indx].lives < 0) {
+		pseg->p[v_indx].lives = 0;
+		(void)pgetzapped(v_indx, mdamage(a_indx));
+	}
+
+	clearm(a_indx, 0);
+}
+
+
+mdrainhp(a_indx, v_indx)
+int a_indx, v_indx;
+{
+	char buf[35];
+	int damage;
+
+	if(m_table[a_indx].att_used >= M_ATTACKS)
+		return;
+
+	m_table[a_indx].att_used++;
+
+	if(!mhit(a_indx, v_indx)) {
+		if(!pseg->p[v_indx].brief) {
+			sprintf(buf, "%s missed you!", m_table[a_indx].name);
+			dmsg_add(v_indx, buf);
+		}
+		return;
+	} 
+
+	if(!pseg->p[v_indx].brief) {
+		sprintf(buf, "%s HIT you!", m_table[a_indx].name);
+		dmsg_add(v_indx, buf);
+	}
+
+	if(pseg->p[v_indx].ma_count > 0)
+		damage = dcomp(mdamage(a_indx), pseg->p[v_indx].m_armor);
+	else
+		damage = mdamage(a_indx);
+		
+	pseg->p[v_indx].max_hp -= damage;
+
+	if(pseg->p[v_indx].max_hp < 2) {
+		pseg->p[v_indx].max_hp = 2;
+		(void)pgetzapped(v_indx, mdamage(a_indx));
+	}
+
+	if(pseg->p[v_indx].hitpoints > pseg->p[v_indx].max_hp)
+		pseg->p[v_indx].hitpoints = pseg->p[v_indx].max_hp;
+
+	clearm(a_indx, 0);
+}
+
+
+mdrainmp(a_indx, v_indx)
+int a_indx, v_indx;
+{
+	char buf[35];
+	int damage;
+
+	if(m_table[a_indx].att_used >= M_ATTACKS)
+		return;
+
+	m_table[a_indx].att_used++;
+
+	if(!mhit(a_indx, v_indx)) {
+		if(!pseg->p[v_indx].brief) {
+			sprintf(buf, "%s missed you!", m_table[a_indx].name);
+			dmsg_add(v_indx, buf);
+		}
+		return;
+	} 
+
+	if(!pseg->p[v_indx].brief) {
+		sprintf(buf, "%s HIT you!", m_table[a_indx].name);
+		dmsg_add(v_indx, buf);
+	}
+
+	if(pseg->p[v_indx].ma_count > 0)
+		damage = dcomp(mdamage(a_indx), pseg->p[v_indx].m_armor);
+	else
+		damage = mdamage(a_indx);
+		
+	pseg->p[v_indx].max_mp -= damage;
+
+	if(pseg->p[v_indx].max_mp < 2) {
+		pseg->p[v_indx].max_mp = 2;
+		(void)pgetzapped(v_indx, mdamage(a_indx));
+	}
+
+	if(pseg->p[v_indx].magicpts > pseg->p[v_indx].max_mp)
+		pseg->p[v_indx].magicpts = pseg->p[v_indx].max_mp;
+
+	clearm(a_indx, 0);
+}
+
+#ifdef BUGGED_CODE_DO_NOT_USE
+
+int dcomp(damage, armor)
+int damage, armor;
+{
+	int final_damage;
+
+	final_damage = damage - armor;
+
+/* This routine is called with the magic armor value in armor.
+It can never be more than 6, so if damage is > 10 this section
+does nothing */
+	if(damage > 10) {
+		if(final_damage < -20)
+			final_damage = 0;
+		else if(final_damage < 1)
+			final_damage = 1;
+	} else {
+/* Now this section allows the possibility of taking a point
+of damage with magic armor that would not have been taken without
+the magic armor */
+		if(final_damage < -10)
+			final_damage = 0;
+		else if(final_damage < 1)
+			final_damage = 1;
+	}
+
+	return final_damage;
+}
+
+#else
+
+int dcomp(damage, armor)
+{
+	if (damage < 0)
+		return 0;
+	if (damage < armor)
+		return 1;	/* magic armor can't stop everything */
+	return damage-armor;
+}
+
+#endif
+
+mstealp(a_indx, v_indx)
+int a_indx, v_indx;
+{
+	int trys, item, i;
+	char buf[35];
+
+	if(m_table[a_indx].att_used >= M_ATTACKS)
+		return;
+
+	m_table[a_indx].att_used++;
+
+	if(!mhit(a_indx, v_indx)) {
+		if(!pseg->p[v_indx].brief) {
+			sprintf(buf, "%s missed you!", m_table[a_indx].name);
+			dmsg_add(v_indx, buf);
+		}
+		return;
+	} 
+
+	if(!pseg->p[v_indx].brief) {
+		sprintf(buf, "%s HIT you!", m_table[a_indx].name);
+		dmsg_add(v_indx, buf);
+	}
+
+	if(rnd(PMAX_ITEMS) == 1) {
+		pseg->p[v_indx].gold -= go2r(pseg->p[v_indx].gold);
+		pseg->player_sem++;
+		return;
+	}
+
+	for(trys = 0; trys < 3; trys++) {
+
+		item = rnd(PMAX_ITEMS) - 1;
+
+		if((i = pseg->p[v_indx].items[item]) != -1) {
+			pseg->itm[i].loc.sector = LOC_NONESUCH;
+			delete_item(v_indx, i);
+			deselect(v_indx, i);
+			pseg->item_sem++;
+			pseg->player_sem++;
+			return;
+		}
+	}
+}
+
+
+killp(v_indx)
+int v_indx;
+{
+	int sector, x, y;
+
+	sector = pseg->p[v_indx].loc.sector;
+	x = pseg->p[v_indx].loc.x;
+	y = pseg->p[v_indx].loc.y;
+
+	mseg->m[sector].map[y][x] = pseg->p[v_indx].loc.under;
+	drop_all(v_indx, sector, x, y);
+
+	mseg->map_sem++;
+
+	del_player(v_indx);
+
+	pseg->p[v_indx].loc.sector = LOC_NONESUCH;
+
+	notify(sector);
+
+	pseg->player_sem++;
+
+	tell_player(v_indx);
+}
+
+
+clearm(v_indx, t_flag)
+int v_indx, t_flag;
+{
+	int sector, x, y;
+
+	sector = m_table[v_indx].loc.sector;
+	x = m_table[v_indx].loc.x;
+	y = m_table[v_indx].loc.y;
+
+	if (sector < 0) return;
+
+	mseg->m[sector].map[y][x] = m_table[v_indx].loc.under;
+
+	if(t_flag)
+		do_treasure(v_indx);
+
+	mseg->map_sem++;
+
+	m_table[v_indx].loc.sector = LOC_NONESUCH;
+
+	m_table[v_indx].decay_cnt = 0;
+}
+
+
+killm(v_indx)
+int v_indx;
+{
+	int sector;
+
+	sector = m_table[v_indx].loc.sector;
+
+	clearm(v_indx, 1);
+
+	notify(sector);
+}
+
+
+do_treasure(v_indx)
+int v_indx;
+{
+	int tval, danger;
+	int sector, x, y;
+
+	sector = m_table[v_indx].loc.sector;
+	x = m_table[v_indx].loc.x;
+	y = m_table[v_indx].loc.y;
+
+	danger = m_table[v_indx].danger;
+
+	if(danger >= DANGER_CUT && rnd(CRYSTAL_ODDS) == 1) {
+		put_crystal(sector, x, y); 
+		return;
+	}
+
+	tval = (m_table[v_indx].max_hp + (danger * 10)) / 2;
+
+#ifdef OLD_CODE_0
+/* Used to be: Weak monsters had small chance of treasure, could
+be anything. */
+
+	if(rnd(100) > tval)
+		return;
+
+#else
+/* Now: Chance of treasure is nearly flat. Stronger monsters have bigger
+treasure */
+
+	if (rnd(100) > tval && rnd(4) == 1)
+		return;
+
+	switch(rnd(2)) {
+	case 1 :
+		put_item_tr(sector, x, y, tval * 20); 
+		break;
+	case 2 :
+		put_treasure(tval * 20, sector, x, y); 
+		break;
+	}
+}
+
+
+put_treasure(max_cash, sector, x, y)
+int max_cash, sector, x, y;
+{
+	int i;
+
+	for(i = 0; i < pseg->item_count; i++) {
+		if(pseg->itm[i].loc.sector == LOC_NONESUCH
+		&& pseg->itm[i].type == CASH) {
+			pseg->itm[i].decay_cnt = 0;
+			pseg->itm[i].loc.under = mseg->m[sector].map[y][x];
+			pseg->itm[i].value = rnd(max_cash);
+			(void)put_item(i, sector, x, y);
+			return;
+		}
+	}
+	/* If we got here, we are out of treasure spots. */
+	/* TARGET: Need to make new ones */
+	dmsg_all("Out Of Treasure Slots!");
+}
+
+
+put_crystal(sector, x, y)
+int sector, x, y;
+{
+	int i;
+
+	for(i = 0; i < pseg->item_count; i++) {
+		if(pseg->itm[i].loc.sector == LOC_NONESUCH
+		&& pseg->itm[i].type == CRYSTAL) {
+			pseg->itm[i].decay_cnt = 0;
+			pseg->itm[i].loc.under = mseg->m[sector].map[y][x];
+			pseg->itm[i].effect = 3 - go2r(2);
+			(void)put_item(i, sector, x, y);
+			return;
+		}
+	}
+}
+
+put_item_tr(sector, x, y, max_val)
+int sector, x, y, max_val;
+{
+	int i, n;
+	long min_val;
+	static int choice = -1;
+	static int last_choice = 0;
+
+/* Previously the award was based solely on danger. This made
+it impossible to award the top of the line prizes. */
+/* Now give 1/3 to 2/3 the cash value in prizes. Winners pay
+all income tax themselves. Void where prohibited. */
+	
+	max_val = max_val * 2 / 3;
+	min_val = max_val / 2;
+
+	for(i = last_choice +1, n=pseg->item_count-1;
+			n >= 0; i++, n--) {
+		if (i >= pseg->item_count)
+			i = 0;
+		if(pseg->itm[i].loc.sector == LOC_NONESUCH
+		&& pseg->itm[i].type != CRYSTAL
+		&& pseg->itm[i].type != CASH
+		&& pseg->itm[i].value >= min_val
+		&& pseg->itm[i].value < max_val) {
+			if(choice == -1 || rnd(2) == 1)
+				choice = i;
+			if(rnd(4) == 1)
+				break;
+		}
+	}
+
+	if(choice == -1)
+		return;
+
+	last_choice = choice;
+
+	pseg->itm[choice].decay_cnt = 0;
+	pseg->itm[choice].loc.under = mseg->m[sector].map[y][x];
+	pseg->itm[choice].rem_uses = pseg->itm[choice].max_uses;
+	(void)put_item(choice, sector, x, y);
+}
+
+
+drop_all(p_indx, sector, x, y)
+int p_indx, sector, x, y;
+{
+	int i, playernum;
+
+	playernum = pseg->p[p_indx].playernum;
+
+	for(i = 0; i < pseg->item_count; i++) {
+		if(pseg->itm[i].loc.sector == LOC_PLAYER
+		&& pseg->itm[i].loc.x == playernum)
+			if(put_item(i, sector, x, y) == -1)
+				pseg->itm[i].loc.sector = LOC_NONESUCH;
+
+		if(pseg->p[p_indx].gold > 0
+		&& pseg->itm[i].loc.sector == LOC_NONESUCH
+		&& pseg->itm[i].type == CASH) {
+			pseg->itm[i].value = pseg->p[p_indx].gold;
+			pseg->p[p_indx].gold = 0;
+			put_item(i, sector, x, y);
+		}
+	}
+
+	notify(sector);
+}
+
+
+damage_it(damage, t_a, t_x, t_y)
+int damage, t_a, t_x, t_y;
+{
+	int i;
+
+	if(is_player(mseg->m[t_a].map[t_y][t_x])) {
+		for(i = 0; i < MAX_PLAYERS; i++)
+			if(pseg->p[i].loc.sector == t_a 
+			&& pseg->p[i].loc.x == t_x 
+			&& pseg->p[i].loc.y == t_y)
+				(void)pgethit(i, damage);
+	} else {
+		for(i = 0; i < n_monster; i++)
+			if(m_table[i].loc.sector == t_a 
+			&& m_table[i].loc.x == t_x 
+			&& m_table[i].loc.y == t_y)
+				mgethit(i, damage);
+	}
+}
+
+
+/* tune the following if you make major changes  */
+/* to MAX_HP or allow monsters with greater than */
+/* 200 fighting scores.                          */
+
+int d_level(p_indx)
+int p_indx;
+{
+	int danger;
+
+	danger = pseg->p[p_indx].fighting / 30;
+	danger += pseg->p[p_indx].max_hp / 20;
+
+	return danger;
+}
+
+
+/* end of file. */
+SHAR_EOF_combat.c
+cat > magic.c <<  SHAR_EOF_magic.c
+/*
+	MDG Multiuser Dungeon Game -- magic.c magic handler
+	
+	MDG is Copyright 1990 John C. Gonnerman
+	This program is subject to the general MDG 
+	copyright statement (see enclosed file, Copyright).
+*/
+
+
+static char *sccsvers = "@(#) magic.c\t(1.2)\tcreated 1/2/91";
+
+#include <stdio.h>
+
+#include "setup.h"
+#include "struct.h"
+#include "spells.h"
+
+#define NOSPELL(x)	dmsg_add(x, "spell not available")
+
+extern struct player_seg *pseg;
+extern struct map_seg *mseg;
+
+extern struct monster_tbl *m_table;
+extern int n_monster;
+
+extern char *spell_names[];
+extern int spell_dd[];
+
+extern struct ast a_spell_table[];
+
+char under[8];
+int n_sectors[4];
+
+
+cast_spell(indx, mptr)
+int indx;
+struct dmessage *mptr;
+{
+	int spell, who, what, dir, max_damage, rc;
+	int x, y; /* debug */
+	char buf[35];
+	char *text;
+
+	spell = mptr->subcmd;
+	what = who = dir = mptr->arg;
+	text = mptr->text;
+
+	sprintf(buf, "cast %s...", spell_names[spell]);
+	dmsg_add(indx, buf);
+
+	if(cast_it(spell, indx) == -1) {
+		pseg->p[indx].magicpts -= (pseg->p[indx].magicpts ? 1 : 0);
+		sprintf(buf, "%s failed", spell_names[spell]);
+		dmsg_add(indx, buf);
+		return;
+	}
+
+	switch(spell + 'a') {
+	case 'a' : /* armor */
+	/* debug 
+		pseg->p[indx].ma_count += rnd(300);
+		pseg->p[indx].m_armor += rnd(5);
+	*/
+		x = rnd(300);
+		y = rnd(5);
+		pseg->p[indx].ma_count += x;
+		pseg->p[indx].m_armor += y;
+		if(pseg->p[indx].m_armor > MAX_MARMOR)
+			pseg->p[indx].m_armor = MAX_MARMOR;
+		pseg->player_sem++;
+		tell_player(indx);
+		break;
+		
+	case 'b' : /* block */
+		pseg->p[indx].blocked += go2r(100);
+		dmsg_add(indx, "Seeks now blocked.");
+		break;
+		
+	case 'c' : /* cold */
+		dmsg_add(indx, "Whoosh!");
+		visible(indx);
+		max_damage = (pseg->p[indx].spells[spell] + 50) / 3;
+		cast_a_spell(&(pseg->p[indx].loc), AS_COLD, dir, 
+			go2r(max_damage));
+		break;
+
+	case 'd' : /* detect */
+		detect(indx);
+		tell_player(indx);
+		break;
+
+	case 'e' : /* escape */
+		if((rc = jump_to(indx, pseg->p[indx].home)) == -1)
+			dmsg_add(indx, "escape bounced");
+		else if(rc == -2)
+			dmsg_add(indx, "escape fizzled");
+		else
+			dmsg_add(indx, "escaped!");
+		break;
+
+	case 'f' : /* fireball */
+		visible(indx);
+		dmsg_add(indx, "Boom!");
+		max_damage = (pseg->p[indx].spells[spell] + 50) / 3;
+		cast_a_spell(&(pseg->p[indx].loc), AS_FIREBALL, dir, 
+			go2r(max_damage));
+		break;
+
+	case 'g' : /* glow */
+		glow(indx);
+		tell_player(indx);
+		break;
+
+	case 'h' : /* heal */
+		heal(indx);
+		tell_player(indx);
+		break;
+
+	case 'i' : /* invisible */
+		invisible(indx);
+		tell_player(indx);
+		break;
+
+	case 'j' : /* jump back */
+		jump_back(indx);
+		break;
+
+	case 'k' : /* knight */
+		knight(indx);
+		break;
+
+	case 'l' : /* lightning */
+		visible(indx);
+		dmsg_add(indx, "Crackle!");
+		max_damage = (pseg->p[indx].spells[spell] + 50) / 3;
+		cast_a_spell(&(pseg->p[indx].loc), AS_LIGHTNING, dir, 
+			go2r(max_damage));
+		break;
+
+	case 'm' : /* missile */
+		visible(indx);
+		dmsg_add(indx, "A fiery missile appears!");
+		max_damage = (pseg->p[indx].spells[spell] + 50) / 3;
+		ranged_spell(indx, dir, 'm' - 'a', go2r(10), max_damage);
+		break;
+
+	case 'n' : /* n */
+		nightmare(indx, who);
+		break;
+
+	case 'o' : /* obscure */
+		if(what >= 0) {
+			toggle_obscure(what);
+			dmsg_add(indx, "The object shimmers...");
+		} else if(what == -1) {
+			pseg->p[indx].gold_hidden = 
+				(pseg->p[indx].gold_hidden ? 0 : 1);
+			dmsg_add(indx, "Your gold shimmers...");
+		} else
+			dmsg_add(indx, "obscure what?");
+		break;
+
+	case 'p' : /* partners */
+		show_partners(indx);
+		break;
+
+	case 'q' : /* quit */
+		quit_spell(indx);
+		break;
+
+	case 'r' : /* death ray */
+		visible(indx);
+		dmsg_add(indx, "Bzzzzzt!");
+		max_damage = (pseg->p[indx].spells[spell] + 50) / 3;
+		cast_a_spell(&(pseg->p[indx].loc), AS_DEATHRAY, dir, 
+			go2r(max_damage));
+		break;
+
+	case 's' : /* seek */
+		seek_s(indx, who);
+		break;
+
+	case 't' : /* teleport */
+		teleport(indx);
+		break;
+
+	case 'u' : /* user */
+		pseg->p[indx].user_spell += go2r(USER_DUR);
+		pseg->player_sem++;
+		break;
+
+	case 'v' : /* verify */
+		verify_item(indx, what);
+		break;
+
+	case 'w' : /* whisper */
+		whisper(indx, who, text);
+		break;
+
+	case 'x' : /* spell x */
+		spell_x(indx);
+		break;
+
+	case 'y' : /* yank */
+		yank(indx, who);
+		break;
+
+	case 'z' : /* zap */
+		visible(indx);
+		dmsg_add(indx, "Zap!");
+		max_damage = (pseg->p[indx].spells[spell] + 50) / 3;
+		cast_a_spell(&(pseg->p[indx].loc), AS_ZAP, L_EAST, 
+			go2r(max_damage));
+		break;
+
+	default :
+		break;
+	}
+}
+
+
+quit_spell(indx)
+int indx;
+{
+	int sector, x, y;
+
+	sector = pseg->p[indx].loc.sector;
+
+	if(sector < 0)
+		return;
+
+	x = pseg->p[indx].loc.x;
+	y = pseg->p[indx].loc.y;
+
+	mseg->m[sector].map[y][x] = pseg->p[indx].loc.under;
+	mseg->map_sem++;
+
+	pseg->p[indx].loc.x = sector;
+	pseg->p[indx].loc.sector = LOC_HOME;
+}
+
+
+show_partners(p_indx)
+int p_indx;
+{
+	int i, len;
+	char o_buf[35];
+
+	strcpy(o_buf, "Partners:");
+
+	for(i = 0; i < MAX_PLAYERS; i++)
+		if(i != p_indx
+		&& pseg->p[i].playernum >= 0
+		&& pseg->p[i].partners[p_indx] == 1) {
+			len = strlen(o_buf);
+			o_buf[len] = ' ';
+			o_buf[len + 1] = i + '1';
+			o_buf[len + 2] = '\0';
+		}
+
+	dmsg_add(p_indx, o_buf);
+}
+
+
+int cast_it(spell, indx)
+int spell, indx;
+{
+	if(pseg->p[indx].magicpts < (spell_dd[spell] + 1)
+	|| rnd(90 + (10 * spell_dd[spell])) > pseg->p[indx].spells[spell])
+		return -1;
+
+	improve_s(indx, spell);
+
+	pseg->p[indx].magicpts -= (spell_dd[spell] + 1);
+	pseg->player_sem++;
+	tell_player(indx);
+
+	return 0;
+}
+
+
+spell_x(p_indx)
+int p_indx;
+{
+	int max_damage, i, sector;
+
+	sector = pseg->p[p_indx].loc.sector;
+
+	for(i = 0; i < MAX_PLAYERS; i++)
+		if(pseg->p[i].loc.sector == sector)
+			dmsg_add(i, "KA-BOOM!!!");
+
+	max_damage = 5 * pseg->p[p_indx].magicpts;
+
+	if(max_damage < 1)
+		max_damage = 5;
+
+	pseg->p[p_indx].magicpts = 0;
+
+	for(i = 0; i < n_monster; i++)
+		if(m_table[i].loc.sector == sector)
+			mgethit(i, go2r(max_damage));
+
+	for(i = 0; i < MAX_PLAYERS; i++)
+		if(pseg->p[i].loc.sector == sector
+		&& i != p_indx
+		&& pseg->p[p_indx].partners[i] == 0)
+			pgethit(i, rnd(max_damage));
+
+	pseg->player_sem++;
+	mseg->map_sem++;
+
+	notify(sector);
+}
+
+
+yank(p_indx, v_indx)
+int p_indx, v_indx;
+{
+	int dest_a, rc;
+	char buf[35];
+
+	if(v_indx < 0 || v_indx >= MAX_PLAYERS)
+		return;
+
+	dest_a = pseg->p[p_indx].loc.sector;
+
+	if(pseg->p[v_indx].loc.sector < 0
+	|| pseg->p[v_indx].playernum < 0
+	|| pseg->p[v_indx].blocked > 0) {
+		sprintf(buf, "%c not found.", (char)('1' + v_indx));
+		dmsg_add(p_indx, buf);
+	} else if((rc = jump_to(v_indx, dest_a)) == -1)
+		dmsg_add(p_indx, "yank bounced");
+	else if(rc == -2)
+		dmsg_add(p_indx, "yank fizzled");
+	else {
+		sprintf(buf, "%c yanked!", (char)('1' + v_indx));
+		dmsg_add(p_indx, buf);
+		dmsg_add(v_indx, "you've been yanked!");
+	}
+}
+
+
+jump_back(indx)
+int indx;
+{
+	int dest_a, rc;
+
+	dest_a = pseg->p[indx].prev_sect;
+
+	if((rc = jump_to(indx, dest_a)) == -1)
+		dmsg_add(indx, "jump back bounced");
+	else if(rc == -2)
+		dmsg_add(indx, "jump back fizzled");
+	else
+		dmsg_add(indx, "returned");
+}
+
+
+teleport(indx)
+int indx;
+{
+	int dest_a, rc;
+
+	dest_a = rnd(mseg->max_areas) - 1;
+
+	if((rc = jump_to(indx, dest_a)) == -1)
+		dmsg_add(indx, "teleport bounced");
+	else if(rc == -2)
+		dmsg_add(indx, "teleport fizzled");
+	else
+		dmsg_add(indx, "teleported");
+}
+
+
+int jump_to(indx, sector)
+int indx, sector;
+{
+	int cnt, rc, symbol, link_dd;
+	int old_s, x, y, dest_x, dest_y;
+
+	old_s = pseg->p[indx].loc.sector;
+	x = pseg->p[indx].loc.x;
+	y = pseg->p[indx].loc.y;
+
+	link_dd = mseg->m[old_s].jump_inhibit + mseg->m[sector].jump_inhibit;
+
+	if(rnd(10) < link_dd)
+		return -2;
+
+	for(cnt = 0; cnt < TELE_TRYS; cnt++) {
+		mseg->m[old_s].map[y][x] = pseg->p[indx].loc.under;
+		mseg->map_sem++;
+
+		dest_x = rnd(MAPCOLS) - 1;
+		dest_y = rnd(MAPROWS) - 1;
+
+		rc = t_move_to(&(pseg->p[indx].loc), 
+			sector, dest_x, dest_y, indx);
+		
+		symbol = pseg->p[indx].invis ? indx + 11 : indx + 1;
+
+		move_sym(&(pseg->p[indx].loc), symbol);
+		mseg->map_sem++;
+
+		if(rc == 0) {
+			pseg->p[indx].prev_sect = old_s;
+			notify(sector);
+			notify(old_s);
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+
+int send_monster(m_indx, sector)
+int m_indx, sector;
+{
+	int rc;
+
+	lift_a_monster(m_indx);
+
+	rc = move_to(&(m_table[m_indx].loc), sector, 
+		m_table[m_indx].loc.x, m_table[m_indx].loc.y, -1);
+
+	move_sym(&(m_table[m_indx].loc), m_table[m_indx].m_sym);
+
+	mseg->map_sem++;
+
+	if(rc == 0) {
+		notify(sector);
+		return 0;
+	}
+
+	return -1;
+}
+
+
+visible(p_indx)
+int p_indx;
+{
+	int sector, x, y;
+
+	pseg->p[p_indx].invis = 0;
+
+	sector = pseg->p[p_indx].loc.sector;
+	x = pseg->p[p_indx].loc.x;
+	y = pseg->p[p_indx].loc.y;
+
+	if(sector < 0)
+		return;
+
+	mseg->m[sector].map[y][x] = 1 + p_indx;
+	mseg->map_sem++;
+}
+
+
+invisible(p_indx)
+int p_indx;
+{
+	int sector, x, y;
+
+	pseg->p[p_indx].invis += rnd(100);
+	dmsg_add(p_indx, "you disappear!");
+
+	sector = pseg->p[p_indx].loc.sector;
+	x = pseg->p[p_indx].loc.x;
+	y = pseg->p[p_indx].loc.y;
+
+	if(sector < 0)
+		return;
+
+	mseg->m[sector].map[y][x] = 11 + p_indx;
+	mseg->map_sem++;
+
+	notify(sector);
+}
+
+
+heal(p_indx)
+int p_indx;
+{
+	pseg->p[p_indx].hitpoints += rnd(10);
+
+	if(pseg->p[p_indx].hitpoints > pseg->p[p_indx].max_hp)
+		pseg->p[p_indx].hitpoints = pseg->p[p_indx].max_hp;
+
+	dmsg_add(p_indx, "you feel better");
+}
+
+
+glow(p_indx)
+int p_indx;
+{
+	pseg->p[p_indx].light += (6 * rnd(100));
+
+	mseg->map_sem++;
+
+	dmsg_add(p_indx, "it's brighter now");
+}
+
+
+detect(indx)
+int indx;
+{
+	pseg->p[indx].detect += go2r(DETECT_DUR);
+
+	mseg->map_sem++;
+
+	dmsg_add(indx, "your vision sharpens");
+}
+
+
+ranged_spell(p_indx, dir, spell, range, damage)
+int p_indx, dir, spell, range, damage;
+{
+	char buf[35];
+
+	if(rspell_start(p_indx, 21, range, damage, dir) == -1) {
+		sprintf(buf, "%s failed", spell_names[spell]);
+		dmsg_add(p_indx, buf);
+	} 
+}
+
+
+int rspell_start(indx, symbol, range, damage, dir)
+int indx, symbol, range, damage, dir;
+{
+	return start_ranged(symbol, 5, damage, 
+		pseg->p[indx].loc.sector, pseg->p[indx].loc.x, 
+		pseg->p[indx].loc.y, dir);
+}
+
+
+int t_move_to(locptr, dest_a, dest_x, dest_y, p_indx)
+struct location *locptr;
+int dest_a, dest_x, dest_y, p_indx;
+{
+	char at_loc;
+
+	if(dest_a < 0)
+		return -1;
+
+	at_loc = mseg->m[dest_a].map[dest_y][dest_x];
+
+	switch(at_loc) {
+	case '0' : /* 0-9 are traps */
+	case '1' :
+	case '2' :
+	case '3' :
+	case '4' :
+	case '5' :
+	case '6' :
+	case '7' :
+	case '8' :
+	case '9' :
+		do_trap(p_indx, at_loc);
+		locptr->sector = dest_a;
+		locptr->x = dest_x;
+		locptr->y = dest_y;
+		locptr->under = at_loc;
+		mseg->map_sem++;
+		return 0;
+
+	case '.' :
+	case ' ' :
+	case '`' : /* shallow water */
+	case '+' : /* secret door */
+	case '<' : /* down */
+	case '>' : /* up */
+		locptr->sector = dest_a;
+		locptr->x = dest_x;
+		locptr->y = dest_y;
+		locptr->under = at_loc;
+		mseg->map_sem++;
+		return 0;
+
+	default :
+		return (int)at_loc;
+	}
+}
+
+
+clear_n_sectors()
+{
+	int i;
+
+	for(i = 0; i < 4; i++)
+		n_sectors[i] = LOC_NONESUCH;
+}
+
+
+add_n_sector(sector)
+int sector;
+{
+	int i;
+
+	for(i = 0; i < 4; i++)
+		if(n_sectors[i] == LOC_NONESUCH) {
+			n_sectors[i] = sector;
+			return;
+		}
+}
+
+
+notify_n_sectors()
+{
+	int i;
+
+	for(i = 0; i < 4; i++)
+		if(n_sectors[i] != LOC_NONESUCH) 
+			notify(n_sectors[i]);
+}
+
+
+cast_a_spell(loc, a_spell, dir, effect)
+struct location *loc;
+int a_spell, dir, effect;
+{
+	int i, limit;
+	char at_spot;
+	struct location t_loc;
+
+	switch(dir) {
+	case L_NORTH :
+	case L_SOUTH :
+	case L_EAST :
+	case L_WEST :
+	case L_NEAST :
+	case L_NWEST :
+	case L_SEAST :
+	case L_SWEST :
+		break;
+	default :
+		return;
+	}
+	
+	clear_n_sectors();
+	limit = 99;
+
+	for(i = 0; i < 8; i++) {
+		t_loc.sector = loc->sector;
+		t_loc.x = loc->x;
+		t_loc.y = loc->y;
+
+		loc_a_spell(&t_loc, a_spell, i, dir);
+
+		if(correct_loc(&t_loc) != -1) {
+			at_spot = mseg->m[t_loc.sector].map[t_loc.y][t_loc.x];
+
+			if(a_spell_table[a_spell].advance[i] <= limit
+			&& at_spot != '#') {
+				add_n_sector(t_loc.sector);
+				under[i] = at_spot;
+				mseg->m[t_loc.sector].map[t_loc.y][t_loc.x] = 
+					'*';
+			} else if(at_spot == '#'
+			&& a_spell_table[a_spell].advance[i] < limit
+			&& a_spell_table[a_spell].flag == ASF_LIMITED) {
+				limit = a_spell_table[a_spell].advance[i];
+			}
+		}
+	}
+
+	mseg->map_sem++;
+	notify_n_sectors();
+
+	busy_wait(600000L);
+
+	clear_n_sectors();
+
+	for(i = 0; i < 8; i++) {
+		t_loc.sector = loc->sector;
+		t_loc.x = loc->x;
+		t_loc.y = loc->y;
+
+		loc_a_spell(&t_loc, a_spell, i, dir);
+
+		if(a_spell_table[a_spell].advance[i] <= limit
+		&& correct_loc(&t_loc) != -1 
+		&& mseg->m[t_loc.sector].map[t_loc.y][t_loc.x] == '*') {
+			add_n_sector(t_loc.sector);
+			mseg->m[t_loc.sector].map[t_loc.y][t_loc.x] = under[i];
+		}
+	}
+
+	mseg->map_sem++;
+	notify_n_sectors();
+
+	for(i = 0; i < 8; i++) {
+		t_loc.sector = loc->sector;
+		t_loc.x = loc->x;
+		t_loc.y = loc->y;
+
+		loc_a_spell(&t_loc, a_spell, i, dir);
+
+		if(correct_loc(&t_loc) != -1
+		&& a_spell_table[a_spell].advance[i] <= limit)
+			zap_spot(t_loc.sector, t_loc.x, t_loc.y, effect);
+	}
+}
+
+
+zap_spot(sector, x, y, effect)
+int sector, x, y, effect;
+{
+	int i;
+
+	if(is_player(mseg->m[sector].map[y][x])) {
+		for(i = 0; i < MAX_PLAYERS; i++)
+			if(pseg->p[i].loc.sector == sector 
+			&& pseg->p[i].loc.x == x 
+			&& pseg->p[i].loc.y == y)
+				pgetzapped(i, effect);
+	} else {
+		for(i = 0; i < n_monster; i++)
+			if(m_table[i].loc.sector == sector 
+			&& m_table[i].loc.x == x 
+			&& m_table[i].loc.y == y)
+				mgethit(i, effect);
+	}
+}
+
+
+loc_a_spell(loc, spell, pos, dir)
+struct location *loc;
+int spell, pos, dir;
+{
+	int off, adv;
+
+	off = a_spell_table[spell].offset[pos];
+	adv = a_spell_table[spell].advance[pos];
+
+	switch(dir) {
+	case L_NORTH :
+		loc->y -= adv;
+		loc->x += off;
+		break;
+	case L_SOUTH :
+		loc->y += adv;
+		loc->x -= off;
+		break;
+	case L_EAST :
+		loc->x += adv;
+		loc->y += off;
+		break;
+	case L_WEST :
+		loc->x -= adv;
+		loc->y -= off;
+		break;
+	case L_NEAST :
+		loc->y += (-1 * adv) + off - (off > 0);
+		loc->x += off + adv + (off < 0);
+		break;
+	case L_NWEST :
+		loc->y += (-1 * adv) + (-1 * off) - (off < 0);
+		loc->x += off + (-1 * adv) - (off > 0);
+		break;
+	case L_SEAST :
+		loc->y += adv + off + (off < 0);
+		loc->x += (-1 * off) + adv + (off > 0);
+		break;
+	case L_SWEST :
+		loc->y += adv + (-1 * off) + (off > 0);
+		loc->x += (-1 * off) + (-1 * adv) - (off < 0);
+		break;
+	}
+}
+
+
+int correct_loc(loc)
+struct location *loc;
+{
+	if(loc->y < 0 && loc->x >= MAPCOLS)
+		return -1;
+	if(loc->y < 0 && loc->x < 0)
+		return -1;
+	if(loc->y >= MAPROWS && loc->x < 0)
+		return -1;
+	if(loc->y >= MAPROWS && loc->x >= MAPCOLS)
+		return -1;
+
+	if(loc->x >= MAPCOLS) {
+		loc->x -= MAPCOLS;
+		loc->sector = mseg->m[loc->sector].links[L_EAST];
+	}
+
+	if(loc->x < 0) {
+		loc->x += MAPCOLS;
+		loc->sector = mseg->m[loc->sector].links[L_WEST];
+	}
+
+	if(loc->y >= MAPROWS) {
+		loc->y -= MAPROWS;
+		loc->sector = mseg->m[loc->sector].links[L_SOUTH];
+	}
+
+	if(loc->y < 0) {
+		loc->y += MAPROWS;
+		loc->sector = mseg->m[loc->sector].links[L_NORTH];
+	}
+
+	if(loc->sector < 0)
+		return -1;
+
+	return 0;
+}
+
+
+busy_wait(delay)
+long delay;
+{
+	for(; delay; delay--);
+}
+
+
+seek_s(p_indx, v_indx)
+int p_indx, v_indx;
+{
+	char buf[35];
+	int rc;
+
+	if(v_indx < 0 || v_indx >= MAX_PLAYERS)
+		return;
+
+	if(pseg->p[v_indx].loc.sector < 0
+	|| pseg->p[v_indx].playernum < 0
+	|| pseg->p[v_indx].blocked > 0) {
+		sprintf(buf, "%c not found.", (char)('1' + v_indx));
+		dmsg_add(p_indx, buf);
+	} else if((rc = jump_to(p_indx, pseg->p[v_indx].loc.sector)) == -1)
+		dmsg_add(p_indx, "seek bounced.");
+	else if(rc == -2)
+		dmsg_add(p_indx, "seek fizzled.");
+	else {
+		sprintf(buf, "%c found!", (char)('1' + v_indx));
+		dmsg_add(p_indx, buf);
+	}
+}
+
+
+toggle_obscure(item_indx)
+int item_indx;
+{
+	if(item_indx < 0
+	|| item_indx >= pseg->item_count
+	|| pseg->itm[item_indx].loc.sector > -1)
+		return;
+
+	if(pseg->itm[item_indx].type == pseg->itm[item_indx].symbol)
+		pseg->itm[item_indx].symbol = HIDDEN;
+	else
+		pseg->itm[item_indx].symbol = pseg->itm[item_indx].type;
+
+	pseg->item_sem++;
+}
+
+
+verify_item(indx, what)
+int indx, what;
+{
+	char buf[35];
+
+	if(what < 0 || what >= pseg->item_count)
+		return;
+
+	if(pseg->itm[what].curse == 0)
+		sprintf(buf, "%s is OK", pseg->itm[what].name);
+	else
+		sprintf(buf, "%s is CURSED", pseg->itm[what].name);
+
+	dmsg_add(indx, buf);
+}
+
+
+knight(p_indx)
+int p_indx;
+{
+	dmsg_add(p_indx, "You feel more confident.");
+	pseg->p[p_indx].knight += rnd(KNIGHT_DUR);
+}
+
+
+nightmare(p_indx, v_indx)
+int p_indx, v_indx;
+{
+	char buf[35];
+	int choice;
+
+	if(v_indx < 0 || v_indx >= MAX_PLAYERS)
+		return;
+
+	if(pseg->p[v_indx].loc.sector < 0
+	|| pseg->p[v_indx].playernum < 0
+	|| pseg->p[v_indx].blocked > 0) {
+		sprintf(buf, "%c not found.", (char)('1' + v_indx));
+		dmsg_add(p_indx, buf);
+		return;
+	}
+
+	if((choice = nearestm(p_indx)) == -1) {
+		dmsg_add(p_indx, "No monster.");
+		return;
+	}
+
+	if(send_monster(choice, pseg->p[v_indx].loc.sector) == -1) {
+		dmsg_add(p_indx, "Can't send monster.");
+		return;
+	}
+
+	dmsg_add(p_indx, "Monster sent...");
+	dmsg_add(v_indx, "A Nightmare!!!");
+}
+
+
+int nearestm(p_indx)
+int p_indx;
+{
+	int result, dist, n_dist, i;
+	int dest_a, m_a, m_x, m_y;
+
+	result = -1;
+	dist = 100;
+
+	dest_a = pseg->p[p_indx].loc.sector;
+
+	for(i = 0; i < n_monster; i++) {
+		m_a = m_table[i].loc.sector;
+		m_x = m_table[i].loc.x;
+		m_y = m_table[i].loc.y;
+
+		if(m_a == dest_a
+		&& (n_dist = distance(p_indx, m_x, m_y)) < dist) {
+			dist = n_dist;
+			result = i;
+		}
+	}
+
+	return result;
+}
+
+
+/* end of file. */
+SHAR_EOF_magic.c
+cat > clock.c <<  SHAR_EOF_clock.c
+/*
+	MDG Multiuser Dungeon Game -- clock task
+	
+	MDG is Copyright 1990 John C. Gonnerman
+	This program is subject to the general MDG 
+	copyright statement (see enclosed file, Copyright).
+*/
+
+static char *sccsx = "@(#) MDG_CLOCK Copyright 1990 John C. Gonnerman";
+static char *sccsvers = "@(#) clock.c\t(1.2)\tcreated 1/2/91";
+
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+
+#include "setup.h"
+#include "files.h"
+#include "struct.h"
+#include "messages.h"
+
+extern long dmsgkey, gsemkey, mapkey, playerkey;
+
+char *progname;
+int dqid;
+
+extern int errno;
+extern char *sys_errlist[];
+
+
+main(argc, argv)
+int argc;
+char **argv;
+{
+	struct dmessage msg_buf;
+	char *strrchr(), *strstr();
+	int mode;
+
+	if((progname = strrchr(argv[0], '/')) == NULL)
+		progname = argv[0];
+	else 
+		progname++;
+
+	fputs("clock started.\n", stderr);
+
+	if(argc != 1) {
+		fprintf(stderr, ARGCOUNT, progname, argc);
+		exit(1);
+	}
+
+	chdir(GAME_HOME);
+
+	/* load keys from config file */
+
+	loadconfig();
+
+	/* set signal handlers */
+
+/*
+	signal(SIGHUP, exit);
+	signal(SIGTERM, exit);
+*/
+
+	/* open message queue */
+
+	if((dqid = msgget(dmsgkey, 0)) == -1) {
+		fprintf(stderr, CANTERR, progname, "open queue",
+			sys_errlist[errno]);
+		exit(1);
+	}
+
+	/* actual monster packet driver */
+
+	while(1) {
+		sleep(1);
+
+		msg_buf.msg_type = 1L;
+		msg_buf.cmd = ' ';
+		msg_buf.playernum = -1;
+		msgsnd(dqid, &msg_buf, DMSGSIZ, IPC_NOWAIT);
+	}
+}
+
+
+/* end of file */
+SHAR_EOF_clock.c
+cat > dmain.c <<  SHAR_EOF_dmain.c
+/*
+	MDG Multiuser Dungeon Game -- mdg_daemon
+	
+	MDG is Copyright 1990 John C. Gonnerman
+	This program is subject to the general MDG 
+	copyright statement (see enclosed file, Copyright).
+*/
+
+static char *sccsx = "@(#) MDG_DAEMON Copyright 1990 John C. Gonnerman";
+static char *sccsvers = "@(#) dmain.c\t(1.5)\tcreated 1/4/91";
+
+#include <stdio.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <sys/sem.h>
+#include "setup.h"
+#include "files.h"
+#include "struct.h"
+#include "messages.h"
+
+char *progname;
+int dqid, pid;
+time_t mark_time;
+long max_mps, msg_count;
+
+/* flag for debugging */
+int in_msgrcv;
+
+FILE *saveopen();
+
+extern long dmsgkey, gsemkey, mapkey, playerkey;
+
+extern struct player_seg *pseg;
+extern struct map_seg *mseg;
+
+extern int errno;
+extern char *sys_errlist[];
+
+
+main(argc, argv)
+int argc;
+char **argv;
+{
+	int i, rc, xx, dfd, tmp;
+	FILE *gfp;
+	void shutdown();
+	struct dmessage msg_buf;
+	struct msqid_ds qbuf;
+
+	progname = argv[0];
+
+	/* arrange for file creation to be limited. */
+
+	umask(0007);
+
+	if(argc != 1) {
+		fprintf(stderr, ARGCOUNT, progname, argc);
+		exit(1);
+	}
+
+	fputs(DTITLE, stderr);
+	fputs(DCOPYRIGHT, stderr);
+	fputs(LOADMSG, stderr);
+
+	if(chdir(GAME_HOME) == -1) {
+		fprintf(stderr, CANTERR, progname, "chdir()",
+			sys_errlist[errno]);
+		exit(1);
+	}
+
+	if((tmp = creat(LOCKFILE, 0)) == -1) {
+		fprintf(stderr, "%s: daemon lock found, aborting...\n",
+			progname);
+		exit(99);
+	}
+
+	close(tmp);
+
+	if((dfd = open(ERRLOGFILE, O_WRONLY|O_CREAT|O_TRUNC, 0660)) == -1) {
+		fprintf(stderr, CANTERR, progname, "open error log",
+			sys_errlist[errno]);
+		exit(1);
+	}
+
+	close(2);
+	dup(dfd);
+	close(dfd);
+
+	setbuf(stderr, NULL);
+
+	close(0);
+	close(1);
+
+	fputs(LOADMSG, stderr);
+
+	if((rc = fork()) == -1) {
+		fprintf(stderr, CANTERR, progname, "fork()", 
+			sys_errlist[errno]);
+		exit(1);
+	}
+
+	if(rc != 0)
+		exit(0);
+
+	setpgrp();
+
+	/* load keys from config file */
+
+	loadconfig();
+
+	/* load the player segment */
+
+	if((gfp = saveopen(ITEMS, "r")) == NULL) {
+		fprintf(stderr, CANTERR, progname, "open item file",
+			sys_errlist[errno]);
+		exit(1);
+	}
+
+	load_pseg(gfp);
+	fclose(gfp);
+
+	/* load the monster table */
+
+	if((gfp = saveopen(MONSTERS, "r")) == NULL) {
+		fprintf(stderr, CANTERR, progname, "open monster file",
+			sys_errlist[errno]);
+		exit(1);
+	}
+
+	load_monsters(gfp);
+	fclose(gfp);
+
+	/* load the notes table */
+
+	if((gfp = saveopen(NOTES, "r")) == NULL) {
+		fprintf(stderr, CANTERR, progname, "open note file",
+			sys_errlist[errno]);
+		exit(1);
+	}
+
+	load_notes(gfp);
+	fclose(gfp);
+
+	/* load the map segment */
+
+	if((gfp = saveopen(MAP, "r")) == NULL) {
+		fprintf(stderr, CANTERR, progname, "open map file",
+			sys_errlist[errno]);
+		exit(1);
+	}
+
+	load_mseg(gfp);
+	fclose(gfp);
+
+	/* initialize ranged table */
+
+	init_ranged();
+
+	/* attach the segments. */
+
+	seg_attach();
+
+	/* create message queues (if needed) and open them */
+
+	if((dqid = msgget(dmsgkey, IPC_CREAT | 0666)) == -1) {
+		fprintf(stderr, CANTERR, progname, "open daemon queue",
+			sys_errlist[errno]);
+		exit(1);
+	}
+
+	msgctl(dqid, IPC_STAT, &qbuf);
+	qbuf.msg_qbytes = DQSIZ;
+	msgctl(dqid, IPC_SET, &qbuf);
+
+	if((pseg->sid = semget(gsemkey, MAX_PLAYERS, IPC_CREAT|0777)) == -1) {
+		fprintf(stderr, CANTERR, progname, "open game semset",
+			sys_errlist[errno]);
+		exit(1);
+	}
+
+	/* ready to run, so set signal traps */
+
+	signal(SIGTERM, shutdown);
+	signal(SIGHUP, shutdown);
+
+	/* lower our priority ... */
+
+	nice(NICEVAL);
+
+	/* ... start the monster packet driver ... */
+
+	if((pid = fork()) == 0) {
+		if(execl(CLOCKTASK, CLOCKTASK, (char *)0) == -1) {
+			fprintf(stderr, CANTERR, progname, "execl()",
+				sys_errlist[errno]);
+			exit(1);
+		}
+	} else if(pid == -1) {
+		fprintf(stderr, CANTERR, progname, "fork()",
+			sys_errlist[errno]);
+		exit(1);
+	}
+
+	/* ... seed the random number generator ... */
+
+	random();
+
+	/* ... and place the stuff. */
+
+	place_items();
+	place_monsters();
+
+	/* we got it, let's do it! */
+
+	mark_time = time(NULL);
+	max_mps = 0;
+	msg_count = 0;
+
+	while(1) {
+		in_msgrcv = 1;
+
+		if((xx = msgrcv(dqid, &msg_buf, DMSGSIZ, 0L, 0)) == DMSGSIZ) {
+				msg_count++;
+				msg_handler(msg_buf);
+		} 
+
+		in_msgrcv = 0;
+
+		if(mark_time != time(NULL)) {
+			if(msg_count > max_mps)
+				max_mps = msg_count;
+			msg_count = 0;
+			mark_time = time(NULL);
+		}
+	}
+}
+
+
+int rename(oldname, newname)
+char *oldname, *newname;
+{
+	unlink(newname);
+
+	if(link(oldname, newname) != -1)
+		return unlink(oldname);
+	else
+		return -1;
+}
+
+
+FILE *saveopen(file, mode)
+char *file, *mode;
+{
+	FILE *fp;
+	char savefile[128], altfile[128];
+
+	strcpy(savefile, file);
+	strcat(savefile, SAVEEXT);
+
+	strcpy(altfile, file);
+
+	if(mode[0] == 'r') {
+		strcat(altfile, STARTEXT);
+
+		if((fp = fopen(savefile, "r")) == NULL)
+			return fopen(altfile, "r");
+		else 
+			return fp;
+	} else if(mode[0] == 'w') {
+		strcat(altfile, OLDEXT);
+		rename(savefile, altfile);
+
+		return fopen(savefile, "w");
+	}
+}
+
+
+/* end of file */
+SHAR_EOF_dmain.c
+-- 
+		Michael
+michael@stb.info.com denwa!stb!michael anes.ucla.edu!stb!michael 
+"Space is an illusion; disk space doubly so"
+
+

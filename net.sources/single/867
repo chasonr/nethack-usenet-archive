@@ -1,0 +1,723 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,bffd579366127a1e,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-12-15 20:26:20 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!security!genrad!decvax!decwrl!flairvax!turtleva!ken
+From: ken@turtleva.UUCP (Ken Turkowski)
+Newsgroups: net.sources
+Subject: Graphics source in C: hsalgs/obj_sort.c
+Message-ID: <285@turtleva.UUCP>
+Date: Thu, 15-Dec-83 23:26:20 EST
+Article-I.D.: turtleva.285
+Posted: Thu Dec 15 23:26:20 1983
+Date-Received: Sun, 18-Dec-83 23:36:19 EST
+Lines: 705
+
+echo x - hsalgs/obj_sort.c
+cat >hsalgs/obj_sort.c <<'!Funky!Stuff!'
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ 
+    obj_sort.c - top-level object transform and priority sort
+        - takes object structures assembled by "scn_assmblr.c", transforms
+          and priority sorts
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+*/
+
+#include "scn_assmblr.h"
+
+#define COVERED         1
+#define UNCOVERED       0
+#define COVERS         -1
+#define PIX_SIZE        2./640.                    /* approximate pixel width */
+
+    
+struct sort_list {   short          obj_ptr; /* pointer to object definition */
+                     struct sort_list  *nxt; /* pointer to next list element */
+                 };
+
+extern  double      view_angle,tilt_angle;             /* scn_assmblr global */
+
+static  char        new_xfm[MAX_OBJECTS];              /* new transform tag  */
+static  float       view_mtx[4][4];                    /* eyespace matrix    */
+                   
+static  long        occlsn[MAX_OBJECTS][MAX_OBJECTS/32];/* eyespce occlusion */
+static  short       list_slot;                    /* list allocation pointer */
+static  short       boxes;                 /* global for overlap & separable */
+static  float       bbox1[8][3],bbox2[8][3];       /* bounding box vertices */
+static  short   pol[6][4] = {   0, 1, 2, 3,        /* bounding box polygons */
+                                4, 5, 6, 7,
+                                7, 6, 1, 0,
+                                3, 2, 5, 4,
+                                1, 6, 5, 2,
+                                7, 0, 3, 4,   }; 
+static double cot_x,cot_y;                            /* for gross clip test */
+
+/*  ++++++++++++++++++++++++++ OBJ_SORT ++++++++++++++++++++++++++++++++++++ */ 
+obj_sort(object,p_list) 
+object_def object[];    struct { short  obj,insep; } p_list[];
+{   short i;   double cos(),sin();
+
+    /* -------------- update object transform matrices, if changed -------- */
+    for (i=0; i<MAX_OBJECTS; i++)
+        if (object[i].name[0] != NULLCHAR)              /* skip if empty */
+            if (object[i].new_mtx)  build_mtx(&object[i],object);
+
+
+    /* ---- update composite matrix if object or parent matrix changed ---- */
+    new_xfm[CI] = new_xfm[EP] = FALSE;    /* initialize for subsequent test */
+    for (i=0; i<MAX_OBJECTS; i++)  if (object[i].name[0] != NULLCHAR) 
+    {   short j; 
+        if (!(object[i].new_mtx || new_xfm[CI] || new_xfm[EP]))
+        {   new_xfm[i] = FALSE;    j = i;
+            while (object[j].parent)  {   j = object[j].parent;   /* parent? */
+                                          new_xfm[i] |= object[j].new_mtx;   } 
+        }
+        else new_xfm[i] = TRUE; 
+        
+        /* ------------------ build new composite matrix ------------------ */
+        if (new_xfm[i])
+        {   short k;
+            ident_mtx(object[i].comp_mtx);            /* build scale matrix  */ 
+            for (k=0; k<3; k++)  object[i].comp_mtx[k][k] = object[i].scale[k];
+                                         /* include rotation and translation */
+            mtx_mpy(object[i].comp_mtx,object[i].mtx,object[i].comp_mtx);
+            j = i;
+            while (object[j].parent)
+            {   j = object[j].parent;                     /* trace hierarchy */
+                mtx_mpy(object[i].comp_mtx,object[j].mtx,object[i].comp_mtx);
+            }
+        } 
+    }
+    
+    /* ------------------ update view matrix, if changed ------------------- */
+    if (new_xfm[CI] || new_xfm[EP])  get_eyespace(object);
+
+    /* ------------------ add view matrix to updated objects --------------- */
+    for (i=0; i<MAX_OBJECTS; i++)  if (object[i].name[0] != NULLCHAR) 
+        if (new_xfm[i])                                      /* add eyespace */
+        {   
+            mtx_mpy(object[i].comp_mtx,view_mtx,object[i].comp_mtx);
+         /* printf("transform for %s\n",object[i].name);
+            {   short j,k;
+                for (j=0; j<4; j++)
+                {   for (k=0; k<4; k++) printf("  %g",object[i].comp_mtx[j][k]);
+                    printf("\n");   }  
+            }                   /*  debug */
+        }
+
+    /* ----------- update clip code if object matrix or view changed ------- */
+    cot_x = cos(DtoR * view_angle/2.) / sin(DtoR * view_angle/2.);
+    cot_y = cot_x / .75;
+    for (i=FIRST_OBJ; i<MAX_OBJECTS; i++) 
+        if (object[i].name[0] != NULLCHAR)                  /* skip if empty */
+            if (new_xfm[i])                               /* skip if unmoved */
+            {   double scale_fact, sqrt(), fabs();
+                transform(object[i].centroid,object[i].comp_mtx,
+                                                           object[i].xfmd_ctr);
+                object[i].depth = sqrt(sqr(object[i].xfmd_ctr[0]) + 
+                                       sqr(object[i].xfmd_ctr[1]) + 
+                                       sqr(object[i].xfmd_ctr[2]));
+                scale_fact = object[i].scale[1] > object[i].scale[0] ?
+                            (object[i].scale[2] > object[i].scale[1] ?
+                                object[i].scale[2] : object[i].scale[1])  :
+                            (object[i].scale[2] > object[i].scale[0] ?
+                                object[i].scale[2] : object[i].scale[0])  ;
+                object[i].xfmd_radius = object[i].radius * scale_fact;
+
+                if (((fabs(object[i].xfmd_ctr[0]) + object[i].xfmd_radius) * 
+                                            cot_x < object[i].xfmd_ctr[2])  &&
+                    ((fabs(object[i].xfmd_ctr[1]) + object[i].xfmd_radius) *
+                                            cot_y < object[i].xfmd_ctr[2]))
+                           object[i].clipped = 0;    /* entirely in picture */
+                else 
+                if (((fabs(object[i].xfmd_ctr[0]) - object[i].xfmd_radius) *
+                                            cot_x > object[i].xfmd_ctr[2])  ||
+                    ((fabs(object[i].xfmd_ctr[1]) - object[i].xfmd_radius) *
+                                            cot_y > object[i].xfmd_ctr[2]))
+                           object[i].clipped = -1;    /* all outside picture */
+                else       object[i].clipped = 1;          /* needs clipping */
+            }
+
+    /* --------- update priority where object matrices or view changed ----- */
+    find_occlusions(object);             /* get occlusions and intersections */
+    priority_sort(object,p_list);                   /* sort to priority list */
+}
+
+
+
+
+/* ++++++++++++++++++++++++++ BUILD_BOX +++++++++++++++++++++++++++++++++++ */
+build_box(bx,object)  /* get bounding box vtces from obj. - 1st poly is top */
+float bx[8][3];    object_def *object;
+{
+    bx[0][0] = bx[1][0] = bx[6][0] = bx[7][0] = object->box[0];        /* x */
+    bx[2][0] = bx[3][0] = bx[4][0] = bx[5][0] = object->box[1];
+    bx[0][1] = bx[1][1] = bx[2][1] = bx[3][1] = object->box[2];        /* y */
+    bx[4][1] = bx[5][1] = bx[6][1] = bx[7][1] = object->box[3];
+    bx[0][2] = bx[3][2] = bx[4][2] = bx[7][2] = object->box[4];        /* z */
+    bx[1][2] = bx[2][2] = bx[5][2] = bx[6][2] = object->box[5];
+}
+
+
+
+
+/* +++++++++++++++++++++++++ BUILD_MTX ++++++++++++++++++++++++++++++++++++ */
+build_mtx(object,objarray)   /* build rotation and translation matrix for
+                                object. Note scaling is done elsewhere to avoid
+                                compounding scale factors in a hierarchy */
+object_def  *object,objarray[];
+{   short i,j;    float temp_mtx[4][4],alph,beta,gama,magnitude,cosphi,sinphi; 
+    double sqrt(),cos(),sin();
+
+    ident_mtx(object->mtx);
+    
+    for (j=0; j<MAXROT; j++)  if (object->angle[j] != 0.)
+    {   /* build general rotation matrix */ 
+        alph = object->rotend[j][0] - object->rotbas[j][0];/*direction cosines*/
+        beta = object->rotend[j][1] - object->rotbas[j][1]; 
+        gama = object->rotend[j][2] - object->rotbas[j][2];
+        magnitude = sqrt( sqr(alph) + sqr(beta) + sqr(gama) );   /* normalize */
+        if (magnitude > 0.)                     /* skip if zero rotation axis */
+        {   ident_mtx(temp_mtx);           /* translate to rotation axis base */
+            for (i=0; i<3; i++)  temp_mtx[3][i] = -object->rotbas[j][i];
+            mtx_mpy(object->mtx,temp_mtx,object->mtx);   /* apply translation */
+            alph /= magnitude;    beta /= magnitude;    gama /= magnitude; 
+            cosphi = cos(object->angle[j]*DtoR); 
+            sinphi = sin(object->angle[j]*DtoR);
+            ident_mtx(temp_mtx);          /* general rotation matrix template */
+            temp_mtx[0][0] = sqr(alph) + (1.0 - sqr(alph))*cosphi; 
+            temp_mtx[1][0] = alph*beta*(1.0 - cosphi) + gama*sinphi;
+            temp_mtx[2][0] = alph*gama*(1.0 - cosphi) - beta*sinphi;
+            temp_mtx[0][1] = alph*beta*(1.0 - cosphi) - gama*sinphi; 
+            temp_mtx[1][1] = sqr(beta) + (1.0 - sqr(beta))*cosphi;
+            temp_mtx[2][1] = beta*gama*(1.0 - cosphi) + alph*sinphi;
+            temp_mtx[0][2] = alph*gama*(1.0 - cosphi) + beta*sinphi; 
+            temp_mtx[1][2] = alph*gama*(1.0 - cosphi) - alph*sinphi;
+            temp_mtx[2][2] = sqr(gama) + (1.0 - sqr(gama))*cosphi;
+            mtx_mpy(object->mtx,temp_mtx,object->mtx);      /* apply rotation */
+            ident_mtx(temp_mtx); 
+            for (i=0; i<3; i++)  temp_mtx[3][i] = object->rotbas[j][i]; 
+            mtx_mpy(object->mtx,temp_mtx,object->mtx);    /* restore position */
+        }
+    }
+    /* translate to position */ 
+    ident_mtx(temp_mtx);
+    for (i=0; i<3; i++) temp_mtx[3][i] = object->postn[i];
+    if ((object->supported) && (object->parent >0)) /* raise to top of parent */
+        temp_mtx[3][2] += objarray[object->parent].box[5] - 
+                          object->scale[2] * object->box[4];
+    mtx_mpy(object->mtx,temp_mtx,object->mtx);
+} 
+
+
+
+
+/* ++++++++++++++++++++++++++ FIND_OCCLUSIONS +++++++++++++++++++++++++++++ */
+find_occlusions(object)               /* load occlusion relations in matrix */
+object_def object[];
+{   short i,j;
+
+    i = FIRST_OBJ;                                 /* zero occlusion array */
+    while (object[i].name[0] != NULLCHAR)
+    {   for (j=0; j<MAX_OBJECTS/32; j++) occlsn[i][j] = 0;    i++;   }
+
+    i = FIRST_OBJ;                                       /* initialize loop */
+                                   /* do for all active objects within view */
+    while (object[i].name[0] != NULLCHAR)
+    {   if (object[i].clipped >= 0)
+        {   j = i+1;
+                                             /* compare with rest of objects */
+            while (object[j].name[0] != NULLCHAR)
+            {   if (object[j].clipped >= 0)
+                {   short i_behind;
+                    boxes = FALSE;  /* flag for saving redo of bounding boxes */
+                    if (overlap(&object[i],&object[j]))   /* do objs overlap? */
+                        if (separable(&object[i],&object[j],&i_behind))
+                            if (i_behind) 
+                            {   load_occlsn(j,i,TRUE);            /*j in front*/
+                                /* printf(" %s (%d) hides %s (%d)\n",
+                                        object[j].name,j,object[i].name,i); */ }
+                            else
+                            {   load_occlsn(i,j,TRUE);            /*i in front*/
+                                /* printf(" %s (%d) hidden by %s (%d)\n",
+                                        object[j].name,j,object[i].name,i); */ }
+                        else
+                        {   load_occlsn(i,j,FALSE);            /* inseparable */
+                            /* printf(" %s (%d) inseparable from %s (%d)\n",
+                                object[j].name,j,object[i].name,i); */  }
+                }
+                j++;
+            }
+        }
+            /* printf("%s covers:",object[i].name);
+            for (j=0; j<32; j++)  if (occlsn[i][0] & (0x1 << j))
+                printf("  %s",object[j].name);
+            printf("\n");       /* debug */
+        i++;
+    }
+    /* i = FIRST_OBJ;
+    while (object[i].name[0] != NULLCHAR)  if (occlsn[i][0] != 0)
+    {   printf("%s covers:",object[i].name);
+        for (j=0; j<32; j++)  if (occlsn[i][0] & (0x1 << j))
+                printf("  %s",object[j].name);
+        printf("\n");  i++;
+    }
+    else i++;   /* debug */
+}
+
+
+
+
+
+/* ++++++++++++++++++++++++++++ FIX_CYCLE +++++++++++++++++++++++++++++++++ */
+fix_cycle(p_list,obj,covers_at,covered_at)    /* fix cycle in priority list */
+struct { short obj,insep; }  p_list[];    short obj,covers_at,covered_at;
+{   printf(" cycle discovered!!  Write more code!!\n");
+}
+
+
+
+
+/* +++++++++++++++++++++++++++ GET_EYESPACE +++++++++++++++++++++++++++++++ */
+get_eyespace(object) 
+object_def object[];
+{   float temp_mtx[4][4],pt[3],eye_pos[3],ctr_pos[3],hypot,cosang,sinang;
+    short i;  double sqrt(),sin(),cos();
+
+    for (i=0; i<3; i++)  eye_pos[i] = ctr_pos[i] = 0.0; /* get xfmd postns */
+    transform(eye_pos,object[EP].comp_mtx,eye_pos);
+    transform(ctr_pos,object[CI].comp_mtx,ctr_pos);
+
+    ident_mtx(view_mtx);                   /* translate eyepoint to origin */ 
+    view_mtx[3][0] = -eye_pos[0];
+    view_mtx[3][1] = -eye_pos[1]; 
+    view_mtx[3][2] = -eye_pos[2];
+    
+    for (i=0; i<3; i++)  pt[i] = ctr_pos[i] - eye_pos[i];
+    hypot = sqrt( sqr(pt[0]) + sqr(pt[1]));   /* CI - EP to set up z-rot. */ 
+    if (hypot > 0.) 
+    {   cosang = pt[1]/hypot;  sinang = pt[0]/hypot;    /* rotate about z */
+        ident_mtx(temp_mtx);
+        temp_mtx[0][0] = cosang;       temp_mtx[1][0] = -sinang;
+        temp_mtx[0][1] = sinang;       temp_mtx[1][1] = cosang;
+        mtx_mpy(view_mtx,temp_mtx,view_mtx);
+    }
+    
+    pt[0] = 0.;        pt[1] = hypot;                 /* rotated CI' */
+    hypot = sqrt( sqr(pt[1]) + sqr(pt[2]) );
+    if (hypot > 0.)
+    {   cosang = pt[1]/hypot;  sinang = -pt[2]/hypot;  /* rotate about x */ 
+        ident_mtx(temp_mtx);
+        temp_mtx[1][1] = cosang;       temp_mtx[2][1] = -sinang;
+        temp_mtx[1][2] = sinang;       temp_mtx[2][2] = cosang;
+        mtx_mpy(view_mtx,temp_mtx,view_mtx);
+    }
+    
+    ident_mtx(temp_mtx);                            /* switch y and z axes */
+    temp_mtx[1][1] = 0.0;               temp_mtx[2][1] = 1.0;
+    temp_mtx[1][2] = 1.0;               temp_mtx[2][2] = 0.0;
+    mtx_mpy(view_mtx,temp_mtx,view_mtx);
+
+    ident_mtx(temp_mtx);      /* tilt about z */
+    cosang = cos(DtoR*tilt_angle); 
+    sinang = sin(DtoR*tilt_angle);
+    temp_mtx[0][0] = cosang;  temp_mtx[1][0] = -sinang;
+    temp_mtx[0][1] = sinang;  temp_mtx[1][1] =  cosang;
+    mtx_mpy(view_mtx,temp_mtx,view_mtx);
+}
+
+
+
+/* ++++++++++++++++++++++++++ GET_INSPRBLES ++++++++++++++++++++++++++++++ */
+get_insprbles(obj,object,p_list,insert_pt)  /* get cluster of intersecting
+                                             objects and link them to node */
+short obj,insert_pt;    struct { short obj,insep; } p_list[];
+object_def object[];
+{   short j,wd,bit;
+                             /* find set bits representing occluded objects */
+    for (wd=0; wd<MAX_OBJECTS/32; wd++)  if (occlsn[obj][wd] != 0)
+        for (bit=0; bit<32; bit++)        /* pull bits out of non-zero word */
+            if (occlsn[obj][wd] & (0x1 << bit))
+            {   short obj2,wd2,bit2;          /* check for mutual occlusion */
+                obj2 = wd*32 + bit;    wd2 = obj/32;    bit2 = obj%32;
+                if (!object[obj2].touched &&            /* not yet checked? */
+                   (occlsn[obj2][wd2] & (0x1 << bit2))) /* bit set? */
+                {   insert_pt++;                /* intersecting, add to list */
+                    if (insert_pt != list_slot)       /* not at end of list? */
+                        for (j=list_slot; j>insert_pt; j--)     /* make room */
+                        {   p_list[j].obj   = p_list[j-1].obj;
+                            p_list[j].insep = p_list[j-1].insep;
+                        }
+                    p_list[insert_pt].obj = obj2;             /* add to list */
+                    p_list[insert_pt-1].insep = TRUE;  /* tag previous entry */
+                    object[obj2].touched = TRUE;      /* tag object included */
+                    list_slot++;
+                    /* printf(" %s clustered with %s\n",
+                                object[obj2].name,object[obj}5-|                                        /* get anything clustered with obj2 */
+                    get_insprbles(obj2,object,p_list,insert_pt);
+                }
+            }
+}
+
+
+
+ 
+/* ++++++++++++++++++++++++++++ GETPLANE ++++++++++++++++++++++++++++++++++ */
+getplane(pt1,pt2,pt3,coefs) /* get coefficients for plane defined by 3 pts. */
+float pt1[3],pt2[3],pt3[3],coefs[4];
+{   double v1[3],v2[3],magnitude;    short i;
+    for (i=0; i<3; i++)            /* get cross-product (left-handed space) */
+    {   v1[i] = pt2[i] - pt1[i];    v2[i] = pt3[i] - pt1[i];   }
+    coefs[0] = v1[1] * v2[2] - v1[2] * v2[1];
+    coefs[1] = v1[2] * v2[0] - v1[0] * v2[2];
+    coefs[2] = v1[0] * v2[1] - v1[1] * v2[0];
+
+    magnitude = sqrt(sqr(coefs[0]) + sqr(coefs[1]) + sqr(coefs[2]));
+    if (magnitude == 0.)  coefs[2] = 1.;        /* in case of colinear pts */
+    else        for (i=0; i<3; i++)  coefs[i] /= magnitude;     /* normalize */
+                      /* 4th coefficient is perpendicular distance to origin */
+    coefs[3] = -(coefs[0]*pt1[0] + coefs[1]*pt1[1] + coefs[2]*pt1[2]);
+}
+
+
+ 
+
+/* ++++++++++++++++++++++++++++ IDENT_MTX +++++++++++++++++++++++++++++++++ */ 
+ident_mtx(temp_mtx)
+float temp_mtx[4][4];
+{   short i,j;
+    for (i=0; i<4; i++)
+        for (j=0; j<4; j++)  if (j != i)  temp_mtx[i][j] = 0.0; 
+                             else         temp_mtx[i][j] = 1.0;
+}
+
+
+
+
+/* ++++++++++++++++++++++++++ LIST_INSERT +++++++++++++++++++++++++++++++++ */
+short list_insert(obj,object,p_list)                  /* insert node in list */
+short obj;                                          /* object to be inserted */
+object_def object[];                     /* collection of object definitions */
+struct { short  obj,insep; } p_list[];           /* developing priority list */
+{   short i,obj2,insert_pt;
+
+    insert_pt = 0;
+    /* printf(" inserting %s into\n",object[obj].name);         /* debug */
+    
+    for (i=0; i<list_slot; i++)         /* traverse input list front to back */ 
+    {   short prio_ok,insep_obj;
+        
+        obj2 = p_list[i].obj;           /* object from list to check against */
+
+        /* ------ if objects overlap on screen and obj2 not in front ------- */
+        if (occluding(obj2,obj,&prio_ok,&insep_obj))
+        {   if (insep_obj)
+                printf("graph_insert: unexpected inseparability: %s & %s\n",
+                                            object[obj].name,object[obj2].name);
+
+            if ((!prio_ok) && (insert_pt == 0)) 
+              insert_pt = i;              /* separable objects in wrong order */
+            else                          /* separable objects in right order */
+              if ((insert_pt != 0) && prio_ok)  /* and covered by closer obj. */
+                  fix_cycle(p_list,obj,insert_pt,i);    /* cycle! */
+        }
+    }
+
+    if (insert_pt == 0) insert_pt = list_slot;          /* put at end of list */
+    else for (i=list_slot; i>insert_pt; i--)     /* make room for new element */
+         {   p_list[i].obj   = p_list[i-1].obj;
+             p_list[i].insep = p_list[i-1].insep;
+         }
+    p_list[insert_pt].obj = obj;                              /* add to list */
+    p_list[insert_pt].insep = FALSE;
+    object[obj].touched = TRUE;           /* tag object as included in graph */
+    list_slot++;
+    /* for (i=0; i<list_slot; i++)   printf(" %s ",object[p_list[i].obj].name);
+    printf("\n");               /* debug */
+
+    get_insprbles(obj,object,p_list,insert_pt);/* add intscting objs to list */
+}
+
+
+
+
+
+/* +++++++++++++++++++++++++++ LOAD_OCCLSN +++++++++++++++++++++++++++++++++ */
+load_occlsn(i,j,separable)              /* load occlusion relation in matrix */
+short i,j,separable;
+{   short wd,bit;
+    wd = j/32;    bit = j%32;                       /* enter i as covering j */
+    occlsn[i][wd] |= 0x1 << bit;
+    if (!separable)
+    {   wd = i/32;   bit = i%32; /* intersecting, also enter j as covering i */
+        occlsn[j][wd] |= 0x1 << bit;
+    }
+}
+
+
+
+
+/* ++++++++++++++++++++++++++ MTX_MPY ++++++++++++++++++++++++++++++++++++++ */
+mtx_mpy(mtx1,mtx2,result)           /* matrix multiply with insulated output */ 
+float mtx1[4][4],mtx2[4][4],result[4][4];
+{   short i,j;    float temp[4][4];
+    for (i=0; i<4; i++) 
+        for (j=0; j<4; j++)
+            temp[i][j] = mtx1[i][0]*mtx2[0][j] + mtx1[i][1]*mtx2[1][j] +
+                         mtx1[i][2]*mtx2[2][j] + mtx1[i][3]*mtx2[3][j];
+    for (i=0; i<4; i++)  for (j=0; j<4; j++)  result[i][j] = temp[i][j];
+}
+
+
+
+
+/* +++++++++++++++++++++++++++++ OCCLUDING +++++++++++++++++++++++++++++++++ */
+occluding(i,j,in_order,inseparable)              /* check occlusion relation */
+short i,j,*in_order,*inseparable;
+{   short wd,bit;
+    wd = j/32;    bit = j%32;                             /* does i cover j? */
+    if (occlsn[i][wd] & (0x1 << bit)) *in_order = TRUE;
+    else                                      *in_order = FALSE;
+    wd = i/32;    bit = i%32;                             /* does j cover i? */
+    if (occlsn[j][wd] & (0x1 << bit))
+        if (*in_order)  *inseparable = TRUE; /*intersecting, mutually covering*/
+        else           *inseparable = FALSE;
+    else  if(!(*in_order))      return FALSE;       /* neither occludes the other */
+  
+    return TRUE;                            /* some occlusion relation holds */
+}
+
+
+
+
+/* +++++++++++++++++++++++++++++ OVERLAP ++++++++++++++++++++++++++++++++++ */
+overlap(object1,object2)        /* return TRUE if objects overlap on screen */
+object_def *object1,*object2;
+{   double dist,dp1,dp2;    float eyept[3],mdpt[3],pt3[3],coefs[4],*vtx1,*vtx2;
+    short i;
+    /* ---- test for overlap of perspective images of bounding spheres ---- */
+    dp1 = object1->depth;    dp2 = object2->depth;
+    dist = sqrt(sqr(object1->xfmd_ctr[0]/dp1 - object2->xfmd_ctr[0]/dp2) +
+                sqr(object1->xfmd_ctr[1]/dp1 - object2->xfmd_ctr[1]/dp2));
+    if (dist > (object1->xfmd_radius/dp1 + object2->xfmd_radius/dp2 + PIX_SIZE))
+    {   boxes = FALSE;    return FALSE;   }              /* non-overlapping */
+
+    /* ---- find plane through eyepoint which separates bounding boxes ---- */
+
+    build_box(bbox1,object1); /* xformed vertices for 1st obj. bounding box */
+    for (i=0; i<8; i++)  transform(bbox1[i],object1->comp_mtx,bbox1[i]);
+    build_box(bbox2,object2); /* xformed vertices for 2nd obj. bounding box */
+    for (i=0; i<8; i++)  transform(bbox2[i],object2->comp_mtx,bbox2[i]);
+    boxes = TRUE;
+
+    /* get plane defined by eyepoint and midpoint between two centroids and
+        third point which projects on midpoint */
+    for (i=0; i<3; i++)                   /* get midpoint between centroids */
+        mdpt[i] = (object2->xfmd_ctr[i] + object1->xfmd_ctr[i]) / 2.;
+                        /* get 3rd pt., perpendicular projector on midpoint */ 
+    pt3[0] = mdpt[0] - (object2->xfmd_ctr[1] - object1->xfmd_ctr[1]);
+    pt3[1] = mdpt[1] + (object2->xfmd_ctr[0] - object1->xfmd_ctr[0]);
+    pt3[2] = mdpt[2];
+    eyept[0] =  eyept[1] =  eyept[2] = 0.; 
+    vtx1 = mdpt;    vtx2 = pt3;
+
+    for (i=0; i<4; i++)                 /* try four iterations, (wasteful?) */
+    {   short j;
+        getplane(eyept,vtx1,vtx2,coefs); /* get plane equation coefficients */
+        if ((coefs[0] * object1->xfmd_ctr[0] + coefs[1] * object1->xfmd_ctr[1] +
+             coefs[2] * object1->xfmd_ctr[2] + coefs[3]) > 0.)/*reverse plane*/
+                for (j=0; j<4; j++)  coefs[j] *= -1.;/*keep object1 on - side*/
+        if (!plane_test(coefs,bbox1,bbox2,&vtx1,&vtx2))    return FALSE;
+    }
+    return TRUE;                                /* can't separate on screen */ 
+}
+
+
+
+/* ++++++++++++++++++++++++++++ PLANE_TEST ++++++++++++++++++++++++++++++++ */
+plane_test(coefs,box1,box2,vtx1,vtx2)       /* return true if any points found
+                                on wrong side of plane, return pointers to
+                                vertices on wrong side which most overlap, if
+                                both overlap, one ptr from each box returned */
+float coefs[],box1[8][3],box2[8][3],**vtx1,**vtx2;
+{   short i,p11,p12,p21,p22,o11,o12,o21,o22;    double dst1,dst2;
+    p11 = p12 = p21 = p22 = -1;    o11 = o12 = o21 = o22 = FALSE;
+    dst2 = dst1 = 0;
+    for (i=0; i<8; i++)         /* check for pts. from box1 on positive side */
+    {   double dist;                      /* box1 should be on negative side */
+        dist = box1[i][0] * coefs[0] + box1[i][1] * coefs[1] +
+               box1[i][2] * coefs[2] + coefs[3];  
+        if ((dist > dst1) || (i == 0))
+        {   o12 = o11;    if (dist > .00001)  o11 = TRUE;
+            p12 = p11;    p11 = i;
+            dst1 = dist;
+        }
+                                          /* box2 should be on positive side */
+        dist = box2[i][0] * coefs[0] + box2[i][1] * coefs[1] +
+               box2[i][2] * coefs[2] + coefs[3];  
+        if ((dist < dst2) || (i == 0))
+        {   o22 = o21;    if (dist < -0.00001)  o21 = TRUE;
+            p22 = p21;    p21 = i;
+            dst2 = dist;
+        }
+    }
+    if ((dst1 < .00001) && (dst2 > -0.00001))  return FALSE;   /* no overlap */
+    else                                    /* at least one pt on wrong side */
+    {          /* both overlap, return most overlapping vertex from each box */
+        if      (o11 && o21)  { *vtx1 = box1[p11]; *vtx2 = box2[p21]; }
+                                    /* box1 has two points over, return them */
+        else if (o11 && o12)  { *vtx1 = box1[p11]; *vtx2 = box1[p12]; }
+                    /* box2 has two points over, return them */
+        else if (o21 && o22)  { *vtx1 = box2[p21]; *vtx2 = box2[p22]; }
+           /* only one point over, return it and closest one from other side,
+                if they're not the same */
+        else
+        {   *vtx1 = box1[p11]; *vtx2 = box2[p21];
+            if ( (sqr((*vtx1)[0] - (*vtx2)[0]) + sqr((*vtx1)[1] - (*vtx2)[1]) + 
+                  sqr((*vtx1)[2] - (*vtx2)[2])) < 0.00001)
+                if (o11) *vtx2 = box2[p22];  /* same, replace with next pt. */
+                else     *vtx1 = box1[p12];
+        }
+        return TRUE;    /* may not always work, any suggestions? */
+    }
+}
+
+
+
+
+
+/* +++++++++++++++++++++++++++ PRIORITY_SORT +++++++++++++++++++++++++++++++ */ 
+priority_sort(object,p_list)                /* sort objects to priority list */ 
+object_def object[];    struct {  short obj,insep; } p_list[];
+{   
+    struct sort_list dpth_srt[2*MAX_OBJECTS]; 
+    short i,first,nxt_slot;    double max_dpth,min_dpth,scale;
+
+    /* --------- get min and max depth for visible object centroids --------- */
+    first = TRUE;
+    for (i=FIRST_OBJ; i<MAX_OBJECTS; i++)  /* for each active object in view */ 
+    {   object[i].touched = FALSE;                      /* clear access flag */
+        if ( (object[i].name[0] != NULLCHAR) && (object[i].clipped >= 0) )
+            if (first)  
+            {   max_dpth = min_dpth = object[i].depth;    first = FALSE;   }
+            else
+                if      (object[i].depth > max_dpth) max_dpth = object[i].depth;
+                else
+                {  if (object[i].depth < min_dpth) min_dpth = object[i].depth; }
+        else  object[i].depth = 0.;
+    }
+    /* ---------------- bucket sort on depth ---------------------------- */
+    for (i=0; i<MAX_OBJECTS; i++)  dpth_srt[i].obj_ptr = NULL; /*clear buckets*/ 
+    nxt_slot = MAX_OBJECTS;           /* pointer to free space in sort array */ 
+    scale = (max_dpth > min_dpth+.00025)?              /* scale to array size */
+        (MAX_OBJECTS -1) / (max_dpth - min_dpth) : 1024000.0;
+    for (i=FIRST_OBJ; i<MAX_OBJECTS; i++)
+    if ( (object[i].name[0] != NULLCHAR) && (object[i].clipped >= 0) ) 
+    {   short bucket;                            /* 0 <= bucket < MAX_OBJECTS */
+        bucket = (object[i].depth - min_dpth) * scale; 
+        if (dpth_srt[bucket].obj_ptr == NULL)  /* first object at this depth? */
+        {   dpth_srt[bucket].obj_ptr = i;
+            dpth_srt[bucket].nxt = NULL;   
+        }
+        else                             /* link to last entry at this depth */ 
+        {   dpth_srt[nxt_slot].obj_ptr = i;   
+            dpth_srt[nxt_slot].nxt = dpth_srt[bucket].nxt; 
+            dpth_srt[bucket].nxt = &dpth_srt[nxt_slot++]; 
+        } 
+    }
+
+    /* --------------- priority sort over depth sorted list ----------------- */
+    list_slot = 0;                          /* list array allocation pointer */
+    
+    for (i=0; i<MAX_OBJECTS; i++)          /* retrieve buckets front to rear */
+    { 
+        if ((dpth_srt[i].obj_ptr) != NULL)            /* is bucket occupied? */
+        {   struct sort_list *bkt_ptr;    short first;
+            first = TRUE;    bkt_ptr = &dpth_srt[i];
+            do           /* enter objects on bucket list into priority graph */
+            {   short new_obj;
+                
+                if (first) first = FALSE;                /* if not first time */
+                else       bkt_ptr = bkt_ptr->nxt;   /* get next list element */
+                
+                new_obj = bkt_ptr->obj_ptr;                /* get object ptr. */
+                if (object[new_obj].touched)  continue;   /* skip, if entered */
+
+                list_insert(new_obj,object,p_list);          /* enter in list */
+
+            }   while (bkt_ptr->nxt != NULL);     /* do until list exhausted */
+        }
+    }
+}
+
+
+
+/* +++++++++++++++++++++++++++ SEPARABLE ++++++++++++++++++++++++++++++++++ */
+separable(object1,object2,prio_ok)      /* test overlapping objects for 
+                                  separability, prio_ok if object2 in front */
+object_def *object1,*object2;    short *prio_ok;
+{   float coefs[4],*vtx1,*vtx2;    short i,two_is_bigger;
+    double dist;
+    /* ----------- are objects' bounding spheres disjoint? --------------- */
+    dist = sqrt(sqr(object1->xfmd_ctr[0] - object2->xfmd_ctr[0]) +
+                sqr(object1->xfmd_ctr[1] - object2->xfmd_ctr[1]) +
+                sqr(object1->xfmd_ctr[2] - object2->xfmd_ctr[2]));
+    if (dist > (object1->xfmd_radius + object2->xfmd_radius))   /* disjoint */
+    {   if (object1->depth > object2->depth)  *prio_ok = TRUE;  /* order ok */
+        else                                  *prio_ok = FALSE; /* reversed */
+        return TRUE;
+    }
+
+    /* -------------- find separating plane for bounding boxes ------------ */
+    if (!boxes) { fprintf(stderr," separable: - no boxes!!\n"); return FALSE; }
+
+    /* try each polygon of larger box then each poly of smaller as separating
+       plane (there must be some possible optimizations here) */
+    if (object2->xfmd_radius > object1->xfmd_radius)    two_is_bigger = TRUE;
+    else                                                two_is_bigger = FALSE;
+    
+    for (i=0; i<2; i++)                 /* for each bounding box */
+    {   short j;
+        for (j=0; j<6; j++)             /* for each polygon of box */
+        {   float *pt1,*pt2,*pt3;    short using_one,disjoint;
+            if ((two_is_bigger && i) || !(two_is_bigger || i))    /* x - nor */
+            {   pt3 = bbox1[pol[j][2]];    pt2 = bbox1[pol[j][1]];
+                pt1 = bbox1[pol[j][0]];    using_one = TRUE;   }
+            else
+            {   pt3 = bbox2[pol[j][2]];    pt2 = bbox2[pol[j][1]]; 
+                pt1 = bbox2[pol[j][0]];    using_one = FALSE;  }
+            getplane(pt3,pt2,pt1,coefs);
+            if (using_one) disjoint = !plane_test(coefs,bbox2,bbox1,&vtx2,&vtx1);
+            else           disjoint = !plane_test(coefs,bbox1,bbox2,&vtx1,&vtx2);
+            if (disjoint)
+            {   /* objects separable, priority ok if eyepoint on same side of
+                   separating plane as object2 */
+                if ( ((coefs[3] < 0) && ( using_one)) ||  /* both on - side */
+                     ((coefs[3] > 0) && (!using_one)) )   /* both on + side */
+                        *prio_ok = TRUE;
+                else    *prio_ok = FALSE;
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+
+
+/* +++++++++++++++++++++++++ TRANSFORM +++++++++++++++++++++++++++++++++++++ */
+transform(ipt,mtx,opt)                           /* apply transform to point */
+float ipt[3],mtx[4][4],opt[3];   /* output may be same as input or different */
+{   float pt[3]; 
+    pt[0] = mtx[0][0]*ipt[0] + mtx[1][0]*ipt[1] + mtx[2][0]*ipt[2] + mtx[3][0];
+    pt[1] = mtx[0][1]*ipt[0] + mtx[1][1]*ipt[1] + mtx[2][1]*ipt[2] + mtx[3][1]; 
+    pt[2] = mtx[0][2]*ipt[0] + mtx[1][2]*ipt[1] + mtx[2][2]*ipt[2] + mtx[3][2];
+    opt[0] = pt[0];    opt[1] = pt[1];    opt[2] = pt[2];
+}
+
+
+
+
+!Funky!Stuff!
+
+

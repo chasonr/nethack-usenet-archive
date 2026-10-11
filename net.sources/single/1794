@@ -1,0 +1,3086 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,deda1445da716187,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-10-05 09:09:58 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site ut-ngp.UUCP
+Path: utzoo!linus!philabs!cmcl2!seismo!ut-sally!ut-ngp!knutson
+From: knutson@ut-ngp.UUCP (Jim Knutson)
+Newsgroups: net.sources
+Subject: MS-DOS Kermit sources (Part 6 of 7)
+Message-ID: <1009@ut-ngp.UUCP>
+Date: Fri, 5-Oct-84 12:09:58 EDT
+Article-I.D.: ut-ngp.1009
+Posted: Fri Oct  5 12:09:58 1984
+Date-Received: Sun, 7-Oct-84 04:39:40 EDT
+Organization: U.Texas Computation Center, Austin, Texas
+Lines: 3066
+
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting msxwng.asm'
+sed 's/^X//' <<'//go.sysin dd *' >msxwng.asm
+	public  serini, serrst, clrbuf, outchr, coms, vts, dodel, ctlu
+        public  cmblnk, locate, lclini, prtchr, dobaud, clearl
+        public  dodisk, getbaud, beep, term, puthlp
+	public	count, poscur, machnam, sendbr, putmod, clrmod
+	public	setktab, setkhlp, xofsnt, showkey
+        include msdefs.h
+
+false   equ     0
+true	equ	1	
+
+ctrla	equ	1		; Control-A.
+
+auxin	equ	3
+auxout	equ	4
+auxfil	equ	3		; file number of aux file.
+iordy	equ	6		; input ready function
+write	equ	40h
+wbios	equ	88h
+settrp	equ	02h
+clrtrp	equ	03h
+chrrdy	equ	01h
+txrdy	equ	02h
+
+rcvdat	equ	1080h
+rcvstat equ	1082h
+rcvmod	equ	1084h
+rcvcmd	equ	1086h
+trdat	equ	1088h
+trmod	equ	108ch
+wrcmd	equ	108eh
+
+; mode bits
+mod1	equ	4dh			; clock rate, 8 bits, 1 stop bit
+mod2	equ	30h			; internal clock
+
+; command register bits
+txen	equ	01h
+dtr	equ	02h
+rxen	equ	04h
+brk	equ	08h
+clrerr	equ	10h
+rts	equ	20h
+
+
+datas   segment public 'datas'
+        extrn   drives:byte, flags:byte, trans:byte
+	extrn	portval:word, port1:byte, port2:byte, swchar:byte
+
+portin	db	0
+crlf    db      cr,lf,'$'
+machnam	db	'FIELD TEST Wang$'
+noimp	db	cr,lf,'Command not implemented.$'
+shkmsg	db	'Not implemented.'
+shklen	equ	$-shkmsg
+xofsnt	db	0		; Say if we sent an XOFF.
+xofrcv	db	0		; Say if we received an XOFF.
+setktab	db	0
+setkhlp	db	0
+invseq	db	esc,'[7m$'	; Reverse video on.
+nrmseq	db	esc,'[0m$'	; Reverse video off.
+ivlseq	db	79 dup (' '),cr,'$' 	; Make a line inverse video
+comphlp db      cr,lf,'1 (COM1)   2 (COM2)$'    
+delstr  db      BS,' ',BS,'$' 	; Delete string.
+clrlin	db	cr,esc,'[K$'
+tmp     db      ?,'$'
+temp    dw      0
+temp1   dw      ?               ; Temporary storage.
+temp2   dw      ?               ; Temporary storage.
+
+; Entries for choosing communications port. [19b]
+comptab db      04H
+        db      01H,'1$'
+        dw      01H
+        db      01H,'2$'
+        dw      00H
+        db      04H,'COM1$'
+        dw      01H
+        db      04H,'COM2$'
+        dw      00H
+
+; variables for serial interrupt handler
+
+source  db      bufsiz DUP(?)   ; Buffer for data from port.
+bufout  dw      0               ; buffer removal ptr
+count   dw      0               ; Number of chars in int buffer.
+bufin   dw      0               ; buffer insertion ptr
+telflg  db      0               ; Are we acting as a terminal. [16] [17c]
+clreol  db      esc,'[0K$'
+blank	db	esc,'[H',esc,'[J$'
+movcur  db      esc,'['
+colno   db      20 dup (?)
+ten     db      10
+prthnd  dw      0
+ourarg  termarg <>
+; must parallel baud rate defs in pcdefs.
+baudtab db	0ffh		; 45.5 baud (not supported)
+	db	0		; 50
+	db	1		; 75
+	db	2		; 110
+	db	3		; 134.5
+	db	4		; 150
+	db	5		; 300
+	db	6		; 600
+	db	7		; 1200
+	db	8		; 1800
+	db	9		; 2000
+	db	10		; 2400
+	db	12		; 4800
+	db	14		; 9600
+	db	15		; 19.2k
+	db	0ffh		; 38.4k (ha)
+
+nbaud	equ	$-baudtab
+qid	dw	?
+prtcnt	dw	?
+trqid	dw	?
+tmqid	dw	?
+brflg	db	?
+datas   ends
+
+code    segment public
+        extrn   comnd:near, dopar:near, prserr:near
+        assume  cs:code,ds:datas
+
+DODISK  PROC    NEAR
+	mov ah,gcurdsk			; Current disk value to AL.
+	int dos
+	mov dl,al			; Put current disk in DL.
+	mov ah,seldsk			; Select current disk.
+	int dos				; Get number of drives in AL.
+	mov drives,al
+	ret
+DODISK  ENDP
+
+; Clear the input buffer before sending a packet. [20e]
+
+CLRBUF  PROC    NEAR
+	mov	ah,ioctl
+	mov	bx,auxfil
+	mov	al,iordy
+	int	dos
+	cmp	al,0ffh
+	jne	clrb1			; not ready, keep going
+	mov	ah,auxin
+	int	dos
+	jmp	clrbuf			; read char and keep going.
+clrb1:	mov	count,0
+	mov ax,offset source
+	mov bufin,ax
+        mov bufout,ax
+        ret
+CLRBUF  ENDP
+
+; Common routine to clear to end-of-line. [19a]
+
+CLEARL  PROC    NEAR
+        mov dx,offset clreol
+        mov ah,prstr
+        int dos
+        ret
+CLEARL  ENDP
+
+; This routine should set the baud rate for the current port but it
+; is actually done in SERINI.
+dobaud	proc	near
+	ret
+dobaud  endp
+
+; Send a break out the current serial port.  Returns normally.
+sendbr:	push dx
+	push ax
+	push cx
+	push ds			; preserve data segment
+	mov ax,cs
+	mov ds,ax		; handler is in code segment
+	mov al,settrp
+	mov bx,txrdy		; interrupt on transmitter empty
+	mov cx,0		; interrupt immediately
+	mov dx,offset sendb1	; handler routine
+	int wbios
+	pop ds
+	mov trqid,bx
+	push ds
+	mov ax,cs
+	mov ds,ax
+	mov al,settrp
+	mov bx,0		; 10 ms timer
+	mov cx,21		; after 21 times - approx 200 ms.
+	mov dx,offset sendb2	; timer interrupt
+	int wbios
+	pop ds
+	mov tmqid,bx
+
+	mov brflg,1
+	mov dx,rcvcmd
+	in al,dx		; Read command register.
+	or al,brk+txen		; Set send-break bit.
+	mov dx,wrcmd		; Write command register.
+	out dx,al
+pause:	cmp brflg,0
+	jne pause		; while non-zero, keep going
+	mov al,clrtrp		; clear the trap
+	mov bx,trqid
+	int wbios
+	mov al,clrtrp
+	mov bx,tmqid
+	int wbios
+	pop cx
+	pop ax
+	pop dx
+	ret
+
+sendb1	proc	far
+	ret
+sendb1	endp
+
+sendb2	proc	far
+	push ax
+	push ds
+	mov ax,seg datas
+	mov ds,ax
+	mov brflg,0
+	mov dx,rcvcmd
+	in al,dx
+	and al,not (txen + brk)
+	mov dx,wrcmd
+	out dx,al
+	pop ds
+	pop ax
+	ret
+sendb2	endp
+
+
+; Write a line in inverse video at the bottom of the screen...
+; the line is passed in dx, terminated by a $.  Returns normally.
+putmod	proc	near
+	push	dx		; preserve message
+	mov	dx,24 * 100H	; line 24
+	call	poscur
+	mov	dx,offset invseq ; put into inverse video
+	mov	ah,prstr
+	int	dos
+	pop	dx
+	int 	dos
+	mov	dx,offset nrmseq ; normal videw
+	int	dos
+	ret			; and return
+putmod	endp
+
+; Clear the mode line written by putmod.  Returns normally.
+clrmod	proc	near
+	mov	dx,24 * 100H
+	call	poscur
+	call	clearl
+	ret
+clrmod	endp
+
+; Put a help message one the screen in reverse video.  Pass
+; the message in AX, terminated by a null.  Returns normally.
+; The message is put wherever the cursor currently is located.
+puthlp	proc	near
+	push ax
+	mov ah,prstr		; Leave some room before the message.
+	mov dx,offset crlf
+	int dos
+	mov dx,offset invseq	; Put into reverse video.
+	int dos
+	pop si			; Put message address here.
+puth0:	mov ah,prstr
+	mov dx,offset ivlseq	; Make line inverse video
+	int dos
+puth1:	lodsb
+	cmp al,0		; Terminated with a null.
+	je puth2
+	mov dl,al
+	mov ah,conout
+	int dos	
+	cmp al,lf		; Line feed?
+	je puth0		; Yes, clear the next line.
+	jmp puth1		; Else, just keep on writing.
+puth2:	mov dx,offset nrmseq	; Normal video.
+	mov ah,prstr
+	int dos
+	mov dx,offset crlf
+	int dos
+	ret
+puthlp	endp
+
+outchr: push dx                 ; Save register.
+	mov al,ah
+	call dopar
+	mov dl,al
+	mov ah,auxout
+	int dos
+	pop	dx
+	jmp rskp
+
+
+; This routine blanks the screen.
+
+CMBLNK	PROC	NEAR
+        mov ah,prstr
+        mov dx,offset blank
+        int dos
+        ret
+CMBLNK  ENDP
+
+LOCATE  PROC    NEAR
+        mov dx,0                ; Go to top left corner of screen.
+        jmp poscur              ; callret...
+LOCATE  ENDP
+
+GETBAUD PROC    NEAR
+	cld
+	mov dx,rcvmod
+	in al,dx
+	in al,dx		; get second mode word
+	and	al,0fh		; isolate baud rate
+	mov cx,nbaud
+	mov di,offset baudtab
+	mov bx,ds
+	mov es,bx		; address correct segment
+	mov bx,portval
+	repne scasb		; look for baud rate
+	jne getb1		; mystery baud rate...
+	sub di,offset baudtab + 1
+	mov [bx].baud,di	; store baud rate in comm area
+	ret			; and return
+getb1:	mov [bx].baud,-1	; unknown baud rate
+        ret
+GETBAUD ENDP
+
+; skip returns if no character available at port,
+; otherwise returns with char in al, # of chars in buffer in dx.
+PRTCHR  PROC    NEAR
+prtchx: cmp count,0
+	je prtch4		; empty buffer, forget it.
+	mov si,bufout
+	lodsb
+	cmp si,offset source + bufsiz
+	jb prtch1
+	mov si,offset source
+prtch1: mov bufout,si
+	dec count
+	push bx
+	mov bx,portval
+        cmp [bx].parflg,PARNON ; no parity?
+        je prtch3               ; then don't strip
+        and al,7fh              ; else turn off parity
+prtch3: mov dx,count		; chars left in buffer
+	pop bx
+        ret
+prtch4: jmp rskp		; no chars...
+PRTCHR  ENDP
+
+; Position the cursor according to contents of DX.
+
+POSCUR  PROC    NEAR
+        mov     ax,ds
+        mov     es,ax                   ; address data segment!!!
+        cld
+        mov     di,offset colno
+        mov     al,dh                   ; row
+	inc	al
+        call    nout
+        mov     al,';'
+        stosb
+        mov     al,dl                   ; col
+	inc	al
+        call    nout
+        mov     al,'H'
+        stosb
+        mov     al,'$'
+        stosb
+        mov     dx,offset movcur
+        mov     ah,prstr
+        int     dos                     ; print the sequence
+        ret
+POSCUR  ENDP
+
+NOUT	PROC	NEAR
+        cbw                     ; extend to word
+        div     byte ptr ten    ; divide by 10
+        or      al,al           ; any quotient?
+        jz      nout1           ; no, forget this
+        push    ax              ; save current result
+        call    nout            ; output high order
+        pop     ax              ; restore
+nout1:  mov     al,ah           ; get digit
+        add     al,'0'          ; make printable
+        stosb
+        ret                     ; put in buffer and return
+NOUT    endp
+
+; Perform a delete.
+
+DODEL   PROC    NEAR
+        mov ah,prstr
+        mov dx,offset delstr    ; Erase weird character.
+        int dos                 
+        ret
+DODEL   ENDP
+
+; Perform a Control-U.
+
+CTLU    PROC    NEAR
+        mov ah,prstr
+        mov dx,offset clrlin
+        int dos
+        ret
+CTLU    ENDP
+
+COMS    PROC    NEAR
+        mov dx,offset comptab
+        mov bx,offset comphlp
+        mov ah,cmkey
+        call comnd
+         jmp r
+        push bx
+        mov ah,cmcfm
+        call comnd              ; Get a confirm.
+         jmp comx               ;  Didn't get a confirm.
+	 nop
+	pop bx
+        mov flags.comflg,bl     ; Set the comm port flag.
+	cmp flags.comflg,1	; Using Com 1?
+	jne coms0		; Nope.
+	mov ax,offset port1
+	mov portval,ax
+	ret
+coms0:	mov ax,offset port2
+	mov portval,ax
+        ret
+comx:	pop bx
+	ret
+COMS    ENDP
+
+VTS     PROC    NEAR
+	jmp notimp
+VTS     ENDP
+
+notimp:	mov ah,prstr
+	mov dx,offset noimp
+	int dos
+	jmp prserr
+
+lclini: mov trans.escchr,ctrla	; Use Control-A as escape char.
+	mov swchar,'/'
+	ret
+
+showkey:
+	mov ax,offset shkmsg
+	mov cx,shklen
+	ret
+
+
+;     Common initialization for using serial port.
+
+SERINI  PROC    NEAR
+	cmp portin,0		; already inited?
+	jne serin1		; yes, skip it
+	mov portin,1		; remember inited
+	mov dx,rcvcmd
+	in al,dx		; read cmd register to reset mode ptr.
+	mov dx,trmod
+	mov al,mod1
+	out dx,al
+	push bx
+	mov bx,portval
+	mov si,[bx].baud
+	pop bx
+	mov al,baudtab[si]
+	or al,mod2
+	out dx,al
+	mov dx,wrcmd
+	mov al,txen+dtr+rxen+clrerr+rts
+	out dx,al		; enable transmit and receive
+	call clrbuf		; empty buffer
+	mov al,settrp
+	mov bx,chrrdy		; interrupt on character ready
+	mov cx,0		; interrupt immediately
+	mov dx,offset serint	; handler routine
+	mov prtcnt,0		; no characters in yet
+	push ds
+	mov si,cs
+	mov ds,si
+	int wbios
+	pop ds
+	or al,al
+	jne serin1
+	mov qid,bx		; preserve trap identification
+serin1: ret			; We're done. [21c]
+SERINI  ENDP
+
+SERRST  PROC    NEAR
+	cmp portin,0		; already de-inited?
+	je serrs1		; yes, skip this
+	mov portin,0
+	mov al,clrtrp
+	mov bx,qid
+	int wbios
+serrs1:	ret
+SERRST  ENDP
+
+; serial interrupt handler
+serint	proc	far
+	push ds
+	push ax
+	push dx
+	push di
+	mov ax,seg datas
+	mov ds,ax
+	mov di,bufin
+	mov dx,rcvdat
+	in al,dx
+	mov [di],al
+	inc di
+	cmp di,offset source + bufsiz
+	jb sernt1
+	mov di,offset source
+sernt1: mov bufin,di
+	inc count
+	pop di
+	pop dx
+	pop ax
+	pop ds
+	ret
+serint	endp
+
+
+; Generate a short beep.
+
+BEEP    PROC    NEAR
+        mov dl,bell
+        mov ah,conout
+        int dos 
+        ret
+BEEP    ENDP 
+ 
+; Jumping to this location is like retskp.  It assumes the instruction
+;   after the call is a jmp addr.
+ 
+RSKP    PROC    NEAR
+        pop bp
+        add bp,3
+        push bp
+        ret
+RSKP    ENDP
+ 
+; Jumping here is the same as a ret.
+ 
+R       PROC    NEAR
+        ret
+R       ENDP
+
+term    proc    near
+        mov si,ax               ; this is source
+        mov di,offset ourarg    ; place to store arguments
+        mov ax,ds
+        mov es,ax               ; address destination segment
+        mov cx,size termarg
+        rep movsb               ; copy into our arg blk
+term1:  call prtchr
+        jmp short term2         ; have a char...
+        nop
+        nop
+        jmp short term3         ; no char, go on
+term2:	and al,7fh
+	push ax
+        mov dl,al
+	mov ah,dconio
+        int dos                 ; write out the character
+        pop ax
+        test ourarg.flgs,capt   ; capturing output?
+        jz term3                ; no, forget it
+        call ourarg.captr       ; else call the routine
+term3:  mov ah,dconio
+        mov dl,0ffh
+        int dos
+	or al,al
+        jz term1                ; no character, go on
+        cmp al,ourarg.escc      ; escape char?
+        je term4                ; yes, exit
+        push ax                 ; save char
+        mov ah,al
+        call outchr             ; output the character
+        nop
+        nop
+        nop
+        pop ax
+        test ourarg.flgs,lclecho ; echoing?
+        jz term1                ; no, continue loop
+        mov dl,al
+        mov ah,dconio
+        int dos
+        jmp term1               ; else echo and keep going
+term4:	ret
+term    endp
+code	ends
+        end
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msxwng.asm
+	/bin/echo -n '	'; /bin/ls -ld msxwng.asm
+fi
+/bin/echo 'Extracting msxz100.asm'
+sed 's/^X//' <<'//go.sysin dd *' >msxz100.asm
+
+; Kermit system dependent module for Heath/Zenith Z100
+
+	public	serini, serrst, clrbuf, outchr, coms, vts, dodel,
+	public	ctlu, cmblnk, locate, prtchr, dobaud, clearl,
+	public	dodisk, getbaud, beep,
+	public	count, xofsnt, puthlp, putmod, clrmod, poscur
+	public	sendbr, machnam, setktab, setkhlp, lclini, showkey
+	include msdefs.h
+
+false	equ	0
+true	equ	1
+mntrgh	equ	bufsiz*3/4	; High point = 3/4 of buffer full.
+
+; constants used by serial port handler
+
+BRKBIT	EQU	048H		; Send-break bit. 
+
+MDMCOM1	EQU	00EFH		; Address of modem port command. [19b]
+
+; external variables used:
+; drives - # of disk drives on system
+; flags - global flags as per flginfo structure defined in pcdefs
+; trans - global transmission parameters, trinfo struct defined in pcdefs
+; portval - pointer to current portinfo structure (currently either port1
+;    or port2)
+; port1, port2 - portinfo structures for the corresponding ports
+
+; global variables defined in this module:
+; xofsnt, xofrcv - tell whether we saw or sent an xoff.
+; setktab - keyword table for redefining keys (should contain a 0 if
+;    not implemented)
+; setkhlp - help for setktab.
+
+BIOS_SEG SEGMENT AT 40H		; Define segment where BIOS really is
+	ORG	6*3
+BIOS_AUXOUT LABEL FAR		; AUX output routine
+	ORG	26*3
+BIOS_AUXFUNC LABEL FAR		; AUX: function
+	ORG	27*3
+BIOS_CONFUNC LABEL FAR		; CON: function
+BIOS_SEG ENDS
+
+; Function codes for BIOS_xxxFUNC
+CHR_WRITE	EQU	0	; Write character
+CHR_READ	EQU	1	; Read character
+CHR_STATUS	EQU	2	; Get status
+  CHR_SFGS	EQU	0	; Get status subfunction
+  CHR_SFGC	EQU	1	; Get config subfunction
+CHR_CONTROL	EQU	3	; Control function
+  CHR_CFSU	EQU	0	; Set new configuration parameters
+  CHR_CFCI	EQU	1	; Clear input buffer
+
+
+datas 	segment	public 'datas'
+	extrn	drives:byte, flags:byte, trans:byte
+	extrn	portval:word, port1:byte, port2:byte
+
+setktab	db	13
+	mkeyw	'F0',96h
+	mkeyw	'F1',97h
+	mkeyw	'F2',98h
+	mkeyw	'F3',99h
+	mkeyw	'F4',9ah
+	mkeyw	'F5',9bh
+	mkeyw	'F6',9ch
+	mkeyw	'F7',9dh
+	mkeyw	'F8',9eh
+	mkeyw	'F9',9fh
+	mkeyw	'F10',0a0h
+	mkeyw	'F11',0a1h
+	mkeyw	'SCAN',-1
+
+setkhlp	db	cr,lf,'Keyname: f0, ... f11, "HELP" or "SCAN" follwed by '
+	db	'decimal scan code$'
+brkval	db	0		; What to send for a break.
+brkadr	dw	0		; Where to send it.
+badbd	db	cr,lf,'Unimplemented baud rate$'
+noimp	db	cr,lf,'Not implemented$'
+machnam	db	'Heath-Zenith Z-100$'
+crlf	db	cr,lf,'$'
+delstr  db	BS,' ',BS,'$' 	; Delete string. [21d]
+home	db	ESC,'H$'
+eeolstr db	ESC,'K$'	; Erase to end of line
+clrstr	db	ESC,'E$'	; Erase entire display
+enamod	db	ESC,'x1$'	; Enable 25th line
+dismod	db	ESC,'y1$'	; Disable 25th line
+enascan	db	ESC,'y?$'	; Enable scan codes
+disscan	db	ESC,'x?$'	; Disable scan codes
+begrev	db	ESC,'p$'	; Enter reverse video
+endrev	db	ESC,'q$'	; Exit reverse video
+lin25	db	ESC,'Y8 $'	; Column 1 row 25
+savcur	db	ESC,'j$'	; Save current cursor position
+precur	db	ESC,'k$'	; Restore cursor to previous position
+clrlin  db	cr,'$'		; Clear line (just the cr part).
+xofsnt	db	0		; Say if we sent an XOFF.
+xofrcv	db	0		; Say if we received an XOFF.
+tmp	db	?,'$'
+temp1	dw	?		; Temporary storage.
+
+ontab	db	02H		; Two entries.
+	db	03H,'OFF$'	; Should be alphabetized. [19a]
+	dw	00H
+	db	02H,'ON$'
+	dw	01H
+
+; this table is indexed by the baud rate definitions given in
+; pcdefs.  Unsupported baud rates should contain FF.
+bddat	label	word
+	dw	0		; 45.5 baud
+	dw	1		; 50 baud
+	dw	2   		; 75 baud
+	dw	3   		; 110 baud
+	dw	4   		; 134.5 baud
+	dw	5   		; 150 baud
+	dw	6   		; 300 baud
+	dw	7   		; 600 baud
+	dw	8  		; 1200 baud
+	dw	9  		; 1800 baud
+	dw	10 		; 2000 baud
+	dw	11 		; 2400 baud
+	dw	12 		; 4800 baud
+	dw	13 		; 9600 baud
+	dw	14  		; 19200 baud
+	dw	15  		; 38400 baud
+
+; storage for port configuration
+cfginfo	struc
+cfclass	db	0
+cfattr	db	0
+cfport	dw	0
+cfbaud	db	0
+cfhshk	db	0
+cfbctl	db	0
+cfecnt	db	0
+cfncnt	db	0
+cfnchr	db	0
+cfres	db	6 dup(?)
+cfsize	db	0
+cfginfo	ends
+
+auxconf	cfginfo	<>
+
+; variables for serial interrupt handler
+
+count	dw	0		; Number of chars in int buffer.
+
+ourarg	termarg	<>
+
+shkbuf	db	300 dup (?)	; room for definition
+shkmsg	db	'  Scan code: '
+shkmln	equ	$-shkmsg
+shkms1	db	cr,lf,'  Definition: '
+shkm1ln	equ	$-shkms1
+datas	ends
+
+code	segment	public
+	extrn	comnd:near, dopar:near, defkey:near
+	assume	cs:code,ds:datas
+
+; local initialization
+
+lclini	proc	near
+	mov	brkval,BRKBIT	; What to send for a break.
+	mov	brkadr,MDMCOM1
+ 	mov	flags.vtflg,0	; Turn off true Heath mode (allows key macros)	 
+	ret
+lclini	endp
+
+; this is called by Kermit initialization.  It checks the
+; number of disks on the system, sets the drives variable
+; appropriately.  Returns normally.  
+
+DODISK	PROC	NEAR
+	mov	ah,gcurdsk	; Current disk value to AL.
+	int	dos
+	mov	dl,al		; Put current disk in DL.
+	mov	ah,seldsk	; Select current disk.
+	int	dos
+	mov	drives,al
+	ret
+DODISK	ENDP
+
+; show the definition of a key.  The terminal argument block (which contains
+; the address and length of the definition tables) is passed in ax.
+; Returns a string to print in AX, length of same in CX.
+; Returns normally.
+showkey	proc	near
+	push	es
+	push	ax		; save the ptr
+	mov	bx,ds
+	mov	es,bx		; address data segment
+	cld
+showk1:	mov	ah,prstr
+	mov	dx,offset enascan ; enable scan codes
+	int	dos
+	mov	ah,0ch		; char input with buffer flush
+	mov	al,7
+	int	dos
+;	mov	ah,chr_control
+;	mov	al,chr_cfci	; clear input
+;	call	bios_confunc
+;	mov	ah,chr_read
+;	call	bios_confunc	; read a char
+	push	ax
+	mov	ah,prstr
+	mov	dx,offset disscan ; disable scan codes
+	int	dos
+	pop	ax
+;	push	ax		; save the character
+;	call	gss		; get shift state
+;	pop	bx
+	mov	ah,0		; shift state to ah
+;	mov	al,bh		; scan code to al
+	push	ax		; remember scan code
+	mov	di,offset shkbuf
+	mov	si,offset shkmsg
+	mov	cx,shkmln
+	rep	movsb		; copy in initial message
+	call	nout		; write out scan code
+	mov	si,offset shkms1
+	mov	cx,shkm1ln	; second message
+	rep	movsb
+	pop	ax		; get scan code back
+	pop	bx		; and terminal arg block
+	mov	cx,[bx].klen	; and length
+	jcxz	showk2		; no table, not defined
+	push	di		; remember output ptr
+	mov	di,[bx].ktab	; get key table
+	repne	scasw		; search for a definition for this
+	mov	si,di		; remember result ptr
+	pop	di		; get output ptr back
+	jne	showk2		; not defined, forget it
+	sub	si,[bx].ktab	; compute offset from beginning
+	sub	si,2		; minus 2 for pre-increment
+	add	si,[bx].krpl	; get index into replacement table
+	mov	si,[si]		; pick up replacement
+	mov	cl,[si]		; get length
+	mov	ch,0
+	inc	si
+	rep	movsb		; copy into buffer
+showk2:	mov	ax,offset shkbuf ; this is buffer
+	mov	cx,di
+	sub	cx,ax		; length
+	pop	es
+	ret			; and return
+showkey	endp
+
+; Clear the input buffer. This throws away all the characters in the
+; serial interrupt buffer.  This is particularly important when
+; talking to servers, since NAKs can accumulate in the buffer.
+; Returns normally.
+
+CLRBUF	PROC	NEAR
+	cli
+	mov 	ah,chr_control
+	mov	al,chr_cfci
+	call	bios_auxfunc
+	mov 	count,0
+	sti
+	ret
+CLRBUF	ENDP
+
+; Clear to the end of the current line.  Returns normally.
+
+CLEARL	PROC	NEAR
+	mov	ah,prstr
+	mov	dx,offset eeolstr	; Erase to end of line
+	int	dos
+	ret
+CLEARL	ENDP
+
+; Put the char in AH to the serial port.  This assumes the
+; port has been initialized.  Should honor xon/xoff.  Skip returns on
+; success, returns normally if the character cannot be written.
+
+outchr:	mov	bp,portval
+	cmp	ds:[bp].floflg,0 ; Are we doing flow control.
+	je	outch2		; No, just continue.
+	xor	cx,cx		; clear counter
+outch1:	cmp	xofrcv,true	; Are we being held?
+	jne	outch2		; No - it's OK to go on.
+	loop	outch1		; held, try for a while
+	mov	xofrcv,false	; timed out, force it off and fall thru.
+outch2:	push	dx		; Save register.
+	mov	al,ah		; Parity routine works on AL.
+	call	dopar		; Set parity appropriately.
+	call	bios_auxout
+	pop	dx
+	jmp	rskp
+
+; This routine blanks the screen.  Returns normally.
+
+CMBLNK	PROC	NEAR
+	mov	ah,prstr
+	mov	dx,offset clrstr
+	int	dos
+	ret
+CMBLNK  ENDP
+
+; Locate: homes the cursor.  Returns normally.
+
+LOCATE  PROC	NEAR
+	mov	ah,prstr
+	mov	dx,offset home	; Go to top left corner of screen.
+	int	dos
+LOCATE  ENDP
+
+; write a line in inverse video at the bottom of the screen...
+; the line is passed in dx, terminated by a $.  Returns normally.
+putmod	proc	near
+	push	dx		; preserve message
+	mov	ah,prstr
+	mov	dx,offset savcur
+	int	dos
+	mov	dx,offset enamod
+	int	dos
+	mov	dx,offset lin25
+	int	dos
+	mov	dx,offset begrev
+	int	dos
+	pop	dx		; get message back
+	int	dos		; write it out
+	mov	dx,offset endrev
+	int	dos
+	mov	dx,offset precur
+	int	dos
+	ret			; and return
+putmod	endp
+
+; clear the mode line written by putmod.  Returns normally.
+clrmod	proc	near
+	mov	ah,prstr
+	mov	dx,offset dismod
+	int	dos
+	ret
+clrmod	endp
+
+BEEP	PROC	NEAR
+	mov	dl,07		; ASCII BEL
+	mov	ah,dconio	
+	int	dos             ; Ring it
+	ret
+BEEP	ENDP	
+
+
+; put a help message on the screen.  This one uses reverse video...
+; pass the message in ax, terminated by a null.  Returns normally.
+puthlp	proc	near
+	push	ax		; preserve this
+	mov	ah,prstr
+	mov	dx,offset crlf
+	int	dos
+	pop	si		; point to string again
+puthl3:	lodsb			; get a byte
+	cmp	al,0		; end of string?
+	je	puthl4		; yes, stop
+	mov	dl,al
+	mov	ah,dconio
+	int	dos
+	jmp	puthl3		; and keep going
+puthl4:	mov	ah,prstr
+	mov	dx,offset crlf
+	int	dos
+	ret
+puthlp	endp
+
+; Set the baud rate for the current port, based on the value
+; in the portinfo structure.  Returns normally.
+
+DOBAUD	PROC	NEAR
+	mov	bp,portval
+	mov	temp1,ax	; Don't overwrite previous rate. [25]
+	mov	ax,ds:[bp].baud	; Check if new rate is valid. [25]
+	mov	tmp,2
+	mul	tmp		; Get index into baud table.
+	mov	bx,offset bddat	; Start of table.
+	add	bx,ax
+	mov	ax,[bx]		; The data to output to port.
+	cmp	ax,0FFH		; Unimplemented baud rate.
+	jne	dobd0
+	mov	ax,temp1	; Get back orginal value.
+	mov	ds:[bp].baud,ax	; Leave baud rate as is.
+	mov	ah,prstr
+	mov	dx,offset badbd	; Give an error message.
+	int	dos
+	ret
+dobd0:	push	ax		; Save it
+	mov	bx,ds		; Set up pointer to config info
+	mov	es,bx		;  .  .  .
+	mov	bx,offset auxconf ;  .  .  .
+	mov	ah,chr_status
+	mov	al,chr_sfgc	; get current config info
+	call	bios_auxfunc
+	pop	ax		; get baud back
+	mov	auxconf.cfbaud,al
+	mov	ah,chr_control	; Function is control
+	mov	al,chr_cfsu	; Subfunction is set new config
+	call	bios_auxfunc	; Set the configuration
+	ret
+DOBAUD	ENDP
+
+; Get the current baud rate from the serial card and set it
+; in the portinfo structure for the current port.  Returns normally.
+; This is used during initialization.
+
+GETBAUD	PROC	NEAR
+	mov	bx,ds
+	mov	es,bx
+	mov	bx,offset auxconf
+	mov	ah,chr_status
+	mov	al,chr_sfgc	; Status function get config info
+	call	bios_auxfunc
+	mov	ch,0
+	mov	cl,auxconf.cfbaud
+	mov	bp,portval
+	mov	ds:[bp].baud,cx
+	ret
+GETBAUD	ENDP
+
+; skip returns if no character available at port,
+; otherwise returns with char in al, # of chars in buffer in dx.
+PRTCHR  PROC	NEAR
+	call	chkxon		; see if we need to xon
+	push	bx
+	mov 	ah,chr_status
+	mov 	al,chr_sfgs	; Status function get status
+	call	bios_auxfunc
+	cmp 	bl,0
+	jnz 	prtch2
+	pop 	bx
+	jmp 	rskp     	; No data - check console.
+prtch2:	mov	dh,0
+	mov	dl,bl		; Place # of chars in dx
+	mov	ah,chr_read
+	call 	bios_auxfunc
+	dec	dl		; Decrement number of chars
+	mov	count,dx	; Save count for posterity
+	pop	bx
+	ret
+PRTCHR  ENDP
+
+; local routine to see if we have to transmit an xon
+chkxon	proc	near
+	push	bx
+	mov	bx,portval
+	cmp	[bx].floflg,0	; doing flow control?
+	je	chkxo1		; no, skip all this
+	cmp	xofsnt,false	; have we sent an xoff?
+	je	chkxo1		; no, forget it
+	cmp	count,mntrgh	; below trigger?
+	jae	chkxo1		; no, forget it
+	mov	ax,[bx].flowc	; ah gets xon
+	call	outchr		; send it
+	nop
+	nop
+	nop			; in case it skips
+	mov	xofsnt,false	; remember we've sent the xon.
+chkxo1:	pop	bx		; restore register
+	ret			; and return
+chkxon	endp
+
+; Send a break out the current serial port.  Returns normally.
+SENDBR	PROC	NEAR
+	push	cx
+	push	dx
+	push	ax
+	xor	cx,cx		; Clear loop counter.
+	mov	dx,brkadr	; Port address.  [19b]
+	in	al,dx		; Get current setting.
+	or	al,brkval	; Set send-break bit(s).
+	out	dx,al		; Start the break.
+pause:	loop	pause		; Wait a while.
+	xor	al,brkval	; Clear send-break bit(s).
+	out	dx,al		; Stop the break.
+	pop	ax
+	pop	dx
+	pop	cx
+	ret			; And return.
+SENDBR	ENDP
+
+; Position the cursor according to contents of DX:
+; DH contains row, DL contains column.  Returns normally.
+
+POSCUR	PROC	NEAR
+	push	dx
+	mov	ah,CONOUT
+	mov	dl,ESC
+	int	dos
+	mov	dl,'Y'
+	int	dos
+	pop	dx
+	push	dx
+	mov	dl,dh
+	add	dl,' '
+	int	dos
+	pop	dx
+	add	dl,' '
+	int	dos
+	ret
+POSCUR	ENDP
+
+; Delete a character from the terminal.  This works by printing
+; backspaces and spaces.  Returns normally.
+
+DODEL	PROC	NEAR
+	mov	ah,prstr
+	mov	dx,offset delstr ; Erase weird character.
+	int	dos			
+	ret
+DODEL	ENDP
+
+; Move the cursor to the left margin, then clear to end of line.
+; Returns normally.
+
+CTLU	PROC	NEAR
+	mov	ah,prstr
+	mov	dx,offset clrlin
+	int	dos
+	call	clearl
+	ret
+CTLU	ENDP
+
+; set the current port.  
+
+COMS	PROC	NEAR
+	jmp	notimp
+COMS	ENDP
+
+; Set heath emulation on/off.
+
+VTS	PROC	NEAR
+	mov	dx,offset ontab
+	mov	bx,0
+	mov	ah,cmkey
+	call	comnd
+	 jmp	r
+	push	bx
+	mov	ah,cmcfm
+	call	comnd			; Get a confirm.
+	 jmp	vt0			; didn't get a confirm.
+	 nop
+	pop	bx
+	mov	flags.vtflg,bl		; Set the Heath emulation flag
+	ret
+vt0:	pop	bx
+	ret
+VTS	ENDP
+
+notimp:	mov	ah,prstr
+	mov	dx,offset noimp
+	int	dos
+	jmp	rskp
+
+; initialization for using serial port.  This routine performs
+; any initialization necessary for using the serial port, including
+; setting up interrupt routines, setting buffer pointers, etc.
+; Doing this twice in a row should be harmless (this version checks
+; a flag and returns if initialization has already been done).
+; SERRST below should restore any interrupt vectors that this changes.
+; Returns normally.
+
+SERINI	PROC	NEAR
+	ret			; We're done.
+SERINI	ENDP
+
+; Reset the serial port.  This is the opposite of serini.  Calling
+; this twice without intervening calls to serini should be harmless.
+; Returns normally.
+
+SERRST	PROC	NEAR
+	ret			; All done.
+SERRST	ENDP
+
+
+; put the number in ax into the buffer pointed to by di.  Di is updated
+nout	proc	near
+	mov	dx,0		; high order is always 0.
+	mov	bx,10
+	div	bx		; divide to get digit
+	push	dx		; save remainder digit
+	or	ax,ax		; test quotient
+	jz	nout1		; zero, no more of number
+	call	nout		; else call for rest of number
+nout1:	pop	ax		; get digit back
+	add	al,'0'		; make printable
+	stosb			; drop it off
+	ret			; and return
+nout	endp
+
+
+; Jumping to this location is like retskp.  It assumes the instruction
+;   after the call is a jmp addr.
+ 
+RSKP	PROC	NEAR
+	pop	bp
+	add	bp,3
+	push	bp
+	ret
+RSKP	ENDP
+ 
+; Jumping here is the same as a ret.
+ 
+R	PROC	NEAR
+	ret
+R	ENDP
+
+code	ends 
+	end
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msxz100.asm
+	/bin/echo -n '	'; /bin/ls -ld msxz100.asm
+fi
+/bin/echo 'Extracting msyibm.asm'
+sed 's/^X//' <<'//go.sysin dd *' >msyibm.asm
+
+	title term
+
+	public	term, gss		; entry points
+	include	msdefs.h
+
+; some character definitions
+
+chesc	equ	27
+bel	equ	7
+
+print_out equ	05h			; dos function to print to printer
+pbout	equ	02h			; dos function to print a character
+prscan	equ	72h			; print-screen scan code...
+upscan	equ	49h			; up page
+dnscan	equ	51h			; down page
+ctlup	equ	84h			; ctl-up page
+ctldn	equ	76h			; ctl-down page
+homscn	equ	47h			; home screen
+endscn	equ	4fh			; end of screen
+screen	equ	10h			; bios screen call
+kb	equ	16h			; keyboard interrupt
+alt_shift equ	8H			; alt shift key down
+ctl_shift equ	4H			; ctl key down
+left_shift equ	2H			; left shift key down
+right_shift equ	1H			; right shift key down
+
+timer	equ	40h			; timer port
+bel_prt	equ	61h			; speaker control
+
+crt_status equ	3dah			; crt status port
+disp_enb   equ	8			; display enable bit
+
+uparr	equ	48h			; scan codes for arrow keys
+dnarr	equ	50h
+lftarr	equ	4bh
+rgtarr	equ	4dh
+
+
+modfrm	struc				; format of mode line
+	db	'Esc chr: '
+m_echr	db	2 dup (?)
+	db	', Port: '
+m_prt	db	1 dup (?)
+	db	', Speed: '
+m_baud	db	4 dup (?)
+	db	', Parity: '
+m_par	db	4 dup (?)
+	db	', Echo: '
+m_echo	db	3 dup (?)
+	db	', Type '
+m_hlp	db	2 dup (?)
+	db	'? for Help'
+modfrm	ends
+
+datas	segment	public 'datas'
+waste	db	100h dup (?)		;*** need this junk because assembler
+					;*** generates non-relocatable offsets
+					;*** for things like 
+					;*** "sub di,offset foo"
+					;*** if offset foo < 100H
+; stuff for screen routines
+flags	db	?			; status flags...
+flags1	db	0			; internal flags.
+prtscr	equ	80h			; print screen pressed
+lnwrap	equ	40h			; line wrap enabled.
+inited	equ	08h			; been here before...
+cursor	dw	?
+esc_ch	db	?
+argadr	dw	?			; address of arg blk
+ckeys	db	0,prscan,dnscan,upscan,endscn,homscn,ctlup,ctldn
+	db	uparr,dnarr,lftarr,rgtarr
+lckeys	equ	$-ckeys
+; ckacts must parallel ckeys above...
+ckacts	dw	trnbrk,trnprs,upwpg,dnwpg,endwnd,homwnd,dnwind,upwind
+	dw	trnupw,trndnw,trnlfw,trnrgw
+
+uptrn	db	esc,'A'
+dntrn	db	esc,'B'
+rgtrn	db	esc,'C'
+lftrn	db	esc,'D'
+
+spctab	db	chesc,cr,lf,bs,tab,bel
+lspctab	equ	$-spctab
+spcjmp	dw	outesc,outcr,outlf,outbs,outtab,outbel	; must match spctab
+esctab	db	'YABCDEFGHIJKLM'
+	db	'NOZ@[pq<vw'
+lesctab	equ	$-esctab
+; escjmp must parallel esctab above
+escjmp	dw	movcur,curup,curdwn,currt,outbs,clrscr,outign,outign,curhom
+	dw	revind,clreow,clreol,inslin,dellin,delchr,noins
+	dw	vtident,entins,doansi
+	dw	invvid,nrmvid,outign,dowrap,nowrap
+vtidstr	db	chesc,'/K'
+lvtidst	equ	$-vtidstr
+coord	dw	?
+insmod	db	?
+wcoord	dw	?
+ttstate	dw	outtt0
+curattr	db	?			; current attribute
+ansarg	db	?			; ansi argument value
+igncnt	db	?			; # of chars to ignore
+beldiv	dw	2dch			; 550 hz?
+crt_mode db	?
+crt_cols db	?
+crt_lins db	?	
+low_rgt	dw	?			; lower right corner of window
+; key redefinitions
+ktrntab	dw	?			; address of translation table
+krpltab	dw	?			; address of replacement table
+tmptab	db	0eh,3bh			; scan code for bs, f1
+ktlen	dw	?
+modbuf	modfrm	<>			; mode line buffer
+; routine to call for captured output
+captrtn	dw	?
+; some static data for mode line
+unkbaud	db	'Unk '			; must be 4 chars...
+baudn	db	'45.5'
+	db	'  50'
+	db	'  75'
+	db	' 110'
+	db	' 135'
+	db	' 150'
+	db	' 300'
+	db	' 600'
+	db	'1200'
+	db	'1800'
+	db	'2000'
+	db	'2400'
+	db	'4800'
+	db	'9600'
+baudnsiz  equ	14			; # of baud rates known (tbl size / 4)
+parnams	db	'Even'
+	db	'Mark'
+	db	'None'
+	db	'Odd '			; must be 4 chars
+	db	'Spc '
+offmsg	db	'Off'
+onmsg	db	'On '
+lclmsg	db	'Lcl'
+remmsg	db	'Rem'
+; storage for multi-window stuff
+swidth	equ	80
+slen	equ	24
+npgs	equ	5			; # of pages on each side
+bsize	equ	swidth*slen*npgs*2
+scrsav	dw	swidth*slen dup (0700H)	; a blank screen
+
+; circular buffer.  To work properly, the buffer size should be an exact
+; multiple of swidth*2
+cbuf	struc
+pp	dw	?			; place ptr in buffer
+bend	dw	?			; end of buffer
+orig	dw	?			; buffer origin
+lcnt	dw	0			; # of lines in buffer.
+cbuf	ends
+
+topbuf	db	bsize dup (?)
+botbuf	db	bsize dup (?)		; top and bottom windows
+tlbuf	db	swidth*2 dup (?)
+blbuf	db	swidth*2 dup (?)
+twnd	cbuf	<topbuf,topbuf+bsize-1,topbuf,0>
+bwnd	cbuf	<botbuf,botbuf+bsize-1,botbuf,0>
+portno	db	?
+prton	db	'Printer: on'
+prtnlen	equ	$-prton
+prtoff	db	'Printer: off'
+prtflen	equ	$-prtoff
+datas	ends
+
+code	segment	public			; code segment
+	extrn	prtchr:near,outchr:near,sendbr:near
+	assume	cs:code,ds:datas,es:datas
+
+scrini	proc	near			; init screen stuff
+	mov	ah,15			; read video state...
+	int	screen
+	mov	crt_mode,al		; save crt mode
+	cmp	ah,crt_cols		; is real # of cols < passed?
+	jge	scrin1			; no
+	mov	crt_cols,ah		; yes, save # of cols
+scrin1:	mov	dl,crt_cols		; # of cols again
+	mov	dh,crt_lins		; and # of rows
+	dec	dl
+	dec	dh
+	mov	low_rgt,dx		; save away window address
+	mov	insmod,0		; not in insert mode
+	mov	dx,cursor		; assume old cursor
+	test	flags1,inited		; have we been here before?
+	jnz	scrin4			; yes, use old cursor
+	mov	curattr,07		; else set nice screen attribute
+	mov	ttstate,offset outtt0	; normal screen state
+	mov	ah,3			; figure out where cursor is
+	xor	bh,bh			; page 0
+	int	screen			; read cursor position
+	cmp	dh,crt_lins		; past logical end of screen?
+	jb	scrin2			; no, keep going
+	mov	dh,byte ptr low_rgt+1	; yes, just use lower right corner
+scrin2:	cmp	dl,crt_cols		; maybe past right margin
+	jb	scrin3			; no, use the way it is
+	mov	dl,byte ptr low_rgt
+scrin3:	mov	cursor,dx		; init cursor
+scrin4:	mov	ah,2
+	xor	bh,bh
+	int	screen			; set cursor in case it moved
+	ret
+scrini	endp
+
+argini	proc	near			; read passed arguments
+	mov	bx,argadr		; base of argument block
+	mov	al,[bx].flgs		; get flags
+	and	al,capt+emheath+havtt+trnctl+lclecho+modoff
+	mov	flags,al		; mask for allowable and save
+	and	flags1,not (prtscr)	; these are allowable
+					; (others remain).
+	mov	al,[bx].prt
+	cmp	al,portno		; using same port?
+	je	argin1			; yes, go on
+	and	flags1,not inited	; else re-init stuff
+argin1:	mov	portno,al		; update port number
+	mov	al,[bx].cols
+	mov	crt_cols,al
+	mov	al,[bx].rows
+	mov	crt_lins,al		; init # of rows and cols
+	mov	ax,[bx].captr
+	mov	captrtn,ax		; buffer capture routine
+	mov	ax,[bx].belld
+	mov	beldiv,ax		; bell divisor
+	mov	ax,[bx].klen
+	mov	ktlen,ax		; length of key redef tbl
+	mov	ax,[bx].ktab
+	mov	ktrntab,ax		; save key translation table
+	mov	ax,[bx].krpl
+	mov	krpltab,ax
+	mov	al,[bx].escc
+	mov	esc_ch,al
+	ret				; that's it
+argini	endp
+
+modlin	proc	near			; turn on mode line
+	mov	al,esc_ch
+	mov	modbuf.m_echr,' '	; first char is initial space
+	mov	modbuf.m_hlp,' '	; goes here too.
+	cmp	al,32			; printable?
+	jnb	modl1			; yes, keep going
+	add	al,40h			; made printable
+	mov	modbuf.m_echr,'^'	; note control char
+	mov	modbuf.m_hlp,'^'
+modl1:	mov	modbuf.m_echr+1,al	; fill in character
+	mov	modbuf.m_hlp+1,al
+	mov	bx,argadr		; get argument block
+	mov	al,[bx].baudb		; get baud bits
+	mov	si,offset unkbaud	; assume unknown baud
+	cmp	al,baudnsiz		; too big?
+	jnb	modl2			; yes, use default
+	mov	cl,2			; each is 4 bytes long
+	shl	al,cl
+	mov	ah,0
+	add	ax,offset baudn
+	mov	si,ax
+modl2:	mov	cx,size m_baud		; length of baud space
+	mov	di,offset modbuf.m_baud
+	rep	movsb			; copy in baud rate
+	mov	al,[bx].parity		; get parity code
+	mov	cl,2			; each is 4 bytes long...
+	shl	al,cl
+	mov	ah,0
+	add	ax,offset parnams	; names of parity settings
+	mov	si,ax
+	mov	cx,4			; each is 4 long
+	mov	di,offset modbuf.m_par
+	rep	movsb
+	mov	si,offset lclmsg	; assume remote echoing
+	test	flags,lclecho		; echoing?
+	jz	modl4			; no, keep going
+	mov	si,offset remmsg
+modl4:	mov	cx,3			; size of on/off
+	mov	di,offset modbuf.m_echo
+	rep	movsb
+	mov	al,'1'
+	cmp	portno,1		; port 1?
+	je	modl5			; yes, keep going
+	mov	al,'2'
+modl5:	mov	modbuf.m_prt,al		; fill in port number
+	mov	cx,size modfrm		; this is size of mode line
+	mov	si,offset modbuf	; mode line image
+; alternate entry to write an alternate mode line
+modwrt:	push	cx
+	push	si			; save mode line and size
+	mov	dx,24 * 100h		; 25th line for mode line
+	push	word ptr curattr	; save current attributes
+	mov	curattr,70h		; want inverse video
+	call	clreol			; clear to end of line...
+	pop	word ptr curattr	; restore attributes
+	mov	dx,24 * 100h
+	mov	bh,0
+	mov	ah,2			; set cursor position
+	int	screen
+	pop	si
+	pop	cx			; restore these
+modl6:	lodsb				; get a byte
+	mov	ah,14			; write to terminal
+	mov	bh,0			; page 0
+	int	screen
+	loop	modl6			; write out entire mode line
+	mov	dx,cursor
+	mov	ah,2
+	mov	bh,0
+	int	screen			; put cursor back where it belongs
+	ret				; and return
+modlin	endp
+
+clrmod	proc	near			; clear mode line
+	mov	ax,600h			; blank window
+	mov	cx,24 * 100h		; beginning of window
+	mov	dx,24 * 100h + 79	; end of window
+	mov	bh,07			; nice attribute
+	int	screen			; clear mode line
+	ret				; and return
+clrmod	endp
+
+term	proc	near			; terminal emulator entry point
+
+	mov	argadr,ax		; save argument ptr
+	push	es			; save caller's extra segment address
+	mov	ax,seg datas
+	mov	es,ax
+
+	call	argini			; init options from arg address
+
+	call	scrini			; init screen stuff
+
+	test	flags1,inited		; have we run yet?
+	jz	term1			; no, forget this part
+	call	restscr			; restore screen
+term1:	or	flags1,inited		; remember we've run already.
+
+	call	clrmod			; empty mode line
+	test	flags,modoff		; is mode line disabled?
+	jnz	lp			; yes, skip it
+	call	modlin			; turn on mode line
+
+lp:	call	portchr			; char at port?
+	 jnc	chkinp			; no, keep going
+	call	outtty			; print on terminal
+
+chkinp:	mov	ah,1
+	int	kb
+	jz	lp			; nothing available...
+	xor	ah,ah
+	int	kb			; get the char from the buffer
+	push	ax			; save character temporarily
+	call	gss			; get shift state into al
+	mov	bl,al			; save shift state
+	pop	ax
+
+	cmp	al,esc_ch		; escape character?
+	je	quit			; yes, stop here
+
+	call	trnout			; translate if nec., output to prt
+	jmp	chkinp			; and keep going
+
+quit:	call	clrmod			; erase mode line
+	call	savescr			; save screen
+
+	mov	al,flags
+	mov	bx,argadr
+	mov	[bx].flgs,al		; update flags in arg block
+	pop	es			; restore segment register
+	ret				; and return to caller
+
+term	endp
+
+; get shift state into al.  We only care about shift, ctl, and alt keys.
+; right shift is collapsed into left shift.
+gss	proc	near
+	mov	ah,2
+	int	kb			; get current shift state
+	mov	bl,al			; copy for a moment
+	and	bl,right_shift		; mask out all but right shift
+	shl	bl,1			; move right shift to left shift pos
+	or	al,bl			; collapse shift bits
+	and	al,(left_shift + alt_shift + ctl_shift)
+	ret
+gss	endp
+
+; save the screen so we can restore it
+; maybe save cursor also.
+savescr	proc	near
+	push	ds
+	mov	si,0
+	mov	di,offset scrsav	; place to put screen
+	mov	cx,80*24		; # of words on screen
+	call	scrseg
+	push	ax			; save screen segment
+	call	scrwait			; wait for screen to be ready
+	pop	ds			; address screen
+	rep	movsw			; save the screen
+	pop	ds			; restore this
+	ret				; and return
+savescr	endp
+
+; restore screen from scrsav buffer
+restscr	proc	near
+	push	es
+	mov	si,offset scrsav	; source
+	mov	di,0
+	mov	cx,80*24
+	call	scrseg
+	mov	es,ax
+	call	scrwait
+	rep	movsw			; restore it
+	pop	es
+	ret
+restscr	endp
+
+; send the character in al out to the serial port
+; handle echoing also...
+outprt	proc	near
+	test	flags,lclecho		; echoing?
+	jz	outpr1			; no, forget it
+	push	ax			; save char
+	call	outtty			; print it
+	pop	ax			; restore
+outpr1:	mov	ah,al			; this is where outchr expects it
+	call	outchr			; output to the port
+	 nop
+	 nop
+	 nop				; skip returns...
+	ret
+outprt	endp
+
+; returns with carry on if a character is available
+
+portchr	proc	near
+	call	prtchr			; character at port?
+	 jmp	short portc1		; yes, go handle
+	nop				; skip return is stupid...
+	clc				; no carry -> no character
+	ret				; and return...
+portc1:	and	al,7fh			; we don't worry about parity here
+	stc				; have a character
+	ret				; and return
+portchr	endp
+
+
+; translate the scan code in ah according to the translate table
+; given in ktrntab/krpltab, output to port.  If no translation,
+; use ascii char in al. (should probably include shift state
+; somewhere).  Shift state is in bl.
+trnout	proc	near
+	cmp	ah,4eh			;*** plus key thing?
+	je	trnmod			; yes, go toggle mode line
+trnou1:	test	flags,havtt		; translate table given?
+	jz	trnou3			; no, just output character
+	push	ax			; save original value
+	mov	al,ah			; put scan code into ah
+	mov	ah,bl			; shift state into top half.
+	mov	di,ktrntab		; pick up translate tbl
+	mov	cx,ktlen		; length of tbl
+	repne	scasw			; look for our key
+	pop	ax			; recover character
+	jne	trnou3			; not found, forget it
+	sub	di,ktrntab		; get index into tbl
+	sub	di,2			; (minus 2 for pre-increment)
+	mov	bx,krpltab		; get replacement table
+	mov	si,[bx][di]		; and addr of replacement
+	mov	cl,[si]			; get first byte (length)
+	xor	ch,ch			; clear high-order byte
+	inc	si			; point to translation string
+trnou2:	lodsb				; get a byte
+	push	si
+	push	cx			; save important registers
+	call	outprt			; send to port
+	pop	cx
+	pop	si
+	loop	trnou2			; send all chars
+	ret				; and return
+trnou3:	cmp	al,0			; is it a special code?
+	jne	trnou4			; no, don't do this
+	mov	al,ah			; get scan code
+	mov	cx,lckeys		; length of table
+	mov	di,offset ckeys		; table address
+	repne	scasb
+	mov	al,0			; ascii code was 0...
+	jne	trnou4			; not found, keep going
+	sub	di,offset ckeys+1	; get table offset
+	shl	di,1			; shift for word offset
+	jmp	ckacts[di]		; jump to appropriate routine
+trnou4:	call	outprt			; just output single char
+	ret				; and return
+
+trnmod:	test	flags,modoff		; mode line already off?
+	jnz	trnm1			; yes, go turn on
+	call	clrmod			; no, clear mode line here
+	or	flags,modoff		; turn on flag
+	ret				; and return
+trnm1:	call	modlin			; turn on mode line
+	and	flags,not modoff	; clear flag
+	ret				; and return
+
+trnbrk:	mov	ah,dconio
+	mov	dl,0ffH
+	int	dos			; read the bogus ^C DOS gets.
+	call	sendbr
+	ret
+trnprs:	xor	flags1,prtscr		; flip the flag
+	and	flags,not modoff	; turn on mode line
+	mov	si,offset prton
+	mov	cx,prtnlen
+	test	flags1,prtscr		; did it go on?
+	jnz	trnpr1			; yes, say so
+	mov	si,offset prtoff
+	mov	cx,prtflen
+trnpr1:	call	modwrt			; write into mode line
+	ret				; and return
+
+; common entry for arrow keys
+trnarr:	mov	cx,2			; length is always 2
+	jmp	trnou2			; go send definition
+
+trnupw:	mov	si,offset uptrn
+	jmp	trnarr
+
+trndnw:	mov	si,offset dntrn
+	jmp	trnarr
+
+trnlfw:	mov	si,offset lftrn
+	jmp	trnarr
+
+trnrgw:	mov	si,offset rgtrn
+	jmp	trnarr
+
+trnout	endp
+
+; move viewing window up (screen moves down).
+; alternate entry upwin2 doesn't beep if invalid.
+upwind	proc	near
+	mov	ax,offset tlbuf	; place to put line temporarily
+	mov	bx,offset twnd ; where to get lines from
+	call	getcirc		; try to get a line
+	jnc	upwin3		; have a line, go show it
+	call	outbel		; else ring bel
+	ret			; and return
+upwin2:	mov	ax,offset tlbuf
+	mov	bx,offset twnd
+	call	getcirc
+	jnc	upwin3
+	ret			; this just rets if no line avail.
+upwin3:	mov	ax,offset blbuf	; place for bottom line
+	call	getbot		; fetch bottom line
+	mov	ax,offset blbuf
+	mov	bx,offset bwnd
+	call	putcirc		; save in circular buffer
+	mov	ax,701h		; scroll down one line
+	xor	cx,cx		; from top
+	mov	dx,low_rgt	; to bottom
+	mov	bh,curattr
+	int	screen		; scroll it down
+	mov	di,0		; offset for destination
+	mov	si,offset tlbuf	; where to get line from
+	mov	cx,swidth	; length of line
+	push	es
+	call	scrseg
+	push	ax
+	call	scrwait
+	pop	es
+	rep	movsw		; copy the line in
+	pop	es		; restore this
+	ret			; and return
+upwind	endp
+
+
+; move viewing window down a line (screen scrolls up)
+; entry dwin2 does same w/out checking to see if scroll is legal
+dnwind	proc	near
+	mov	ax,offset blbuf	; place to put line temporarily
+	mov	bx,offset bwnd ; where to get lines from
+	call	getcirc		; try to get a line
+	jnc	dnwin3		; have a line, go show it
+	call	outbel		; else ring bel
+	ret			; and return
+dnwin2:	mov	ax,offset blbuf
+	mov	bx,offset bwnd
+	call	getcirc
+	jnc	dnwin3
+	ret			; this just rets if no line avail.
+dnwin3:	call	scrprep		; save top line
+	mov	ax,601h		; scroll up one line
+	xor	cx,cx		; from top
+	mov	dx,low_rgt	; to bottom
+	mov	bh,curattr
+	int	screen		; scroll it down
+	mov	dx,low_rgt
+	mov	dl,0		; get addr of last line
+	call	scrloc
+	mov	di,ax		; this is offset in dest
+	mov	si,offset blbuf	; where to get line from
+	mov	cx,swidth	; length of line
+	push	es
+	call	scrseg
+	push	ax
+	call	scrwait
+	pop	es
+	rep	movsw		; copy the line in
+	pop	es		; restore this
+	ret			; and return
+dnwind	endp
+
+; move viewing window down as much as possible...
+endwnd	proc	near
+	mov	cx,1000			; large number of lines
+	jmp	dnwp1			; and enter dwnpg
+endwnd	endp
+
+; scroll viewing window down (contents move up) crt_lins times...
+dnwpg	proc	near
+	mov	cl,crt_lins
+	mov	ch,0
+dnwp1:	push	cx			; save this
+	call	dnwin2
+	pop	cx
+	loop	dnwp1
+	ret				; and return
+dnwpg	endp
+
+; home viewing window
+homwnd	proc	near
+	mov	cx,1000			; large # of lines
+	jmp	upwp1			; join upwpg
+homwnd	endp
+
+; scroll viewing window up (screen moves down) a page
+upwpg	proc	near
+	mov	cl,crt_lins
+	mov	ch,0
+upwp1:	push	cx
+	call	upwin2
+	pop	cx
+	loop	upwp1
+	ret				; and return
+upwpg	endp
+
+; get the bottom line into the buffer pointed to by ax.
+getbot	proc	near
+	push	ds
+	mov	di,ax			; save dest
+	mov	cx,swidth
+	mov	dx,low_rgt
+	mov	dl,0
+	call	scrloc
+	mov	si,ax
+	call	scrseg
+	push	ax
+	call	scrwait
+	pop	ds
+	rep	movsw
+	pop	ds
+	ret
+getbot	endp
+
+; put a line into the circular buffer.  Pass the buffer structure
+; in bx, the pointer to the line in ax.
+putcirc	proc	near
+	push	si
+	push	di
+	push	cx
+	push	dx
+	mov	di,[bx].pp		; pick up buffer ptr
+	add	di,2*swidth		; increment to next avail slot
+	cmp	di,[bx].bend		; past end?
+	jb	putci1			; no, leave alone
+	mov	di,[bx].orig		; else start at beginning
+putci1:	mov	[bx].pp,di		; update ptr
+	mov	si,ax			; this is source
+	mov	cx,swidth
+	rep	movsw			; copy into buffer
+	cmp	[bx].lcnt,npgs*slen	; can we increment it?
+	jae	putci2			; no, keep going
+	inc	[bx].lcnt		; else count this line
+putci2:	pop	dx
+	pop	cx
+	pop	di
+	pop	si			; restore registers
+	ret
+putcirc	endp
+
+; get a line from the circular buffer, removing it from the buffer.
+; returns with carry on if the buffer is empty.
+; pass the buffer structure in bx, the buffer to copy the line into
+; in ax.
+getcirc	proc	near
+	push	si
+	push	di
+	push	cx
+	push	dx
+	cmp	[bx].lcnt,0		; any lines in buffer?
+	jne	getci1			; yes, ok to take one out.
+	stc				; else set carry
+	jmp	short getcir3		; and return
+getci1:	mov	si,[bx].pp		; this is source
+	mov	di,ax			; this is dest
+	mov	cx,swidth		; # of chars to copy
+	rep	movsw
+	mov	si,[bx].pp		; get ptr again
+	sub	si,2*swidth		; move back
+	cmp	si,[bx].orig		; compare to origin
+	jae	getcir2			; still in range, continue
+	mov	si,[bx].bend		; else use end of buffer
+	sub	si,2*swidth-1		; minus length of a piece
+getcir2:mov	[bx].pp,si		; update ptr
+	dec	[bx].lcnt		; decrement # of lines in buffer
+	clc				; make sure no carry
+getcir3:pop	dx
+	pop	cx
+	pop	di
+	pop	si
+	ret
+getcirc	endp
+
+; call before scrolling to save top line...
+scrprep	proc	near
+	push	ds
+	mov	si,0			; offset of top line
+	mov	cx,swidth		; length of line
+	mov	di,offset tlbuf		; place to put line temporarily
+	call	scrseg
+	push	ax
+	call	scrwait
+	pop	ds
+	rep	movsw			; copy the line
+	pop	ds			; restore this
+	mov	ax,offset tlbuf
+	mov	bx,offset twnd		; this is where it goes
+	call	putcirc			; put into buffer
+	ret				; and return
+scrprep	endp
+
+
+; put the character in al to the screen
+outtty	proc	near
+	test	flags,capt		; capturing output?
+	jz	outnoc			; no, forget this part
+	push	ax			; save char
+	call	captrtn			; give it captured character
+	pop	ax			; restore character and keep going
+
+outnoc:	test	flags1,prtscr		; should we be printing?
+	jz	outnop			; no, keep going
+	push	ax
+	mov	ah,print_out
+	mov	dl,al			; put character here for dos...
+	int	dos
+	pop	ax
+
+outnop:	test	flags,emheath		; emulating heath?
+	jnz	outnop1			; yup, go do something smart
+	mov	dl,al
+	mov	ah,pbout
+	int	dos			; else let dos print char
+	ret				; and return
+
+outnop1:mov	dx,cursor		; these may need cursor...
+	jmp	ttstate			; jump according to current state
+
+outtt0:
+	cmp	al,32			; special character?
+	jb	outtt1			; yes, handle specially...
+
+	cmp	insmod,0		; in insert mode?
+	je	outnrm			; no, output normal
+	push	ax			; save character
+	call	inschr			; insert a character
+	pop	ax
+outnrm:	xor	bh,bh			; current page
+	mov	cx,1			; only one char
+	mov	bl,curattr		; with current attribute
+	mov	ah,9
+	int	screen			; put onto screen
+	mov	dx,cursor		; get cursor pos
+currt:	inc	dl			; bump col
+	cmp	dl,crt_cols		; see if in range
+	jb	setcur			; in range, go set cursor
+	test	flags1,lnwrap		; in wrap mode?
+	jz	outign			; no, just return w/out updating cursor
+	xor	dl,dl
+	inc	dh			; handle wrap
+setcur:	cmp	dh,crt_lins
+	jb	setc1			; not off end, keep going
+	push	dx			; save row/col
+	call	scrprep			; save top line in window buf
+	mov	ax,0601h		; scroll up one line
+	xor	cx,cx			; from 0,0
+	mov	dx,low_rgt		; to 24,80
+	mov	bh,curattr		; nice attribute
+	int	screen			; do the scroll
+	pop	dx
+	mov	dh,crt_lins		; go to bottom line again...
+	dec	dh
+setc1:	xor	bh,bh			; page is 0
+	mov	cursor,dx		; save cursor pos
+	mov	ah,2
+	int	screen			; set cursor
+outign:	ret				; and return
+; special character (in al)
+outtt1:	mov	di,offset spctab	; special char table
+	mov	cx,lspctab		; length of tbl
+	repne	scasb			; look for char in tbl
+	jz	outtt2			; found, go do something with it
+	test	flags,trnctl		; are we allowed to print carets?
+	jz	outign			; no, just ignore it.
+	push	ax			; save char
+	mov	al,'^'
+	call	outtty			; print caret
+	pop	ax
+	add	al,'A'-1		; make printable
+	jmp	outtty			; print, then return
+
+outtt2:	mov	dx,cursor		; might need cursor pos
+	sub	di,offset spctab+1	; get index of char
+	shl	di,1			; double for word offset
+	jmp	spcjmp[di]		; and go handle
+
+; special char routines.  cursor is in dx, char in al
+
+outlf:	inc	dh			; bump row
+	jmp	setcur
+
+outcr:	xor	dl,dl			; set col to 0
+	jmp	setcur
+
+outbs:	or	dl,dl
+	jle	setcur			; col 0, can't back up
+	dec	dl			; back up col
+	jmp	setcur			; and use if reasonable
+
+outtab:	mov	dl,byte ptr cursor	; get initial column
+outta1:	mov	dh,dl			; save column ptr
+	push	dx
+	mov	al,' '			; output a space
+	call	outtty			; convenient, huh?
+	pop	dx
+	mov	dl,byte ptr cursor
+	cmp	dh,dl			; is it moving?
+	je	outta2			; no, forget this
+	test	dl,7			; is it a multiple of 8?
+	jnz	outta1			; no, keep going
+outta2:	ret				; else return
+
+; stolen from bios
+outbel:	mov	al,10110110b		; timer initialization
+	out	timer+3,al
+	mov	ax,beldiv		; bel divisor
+	out	timer+2,al
+	mov	al,ah
+	out	timer+2,al		; output divisor
+	in	al,bel_prt
+	mov	ah,al			; remember original value
+	or	al,3			; turn speaker on
+	out	bel_prt,al
+	mov	cx,8888h
+outbe1:	loop	outbe1			; wait a while
+	mov	al,ah
+	out	bel_prt,al		; turn bell off
+	ret				; and return
+
+outesc:	mov	ttstate,offset escseq	; expect escape sequence.
+	ret				; and return
+
+; escape-char handling routines
+escseq:	mov	ttstate,offset outtt0	; put state back to normal
+	mov	di,offset esctab	; escape char tbl
+	mov	cx,lesctab		; length of tbl
+	repne	scasb			; look for it in tbl
+	jz	escsq1			; found, go use it
+	jmp	outtty			; not there, just print it
+escsq1:	sub	di,offset esctab+1	; get offset into tbl
+	shl	di,1			; convert to word offset
+	jmp	escjmp[di]		; and go dispatch on it
+
+; escape dispatch routines
+revind:	cmp	dh,0
+	jle	revin1
+	dec	dh			; back up a row
+	jmp	setcur			; and go set cursor
+revin1:	push	dx			; save cursor pos
+	mov	ax,701h			; scroll down one line
+	xor	cx,cx			; from top
+	mov	dx,low_rgt		; to bottom
+	mov	bh,curattr
+	int	screen			; scroll it down
+	pop	dx			; restore cursor.
+	mov	dh,0			; set row back to 0
+	jmp	setcur
+
+curup:	cmp	dh,0			; w/in range?
+	jle	curu1			; no, skip this
+	dec	dh			; else back up
+curu1:	jmp	setcur			; and go set position
+
+curdwn:	inc	dh
+	jmp	setcur			; increment row (setcur can scroll!)
+
+; currt is above
+
+clrscr:	call	curhom			; go home cursor
+	jmp	clreow			; then clear to end of window
+
+curhom:	xor	dx,dx			; move to 0,0
+	jmp	setcur
+
+clreow:	cmp	dl,0			; at beginning of line?
+	jz	clrw1			; yes, skip this part...
+	push	dx			; remember cursor pos
+	call	clreol			; clear to end of this line
+	pop	dx
+	inc	dh			; bump row
+	xor	dl,dl			; start from col 0
+clrw1:	cmp	dh,crt_lins		; last line on screen
+	jnb	clrw2			; if not in range, forget it
+	mov	ax,700h			; clear whole window
+	mov	cx,dx			; this is beginning
+	mov	dx,low_rgt
+;	mov	dx,174fh		; this is lower right corner
+	mov	bh,curattr		; default attribute
+	int	screen			; go clear it
+clrw2:	ret				; and return
+
+clreol:	push	es
+	mov	cl,crt_cols		; last col + 1
+	sub	cl,dl			; this is # of chars to move
+	xor	ch,ch
+	jcxz	clrl1
+	call	scrloc			; compute screen location (to ax)
+	mov	di,ax
+	call	scrseg
+	mov	es,ax			; address screen segment
+	call	scrwait			; wait for retrace
+	mov	ah,curattr		; current attribute
+	mov	al,' '			; fill char
+	rep	stosw			; fill line with spaces
+clrl1:	pop	es
+	ret				; and return
+
+inslin:	mov	al,1			; scroll one line
+; alternate entry if inserting more then one line
+inslin1:mov	ch,dh			; start at current row
+	xor	cl,cl			; column 0
+	mov	dx,low_rgt
+;	mov	dx,174fh		; to bottom of screen
+	mov	ah,7h			; scroll down.
+	mov	bh,curattr		; attribute
+	int	screen
+	ret
+
+dellin:	mov	al,1			; scroll 1 line
+; alternate entry if deleting more than one line
+dellin1:mov	ch,dh			; start at current row
+	xor	cl,cl			; column 0
+	mov	dx,low_rgt
+;	mov	dx,174fh		; to bottom of screen
+	mov	ah,6h			; scroll up.
+	mov	bh,curattr		; attribute
+	int	screen
+	ret
+
+delchr:	push	ds
+	push	es
+	pushf			; these may get changed...
+	mov	cl,crt_cols
+	dec	cl
+	sub	cl,dl		; from what we're fiddling)
+	xor	ch,ch
+	jcxz	delch1		; none to move, forget it
+	call	scrloc		; compute location
+	mov	di,ax
+	mov	si,ax
+	add	si,2		; source is next position over
+	call	scrseg		; pick up screen segment
+	push	ax		; put screen segment onto stack
+	mov	es,ax		; and in destination segment
+	call	scrwait		; wait for retrace
+	pop	ds		; address screen segment
+	rep	movsw		; delete it
+	mov	byte ptr [di],' ' ; kill char at end of line
+delch1:	popf
+	pop	es
+	pop	ds
+	ret
+
+inschr:	push	ds
+	push	es		; save these as well
+	pushf			; might as well save flags...
+	mov	dx,cursor	; this is place to do it
+	mov	cl,crt_cols
+	dec	cl
+;	mov	cl,79		; this is last col to move, +1 for length
+	sub	cl,dl		; compute distance to end
+	xor	ch,ch		; clear top half of offset
+	jcxz	insch1		; nothing to move...
+	mov	dl,crt_cols
+	sub	dl,2		; last col to move
+;	mov	dl,78		; this is address of last col to move
+	call	scrloc		; compute pos
+	mov	si,ax
+	mov	di,ax
+	add	di,2		; destination is one byte over...
+	std			; remember to move us backwards
+	call	scrseg		; find screen segment
+	mov	es,ax
+	push	ax		; save screen seg on stack
+	call	scrwait		; wait until save to write
+	pop	ds		; address screen segment
+	rep	movsw		; move each char and attribute
+insch1:	popf
+	pop	es
+	pop	ds
+	ret			; and return
+
+noins:	mov	insmod,0		; turn off insert mode
+	ret				; and return
+
+movcur:	mov	wcoord,2		; want two coordinates...
+	mov	ttstate,offset getcoord
+	ret				; and return
+
+vtident: mov	si,offset vtidstr
+	mov	cx,lvtidst
+vtid1:	lodsb				; get a byte from the string
+	push	si			; have to save from outprt
+	push	cx
+	call	outprt			; send to serial port
+	pop	cx
+	pop	si
+	loop	vtid1			; go thru all chars
+	ret				; and return
+
+entins:	mov	insmod,0ffh		; enter insert mode...
+	ret				; and return
+
+doansi:	mov	ansarg,0		; ansi argument is 0 (default)
+	mov	ttstate,offset getaarg	; state is get ansi argument
+	ret
+
+getaarg:cmp	al,'0'
+	jb	getaa1			; in range for digit?
+	cmp	al,'9'
+	ja	getaa1
+	sub	al,'0'			; convert to binary
+	mov	dl,al			; tuck away
+	mov	al,ansarg
+	mov	dh,10
+	mul	dh			; shift sum
+	add	al,dl			; add in this digit (what about ovfl?)
+	mov	ansarg,al
+	ret				; and return
+
+getaa1:	cmp	al,'?'			; the dreaded question mark?
+	jne	getaa2
+	mov	ttstate,offset ignn	; we ignore these...
+	mov	igncnt,2		; this is how many chars come after him
+	ret
+
+getaa2:	mov	ttstate,offset outtt0	; reset state
+	mov	dx,cursor		; this needs cursor position
+	mov	bl,ansarg
+	xchg	al,bl			; put argument in nice place
+	cmp	bl,'L'			; insert line?
+	jne	getaa3
+	jmp	inslin1			; and go do it
+
+getaa3:	cmp	bl,'M'			; maybe delete line?
+	jne	getaa4
+	jmp	dellin1
+
+getaa4:	ret				; ignore.
+
+invvid:	mov	curattr,70h		; attribute for inverse video
+	ret
+
+nrmvid:	mov	curattr,07h		; attribute for normal video
+	ret
+
+dowrap:	or	flags1,lnwrap		; turn on wrap mode
+	ret				; and return
+
+nowrap:	and	flags1,not lnwrap	; turn off wrap mode
+	ret				; and return
+
+; get a coordinate.
+getcoord:
+	sub	al,32			; coordinates offset by 32
+	mov	si,wcoord
+	dec	si
+	mov	byte ptr coord[si],al	; fill in appropriate coordinate
+	mov	wcoord,si		; update flag
+	jnz	getco1			; more needed, can't do anything yet
+	mov	ttstate,offset outtt0	; reset state
+	mov	dx,coord		; get coordinates
+	jmp	setcur			; and go jump there
+getco1:	ret
+
+; ignore following igncnt characters
+ignn:	dec	igncnt			; decrement count
+	jnz	ignn1
+	mov	ttstate,offset outtt0	; put state back to normal if done
+ignn1:	ret
+
+outtty	endp
+
+; computes screen location to ax, given row and col in dx.
+; trashes ax,bx
+scrloc	proc	near
+	mov	al,dh		; get row
+	mov	bl,crt_cols	;** row size
+	mul	bl		; multiply by row size
+	xor	dh,dh		; clear col
+	add	ax,dx		; this is current position
+	sal	ax,1		; double for attributes
+	ret
+scrloc	endp
+
+; puts current screen segment in ax
+scrseg	proc	near
+	mov	ax,0b000h		; assume bw for now
+	cmp	crt_mode,7		; 7 is bw (***)
+	je	scrse1
+	mov	ax,0b800h		; color card
+scrse1:	ret
+scrseg	endp
+
+; wait for retrace so can write to screen memory
+scrwait	proc	near
+	cmp	crt_mode,7		; bw mode?
+	je	scrwa3			; yes, no waiting
+	push	dx
+	mov	dx,crt_status
+scrwa1:	in	al,dx
+	test	al,disp_enb		; display enable?
+	jnz	scrwa1			; yes, keep waiting
+scrwa2:	in	al,dx
+	test	al,disp_enb		; now wait for it to go off
+	jz	scrwa2			; so can have whole cycle
+	pop	dx
+scrwa3:	ret				; that was easy...
+scrwait	endp
+code	ends
+
+if1
+	%out [End of pass 1]
+else
+	%out [End of assembly]
+endif
+
+	end
+
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msyibm.asm
+	/bin/echo -n '	'; /bin/ls -ld msyibm.asm
+fi
+/bin/echo 'Extracting msyz100.asm'
+sed 's/^X//' <<'//go.sysin dd *' >msyz100.asm
+
+; Kermit system dependent module for Heath/Zenith Z100
+
+	public	term
+	include msdefs.h
+
+
+BIOS_SEG SEGMENT AT 40H		; Define segment where BIOS really is
+	ORG	4*3
+BIOS_PRINT	LABEL FAR       ; Printer output
+	ORG	6*3
+BIOS_AUXOUT	LABEL FAR	; AUX output routine
+	ORG	26*3
+BIOS_AUXFUNC	LABEL FAR	; AUX: function
+	ORG	27*3
+BIOS_CONFUNC	LABEL FAR	; CON: function
+BIOS_SEG ENDS
+
+; Function codes for BIOS_xxxFUNC
+CHR_WRITE	EQU	0	; Write character
+CHR_READ	EQU	1	; Read character
+CHR_STATUS	EQU	2	; Get status
+  CHR_SFGS	EQU	0	; Get status subfunction
+  CHR_SFGC	EQU	1	; Get config subfunction
+CHR_CONTROL	EQU	3	; Control function
+  CHR_CFSU	EQU	0	; Set new configuration parameters
+  CHR_CFCI	EQU	1	; Clear input buffer
+
+; Scan code definitions used for translating back to Heath ESC sequences
+entscan	equ	08dh		; enter key scan code
+f0scan	equ	096h		; F0 key
+f1scan	equ	097h		; F1 key
+f2scan	equ	098h		; F2 key
+f3scan	equ	099h		; F3 key
+f4scan	equ	09ah		; F4 key
+f5scan	equ	09bh		; F5 key
+f6scan	equ	09ch		; F6 key
+f7scan	equ	09dh		; F7 key
+f8scan	equ	09eh		; F8 key
+f9scan	equ	09fh		; F9 key
+f10scn	equ	0a0h		; F10 key
+f11scn	equ	0a1h		; F11 key
+f12scn	equ	0a2h		; F12 key
+homscan	equ	0a9h		; Home key
+upscan	equ	0a5h		; Up arrow
+dnscan	equ	0a6h		; Down arrow
+rtscan	equ	0a7h		; Right arrow
+lfscan	equ	0a8h		; Left arrow
+kpminus	equ	0adh		; keypad minus
+kpdot	equ	0aeh		; keypad period
+kp0	equ	0b0h		; keypad 0
+kp1	equ	0b1h		; keypad 1
+kp2	equ	0b2h		; keypad 2
+kp3	equ	0b3h		; keypad 3
+kp4	equ	0b4h		; keypad 4
+kp5	equ	0b5h		; keypad 5
+kp6	equ	0b6h		; keypad 6
+kp7	equ	0b7h		; keypad 7
+kp8	equ	0b8h		; keypad 8
+kp9	equ	0b9h		; keypad 9
+sentscn	equ	0cdh		; shifted enter key
+sf0scan	equ	0d6h		; shifted F0 key
+sf1scan	equ	0d7h		; shifted F1 key
+sf2scan	equ	0d8h		; shifted F2 key
+sf3scan	equ	0d9h		; shifted F3 key
+sf4scan	equ	0dah		; shifted F4 key
+sf5scan	equ	0dbh		; shifted F5 key
+sf6scan	equ	0dch		; shifted F6 key
+sf7scan	equ	0ddh		; shifted F7 key
+sf8scan	equ	0deh		; shifted F8 key
+sf9scan	equ	0dfh		; shifted F9 key
+sf10scn	equ	0e0h		; shifted F10 key
+sf11scn	equ	0e1h		; shifted F11 key
+sf12scn	equ	0e2h		; shifted F12 key
+shomscn	equ	0e9h		; shifted Home key
+supscan	equ	0e5h		; shifted Up arrow
+sdnscan	equ	0e6h		; shifted Down arrow
+srtscan	equ	0e7h		; shifted Right arrow
+slfscan	equ	0e8h		; shifted Left arrow
+skpmins	equ	0edh		; shifted keypad minus
+skpdot	equ	0eeh		; shifted keypad period
+skp0	equ	0f0h		; shifted keypad 0
+skp1	equ	0f1h		; shifted keypad 1
+skp2	equ	0f2h		; shifted keypad 2
+skp3	equ	0f3h		; shifted keypad 3
+skp4	equ	0f4h		; shifted keypad 4
+skp5	equ	0f5h		; shifted keypad 5
+skp6	equ	0f6h		; shifted keypad 6
+skp7	equ	0f7h		; shifted keypad 7
+skp8	equ	0f8h		; shifted keypad 8
+skp9	equ	0f9h		; shifted keypad 9
+
+; Miscellaneous scan codes used for functions
+prscan	equ	f12scn		; print-screen scan code (F12)...
+brkscan	equ	0aah		; Break key
+
+
+modfrm	struc				; format of mode line
+	db	'Esc chr: '
+m_echr	db	2 dup (?)
+	db	', Speed: '
+m_baud	db	4 dup (?)
+	db	', Parity: '
+m_par	db	4 dup (?)
+	db	', Echo: '
+m_echo	db	3 dup (?)
+	db	', Prn: '
+m_prs	db	3 dup (?)
+	db	', Type '
+m_hlp	db	2 dup (?)
+	db	'? for Help$'
+modfrm	ends
+
+datas 	segment	public 'datas'
+waste	db	100h dup(?)		; assembler problem???
+
+flags1	db	0			; internal flags
+prtscr	equ	80h			; print screen pressed flag
+
+; Key translations - F12 is printscreen
+ckeys	db	brkscan,prscan,upscan,dnscan,lfscan,rtscan,homscan
+	db	entscan,f0scan,f1scan,f2scan,f3scan,f4scan,f5scan,f6scan
+	db	f7scan,f8scan,f9scan,f10scn,f11scn,kpminus
+	db	kpdot,kp0,kp1,kp2,kp3,kp4,kp5,kp6,kp7,kp8,kp9
+	db	supscan,sdnscan,slfscan,srtscan,shomscn
+	db	sentscn,sf0scan,sf1scan,sf2scan,sf3scan,sf4scan,sf5scan,sf6scan
+	db	sf7scan,sf8scan,sf9scan,sf10scn,sf11scn,skpmins
+	db	skpdot,skp0,skp1,skp2,skp3,skp4,skp5,skp6,skp7,skp8,skp9
+lckeys	equ	$-ckeys
+;ckacts must parallel ckeys above...
+ckacts	dw	trnbrk,trnprs,trnupw,trndnw,trnlfw,trnrgw,trnhom,trnkpn
+	dw	trnf0,trnf1,trnf2,trnf3,trnf4,trnf5,trnf6,trnf7,trnf8,trnf9
+	dw	trnf10,trnf11,trnkpn,trnkpn,trnkpn,trnkpn,trnkpn
+	dw	trnkpn,trnkpn,trnkpn,trnkpn,trnkpn,trnkpn,trnkpn
+	dw	trnupw,trndnw,trnlfw,trnrgw,trnhom,trnkps
+	dw	trnsf0,trnsf1,trnsf2,trnsf3,trnsf4,trnsf5,trnsf6,trnsf7
+	dw	trnsf8,trnsf9,trnsf10,trnsf11,trnkps,trnkps
+	dw	trnkps,trnskp1,trnskp2,trnskp3,trnskp4,trnskp5,trnskp6
+	dw	trnskp7,trnskp8,trnskp9
+
+enascan	db	ESC,'y?$'	; Enable scan codes
+disscan	db	ESC,'x?$'	; Disable scan codes
+uptrn	db	esc,'A'
+dntrn	db	esc,'B'
+rgtrn	db	esc,'C'
+lftrn	db	esc,'D'
+enttrn	db	cr		; enter key translation
+homtrn	db	ESC,'H'		; home key translation
+dottrn	db	'.'		; keypad . translation
+mintrn	db	'-'		; keypad - translation
+kp0trn	db	'0'		; keypad 0 translation
+kp1trn	db	'1'		; keypad 1 translation
+kp2trn	db	'2'		; keypad 2 translation
+kp3trn	db	'3'		; keypad 3 translation
+kp4trn	db	'4'		; keypad 4 translation
+kp5trn	db	'5'		; keypad 5 translation
+kp6trn	db	'6'		; keypad 6 translation
+kp7trn	db	'7'		; keypad 7 translation
+kp8trn	db	'8'		; keypad 8 translation
+kp9trn	db	'9'		; keypad 9 translation
+senttrn	db	cr		; shifted enter key translation
+shomtrn	db	ESC,'H'		; home key translation
+sdottrn	db	'.'		; shifted keypad . translation
+smintrn	db	'-'		; shifted keypad - translation
+skp0trn	db	'0'		; shifted keypad 0 translation
+skp1trn	db	ESC,'L'		; shifted keypad 1 translation
+skp2trn	db	ESC,'B'		; shifted keypad 2 translation
+skp3trn	db	ESC,'M'		; shifted keypad 3 translation
+skp4trn	db	ESC,'D'		; shifted keypad 4 translation
+skp5trn	db	ESC,'H'		; shifted keypad 5 translation
+skp6trn	db	ESC,'C'		; shifted keypad 6 translation
+skp7trn	db	ESC,'@'		; shifted keypad 7 translation
+skp8trn	db	ESC,'A'		; shifted keypad 8 translation
+skp9trn	db	ESC,'N'		; shifted keypad 9 translation
+f0trn	db	ESC,'J'		; F0 translation
+f1trn	db	ESC,'S'		; F1 translation
+f2trn	db	ESC,'T'		; F2 translation
+f3trn	db	ESC,'U'		; F3 translation
+f4trn	db	ESC,'V'		; F4 translation
+f5trn	db	ESC,'W'		; F5 translation
+f6trn	db	ESC,'P'		; F6 translation
+f7trn	db	ESC,'Q'		; F7 translation
+f8trn	db	ESC,'R'		; F8 translation
+f9trn	db	ESC,'0I'	; F9 translation
+f10trn	db	ESC,'0J'	; F10 translation
+f11trn	db	ESC,'0K'	; F11 translation
+f12trn	db	ESC,'0L'	; F12 translation
+sf0trn	db	ESC,'E'		; shifted F0 translation
+sf1trn	db	ESC,'1A'	; shifted F1 translation
+sf2trn	db	ESC,'1B'	; shifted F2 translation
+sf3trn	db	ESC,'1C'	; shifted F3 translation
+sf4trn	db	ESC,'1D'	; shifted F4 translation
+sf5trn	db	ESC,'1E'	; shifted F5 translation
+sf6trn	db	ESC,'1F'	; shifted F6 translation
+sf7trn	db	ESC,'1G'	; shifted F7 translation
+sf8trn	db	ESC,'1H'	; shifted F8 translation
+sf9trn	db	ESC,'1I'	; shifted F9 translation
+sf10trn	db	ESC,'1J'	; shifted F10 translation
+sf11trn	db	ESC,'1K'	; shifted F11 translation
+sf12trn	db	ESC,'1L'	; shifted F12 translation
+
+
+ourarg	termarg	<>
+modbuf	modfrm	<>			; mode line buffer
+
+; some static data for mode line
+unkbaud	db	'Unk '			; must be 4 chars...
+baudn	db	'45.5'
+	db	'  50'
+	db	'  75'
+	db	' 110'
+	db	' 135'
+	db	' 150'
+	db	' 300'
+	db	' 600'
+	db	'1200'
+	db	'1800'
+	db	'2000'
+	db	'2400'
+	db	'4800'
+	db	'9600'
+	db	' 19K'
+	db	' 38K'
+
+baudnsiz  equ	16			; # of baud rates known (tbl size / 4)
+parnams	db	'Even'
+	db	'Mark'
+	db	'None'
+	db	'Odd '			; must be 4 chars
+	db	'Spc '
+offmsg	db	'Off'
+onmsg	db	'On '
+lclmsg	db	'Lcl'
+remmsg	db	'Rem'
+
+datas	ends
+
+code	segment	public
+	extrn	prtchr:near,outchr:near,putmod:near,clrmod:near,sendbr:near
+	assume	cs:code,ds:datas
+
+; This is from the dumb terminal emulator routine in MSXGEN.ASM.
+; Had to use bios calls because DOS calls were losing chars.
+term	proc	near
+	mov 	si,ax		; this is source
+	mov 	di,offset ourarg ; place to store arguments
+	mov 	ax,ds
+	push	es		; save caller's extra segment address
+	mov 	es,ax		; address destination segment
+	mov 	cx,size termarg
+	rep 	movsb		; copy into our arg blk
+	and	flags1,not (prtscr)	; print screen mode disabled
+
+	test	ourarg.flgs,emheath ; Are we to use Heath sequences?
+	jnz	chkmod		; no, do something else
+	mov	ah,prstr
+	mov	dx,offset enascan ; enable scan codes
+	int	dos 
+
+chkmod:	call 	clrmod		; clear mode line
+	test 	ourarg.flgs,modoff ; is mode line disabled?
+	jnz	term1		; yes, skip it
+	call 	modlin		; turn on mode line
+
+term1:	call 	portchr		; char at port?
+	 jnc	term3		; no, keep going
+	call	outtty		; print on terminal
+
+term3:	mov 	ah,chr_status
+	mov 	al,chr_sfgs	; get number of characters
+	call 	bios_confunc	; check console
+	cmp 	bl,0
+	jz 	term1		; no character, go on
+	mov 	ah,chr_read
+	call 	bios_confunc	; read it
+	cmp 	al,ourarg.escc	; escape char?
+	je 	term4		; yes, exit
+	push 	ax		; save char
+	mov 	ah,al
+	call	trnout		; translate if nec., output to port
+	pop 	ax
+	jmp 	term1		; else echo and keep going
+
+term4:	call	clrmod
+	mov	ah,prstr
+	mov	dx,offset disscan ; disable scan code generation
+	int	dos
+	pop	es
+	ret
+
+term	endp
+
+; returns with carry on if a character is available
+
+portchr	proc	near
+	call	prtchr			; character at port?
+	 jmp	short portc1		; yes, go handle
+	nop				; skip return is stupid
+	clc				; no carry -> no character
+	ret
+portc1:	and	al,7fh			; we don't worry about parity here
+	stc				; have a character
+	ret
+portchr	endp
+
+; put the character in al to the screen
+outtty	proc	near
+	mov 	ah,chr_write
+	call 	bios_confunc
+	test 	ourarg.flgs,capt ; capturing output?
+	jz 	outtt1		; no, forget it
+	call 	ourarg.captr	; else call the routine
+
+outtt1:	test	flags1,prtscr	; print screen?
+	jz	outtt2		; no, try something else
+	call	bios_print
+
+outtt2:	ret
+outtty	endp
+
+; send the character in al out to the serial port
+; handle echoing also...
+outprt	proc	near
+	test	ourarg.flgs,lclecho	; echoing?
+	jz	outpr1			; no, forget it
+	push	ax			; save char
+	call	outtty			; print it
+	pop	ax			; restore
+outpr1:	mov	ah,al			; this is where outchr expects it
+	call	outchr			; output to the port
+	 nop
+	 nop
+	 nop				; skip returns...
+	ret
+outprt	endp
+
+modlin	proc	near			; turn on mode line
+	mov	al,ourarg.escc
+	mov	modbuf.m_echr,' '	; first char is initial space
+	mov	modbuf.m_hlp,' '	; goes here too.
+	cmp	al,32			; printable?
+	jnb	modl1			; yes, keep going
+	add	al,40h			; made printable
+	mov	modbuf.m_echr,'^'	; note control char
+	mov	modbuf.m_hlp,'^'
+modl1:	mov	modbuf.m_echr+1,al	; fill in character
+	mov	modbuf.m_hlp+1,al
+	mov	al,ourarg.baudb		; get baud bits
+	mov	si,offset unkbaud	; assume unknown baud
+	cmp	al,baudnsiz		; too big?
+	jnb	modl2			; yes, use default
+	mov	cl,2			; each is 4 bytes long
+	shl	al,cl
+	mov	ah,0
+	add	ax,offset baudn
+	mov	si,ax
+modl2:	mov	cx,size m_baud		; length of baud space
+	mov	di,offset modbuf.m_baud
+	rep	movsb			; copy in baud rate
+	mov	al,ourarg.parity	; get parity code
+	mov	cl,2			; each is 4 bytes long...
+	shl	al,cl
+	mov	ah,0
+	add	ax,offset parnams	; names of parity settings
+	mov	si,ax
+	mov	cx,4			; each is 4 long
+	mov	di,offset modbuf.m_par
+	rep	movsb
+	mov	si,offset remmsg	; assume remote echoing
+	test	ourarg.flgs,lclecho	; echoing?
+	jz	modl4			; no, keep going
+	mov	si,offset lclmsg
+modl4:	mov	cx,3			; size of on/off
+	mov	di,offset modbuf.m_echo
+	rep	movsb
+;	mov	al,'1'
+;	cmp	portno,1		; port 1?
+;	je	modl5			; yes, keep going
+;	mov	al,'2'
+;modl5:	mov	modbuf.m_prt,al		; fill in port number
+;	mov	cx,size modfrm		; this is size of mode line
+;	mov	si,offset modbuf	; mode line image
+	mov	si,offset offmsg	; assume printer off
+	test	flags1,prtscr		; print screen enabled?
+	jz	modl5			; no, keep going
+	mov	si,offset onmsg
+modl5:	mov	cx,3
+	mov	di,offset modbuf.m_prs
+	rep	movsb
+	mov	dx,offset modbuf
+	call	putmod
+	ret				; and return
+modlin	endp
+
+; translate the scan code in ah according to the translate table
+; given in ktrntab/krpltab, output to port.  If no translation,
+; use ascii char in al. (should probably include shift state
+; somewhere).  Shift state is in bl.
+trnout	proc	near
+	test	ourarg.flgs,havtt	; translate table given?
+	jz	trnou3			; no, just output character
+	cmp	ourarg.klen,0		; did they say we have one 
+	je	trnou3			; but we really don't?
+	push	ax			; save original value
+	xor	ah,ah			; Zero top half
+	mov	di,ourarg.ktab
+	mov	cx,ourarg.klen
+	repne	scasw			; look for our key
+	pop	ax			; recover character
+	jne	trnou3			; not found, forget it
+	sub	di,ourarg.ktab
+	sub	di,2			; (minus 2 for pre-increment)
+	mov	bx,ourarg.krpl
+	mov	si,[bx][di]		; and addr of replacement
+	mov	cl,[si]			; get first byte (length)
+	xor	ch,ch			; clear high-order byte
+	inc	si			; point to translation string
+trnou2:	lodsb				; get a byte
+	push	si
+	push	cx			; save important registers
+	call	outprt			; send to port
+	pop	cx
+	pop	si
+	loop	trnou2			; send all chars
+	ret				; and return
+trnou3:	xor	ah,ah			; get scan code
+	mov	cx,lckeys		; length of table
+	mov	di,offset ckeys		; table address
+	repne	scasb
+;	mov	al,0			; ascii code was 0...
+	jne	trnou4			; not found, keep going
+	sub	di,offset ckeys+1	; get table offset
+	shl	di,1			; shift for word offset
+	jmp	ckacts[di]		; jump to appropriate routine
+trnou4:	call	outprt			; just output single char
+	ret				; and return
+
+;trnmod:	test	flags,modoff		; mode line already off?
+;	jnz	trnm1			; yes, go turn on
+;	call	clrmod			; no, clear mode line here
+;	or	flags,modoff		; turn on flag
+;	ret				; and return
+;trnm1:	call	modlin			; turn on mode line
+;	and	flags,not modoff	; clear flag
+;	ret				; and return
+
+trnbrk:
+	call	sendbr
+	ret
+
+trnprs:	xor	flags1,prtscr		; flip the flag
+	and	ourarg.flgs,not modoff	; turn on mode line
+	call	modlin			; write into mode line
+	ret				; and return
+
+trn1ch:	mov	cx,1			; length is always 1
+	jmp	trnou2
+
+; common entry for arrow keys
+trn2ch:	mov	cx,2			; length is always 2
+	jmp	trnou2			; go send definition
+
+trn3ch:	mov	cx,3			; length is always 3
+	jmp	trnou2
+
+trnupw:	mov	si,offset uptrn
+	jmp	trn2ch
+
+trndnw:	mov	si,offset dntrn
+	jmp	trn2ch
+
+trnlfw:	mov	si,offset lftrn
+	jmp	trn2ch
+
+trnrgw:	mov	si,offset rgtrn
+	jmp	trn2ch
+
+trnhom:	mov	si,offset homtrn
+	jmp	trn2ch
+
+trnent:	mov	si,offset enttrn
+	jmp	trn1ch
+
+trnf0:	mov	si,offset f0trn
+	jmp	trn2ch
+
+trnf1:	mov	si,offset f1trn
+	jmp	trn2ch
+
+trnf2:	mov	si,offset f2trn
+	jmp	trn2ch
+
+trnf3:	mov	si,offset f3trn
+	jmp	trn2ch
+
+trnf4:	mov	si,offset f4trn
+	jmp	trn2ch
+
+trnf5:	mov	si,offset f5trn
+	jmp	trn2ch
+
+trnf6:	mov	si,offset f6trn
+	jmp	trn2ch
+
+trnf7:	mov	si,offset f7trn
+	jmp	trn2ch
+
+trnf8:	mov	si,offset f8trn
+	jmp	trn2ch
+
+trnf9:	mov	si,offset f9trn
+	jmp	trn3ch
+
+trnf10:	mov	si,offset f10trn
+	jmp	trn3ch
+
+trnf11:	mov	si,offset f11trn
+	jmp	trn3ch
+
+trnkpn:	and	al,07fh			; strip high bits
+	jmp	trnou4			; now output it
+
+trnkps:	and	al,03fh			; strip high bits (special case)
+	jmp	trnou4
+
+trnsf0:	mov	si,offset sf0trn
+	jmp	trn2ch
+
+trnsf1:	mov	si,offset sf1trn
+	jmp	trn3ch
+
+trnsf2:	mov	si,offset sf2trn
+	jmp	trn3ch
+
+trnsf3:	mov	si,offset sf3trn
+	jmp	trn3ch
+
+trnsf4:	mov	si,offset sf4trn
+	jmp	trn3ch
+
+trnsf5:	mov	si,offset sf5trn
+	jmp	trn3ch
+
+trnsf6:	mov	si,offset sf6trn
+	jmp	trn3ch
+
+trnsf7:	mov	si,offset sf7trn
+	jmp	trn3ch
+
+trnsf8:	mov	si,offset sf8trn
+	jmp	trn3ch
+
+trnsf9:	mov	si,offset sf9trn
+	jmp	trn3ch
+
+trnsf10: mov	si,offset sf10trn
+	jmp	trn3ch
+
+trnsf11: mov	si,offset sf11trn
+	jmp	trn3ch
+
+trnskp1: mov	si,offset skp1trn
+	jmp	trn2ch
+
+trnskp2: mov	si,offset skp2trn
+	jmp	trn2ch
+
+trnskp3: mov	si,offset skp3trn
+	jmp	trn2ch
+
+trnskp4: mov	si,offset skp4trn
+	jmp	trn2ch
+
+trnskp5: mov	si,offset skp5trn
+	jmp	trn2ch
+
+trnskp6: mov	si,offset skp6trn
+	jmp	trn2ch
+
+trnskp7: mov	si,offset skp7trn
+	jmp	trn2ch
+
+trnskp8: mov	si,offset skp8trn
+	jmp	trn2ch
+
+trnskp9: mov	si,offset skp9trn
+	jmp	trn2ch
+
+trnout	endp
+
+code	ends 
+	end
+
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msyz100.asm
+	/bin/echo -n '	'; /bin/ls -ld msyz100.asm
+fi
+/bin/echo 'Extracting msz100.hlp'
+sed 's/^X//' <<'//go.sysin dd *' >msz100.hlp
+		  KERMIT VERSION 2.26 FOR Z-DOS
+
+			September 20, 1984
+
+This guide is meant to be a supplement to the MSKERMIT.HLP file.  It
+describes the differences between the Z-100 version of Kermit and
+the IBM-PC version.  This version has not been tested with Z-DOS
+version 2.0.  LOCAL command execution may or may not work.
+
+* Program Operation
+
+The Z-100 version of Kermit uses a slightly different concept for
+Heath emulation.  The Z-100 normally uses the same escape sequences
+as the Heathkit H-19 terminal, although a slightly different key
+arrangement is used.  With Heath emulation mode turned on, the normal
+Z-100/H19 escape sequences will be sent by the function keys and keypad.
+However, key redefinition will not be available.  Printer control is 
+also not available in Heath emulation mode.  When Heath emulation
+is turned off (the default), the function keys and keypad emulate the
+Heath sequence as best as possible (no checks are made for alternate
+or shifted keypad modes), but key redefinition is allowed.  If a problem
+is encountered running a program that uses the keypad keys or function
+keys, swicth to Heath emulation and see if that helps.  Heath
+emulation only affects what characters are sent for keys typed at the
+keyboard.  It does not change the affect of incoming characters or
+escape sequences.
+
+The Z-100 version of Kermit-MS does not support multiple communication
+ports.  The modem is assumed to be connected to the AUX port.  This
+port must be configured as no parity, no handshake, 1 stop bit, 8 data
+bits, no pad.
+
+* Terminal Emulation
+
+The Z-DOS version of Kermit-MS uses the following capabilities:
+
+	Escape Char:	^]
+	Modeline
+	Printer control
+	Key redefinition (with Heath emulation off)
+
+Screen scroll is not currently supported.
+
+X. Printer Control
+
+The contents of a screen may be printed at any time if a printscreen
+driver has been installed prior to running Kermit.  This is usually
+done by running the PSC command which comes with your ZDOS 1.25
+disks.  After this, the screen contents may be printed using
+Shift-F12.
+
+If you wish to log a terminal session on the printer and you are not
+using Heath emulation mode, the F12 function key will start or stop
+the spooling of incoming characters to the printer.  This may also
+be simulated by the Kermit-MS LOG PRN and CLOSE commands.
+
+X. Key Redefinition
+
+Key redefinitions are accomplished in the same way as with the IBM-PC
+version.  However, key redefintion may only be used when Heath
+emulation is turned off.
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msz100.hlp
+	/bin/echo -n '	'; /bin/ls -ld msz100.hlp
+fi
+
+

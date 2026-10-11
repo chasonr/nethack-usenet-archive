@@ -1,0 +1,303 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,7478132dbbbeebcf,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-10-15 17:08:15 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site gyre.UUCP
+Path: utzoo!linus!philabs!cmcl2!seismo!umcp-cs!tove!gyre!fred
+From: fred@gyre.UUCP (Fred Blonder)
+Newsgroups: net.sources
+Subject: New wild & crazy pseudo-device driver for 4.2BSD
+Message-ID: <10@gyre.UUCP>
+Date: Mon, 15-Oct-84 20:08:15 EDT
+Article-I.D.: gyre.10
+Posted: Mon Oct 15 20:08:15 1984
+Date-Received: Wed, 17-Oct-84 19:29:16 EDT
+Distribution: net
+Organization: U of Maryland, Laboratory for Parallel Computation, C.P., MD
+Lines: 282
+
+I once posted a version of this for 4.1BSD. Here's the new improved
+version for 4.2B SD.
+
+This is a really strange device driver, which can be put to all sorts
+of mischevious uses. It consists of the series of files: /dev/fd0 -
+/dev/fd19. Opening /dev/fdN opens the file (if such exists) associated
+with file descriptor N in the current process, even if you don't know
+its name, or even if it's been unlinked. If the file descriptor
+references a socket, the driver fakes a ``dup()'' sys call on file
+descriptor N. The driver, if the open is succesful, deletes all
+references to itself from the process which opened it, so it consists
+of only the ``open'' routine, since future references to the new file
+descriptor will access the file which has been indirected to.
+
+This can be used to force programs which don't normally do so, to read
+their standard input, or write to their standard output.
+
+Ex:
+
+	make -f /dev/fd0
+	<type makescript here>
+
+or
+
+	ln -s /dev/fd0 foo.c
+	<command that generates C source> | cc foo.c -o /dev/fd1 \
+						| <something real strange>
+
+To install, add to these files:
+
+==========================================================================
+/sys/conf/<SYSNAME>:
+			pseudo-device	fd
+
+==========================================================================
+/sys/conf/files:
+			sys/dev_fd.c		optional fd
+
+==========================================================================
+/sys/vax/conf.c:
+	299a309,315
+	> #include "fd.h"
+	> #if NFD > 0
+	> int	fdopen();
+	> #else
+	> #define	fdopen	nodev
+	> #endif NFD
+	> 
+	729a746,749
+	> 
+	> 	fdopen,		nodev,		nodev,		nodev,
+	> 	nodev,		nodev,		nodev,		0,
+	> 	nodev,		nodev,
+
+==========================================================================
+
+and then install these files:
+
+==========================================================================
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting dev_fd.c'
+sed 's/^X//' <<'//go.sysin dd *' >dev_fd.c
+static char sccsid[] = "@(#)$Header: /usr/sys/sys/RCS/dev_fd.c,v 1.4 84/10/11 17:25:34 bin Exp $";
+
+X/*
+ * fd.c		Fred Blonder - U of Maryland	11-Sep-1984
+ *
+ * ``File Descriptor'' pseudo-device driver, rewritten for Berkeley 4.2.
+ *
+ * Opening minor device N opens the file (if any) connected to file-descriptor
+ * N belonging to the calling process. Note that this driver consists of only
+ * the ``open()'' routine, because all subsequent references to this file will
+ * be direct to the other driver.
+ *
+ * $Log:	dev_fd.c,v $
+ * Revision 1.4  84/10/11  17:25:34  bin
+ * Added casts to get rid of compile-time diagnostics.
+ * 
+ * Revision 1.3  84/10/11  17:03:01  bin
+ * Added code to check access modes when doing a fake ``dup()''.
+ * Fixed bug in test to perform ``dup()''.
+ * 
+ * Revision 1.2  84/10/10  18:40:03  bin
+ * Added code to fake a ``dup()'' sys call if the requested
+ * descriptor refers to a socket.
+ * 
+ * Fixed a bug in the error-exit code.
+ * 
+ * Revision 1.1  84/10/08  15:11:02  bin
+ * Initial revision
+ * 
+ */
+
+#include "fd.h"
+#if NFD > 0
+
+#include "../h/param.h"
+#include "../h/inode.h"
+#include "../h/file.h"
+#include "../h/dir.h"
+#include "../h/user.h"
+#include "../h/errno.h"
+
+fdopen(dev, mode)
+dev_t dev;
+int mode;
+{
+	struct file *fp, *wfp;
+	struct inode *ip, *wip;
+
+	/* Note the horrid kludge here: u.u_r.r_val1 contains the value
+	   of the new file descriptor, which has not been disturbed since
+	   it was allocated. */
+	if ((fp = getf(u.u_r.r_val1)) == NULL)
+		return(u.u_error);
+
+	if ((wfp = getf(minor(dev))) == NULL)
+		return(u.u_error);
+
+	/* We must explicitly test for this case because ufalloc() may
+	   have allocated us the same file desriptor we are referring
+	   to, if the proccess referred to an invalid (closed) descriptor.
+	   Ordinarily this would be caught by getf(), but by the time we
+	   reach this routine u_pofile[minor(dev)] could already be set
+	   to point to our file struct. */
+	if (fp == wfp)
+		return(u.u_error = EBADF);
+
+	ip = (struct inode *)fp->f_data;
+
+	/* Special handling for sockets: Fake a ``dup()'' sys call
+	   instead of opening an inode. */
+	if (wfp->f_type != DTYPE_INODE) {
+		/* Check that the mode the file is being opened
+		   for is consistent with the mode of the existing
+		   descriptor. This isn't as clean as it should be,
+		   but this entire driver is a real kludge anyway. */
+		if ((fp->f_flag & mode & (FREAD|FWRITE)) !=
+						(mode & (FREAD|FWRITE))) {
+			return(u.u_error = EACCES);
+			}
+
+		/* Delete references to this pseudo-device. */
+		irele(ip);		/* Chuck the inode. */
+		fp->f_count = 0;	/* Chuck the file structure. */
+		/* Dup the file descriptor. */
+		dupit(u.u_r.r_val1, wfp, u.u_pofile[minor(dev)]);
+		return(0);
+		}
+
+	wip = (struct inode *)wfp->f_data;
+
+	/* I'm not sure that we really need to lock the inode here,
+	   but why not be paranoid? */
+	ilock(wip);
+
+	/* Since we're opening a file again, we run through all the
+	   permission checks so this can't be used as a loophole to
+	   get access to a file we shouldn't have. */
+	if (mode&FREAD && access(wip, IREAD))
+		goto bad;
+	if (mode&(FWRITE|FTRUNC)) {
+		if ((ip->i_mode&IFMT) == IFDIR) {
+			u.u_error = EISDIR;
+			goto bad;
+			}
+		if (access(wip, IWRITE))
+			goto bad;
+		}
+
+	/* The file must always exist, so we don't even bother testing
+	   for its presence. */
+	if (mode&(FCREAT|FEXCL)) {
+		u.u_error = EEXIST;
+		goto bad;
+		}
+
+	/* This may not make any sense, but I'm paranoid and figure that
+	   it's probably an error. */
+	if (mode&FTRUNC) {
+		u.u_error = EBUSY;
+		goto bad;
+		}
+
+	/* Call the device-specific open routine, if any. */
+	if ((u.u_error = openi(wip, mode)) != 0)
+		goto bad;
+
+	/* Made it this far, now switch the inode pointers in the
+	   file descriptors around, to make this file open refer
+	   to the other file. */
+	irele(ip); /* We don't need this anymore. */
+	fp->f_data = (caddr_t)wip;
+	wip->i_count++;
+	iunlock(wip);
+	return(0);
+
+    bad:
+	iunlock(wip);
+	return(u.u_error);
+}
+
+#endif
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 dev_fd.c
+	/bin/echo -n '	'; /bin/ls -ld dev_fd.c
+fi
+/bin/echo 'Extracting fd.4'
+sed 's/^X//' <<'//go.sysin dd *' >fd.4
+X.TH FD 4l "13-Oct-1984 (U of Maryland)"
+X.UC 4
+X.SH NAME
+X/dev/fd* \- ``file descriptor'' driver
+X.SH DESCRIPTION
+X.lg
+X.I /dev/fd0
+-
+X.I /dev/fd19
+are special files that reference the files associated with a process'
+open file descriptors.
+That is, opening the file: /dev/fd\fIN\fP is equivalent to opening whatever
+file you opened to get the file descriptor \fIN\fP, even though you may not
+know the file's true name (or even if it has one).
+This can be used to force a program which opens files by name, to connect
+itself to open file descriptors (which you have thoughtfully provided) in
+weird and wonderful ways. A simple use would be to force a program which
+only accepts input from files, to read from its standard input.
+For instance:
+X.sp
+X.ti +10
+cat /dev/fd0
+X.sp
+produces the same result as:
+X.sp
+X.ti +10
+cat -
+X.sp
+which would be useful if \fIcat\fP didn't use the ``-'' convention.
+X.sp 2
+If the open file descriptor references a socket, the driver fakes a ``dup()''
+system call instead of actually opening a file. In this case it
+checks to see that the read/write mode you are attempting to open
+the file with, is compatible with the mode of the existing file descriptor.
+That is: if descriptor 5 refers to a socket and
+is open for writing, you cannot open ``/dev/fd5''
+for reading.
+X.SH AUTHOR
+Fred Blonder <Fred@Maryland>
+X.SH FILES
+X/dev/fd*
+X.SH BUGS
+Since, for sockets,
+the driver fakes a ``dup'' system call rather than actually re-opening
+the file, the new descriptor is a copy of the dup-ed descriptor, and shares
+its properties. Specifically: it will have the same read/write mode as the
+dup-ed descriptor. If descriptor 0 is open for reading and writing, opening
+``/dev/fd0'' for reading will return a writable, as well as readable, file
+descriptor.
+Also: the descriptors share the same read/write pointer, so seeks, reads &
+writes on one will affect the other.
+X.sp
+While not a bug in the driver specifically, use of these files can produce odd
+interactions with programs which don't expect to have their file
+descriptors surreptitiously aliased.
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 fd.4
+	/bin/echo -n '	'; /bin/ls -ld fd.4
+fi
+-- 
+					Fred Blonder (301) 454-7690
+					harpo!seismo!umcp-cs!fred
+					Fred@Maryland.ARPA
+
+

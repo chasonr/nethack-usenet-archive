@@ -1,0 +1,514 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,aa3a3fea29499a8e,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-12-23 05:25:22 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site ecn-pc.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxr!mhuxt!houxm!ihnp4!inuxc!pur-ee!ecn-pc!langet
+From: langet@ecn-pc.UUCP (Timothy Lange)
+Newsgroups: net.sources
+Subject: Sort DOS directories.
+Message-ID: <448@ecn-pc.UUCP>
+Date: Mon, 23-Dec-85 08:25:22 EST
+Article-I.D.: ecn-pc.448
+Posted: Mon Dec 23 08:25:22 1985
+Date-Received: Wed, 25-Dec-85 01:07:33 EST
+Reply-To: langet@pur-ee.UUCP (Timothy Lange)
+Organization: Engineering Business Office, Purdue University
+Lines: 493
+
+
+-- start of code --
+page	60, 132
+title	Sortdir, pack a directory to save space and sort file names.
+;
+; This program is based heavily on the program called `packdir' written
+; by Ted Mirecki and printed in the February, '85 issue of PC Tech Journal.
+;
+; I have rewritten part of the code, fixed some bugs in the original, and
+; added sections to sort directory entries.  This is a use at your own
+; risk program, read the code before you use it!   Timothy Lange.  12/23/85.
+;
+; Equates.
+;
+cr	equ	00dh
+lf	equ	00ah
+space	equ	020h
+;
+; Macros.
+;
+doscall macro	func
+	mov	ah, func
+	int	21h
+	endm
+;
+; Directory entry structure layout.
+;
+dirent	struc
+dname	db	8 dup(?)		; name of file
+dext	db	?,?,?			; extension
+attr	db	?			; attribute byte
+	db	0ah dup(?)		; reserved for DOS
+dtime	dw	?			; file update time
+ddate	dw	?			; file update date
+startcl dw	?			; starting cluster
+dsize	dd	?			; file size
+dirent	ends
+;
+;  Normal FCB structure layout.
+;
+normfcb struc
+drive	db	?			; drive id
+fname	db	8 dup(?)		; name of file
+fext	db	?,?,?			; extension
+curblok dw	?			; current block
+recsize dw	?			; record size for each read
+fsizelo dw	?			; lo-order word of file size
+fsizehi dw	?			; hi-order word of file size
+fdate	dw	?			; file update date
+	db	0ah dup (?)		; reserved for DOS
+recinblok	db	?		; record within block
+relrec	dw	?			; relative record number
+	dw	?
+normfcb ends
+;
+code	segment
+	org	80h			; parameter area in PSP
+subdata label	byte			; use as buffer for 1 subdir entry
+	org	100h
+	assume	cs:code, ds:code, es:code, ss:code
+begin:	jmp	start
+;
+; Extended FCB No. 1 will be built from command line parameters passed
+; by DOS, and used to look up the sub-directory in its parent.
+;
+xfcb1	db	0ffh, 0, 0, 0, 0, 0	; FCB extension header
+	db	10h			; attribute byte for sub-dirs
+fcb1	normfcb<>			; normal FCB after extension
+;
+; Extended FCB No. 2 will be built by DOS as a result of lookup in
+; parent directory, and used open & read sub-directory file.
+;
+xfcb2	db	0ffh, 0, 0, 0, 0, 0	; FCB extension header
+	db	10h			; attribute byte for sub-dirs
+fcb2	normfcb<>			; normal FCB after extension
+;
+; Message strings.
+;
+diskerr$	db	cr, lf, 'Disk read error', cr, lf, '$'
+badfat$ db	cr, lf, 'FAT error: cluster chain not terminated'
+	db	cr, lf, '$'
+count$	db	' had'
+inrec$	db	6 dup (' ')		; space for input rec count digits
+	db	' clusters, now has'
+outrec$ db	6 dup (' ')		; space for output count digits
+	db	cr, lf, '$'
+endmsg$ db	cr, lf
+nodir$	db	6 dup (' ')		; space for directory count digits
+	db	' Sub-Directories processed', cr, lf
+freed$	db	6 dup (' ')		; space for freed count digits
+	db	' clusters freed', cr, lf, '$'
+;
+; Miscellaneous data values.
+;
+cluslen dw	?			; bytes per cluster
+fatcount	dw	?		; number of entries in FAT
+fcode	db	11h			; function code for find first
+fileclus	dw	0		; file size from tracing cluster chain
+freed	dw	0			; count of clusters freed
+inrec	dw	0			; current input record no.
+maxrec	dw	0			; maximum number of records found
+outrec	dw	0			; current output record no.
+ndirs	dw	0			; count of directories processed
+retry	db	3			; 3 retries if read error
+savstart	dw	?		; save starting cluster of file
+secsper db	?			; sectors per cluster
+sorttbl db	20h*200h dup(0)		; data area for sorting directory
+temp	db	20h dup (space)		; temp data area for sorting
+;
+sortdir proc	near
+;
+; Each called routine returns carry flag clear if no errors,
+; set if error.	 If error, then DX points to error message.
+; Display the message, then exit to DOS.
+;
+start:	call	getname			; look for filename on command line
+	call	fatread			; read in the FAT
+	jc	msg
+nextnam:call	open			; look up filename and open it
+	jc	eoj			; all done when no more matching names
+	call	dirsize			; get file size by tracing clusters
+	jc	msg
+	call	process			; process the contents of the sub-dir
+	call	close			; close the sub-dir file
+	jmp	nextnam
+eoj:	mov	ax, ndirs		; convert dir count to ASCII
+	mov	si, offset code:nodir$
+	call	i2asc
+	mov	ax, freed		; convert freed count
+	mov	si, offset code:freed$
+	call	i2asc
+	mov	dx, offset code:endmsg$
+msg:	doscall 009h			; display string
+	doscall 04ch			; terminate
+sortdir endp
+;
+; Test if filename was specified on command line.  If not, build one
+; consisting of all wild characters.  Move name to FCB1, set DTA.
+;
+getname proc	near
+	mov	si, 5ch			; point to 1st FCB in prefix
+	cmp	byte ptr [si+1], ' '	; test for name from command line
+	jne	get1			; name is there
+	mov	cx, 0bh			; else insert 11 wild chars
+	lea	di, [si+1]		; into name file of FCB1
+	mov	al, '?'
+	cld
+	rep	stosb
+get1:	mov	di, offset code:fcb1	; point to FCB no. 1
+	mov	cx, 0ch			; CX = length of drive, name and ext
+	cld
+	rep	movsb			; move name from prefix to FCB 1
+	ret
+getname endp
+;
+; Get the FAT characteristics, calculate the size of the FAT, and read
+; The FAT into the buffer.  If read error, reset disk & retry 3 times.
+;
+fatread proc	near
+	mov	dl, fcb2.drive		; move drive id into DL
+	push	ds			; save the data segment
+	doscall 01ch			; get FAT info
+	pop	ds			; restore data segment
+	mov	secsper, al		; save sectors per cluster
+	mov	fatcount, dx		; save number of FAT entries
+	cbw				; convert secs per clus to word
+	mul	cx			; AX=AX * CX, bytes per cluster
+	mov	cluslen, ax		; store it for future use
+	mov	ax, fatcount		; restore entry count in AX
+	mov	dx, ax			; repeat it in DX
+	inc	dx			; add 1 to round up
+	shr	dx, 1			; entry count divided by 2
+	add	ax, dx			; size in bytes = 1.5 * entry count
+	add	ax, cx			; round up to next sector
+	dec	ax			;  by adding sector size less 1
+	cwd				; convert to dbl word in DX:AX
+	div	cx			; AX / CX = FAT length in sectors
+	mov	cx, ax			; move sector count to CX
+	doscall 019h			; get default drive
+	mov	dx, 1			; begin at sector 1
+	mov	bx, offset code:fatword ; point to buffer for FAT
+f1:	push	ax			; save the registers
+	push	bx
+	push	cx
+	push	dx
+	int	25h			; absolute disk read
+	jnc	f2			; jump if no disk errors
+	popf				; pop flags saved by INT 25H
+	pop	dx
+	pop	cx
+	pop	bx
+	sub	ah, ah			; AH = 0 is disk reset function
+	int	13h			; disk I/O interrupt
+	pop	ax			; restore sector count
+	dec	retry			; decrement retry count
+	jnz	f1			; try reading again if not zero
+	mov	dx, offset code:diskerr$; error exit
+	stc
+	ret
+f2:	popf				; read ok: restore stack
+	pop	dx
+	pop	cx
+	pop	bx
+	pop	ax
+	clc
+	ret
+fatread endp
+;
+; Input:  AH is 11 to find first name, 12 to find subsequent.  If found,
+; but not a sub-directory, look for next matching entry, until a
+; matching sub-directory is found or there are no more matching entries.
+; If no match, exit with carry flag on, else open the file, save starting
+; cluster pointer, display its name and turn carry flag off.
+;
+open	proc	near
+	mov	dx, offset code:xfcb2	; set DTA at extended FCB 2
+	doscall 1ah
+	mov	dx, offset code:xfcb1	; point to exteneded FCB 1
+op1:	doscall fcode			; get code 11H or 12H
+	cmp	al, 0ffh		; AL=FFH if not found
+	jne	op2			; skip if found
+	stc				; set carry flag if not found
+	ret
+op2:	mov	fcode, 12h		; code 12H = find next
+	cmp	byte ptr (fcb2+1).attr, 10h	; if found, test if a sub-dir
+	jne	op1			; if not, go find next entry
+	cmp	byte ptr (fcb2+1).dname, '.'	; if sub-dir, test if period
+	je	op1
+	mov	ax, (fcb2+1).startcl	; get starting cluster from FCB
+	mov	savstart, ax		; save it for future use
+	mov	dx, offset code:xfcb2	; point to extended FCB
+	doscall 00fh			; open file function
+	mov	si, offset code:fcb2.fname	; point to name in open FCB
+	mov	cx, 11			; display 11 characters of filename
+op3:	mov	dl, [si]		; get filename character
+	doscall 002h			; display it
+	inc	si			; point to next character in name
+	loop	op3
+	clc				; indicate no errors
+	ret
+open	endp
+;
+; Trace thru FAT, counting clusters in allocation chain.  For each cluster
+; add bytes per cluster to file size.  At exit, file size in bytes is
+; stored in open FCB, file size in clusters in location FILECLUS.
+; Register usage:  DX:AX is dword accumulator for file size
+;		   BX is last cluster number
+;		   CX contains count of FAT entries
+;		   SI points to next FAT entry
+;		   DI contains bytes per cluster
+;
+dirsize proc	near
+	mov	bx, savstart		; put starting cluster in BX
+	mov	di, cluslen		; bytes per cluster in DI
+	mov	cx, fatcount		; loop count in CX
+	sub	ax, ax			; zero out file size
+	mov	dx, ax			; and cluster count
+	mov	fileclus, ax		; and cluster count
+d1:	add	ax, di			; update file length
+	adc	dx, 0			; carry into high word
+	inc	fileclus		; update cluster count
+	mov	si, bx			; calc BX * 1.5 in SI
+	shr	bx, 1
+	pushf				; save the carry flag
+	add	si, bx
+	mov	bx, fatword[si]		; get next FAT entry
+	popf				; restore carry from shift
+	jnc	d2			; skip if BX was even
+	shr	bx, 1			; if odd, right-just
+	shr	bx, 1			;  hi 12 bits of cluster no.
+	shr	bx, 1
+	shr	bx, 1
+d2:	and	bx, 0fffh		; zero out 4 hi bits
+	cmp	bx, 0ff8h		; test for end of chain
+	jge	d3			; end if cluster is FF8H or above
+	loop	d1			; loop if not
+	mov	dx, offset code:badfat$ ; if FAT end but not chain end,
+	stc				;  then error
+	ret
+d3:	mov	fcb2.fsizelo, ax	; put file length into FCB
+	mov	fcb2.fsizehi, dx
+	clc				; clear error flag
+	ret
+dirsize endp
+;
+; Read the sub-directory as a data file, 1 entry at a time.  Store them
+; in order into table 'sorttbl' for sorting.  Sort table, then write back
+; out to disk.
+;
+process	proc	near
+	sub	ax, ax
+	mov	inrec, ax		; start at first directory entry
+	mov	outrec, ax
+	mov	bx, offset code:sorttbl
+	mov	si, offset code:subdata ; point to I/O buffer
+	mov	dx, si			; set DTA to buffer
+	doscall 01ah
+	mov	fcb2.recsize, 20h	; insert record size into FCB
+	mov	dx, offset code:xfcb2	; point to extended FCB
+read2:	mov	ax, inrec		; set record (entry) no. to read
+	mov	fcb2.relrec, ax		; put it into FCB's relative rec field
+	doscall 021h			; direct access read
+	test	al, al			; eof if AL not zero
+	jz	okay2
+	jmp	loop0
+okay2:	cmp	byte ptr subdata, 0	; never used entry?
+	je	loop0
+	inc	inrec			; update record no. for next read
+	cmp	byte ptr subdata, 0e5h	; is entry deleted?
+	je	read2			; yes, do not save, go read next
+	mov	di, bx			; copy from buffer to sort table
+	mov	si, offset code:subdata
+	mov	cx, 20h
+	cld
+	rep	movsb
+	add	bx, 20h			; point to next table entry
+	inc	outrec
+	jmp	read2
+;
+; Inrec now contains range of records in table, 0 - inrec
+;
+loop0:	sub	outrec, 1
+	mov	bx, inrec		; put total number of records read 
+	mov	maxrec, bx		; into maxrec
+loop1:	mov	bx, 1			; sorted flag, now true.
+	mov	inrec, 0
+	mov	dx, offset code:sorttbl
+loop2:	mov	di, dx
+	mov	si, dx
+	add	si, 20h
+	mov	cx, 0bh
+	cld
+	repe	cmpsb
+	je	noswap
+	sub	di, 1
+	sub	si, 1
+	mov	al, byte ptr [di]
+	cmp	al, byte ptr [si]
+	jl	noswap
+;
+; Swap adjacent table entries.
+;
+	mov	di, offset code:temp	; move first entry to temp
+	mov	si, dx
+	mov	cx, 20h
+	cld
+	rep	movsb
+	mov	di, dx			; move second entry to first
+	mov	si, dx
+	add	si, 20h
+	mov	cx, 20h
+	cld
+	rep	movsb
+	mov	di, dx			; move temp to second entry
+	add	di, 20h
+	mov	si, offset code:temp
+	mov	cx, 20h
+	cld
+	rep	movsb
+	mov	bx, 0			; sorted flag to false
+noswap: inc	inrec
+	mov	ax, inrec
+	add	dx, 20h
+	cmp	ax, outrec		; done with first pass?
+	jl	loop2			; no, keep going
+	cmp	bx, 1			; table sorted?
+	jne	loop1			; no, do it again
+;
+; Write out table.
+;
+	add	outrec, 1
+	mov	inrec, 0		; get record no. to write
+	mov	ax, inrec
+	mov	bx, offset code:sorttbl
+	mov	dx, offset code:xfcb2	; point to extended FCB
+write2: mov	si, bx
+	mov	di, offset code:subdata
+	mov	cx, 20h
+	cld
+	rep	movsb
+	mov	fcb2.relrec, ax		; put it into FCB
+	doscall 022h			; direct access write
+	push	di			; zero out table entry in case
+	mov	di, bx			; next directory is shorter
+	mov	al, 0
+	mov	cx, 20h
+	rep	stosb
+	pop	di			; finished zeroing out entry
+	add	bx, 20h			; increment to next table entry
+	inc	inrec
+	mov	ax, inrec
+	cmp	ax, maxrec		; last entry?
+	jle	write2			; if not, read next, else eof
+	ret				; return at end of data
+process	endp
+;
+; Close the sub directory file and display counts.
+;
+close	proc	near
+	mov	ax, outrec		; get count of entries written
+	test	ax, ax			; make sure some were written
+	jz	cl1
+	mov	fcb2.relrec, ax		; set record count in FCB
+	sub	cx, cx			; write nothing, just set size
+	mov	dx, offset code:xfcb2	; point to extended FCB
+	doscall 028h			; block write, set size
+cl1:	mov	ax, fileclus		; get input cluster count
+	add	freed, ax		; update freed cluster count
+	mov	si, offset code:inrec$
+	call	i2asc			; convert count to ASCII digits
+	mov	ax, outrec		; get output record count
+	mov	bx, 20h			; bytes per entry
+	mul	bx			; DX:AX = output bytes
+	div	cluslen			; get output clusters, remdr in DX
+	test	dx, dx			; test for remainder
+	jz	cl2
+	inc	ax			; if remdr, round up to next cluster
+cl2:	sub	freed, ax		; total freed = freed + input - output
+	mov	si, offset code:outrec$
+	call	i2asc			; convert output count to digits
+	mov	dx, offset code:count$	; display count msg
+	doscall 009h
+	inc	ndirs			; increment directory count
+	ret
+close	endp
+;
+; I2ASC converts 2 byte integer into 6 byte numeric ASCII string.
+; Input:  number to be converted in AX
+;	  DS:SI points to string to receive output
+; Output: string at DS:SI, right justified, blank padded
+;	  if AX = 0, string is 1 zero in rightmost position
+;	  if AX < 0, leading minus is floated before 1st digit
+;	  DS:DI points to first non-blank in string
+;	  all other registers unchanged
+;
+i2asc	proc	near
+	push	es			; save registers
+	push	dx
+	push	cx
+	push	bx
+	push	ax
+	mov	al, ' '			; blank out string
+	mov	dx, ds
+	mov	es, dx
+	mov	di, si
+	mov	cx, 6
+	cld
+	rep	stosb
+	mov	di, si
+	add	di, 5			; point at string end
+	mov	bx, 0ah			; base ten divisor
+	pop	ax			; get binary number into ax
+	push	ax
+	std				; move backwards thru string
+divloop:cwd				; convert to dbl word in DX, AX
+	idiv	bx			; quotient in AX, remainder in DX
+	test	dl, 80h			; test if remainder negative
+	jz	$+4			; skip if positive
+	neg	dl			; else get abs of remainder
+	or	dx, 30h			; insert ASCII zone
+	xchg	ax, dx			; exchange quotient and remainder
+	cld
+	stosb				; store ASCII character in string
+	mov	ax, dx			; restore quotient
+	test	ax, 0ffffh		; test if more decimal digits
+	jnz	divloop
+	pop	bx			; restore integer into BX
+	test	bx, 8000h		; test if number negative
+	jz	i2exit
+	mov	al, '-'			; insert minus sign if negative
+	cld
+	stosb
+i2exit: inc	di			; point at last non-blank
+	mov	ax, bx			; restore registers
+	pop	bx
+	pop	cx
+	pop	dx
+	pop	es
+	cld
+	ret
+i2asc	endp
+;
+; Open-ended buffer for holding File Allocation Table.
+;
+fatword label	word			; process FAT by words
+code	ends
+	end	begin
+-- end of code --
+-- 
+Tim Lange		Engineering Business Offices
+317-494-5338		Rm 120 Engineering Administration Bldg.
+Purdue University 	West Lafayette, IN  47907
+{decvax|harpo|ihnp4|inuxc|seismo|ucbvax}!pur-ee!langet
+
+

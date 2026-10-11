@@ -1,0 +1,357 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,785e8bb99b1cf1af,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-12-01 06:59:47 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site uwvax.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!godot!harvard!seismo!uwvax!derek
+From: derek@uwvax.UUCP (Derek Zahn)
+Newsgroups: net.sources
+Subject: newsstats.c  -- collect newsgroup usage data
+Message-ID: <72@uwvax.UUCP>
+Date: Sat, 1-Dec-84 09:59:47 EST
+Article-I.D.: uwvax.72
+Posted: Sat Dec  1 09:59:47 1984
+Date-Received: Tue, 4-Dec-84 05:28:08 EST
+Distribution: net
+Organization: U of Wisconsin CS Dept
+Lines: 336
+
+A little while ago, someone asked for a program to summarize newsgroup
+usage, so I wrote one and here it is.  Please note, though, that I have
+some qualms about its misuse (especially by root) violating common privacy
+courtesy.
+
+CUT HERE -------------------------------------------------------------->
+
+
+#include    <pwd.h>
+#include    <stdio.h>
+
+/*
+ *   newsstats.c
+ *   
+ *   usage: newsstats [-u] [-n]
+ *
+ *   Derek Zahn @ the University of Wisconsin
+ *   ...!{allegra,heurikon,ihnp4,seismo,sfwin,ucbvax,uwm-evax}!uwvax!derek
+ *   derek@wisc-rsch.arpa
+ *
+ *   This program scans through the readable .newsrc files and prints out
+ *   information on the newsgroup usage.  With no options, it prints out
+ *   a list of newsgroups and the number of people that read them, sorted
+ *   in alphabetical order.  The -n option causes the list to be sorted by
+ *   the number of people that read the group.  The -u option causes a list
+ *   of all users that read each group to be printed after the general stats
+ *   for that group.  The code is a bit obscure, since I decided to make
+ *   speed of execution the primary factor.
+ *
+ *   Warning!  Use of this program could conceivably raise sensitive privacy
+ *   issues, and the author absolves himself from all results of its use.
+ *
+ *   Copyright 1984, Board of Regents of the University of Wisconsin, all
+ *   rights reserved.
+ *   Permission is hereby granted for distribution provided that no direct
+ *   commercial advantage is gained, and that this copyright notice appears
+ *   on all copies.
+ */
+
+#define TABLESIZE   300         /*  Size of hashed newsgroup table   */
+#define MAXENTRIES  600         /*  Maximum size, including overflow */
+#define NUSERS      20          /*  Number of users in a user bucket */
+
+struct users {
+    int     number;
+    char    user[NUSERS+1][10];
+    struct  users   *next;
+};
+    
+struct group {
+    char    name[30];
+    int     count;
+    struct  group   *next;
+    struct  users   *who;
+};
+
+struct  group   *newgroup();
+struct  users   *people();
+int     compare();
+char    *strcpy(), *index(), *malloc();
+
+struct  group   *groups[TABLESIZE];     /*  The hashed table               */
+struct  group   *table[MAXENTRIES];     /*  A sequential table for sorting */
+int     curtableentry = 0;
+int     userflag = 0;
+int     numflag = 0;
+
+main(argc, argv)
+int     argc;
+char    *argv[];
+{
+    struct  passwd  *pw;
+    FILE    *newsrc;
+    char    file[40];
+    char    line[1024];
+    struct  group   *current;
+    int     num, val;
+    char    *delimeter=0;
+
+    /* Pick off the options (-u and -n only)   */
+
+    if(argc > 3) 
+        usage(argv[0]);
+    for(num=1;num<argc;num++) {
+        if(argv[num][0] != '-')
+            usage(argv[0]);
+        switch(argv[num][1]) {
+            case 'u':
+                userflag++;
+                break;
+            case 'n':
+                numflag++;
+                break;
+            default:
+                usage(argv[0]);
+                break;
+        }
+    }
+
+    /*  Look at every entry in the password file    */
+
+    while((pw = getpwent()) != NULL) {
+        (void) sprintf(file, "%s/.newsrc",pw->pw_dir);
+
+        /*  Open the .newsrc file   */
+
+        if((newsrc=fopen(file, "r")) != NULL) {
+
+            /*  Pick off the options line   */
+
+            (void) fgets(line, sizeof line, newsrc);
+
+            /*  For each entry, process it if it is active.  */
+
+            while(fgets(line, sizeof line, newsrc) != NULL) {
+                if((delimeter = index(line, ':'))) {
+                    *delimeter = 0;
+
+                    /*  Get its location by its hash value  */
+
+                    num = hash(line);
+
+                    /*  If there is already an entry there, we have to look */
+                    /*  through the linked list for the right one.          */
+
+                    if(current = groups[num]) {
+                        while((val = strcmp(line, current->name)) && current->next)
+                            current = current->next;
+                        if(!val) 
+
+                            /*  We found the right entry!   */
+
+                            adduser(current, pw->pw_name);
+                        else 
+
+                            /*  End of the list, no luck.  New group!  */
+
+                            current->next = (struct group *)newgroup(line,pw->pw_name);
+                    }
+                    else
+
+                        /*  No entry here, so put our boy right in there  */
+
+                        groups[num] = (struct group *)newgroup(line,pw->pw_name);
+                }
+            }
+            (void) fclose(newsrc);
+        }
+    }
+
+    /*  Print out the results   */
+
+    printout();
+}
+
+
+/*
+ *  This function returns a simple hash function, based on the name of the
+ *  newsgroup.  Probably there is a better function.
+ */
+
+hash(ptr)
+char    ptr[];
+{
+    int     value,len;
+
+    len = strlen(ptr);
+    value = (ptr[1] * ptr[5] * ptr[len-1] * ptr[len-2]) % TABLESIZE;
+    return(value);
+}
+
+
+/*
+ *  We need to insert a new group into tables.  Get space for it, and
+ *  store the pointer in the sequential table and return the pointer.
+ *  If we are accumulating user information, also put the first user
+ *  into the list.
+ */
+
+struct group *
+newgroup(grname,towho)
+char    grname[];
+char    *towho;
+{
+    struct  group   *new;
+
+    new = (struct group *)malloc(sizeof (struct group));
+    (void) strcpy(new->name, grname);
+    new->count = 1;
+    new->next = (struct group *) 0;
+    if(userflag)
+        new->who = people(towho);
+    table[curtableentry++] = new;
+    return(new);
+}
+
+
+/*  
+ *  We need to add a user to a specific newsgroup's list.  Sort of complex,
+ *  because of the modified list structure that is used to save time.  If
+ *  we are not collecting user info, just increment the count.
+ */
+
+adduser(where, who)
+struct  group   *where;
+char    *who;
+{
+    struct  users   *folks;
+
+    where->count++;
+    if(userflag) {
+        folks = where->who;
+        while(folks->next)
+            folks = folks->next;
+        if(folks->number == NUSERS)
+            folks->next = people(who);
+        else {
+            folks->number++;
+            (void) strcpy(folks->user[folks->number], who);
+        }
+    }
+}
+
+
+/*
+ *  Now we need to allocate more space for the list of readers of the
+ *  newsgroup.  Make a new node, add the first user, and return a pointer
+ *  to the result.
+ */
+
+struct users *
+people(who)
+char    *who;
+{
+    struct  users   *new;
+
+    new = (struct users *)malloc(sizeof (struct users));
+    new->number = 1;
+    (void) strcpy(new->user[1], who);
+    new->next = (struct users *) 0;
+    return(new);
+}
+
+    
+
+
+/*  
+ *  Print out the result of all this computation.
+ */
+
+printout()
+{
+    int     count, x, eol;
+    struct  users   *who;
+
+    /*  Since we used a hashed table, it is nice to sort the result   */
+    /*  before printing out.                                          */
+
+    qsort((char *)table, curtableentry, sizeof (struct group *), compare);
+
+    /*  Go through the now sorted table, one newsgroup at a time.     */
+
+    for(count=0;count<curtableentry;count++) {
+        printf("%-5d %s\n",table[count]->count,table[count]->name);
+
+        /*  If we saved the users, may as well print them out.        */
+
+        if(userflag) {
+            who = table[count]->who;
+
+            /*  The users were stored in a list of nodes, each        */
+            /*  NUSERS people.                                        */
+
+            while(who) {
+                for(x=1;x<=who->number;x++) {
+                    if((x % 5) == 0) {
+                        eol = 1;
+                        printf("%-12s\n",who->user[x]);
+                    }
+                    else {
+                        eol = 0;
+                        printf("%-12s",who->user[x]);
+                    }
+                }
+                who = who->next;
+            }
+
+            /* Sloppy, but it makes the output look good.     */
+
+            printf("\n");
+            if(!eol)
+                printf("\n");
+        }
+    }
+}
+
+
+
+/*
+ *  This routine is called by qsort to determine which of two entries  
+ *  is to be considered larger.  The passing of variables is painful,
+ *  due to the peculiar nature of the thing that we passed to qsort.
+ *  How we determine which is larger depends on whether we are sorting
+ *  the newsgroups by alphabetical order or by their readership.
+ */
+
+compare(first, second)
+struct  group   **first, **second;
+{
+    if(numflag) 
+        return(((*first)->count > (*second)->count) ? -1 : 1);
+    return(strcmp((*first)->name, (*second)->name));
+}
+
+
+
+/*
+ *  Barf obnoxiously and die.
+ */
+
+usage(progname)
+char    *progname;
+{
+    printf("usage: %s [-u] [-n]\n",progname);
+    exit(1);
+}
+
+
+
+/* lint output
+newsstats.c:
+*/
+-- 
+Derek Zahn @ wisconsin
+...!{allegra,heurikon,ihnp4,seismo,sfwin,ucbvax,uwm-evax}!uwvax!derek
+derek@wisc-rsch.arpa
+
+

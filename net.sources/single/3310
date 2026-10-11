@@ -1,0 +1,774 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,fd1accd5da368c90,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-09-13 06:26:54 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site peora.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxr!mhuxn!ihnp4!houxm!vax135!petsd!peora!jer
+From: jer@peora.UUCP (J. Eric Roskos)
+Newsgroups: net.sources
+Subject: Domain Routing Routines (cf. net.mail)
+Message-ID: <1631@peora.UUCP>
+Date: Fri, 13-Sep-85 09:26:54 EDT
+Article-I.D.: peora.1631
+Posted: Fri Sep 13 09:26:54 1985
+Date-Received: Sat, 14-Sep-85 07:17:35 EDT
+Organization: Perkin-Elmer SDC, Orlando, Fl.
+Lines: 753
+Keywords: RFC-822, UUCP Mail, Pathalias
+
+With a certain amount of reluctance, I am posting the following set of
+routines for the translation of RFC822-style mail addresses to net.sources.
+
+These are the routines which I have recently discussed at great length in
+net.mail.  See that newsgroup for more information on what they do.
+
+These routines require a DBM-style pathalias database.  Pathalias was posted
+a few weeks ago to this newsgroup, by Peter Honeyman.
+
+There are 2 pieces of documentation included.  People familiar with RFC822
+should read OPATH(3), which gives a complete explanation.  People who don't
+know what RFC822 is should read ADDRESS(1), which gives a very simplified
+(and sometimes out-of-date) description of the basic ideas behind RFC822-based
+addressing (with simplifications such as in the description of what a
+"domain" is).
+
+These routines are intended to be included in a UUCP transport-mechanism
+mailer (oupath() serves this role), or in a user interface (opath() serves
+this function).  The typical way to invoke them is:
+
+From a user interface:
+	route=opath(address);
+
+From a transport-level mailer:
+	if (index(address,"!")) /* better tests are possible */
+		route=oupath(address);
+	else
+		route=opath(address);
+
+These programs are posted in answer to the assertion that rational
+principles of routing using existing mailers are "an academic exercise at
+best".  They have been working here for nearly a year.
+
+Note that someone at another site is working on a mailer which will include
+these; if you don't have source code for your mailer, you may want to use
+his, when it is completed.  AT&T's UUCP Project is also shortly going to
+come out with a mailer, which may or may not be compatible with this
+software.
+
+Gateways named in the sample domain table provided are not necessarily
+valid gateways, nor necessarily those you should use at your site.
+
+
+
+#	This is a shell archive.
+#	Remove everything above and including the cut line.
+#	Then run the rest of the file through sh.
+#-----cut here-----cut here-----cut here-----cut here-----
+#!/bin/sh
+# shar:	Shell Archiver
+#	Run the following text with /bin/sh to create:
+#	opath.c
+#	address.c
+#	/usr/man/local/man1/address.1
+#	/usr/man/local/man3/opath.3
+#	/usr/lib/uucp/domains
+# This archive created: Fri Sep 13 09:06:34 1985
+echo shar: extracting opath.c '(5859 characters)'
+cat << \SHAR_EOF > opath.c
+/*
+ * opath.c - get an optimal uucp path from the path database, using an
+ * RFC882-style address as input.  The '%' character is properly translated,
+ * and gateway-substitution is done to get mail onto other networks.
+ *
+ * This program requires the DBM-style pathalias database.
+ *
+ * Eric Roskos, Perkin-Elmer Corp. SDC
+ * Version 3.2 created 85/09/12 15:21:51
+ */
+
+static char *opathsccsid = "@(#)opath.c	3.2 (peora) 15:21:51 - 85/09/12";
+
+#include <stdio.h>
+#include <whoami.h>
+
+/**
+ ** User-configurable parameters
+ **/
+
+/* locations of files */
+
+static char *archive = "/usr/lib/uucp/alpath";  /* pathalias database   */
+static char *domfile = "/usr/lib/uucp/domains"; /* gateway/domain table */
+static char *logfile = "/usr/adm/opath.log";    /* activity log */
+
+/**
+ ** Global Variables
+ **/
+
+static char pval[150]; /* the path string is built here */
+
+/*
+ * the following are used to pass results by side-effect from the domain()
+ * routine.
+ */
+
+static char prefix[80], suffix[80], fullsite[80];
+
+/**
+ ** Subroutines
+ **/
+
+/*
+ * The Domain Table and its associated routines
+ */
+
+static struct domains
+{
+	char dom[50];
+	char pre[50];
+	char suf[50];
+	char map[50];
+} domtab[100];
+
+/* Inline routine to copy a domain into the domain table */
+
+#define DOMCPY(fld) { int i = 0; q=dp->fld; while (*p!=','&&*p!='\n'&&*p) \
+		    {*q++ = *p++; if (i++>=48) break;} \
+		    *q++ = '\0'; if (!*p) { \
+		    fprintf(stderr,"opath: fld(s) missing in %s at %s\n", \
+		    s, buf); \
+		    dp++; continue;} p++; }
+
+/* Load the domain table from disk */
+
+static int
+loaddomtab(s)
+char *s;
+{
+FILE *f;
+char buf[100];
+register char *p,*q;
+struct domains *dp;
+
+	f = fopen(s,"r");
+	if (f==NULL)
+	{
+		fprintf(stderr,"opath: can't open domain file '%s'\n",s);
+		exit(1);
+	}
+
+	dp = domtab;
+
+	while (fgets(buf,100,f))
+	{
+		if (buf[0]=='#') continue; /* comments start with "#" */
+		p = buf;
+		DOMCPY(dom);
+		DOMCPY(pre);
+		DOMCPY(suf);
+		DOMCPY(map);
+		if (dp->map[0] == '\0')
+		{
+			fprintf(stderr,"opath: bad route template in %s\n",s);
+			strcpy(dp->map,"Invalid");
+		}
+		dp++;
+	}
+
+	dp->map[0] = '\0';  /* mark end of table */
+	fclose(f);
+
+	return(0);
+}
+
+/* Get a UUCP path from the pathalias database */
+
+static char *
+gpath(s)
+char *s;
+{
+static char path[100];
+char *uupath();
+
+	strcpy(path,uupath(s));
+	return(path);
+}
+
+/* String compare: entire first argument must match suffix of 2nd argument */
+
+static int
+domcmp(ss,tt)
+char *ss, *tt;
+{
+char *s, *t;
+int cmp;
+
+	s = ss + strlen(ss) - 1;
+	t = tt + strlen(tt) - 1;
+
+	do
+	{
+		if (*s - *t) break;
+		s--;
+		t--;
+	} while (s >= ss);
+
+	if (++s == ss) return(0);
+	else return(1);
+}
+
+/* Look up a domain, and by side effect set prefix and suffix appropriately */
+
+char *domain(s)
+char *s;
+{
+struct domains *d;
+char *p;
+static int loaded = 0;
+
+	if (!loaded++) loaddomtab(domfile);
+
+	if (*s!='.') /* default to UUCP domain */
+	{
+		prefix[0]=suffix[0]='\0';
+		return("%R!%U");
+	}
+
+	for (p=s; *p; p++) if (*p>='a' && *p<='z') *p -= 'a'-'A';
+
+	for (d = &domtab[0]; (int)d->map[0]; d++)
+	{
+		if (domcmp(d->dom,s)==0) break;
+	}
+
+	strcpy(prefix,(d->pre[0]=='>')? gpath(&d->pre[1]) : d->pre);
+	strcpy(suffix,d->suf);
+
+	return(d->map);
+}
+
+/* opath: generates a UUCP path from an RFC-822 address */
+
+#define COPYON(s) {char *r; r=s; while (*r) *p++ = *r++; *p = '\0';}
+
+char *
+opath(s)
+char *s;
+{
+char user[50],site[50];
+static char cm[150];
+FILE *f;
+char *p, *q, *t;
+char *d;
+int i;
+int found;
+char *suf;
+
+	for (p=user,q=s;(*p = *q)!='@'; p++,q++)
+		if (*q=='\0') return(s);
+	*p = '\0';
+
+	strcpy(fullsite,++q);
+
+	for (p=site;(*p = *q)!='.'; p++,q++)
+		if (*q=='\0') break;
+	*p = '\0';
+
+	d = domain(q);
+
+	if (d[0]=='\0') return(s); /* unknown domain - do nothing */
+
+	for (p=pval, q=d; *q; q++)
+	{
+		if (*q=='%')
+		{
+			switch(*++q)
+			{
+			case 'P':
+				COPYON(prefix);
+				break;
+
+			case 'S':
+				COPYON(suffix);
+				break;
+
+			case 'U':
+				COPYON(user);
+				break;
+
+			case 'N':
+				COPYON(site);
+				break;
+
+			case 'D':
+				COPYON(fullsite);
+				break;
+
+			case 'R':
+				COPYON(gpath(site));
+				break;
+
+			case '%':
+				*p++ = '%';
+				break;
+			}
+		}
+		else
+			*p++ = *q;
+	}
+
+	return(pval);
+}
+
+/* oupath: generates a uucp path from a (possibly disconnected) uucp path */
+
+char *oupath(s)
+char *s;
+{
+char *p,*q;
+static char adr[100];
+char first[100];
+int found;
+
+	for (p=s,q=first,found=0; *p!='!' && *p!='\0'; p++)
+	{
+		if (*p=='.') found++;
+		*q++ = *p;
+	}
+	if (*p=='\0') return (s);
+
+	*q = '\0';
+
+	if (found)
+	{
+		strcpy(adr,++p);
+		strcat(adr,"@");
+		strcat(adr,first);
+		return(opath(adr));
+	}
+	else
+	{
+	int i;
+		strcpy(adr,gpath(first));
+		strcat(adr,/* ++ */p);
+
+		return(adr);
+	}
+}
+
+/**
+ ** Public-domain subroutines obtained from net.sources
+ **/
+
+/*
+ * The following is extracted from William Sebok's uupath program
+ */
+
+/* * * * uupath - look up path to computer in database * * * W.Sebok 11/4/83 */
+#ifdef NULL
+#undef NULL
+#define NULL 0
+#endif
+
+typedef struct {char *dptr; int dsize;} datum;
+datum fetch();
+datum firstkey();
+datum nextkey();
+
+
+static char *
+uupath(s)
+char *s;
+{
+	char *fil;
+	int ret;
+	datum key;
+	static datum result;
+	char buf[BUFSIZ];
+	static int inited = 0;
+
+	fil = archive;
+	strcpy(buf,s);
+/***    strcat(buf,"!");  ***/
+	key.dptr = buf;
+	key.dsize = strlen(key.dptr) + 1 ;
+	if (!inited++) {
+		ret = dbminit(fil);
+		if (ret != 0) {
+			fprintf(stderr,"Can't open database '%s'\n",fil);
+			return(s);
+		}
+	}
+	result = fetch(key);
+	if (result.dptr != NULL) {
+		if (domcmp("!%s",result.dptr)==0) {
+			result.dptr[result.dsize-4] = '\0';
+		}
+		/* next line handles strange pathalias "feature" */
+		if (strcmp(result.dptr,"%s")==0) return(SYSNAME);
+		return(result.dptr);
+	} else {
+		fprintf(stderr,"%s not found\n",s);
+		return(s);
+	}
+	return(s);
+}
+
+opathlog(fmt,a,b,c,d)
+char *fmt;
+int a,b,c,d;
+{
+FILE *f;
+
+	f = fopen(logfile,"a");
+	if (f==NULL) return;
+
+	fprintf(f,fmt,a,b,c,d);
+	fclose(f);
+}
+SHAR_EOF
+if test 5859 -ne "`wc -c opath.c`"
+then
+echo shar: error transmitting opath.c '(should have been 5859 characters)'
+fi
+echo shar: extracting address.c '(581 characters)'
+cat << \SHAR_EOF > address.c
+/*
+ * address - run opath to see what a translated RFC822 address will come
+ * out as.
+ *
+ * By E. Roskos 1/16/85
+ */
+
+#include <stdio.h>
+
+char *opath();
+
+main(argc,argv)
+int argc;
+char **argv;
+{
+char *p;
+int uswitch;
+
+	if (argc < 2)
+	{
+		fprintf(stderr,"usage: %s rfcaddress [...]\n",
+			argv[0]);
+		exit(1);
+	}
+
+	while (--argc)
+	{
+		p = *++argv;
+		if (*p=='-')
+		{
+			switch(*++p)
+			{
+			case 'u': uswitch++;
+				  continue;
+			default:  printf("unknown switch: %c\n",*p);
+				  continue;
+			}
+			continue;
+		}
+		printf("%s: %s\n",p,uswitch?oupath(p):opath(p));
+	}
+
+	exit(0);
+}
+SHAR_EOF
+if test 581 -ne "`wc -c address.c`"
+then
+echo shar: error transmitting address.c '(should have been 581 characters)'
+fi
+echo shar: extracting address.1 '(3563 characters)'
+cat << \SHAR_EOF > address.1
+.TH ADDRESS 1 local
+.SH NAME
+address - display the path generated by \fBdeliver\fR for an
+RFC822-format address.
+.SH SYNOPSIS
+address rfc-address [ ... ]
+.SH DESCRIPTION
+This program allows you to check the UUCP mail routing path that will
+be generated by the UUCP mailer \fBdeliver\fR if you specify an
+RFC822-format address \fBrfc-address\fR in the ``To:'' field of the mail header.
+For each RFC-style address on the command line, \fBaddress\fR echoes the
+address to the standard output, followed by a colon, followed by
+the UUCP address that will be used to send the message to that address.
+
+.SH "ADDRESS FORMAT"
+Briefly, the RFC822-format address is of the form
+.nf
+.sp 1
+	<localaddress>@<hostname>.<network>
+.sp 1
+.fi
+where <hostname> is the name of the system you are sending the message
+to, <network> is a modifier for <hostname> identifying the network in
+which the address is to be interpreted (UUCP, ARPA, MAILNET, CSNET, etc);
+and <localaddress> is an address string to be interpreted on the host
+machine.
+
+The <localaddress> field may contain further remote addresses to be
+interpreted on the host machine.  Typically this will be an address for
+mailing via another network; and in particular, the <localaddress> may
+(recursively) be identical in format to the RFC address, but with
+the symbol `%' replacing the symbol `@' in the standard address format.
+Where this form is used, the rightmost % is replaced by an
+@ before the host machine sends the message out.
+
+On our system, the presently
+valid <network>s are UUCP, ARPA, CSNET, and MAILNET.
+The recently proposed UUCP domain names are also accepted, although
+they are treated the same as plain ``UUCP''.
+Omitting
+the <network> causes the network to default to UUCP.  The <hostname>
+should be the name of a remote machine to which the message is
+directed; see \fI/usr/lib/uucp/uuaddress.alpha\fR for a list of all
+known UUCP hostnames.  It is \fInot\fR necessary to specify a UUCP pathname
+when using this format; the pathname is automatically determined for you
+and substituted into the address before mailing.  The selected pathname
+is determined using the \fBpathalias\fR database, and is supposed
+to be optimal, taking into consideration information provided by
+each site about how often they send mail out, etc.
+
+.SH EXAMPLES
+.HP 5
+joe
+.br
+The message is sent to the user ``joe'' on the local system.
+.HP 5
+joe@ucbvax
+.br
+The message is sent to joe on the UUCP system named ``ucbvax''; this
+address is automatically translated to a proper (and ostensibly
+optimal) UUCP path.
+.HP 5
+joe@ucbvax.UUCP
+.br
+Same as joe@ucbvax
+.HP 5
+joe@ucbvax.ARPA
+.br
+The message is addressed to joe at ucbvax, using the ARPA network.
+The message will be routed to the ARPAnet via a UUCP-ARPAnet gateway.
+.HP 5
+joe%mit-multics.ARPA@ucbvax
+.br
+The message is sent to ucbvax, who then uses the address
+joe@mit-multics.ARPA to send the message on to mit-multics via the
+ARPAnet.  Since ucbvax is on the arpanet, this address will work correctly
+(as long as there is someone named joe on the MIT multics machine).
+.HP 5
+joe%vanderbilt.MAILNET%mit-multics.ARPA@ucbvax
+.br
+The message is sent via UUCP to ucbvax, who then sends the message
+to mit-multics via the arpanet; mit-multics then sends the message
+to joe@vanderbilt via MAILNET.  Since the above machines each have access
+to the networks named in the address, this address will work correctly.
+.SH FILES
+/usr/lib/uucp/domains - Domain/gateway table
+.br
+/usr/lib/uucp/archive - Pathalias database
+.SH "SEE ALSO"
+opath(3)
+.SH AUTHOR
+Eric Roskos, PE SDC, 1/16/85
+SHAR_EOF
+if test 3563 -ne "`wc -c address.1`"
+then
+echo shar: error transmitting address.1 '(should have been 3563 characters)'
+fi
+echo shar: extracting opath.3 '(4896 characters)'
+cat << \SHAR_EOF > opath.3
+.TH OPATH 3 "PE SDC"
+.SH NAME
+opath - Generate a UUCP route from an RFC822 address
+.br
+oupath - Generate a UUCP route from a (possibly disconnected) UUCP path
+.SH SYNOPSIS
+char *opath(s)
+.br
+char *s;
+.sp 1
+char *oupath(s)
+.br
+char *s;
+.SH DESCRIPTION
+These routines use the \fBpathalias\fR database to generate UUCP routing
+paths from your local site to specified remote sites on either the UUCP
+network or other connected networks.
+.PP
+\fBopath\fR takes one argument, an RFC822 address, as described in
+ADDRESS(1).  From this, it generates and returns a UUCP path to the site
+named in the argument.
+.PP
+\fBoupath\fR takes one argument, a UUCP path.  If the next site on this
+path is named \fIx\fR, \fBoupath\fR will prepend a path from your site to
+\fIx\fR, if \fIx\fR is nonadjacent to your site.  If \fIx\fR is a domain,
+i.e. contains a dot (.), \fBoupath\fR will generate a path to a gateway
+for this domain.  Note that \fBoupath\fR will \fInot\fR alter the argument
+path, other than to make the above transformations; it does not check whether
+sites in the argument are adjacent to one another, or whether they represent
+an optimal path; it is assumed that if the user has specified a path, then
+he wants to use that path.
+.PP
+The principal difference between \fBopath\fR and \fBoupath\fR is that the
+former gives precedence to ``@'', whereas the latter gives precedence
+to ``!''.  The former is intended to be invoked when receiving mail from
+a user interface or a non-UUCP source (if the subsequent transport mechanism
+is to be UUCP), whereas the latter is intended solely to be used by UUCP
+internal software, principally \fBrmail\fR, in routing mail through the
+UUCP network.
+.SH "FILES"
+\fI/usr/lib/uucp/archive\fR - The pathalias database, in DBM(3) format.
+See PATHALIAS(1) for information; pathalias is a public-domain program
+distributed via the Usenet's net.sources facility.
+.br
+.sp 1
+\fI/usr/lib/uucp/domains\fR - The domain/gateway table.  Each line of this
+file consists of either a ``#'' followed by arbitrary comment text, or
+an entry of the form:
+.br
+.in 1i
+<domain>,<path>,<reserved>,<template>
+.br
+.in
+Where <domain> is the string (in capital letters) identifying a particular
+<path> is a string which may be included at an arbitrary point in the
+generated route, <reserved> is currently unused, and <template> is a string
+indicating the format of the generated route.
+.PP
+The <template> is a printf-style string; it is \fBnot\fR quoted, and
+begins at the character immediately following the comma which separates
+<template> from <reserved>.  The <template> may consist of arbitrary ASCII
+characters, which are copied unchanged into the generated route; or of
+a percent (%) sign followed by one of the following characters:
+.IP P
+The <path> string is inserted.  The <path> may consist either of a string
+which is inserted unchanged; or of the character ``>'' followed by the
+name of a UUCP site, in which case the entire <path> string is replaced
+with a string representing the path to the named site.  The last token on
+this string is the site named in the original <path> string, without a
+following ``!''.
+.IP U
+The user name from the original address is inserted.
+.IP N
+The site name from the original address, with the domain specifiers
+removed, is inserted.
+.IP D
+The site name from the original address, including the domain specifiers,
+is inserted.
+.IP R
+The UUCP path to the site named in the original address is looked up in
+the pathalias database and inserted.  Note that this path is looked up
+only when the %R is seen while scanning the <template>, so an error message
+for an invalid site name is generated if and only if it appears in an
+address with a domain which contains a %R in its template.
+.PP
+When making entries in the domain table, domain names which are a suffix of
+another domain name in the table should be ordered such that the longer
+string(s) appear first.  For example, .WA.UUCP should preceed .UUCP in
+the table.  A linear search is made of the table, and the first domain
+found in the table which is a suffix of the domain in the designated address
+is used as the domain in generating the routing.
+.PP
+Following are some example entries for the domain table.  Note that all
+domain names begin with a ``.''.
+.sp 1
+.nf
+.in 1i
+# This is a comment
+\&.HP.UUCP,,,%R!%U
+\&.UUCP,,,%R!%U
+\&.CSNET,>decwrl,,%P!%U%%%S@CSNET-RELAY.ARPA
+\&.EDU,>ucbvax,,%P!%D
+.in
+.fi
+.sp 1
+.SH "SEE ALSO"
+PATHALIAS(1), ADDRESS(1), RMAIL(1)
+.SH "AUTHOR"
+Eric Roskos, Perkin-Elmer Corp. SDC.
+.SH "NOTE"
+The <reserved> field in the domain table currently has a function which
+may be determined by examining the source code for opath.  However, this
+function is a vestigal function provided for sites that used an earlier
+version of opath; future opath versions will use this field for a different
+purpose, and new users of opath therefore should \fBnot\fR use this field.
+SHAR_EOF
+if test 4896 -ne "`wc -c opath.3`"
+then
+echo shar: error transmitting opath.3 '(should have been 4896 characters)'
+fi
+echo shar: extracting domains '(1167 characters)'
+cat << \SHAR_EOF > domains
+#
+# Perkin-Elmer SDC Domain Table
+#
+# Format: <domain>,<prefix>,<suffix>,<template>
+#
+# Where <template> may contain:
+#       %P - prefix string
+#       %S - suffix string
+#       %U - destination user name
+#       %N - destination site name
+#       %D - destination site name with domain suffix
+#       %% - a percent (%) sign
+#       %R - pathalias route to the destination site
+#
+.WA.UUCP,,,%R!%U
+.OR.UUCP,,,%R!%U
+.N-CA.UUCP,,,%R!%U
+.S-CA.UUCP,,,%R!%U
+.MTN.UUCP,,,%R!%U
+.S-CEN.UUCP,,,%R!%U
+.MID-W.UUCP,,,%R!%U
+.S-EAST.UUCP,,,%R!%U
+.ATL.UUCP,,,%R!%U
+.N-ENG.UUCP,,,%R!%U
+.HI.UUCP,,,%R!%U
+.W-CAN.UUCP,,,%R!%U
+.E-CAN.UUCP,,,%R!%U
+.EUR.UUCP,,,%R!%U
+.UK.UUCP,,,%R!%U
+.AUS.UUCP,,,%R!%U
+.ISRAEL.UUCP,,,%R!%U
+.ATT.UUCP,>ihnp4,,%P!%D!%U
+.HP.UUCP,,,%R!%U
+.PE.UUCP,,,%R!%U
+.UUCP,,,%R!%U
+.CSNET,>ucbvax,,%P!%U%%%D@CSNET-RELAY.ARPA
+.MAILNET,>ucbvax,,%P!%U%%%D@MIT-MULTICS.ARPA
+# .BITNET,>ucbvax,,%P!%U%%%D@WISCVM.ARPA
+.XEROX,>ucbvax,,%P!%U.%D@XEROX.ARPA
+.DEC,>decwrl,,%P!%U@%D
+.ARPA,>ucbvax,,%P!%U@%D
+.EDU,>ucbvax,,%P!%U@%D
+.COM,>ucbvax,,%P!%U@%D
+.GOV,>ucbvax,,%P!%U@%D
+.MIL,>ucbvax,,%P!%U@%D
+.OTH,>ucbvax,,%P!%U@%D
+.BITNET,>psuvax,,%P!%U@%D
+#
+# our local domains
+#
+.PE,,,%R!%U
+SHAR_EOF
+if test 1167 -ne "`wc -c domains`"
+then
+echo shar: error transmitting domains '(should have been 1167 characters)'
+fi
+#	End of shell archive
+exit 0
+-- 
+Shyy-Anzr:  J. Eric Roskos
+UUCP: Ofc:  ..!{decvax,ucbvax,ihnp4}!vax135!petsd!peora!jer
+     Home:  ..!{decvax,ucbvax,ihnp4}!vax135!petsd!peora!jerpc!jer
+  US Mail:  MS 795; Perkin-Elmer SDC;
+	    2486 Sand Lake Road, Orlando, FL 32809-7642
+
+

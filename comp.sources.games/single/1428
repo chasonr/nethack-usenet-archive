@@ -1,0 +1,1958 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,a563d1da2e8d10eb,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1992-09-08 06:29:04 PST
+Path: sparky!uunet!zephyr.ens.tek.com!master!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v14i084:  okbridge2 - computer-mediated bridge game, Part06/14
+Message-ID: <3523@master.CNA.TEK.COM>
+Date: 7 Sep 92 21:41:46 GMT
+Sender: news@master.CNA.TEK.COM
+Lines: 1942
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: mclegg@cs.UCSD.EDU (Matthew Clegg)
+Posting-number: Volume 14, Issue 84
+Archive-name: okbridge2/Part06
+Supersedes: okbridge: Volume 13, Issue 16-22
+Environment: BSD-derived Unix, NeXT, curses, sockets
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 6 (of 14)."
+# Contents:  cs.c display.c
+# Wrapped by billr@saab on Mon Sep  7 14:33:36 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'cs.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'cs.c'\"
+else
+echo shar: Extracting \"'cs.c'\" \(16640 characters\)
+sed "s/^X//" >'cs.c' <<'END_OF_FILE'
+X/* cs.c -- client/server routines
+X *
+X ! Copyright (C) 1990-1992 by Matthew Clegg.  All Rights Reserved
+X ! 
+X ! OKbridge is made available as a free service to the Internet.
+X ! Accordingly, the following restrictions are placed on its use:
+X ! 
+X ! 1.  OKbridge may not be modified in any way without the explicit 
+X !     permission of Matthew Clegg.  
+X ! 
+X ! 2.  OKbridge may not be used in any way for commercial advantage.
+X !     It may not be placed on for-profit networks or on for-profit
+X !     computer systems.  It may not be bundled as part of a package
+X !     or service provided by a for-profit organization.
+X ! 
+X ! If you have questions about restrictions on the use of OKbridge,
+X ! write to mclegg@cs.ucsd.edu.
+X ! 
+X ! DISCLAIMER:  The user of OKbridge accepts full responsibility for any
+X ! damage which may be caused by OKbridge.
+X *
+X */
+X
+X#include <stdio.h>
+X#include <string.h>
+X
+X#include "socket.h"
+X#include "network.h"
+X#include "state.h"
+X#include "gps.h"
+X#include "cs.h"
+X
+X#ifdef LOGFILE
+Xextern FILE *net_log;
+X#endif
+X
+X#ifdef GCC
+Xextern strcasecmp ();
+Xextern fprintf ();
+Xextern fflush ();
+X#endif
+X
+Xextern char Parser_Error_Buf [];
+X
+Xextern void Generate_reset ();
+Xextern void Network_Comment ();
+X
+Xvoid Clear_Spectators (t)
+X     Table t;
+X/* Clears the spectator mode flag for each of the players at the table t. */
+X{
+X  Connection c;
+X
+X  FOREACH_PLAYER (c, t) 
+X    c->spectator = 0;
+X  spectator_mode = 0;
+X
+X}
+X
+Xvoid Vacate_seat (t, s)
+X     Table t; int s;
+X/* Clears the seat s in the table t. */
+X{
+X  if (IS_PLAYER(s)) {
+X    t->Seats[s].connection = NULL;
+X    sprintf (t->Seats[s].player_name, "%s", seat_names[s]);
+X    t->Seats[s].occupied = 0;
+X  }
+X
+X}
+X
+Xvoid Assign_seat (t, c, seat)
+X     Table t; Connection c; int seat;
+X/* void Assign_seat (Table t, Connection c, int seat) */
+X/* Assigns the given seat to the player with connection c. */
+X{
+X  Vacate_seat (t, c->seat);
+X
+X  c->seat = seat;
+X  if (IS_PLAYER(seat)) {
+X    t->Seats[seat].connection = c;
+X    sprintf (PLAYER_NAME(t, seat), "%s", c->player_name);
+X    t->Seats[seat].occupied = 1;
+X  }
+X}
+X
+Xint Request_Seat (c, requested)
+X     Connection c; int requested;
+X/* int Request_Seat (Connection c, int requested) */
+X/* Requests the given seat for the player with connection c.
+X . If the request can be granted, then assigns the player to the seat,
+X . sends an acknowledgment message to the requesting player, and returns 
+X . the seat index of the seat assigned.  If it cannot be granted, then sends 
+X . an error message to the requesting player and returns -1.
+X */
+X{
+X  int i;
+X  char message_buf [100];
+X  Table t = c->table;
+X
+X  if (VACANT(t,requested)) {
+X    Send_seat (c->table, c->seat, requested, c->player_name);
+X    Assign_seat (c->table, c, requested);
+X    sprintf (message_buf, "SEATPOS %s", seat_names[requested]);
+X    send_private_message (c, message_buf);
+X    return (requested);
+X  } else {
+X    /* Construct a SEATERR message indicating which seats are free: */
+X    sprintf (message_buf, "SEATERR");
+X    for (i = 0; i < 4; i++)
+X      if (!t->Seats[i].occupied)
+X	sprintf (message_buf+strlen(message_buf), " %s", seat_names[i]);
+X    send_private_message (c, message_buf);
+X    return (-1);
+X  }
+X}
+X
+Xstatic void Respond_to_who_message (who_msg)
+X     Message who_msg;
+X{
+X  char msg_buf[100], message[120];
+X  int i;
+X  Connection c;
+X  Table t = who_msg->source->table;
+X
+X  msg_buf[0] = '\0';
+X  for (i = 0; i < 4; i++)
+X    if (OCCUPIED(t,i))
+X      sprintf (msg_buf+strlen(msg_buf),"%s(%c) %s",
+X	       (strlen(msg_buf) > 0)? ", ": "",
+X	       *("NESW" + i), PLAYER_NAME(t, i));
+X  if (strlen(msg_buf) > 0) {
+X    sprintf (message, "COMMENT %s", msg_buf);
+X    send_private_message (who_msg->source, message);
+X  }
+X
+X  msg_buf[0] = '\0';
+X  FOREACH_PLAYER (c, t) {
+X    if (IS_OBSERVER(c->seat) && !c->spectator) {
+X      sprintf (msg_buf+strlen(msg_buf), "%s%s",
+X	       (strlen(msg_buf) > 0)? ", ": " ", c->player_name);
+X    }
+X    if (strlen (msg_buf) > 50) {
+X      sprintf (message, "COMMENT OBSERVERS: %s", msg_buf);
+X      send_private_message (who_msg->source, message);
+X      msg_buf[0] = '\0';
+X    }
+X  }
+X  if (strlen(msg_buf) > 0) {
+X    sprintf (message, "COMMENT OBSERVERS: %s", msg_buf);
+X    send_private_message (who_msg->source, message);
+X  }
+X
+X  msg_buf[0] = '\0';
+X  FOREACH_PLAYER (c, t) {
+X    if (c->spectator) {
+X      sprintf (msg_buf+strlen(msg_buf), "%s%s",
+X	       (strlen(msg_buf) > 0)? ", ": " ", c->player_name);
+X    }
+X    if (strlen (msg_buf) > 50) {
+X      sprintf (message, "COMMENT SPECTATORS: %s", msg_buf);
+X      send_private_message (who_msg->source, message);
+X      msg_buf[0] = '\0';
+X    }
+X  }
+X  if (strlen(msg_buf) > 0) {
+X    sprintf (message, "COMMENT SPECTATORS: %s", msg_buf);
+X    send_private_message (who_msg->source, message);
+X  }
+X}
+X
+Xstatic void Transmit_State_Information (t, c)
+X     Table t;
+X     Connection c;
+X/* If a board is currently being played at the table t, then transmits
+X * the state information for that board. 
+X */
+X{
+X  char buf1[100], buf2[100], buf3[100];
+X  Play_record *p;
+X  Connection d;
+X
+X  sprintf (buf1, "TABLE %d", t->table_no);
+X  send_private_message (c, buf1);
+X
+X  FOREACH_PLAYER (d, t) {
+X    if (d != c) {
+X      sprintf (buf1, "ACK %s %s", d->player_name,
+X	       IS_PLAYER(d->seat)? seat_names[d->seat]: "");
+X      send_private_message (c, buf1);
+X    }
+X  } 
+X
+X  if (IS_PLAYER(c->seat)) {
+X    sprintf (buf1, "SEATPOS %s", seat_names[c->seat]);
+X    send_private_message (c, buf1);
+X  }
+X
+X  c->state = CSTATE_PLAYING;
+X  if (t->game_mode == STARTUP_MODE)
+X    return;
+X
+X  send_private_message (c, "DEAL");
+X
+X  if (t->board == NULL)
+X    return;
+X
+X  sprintf (buf1, "BOARD %s %d", t->board->source, t->board->serial_no);
+X  send_private_message (c, buf1);
+X
+X  Encode_board (t->board, buf1, buf2);
+X  server_send_unformatted (c, buf1);
+X  server_send_unformatted (c, buf2);
+X
+X  for (p = t->board->play_records; p != NULL; p = p->next) {
+X    sprintf (buf1, "RECORD %s %d", t->board->source, t->board->serial_no);
+X    send_private_message (c, buf1);
+X    Encode_play_record (p, buf1, buf2, buf3);
+X    server_send_unformatted (c, buf1);
+X    server_send_unformatted (c, buf2);
+X    server_send_unformatted (c, buf3);
+X  }
+X
+X  if ((p = t->play_record) != NULL) {
+X    sprintf (buf1, "USEREC %s %s %s %s", 
+X	     p->player_names[PLAYER_NORTH], p->player_names[PLAYER_EAST],
+X	     p->player_names[PLAYER_SOUTH], p->player_names[PLAYER_WEST]);
+X    send_private_message (c, buf1);
+X  }
+X
+X  sprintf (buf1, "SCORE %d %d %d %d",
+X	   t->above_line[SIDE_NS], t->above_line[SIDE_EW],
+X	   t->below_line[SIDE_NS], t->below_line[SIDE_EW]);
+X  send_private_message (c, buf1);
+X  
+X  switch (t->playing_mode) {
+X  case CLUB_PLAYING_MODE:
+X    send_private_message (c, "MODE CLUB");
+X    break;
+X  case FORMAL_PLAYING_MODE:
+X    send_private_message (c, "MODE FORMAL");
+X    break;
+X  case PRACTICE_PLAYING_MODE:
+X    send_private_message (c, "MODE PRACTICE");
+X    break;
+X  }
+X
+X  send_private_message (c, "BEGIN");
+X
+X  if (t->game_mode != SCORING_MODE)
+X    return;
+X
+X  send_private_message (c, "END");
+X}
+X
+Xstatic void Who_Response (who_msg, c, response)
+X     Message who_msg;
+X     Connection c;
+X     char *response;
+X{
+X  char buf[100];
+X
+X  sprintf (buf, "WHORESP %s %s", c->player_name, response);
+X  send_private_message (who_msg->source, buf);
+X}
+X
+Xstatic void Respond_to_Whois_Message (msg)
+X     Message msg;
+X{
+X  Connection c;
+X  char buf[80];
+X
+X  if (!strcmp(msg->p.data.whois.name, "*ALL*")) {
+X    FOREACH_PLAYER (c, msg->source->table) {
+X      if (strlen(c->fullname))
+X	Who_Response (msg, c, c->fullname);
+X      if (strlen(c->email))
+X	Who_Response (msg, c, c->email);
+X    }
+X    return;
+X  }
+X
+X  FOREACH_CONNECTION (c)
+X    if (!strcasecmp(msg->p.data.whois.name, c->player_name))
+X      break;
+X
+X  if (c == NULL) {
+X    sprintf (buf, "WHORESP %s %s", msg->p.data.whois.name,
+X	     "THERE IS NO PLAYER WITH THIS NAME.");
+X    send_private_message (msg->source, buf);
+X  } else if ((strlen(c->fullname) == 0) && (strlen(c->email) == 0))
+X    Who_Response (msg, c, "NO INFORMATION AVAILABLE.");
+X  else {
+X    if (strlen(c->fullname))
+X      Who_Response (msg, c, c->fullname);
+X    if (strlen(c->email))
+X      Who_Response (msg, c, c->email);
+X  }
+X}
+X
+Xvoid Handle_Protocol_Message_for_Server (msg)
+X     Message msg;
+X/* Processes the message m.  If the message is a protocol message, then
+X   takes appropriate action based on the message.  Appends the message
+X   to the appropriate conversation queue if further action is warranted.
+X*/
+X{
+X  char message_buf [100];
+X  int s;
+X  int  propagate;
+X    /* A boolean flag which in the server mode indicates that the message
+X       received should automatically be propagated to all other players. */
+X  int pass_upwards;
+X    /* A boolean flag which indicates that the message should be put
+X       onto the conversation queue to be processed at the next level. */
+X  Table t = msg->source->table;
+X  Table tp;
+X
+X  propagate = !msg->private;
+X  pass_upwards = 1;
+X
+X  switch (msg->p.command) {
+X  case CMD_ERROR  :
+X    if (msg->source->state == CSTATE_CONNECTED) {
+X      sprintf (message_buf, "NORTH SEATERR OKBRIDGE %s: %s",
+X	       major_revision_level, "I DON'T RECOGNIZE YOU -- GO AWAY!");
+X      fd_writeln (msg->source->channel, message_buf);
+X      close_connection (msg->source);
+X    } else {
+X/*
+X      sprintf (message_buf, "ERROR!! %s", msg->p.data.error.message);
+X      send_private_message (msg->source, message_buf);
+X*/
+X#ifdef LOGFILE
+X      fprintf (net_log, "** %s\n", msg->p.command_text);
+X      fprintf (net_log, "** %s\n", message_buf);
+X      fflush (net_log);
+X#endif
+X    }
+X    propagate = pass_upwards = 0;
+X    break;
+X
+X  case CMD_EMAIL:
+X    propagate = 0;
+X    if (msg->source->local)
+X      sprintf (Local_Player_Connection->email, "%s", msg->p.data.email.addr);
+X    else
+X      sprintf (msg->source->email, "%s", msg->p.data.email.addr);
+X    break;
+X
+X  case CMD_FULLNAME:
+X    propagate = 0;
+X    if (msg->source->local)
+X      sprintf (Local_Player_Connection->fullname, "%s", 
+X	       msg->p.data.fullname.name);
+X    else
+X      sprintf (msg->source->fullname, "%s", msg->p.data.fullname.name);
+X    GPS_Broadcast_Server_Silently ();
+X    break;
+X
+X  case CMD_HELLO  :
+X    if (strcmp(major_revision_level, msg->p.data.hello.version)) {
+X      if (strcmp(msg->p.data.hello.version, "1.6")) {
+X	sprintf (message_buf, "CONNERR %s %s %s",
+X		 "INCOMPATIBLE VERSIONS OF OKBRIDGE --",
+X		 "SERVER IS USING VERSION", major_revision_level);
+X	send_private_message (msg->source, message_buf);
+X	close_connection (msg->source);
+X      } else {
+X	sprintf (message_buf, "OKBRIDGE ERROR !! OKBRIDGE %s%s: %s",
+X		 major_revision_level, minor_revision_level,
+X		 "I DON'T RECOGNIZE YOU -- GO AWAY!");
+X	server_send_unformatted (msg->source, message_buf);
+X	write (msg->source->channel, "\0", 1);
+X	close_connection (msg->source);
+X      }
+X      propagate = 0;
+X    } else {
+X      sprintf (msg->source->player_name, "%s", msg->p.player_name);
+X      msg->source->state = CSTATE_PLAYING;
+X      if (OCCUPIED(t, msg->p.data.hello.seat_req)) {
+X	msg->p.data.hello.seat_req = PLAYER_OBS;
+X	sprintf (msg->p.command_text, "%s HELLO %s %s OBS",
+X		 msg->p.player_name, major_revision_level,
+X		 msg->p.player_name);
+X      }
+X      Assign_seat (t, msg->source, msg->p.data.hello.seat_req);
+X      Transmit_State_Information (t, msg->source);
+X/*    GPS_Broadcast_Server_Silently (); */
+X      propagate = 1;
+X    }
+X    break;
+X
+X  case CMD_NAME:
+X    sprintf (msg->source->player_name, "%s", msg->p.data.name.new_name);
+X    break;
+X
+X  case CMD_QUIT   :
+X    if (!msg->source->local) {
+X      Vacate_seat (msg->source->table, msg->p.player_no);
+X      close_connection (msg->source);
+X    }
+X    GPS_Broadcast_Server_Silently ();
+X    break;
+X
+X  case CMD_PLAYREQ:
+X    propagate = 0;
+X    break;
+X
+X  case CMD_REGISTRY:
+X    propagate = 0;
+X    strcpy (msg->source->registry, msg->p.data.registry.id);
+X    break;
+X
+X  case CMD_SEATERR:
+X    propagate = 0;
+X    break;
+X
+X  case CMD_SEATPOS:
+X    propagate = 0;
+X    break;
+X
+X  case CMD_SEATREQ:
+X    propagate = 0;
+X    Request_Seat (msg->source, msg->p.data.seatreq);
+X    break;
+X
+X  case CMD_SERVEREQ:
+X    propagate = 0;
+X    if (Parse_Server_Command (msg->p.data.servereq.command)) {
+X      sprintf (message_buf, "COMMENT %s", Parser_Error_Buf);
+X      send_private_message (msg->source, message_buf);
+X    } else
+X      send_private_message (msg->source, 
+X			    "COMMENT SERVER REQUEST ACKNOWLEDGED.");
+X    break;
+X
+X  case CMD_TABLE:
+X    propagate = 0;
+X    for (tp = Table_List; tp != NULL; tp = tp->next)
+X      if (tp->table_no == msg->p.data.tablereq)
+X	break;
+X
+X    if (tp != NULL)
+X      Local_table = tp;
+X    break;
+X
+X  case CMD_TABLEREQ:
+X    propagate = 0;
+X    for (tp = Table_List; tp != NULL; tp = tp->next)
+X      if (tp->table_no == msg->p.data.tablereq)
+X	break;
+X
+X    if (tp == NULL) {
+X      sprintf (message_buf, "COMMENT THERE IS NO TABLE NUMBER %d.",
+X	       msg->p.data.tablereq);
+X      send_private_message (msg->source, message_buf);
+X    } else if (tp->table_no == t->table_no) {
+X      sprintf (message_buf, "COMMENT YOU ARE ALREADY AT TABLE %d.",
+X	       msg->p.data.tablereq);
+X      send_private_message (msg->source, message_buf);
+X    } else {
+X      Assign_seat (msg->source->table, msg->source, PLAYER_OBS);
+X      Switch_Table (msg->source, tp);
+X      Transmit_State_Information (tp, msg->source);
+X      Send_seat (tp, PLAYER_OBS, PLAYER_OBS, msg->p.player_name);
+X    }
+X    break;
+X
+X  case CMD_WHO:
+X    Respond_to_who_message (msg);
+X    propagate = pass_upwards = 0;
+X    break;
+X
+X  case CMD_WHOIS:
+X    propagate = pass_upwards = 0;
+X    Respond_to_Whois_Message (msg);
+X    break;
+X
+X  default:
+X    break;
+X  }
+X
+X  if (propagate) {
+X    if (msg->loopback)
+X      Relay_message (msg->source->table, msg->source, msg->p.command,
+X		     msg->p.command_text);
+X    else {
+X      sprintf (message_buf, "%s %s", 
+X	       seat_names[msg->p.player_no],   msg->p.command_text);
+X      Relay_message (msg->source->table, msg->source, msg->p.command, 
+X		     message_buf);
+X    }
+X    if (msg->p.command == CMD_BOARD)
+X      Relay_board (t, msg->source, msg->p.data.board.record);
+X    else if (msg->p.command == CMD_RECORD)
+X      Relay_play_record (t, msg->source, msg->p.data.record.play);
+X  }
+X
+X  if (pass_upwards)
+X    enqueue_message (t->conversation_queue, msg);
+X  else
+X    deallocate_message (msg);
+X
+X}
+X
+Xvoid Handle_Protocol_Message_for_Client (msg)
+X     Message msg;
+X/* Performs the corresponding action as Handle_Protocol_Message_for_Server */
+X{
+X  int pass_upwards = 1;
+X    /* A boolean flag which indicates that the message should be put
+X       onto the conversation queue to be processed at the next level. */
+X  char message_buf[80];
+X
+X  Table t = Local_table;
+X
+X  switch (msg->p.command) {
+X  case CMD_ERROR:
+X    sprintf (message_buf, "ERROR!! %s", msg->p.data.error.message);
+X    Network_Comment (message_buf);
+X    Network_Comment (msg->p.command_text);
+X#ifdef LOGFILE
+X    fprintf (net_log, "** %s\n", msg->p.command_text);
+X    fprintf (net_log, "** %s\n", message_buf);
+X    fflush (net_log);
+X#endif
+X    break;
+X
+X  case CMD_ACK:
+X    if (IS_PLAYER(msg->p.data.ack.position)) {
+X      sprintf (PLAYER_NAME(t, msg->p.data.ack.position), "%s", 
+X	       msg->p.data.ack.player_name);
+X      t->Seats[msg->p.data.ack.position].occupied = 1;
+X    }
+X    break;
+X
+X  case CMD_HELLO:
+X    if (IS_PLAYER(msg->p.data.hello.seat_req)) {
+X      sprintf (PLAYER_NAME(t, msg->p.data.hello.seat_req), "%s", 
+X	       msg->p.data.hello.player_name);
+X      t->Seats[msg->p.data.hello.seat_req].occupied = 1;
+X    }
+X    break;
+X
+X  case CMD_QUIT   :
+X    Vacate_seat (t, msg->p.player_no);
+X    break;
+X
+X  case CMD_SEAT   :
+X    if (msg->p.data.seat.old_pos != local_player)
+X      Vacate_seat (t, msg->p.data.seat.old_pos);
+X    if (IS_PLAYER(msg->p.data.seat.new_pos)) { 
+X      sprintf (PLAYER_NAME(t, msg->p.data.seat.new_pos), "%s", 
+X	       msg->p.data.seat.player_name);
+X      t->Seats[msg->p.data.seat.new_pos].occupied = 1;
+X    }
+X    break;
+X    
+X  case CMD_SEATREQ:
+X    if (!client_mode)
+X      Request_Seat (msg->source, msg->p.data.seatreq);
+X    break;
+X
+X  case CMD_TABLE:
+X    t->table_no = msg->p.data.table;
+X    Vacate_seat (t, PLAYER_NORTH);
+X    Vacate_seat (t, PLAYER_EAST);
+X    Vacate_seat (t, PLAYER_SOUTH);
+X    Vacate_seat (t, PLAYER_WEST);
+X    break;
+X
+X  case CMD_WHO:
+X    if (!client_mode)
+X      Respond_to_who_message (msg);
+X    pass_upwards = 0;
+X    break;
+X
+X  case CMD_WHOIS:
+X    if (!client_mode) {
+X      if (local_player_full_name != NULL)
+X	sprintf (Local_Player_Connection->fullname, "%s", 
+X		 local_player_full_name);
+X      if (local_player_email != NULL)
+X	sprintf (Local_Player_Connection->email, "%s", local_player_email);
+X      Respond_to_Whois_Message (msg);
+X    }
+X    pass_upwards = 0;
+X    break;
+X
+X  default:
+X    break;
+X  }
+X
+X  if (pass_upwards)
+X    enqueue_message (t->conversation_queue, msg);
+X  else
+X    deallocate_message (msg);
+X}
+END_OF_FILE
+if test 16640 -ne `wc -c <'cs.c'`; then
+    echo shar: \"'cs.c'\" unpacked with wrong size!
+fi
+# end of 'cs.c'
+fi
+if test -f 'display.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'display.c'\"
+else
+echo shar: Extracting \"'display.c'\" \(34086 characters\)
+sed "s/^X//" >'display.c' <<'END_OF_FILE'
+X/* display.c -- Display functions for OKbridge program.
+X *
+X ! Copyright (C) 1990-1992 by Matthew Clegg.  All Rights Reserved
+X ! 
+X ! OKbridge is made available as a free service to the Internet.
+X ! Accordingly, the following restrictions are placed on its use:
+X ! 
+X ! 1.  OKbridge may not be modified in any way without the explicit 
+X !     permission of Matthew Clegg.  
+X ! 
+X ! 2.  OKbridge may not be used in any way for commercial advantage.
+X !     It may not be placed on for-profit networks or on for-profit
+X !     computer systems.  It may not be bundled as part of a package
+X !     or service provided by a for-profit organization.
+X ! 
+X ! If you have questions about restrictions on the use of OKbridge,
+X ! write to mclegg@cs.ucsd.edu.
+X ! 
+X ! DISCLAIMER:  The user of OKbridge accepts full responsibility for any
+X ! damage which may be caused by OKbridge.
+X *
+X */
+X 
+X#include <stdio.h>
+X#include <string.h>
+X
+Xextern char *malloc ();
+X
+X#define _DISPLAY_
+X 
+X#include "state.h"
+X#include "terminal.h"
+X#include "display.h"
+X#include "help.h"
+X#include "input.h"
+X
+X#ifdef LOGFILE
+Xextern FILE *net_log;
+X#endif
+X
+Xtypedef int window[4];
+X 
+X/* Conceptually, we think of the screen as being divided into a number
+X   of windows, where each window describes one particular type of activity
+X   or aspect of the game.  Therefore, we make the following definitions,
+X   although these are only guidelines for operation of the display.
+X 
+XName of
+XWindow          	 Ymin	Xmin	Height	Width
+X-------			 ----	----	----	----			*/
+Xwindow title 	     = { 1,	1,	6,	25};
+Xwindow top_hand      = { 2,	30,	4,	26};
+Xwindow scores	     = { 1,	58,	6,	26};
+Xwindow left_hand     = { 8,	6,	6,	18};
+Xwindow playing_board = { 5,	27,	9,	26};
+Xwindow bidding_board = { 5,	1,	9,	57};
+Xwindow right_hand    = { 8,	56,	6,	23};
+Xwindow input	     = { 13,	1,	6,	26};
+Xwindow status	     = { 18,    1,	1,	79};
+Xwindow bottom_hand   = { 13,	30,	4,	26};
+Xwindow help	     = { 13,	53,	6,	26};
+Xwindow converse	     = { 19,	1,	6,	78};
+X 
+X#define XMIN(w)		w[1]
+X#define YMIN(w)         w[0]
+X#define XMAX(w)		(w[1] + w[3] - 1)
+X#define YMAX(w)		(w[0] + w[2] - 1)
+X#define HEIGHT(w)	w[2]
+X#define WIDTH(w)	w[3]
+X
+Xstatic int PLAYERHAND_X [4];
+Xstatic int PLAYERHAND_Y [4]; 
+Xstatic int CARDPOS_X    [4];
+Xstatic int CARDPOS_Y    [4];
+Xstatic char *position_names [4];
+Xstatic int comments_suspended = 0;
+X 
+Xstatic char line_buf [81];
+Xstatic int  status_loc;
+X
+X#define COMMENT_LENGTH 78
+X
+Xtypedef char comment_line [COMMENT_LENGTH];
+Xtypedef comment_line *comment_buf;
+X
+Xstatic int full_screen_talk_start = 3;
+X  /* The first line of the screen on which comments will be displayed,
+X     if the full screen is used for talking.  */
+Xstatic int full_screen_talk_end  = 22;
+X  /* The last line on which comments will be displayed for full screen mode. */
+Xstatic int full_screen_talk_size = 20;
+X  /* The total number of lines in the full screen talk display. */
+Xstatic int full_screen_cursor = 0;
+X  /* The line in the full screen buffer where the next talk message will be
+X     displayed. */
+X
+Xstatic int playing_screen_talk_start = 20;
+X  /* The first line of the screen on which comments will be displayed,
+X     if we are in playing mode. */
+Xstatic int playing_screen_talk_end = 24;
+X  /* last comment line for playing screen. */
+Xstatic int playing_screen_talk_size = 5;
+X  /* The total number of lines in the playing screen talk display. */
+X
+Xstatic int talk_start, talk_end;
+X  /* The current first and last lines for display of player comments. */
+Xstatic int talk_size;
+X  /* talk_end - talk_start + 1. */
+X
+Xstatic comment_line *full_screen_comments = NULL, 
+X                    *playing_screen_comments = NULL,
+X                    *player_comments;
+X
+X/* We record the list of cards played in the current trick, so that
+X   we can redisplay them during a refresh if necessary. */
+Xstatic int Current_trick [4];
+X  /* A list of plays indexed by position.  If the value is non-negative,
+X     then it indicates the play made by the corresponding player. */
+X
+Xstatic int status_display_level = 0;
+X  /* The number of locks which have been placed on the status display. */
+Xstatic char status_buf [10] [80];
+X  /* For each lock level, a record of the status message at that level. */
+X
+XBoard *Board_for_display;
+X  /* This is a pointer to the board which is being displayed in the
+X     SCORING_DISPLAY mode. */
+XPlay_record *Current_page_of_scores = NULL;
+X  /* The first play record which is being displayed on the current page
+X     of scores. */
+XPlay_record *Next_page_of_scores = NULL;
+X  /* The first play record which will be displayed on the next page 
+X     of scores. */
+X
+Xchar total_time_buffer [20];
+X  /* A buffer used for displaying the total time playing the current hand. */
+Xchar local_time_buffer [20];
+X  /* A buffer used for displaying the time used by the local player. */
+X    
+Xvoid Select_Talk_Mode ();
+Xvoid Select_Conversation_Mode ();
+Xvoid Display_Page_of_Scores ();
+Xvoid Refresh_Time_Display ();
+X
+X
+Xstatic void underline (ymin, xmin, length)
+X       int ymin, xmin, length;
+X/* Prints a line of hyphens BELOW the field beginning at (ymin,xmin),
+X *  of given length.
+X */
+X{
+X	int i;
+X 
+X	for (i = 0; i < length; i++)
+X		line_buf[i] = '-';
+X	line_buf[length] = '\0';
+X	print (ymin+1, xmin, line_buf);
+X}
+X 
+Xstatic void clear_screen_area (ymin, xmin, height, width)
+X       int ymin, xmin, height, width;
+X{
+X	int i;
+X 
+X	for (i = 0; i < width; i++) line_buf[i] = ' ';
+X	line_buf[width] = '\0';
+X	for (i = 0; i < height; i++) print (ymin+i, xmin, line_buf);
+X}
+X
+Xstatic void Display_Board_Number ()
+X{
+X  if ((Local_board != NULL) && (Local_board->source != NULL)) {
+X    sprintf (line_buf, "%s BOARD %d", Local_board->source,
+X	     Local_board->serial_no);
+X    print (YMIN(title)+1,  XMIN(title),  line_buf);
+X  } else {
+X    sprintf (line_buf, "%d", hands_played);
+X    print (YMIN(title)+1, XMIN(title)+6, line_buf);
+X  }
+X
+X}
+X
+Xstatic void Redraw_Scoring_Panel ()
+X/* Redraws the scoring panel in the upper corner of the screen, which
+X   displays the vulnerabilities, number of tricks taken, and scores.
+X*/
+X{
+X  /* Setup the scoreboard: */
+X  if (local_player >= 4) {
+X    print (YMIN(scores), XMIN(scores) + 8,   "  N-S");
+X    print (YMIN(scores), XMIN(scores) + 16,  "  E-W");
+X  } else if (side_of(local_player) == SIDE_NS) {
+X    print (YMIN(scores), XMIN(scores) + 8,   "   WE");
+X    print (YMIN(scores), XMIN(scores) + 16,  " THEY");
+X  } else {
+X    print (YMIN(scores), XMIN(scores) + 16,  "   WE");
+X    print (YMIN(scores), XMIN(scores) + 8,   " THEY");
+X  }
+X  underline (YMIN(scores), XMIN(scores) + 8, 5);
+X  underline (YMIN(scores), XMIN(scores) + 16, 5);
+X  print (YMIN(scores)+2, XMIN(scores), "TRICKS");
+X  print (YMIN(scores)+3, XMIN(scores), "VUL");
+X  
+X  switch (Local_board->scoring_mode) {
+X  case RUBBER_SCORING:
+X    print (YMIN(scores)+4, XMIN(scores), "ABOVE");
+X    print (YMIN(scores)+5, XMIN(scores), "BELOW");
+X    print (YMIN(title)+1,  XMIN(title),  "HAND");
+X    break;
+X  case DUPLICATE_SCORING:
+X    print (YMIN(scores)+4, XMIN(scores), "TOTAL");
+X    print (YMIN(scores)+5, XMIN(scores), "PREV");
+X    print (YMIN(title)+1,  XMIN(title),  "BOARD");
+X    break;
+X  case IMP_SCORING:
+X    print (YMIN(scores)+4, XMIN(scores), "TOTAL");
+X    print (YMIN(scores)+5, XMIN(scores), "IMP");
+X    print (YMIN(title)+1,  XMIN(title),  "BOARD");
+X    break;
+X  case MP_SCORING:
+X    print (YMIN(scores)+4, XMIN(scores), "TOTAL");
+X    print (YMIN(scores)+5, XMIN(scores), "MP");
+X    print (YMIN(title)+1,  XMIN(title),  "BOARD");
+X    break;
+X  default:
+X    break;
+X  }
+X
+X  Display_Tricks_Taken ();
+X  Display_Above_Line_Points ();
+X  Display_Below_Line_Points ();
+X  Display_Vulnerabilities ();
+X  Display_Board_Number ();
+X
+X}
+X
+Xstatic void Redraw_Conversation_Area ()
+X{
+X  int i;
+X
+X  /* Setup the conversational area: */
+X  for (i = 0; i <= XMAX(converse); i++) line_buf[i] = '-';
+X  line_buf[72] = '+';
+X  line_buf[XMAX(converse)+1] = '\0';
+X  print (YMIN(converse), XMIN(converse), line_buf);
+X  for (i = talk_start; i <= talk_end; i++) {
+X    print (i, XMIN(converse), "|");
+X    print (i, XMAX(converse)+1, "|");
+X  }
+X
+X  /* Setup the input area: */
+X  print (TALK_ROW, TALK_COL, "TALK");
+X  status_loc = YMIN(status);
+X
+X}
+X
+Xstatic void Redraw_Bidding_Display ()
+X{
+X  int i, p;
+X  hand h;
+X  
+X  Display_Bidding_Board ();
+X  if (IS_PLAYER(local_player)) {
+X    Generate_holdings (Local_board, Local_play->play_list, 0, local_player, h);
+X    Display_Hand_for_Bidding (local_player, h);
+X  } else if (spectator_mode) {
+X    Generate_holdings (Local_board, Local_play->play_list, 0, 
+X		       revealed_bidder, h);
+X    Display_Hand_for_Bidding (revealed_bidder, h);
+X  }
+X
+X  p = Local_board->dealer;
+X  for (i = 0; i < Local_play->no_bids; i++) {
+X    Display_Bid (i);
+X    p = player_next [p];
+X  }
+X  Display_Bidder (p);
+X  Refresh_Time_Display ();
+X  print (PLAY_ROW, PLAY_COL, "BID ");
+X}
+X
+Xstatic void Redraw_Playing_Display ()
+X{
+X  int i;
+X
+X  Display_Contract (); 
+X  Display_Playing_Board ();
+X
+X  for (i = 0; i < 4; i++)
+X    if (revealed_hands[i]) {
+X      if (Local_table->game_mode == PLAYING_MODE)
+X	Display_Hand(i);
+X      else
+X	Display_Partial_Hand (i, 0);
+X    }
+X
+X  for (i = 0; i < 4; i++)
+X    Display_Play (i, Current_trick[i]);
+X
+X  Display_Player (Local_play->next_player);
+X  Refresh_Time_Display ();
+X  print (PLAY_ROW, PLAY_COL, "PLAY");
+X}
+X
+Xstatic void Redraw_Scoring_Display ()
+X{
+X  Display_Page_of_Scores (Current_page_of_scores);
+X}
+X
+Xvoid Display_Player_Position ()
+X{
+X  char buf[80], *position_name;
+X  
+X  if (IS_PLAYER(local_player))
+X    position_name = seat_names[local_player];
+X  else if (spectator_mode)
+X    position_name = "SPECTATOR";
+X  else
+X    position_name = "OBSERVER";
+X  
+X  sprintf (buf, "OKBRIDGE %s%s  %s     ", 
+X	   major_revision_level, minor_revision_level, position_name);
+X  
+X  print (1, 1, buf);
+X} 
+X
+Xvoid Refresh_Status_Display ();
+Xvoid Begin_full_screen_talk_mode ();
+Xvoid Recompute_Display_Positions ();
+X 
+Xvoid Reset_Display ()
+X/* Redraws the main features of the screen.  Used in the process
+X * of doing a 'refresh'.
+X */
+X{
+X  if (display_mode == MANUAL_DISPLAY)
+X    return;
+X
+X  clear_screen ();
+X
+X  Recompute_Display_Positions ();
+X
+X  if (display_mode == HELP_DISPLAY) {
+X    Suspend_Comment_Display ();
+X    status_loc = terminal_lines;
+X    display_topics ("LIST OF HELP TOPICS");
+X    print (terminal_lines-1, 1, "HELP");
+X    Refresh_Status_Display ();
+X    return;
+X  }
+X
+X  Display_Player_Position ();
+X  Continue_Comment_Display ();
+X  
+X  switch (display_mode) {
+X  case TALK_DISPLAY:
+X    Begin_full_screen_talk_mode ();
+X    break;
+X  case BIDDING_DISPLAY:
+X    Redraw_Bidding_Display ();
+X    Redraw_Scoring_Panel ();
+X    Redraw_Conversation_Area ();
+X    break;
+X  case PLAYING_DISPLAY:
+X    Redraw_Playing_Display ();
+X    Redraw_Scoring_Panel ();
+X    Redraw_Conversation_Area ();
+X    break;
+X  case SCORING_DISPLAY:
+X    Redraw_Scoring_Display ();
+X    Redraw_Conversation_Area ();
+X    break;
+X  }
+X
+X  Refresh_Player_Comments ();
+X  Refresh_Status_Display ();
+X}
+X
+Xvoid Recompute_Display_Positions ()
+X/* Recomputes a number of internal constants for the display. */
+X{
+X  int l = local_player;
+X  
+X  if (l >= 4) l = PLAYER_SOUTH;
+X  
+X  PLAYERHAND_X [l] = XMIN(bottom_hand);
+X  PLAYERHAND_Y [l] = YMIN(bottom_hand);
+X  PLAYERHAND_X [player_next[l]] = XMIN(left_hand);
+X  PLAYERHAND_Y [player_next[l]] = YMIN(left_hand);
+X  PLAYERHAND_X [player_partner[l]] = XMIN(top_hand);
+X  PLAYERHAND_Y [player_partner[l]] = YMIN(top_hand);
+X  PLAYERHAND_X [player_prev[l]] = XMIN(right_hand);
+X  PLAYERHAND_Y [player_prev[l]] = YMIN(right_hand);
+X  
+X  CARDPOS_Y[l] = YMAX(playing_board) - 2;
+X  CARDPOS_X[l] = (XMAX(playing_board) + 
+X		  XMIN(playing_board))/2;
+X  CARDPOS_Y[player_next[l]] = (YMAX(playing_board) + 
+X			       YMIN(playing_board))/2;
+X  CARDPOS_X[player_next[l]] = XMIN(playing_board) + 3;
+X  CARDPOS_Y[player_partner[l]] = YMIN(playing_board) + 2;
+X  CARDPOS_X[player_partner[l]] = (XMAX(playing_board) + 
+X				  XMIN(playing_board))/2;
+X  CARDPOS_Y[player_prev[l]] = (YMAX(playing_board) + 
+X			       YMIN(playing_board))/2;
+X  CARDPOS_X[player_prev[l]] = XMAX(playing_board) - 4;
+X  
+X  position_names[0] = PLAYER_NAME(Local_table, l);
+X  position_names[1] = PLAYER_NAME(Local_table, player_next[l]);
+X  position_names[2] = PLAYER_NAME(Local_table, player_partner[l]);
+X  position_names[3] = PLAYER_NAME(Local_table, player_prev[l]);
+X}
+X
+Xvoid Initialize_Display ()
+X/* Should be called once when the program starts up. */
+X{ 
+X  Initialize_Player_Comments ();
+X  status_buf[0][0] = '\0';
+X  display_mode = TALK_DISPLAY;
+X  Current_trick[0] = Current_trick[1] = 
+X    Current_trick[2] = Current_trick[3] = -1;
+X
+X  Reset_Display ();
+X  Recompute_Display_Positions ();
+X}
+X
+Xvoid Reinitialize_Display ()
+X{
+X  Reinitialize_Player_Comments ();
+X  Reset_Display ();
+X
+X  Recompute_Display_Positions ();
+X}
+X
+Xvoid Refresh_Display ()
+X/* Resets the terminal display and redraws everything. */
+X{
+X  Reset_Display ();
+X}
+X
+Xvoid Clear_Playing_Area ();
+X
+Xvoid Refresh_Player_Names ()
+X/* Redraws the player names.  Useful in case one of the players has changed
+X   position. */
+X{
+X  if ((display_mode != BIDDING_DISPLAY) && (display_mode != PLAYING_DISPLAY))
+X    return;
+X
+X  if (display_mode == BIDDING_DISPLAY) {
+X    Clear_Bidding_Board ();
+X    Redraw_Bidding_Display ();
+X  } else {
+X    Clear_Playing_Area ();
+X    Redraw_Playing_Display ();
+X  }
+X
+X}
+X
+Xvoid Set_Display_Mode (mode)
+X     int mode;
+X{
+X  if (display_mode == mode)
+X    return;
+X
+X  display_mode = mode;
+X
+X  if ((mode == HELP_DISPLAY) || (mode == MANUAL_DISPLAY)) {
+X    clear_screen ();
+X    Suspend_Comment_Display ();
+X    status_loc = terminal_lines;
+X    return;
+X  }
+X
+X  if (display_mode == TALK_DISPLAY)
+X    Select_Talk_Mode ();
+X  else
+X    Select_Conversation_Mode ();
+X
+X  Refresh_Display ();
+X}
+X 
+Xvoid Display_Tricks_Taken ()
+X{
+X  sprintf (line_buf,"%5d   %5d",
+X	   Local_play->tricks[SIDE_NS], Local_play->tricks[SIDE_EW]);
+X  print (YMIN(scores)+2,XMIN(scores)+8, line_buf);
+X}
+X
+Xvoid Format_IMP_string (score, buf)
+X     int score; char *buf;
+X{
+X  int whole, fraction;
+X
+X
+X  if ((-95 < score) && (score < 0)) {
+X    score = (score - 5) / 10;
+X    sprintf (buf, " -0.%d", -score);
+X    return;
+X  } else if (score < 0) {
+X    score = (score - 5) / 10;
+X    fraction = (-score) % 10;
+X    whole = -((-score) / 10);
+X  } else {
+X    score = (score + 5) / 10;
+X    fraction = score % 10;
+X    whole = score / 10;
+X  }
+X
+X  if (fraction == 0)
+X    sprintf (buf, "%4d. ", whole);
+X  else
+X    sprintf (buf, "%4d.%d", whole, fraction);
+X}
+X 
+Xvoid Display_Above_Line_Points ()
+X{
+X  char ew_buf[10], ns_buf [10];
+X
+X  if (Local_board->scoring_mode == IMP_SCORING) {
+X    Format_IMP_string (Local_table->above_line[SIDE_NS], ns_buf);
+X    Format_IMP_string (Local_table->above_line[SIDE_EW], ew_buf);
+X    sprintf (line_buf,"%6s  %6s", ns_buf, ew_buf);
+X  } else if (Local_board->scoring_mode == MP_SCORING) {
+X    sprintf (line_buf, "%5.2f  %6.2f", 
+X	     ((float) Local_table->above_line[SIDE_NS]) * 0.01,
+X	     ((float) Local_table->above_line[SIDE_EW]) * 0.01);
+X  } else
+X    sprintf (line_buf,"%5d   %5d",
+X	     Local_table->above_line[SIDE_NS], 
+X	     Local_table->above_line[SIDE_EW]);
+X
+X  print (YMIN(scores)+4,XMIN(scores)+8, line_buf);
+X}
+X 
+Xvoid Display_Below_Line_Points ()
+X{
+X  char ew_buf[10], ns_buf [10];
+X
+X  if (Local_board->scoring_mode == IMP_SCORING) {
+X    Format_IMP_string (Local_table->below_line[SIDE_NS], ns_buf);
+X    Format_IMP_string (Local_table->below_line[SIDE_EW], ew_buf);
+X    sprintf (line_buf,"%6s  %6s", ns_buf, ew_buf);
+X  } else if (Local_board->scoring_mode == MP_SCORING) {
+X    sprintf (line_buf, "%5.2f  %6.2f", 
+X	     ((float) Local_table->below_line[SIDE_NS]) * 0.01,
+X	     ((float) Local_table->below_line[SIDE_EW]) * 0.01);
+X  } else
+X    sprintf (line_buf,"%5d   %5d",
+X	     Local_table->below_line[SIDE_NS], 
+X	     Local_table->below_line[SIDE_EW]);
+X
+X  print (YMIN(scores)+5,XMIN(scores)+8, line_buf);
+X}
+X 
+Xvoid Display_Vulnerabilities   ()
+X{
+X  char *nsv, *ewv;
+X 
+X  if (Local_board->vulnerable[SIDE_NS]) 
+X    nsv = "  YES";
+X  else
+X    nsv = "   NO";
+X
+X  if (Local_board->vulnerable[SIDE_EW]) 
+X    ewv = "  YES";
+X  else
+X    ewv = "   NO";
+X
+X  sprintf (line_buf, "%s   %s",nsv,ewv);
+X  print (YMIN(scores)+3, XMIN(scores)+8, line_buf);
+X}
+X 
+Xvoid Clear_Bidding_Board ()
+X{
+X  int x, y, h, w;
+X
+X  x = XMIN(bidding_board);
+X  y = YMIN(bidding_board);
+X  h = HEIGHT(bidding_board);
+X  w = WIDTH(bidding_board);
+X  clear_screen_area (y, x, h, w);
+X  clear_screen_area (PLAY_ROW, 1, 1, 10);
+X 
+X}
+X
+Xvoid Refresh_Time_Display ()
+X{
+X  if ((display_mode != PLAYING_DISPLAY) && (display_mode != BIDDING_DISPLAY))
+X    return;
+X
+X  print (PLAY_ROW,   80 - strlen(total_time_buffer), total_time_buffer);
+X  print (PLAY_ROW+1, 80 - strlen(local_time_buffer), local_time_buffer);
+X}
+X
+Xvoid Display_Total_Time (total_buf, local_buf)
+X     char *total_buf, *local_buf;
+X{
+X  sprintf (total_time_buffer, "%s", total_buf);
+X  sprintf (local_time_buffer, "%s", local_buf);
+X  Refresh_Time_Display ();
+X}
+X
+Xvoid Display_Bidding_Board ()
+X/* The bidding display is given as four columns, similar to that found
+X   in many bridge books.  At the top of each column is printed the
+X   corresponding input parameter string to identify the bidder. */
+X{
+X  char *first, *second, *third, *fourth;
+X  
+X  Clear_Bidding_Board ();
+X  
+X  first  = PLAYER_NAME(Local_table, PLAYER_NORTH);
+X  second = PLAYER_NAME(Local_table, player_next[PLAYER_NORTH]);
+X  third  = PLAYER_NAME(Local_table, player_partner[PLAYER_NORTH]);
+X  fourth = PLAYER_NAME(Local_table, player_prev[PLAYER_NORTH]);
+X  
+X  print(YMIN(bidding_board), XMIN(bidding_board)+05, first);
+X  print(YMIN(bidding_board), XMIN(bidding_board)+15, second);
+X  print(YMIN(bidding_board), XMIN(bidding_board)+25, third);
+X  print(YMIN(bidding_board), XMIN(bidding_board)+35, fourth);
+X  
+X  underline(YMIN(bidding_board),XMIN(bidding_board)+05,strlen(first));
+X  underline(YMIN(bidding_board),XMIN(bidding_board)+15,strlen(second));
+X  underline(YMIN(bidding_board),XMIN(bidding_board)+25,strlen(third));
+X  underline(YMIN(bidding_board),XMIN(bidding_board)+35,strlen(fourth));
+X
+X  Display_Board_Number ();
+X}
+X 
+Xstatic void Display_suit (y, x, cards)
+X     int y, x; suit_type cards;
+X/* Displays the cards in a given suit held by a player.  As input,
+X * cards[] is an array of 13 elements, where cards[i] is TRUE if the
+X * player holds the given card.  Displays the cards as a string on
+X * the terminal, beginning at coordinates <y,x>.
+X */
+X{
+X  int i;
+X 
+X  for (i = 12; i >= 0; i--)
+X    if (cards[i])
+X      print (y, x++, rank_names[i]);
+X}
+X 
+Xvoid Display_Hand_for_Bidding (pos, h)
+X     int pos; hand h;
+X{
+X  int i, x, y;
+X  
+X  if (pos >= 4) return;
+X  
+X  y = YMIN(bidding_board);
+X  x = XMIN(bidding_board) + 45;
+X  clear_screen_area (y, x, HEIGHT(bidding_board), XMAX(bidding_board)-x+1);
+X  for (i = 0; i < 6; i++)
+X    print (y+i, x, "|");
+X  
+X  x+=1;
+X  print (y, x, PLAYER_NAME(Local_table, pos));
+X  underline (y, x, strlen(PLAYER_NAME(Local_table, pos)));
+X  print (y+2, x, "S "); Display_suit (y+2, x+2, h+39);
+X  print (y+3, x, "H "); Display_suit (y+3, x+2, h+26);
+X  print (y+4, x, "D "); Display_suit (y+4, x+2, h+13);
+X  print (y+5, x, "C "); Display_suit (y+5, x+2, h);
+X}
+X
+Xvoid Clear_Bidder ()
+X{
+X  clear_screen_area (YMIN(title)+2, XMIN(title), 1, 20);
+X}
+X 
+Xvoid Display_Bidder (player)
+X	int player;
+X{
+X  char bid_buf[80];
+X 
+X  sprintf (bid_buf, "(%c) %s's BID        ", *("NESW" + player),
+X	   PLAYER_NAME(Local_table, player));
+X		 
+X  print (YMIN(title)+2, XMIN(title), bid_buf);
+X}
+X 
+Xvoid Display_Bid (k)
+X     int k;
+X/* Displays the k-th bid in the bidding list. */
+X{
+X  int i, x, y, bid, position, round, player;
+X  char bid_string [10];
+X  
+X  round = (k / 4) + 1;
+X  bid = Local_play->bids[k];
+X  player = k % 4;
+X  for (i = 0; i != Local_board->dealer; i++)
+X    player = player_next[player];
+X  
+X  y = YMIN(bidding_board) + round + 1;
+X  sprintf (line_buf, " %2d", round);
+X  print (y, XMIN(bidding_board), line_buf);
+X  
+X  y++; 
+X  for (x = Local_board->dealer; x < 4; x++)
+X    if (x == player) y--;
+X  
+X  position = player;
+X  x = XMIN(bidding_board) + 10 * position + 5;
+X  if (bid == BID_PASS)
+X    sprintf (bid_string, "--");
+X  else
+X    sprintf (bid_string, "%s", bid_names[bid]);
+X  if (Local_play->alerts[k])
+X    sprintf (bid_string + strlen(bid_string)," !");
+X  
+X  print (y, x, bid_string);
+X}
+X 
+Xvoid Display_Contract ()
+X{
+X  char double_buf[40], contract_buf[60];
+X  int trump_suit = trumpsuit_of (Local_play->contract);
+X  int contract   = level_of (Local_play->contract);
+X 
+X  if (Local_play->contract == BID_PASS) {
+X    print (YMIN(title)+3, XMIN(title), "PASSED HAND");
+X    return;
+X  }
+X
+X  clear_screen_area (YMIN(title)+2, XMIN(title), HEIGHT(title),
+X			   WIDTH(title));
+X  if (Local_play->doubled == 2)
+X    sprintf (double_buf,"  REDOUBLED");
+X  else if (Local_play->doubled == 1)
+X    sprintf (double_buf, "  DOUBLED");
+X  else
+X    double_buf[0] = '\0';
+X  sprintf (contract_buf, "%1d%s (%s)%s",contract,suit_names[trump_suit],
+X	   PLAYER_NAME(Local_table, Local_play->declarer), double_buf);
+X 
+X  print (YMIN(title)+3, XMIN(title), contract_buf);
+X}
+X
+Xvoid Clear_Playing_Area () 
+X{
+X  clear_screen_area (YMIN(playing_board), XMIN(playing_board),
+X		     HEIGHT(playing_board), WIDTH(playing_board));
+X  clear_screen_area (YMIN(left_hand), XMIN(left_hand),
+X		     HEIGHT(left_hand), WIDTH(left_hand));
+X  clear_screen_area (YMIN(right_hand), XMIN(right_hand),
+X		     HEIGHT(right_hand), WIDTH(right_hand));
+X  clear_screen_area (YMIN(top_hand), XMIN(top_hand),
+X		     HEIGHT(top_hand), WIDTH(top_hand));
+X  clear_screen_area (YMIN(bottom_hand), XMIN(bottom_hand),
+X		     HEIGHT(bottom_hand), WIDTH(bottom_hand));
+X  clear_screen_area (YMIN(title)+3, XMIN(title), 1, WIDTH(title));
+X  
+X}
+X
+Xvoid Clear_Playing_Board ()
+X{
+X  Clear_Playing_Area ();
+X
+X  Current_trick[0] = Current_trick[1] = 
+X    Current_trick[2] = Current_trick[3] = -1;
+X}
+X 
+Xvoid Display_Playing_Board ()
+X{
+X  int i;
+X  
+X  for (i = 0; i < 4; i++)
+X    print (PLAYERHAND_Y[i]+1, PLAYERHAND_X[i]+12 -
+X	   strlen(PLAYER_NAME(Local_table, i)), PLAYER_NAME(Local_table, i));
+X  
+X  for (i = 0; i < WIDTH(playing_board)-1; i++) line_buf[i] = '-';
+X  line_buf[WIDTH(playing_board)-2] = '\0';
+X  print (YMIN(playing_board)+1,XMIN(playing_board)+1,line_buf);
+X  print (YMAX(playing_board)-1,XMIN(playing_board)+1,line_buf);
+X  
+X  for (i = YMIN(playing_board)+2; i < YMAX(playing_board)-1; i++) {
+X    print (i, XMIN(playing_board)+1, "|");
+X    print (i, XMAX(playing_board)-1, "|");
+X  }
+X}
+X 
+Xvoid Display_Player (player)
+X     int player;
+X{
+X  char play_buf[80];
+X  
+X  if (player < 0)
+X    sprintf (play_buf, "                    ");
+X  else if (player == player_partner[Local_play->declarer])
+X    sprintf (play_buf, "DUMMY'S PLAY        ");
+X  else
+X    sprintf (play_buf, "(%c) %s's PLAY        ", 
+X	     *("NESW" + player), PLAYER_NAME(Local_table, player));
+X  print (YMIN(title)+4, XMIN(title), play_buf);
+X}
+X 
+Xvoid Display_Play (p, card)
+X     int p, card;
+X{
+X  int x, y;
+X  
+X  y = CARDPOS_Y [p];
+X  x = CARDPOS_X [p];
+X  if ((0 <= card) && (card < 52))
+X    print (y, x, card_names[card]);
+X  else
+X    print (y, x, "   ");
+X  
+X  Current_trick [p] = card;
+X}
+X 
+Xvoid Clear_Plays  ()
+X{
+X  Display_Play (PLAYER_NORTH, -1);
+X  Display_Play (PLAYER_EAST,  -1);
+X  Display_Play (PLAYER_SOUTH, -1);
+X  Display_Play (PLAYER_WEST,  -1);
+X}
+X
+Xvoid Display_Partial_Hand (p, no_plays)
+X     int p; int no_plays;
+X{
+X  int y, x, i;
+X  hand h;
+X  
+X  if (IS_OBSERVER(p))
+X    return;
+X  
+X  y = PLAYERHAND_Y [p];
+X  x = PLAYERHAND_X [p];
+X  for (i = 0; i < 4; i++)
+X    print (y+i, x, "                   ");
+X  
+X  Generate_holdings (Local_board, Local_play->play_list, no_plays, p, h);
+X  print (y,   x+5-8, "        ");
+X  print (y,   x+5-strlen(PLAYER_NAME(Local_table, p)), 
+X	 PLAYER_NAME(Local_table, p));
+X  if (p == player_partner[Local_play->declarer])
+X    print (y+1, x+5-7, "(DUMMY)");
+X  print (y,   x+7, "S "); Display_suit (y,   x+10, h+39);
+X  print (y+1, x+7, "H "); Display_suit (y+1, x+10, h+26);
+X  print (y+2, x+7, "D "); Display_suit (y+2, x+10, h+13);
+X  print (y+3, x+7, "C "); Display_suit (y+3, x+10, h);
+X  
+X  revealed_hands[p] = 1;
+X}
+X
+Xvoid Display_Hand (p)
+X     int p;
+X{
+X  Display_Partial_Hand (p, Local_play->no_plays);
+X}
+X
+Xvoid Clear_Hand (p)
+X     int p;
+X{
+X  int y, x, i;
+X  
+X  y = PLAYERHAND_Y [p];
+X  x = PLAYERHAND_X [p];
+X  for (i = 0; i < 4; i++)
+X    print (y+i, x, "                   ");
+X  
+X  print (y,   x+5-strlen(PLAYER_NAME(Local_table, p)), 
+X	 PLAYER_NAME(Local_table, p));
+X  if (p == player_partner[Local_play->declarer])
+X    print (y+1, x+5-7, "(DUMMY)");
+X  
+X  revealed_hands[p] = 0;
+X}
+X
+Xstatic char *seat_letters [4] = {"N", "E", "S", "W"};
+Xstatic char *double_names [3] = {"", "-X", "-XX"};
+X
+Xstatic void Display_Score_Record (b, p, line)
+X     Board *b;
+X     Play_record *p;
+X     int line;
+X{
+X  char contract_buf[10];
+X  char buf[100];
+X  char mark;
+X
+X  if (p->contract == BID_PASS)
+X    sprintf (contract_buf, "PASSED");
+X  else
+X    sprintf (contract_buf, "%s%s", bid_names[p->contract], 
+X	     double_names[p->doubled]);
+X
+X  if (!strcasecmp(p->player_names[PLAYER_NORTH], local_player_name) ||
+X      !strcasecmp(p->player_names[PLAYER_SOUTH], local_player_name))
+X    mark = '>';
+X  else
+X    mark = ' ';
+X
+X  sprintf (buf,
+X	   "  %c   N %-8s S %-8s %-8s %-2s %+6d %6d %6.1f %6.2f", mark,
+X	   p->player_names[PLAYER_NORTH], p->player_names[PLAYER_SOUTH],
+X	   contract_buf, seat_letters[p->declarer], p->result,
+X	   p->below_line[SIDE_NS], 
+X	   p->imatch_points[SIDE_NS],
+X	   p->match_points[SIDE_NS]);
+X  print (line, 1, buf);
+X
+X  if (!strcasecmp(p->player_names[PLAYER_EAST], local_player_name) ||
+X      !strcasecmp(p->player_names[PLAYER_WEST], local_player_name))
+X    mark = '>';
+X  else
+X    mark = ' ';
+X
+X  sprintf (buf,
+X	   "  %c   E %-8s W %-8s %-8s %2s %6s %6d %6.1f %6.2f", mark,
+X	   p->player_names[PLAYER_EAST], p->player_names[PLAYER_WEST],
+X	   " ", " ", " ", p->below_line[SIDE_EW],
+X	   p->imatch_points[SIDE_EW],
+X	   p->match_points[SIDE_EW]);
+X  print (line+1, 1, buf);
+X}
+X
+Xvoid Display_Page_of_Scores (p)
+X     Play_record *p;
+X/* Displays a page of scores, starting with the play record p.  Sets the
+X   variable Current_page_of_scores equal to p, and the variable 
+X   Next_page_of_scores equal to the first undisplayed record.
+X*/
+X{
+X  char buf[100];
+X  char *vul_string;
+X  int line = 5;
+X  Board *b = Board_for_display;
+X
+X  clear_screen_area (1, 1, 15, 80);
+X
+X  Current_page_of_scores = Next_page_of_scores = p;
+X
+X  if (b->vulnerable[SIDE_NS] && b->vulnerable[SIDE_EW])
+X    vul_string = "BOTH";
+X  else if (b->vulnerable[SIDE_NS])
+X    vul_string = "N-S";
+X  else if (b->vulnerable[SIDE_EW])
+X    vul_string = "E-W";
+X  else
+X    vul_string = "NONE";
+X
+X  sprintf (buf, "%s BOARD %d", b->source, b->serial_no);
+X  print (1, 78 - strlen(buf), buf);
+X
+X  switch (b->scoring_mode) {
+X  case RUBBER_SCORING:
+X    print (1, 1, "RUBBER BRIDGE");
+X    break;
+X  case DUPLICATE_SCORING:
+X    print (1, 1, "DUPLICATE BRIDGE");
+X    break;
+X  case MP_SCORING:
+X    print (1, 1, "MATCH POINTS");
+X    break;
+X  case IMP_SCORING:
+X    print (1, 1, "INTL MATCH POINTS");
+X    break;
+X  }
+X
+X  sprintf (buf, "DEALER %s, VUL %s", seat_names[b->dealer], vul_string);
+X  print (2, 1, buf);
+X
+X  sprintf (buf, "%5s %21s %-8s %-2s %6s %6s %6s %6s", " ", " ",
+X	   "CONTRACT", "BY", "RESULT", "SCORE", "IMPS", "MPS");
+X  print (4, 1, buf);
+X
+X  while ((line < 15) && (Next_page_of_scores != NULL)) {
+X    Display_Score_Record (b, Next_page_of_scores, line);
+X    line += 3;
+X    Next_page_of_scores = Next_page_of_scores->next;
+X  }
+X
+X}
+X
+Xvoid Display_First_Page_of_Scores (b)
+X     Board *b;
+X/* Initiales the scoring display and displays the first page of results from
+X * board b. 
+X */
+X{
+X  if ((b->play_records == NULL) || (b->play_records->next == NULL)) {
+X    Next_page_of_scores = Current_page_of_scores = NULL;
+X    return;
+X  }
+X
+X  Board_for_display = b;
+X  Set_Display_Mode (SCORING_DISPLAY);
+X  Set_Input_Mode (TALK_INPUT);
+X
+X  Display_Page_of_Scores (b->play_records);
+X}
+X
+Xint More_Scores_to_Display ()
+X/* int More_Scores_to_Display (void); */
+X/* Returns true if not all of the results have been displayed from the
+X * board which is currently being displayed. 
+X */
+X{
+X  return (Next_page_of_scores != NULL);
+X}
+X
+Xvoid Display_More_Scores ()
+X/* void Display_More_Scores (void); */
+X/* Displays the next page of scores for the board b. */
+X{
+X  Display_Page_of_Scores (Next_page_of_scores);
+X}
+X
+X
+X
+Xstatic void Save_Status_Message (message)
+X     char *message;
+X/* Saves the given message into the status display buffer at the
+X   current level of locking. */
+X{
+X  int i;
+X
+X  for (i = 0; (i < WIDTH(status)) && (message[i] != '\0'); i++)
+X    status_buf[status_display_level][i] = message[i];
+X  status_buf[status_display_level][i] = '\0';
+X}
+X
+Xvoid Status (message)
+X     char *message;
+X{
+X  if (status_display_level > 0) {
+X    Moderator_Comment (message);
+X    return;
+X  }
+X
+X  Clear_Status ();
+X  Save_Status_Message (message);
+X  Refresh_Status_Display ();
+X}
+X 
+Xvoid Clear_Status ()
+X{
+X  if (status_display_level > 0)
+X    return;
+X
+X  clear_screen_area (status_loc, XMIN(status), 1, WIDTH(status));
+X  status_buf [0][0] = '\0';
+X}
+X
+Xvoid Lock_Status (message)
+X     char *message;
+X/* Locks the status display.  This prevents the current message from being
+X   erased from the display.  If a new request to Status is made, that
+X   message is displayed as a moderator comment instead.
+X*/
+X{
+X  status_display_level += 1;
+X  Save_Status_Message (message);
+X  Refresh_Status_Display ();
+X}
+X
+Xvoid Unlock_Status ()
+X/* Unlocks the status display. */
+X{
+X  if (status_display_level > 0)
+X    status_display_level -= 1;
+X  Refresh_Status_Display ();
+X}
+X
+Xvoid Reset_Status ()
+X/* Resets the status display. */
+X{
+X  status_display_level = 0;
+X  Clear_Status ();
+X}
+X
+Xvoid Refresh_Status_Display ()
+X{
+X  clear_screen_area (status_loc, XMIN(status), 1, WIDTH(status));
+X  print (status_loc, XMIN(status), status_buf[status_display_level]);
+X  set_cursor 
+X    (status_loc, XMIN(status) + strlen(status_buf[status_display_level]) + 1);
+X}
+X
+X/* The bottom part of the screen is used for the exchange of comments
+X   between the players.  The following procedures are used for managing
+X   this part of the display. */
+X 
+X 
+Xstatic void blank_out_comment (c)
+X     comment_line c;
+X{
+X  int i;
+X 
+X  for (i = 0; i < COMMENT_LENGTH-1; i++) c[i] = ' ';
+X  c[COMMENT_LENGTH-1] = '\0';
+X}
+X 
+Xstatic void copy_string_to_comment (c, s)
+X     comment_line c; char *s;
+X{
+X  int i;
+X 
+X  blank_out_comment(c);
+X  i = 0;
+X  while ((s[i] != '\0') && (i < COMMENT_LENGTH-1)) {
+X    c[i] = s[i]; 
+X    i++; 
+X  }
+X 
+X}
+X 
+Xstatic void scroll_player_comments ()
+X{
+X  int i;
+X
+X  for (i = 0; i < playing_screen_talk_size-1; i++)
+X    bcopy (playing_screen_comments[i+1], playing_screen_comments[i], 
+X	   sizeof(comment_line));
+X  blank_out_comment (playing_screen_comments[playing_screen_talk_size-1]);
+X}
+X
+Xvoid Select_Conversation_Mode ()
+X{
+X  talk_start = playing_screen_talk_start;
+X  talk_end   = playing_screen_talk_end;
+X  talk_size  = playing_screen_talk_size;
+X  player_comments = playing_screen_comments;
+X}
+X
+Xvoid Select_Talk_Mode ()
+X{
+X  talk_start = full_screen_talk_start;
+X  talk_end   = full_screen_talk_end;
+X  talk_size  = full_screen_talk_size;
+X  player_comments = full_screen_comments;
+X}
+X
+Xvoid Refresh_Player_Comments ()
+X{
+X  int i;
+X
+X  if (comments_suspended)
+X    return;
+X
+X  for (i = 0; i < talk_size; i++)
+X    print (talk_start+i, 2, player_comments[i]);
+X}
+X
+Xvoid Clear_Comment_Display ()
+X{
+X  int i;
+X
+X  for (i = 0; i < full_screen_talk_size; i++)
+X    blank_out_comment (full_screen_comments + i);
+X  for (i = 0; i < playing_screen_talk_size; i++)
+X    blank_out_comment (playing_screen_comments + i);
+X
+X  full_screen_cursor = 0;
+X  Refresh_Player_Comments ();
+X}
+X 
+Xvoid Initialize_Player_Comments ()
+X{
+X  int i, m, n;
+X  
+X  full_screen_talk_end = terminal_lines - 3;
+X  playing_screen_talk_end = terminal_lines;
+X  
+X  n = full_screen_talk_end - full_screen_talk_start + 1;
+X  m = playing_screen_talk_end - playing_screen_talk_start + 1;
+X  if (n <= 0)
+X    n = 1;
+X  else if (m <= 0)
+X    m = 1;
+X  
+X  full_screen_comments = (comment_line *) 
+X    malloc (n * sizeof(comment_line));
+X  
+X  playing_screen_comments = (comment_line *)
+X    malloc (m * sizeof(comment_line));
+X  
+X  for (i = 0; i < n; i++)
+X    blank_out_comment (full_screen_comments[i]);
+X  for (i = 0; i < m; i++)
+X    blank_out_comment (playing_screen_comments[i]);
+X  
+X  full_screen_cursor = 0;
+X  full_screen_talk_size = n;
+X  playing_screen_talk_size = m;
+X
+X  if (display_mode == TALK_DISPLAY)
+X    Select_Talk_Mode ();
+X  else
+X    Select_Conversation_Mode ();
+X}
+X
+Xvoid Reinitialize_Player_Comments ()
+X{
+X  Initialize_Player_Comments ();
+X}
+X
+Xvoid Display_Player_Comment (comment_level, player_name, comment)
+X     int comment_level; char *player_name, *comment;
+X{
+X  char message_buf [200];
+X  char level_id;
+X  
+X  switch (comment_level) {
+X  case COMMENT_PRIVATE: level_id = '-'; break;
+X  case COMMENT_FORMAL:  level_id = '='; break;
+X  case COMMENT_PUBLIC:  level_id = ':'; break;
+X  default:              level_id = '*';
+X  }
+X  
+X  sprintf (message_buf, "%s%c %s", player_name, level_id, comment);
+X  
+X  copy_string_to_comment (full_screen_comments[full_screen_cursor], 
+X			  message_buf);
+X  if (full_screen_cursor < full_screen_talk_size - 1)
+X    full_screen_cursor++;
+X  else
+X    full_screen_cursor = 0;
+X  blank_out_comment (full_screen_comments[full_screen_cursor]);
+X
+X  scroll_player_comments ();
+X  copy_string_to_comment 
+X    (playing_screen_comments[playing_screen_talk_size-1], message_buf);
+X
+X  Refresh_Player_Comments ();
+X}
+X
+Xvoid Moderator_Comment (msg)
+X     char *msg;
+X{
+X  Display_Player_Comment (COMMENT_PUBLIC, "MODERATOR", msg);
+X}
+X
+Xvoid Network_Comment (msg)
+X     char *msg;
+X{
+X  Display_Player_Comment (COMMENT_PRIVATE, "NETWORK", msg);
+X}
+X
+Xvoid Suspend_Comment_Display ()
+X{
+X  comments_suspended = 1;
+X}
+X
+Xvoid Continue_Comment_Display ()
+X{
+X  comments_suspended = 0;
+X}
+X
+X 
+Xvoid Begin_full_screen_talk_mode ()
+X{
+X  int i;
+X
+X  Select_Talk_Mode ();
+X  
+X  for (i = 0; i <= XMAX(converse); i++) line_buf[i] = '-';
+X  line_buf[XMAX(converse)+1] = '\0';
+X  print (full_screen_talk_start-1, 1, line_buf);
+X  line_buf[72] = '+';
+X  print (full_screen_talk_end+1, 1, line_buf);
+X  for (i = 1; i < XMAX(converse); i++) line_buf[i] = ' ';
+X  line_buf[0] = line_buf[XMAX(converse)] = '|';
+X  for (i = full_screen_talk_start; i <= full_screen_talk_end; i++)
+X    print (i, 1, line_buf);
+X  
+X  Refresh_Player_Comments ();
+X  
+X  /* setup the talk buffer: */
+X  
+X  print (terminal_lines-1, 1, "TALK");
+X  status_loc = terminal_lines;
+X}
+X
+Xvoid End_full_screen_talk_mode ()
+X{
+X  Select_Conversation_Mode ();
+X  status_loc = YMIN(status);
+X  Refresh_Display ();
+X}
+END_OF_FILE
+if test 34086 -ne `wc -c <'display.c'`; then
+    echo shar: \"'display.c'\" unpacked with wrong size!
+fi
+# end of 'display.c'
+fi
+echo shar: End of archive 6 \(of 14\).
+cp /dev/null ark6isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 14 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

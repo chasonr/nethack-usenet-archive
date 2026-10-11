@@ -1,0 +1,478 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+Path: g2news2.google.com!postnews.google.com!e4g2000prn.googlegroups.com!not-for-mail
+From: Stephen Anthony Uy <tsanth@iname.com>
+Newsgroups: rec.games.roguelike.nethack
+Subject: [PATCH] Port of Ray Chason's patch for IBMgraphics on UTF-8 terminals 
+	to v3.4.3.
+Date: Tue, 15 Sep 2009 13:47:23 -0700 (PDT)
+Organization: http://groups.google.com
+Lines: 452
+Message-ID: <41823c16-aef0-4939-a93d-2fbbe3534e79@e4g2000prn.googlegroups.com>
+NNTP-Posting-Host: 76.170.88.3
+Mime-Version: 1.0
+Content-Type: text/plain; charset=ISO-8859-1
+X-Trace: posting.google.com 1253047643 4853 127.0.0.1 (15 Sep 2009 20:47:23 GMT)
+X-Complaints-To: groups-abuse@google.com
+NNTP-Posting-Date: Tue, 15 Sep 2009 20:47:23 +0000 (UTC)
+Complaints-To: groups-abuse@google.com
+Injection-Info: e4g2000prn.googlegroups.com; posting-host=76.170.88.3; 
+	posting-account=oP41LwoAAAAlf7EaPwc7NmyRmxwusHf3
+User-Agent: G2/1.0
+X-HTTP-UserAgent: Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.9.0.14) 
+	Gecko/2009090216 Ubuntu/9.04 (jaunty) Firefox/3.0.14,gzip(gfe),gzip(gfe)
+Xref: g2news2.google.com rec.games.roguelike.nethack:11027
+
+This is a port of a patch from 2002 which implemented IBMgraphics on
+UTF-8-capable terminals.  The patch was produced using git v1.6.0.4.
+I'm currently using this with great success on gnome-terminal; YMMV.
+
+Original patch:
+    http://groups.google.com/group/rec.games.roguelike.nethack/
+        browse_thread/thread/a20fed2561a6abb7
+
+Original explanation of patch:
+    http://groups.google.com/group/rec.games.roguelike.nethack/
+        browse_frm/thread/f94adf32bd098847/5d88a63ae67d706f
+
+---
+ include/config.h    |    3 ++
+ src/drawing.c       |    7 ++++-
+ src/mapglyph.c      |    1 +
+ sys/share/ioctl.c   |   31 +++++++++++++++------
+ sys/share/unixtty.c |   49 +++++++++++++++++++++++++++++++---
+ sys/unix/unixmain.c |   28 +++++++++++++------
+ sys/unix/unixunix.c |   31 +++++++++++++++------
+ win/tty/wintty.c    |   74 +++++++++++++++++++++++++++++++++++++++++++
+++++++++
+ 8 files changed, 192 insertions(+), 32 deletions(-)
+
+diff --git a/include/config.h b/include/config.h
+index 376bdea..99a39ba 100644
+--- a/include/config.h
++++ b/include/config.h
+@@ -48,6 +48,9 @@
+ /* #define GNOME_GRAPHICS */	/* Gnome interface */
+ /* #define MSWIN_GRAPHICS */	/* Windows NT, CE, Graphics */
+
++/* Define to display IBMgraphics via UTF-8 */
++#define UNICODE
++
+ /*
+  * Define the default window system.  This should be one that is
+compiled
+  * into your system (see defines above).  Known window systems are:
+diff --git a/src/drawing.c b/src/drawing.c
+index da39614..96e91d9 100644
+--- a/src/drawing.c
++++ b/src/drawing.c
+@@ -741,10 +741,15 @@ static const uchar r_oc_syms[MAXOCLASSES] = {
+ static const uchar IBM_r_oc_syms[MAXOCLASSES] = {	/* a la EPYX Rogue
+*/
+ /* 0*/	'\0',
+ 	ILLOBJ_SYM,
+-#  if defined(MSDOS) || defined(OS2) || ( defined(WIN32) && !defined
+(MSWIN_GRAPHICS) )
++#  if defined(UNICODE) || defined(MSDOS) || defined(OS2) || ( defined
+(WIN32) && !defined(MSWIN_GRAPHICS) )
+ 	0x18,			/* weapon: up arrow */
++#   ifdef UNICODE
++	0x0a,                   /* armor:  Vert rect with o */
++	0x0b,                   /* ring:   circle with arrow */
++#   else
+ /*	0x0a, */ ARMOR_SYM,	/* armor:  Vert rect with o */
+ /*	0x09, */ RING_SYM,	/* ring:   circle with arrow */
++#   endif
+ /* 5*/	0x0c,			/* amulet: "female" symbol */
+ 	TOOL_SYM,
+ 	0x05,			/* food:   club (as in cards) */
+diff --git a/src/mapglyph.c b/src/mapglyph.c
+index 92fbd17..66e2b93 100644
+--- a/src/mapglyph.c
++++ b/src/mapglyph.c
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+
+ #include "hack.h"
++#include "tcap.h"
+ #if defined(TTY_GRAPHICS)
+ #include "wintty.h"	/* for prototype of has_color() only */
+ #endif
+diff --git a/sys/share/ioctl.c b/sys/share/ioctl.c
+index 8349281..fee4a5d 100644
+--- a/sys/share/ioctl.c
++++ b/sys/share/ioctl.c
+@@ -68,13 +68,18 @@ struct termio termio;
+ #include "tcap.h"	/* for LI and CO */
+ #endif
+
+-#ifdef _M_UNIX
++#ifdef UNICODE
++extern void NDECL(utf8_mapon);
++extern void NDECL(utf8_mapoff);
++#else
++# ifdef _M_UNIX
+ extern void NDECL(sco_mapon);
+ extern void NDECL(sco_mapoff);
+-#endif
+-#ifdef __linux__
++# endif
++# ifdef __linux__
+ extern void NDECL(linux_mapon);
+ extern void NDECL(linux_mapoff);
++# endif
+ #endif
+
+ #ifdef AUX
+@@ -157,11 +162,15 @@ dosuspend()
+ # ifdef SIGTSTP
+ 	if(signal(SIGTSTP, SIG_IGN) == SIG_DFL) {
+ 		suspend_nhwindows((char *)0);
+-#  ifdef _M_UNIX
++#  ifdef UNICODE
++		utf8_mapon();
++#  else
++#   ifdef _M_UNIX
+ 		sco_mapon();
+-#  endif
+-#  ifdef __linux__
++#   endif
++#   ifdef __linux__
+ 		linux_mapon();
++#   endif
+ #  endif
+ 		(void) signal(SIGTSTP, SIG_DFL);
+ #  ifdef AUX
+@@ -169,11 +178,15 @@ dosuspend()
+ #  else
+ 		(void) kill(0, SIGTSTP);
+ #  endif
+-#  ifdef _M_UNIX
++#  ifdef UNICODE
++		utf8_mapoff();
++#  else
++#   ifdef _M_UNIX
+ 		sco_mapoff();
+-#  endif
+-#  ifdef __linux__
++#   endif
++#   ifdef __linux__
+ 		linux_mapoff();
++#   endif
+ #  endif
+ 		resume_nhwindows();
+ 	} else {
+diff --git a/sys/share/unixtty.c b/sys/share/unixtty.c
+index 05b76b4..967ff4b 100644
+--- a/sys/share/unixtty.c
++++ b/sys/share/unixtty.c
+@@ -307,7 +307,48 @@ introff()		/* disable kbd interrupts if
+required*/
+ #endif
+ }
+
+-#ifdef _M_UNIX		/* SCO UNIX (3.2.4), from Andreas Arens */
++#ifdef UNICODE
++void NDECL(utf8_mapon);
++void NDECL(utf8_mapoff);
++void NDECL(init_utf8_cons);
++
++void
++utf8_mapon()
++{
++# ifdef TTY_GRAPHICS
++	if (!strcmp(windowprocs.name, "tty")) {
++		fwrite("\033%@", 1, 3, stdout);
++	}
++# endif
++}
++
++void
++utf8_mapoff()
++{
++# ifdef TTY_GRAPHICS
++	if (!strcmp(windowprocs.name, "tty")) {
++		fwrite("\033%G", 1, 3, stdout);
++	}
++# endif
++}
++
++void
++init_utf8_cons()
++{
++# ifdef TTY_GRAPHICS
++	if (!strcmp(windowprocs.name, "tty")) {
++		atexit(utf8_mapon);
++		utf8_mapoff();
++#  ifdef TEXTCOLOR
++		if (has_colors())
++			iflags.use_color = TRUE;
++#  endif
++	}
++# endif
++}
++#endif
++
++#if defined(_M_UNIX) && !defined(UNICODE)              /* SCO UNIX
+(3.2.4), from Andreas Arens */
+ # include <sys/console.h>
+
+ # define BSIZE (E_TABSZ*2)
+@@ -373,10 +414,10 @@ init_sco_cons()
+ 	}
+ # endif
+ }
+-#endif	/* _M_UNIX */
++#endif /* _M_UNIX && !UNICODE */
+
+
+-#ifdef __linux__		/* via Jesse Thilo and Ben Gertzfield */
++#if defined(__linux__) && !defined(UNICODE)            /* via Jesse
+Thilo and Ben Gertzfield */
+ # include <sys/vt.h>
+
+ int linux_flag_console = 0;
+@@ -430,7 +471,7 @@ init_linux_cons()
+ 	}
+ # endif
+ }
+-#endif	/* __linux__ */
++#endif /* __linux__ && !UNICODE */
+
+
+ #ifndef __begui__	/* the Be GUI will define its own error proc */
+diff --git a/sys/unix/unixmain.c b/sys/unix/unixmain.c
+index a13514f..fe1a488 100644
+--- a/sys/unix/unixmain.c
++++ b/sys/unix/unixmain.c
+@@ -30,13 +30,17 @@ static void FDECL(chdirx, (const char
+*,BOOLEAN_P));
+ static boolean NDECL(whoami);
+ static void FDECL(process_options, (int, char **));
+
+-#ifdef _M_UNIX
++#ifdef UNICODE
++extern void NDECL(init_utf8_cons);
++#else
++# ifdef _M_UNIX
+ extern void NDECL(check_sco_console);
+ extern void NDECL(init_sco_cons);
+-#endif
+-#ifdef __linux__
++# endif
++# ifdef __linux__
+ extern void NDECL(check_linux_console);
+ extern void NDECL(init_linux_cons);
++# endif
+ #endif
+
+ static void NDECL(wd_message);
+@@ -143,20 +147,26 @@ char *argv[];
+ 	chdirx(dir,1);
+ #endif
+
+-#ifdef _M_UNIX
++#ifndef UNICODE
++# ifdef _M_UNIX
+ 	check_sco_console();
+-#endif
+-#ifdef __linux__
++# endif
++# ifdef __linux__
+ 	check_linux_console();
++# endif
+ #endif
+ 	initoptions();
+ 	init_nhwindows(&argc,argv);
+ 	exact_username = whoami();
+-#ifdef _M_UNIX
++#ifdef UNICODE
++	init_utf8_cons();
++#else
++# ifdef _M_UNIX
+ 	init_sco_cons();
+-#endif
+-#ifdef __linux__
++# endif
++# ifdef __linux__
+ 	init_linux_cons();
++# endif
+ #endif
+
+ 	/*
+diff --git a/sys/unix/unixunix.c b/sys/unix/unixunix.c
+index c2f84eb..b3b55c7 100644
+--- a/sys/unix/unixunix.c
++++ b/sys/unix/unixunix.c
+@@ -13,13 +13,18 @@
+ #endif
+ #include <signal.h>
+
+-#ifdef _M_UNIX
++#ifdef UNICODE
++extern void NDECL(utf8_mapon);
++extern void NDECL(utf8_mapoff);
++#else
++# ifdef _M_UNIX
+ extern void NDECL(sco_mapon);
+ extern void NDECL(sco_mapoff);
+-#endif
+-#ifdef __linux__
++# endif
++# ifdef __linux__
+ extern void NDECL(linux_mapon);
+ extern void NDECL(linux_mapoff);
++# endif
+ #endif
+
+ #ifndef NHSTDC
+@@ -258,11 +263,15 @@ int wt;
+ {
+ 	register int f;
+ 	suspend_nhwindows((char *)0);	/* also calls end_screen() */
+-#ifdef _M_UNIX
++#ifdef UNICODE
++	utf8_mapon();
++#else
++# ifdef _M_UNIX
+ 	sco_mapon();
+-#endif
+-#ifdef __linux__
++# endif
++# ifdef __linux__
+ 	linux_mapon();
++# endif
+ #endif
+ 	if((f = fork()) == 0){		/* child */
+ 		(void) setgid(getgid());
+@@ -280,11 +289,15 @@ int wt;
+ 	(void) signal(SIGINT,SIG_IGN);
+ 	(void) signal(SIGQUIT,SIG_IGN);
+ 	(void) wait( (int *) 0);
+-#ifdef _M_UNIX
++#ifdef UNICODE
++	utf8_mapoff();
++#else
++# ifdef _M_UNIX
+ 	sco_mapoff();
+-#endif
+-#ifdef __linux__
++# endif
++# ifdef __linux__
+ 	linux_mapoff();
++# endif
+ #endif
+ 	(void) signal(SIGINT, (SIG_RET_TYPE) done1);
+ #ifdef WIZARD
+diff --git a/win/tty/wintty.c b/win/tty/wintty.c
+index 9cba7d7..a8605b9 100644
+--- a/win/tty/wintty.c
++++ b/win/tty/wintty.c
+@@ -25,6 +25,10 @@ extern void msmsg(const char *,...);
+ # endif
+ #endif
+
++#ifdef UNICODE
++static void FDECL (put_utf8, (int));
++#endif
++
+
+ #ifndef NO_TERMS
+ #include "tcap.h"
+@@ -1709,7 +1713,11 @@ tty_putsym(window, x, y, ch)
+     case NHW_MAP:
+     case NHW_BASE:
+ 	tty_curs(window, x, y);
++#ifdef UNICODE
++	put_utf8(ch); /* To print the currency symbol on the Rogue level */
++#else
+ 	(void) putchar(ch);
++#endif
+ 	ttyDisplay->curx++;
+ 	cw->curx++;
+ 	break;
+@@ -2320,6 +2328,67 @@ end_glyphout()
+ #endif
+ }
+
++#ifdef UNICODE
++static void
++put_utf8(ch)
++int ch;
++{
++    /* CP437 to Unicode mapping according to the Unicode Consortium
+*/
++    static ushort cp437[] =
++    {
++	0x0020, 0x263A, 0x263B, 0x2665, 0x2666, 0x2663, 0x2660, 0x2022,
++	0x25D8, 0x25CB, 0x25D9, 0x2642, 0x2640, 0x266A, 0x266B, 0x263C,
++	0x25BA, 0x25C4, 0x2195, 0x203C, 0x00B6, 0x00A7, 0x25AC, 0x21A8,
++	0x2191, 0x2193, 0x2192, 0x2190, 0x221F, 0x2194, 0x25B2, 0x25BC,
++	0x0020, 0x0021, 0x0022, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027,
++	0x0028, 0x0029, 0x002a, 0x002b, 0x002c, 0x002d, 0x002e, 0x002f,
++	0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
++	0x0038, 0x0039, 0x003a, 0x003b, 0x003c, 0x003d, 0x003e, 0x003f,
++	0x0040, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,
++	0x0048, 0x0049, 0x004a, 0x004b, 0x004c, 0x004d, 0x004e, 0x004f,
++	0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057,
++	0x0058, 0x0059, 0x005a, 0x005b, 0x005c, 0x005d, 0x005e, 0x005f,
++	0x0060, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,
++	0x0068, 0x0069, 0x006a, 0x006b, 0x006c, 0x006d, 0x006e, 0x006f,
++	0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,
++	0x0078, 0x0079, 0x007a, 0x007b, 0x007c, 0x007d, 0x007e, 0x2302,
++	0x00c7, 0x00fc, 0x00e9, 0x00e2, 0x00e4, 0x00e0, 0x00e5, 0x00e7,
++	0x00ea, 0x00eb, 0x00e8, 0x00ef, 0x00ee, 0x00ec, 0x00c4, 0x00c5,
++	0x00c9, 0x00e6, 0x00c6, 0x00f4, 0x00f6, 0x00f2, 0x00fb, 0x00f9,
++	0x00ff, 0x00d6, 0x00dc, 0x00a2, 0x00a3, 0x00a5, 0x20a7, 0x0192,
++	0x00e1, 0x00ed, 0x00f3, 0x00fa, 0x00f1, 0x00d1, 0x00aa, 0x00ba,
++	0x00bf, 0x2310, 0x00ac, 0x00bd, 0x00bc, 0x00a1, 0x00ab, 0x00bb,
++	0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556,
++	0x2555, 0x2563, 0x2551, 0x2557, 0x255d, 0x255c, 0x255b, 0x2510,
++	0x2514, 0x2534, 0x252c, 0x251c, 0x2500, 0x253c, 0x255e, 0x255f,
++	0x255a, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256c, 0x2567,
++	0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256b,
++	0x256a, 0x2518, 0x250c, 0x2588, 0x2584, 0x258c, 0x2590, 0x2580,
++	0x03b1, 0x00df, 0x0393, 0x03c0, 0x03a3, 0x03c3, 0x00b5, 0x03c4,
++	0x03a6, 0x0398, 0x03a9, 0x03b4, 0x221e, 0x03c6, 0x03b5, 0x2229,
++	0x2261, 0x00b1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00f7, 0x2248,
++	0x00b0, 0x2219, 0x00b7, 0x221a, 0x207f, 0x00b2, 0x25a0, 0x00a0
++    };
++    ushort code;
++
++    /* Convert selected code to UTF-8 */
++    code = cp437[ch & 0xFF];
++    if (code < 0x80) {
++	putchar(code);
++    }
++    else if (code < 0x0800) {
++	putchar(0xC0 | ((code>> 6) & 0x1F));
++	putchar(0x80 | ( code      & 0x3F));
++    }
++    else {
++	putchar(0xE0 | ((code>>12) & 0x1F));
++	putchar(0x80 | ((code>> 6) & 0x3F));
++	putchar(0x80 | ( code      & 0x3F));
++    }
++}
++# endif
++
++
+ #ifndef WIN32
+ void
+ g_putch(in_ch)
+@@ -2330,7 +2399,12 @@ int in_ch;
+ # if defined(ASCIIGRAPH) && !defined(NO_TERMS)
+     if (iflags.IBMgraphics || iflags.eight_bit_tty) {
+ 	/* IBM-compatible displays don't need other stuff */
++#  ifdef UNICODE
++	/* IBM graphics via UTF-8 */
++	put_utf8(ch);
++#  else
+ 	(void) putchar(ch);
++#  endif
+     } else if (ch & 0x80) {
+ 	if (!GFlag || HE_resets_AS) {
+ 	    graph_on();
+--
+1.6.0.4
+
+

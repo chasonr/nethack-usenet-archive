@@ -1,0 +1,1059 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 162299,33899c2d34191b71,start
+X-Google-Attributes: gid162299,public
+X-Google-ArrivalTime: 1985-08-10 21:16:17 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site oddjob.UUCP
+Path: utzoo!linus!philabs!cmcl2!seismo!lll-crg!dual!qantel!ihnp4!gargoyle!oddjob!matt
+From: matt@oddjob.UUCP (Matt Crawford)
+Newsgroups: net.sources.games
+Subject: search -- part 1 of 6
+Message-ID: <899@oddjob.UUCP>
+Date: Sun, 11-Aug-85 00:16:17 EDT
+Article-I.D.: oddjob.899
+Posted: Sun Aug 11 00:16:17 1985
+Date-Received: Wed, 14-Aug-85 21:34:15 EDT
+Reply-To: matt@oddjob.UUCP (Matt Crawford)
+Followup-To: net.games
+Organization: U. Chicago, Astronomy & Astrophysics
+Lines: 1037
+
+: This is a shar archive.  Extract with sh, not csh.
+echo x - search.c
+sed -e 's/^X//' > search.c << '!xxENDITxx!'
+X#ifndef lint
+Xstatic char rcsid[] = "$Header: search.c,v 2.4 85/08/06 19:20:08 matt Exp $";
+X#endif
+X/*
+X *
+X * search
+X *
+X * multi-player and multi-system search and destroy.
+X *
+X * Original by Dave Pare	1983
+X * Ported & improved
+X *      by Matt Crawford	1985
+X *
+X * The player process.  Search tries to connect to the daemon
+X * via either a "tcp" internet socket (to another machine) or
+X * a "stream" local socket.  It gathers data about the player
+X * and sends it along to the daemon.
+X *
+X * termcap routines taken from the original "slave.c"
+X *
+X * Copyright (c) 1983
+X *
+X * $Log:	search.c,v $
+X * Revision 2.4  85/08/06  19:20:08  matt
+X * Must byte-swap [htons()] a non-standard port number.
+X * 
+X * Revision 2.3  85/07/31  23:57:30  matt
+X * Detect the socket shutdown properly.
+X * 
+X * Revision 2.2  85/04/11  16:41:20  matt
+X * Damn the padding, full speed ahead!
+X * 
+X * Revision 2.1  85/04/10  17:31:47  matt
+X * Major de-linting and minor restructuring.
+X * 
+X * Revision 1.6  85/02/25  14:20:03  matt
+X * Make the select() poll be a real poll and the wait be a
+X * longer wait.
+X * 
+X * Revision 1.5  85/02/10  01:20:36  matt
+X * Had to double a backslash in the advisory message.
+X * 
+X * Revision 1.4  85/02/09  23:50:13  matt
+X * Eliminated the dependence on the value of the mask after
+X * select() times out.  Use the return value to distinguish
+X * a timeout!!
+X * 
+X * Revision 1.3  84/07/08  17:04:24  matt
+X * Added Log
+X * 
+X * Revision 1.2  84/07/07  18:16:34  matt
+X * Put player.speed into network byte order just before sending the
+X * player structure (t_file) to the daemon.
+X */
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include <sys/file.h>
+X#include <sgtty.h>
+X#include <ctype.h>
+X#include <pwd.h>
+X#include <signal.h>
+X#include <sys/time.h>
+X#include <errno.h>
+X#include <sys/socket.h>
+X#include <sys/un.h>
+X
+X#ifdef INET
+X#include <netinet/in.h>
+X#include <netdb.h>
+X#endif
+X
+X#include "defines.h"
+X#include "structs.h"
+X
+Xextern	char *ttyname();
+Xextern	int errno;
+X
+Xint	locked = 0;		/* for the signal handler - sockets made yet? */
+Xstruct	sgttyb savebuf;		/* for saving the term capabilities */
+Xint	line;			/* the line discipline (for the tty) */
+Xint	dtabsiz;		/* how many fd's does YOUR system allow? */
+Xint	fd;			/* the terminal - opened from "/dev/tty" */
+Xt_file	player;			/* who are we, what does our term look like */
+Xint	sock;			/* socket to daemon */
+X
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X	void	fatal();
+X	int	reset();
+X	char	*strcpy(),
+X		*strncpy();
+X	register int cc;		/* returned from all sorts of calls */
+X	register int i;			/* general purpose register */
+X	register int sockmask;
+X	register int stdinmask;
+X	char	buf[4096];		/* misc buffer for i/o */
+X	int	mask;			/* masks used in select() calls */
+X	struct	sgttyb sgbuf;		/* used to set modes - cbreak, etc */
+X	struct	timeval timeout;	/* time outs for select calls */
+X	int	save_mask;		/* don't calculate mask each time */
+X	char	*tmp;
+X	struct	passwd *pwd;		/* our user's /etc/passwd entry */
+X	struct	sockaddr loc_addr;	/* local socket address */
+X#ifdef INET
+X	int	to_in;			/* to internet (connection) */
+X	char	hostname[32];		/* name of our host (that we're on */
+X	char	shortname[32];		/* the shortest name for this host */
+X	struct	servent *serv;		/* returned by getservbyname() */
+X	struct	hostent *host;		/* returned by gethostbyname() */
+X	int	port_num;		/* port number if getservbyname fails */
+X	struct	sockaddr_in in_addr;	/* inter-net socket address */
+X#endif
+X
+X	if (!isatty(0) || !isatty(1)) {
+X		printf("search: must be played from a terminal");
+X		exit(1);
+X	}
+X#ifdef INET
+X	if (argc > 3) {
+X		printf("usage: search [hostname] [portnum]\n");
+X		exit(1);
+X	}
+X	if (argc == 1) 
+X		to_in = 0;
+X	else
+X		to_in = 1;
+X	if (argc == 3)
+X		port_num = atoi(argv[2]);
+X	else
+X		port_num = DEFAULT_IN_PORT;
+X	dtabsiz = getdtablesize();
+X	if (to_in) {
+X		(void) gethostname(hostname, sizeof(hostname));
+X		/*
+X		 * find the shortest name for our local system
+X		 */
+X		host = gethostbyname(hostname);
+X		tmp = host->h_name;
+X		for (i=0; host->h_aliases[i]; i++)
+X			if (strlen(tmp) > strlen(host->h_aliases[i]))
+X				tmp = host->h_aliases[i];
+X		(void) strcpy(shortname, tmp);
+X		/*
+X		 * now find the remote host
+X		 */
+X		host = gethostbyname(argv[1]);
+X		if (host == NULL) {
+X			printf("search: no such host \"%s\"\n", argv[1]);
+X			exit(1);
+X		}
+X		/*
+X		 * get the service from /etc/services (525?)
+X		 */
+X		sock = socket(AF_INET, SOCK_STREAM, 0);
+X		if (sock < 0) {
+X			perror("socket");
+X			exit(1);
+X		}
+X		serv = getservbyname("search", "tcp");
+X		if (serv == NULL || argc == 3) {
+X			if (serv == NULL)
+X				fprintf(stderr,"no entry in /etc/services\n");
+X			fprintf(stderr,"trying port %d\n", port_num);
+X			fprintf(stderr,"use ^\\ if no game screen comes up!\n");
+X			sleep(2);
+X			in_addr.sin_port = htons(port_num);
+X		} else
+X			in_addr.sin_port = serv->s_port;
+X		in_addr.sin_family = host->h_addrtype;
+X		bcopy(host->h_addr, &in_addr.sin_addr, host->h_length);
+X	} else {
+X		sock = socket(AF_UNIX, SOCK_STREAM, 0);
+X		if (sock < 0) {
+X			perror("search, socket");
+X			exit(1);
+X		}
+X		(void) strcpy(loc_addr.sa_data, SLOCK);
+X	}
+X#else
+X	sock = socket(AF_UNIX, SOCK_STREAM, 0);
+X	if (sock < 0) {
+X		perror("search, socket");
+X		exit(1);
+X	}
+X	(void) strcpy(loc_addr.sa_data, SLOCK);
+X#endif
+X	/*
+X	 * make it possible to get out-of-band messages on our favorite
+X	 * socket.
+X	 */
+X	fcntl(sock, F_SETOWN, getpid());
+X	/*
+X	 * open our own tty for both reading & writing - makes it
+X	 * much easier to do ioctls since we only have to do them on
+X	 * the one fd now.
+X	 *
+X	 * it has been observed that running search as root occasionally
+X	 * changes /dev/tty to 622
+X	 */
+X	fd = open("/dev/tty", O_RDWR, 0);
+X	if (fd < 0)
+X		fatal("cannot open your tty\n");
+X	/*
+X	 * save the old term characteristics, and the line discipline
+X	 */
+X	ioctl(fd, TIOCGETP, (char *)&savebuf);
+X	if (ioctl(fd, TIOCGETD, (char *)&line) == -1)
+X		fatal("cannot get line discipline\n");
+X	/*
+X	 * set all the signals - SIGURG is for out-of-band data
+X	 * notification
+X	 */
+X	(void) signal(SIGINT, SIG_IGN);
+X	(void) signal(SIGTERM, SIG_IGN);
+X	(void) signal(SIGQUIT, reset);
+X	(void) signal(SIGHUP, reset);
+X	(void) signal(SIGPIPE, reset);
+X	(void) signal(SIGURG, reset);
+X	(void) signal(SIGTSTP, SIG_IGN);
+X	(void) signal(SIGSTOP, SIG_IGN);
+X	/*
+X	 * now set up the player structure for transmission to the
+X	 * daemon.
+X	 */
+X	i = getuid();
+X	pwd = getpwuid(i);
+X	if (pwd == NULL) {
+X		/* stolen from "talk" */
+X		fprintf(stderr,"You don't exist.  Go away.\n");
+X		reset(0);
+X	}
+X#ifdef INET
+X	if (to_in)
+X		(void) sprintf(player.p_name, "%s@%s", pwd->pw_name, shortname);
+X	else
+X#endif
+X		(void) strcpy(player.p_name, pwd->pw_name);
+X	if (termcap(&player))
+X		fatal("terminal unsuitable for play");
+X	/*
+X	 * Set up terminal modes for game
+X	 */
+X	line = NTTYDISC;
+X	ioctl(fd, TIOCSETD, (char *)&line);
+X	ioctl(fd, TIOCGETP, (char *)&sgbuf);
+X	sgbuf.sg_flags |= CBREAK;
+X	sgbuf.sg_flags &= ~ECHO;
+X	ioctl(fd, TIOCSETP, (char *)&sgbuf);
+X	locked++;
+X	/*
+X	 * now we connect to the daemon
+X	 */
+X#ifdef INET
+X	if (to_in) {
+X		/*
+X		 * and connect to the foreign machine's search daemon
+X		 */
+X		if (connect(sock, (struct sockaddr *)&in_addr,
+X						sizeof(in_addr))) {
+X			printf("search: can't connect to %s's search daemon\n",
+X				argv[1]);
+X			reset(0);
+X		}
+X	} else {
+X		/*
+X		 * connect to the local search daemon thru the lock
+X		 * file (usually /tmp/slock for historical reasons)
+X		 */
+X		if (connect(sock, &loc_addr, sizeof(loc_addr))) {
+X			printf("search: no local search daemon running\n");
+X			reset(0);
+X		}
+X	}
+X#else
+X	if (connect(sock, &loc_addr, sizeof(loc_addr))) {
+X		printf("search: no local search daemon running\n");
+X		reset(0);
+X	}
+X#endif
+X	locked++;
+X	/*
+X	 * transmit all the info we've gathered to the daemon
+X	 */
+X	player.p_speed = htonl(player.p_speed);
+X	if (write(sock, (char *)&player, sizeof(t_file)) < sizeof(t_file)) {
+X		perror("write");
+X		fatal("bad connect on socket");
+X	}
+X	/*
+X	 * set up all the stuff for the select loop
+X	 */
+X	sockmask = 1<<sock;
+X	stdinmask = 1<<0;
+X	save_mask = sockmask | stdinmask;
+X	timeout.tv_sec = 30L;
+X	timeout.tv_usec = 0L;
+X	locked++;
+X	/*
+X	 * and loop until that out-of-band message arrives
+X	 * (or some nasty error occurs)
+X	 */
+X	for (;;) {
+X		mask = save_mask;
+X		i = select(dtabsiz, &mask, NULLINT, NULLINT, &timeout);
+X		if (i < 0) {
+X			if (errno = EINTR)
+X				continue;
+X			perror("select");
+X		}
+X		/*
+X		 * nope - no data waiting.  select() timed out.
+X		 */
+X		if (!i)
+X			continue;
+X		/*
+X		 * data waiting on stdin (the keyboard).  read it in,
+X		 * and send it to the daemon.
+X		 */
+X		if (mask & stdinmask) {
+X			i = read(0, buf, sizeof(buf));
+X			if (i <= 0) {
+X				perror("read");
+X				break;
+X			}
+X			cc = write(sock, buf, i);
+X			if (cc < i) {
+X				perror("write");
+X				break;
+X			}
+X		}
+X		/*
+X		 * input waiting from the daemon - read it in and
+X		 * write it to the screen (stdout).  it's a bunch
+X		 * of screen/map updates!
+X		 */
+X		if (mask & sockmask) {
+X			cc = read(sock, buf, sizeof(buf));
+X			/*
+X			 * when you get zero characters from a socket that
+X			 * had input waiting, it means that the socket was
+X			 * closed down (from the other side)
+X			 */
+X			if (cc == 0)
+X				reset(0);
+X			if (cc < 0) {
+X				if (errno == EINTR)
+X					continue;
+X				perror("socket read");
+X				break;
+X			}
+X			cc = write(1, buf, cc);
+X		}
+X	}
+X	fprintf(stderr,"the daemon died!\n");
+X	reset(0);
+X}
+X
+X
+Xreset(signum)
+Xint signum;
+X{
+X	char	buf[1024];
+X	struct	timeval delay;
+X	int	mask;
+X	int	i;
+X
+X	switch (locked) {
+X		/*
+X		 * disconnect from our socket (getting rid of the
+X		 * gunk possibly leftover)
+X		 */
+X		case 3:
+X		case 2:
+X			mask = 1 << sock;
+X			delay.tv_sec = delay.tv_usec = 0L;
+X			shutdown(sock, 1);
+X			i = select(dtabsiz, &mask, NULLINT, NULLINT, &delay);
+X			if (i > 0) {
+X				i = read(sock, buf, sizeof(buf));
+X				write(1, buf, i);
+X			}
+X			shutdown(sock, 2);
+X			(void) close(sock);
+X			/* fall through */
+X		/*
+X		 * set the term stuff back to normal
+X		 */
+X		case 1:
+X			if (ioctl(fd, TIOCSETD, (char *)&line) == -1)
+X				perror("tiocsetd");
+X			ioctl(fd, TIOCSETP, (char *)&savebuf);
+X			(void) close(fd);
+X			break;
+X		default:
+X			break;
+X	}
+X	exit(signum);
+X}
+X
+Xvoid
+X/*VARARGS1*/
+Xfatal(fmt, arg)
+Xchar *fmt;
+Xint arg;
+X{
+X	fprintf(stderr, "search: fatal error, ");
+X	fprintf(stderr, fmt, arg);
+X	(void) fputc('\n', stderr);
+X	reset(0);
+X}
+X
+Xstatic	char	buf[1024], *bp = buf;
+X
+Xstruct	init {
+X	char	*i_name;	/* termcap name */
+X	char	*i_dest;	/* where to put the result */
+X	short	i_size;		/* sizeof associated buffer */
+X	short	i_pad;		/* padding flag: 0=no, 1=P, 2=P* */
+X} list[] = {
+X	{ "bc", player.p_BC, sizeof(player.p_BC), 0 },
+X	{ "up", player.p_UP, sizeof(player.p_UP), 0 },
+X	{ "cm", player.p_CM, sizeof(player.p_CM), 1 },
+X	{ "ce", player.p_CE, sizeof(player.p_CE), 1 },
+X	{ "cl", player.p_CL, sizeof(player.p_CL), 2 },
+X	{ NULLCH, NULLCH, 0, 0 }
+X};
+X
+X/*
+X * Build up the termcap description needed by searchd
+X */
+Xint termcap(p)
+Xregister t_file *p;
+X{
+X	register char	*cp;
+X	register int	lines,	cols;
+X	register struct init *pi = list;
+X	char	*term,	tbuf[BUFSIZ];
+X	void	getstring();
+X	struct	sgttyb	sbuf;
+X	extern	char	*getenv(),	*tgetstr();
+X
+X	ioctl(fd, TIOCGETP, (char *)&sbuf);
+X	p->p_speed = sbuf.sg_ospeed;
+X	if ((term = getenv("TERM")) != NULL && tgetent(tbuf, term) > 0) {
+X		if (cp = tgetstr("pc", &bp))
+X			p->p_PC = *cp;
+X		cols = tgetnum("co", &bp);
+X		lines = tgetnum("li", &bp);
+X		while (pi->i_size != 0) {
+X			getstring(pi);
+X			pi++;
+X		}
+X		return(*p->p_CM == '\0' || *p->p_CL == '\0' || cols < 80 ||
+X		       lines < 24);
+X	}
+X	return(1);
+X}
+X
+X/*
+X * Termcap support routine
+X */
+Xvoid
+Xgetstring(pi)
+Xregister struct	init	*pi;
+X{
+X	register char	*cp = tgetstr(pi->i_name, &bp);
+X
+X	if (cp == NULL)
+X		return;
+X	if ( pi->i_pad ) {
+X		while ( index( "0123456789.", *cp ) )
+X			cp++;
+X		if ( pi->i_pad == 2 && *cp == '*' )
+X			cp++;
+X	}
+X	if ( strlen(cp) >= pi->i_size )
+X		fatal("%s string too long", pi->i_name);
+X	(void) strncpy(pi->i_dest, cp , pi->i_size);
+X}
+!xxENDITxx!
+echo x - sscore.c
+sed -e 's/^X//' > sscore.c << '!xxENDITxx!'
+X#ifndef lint
+Xstatic char rcsid[] = "$Header: sscore.c,v 1.4 85/07/08 17:22:57 matt Exp $";
+X#endif
+X/*
+X *
+X * search
+X *
+X * multi-player and multi-system search and destroy.
+X *
+X * Original by Dave Pare	1983
+X * Ported & improved
+X *      by Matt Crawford	1985
+X *
+X * program to sort and print the player scoreboard.
+X *
+X * I'm not even going to Copyright (c) this one!
+X *
+X * $Log:	sscore.c,v $
+X * Revision 1.4  85/07/08  17:22:57  matt
+X * prepare for preliminary distribution
+X * 
+X * Revision 1.3  84/07/08  17:04:42  matt
+X * Added Log
+X * 
+X * Revision 1.2  84/07/08  15:37:52  matt
+X * Test for denominator == 0, not numerator, when finding averages.
+X * Changed the loop limits when sorting -- was getting core dumps on sun.
+X */
+X
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <sys/types.h>
+X#include <sys/file.h>
+X#include "defines.h"
+X#include "structs.h"
+X
+X
+Xstruct totals {
+X	char	ptname[20];	/* player name */
+X	int	ptpoints;	/* total points */
+X	int	pthits;		/* total player hits */
+X	int	ptahits;	/* total alien hits */
+X	int	ptkills;	/* total player kills */
+X	int	ptkilled;	/* total times killed */
+X	int	ptlast;		/* last game's score */
+X	int	ptbest;		/* best score */
+X	int	ptgames;	/* # games played */
+X	int	average;	/* average score */
+X} ;
+X
+Xstruct totals *malloc();
+X
+Xmain() {
+X	register int i,
+X		j,
+X		found,
+X		next;
+X	register struct totals *lp;
+X	int	pointfd;
+X	struct	totals *list[2000];
+X	long	number;
+X
+X	for (i=0; i<2000; i++)
+X		list[i] = NULL;
+X	if ((pointfd = open(POINTFILE, O_RDONLY, 0)) < 0)
+X		fatal("can't open points file %s", POINTFILE);
+X	printf("%-17s %-5s %-8s %-7s %-7s %-5s %-6s %-5s %-5s %-4s\n",
+X		"Player", "Games", "Total", "Hits(p)", "Hits(a)",
+X		"Kills", "Killed", "Best", "Last", "Avg");
+X	for (number=0; number<2000; number++) {
+X		lp = malloc(sizeof(struct totals));
+X		if (lp == NULL)
+X			fatal("out of memory\n");
+X		if (read(pointfd, lp, sizeof(t_totals)) <= 0) {
+X			free(lp);
+X			break;
+X		}
+X		if (lp->ptgames > 0)
+X			lp->average = lp->ptpoints/lp->ptgames;
+X		else
+X			lp->average = 0;
+X		list[number] = lp;
+X	}
+X	if ( number == 0 )
+X	        exit(0);
+X	found = 1;
+X	for (i=number-1; i && found; i--) {
+X		found = 0;
+X		for (j=0, next=1; j<i; j++, next++) {
+X			if (list[j]->average < list[next]->average) {
+X				lp = list[j];
+X				list[j] = list[next];
+X				list[next] = lp;
+X				found++;
+X			}
+X		}
+X	}
+X	for (i=0; i<2000; i++) {
+X		lp = list[i];
+X		if (lp == NULL || lp->ptpoints == 0)
+X			continue;
+X		printf("%-17s %-5d %-8d %-7d %-7d %-5d %-6d %-5d %-5d %-4d\n",
+X			lp->ptname, lp->ptgames, lp->ptpoints, lp->pthits,
+X			lp->ptahits, lp->ptkills, lp->ptkilled, lp->ptbest,
+X			lp->ptlast, lp->average);
+X	}
+X}
+X
+Xfatal(fmt, arg)
+Xchar *fmt;
+X{
+X	fprintf(stderr, "sscore:");
+X	fprintf(stderr, fmt, arg);
+X	fputc('\n', stderr);
+X	exit(1);
+X}
+!xxENDITxx!
+echo x - searchwho.c
+sed -e 's/^X//' > searchwho.c << '!xxENDITxx!'
+X#ifndef lint
+Xstatic char rcsid[] = "$Header: searchwho.c,v 2.1 85/04/10 17:31:55 matt Stab $";
+X#endif
+X/*
+X *
+X * searchwho
+X *
+X * multi-player and multi-system search and destroy.
+X *
+X * Original by Dave Pare	1983
+X * Ported & improved
+X *      by Matt Crawford	1985
+X *
+X * who is playing search
+X *
+X * Copyright (c) 1983
+X *
+X * $Log:	searchwho.c,v $
+X * Revision 2.1  85/04/10  17:31:55  matt
+X * Major de-linting and minor restructuring.
+X * 
+X * Revision 1.3  85/02/10  02:06:33  matt
+X * Allow a port to be specified, as for search itself.
+X * 
+X * Revision 1.2  85/02/09  23:50:40  matt
+X * Eliminated the dependence on the value of the mask after
+X * select() times out.  Use the return value to distinguish
+X * a timeout!!
+X * 
+X */
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include <sys/file.h>
+X#include <sgtty.h>
+X#include <ctype.h>
+X#include <pwd.h>
+X#include <signal.h>
+X#include <sys/time.h>
+X#include <errno.h>
+X#include <sys/socket.h>
+X#include <sys/un.h>
+X
+X#include "defines.h"
+X#include "structs.h"
+X
+X#ifdef INET
+X#include <netinet/in.h>
+X#include <netdb.h>
+Xstruct	servent	defserv = {
+X	"search",
+X	(char **)0,
+X	DEFAULT_IN_PORT,
+X	"tcp"
+X};
+X#endif
+X
+Xextern	int errno;
+Xint	dtabsiz;			/* how many fd's here? */
+Xint	sock;				/* socket to daemon */
+X
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X	void reset();
+X	register int    cc;	/* returned from all sorts of calls */
+X	register int    i;	/* general purpose register */
+X	register int    sockmask;
+X	register char   buf[4096];/* misc buffer for i/o */
+X	int     mask;		/* masks used in select() calls */
+X	struct timeval  timeout;/* time outs for select calls */
+X	int     save_mask;	/* don't calculate mask each time */
+X#ifdef INET
+X	int     to_in;		/* flag: using internet */
+X	char    hostname[32];	/* name of local host */
+X	struct servent *serv;	/* returned by getservbyname() */
+X	struct hostent *host;	/* returned by gethostbyname() */
+X	struct sockaddr_in      in_addr;/* internet socket address */
+X#endif
+X	int     first_time;	/* for printing header */
+X	int     junk;
+X	struct sockaddr loc_addr;/* local socket address */
+X
+X	dtabsiz = getdtablesize();
+X#ifdef INET
+X	if (argc > 3) {
+X		printf("usage: searchwho [hostname [port]]\n");
+X		exit(1);
+X	}
+X	if (argc == 1)
+X		to_in = 0;
+X	else
+X		to_in = 1;
+X#endif
+X /* 
+X  * set all the signals
+X  */
+X	(void) signal(SIGINT, SIG_IGN);
+X	(void) signal(SIGTERM, SIG_IGN);
+X	(void) signal(SIGQUIT, reset);
+X	(void) signal(SIGHUP, reset);
+X	(void) signal(SIGPIPE, reset);
+X	(void) signal(SIGALRM, reset);
+X	(void) signal(SIGTSTP, SIG_IGN);
+X	(void) signal(SIGSTOP, SIG_IGN);
+X#ifdef INET
+X	if (to_in) {
+X	/* 
+X	 * now find the remote host
+X	 */
+X		host = gethostbyname(argv[1]);
+X		if (host == NULL) {
+X			printf("%s: no such host \"%s\"\n", argv[0], argv[1]);
+X			exit(1);
+X		}
+X	/* 
+X	 * get the service from /etc/services (525?)
+X	 */
+X		sock = socket(AF_INET, SOCK_STREAM, 0);
+X		if (sock < 0) {
+X			perror("socket");
+X			exit(1);
+X		}
+X		serv = getservbyname("search", "tcp");
+X		if (serv == NULL)
+X			fprintf(stderr, "%s: no entry in /etc/services\n",
+X					argv[0]);
+X		if (argc == 3)
+X			defserv.s_port = atoi(argv[2]);
+X		if (serv == NULL || argc == 3) {
+X			serv = &defserv;
+X			fprintf(stderr, "Assuming port %d\n", serv -> s_port);
+X			defserv.s_port = (int)htons((u_short)defserv.s_port);
+X		}
+X		in_addr.sin_port = serv -> s_port;
+X		in_addr.sin_family = host -> h_addrtype;
+X		bcopy(host -> h_addr, &in_addr.sin_addr, host -> h_length);
+X	/* 
+X	 * and connect to the foreign machine's search daemon
+X	 */
+X		if (connect(sock, &in_addr, sizeof(in_addr))) {
+X			printf("%s: can't connect to %s's search daemon\n",
+X					argv[0], argv[1]);
+X			exit(1);
+X		}
+X	} else {
+X		sock = socket(AF_UNIX, SOCK_STREAM, 0);
+X		if (sock < 0) {
+X			perror("search, socket");
+X			exit(1);
+X		}
+X		(void) strcpy(loc_addr.sa_data, SLOCK);
+X	/* 
+X	 * connect to the local search daemon thru the lock
+X	 * file (usually /tmp/slock for historical reasons)
+X	 */
+X		if (connect(sock, &loc_addr, sizeof(loc_addr))) {
+X			printf("no local search daemon running\n");
+X			exit(1);
+X		}
+X	}
+X#else
+X	sock = socket(AF_UNIX, SOCK_STREAM, 0);
+X	if (sock < 0) {
+X		perror("search, socket");
+X		exit(1);
+X	}
+X	(void) strcpy(loc_addr.sa_data, SLOCK);
+X /* 
+X  * connect to the local search daemon thru the lock
+X  * file (usually /tmp/slock for historical reasons)
+X  */
+X	if (connect(sock, &loc_addr, sizeof(loc_addr))) {
+X		printf("no local search daemon running\n");
+X		exit(1);
+X	}
+X#endif
+X /* 
+X  * daemon knows that a 1 byte message 'w' is from "searchwho".
+X  */
+X	if (write(sock, "w", 1) != 1) {
+X		perror("write");
+X		printf("searchwho: bad connect on socket\n");
+X		exit(1);
+X	}
+X /* 
+X  * set up all the stuff for the select loop
+X  */
+X	sockmask = 1 << sock;
+X	save_mask = sockmask;
+X	timeout.tv_usec = 0L;
+X	timeout.tv_sec = 3L;
+X /* 
+X  * just in case nobody's there
+X  */
+X	alarm(20);
+X	first_time = 1;
+X	for (;;) {
+X		mask = save_mask;
+X		i = select(dtabsiz, &mask, 0, 0, &timeout);
+X		if (i < 0) {
+X			if (errno = EINTR)
+X				continue;
+X			perror("select");
+X		}
+X	/* 
+X	 * nope - no data waiting.  select() timed out.
+X	 */
+X		if (!i) {
+X			printf("no data yet, we'll wait a bit longer...\n");
+X			fflush(stdout);
+X			continue;
+X		}
+X		if (!(sockmask & mask))
+X			continue;
+X	/* 
+X	 * input waiting from the daemon - read it in and
+X	 * write it to the screen (stdout).
+X	 */
+X		alarm (3);
+X		if (fgets(buf, 80, &_iob[sock]) != NULL) {
+X		/* 
+X		 * when you get zero characters from a socket that
+X		 * had input waiting, it means that the socket was
+X		 * closed down (from the other side)
+X		 */
+X			if (first_time) {
+X				if (strncmp(buf, "nobody", 6) != 0) {
+X					printf("    username   points \n");
+X					first_time = 0;
+X				} else
+X					puts(buf);
+X			} else
+X				puts(buf);
+X			fflush(stdout);
+X		} else
+X			reset(0);
+X		alarm(0);
+X	}
+X}
+X
+X/*
+X * reset disconnects us from any sockets we've connected to,
+X * and shuts everything down nicely.
+X */
+Xvoid reset(signal)
+Xint signal;
+X{
+X	char	buf[1024];
+X	struct	timeval delay;
+X	int	mask;
+X	int	i;
+X
+X	/*
+X	 * disconnect from our socket (getting rid of the
+X	 * gunk possibly leftover)
+X	 */
+X	mask = 1 << sock;
+X	delay.tv_sec = 0L;
+X	delay.tv_usec = 500L;
+X	shutdown(sock, 1);
+X	i = select(dtabsiz, &mask, 0, 0, &delay);
+X	if (i > 0) {
+X		i = read(sock, buf, sizeof(buf));
+X		write(1, buf, i);
+X	}
+X	shutdown(sock, 2);
+X	(void) close(sock);
+X	putchar('\n');
+X	exit(0);
+X}
+!xxENDITxx!
+echo x - README
+sed -e 's/^X//' > README << '!xxENDITxx!'
+X                          Overview
+X
+XSearch is composed of two parts - the daemon, and the player.
+X
+XThe daemon does most of the work.  He waits in the wings until someone
+Xconnects to one of his two sockets (/tmp/slock or internet port 525).
+XThe action of connecting to one of the sockets wakes the daemon up,
+Xand when the proper information is recieved the new player is accepted
+Xinto the game.  A socket other than the default 525 may be specified
+Xin /etc/services or as an argument to searchd.
+X
+XThis "request to play" is generated by the player process "search".
+XIf search is invoked without an argument, it is assumed that the
+Xplayer simply wishes to play on the local machine, and connects
+Xthe player to the local (AF_UNIX) socket "/tmp/slock".  An argument
+Xto search is considered to be a remote hostname the player wants to
+Xplay on.  Search will attempt to connect to that host's search
+Xdaemon and to join play in the remote game.  A port other than the
+Xone specified in /etc/services may be given to search as a second
+Xargument.
+X
+X
+XInstallation instructions:
+X
+X0.  If search is being installed by a non-superuser you will have to
+Xmake a few changes to the procedure below.  You must change the path
+Xnames of the game and score file to something appropriate and also
+Xchoose an internet port number which is not in the reserved range.
+XSee the variables LIBDIR, OWNER, GROUP and ROOT in the Makefile.
+XThe search daemon will have to be given this port number as an argument
+Xand the users will have to give it as an argument to search itself.
+X(You could instead just change DEFAULT_IN_PORT in defines.h if you
+Xare putting up search as a non-su on a local network.  All of this
+Xabout port numbers is of course irrelevant if you do not use -DINET.)
+X
+X1.  Decide if you wish to have the internet feature of search.
+XThis is the feature that allows people from other machines
+Xto play search without having to do a remote login, etc.
+XIf you decide that this is a bad thing, or you don't have network
+Xsoftware (i.e. no network), remove the -DINET from the Makefile.
+X
+X2.  Compile all of the modules by running "make".  If you're really
+Xrunning 4.2 BSD it should all work correctly.
+X
+X3.  Run "make install", which will create all the score files,
+Xand move everything to its proper location.  The daemon must have
+Xread and write access to the score files, (if not run as root at
+Xboot time).
+X
+X4.  If you would like the search daemon to be started at boot time
+Xas are the other system daemons, place an entry in /etc/rc.local
+Xthat looks like this:
+X
+Xif [ -f /etc/searchd ]; then
+X	echo -n ' searchd'					>/dev/console
+X	/etc/searchd
+X
+X(Note that if your system clears /tmp AFTER starting searchd, the
+XAF_UNIX socket /tmp/slock will be deleted.  The default Vax 4.2
+X/etc/rc will do this!)
+X
+X5.  If you are using the "internet" feature of search, add an entry
+Xto /etc/services that looks like this:
+X
+Xsearch		525/tcp	searchd		# inter-machine search
+X
+XMake quite sure that this entry number (525) is not being used on
+Xyour system for any other purpose (i.e. no other entries with the
+Xsame number).
+X
+X
+XHow Search Works.
+X
+XThe entire i/o of the game is transmitted over stream socket lines.
+XThe screen output comes from the daemon, through the stream socket
+Xto the player, and then to the screen.  The commands come from the
+Xplayer to the daemon via that same stream socket.  There is one
+Xconnection (i.e. one file descriptor at each end) per player in the
+Xgame.  This means that the upper limit on the number of search players
+Xdepends on the maximum number of files open at once.
+X
+XScore is kept by the daemon, and the score file is updated by it
+Xalso.  This results in a slight delay when a player exits the
+Xgame, but since the players can come from remote machines, it is
+Xnecessary that the daemon do the score file updates.
+X
+XShould the daemon terminate for any reason, it is possible to look
+Xin a file of errors that the daemon keeps.  While many of the entries
+Xin this file will not be errors, it should give some sort of reason
+Xwhy it died.  This file is (on our system) "/usr/games/lib/search/errlog".
+X
+XIf it at any time becomes necessary to kill the daemon, please do
+Xso with "kill -INT pid", as this will let the daemon "clean up"
+Xafter itself.
+X
+XBe warned that with medium to high load averages, playing is extremely
+Xpoor since screen updates come more and more slowly.  It's been my
+Xexperience that search is only playable when the load is below 6
+X(on a vax 780) or below 4 (on a 750).  Failing this, you can always
+Xhave some friendly super-user renice the daemon, and then have fun!
+XAlso be warned that playing search at low baud rates gives the player a
+Xgreat disadvantage, since the screen output comes in faster than
+Xit can be displayed.  Under the current version this will cause jerky
+Xresponse for all players as the daemon's writes begin to block.  If
+Xyou access a michine over a network, and then play search over the
+Xnetwork, all I/O will get repackaged at each step and it can get
+Xhard to hit your target.  As a handicap for good players, the use
+Xof several rlogin links is possible.
+X
+XMost of the '#' aliens have been removed from the game (to increase
+Xperformance), but left most of the shankers '@' in (since they shoot
+Xback).  For those of you that remember the old game, there is no such
+Xthing as a "virgin" in this version, neither does the program keep
+Xtrack of the "scab" status from game to game.
+X
+XThe score file print routine is unbelieveably primitive (compared with
+Xthe original Greg Ordy cranked out).  Scores are kept by the name
+Xof the player - if from a remote machine, that machine's name is also
+Xincluded.
+X
+XSome code was put in the exit routines to try and keep "LAST_ACK"
+Xand "FIN_WAIT_2"'s to a minimum (see the command "netstat").  Otherwise,
+Xall entrances and exits from search invariably generated LAST_ACK's
+Xand FIN_WAIT_2's (which look really messy).  There is a one line kernel
+Xfix that gets rid of most of them, but offhand I don't remember what
+Xit is (I know, big help).
+X
+X
+XPorting Search
+X
+XSearch depends heavily on the 4.2 inter-process communication scheme.
+XPorting to other operating systems will be major work.  (Volunteers?)
+XSearch uses functions with variable numbers of arguments but does *NOT*
+Xuse varargs.h yet.  Since it runs on Pyramids as is, this is a low
+Xpriority.  Most of the other lint has been removed.  Search also needs
+Xsigned chars.  When we bump into a system which doesn't have them,
+Xsomething will have to change.  Search uses temcap but not curses.
+XPadding is totally punted.  If you need to put padding in, look in
+Xsearch.c.
+X
+X
+XIf you have bugs or suggestions, send them to /dev/null.
+XJust kidding.  Send them to Matt at the address below.
+X
+XDave Pare <ucbvax!sdcsvax!mr-frog> or <ihnp4!sdamos!mr-frog>
+XApril 1984
+X
+XAmended by
+XMatt Crawford	<ihnp4!oddjob!matt> or <crawford@anl-mcs.arpa> or
+X		<matt@uchicago.csnet> or <x1.crawford@uchicago.bitnet>
+XJuly/August 1985
+!xxENDITxx!
+
+

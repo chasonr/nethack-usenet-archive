@@ -1,0 +1,2303 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,b85f839a7425b8bd,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1990-07-30 09:46:25 PST
+Path: gmdzi!unido!mcsun!uunet!zephyr.ens.tek.com!tekred!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v11i012:  tinymud2 - user-extendible multi-user adventure (v1.5.4), Part08/10
+Message-ID: <6057@tekred.CNA.TEK.COM>
+Date: 30 Jul 90 16:46:25 GMT
+Sender: news@tekred.CNA.TEK.COM
+Lines: 2286
+Approved: billr@saab.CNA.TEK.COM
+Posted: Mon Jul 30 17:46:25 1990
+
+Submitted-by: James Aspnes <asp@cs.cmu.edu>
+Posting-number: Volume 11, Issue 12
+Archive-name: tinymud2/Part08
+Supersedes: tinymud: Volume 8, Issue 80-83
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 8 (of 10)."
+# Contents:  conc.c dump.c extract.c minimal.db oldinterface.c
+# Wrapped by billr@saab on Fri Jul 27 15:27:49 1990
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'conc.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'conc.c'\"
+else
+echo shar: Extracting \"'conc.c'\" \(11809 characters\)
+sed "s/^X//" >'conc.c' <<'END_OF_FILE'
+X/* tinyMUD port concentrator by Robert Hood */
+X/* Revision 2.0 */
+X
+X#include <stdio.h>
+X#include <signal.h>
+X#include <sys/param.h>
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netinet/in.h>
+X#include <sys/time.h>
+X#include <sys/errno.h>
+X#include <fcntl.h>
+X#include <netdb.h>
+X#include "config.h"
+X
+Xvoid            queue_message(int port, char *data, int len);
+Xvoid            writelog(const char *fmt,...);
+X
+X#define BUFLEN 65536
+X#define CONC_MESSAGE "[ Connected to the TinyMUD port concentrator ]\n"
+X#define PANIC_MESSAGE "\nGoing Down - Bye!\n"
+X
+Xstruct message
+X{
+X  char           *data;
+X  short           len;
+X  struct message *next;
+X};
+X
+Xstruct conc_list
+X{
+X  char            status;
+X
+X  /*
+X   * Status: 0 = Not connected 1 = Connected 2 = Disconnecting (waiting till
+X   * queue is empty) 
+X   */
+X  struct message *first, *last;
+X}              *clist;
+X
+Xint             mud_sock;
+Xint             sock;
+Xint             pid;
+X
+Xint             port = TINYPORT;
+Xint             intport = INTERNAL_PORT;
+Xint             clvl = 1;
+X
+Xmain(argc, argv)
+X  int             argc;
+X  char           *argv[];
+X{
+X  int             l;
+X
+X  if (argc > 1)
+X    port = atoi(argv[1]);
+X  if (argc > 2)
+X    intport = atoi(argv[2]);
+X  if (argc > 3)
+X    clvl = atoi(argv[3]);
+X
+X  signal(SIGPIPE, SIG_IGN);	       /* Ignore I/O signals */
+X  for (l = 3; l < NOFILE; ++l)	       /* Close all files from last process */
+X    close(l);			       /* except stdin, stdout, stderr */
+X  pid = 1;
+X  connect_mud();		       /* Connect to interface.c */
+X  setup();			       /* Setup listen port */
+X  mainloop();			       /* main loop */
+X}
+X
+Xconnect_mud()
+X{
+X  int             temp;
+X  struct sockaddr_in sin;
+X
+X  mud_sock = 0;
+X  while (mud_sock == 0)
+X  {
+X    mud_sock = socket(AF_INET, SOCK_STREAM, 0);
+X    if (mud_sock < 0)
+X    {
+X      perror("socket");
+X      mud_sock = 0;
+X    } else
+X    {
+X      temp = 1;
+X      setsockopt(mud_sock, SOL_SOCKET, SO_REUSEADDR, (char *)&temp, sizeof(temp));
+X      sin.sin_family = AF_INET;
+X      sin.sin_port = htons(intport);
+X      sin.sin_addr.s_addr = htonl(0x7F000001);
+X      temp = connect(mud_sock, (struct sockaddr *) & sin, sizeof(sin));
+X      if (temp < 0)
+X      {
+X	perror("connect");
+X	close(mud_sock);
+X	mud_sock = 0;
+X      }
+X    }
+X    if (mud_sock == 0)
+X    {
+X      sleep(1);
+X      fputs("retrying....\n", stderr);
+X    }
+X  }
+X  if (fcntl(mud_sock, F_SETFL, FNDELAY) == -1)
+X  {
+X    perror("make_nonblocking: fcntl");
+X  }
+X  if (fcntl(mud_sock, F_SETFD, 1) == -1)
+X  {
+X    perror("close on execve: fcntl");
+X  }
+X#ifdef DEBUG
+X  fputs("connected!\n", stderr);
+X#endif
+X}
+X
+Xsetup()
+X{
+X  int             temp;
+X  struct sockaddr_in sin;
+X
+X  sock = socket(AF_INET, SOCK_STREAM, 0);
+X  if (sock < 1)
+X  {
+X    perror("socket");
+X    exit(-1);
+X  }
+X  temp = 1;
+X  setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&temp, sizeof(temp));
+X  sin.sin_family = AF_INET;
+X  sin.sin_port = htons(port);
+X  sin.sin_addr.s_addr = htonl(INADDR_ANY);
+X
+X  temp = bind(sock, (struct sockaddr *) & sin, sizeof(sin));
+X  if (temp < 0)
+X  {
+X    perror("bind");
+X    exit(1);
+X  }
+X  temp = listen(sock, 5);
+X  if (temp < 0)
+X  {
+X    perror("listen");
+X    exit(1);
+X  }
+X}
+X
+Xmainloop()
+X{
+X  int             found, newsock, lastsock, len, loop;
+X  int             accepting, current = 0;
+X  int             temp;
+X  struct timeval  tv;
+X  struct sockaddr_in sin;
+X  struct hostent *hent;
+X  fd_set          in, out;
+X  char           *data;
+X  char           *buf, header[4];
+X  struct conc_list *cptr;
+X  struct message *tmsg;
+X  short           templen;
+X  char           *mainbuf, *outbuf;
+X  int             mainlen, outlen;
+X  int             command;
+X  int             hlen;
+X  char           *hostnm;
+X
+X  /* Allocate huge buffer */
+X  data = (char *)malloc(65536);
+X  /* Allocate array, one for each possible socket */
+X  clist = (struct conc_list *) malloc(sizeof(struct conc_list) * NOFILE);
+X  /* Allocate I/O buffers for main I/O socket */
+X  mainbuf = (char *)malloc(BUFLEN);
+X  mainlen = 0;
+X  outbuf = (char *)malloc(BUFLEN);
+X  outlen = 0;
+X  if (!data || !clist || !mainbuf || !outbuf)
+X  {
+X    perror("malloc");
+X    exit(1);
+X  }
+X  /* Init array */
+X  for (loop = 0; loop < NOFILE; ++loop)
+X  {
+X    cptr = &(clist[loop]);
+X    cptr->status = 0;
+X    cptr->first = 0;
+X    cptr->last = 0;
+X  }
+X
+X  /*
+X   * Accept connections flag ON accepting = 1; /* lastsock for select() 
+X   */
+X  lastsock = sock + 1;
+X  /* mud_sock has already been established */
+X  clist[mud_sock].status = 1;
+X  /* Special port # for control messages */
+X  clist[0].status = 1;
+X  while (1)
+X  {
+X    if (pid < 0)
+X    {
+X      pid = vfork();
+X    }
+X    if (pid == 0)
+X    {
+X      char            pstr[32], istr[32], cstr[32];
+X      sprintf(pstr, "%d", port);
+X      sprintf(istr, "%d", intport);
+X      sprintf(cstr, "%d", clvl + 1);
+X      execlp("concentrate", "conc", pstr, istr, cstr, 0);
+X      writelog("CONC %d:ACK!!!!!! exec failed! Exiting...\n", clvl);
+X      exit(1);
+X      /* Gee...now what? Should I try again? */
+X    }
+X    /* zero out port selector masks */
+X    FD_ZERO(&in);
+X    FD_ZERO(&out);
+X
+X    /* set apropriate bit masks for I/O */
+X    if (accepting)
+X      FD_SET(sock, &in);
+X    for (loop = 1; loop < NOFILE; ++loop)
+X    {
+X      cptr = &(clist[loop]);
+X      if (cptr->status)
+X      {
+X	FD_SET(loop, &in);
+X	if (cptr->first)
+X	  FD_SET(loop, &out);
+X      }
+X    }
+X    if (outlen > 0)
+X      FD_SET(loop, &out);
+X
+X    /* timeout for select */
+X    tv.tv_sec = 1000;
+X    tv.tv_usec = 0;
+X
+X    /* look for ports waiting for I/O */
+X    found = select(lastsock, &in, &out, (fd_set *) 0, &tv);
+X    /* None found, skip the rest... */
+X    if (found < 0)
+X      continue;
+X    /* New connection? */
+X    if (accepting && FD_ISSET(sock, &in))
+X    {
+X      len = sizeof(sin);
+X      newsock = accept(sock, (struct sockaddr *) & sin, &len);
+X      /* This limits the # of connections per concentrator */
+X      if (newsock >= (NOFILE - 5))
+X      {
+X	close(sock);
+X	accepting = 0;
+X	pid = -1;
+X      }
+X      if (newsock >= lastsock)
+X	lastsock = newsock + 1;
+X      cptr = &(clist[newsock]);
+X      cptr->status = 1;
+X      cptr->first = 0;
+X      cptr->last = 0;
+X      /* set to non-blocking mode */
+X      if (fcntl(newsock, F_SETFL, FNDELAY) == -1)
+X      {
+X	perror("make_nonblocking: fcntl");
+X      }
+X      /* set to close on execv */
+X      if (fcntl(newsock, F_SETFD, 1) == -1)
+X      {
+X	perror("close on execv: fcntl");
+X      }
+X      temp = 1;
+X      if (setsockopt(newsock, SOL_SOCKET, SO_KEEPALIVE, (char *)&temp,
+X		     sizeof(temp)) < 0)
+X      {
+X	perror("keepalive setsockopt");
+X      }
+X      queue_message(newsock, CONC_MESSAGE, sizeof(CONC_MESSAGE) - 1);
+X      /* build control code for connect */
+X      data[0] = 0;
+X      data[1] = 1;		       /* connect */
+X      data[2] = newsock;
+X      bcopy(&(sin.sin_addr.s_addr), data + 3, 4);
+X      hent = gethostbyaddr(&(sin.sin_addr.s_addr),
+X			   sizeof(sin.sin_addr.s_addr), AF_INET);
+X      if (hent)
+X	strcpy(data + 7, hent->h_name);
+X      else
+X	strcpy(data + 7, inet_ntoa(sin.sin_addr.s_addr));
+X      queue_message(mud_sock, data, 7 + strlen(data + 7));
+X#ifdef DEBUG
+X      writelog("CONC %d: USER CONNECT: sock %d, host %s\n", clvl,
+X	       newsock, data + 7);
+X#endif
+X    }
+X    /* recieve data from ports */
+X    for (loop = 0; loop < NOFILE; ++loop)
+X    {
+X      cptr = &(clist[loop]);
+X      if (cptr->status && FD_ISSET(loop, &in))
+X      {
+X	if (loop == 0)
+X	{
+X	} else
+X	if (loop == mud_sock)
+X	{
+X	  if (mainlen < BUFLEN)
+X	  {
+X	    len = recv(loop, mainbuf + mainlen,
+X		       BUFLEN - mainlen, 0);
+X	    if (len <= 0)
+X	    {
+X	      /* This is quite useless, but what else am I supposed to do? */
+X	      writelog("CONC %d: Lost Connection\n", clvl);
+X	      panic();
+X	    }
+X	    mainlen += len;
+X	  }
+X	  while (mainlen > 2)
+X	  {
+X	    bcopy(mainbuf, &templen, 2);
+X	    if (mainlen >= (templen + 2))
+X	    {
+X	      queue_message(*(mainbuf + 2), mainbuf + 3,
+X			    templen - 1);
+X	      mainlen = mainlen - templen - 2;
+X	      bcopy(mainbuf + templen + 2, mainbuf, mainlen);
+X	    } else
+X	      break;
+X	  }
+X	} else
+X	{
+X	  /* data + 1 so we can add port later w/o a bcopy */
+X	  len = recv(loop, data + 1, 65530, 0);
+X	  if (len == 0)
+X	  {
+X	    disconnect(loop);
+X	  } else
+X	  if (len < 0)
+X	  {
+X	    /* Hmm..... */
+X	    writelog("CONC %d: recv: %s\n", clvl, strerror(errno));
+X	  } else
+X	  {
+X	    /* Add the port # to the data, and send it to interface.c */
+X	    data[0] = loop;
+X	    queue_message(mud_sock, data, len + 1);
+X	  }
+X	}
+X      }
+X    }
+X    /* Handle output */
+X    for (loop = 0; loop < NOFILE; ++loop)
+X    {
+X      cptr = &(clist[loop]);
+X      if ((loop == 0) && (cptr->first))
+X      {
+X	command = *(cptr->first->data);
+X	switch (command)
+X	{
+X	case 2:		       /* disconnect */
+X	  if (clist[*(cptr->first->data + 1)].status)
+X	    clist[*(cptr->first->data + 1)].status = 2;
+X	  else
+X	    writelog("CONC %d: Recieved dissconnect for unknown user\n", clvl);
+X	  break;
+X	default:
+X	  writelog("CONC %d: Recieved unknown command %d\n", clvl, command);
+X	  break;
+X	}
+X	free(cptr->first->data);
+X	tmsg = cptr->first;
+X	cptr->first = cptr->first->next;
+X	free(tmsg);
+X	if (!cptr->first)
+X	  cptr->last = 0;
+X      } else
+X	if ((loop == mud_sock) && FD_ISSET(mud_sock, &out) &&
+X	    ((cptr->first) || (outlen > 0)))
+X      {
+X	while ((cptr->first) &&
+X	       ((BUFLEN - outlen) > (cptr->first->len + 2)))
+X	{
+X	  templen = cptr->first->len;
+X	  bcopy(&(templen), outbuf + outlen, 2);
+X	  bcopy(cptr->first->data, outbuf + outlen + 2, templen);
+X	  outlen += templen + 2;
+X	  free(cptr->first->data);
+X	  tmsg = cptr->first;
+X	  cptr->first = cptr->first->next;
+X	  free(tmsg);
+X	  if (!cptr->first)
+X	    cptr->last = 0;
+X	}
+X
+X	if (outlen)
+X	{
+X	  len = send(mud_sock, outbuf, outlen, 0);
+X	  if (len > 0)
+X	  {
+X	    outlen -= len;
+X	    bcopy(outbuf + len, outbuf, outlen);
+X	  }
+X	  else
+X	  {
+X	    panic();
+X	  }
+X	}
+X      } else
+X      if (FD_ISSET(loop, &out) && (cptr->first))
+X      {
+X	len = send(loop, cptr->first->data, cptr->first->len, 0);
+X	free(cptr->first->data);
+X	tmsg = cptr->first;
+X	cptr->first = cptr->first->next;
+X	free(tmsg);
+X	if (!cptr->first)
+X	  cptr->last = 0;
+X      }
+X      /* Test for pending disconnect */
+X      else
+X      if ((cptr->status == 2) && (cptr->first == 0))
+X      {
+X	cptr->status = 0;
+X	shutdown(loop, 0);
+X	close(loop);
+X      }
+X    }
+X    /* Test for emptyness */
+X    if (!accepting)
+X    {
+X      for (loop = mud_sock + 1; loop < NOFILE; ++loop)
+X	if (clist[loop].status)
+X	  break;
+X      if (loop == NOFILE)
+X	exit(0);
+X    }
+X  }
+X}
+X
+X/* Properly disconnect a user */
+Xdisconnect(user)
+X  int             user;
+X{
+X  char            header[4];
+X
+X  /* make control message for disconnect */
+X  header[0] = 0;
+X  header[1] = 2;		       /* disconnect code */
+X  header[2] = user;
+X  queue_message(mud_sock, header, 3);
+X
+X  /* shutdown this socket */
+X  clist[user].status = 0;
+X  close(user);
+X#ifdef DEBUG
+X  writelog("CONC %d: USER DISCONNECT: %d\n", clvl, user);
+X#endif
+X}
+X
+Xvoid            queue_message(int port, char *data, int len)
+X{
+X  struct message *ptr;
+X
+X  ptr = (struct message *) malloc(sizeof(struct message));
+X  ptr->data = (char *)malloc(len);
+X  ptr->len = len;
+X  bcopy(data, ptr->data, len);
+X  ptr->next = 0;
+X  if (clist[port].last == 0)
+X    clist[port].first = ptr;
+X  else
+X    (clist[port].last)->next = ptr;
+X  clist[port].last = ptr;
+X}
+X
+X/* Kill off all connections quickly */
+Xpanic()
+X{
+X  int             loop;
+X
+X  for (loop = 1; loop < NOFILE; ++loop)
+X  {
+X    if (clist[loop].status)
+X    {
+X      send(loop, PANIC_MESSAGE, sizeof(PANIC_MESSAGE), 0);
+X      shutdown(loop, 0);
+X      close(loop);
+X    }
+X  }
+X  exit(1);
+X}
+X
+X/* Modified to send stuff to the main server for logging */
+Xvoid            writelog(const char *fmt,...)
+X{
+X  va_list         list;
+X  struct tm      *tm;
+X  long            t;
+X  char            buffer[2048];
+X
+X  va_start(list, fmt);
+X  vsprintf(buffer + 2, fmt, list);
+X  buffer[0] = 0;
+X  buffer[1] = 4;		       /* remote log command */
+X  queue_message(mud_sock, buffer, strlen(buffer + 2) + 2);
+X  va_end(list);
+X}
+END_OF_FILE
+if test 11809 -ne `wc -c <'conc.c'`; then
+    echo shar: \"'conc.c'\" unpacked with wrong size!
+fi
+# end of 'conc.c'
+fi
+if test -f 'dump.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'dump.c'\"
+else
+echo shar: Extracting \"'dump.c'\" \(3229 characters\)
+sed "s/^X//" >'dump.c' <<'END_OF_FILE'
+X#include "copyright.h"
+X
+X#include <stdio.h>
+X
+X#include "db.h"
+X
+X#ifndef COMPRESS
+X#define uncompress(x) (x)
+X#else
+Xconst char *uncompress(const char *s);
+X#endif /* COMPRESS */
+X
+Xconst char *unparse_object(dbref player, dbref loc);
+X
+X/* in a dump, you can see everything */
+Xint can_link_to(dbref who, object_flag_type what, dbref where)
+X{
+X    return 1;
+X}
+X
+Xint controls(dbref who, dbref what)
+X{
+X    return 1;
+X}
+X
+Xvoid main(int argc, char **argv)
+X{
+X    struct object *o;
+X    dbref owner;
+X    dbref thing;
+X
+X    if(argc < 1) {
+X	fprintf(stderr, "Usage: %s [owner]\n", *argv);
+X	exit(1);
+X    }
+X    
+X    if(argc >= 2) {
+X	owner = atol(argv[1]);
+X    } else {
+X	owner = NOTHING;
+X    }
+X
+X    if(db_read(stdin) < 0) {
+X	fprintf(stderr, "%s: bad input\n", argv[0]);
+X	exit(5);
+X    }
+X
+X    for(o = db; o < db+db_top; o++) {
+X	/* don't show exits separately */
+X	if((o->flags & TYPE_MASK) == TYPE_EXIT) continue;
+X
+X	/* don't show it if it isn't owned by the right player */
+X	if(owner != NOTHING && o->owner != owner) continue;
+X
+X	printf("#%d: %s [%s] at %s Pennies: %d Type: ",
+X	       o - db, o->name, db[o->owner].name,
+X	       unparse_object(owner, o->location),
+X	       o->pennies);
+X	switch(o->flags & TYPE_MASK) {
+X	  case TYPE_ROOM:
+X	    printf("Room");
+X	    break;
+X	  case TYPE_EXIT:
+X	    printf("Exit");
+X	    break;
+X	  case TYPE_THING:
+X	    printf("Thing");
+X	    break;
+X	  case TYPE_PLAYER:
+X	    printf("Player");
+X	    break;
+X	  default:
+X	    printf("***UNKNOWN TYPE***");
+X	    break;
+X	}
+X
+X	/* handle flags */
+X	putchar(' ');
+X	if(o->flags & ~TYPE_MASK) {
+X	    printf("Flags: ");
+X	    if(o->flags & LINK_OK) printf("LINK_OK ");
+X	    if(o->flags & DARK) printf("DARK ");
+X	    if(o->flags & STICKY) printf("STICKY ");
+X	    if(o->flags & WIZARD) printf("WIZARD ");
+X	    if(o->flags & TEMPLE) printf("TEMPLE ");
+X#ifdef RESTRICTED_BUILDING
+X	    if(o->flags & BUILDER) printf("BUILDER ");
+X#endif /* RESTRICTED_BUILDING */
+X	}
+X	putchar('\n');
+X	       
+X	if(o->key != TRUE_BOOLEXP) printf("KEY: %s\n",
+X					  unparse_boolexp(owner, o->key));
+X	if(o->description) {
+X	    puts("Description:");
+X	    puts(uncompress(o->description));
+X	}
+X	if(o->succ_message) {
+X	    puts("Success Message:");
+X	    puts(uncompress(o->succ_message));
+X	}
+X	if(o->fail_message) {
+X	    puts("Fail Message:");
+X	    puts(uncompress(o->fail_message));
+X	}
+X	if(o->ofail) {
+X	    puts("Other Fail Message:");
+X	    puts(uncompress(o->ofail));
+X	}
+X	if(o->osuccess) {
+X	    puts("Other Success Message:");
+X	    puts(uncompress(o->osuccess));
+X	}
+X	if(o->contents != NOTHING) {
+X	    puts("Contents:");
+X	    DOLIST(thing, o->contents) {
+X		/* dump thing description */
+X		putchar(' ');
+X		puts(unparse_object(owner, thing));
+X	    }
+X	}
+X	if(o->exits != NOTHING) {
+X	    if((o->flags & TYPE_MASK) == TYPE_ROOM) {
+X		puts("Exits:");
+X		DOLIST(thing, o->exits) {
+X		    printf(" %s", unparse_object(owner, thing));
+X		    if(db[thing].key != TRUE_BOOLEXP) {
+X			printf(" KEY: %s",
+X			       unparse_boolexp(owner, db[thing].key));
+X		    }
+X		    if(db[thing].location != NOTHING) {
+X			printf(" => %s\n",
+X			       unparse_object(owner, db[thing].location));
+X		    } else {
+X			puts(" ***OPEN***");
+X		    }
+X		}
+X	    } else {
+X		printf("Home: %s\n", unparse_object(owner, o->exits));
+X	    }
+X	}
+X	putchar('\n');
+X    }
+X
+X    exit(0);
+X}
+END_OF_FILE
+if test 3229 -ne `wc -c <'dump.c'`; then
+    echo shar: \"'dump.c'\" unpacked with wrong size!
+fi
+# end of 'dump.c'
+fi
+if test -f 'extract.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'extract.c'\"
+else
+echo shar: Extracting \"'extract.c'\" \(10634 characters\)
+sed "s/^X//" >'extract.c' <<'END_OF_FILE'
+X#include "copyright.h"
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <sys/param.h>
+X
+X#include "db.h"
+X
+Xstatic int include_all = 0;	/* include everything unless specified */
+Xstatic int keep_players = 0;	/* keep all players */
+Xstatic int safe_below = 1;	/* Keep everything <= safe_below */
+Xstatic int safe_above = 2e9;	/* Keep everything >= safe_above */
+Xstatic int reachable = 0;	/* Only keep rooms reachable from #0 */
+Xstatic int norecycle = 0;	/* Exclude things in recycling center */
+Xstatic int inbuild = 0;		/* True when in main nuild_trans loop */
+Xstatic int recycling_center = 0;/* Room number home("Recycler") */
+X
+X# define REACH_FLAG 0x40000000
+X# define REACHABLE(X) (db[X].flags & REACH_FLAG)
+X# define SET_REACHABLE(X) (db[X].flags |= REACH_FLAG)
+X
+Xstatic dbref included[NCARGS+1];
+Xstatic dbref excluded[NCARGS+1];
+X
+Xstatic dbref *trans;		/* translation vector */
+X
+X#define DEFAULT_LOCATION (0)
+X#define DEFAULT_OWNER (1)
+X
+Xstatic int isok(dbref);
+X
+X/* returns 1 if object is specifically excluded */
+Xstatic int is_excluded(dbref x)
+X{
+X    int i;
+X
+X    if(x == NOTHING) return 0; /* Don't exclude nothing */
+X
+X    /* check that it isn't excluded */
+X    for(i = 0; excluded[i] != NOTHING; i++) {
+X	if(excluded[i] == x) return 1; /* always exclude specifics */
+X        if(excluded[i] == db[x].owner) return 1;
+X    }
+X
+X    return (0);
+X}
+X
+X/* returns 1 if it is not excluded */
+Xstatic int not_excluded(dbref x)
+X{
+X    int i;
+X
+X    if(x == NOTHING) return 1; /* Don't exclude nothing */
+X
+X    /* check that it isn't excluded */
+X    for(i = 0; excluded[i] != NOTHING; i++) {
+X	if(excluded[i] == x) return 0; /* always exclude specifics */
+X        if(excluded[i] == db[x].owner) return 0;
+X    }
+X
+X    /* if it's an exit, check that its destination is ok */
+X    if(Typeof(x) == TYPE_EXIT && db[x].location >= 0) {
+X	return isok(db[x].location);
+X    } else {
+X	return 1;
+X    }
+X}
+X
+X/* returns 1 if it should be included in translation vector */
+Xstatic int isok(dbref x)
+X{
+X    int i;
+X
+X    if(x == DEFAULT_OWNER || x == DEFAULT_LOCATION) return 1;
+X    if(x == NOTHING) return 1;
+X    
+X    for(i = 0; included[i] != NOTHING; i++) {
+X	if(included[i] == x) return 1; /* always get specific ones */
+X	
+X	if(reachable && Typeof(x) == TYPE_ROOM && !REACHABLE(x))
+X	{ 
+X# ifdef DEBUG
+X	  if (inbuild)
+X	    fprintf (stderr, "Excluding %s(%dR), not reachable\n", 
+X		     db[x].name, x);
+X# endif
+X          return 0;
+X	}
+X	
+X	if(norecycle && db[x].location == recycling_center) return 0;
+X
+X	if(included[i] == db[x].owner 
+X	   || (x <= safe_below || x >= safe_above)
+X	   || keep_players && Typeof(x) == TYPE_PLAYER) {
+X	    return not_excluded(x);
+X	}
+X    }
+X
+X    /* not in the list, can only get it if include_all is on */
+X    /* or it's owned by DEFAULT_OWNER */
+X    return (include_all && not_excluded(x));
+X}
+X
+Xstatic void build_trans(void)
+X{
+X    dbref i;
+X    dbref val;
+X
+X    if((trans = (dbref *) malloc(sizeof(dbref) * db_top)) == 0) {
+X	abort();
+X    }
+X    
+X    inbuild++;
+X
+X    val = 0;
+X    for(i = 0; i < db_top; i++) {
+X	if(isok(i)) {
+X	    trans[i] = val++;
+X	} else {
+X	    trans[i] = NOTHING;
+X	}
+X    }
+X    
+X    inbuild--;
+X}
+X
+Xstatic dbref translate(dbref x)
+X{
+X    if(x == NOTHING || x == HOME) {
+X	return(x);
+X    } else {
+X	return(trans[x]);
+X    }
+X}
+X
+X/* TRUE_BOOLEXP means throw this argument out */
+X/* even on OR; it's effectively a null boolexp */
+X/* NOTE: this doesn't free anything, it just munges it up */
+Xstatic struct boolexp *translate_boolexp(struct boolexp *exp)
+X{
+X    struct boolexp *s1;
+X    struct boolexp *s2;
+X
+X    if(exp == TRUE_BOOLEXP) {
+X	return TRUE_BOOLEXP;
+X    } else {
+X	switch(exp->type) {
+X	  case BOOLEXP_NOT:
+X	    s1 = translate_boolexp(exp->sub1);
+X	    if(s1 == TRUE_BOOLEXP) {
+X		return TRUE_BOOLEXP;
+X	    } else {
+X		exp->sub1 = s1;
+X		return exp;
+X	    }
+X	    /* break; */
+X	  case BOOLEXP_AND:
+X	  case BOOLEXP_OR:
+X	    s1 = translate_boolexp(exp->sub1);
+X	    s2 = translate_boolexp(exp->sub2);
+X	    if(s1 == TRUE_BOOLEXP && s2 == TRUE_BOOLEXP) {
+X		/* nothing left */
+X		return TRUE_BOOLEXP;
+X	    } else if(s1 == TRUE_BOOLEXP && s2 != TRUE_BOOLEXP) {
+X		/* s2 is all that is left */
+X		return s2;
+X	    } else if(s1 != TRUE_BOOLEXP && s2 == TRUE_BOOLEXP) {
+X		/* s1 is all that is left */
+X		return s1;
+X	    } else {
+X		exp->sub1 = s1;
+X		exp->sub2 = s2;
+X		return exp;
+X	    }
+X	    /* break; */
+X	  case BOOLEXP_CONST:
+X	    exp->thing = translate(exp->thing);
+X	    if(exp->thing == NOTHING) {
+X		return TRUE_BOOLEXP;
+X	    } else {
+X		return exp;
+X	    }
+X	    /* break; */
+X	  default:
+X	    abort();		/* bad boolexp type, we lose */
+X	    return TRUE_BOOLEXP;
+X	}
+X    }
+X}
+X
+Xstatic int ok(dbref x)
+X{
+X    if(x == NOTHING || x == HOME) {
+X	return 1;
+X    } else {
+X	return trans[x] != NOTHING;
+X    }
+X}
+X
+Xstatic void check_bad_exits(dbref x)
+X{
+X    dbref e;
+X
+X    if(Typeof(x) == TYPE_ROOM && !isok(x)) {
+X	/* mark all exits as excluded */
+X	DOLIST(e, db[x].exits) {
+X	    trans[e] = NOTHING;
+X	}
+X    }
+X}
+X
+Xstatic void check_owner(dbref x)
+X{
+X    if(ok(x) && !ok(db[x].owner)) {
+X	db[x].owner = DEFAULT_OWNER;
+X    }
+X}
+X
+Xstatic void check_location(dbref x)
+X{
+X    dbref loc;
+X    dbref newloc;
+X
+X    if(ok(x) && (Typeof(x) == TYPE_THING || Typeof(x) == TYPE_PLAYER)
+X       && !ok(loc = db[x].location)) {
+X	/* move it to home or DEFAULT_LOCATION */
+X	if(ok(db[x].exits)) {
+X	    newloc = db[x].exits; /* home */
+X	} else {
+X	    newloc = DEFAULT_LOCATION;
+X	}
+X	db[loc].contents = remove_first(db[loc].contents, x);
+X	PUSH(x, db[newloc].contents);
+X	db[x].location = newloc;
+X    }
+X}
+X
+Xstatic void check_next(dbref x)
+X{
+X    dbref next;
+X
+X    if(ok(x)) {
+X	while(!ok(next = db[x].next)) db[x].next = db[next].next;
+X    }
+X}
+X
+Xstatic void check_contents(dbref x)
+X{
+X    dbref c;
+X
+X    if(ok(x)) {
+X	while(!ok(c = db[x].contents)) db[x].contents = db[c].next;
+X    }
+X}
+X
+X/* also updates home */
+X/* MUST BE CALLED AFTER check_owner! */
+Xstatic void check_exits(dbref x)
+X{
+X    dbref e;
+X
+X    if(ok(x) && !ok(e = db[x].exits)) {
+X	switch(Typeof(x)) {
+X	  case TYPE_ROOM:
+X	    while(!ok(e = db[x].exits)) db[x].exits = db[e].next;
+X	    break;
+X	  case TYPE_PLAYER:
+X	  case TYPE_THING:
+X	    if(ok(db[db[x].owner].exits)) {
+X		/* set it to owner's home */
+X		db[x].exits = db[db[x].owner].exits; /* home */
+X	    } else {
+X		/* set it to DEFAULT_LOCATION */
+X		db[x].exits = DEFAULT_LOCATION; /* home */
+X	    }
+X	    break;
+X	}
+X    }
+X}
+X
+Xstatic void do_write(void)
+X{
+X    dbref i;
+X    dbref kludge;
+X
+X    /* this is braindamaged */
+X    /* we have to rebuild the translation map */
+X    /* because part of it may have gotten nuked in check_bad_exits */
+X    for(i = 0, kludge = 0; i < db_top; i++) {
+X	if(trans[i] != NOTHING) trans[i] = kludge++;
+X    }
+X
+X    for(i = 0; i < db_top; i++) {
+X	if(ok(i)) {
+X	    /* translate all object pointers */
+X	    db[i].location = translate(db[i].location);
+X	    db[i].contents = translate(db[i].contents);
+X	    db[i].exits = translate(db[i].exits);
+X	    db[i].next = translate(db[i].next);
+X	    db[i].key = translate_boolexp(db[i].key);
+X	    db[i].owner = translate(db[i].owner);
+X
+X	    /* write it out */
+X	    printf("#%d\n", translate(i));
+X	    db_write_object(stdout, i);
+X	}
+X    }
+X    puts("***END OF DUMP***");
+X}
+X
+Xint reach_lvl = 0;
+X
+Xmake_reachable (dbref x)
+X{   dbref e, r;
+X    int i;
+X    
+X    if (Typeof(x) != TYPE_ROOM || is_excluded(x)) return;
+X
+X    reach_lvl++;
+X
+X    SET_REACHABLE(x);
+X
+X#ifdef DEBUG
+X    for (i=0; i<reach_lvl; i++ ) fputc (' ', stderr);
+X    fprintf (stderr, "Set %s(%dR) reachable.\n", db[x].name, x);
+X#endif
+X
+X    DOLIST(e, db[x].exits) {
+X	r = db[e].location;
+X
+X	if (r < 0) continue;
+X	if (is_excluded(r)) continue;
+X        if (is_excluded(e)) continue;
+X	if (!REACHABLE(r)) make_reachable(r);
+X    }
+X
+X    reach_lvl--;
+X}
+X
+Xvoid main(int argc, char **argv)
+X{
+X    dbref i;
+X    int top_in;
+X    int top_ex;
+X    char *arg0;
+X
+X    top_in = 0;
+X    top_ex = 0;
+X
+X    /* Load database */
+X    if(db_read(stdin) < 0) {
+X	fputs("Database load failed!\n", stderr);
+X	exit(1);
+X    } 
+X
+X    fputs("Done loading database...\n", stderr);
+X
+X
+X    /* now parse args */
+X    arg0 = *argv;
+X    for (argv++, argc--; argc > 0; argv++, argc--) {
+X	if (isdigit (**argv) || **argv == '-' && isdigit ((*argv)[1])) {
+X	    i = atol(*argv);
+X	} else if (**argv == '+' && isdigit ((*argv)[1])) {
+X	    i = atol(*argv+1);
+X	} else if (**argv == 'b' && isdigit ((*argv)[1])) {
+X	    safe_below = atol(*argv+1);
+X	    fprintf (stderr, "Including all objects %d and below\n",
+X	    	     safe_below);
+X	} else if (**argv == 'a' && isdigit ((*argv)[1])) {
+X	    safe_above = atol(*argv+1);
+X	    fprintf (stderr, "Including all objects %d and above\n",
+X	    	     safe_above);
+X	} else if (!strcmp(*argv, "all")) {
+X	    include_all = 1;
+X	} else if (!strcmp(*argv, "reachable")) {
+X	    reachable = 1;
+X	} else if (!strcmp(*argv, "players")) {
+X	    keep_players = 1;
+X	} else if (!strcmp(*argv, "norecycle")) {
+X	    norecycle = 1;
+X	} else if (**argv == '-' &&
+X	           (i = lookup_player (*argv+1)) != 0) {
+X	    fprintf (stderr, "Excluding player %s(%d)\n",
+X		     db[i].name, i);
+X	    i = -i;
+X	} else if (**argv != '-' &&
+X	    	       (i = lookup_player (*argv)) != NOTHING) {
+X	    fprintf (stderr, "Including player %s(%d)\n",
+X		     db[i].name, i);
+X	} else {
+X		fprintf(stderr, "%s: bogus argument %s\n", arg0, *argv);
+X		continue;
+X	}
+X	
+X	if(i < 0) {
+X	    excluded[top_ex++] = -i;
+X	} else {
+X	    included[top_in++] = i;
+X	}
+X    }
+X
+X    /* Terminate */
+X    included[top_in++] = NOTHING;
+X    excluded[top_ex++] = NOTHING;
+X
+X    /* Check for reachability from DEFAULT_LOCATION */
+X    if (reachable)
+X    { make_reachable (DEFAULT_LOCATION); 
+X      fputs ("Done marking reachability...\n", stderr); 
+X    }
+X    
+X    /* Find recycler */
+X    if (norecycle && ((i = lookup_player (RECYCLER)) != NOTHING))
+X    { recycling_center = db[i].exits;
+X      if (recycling_center == DEFAULT_LOCATION) norecycle = 0;
+X      else
+X      { fprintf (stderr, "Excluding all players in %s(%d)\n",
+X      		  db[recycling_center].name, recycling_center);
+X      }
+X    }
+X
+X    /* Build translation table */
+X    build_trans();
+X    fputs("Done building translation table...\n", stderr);
+X
+X    /* Scan everything */
+X    for(i = 0; i < db_top; i++) check_bad_exits(i);
+X    fputs("Done checking bad exits...\n", stderr);
+X
+X    for(i = 0; i < db_top; i++) check_owner(i);
+X    fputs("Done checking owners...\n", stderr);
+X
+X    for(i = 0; i < db_top; i++) check_location(i);
+X    fputs("Done checking locations...\n", stderr);
+X
+X    for(i = 0; i < db_top; i++) check_next(i);
+X    fputs("Done checking next pointers...\n", stderr);
+X
+X    for(i = 0; i < db_top; i++) check_contents(i);
+X    fputs("Done checking contents...\n", stderr);
+X
+X    for(i = 0; i < db_top; i++) check_exits(i);
+X    fputs("Done checking homes and exits...\n", stderr);
+X
+X    do_write();
+X    fputs("Done.\n", stderr);
+X
+X    exit(0);
+X}
+END_OF_FILE
+if test 10634 -ne `wc -c <'extract.c'`; then
+    echo shar: \"'extract.c'\" unpacked with wrong size!
+fi
+# end of 'extract.c'
+fi
+if test -f 'minimal.db' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'minimal.db'\"
+else
+echo shar: Extracting \"'minimal.db'\" \(197 characters\)
+sed "s/^X//" >'minimal.db' <<'END_OF_FILE'
+X#0
+XRoom Zero
+XYou are in Room Zero.  It's very dark here.
+X-1
+X1
+X-1
+X-1
+X-1
+X
+X
+X
+Xis briefly visible through the mist.
+X1
+X0
+X0
+X
+X#1
+XOne
+XYou see Number One.
+X0
+X-1
+X0
+X-1
+X-1
+X
+X
+X
+X
+X1
+X0
+X19
+Xpotrzebie
+X***END OF DUMP***
+END_OF_FILE
+if test 197 -ne `wc -c <'minimal.db'`; then
+    echo shar: \"'minimal.db'\" unpacked with wrong size!
+fi
+# end of 'minimal.db'
+fi
+if test -f 'oldinterface.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'oldinterface.c'\"
+else
+echo shar: Extracting \"'oldinterface.c'\" \(24677 characters\)
+sed "s/^X//" >'oldinterface.c' <<'END_OF_FILE'
+X#include "copyright.h"
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include <sys/file.h>
+X#include <sys/time.h>
+X#include <signal.h>
+X#include <sys/ioctl.h>
+X#include <sys/wait.h>
+X#include <fcntl.h>
+X#include <sys/errno.h>
+X#include <ctype.h>
+X#include <sys/socket.h>
+X#include <netinet/in.h>
+X#include <netdb.h>
+X
+X#include "db.h"
+X#include "interface.h"
+X#include "config.h"
+X
+Xextern int	errno;
+Xint	shutdown_flag = 0;
+X
+Xstatic const char *connect_fail = "Either that player does not exist, or has a different password.\n";
+X#ifndef REGISTRATION
+Xstatic const char *create_fail = "Either there is already a player with that name, or that name is illegal.\n";
+X#endif REGISTRATION
+Xstatic const char *flushed_message = "<Output Flushed>\n";
+Xstatic const char *shutdown_message = "Going down - Bye\n";
+X
+Xstruct text_block {
+X	int			nchars;
+X	struct text_block	*nxt;
+X	char			*start;
+X	char			*buf;
+X};
+X
+Xstruct text_queue {
+X    struct text_block *head;
+X    struct text_block **tail;
+X};
+X
+Xstruct descriptor_data {
+X        int descriptor;
+X	int connected;
+X	dbref player;
+X	char *output_prefix;
+X	char *output_suffix;
+X	int output_size;
+X	struct text_queue output;
+X	struct text_queue input;
+X	char *raw_input;
+X	char *raw_input_at;
+X	long last_time;
+X	long connected_at;
+X	int quota;
+X	struct sockaddr_in address;
+X	const char *hostname;		/* 5/18/90 - Fuzzy */
+X	struct descriptor_data *next;
+X	struct descriptor_data *prev;
+X} *descriptor_list = 0;
+X
+Xstatic int sock;
+Xstatic int ndescriptors = 0;
+X
+Xvoid process_commands(void);
+Xvoid shovechars(int port);
+Xvoid shutdownsock(struct descriptor_data *d);
+Xstruct descriptor_data *initializesock(int s, struct sockaddr_in *a,
+X				       const char *hostname);
+Xvoid make_nonblocking(int s);
+Xvoid freeqs(struct descriptor_data *d);
+Xvoid welcome_user(struct descriptor_data *d);
+Xvoid do_motd(dbref);
+Xvoid check_connect(struct descriptor_data *d, const char *msg);
+Xvoid close_sockets();
+Xconst char *addrout (long);
+Xvoid dump_users(struct descriptor_data *d, char *user);
+Xvoid set_signals(void);
+Xstruct descriptor_data *new_connection(int sock);
+Xvoid parse_connect (const char *msg, char *command, char *user, char *pass);
+Xvoid set_userstring (char **userstring, const char *command);
+Xint do_command (struct descriptor_data *d, char *command);
+Xchar *strsave (const char *s);
+Xint make_socket(int);
+Xint queue_string(struct descriptor_data *, const char *);
+Xint queue_write(struct descriptor_data *, const char *, int);
+Xint process_output(struct descriptor_data *d);
+Xint process_input(struct descriptor_data *d);
+X#ifdef CONNECT_MESSAGES
+Xvoid announce_connect(dbref);
+Xvoid announce_disconnect(dbref);
+X#endif CONNECT_MESSAGES
+Xchar *time_format_1(long);
+Xchar *time_format_2(long);
+X
+X/* Signal handlers */
+Xint bailout (int, int, struct sigcontext *);
+Xint sigshutdown (int, int, struct sigcontext *);
+X#ifdef DETACH
+Xint logsynch (int, int, struct sigcontext *);
+X#endif DETACH
+X
+Xchar *logfile = LOG_FILE;
+X
+X#define MALLOC(result, type, number) do {			\
+X	if (!((result) = (type *) malloc ((number) * sizeof (type))))	\
+X		panic("Out of memory");				\
+X	} while (0)
+X
+X#define FREE(x) (free((void *) x))
+X
+X#ifndef BOOLEXP_DEBUGGING
+Xvoid main(int argc, char **argv)
+X{
+X    if (argc < 3) {
+X	fprintf(stderr, "Usage: %s infile dumpfile [port [logfile]]\n", *argv);
+X	exit (1);
+X    }
+X
+X    if (argc > 4) logfile = argv[4];
+X
+X    set_signals ();
+X    if (init_game (argv[1], argv[2]) < 0) {
+X	writelog("INIT: Couldn't load %s!\n", argv[1]);
+X	exit (2);
+X    }
+X
+X    /* go do it */
+X    shovechars (argc >= 4 ? atoi (argv[3]) : TINYPORT);
+X    close_sockets ();
+X    dump_database ();
+X    exit (0);
+X}
+X#endif /*BOOLEXP_DEBUGGING*/
+X
+Xvoid set_signals(void)
+X{
+X#ifdef DETACH
+X    int i;
+X
+X    if (fork() != 0) exit(0);
+X
+X    for (i=getdtablesize(); i >= 0; i--)
+X	(void) close(i);
+X
+X    i = open("/dev/tty", O_RDWR, 0);
+X    if (i != -1) {
+X	ioctl(i, TIOCNOTTY, 0);
+X	close(i);
+X    }
+X
+X    freopen(logfile, "a", stderr);
+X    setbuf(stderr, NULL);
+X#endif DETACH    
+X    
+X    /* we don't care about SIGPIPE, we notice it in select() and write() */
+X    signal (SIGPIPE, SIG_IGN);
+X
+X    /* standard termination signals */
+X    signal (SIGINT, (void (*)) sigshutdown);
+X    signal (SIGTERM, (void (*)) sigshutdown);
+X
+X#ifdef DETACH
+X    /* SIGUSR2 synchronizes the log file */
+X    signal (SIGUSR2, (void (*)) logsynch);
+X#else DETACH    
+X    signal (SIGUSR2, (void (*)) bailout);
+X#endif DETACH    
+X
+X    /* catch these because we might as well */
+X    signal (SIGQUIT, (void (*)) bailout);
+X    signal (SIGILL, (void (*)) bailout);
+X    signal (SIGTRAP, (void (*)) bailout);
+X    signal (SIGIOT, (void (*)) bailout);
+X    signal (SIGEMT, (void (*)) bailout);
+X    signal (SIGFPE, (void (*)) bailout);
+X    signal (SIGBUS, (void (*)) bailout);
+X    signal (SIGSEGV, (void (*)) bailout);
+X    signal (SIGSYS, (void (*)) bailout);
+X    signal (SIGXCPU, (void (*)) bailout);
+X    signal (SIGXFSZ, (void (*)) bailout);
+X    signal (SIGVTALRM, (void (*)) bailout);
+X    signal (SIGUSR1, (void (*)) bailout);
+X}
+X
+Xint notify(dbref player, const char *msg)
+X{
+X    struct descriptor_data *d;
+X    int retval = 0;
+X#ifdef COMPRESS
+X    extern const char *uncompress(const char *);
+X
+X    msg = uncompress(msg);
+X#endif /* COMPRESS */
+X
+X    for(d = descriptor_list; d; d = d->next) {
+X	if (d->connected && d->player == player) {
+X	    queue_string(d, msg);
+X	    queue_write(d, "\n", 1);
+X	    retval = 1;
+X	}
+X    }
+X    return(retval);
+X}
+X
+Xstruct timeval timeval_sub(struct timeval now, struct timeval then)
+X{
+X    now.tv_sec -= then.tv_sec;
+X    now.tv_usec -= then.tv_usec;
+X    if (now.tv_usec < 0) {
+X	now.tv_usec += 1000000;
+X	now.tv_sec--;
+X    }
+X    return now;
+X}
+X
+Xint msec_diff(struct timeval now, struct timeval then)
+X{
+X    return ((now.tv_sec - then.tv_sec) * 1000
+X	    + (now.tv_usec - then.tv_usec) / 1000);
+X}
+X
+Xstruct timeval msec_add(struct timeval t, int x)
+X{
+X    t.tv_sec += x / 1000;
+X    t.tv_usec += (x % 1000) * 1000;
+X    if (t.tv_usec >= 1000000) {
+X	t.tv_sec += t.tv_usec / 1000000;
+X	t.tv_usec = t.tv_usec % 1000000;
+X    }
+X    return t;
+X}
+X
+Xstruct timeval update_quotas(struct timeval last, struct timeval current)
+X{
+X    int nslices;
+X    struct descriptor_data *d;
+X
+X    nslices = msec_diff (current, last) / COMMAND_TIME_MSEC;
+X
+X    if (nslices > 0) {
+X	for (d = descriptor_list; d; d = d -> next) {
+X	    d -> quota += COMMANDS_PER_TIME * nslices;
+X	    if (d -> quota > COMMAND_BURST_SIZE)
+X		d -> quota = COMMAND_BURST_SIZE;
+X	}
+X    }
+X    return msec_add (last, nslices * COMMAND_TIME_MSEC);
+X}
+X
+Xvoid shovechars(int port)
+X{
+X    fd_set input_set, output_set;
+X    long now;
+X    struct timeval last_slice, current_time;
+X    struct timeval next_slice;
+X    struct timeval timeout, slice_timeout;
+X    int maxd;
+X    struct descriptor_data *d, *dnext;
+X    struct descriptor_data *newd;
+X    int avail_descriptors;
+X
+X    sock = make_socket (port);
+X    maxd = sock+1;
+X    gettimeofday(&last_slice, (struct timezone *) 0);
+X
+X    avail_descriptors = getdtablesize() - 4;
+X    
+X    while (shutdown_flag == 0) {
+X	gettimeofday(&current_time, (struct timezone *) 0);
+X	last_slice = update_quotas (last_slice, current_time);
+X
+X	process_commands();
+X
+X	if (shutdown_flag)
+X	    break;
+X	timeout.tv_sec = 1000;
+X	timeout.tv_usec = 0;
+X	next_slice = msec_add (last_slice, COMMAND_TIME_MSEC);
+X	slice_timeout = timeval_sub (next_slice, current_time);
+X	
+X	FD_ZERO (&input_set);
+X	FD_ZERO (&output_set);
+X	if (ndescriptors < avail_descriptors)
+X	    FD_SET (sock, &input_set);
+X	for (d = descriptor_list; d; d=d->next) {
+X	    if (d->input.head)
+X		timeout = slice_timeout;
+X	    else
+X		FD_SET (d->descriptor, &input_set);
+X	    if (d->output.head)
+X		FD_SET (d->descriptor, &output_set);
+X	}
+X
+X	if (select (maxd, &input_set, &output_set,
+X		    (fd_set *) 0, &timeout) < 0) {
+X	    if (errno != EINTR) {
+X		perror ("select");
+X		return;
+X	    }
+X	} else {
+X	    (void) time (&now);
+X	    if (FD_ISSET (sock, &input_set)) {
+X		if (!(newd = new_connection (sock))) {
+X		    if (errno
+X			&& errno != EINTR
+X			&& errno != EMFILE
+X			&& errno != ENFILE) {
+X			perror ("new_connection");
+X			return;
+X		    }
+X		} else {
+X		if (newd->descriptor >= maxd)
+X		    maxd = newd->descriptor + 1;
+X		}
+X	    }
+X	    for (d = descriptor_list; d; d = dnext) {
+X		dnext = d->next;
+X		if (FD_ISSET (d->descriptor, &input_set)) {
+X			d->last_time = now;
+X			if (!process_input (d)) {
+X			    shutdownsock (d);
+X			    continue;
+X			}
+X		}
+X		if (FD_ISSET (d->descriptor, &output_set)) {
+X		    if (!process_output (d)) {
+X			shutdownsock (d);
+X		    }
+X		}
+X	    }
+X	}
+X    }
+X}
+X
+Xstatic char hostname[128];
+X
+Xstruct descriptor_data *new_connection(int sock)
+X{
+X    int newsock;
+X    struct sockaddr_in addr;
+X    int addr_len;
+X
+X    addr_len = sizeof (addr);
+X    newsock = accept (sock, (struct sockaddr *) & addr, &addr_len);
+X    if (newsock < 0) {
+X	return 0;
+X#ifdef LOCKOUT
+X    } else if(forbidden_site(ntohl(addr.sin_addr.s_addr))) {
+X	writelog("REFUSED CONNECTION from %s(%d) on descriptor %d\n",
+X		addrout(addr.sin_addr.s_addr),
+X		ntohs(addr.sin_port), newsock);
+X	shutdown(newsock, 2);
+X	close(newsock);
+X	errno = 0;
+X	return 0;
+X#endif /* LOCKOUT */
+X    } else {
+X	strcpy (hostname, addrout (addr.sin_addr.s_addr));
+X#ifdef NOISY_LOG
+X	writelog("ACCEPT from %s(%d) on descriptor %d\n",
+X		 hostname,
+X		 ntohs (addr.sin_port), newsock);
+X#endif NOISY_LOG
+X	return initializesock (newsock, &addr, hostname);
+X    }
+X}
+X
+Xconst char *addrout(long a)
+X{
+X    /* New version: returns host names, not octets.  Uses gethostbyaddr. */
+X    extern char *inet_ntoa(long);
+X    
+X#ifdef HOST_NAME
+X    struct hostent *he;
+X
+X    he = gethostbyaddr(&a,sizeof(a),AF_INET);
+X    if (he) return he->h_name;
+X    else return inet_ntoa(a);
+X#else
+X    return inet_ntoa(a);
+X#endif HOST_NAME
+X}
+X
+X
+Xvoid clearstrings(struct descriptor_data *d)
+X{
+X    if (d->output_prefix) {
+X	FREE(d->output_prefix);
+X	d->output_prefix = 0;
+X    }
+X    if (d->output_suffix) {
+X	FREE(d->output_suffix);
+X	d->output_suffix = 0;
+X    }
+X}
+X
+Xvoid shutdownsock(struct descriptor_data *d)
+X{
+X    if (d->connected) {
+X	writelog("DISCONNECT player %s(%d) %d %s\n",
+X		db[d->player].name, d->player, d->descriptor, d->hostname);
+X#ifdef CONNECT_MESSAGES
+X	announce_disconnect(d->player);
+X#endif CONNECT_MESSAGES
+X    } else {
+X	writelog("DISCONNECT descriptor %d never connected\n",
+X		d->descriptor);
+X    }
+X    clearstrings (d);
+X    shutdown (d->descriptor, 2);
+X    close (d->descriptor);
+X    freeqs (d);
+X    if (d->prev) d->prev->next = d->next; else descriptor_list = d->next;
+X    if (d->next) d->next->prev = d->prev;
+X    FREE (d);
+X    ndescriptors--;
+X}
+X
+Xstruct descriptor_data *initializesock(int s, struct sockaddr_in *a,
+X				       const char *hostname)
+X{
+X    struct descriptor_data *d;
+X
+X    ndescriptors++;
+X    MALLOC(d, struct descriptor_data, 1);
+X    d->descriptor = s;
+X    d->connected = 0;
+X    make_nonblocking (s);
+X    d->output_prefix = 0;
+X    d->output_suffix = 0;
+X    d->output_size = 0;
+X    d->output.head = 0;
+X    d->output.tail = &d->output.head;
+X    d->input.head = 0;
+X    d->input.tail = &d->input.head;
+X    d->raw_input = 0;
+X    d->raw_input_at = 0;
+X    d->quota = COMMAND_BURST_SIZE;
+X    d->last_time = 0;
+X    d->address = *a;			/* added 5/3/90 SCG */
+X    d->hostname = alloc_string(hostname);
+X    if (descriptor_list)
+X        descriptor_list->prev = d;
+X    d->next = descriptor_list;
+X    d->prev = NULL;
+X    descriptor_list = d;
+X    
+X    welcome_user (d);
+X    return d;
+X}
+X
+Xint make_socket(int port)
+X{
+X    int s;
+X    struct sockaddr_in server;
+X    int opt;
+X
+X    s = socket (AF_INET, SOCK_STREAM, 0);
+X    if (s < 0) {
+X	perror ("creating stream socket");
+X	exit (3);
+X    }
+X    opt = 1;
+X    if (setsockopt (s, SOL_SOCKET, SO_REUSEADDR,
+X		    (char *) &opt, sizeof (opt)) < 0) {
+X	perror ("setsockopt");
+X	exit (1);
+X    }
+X    server.sin_family = AF_INET;
+X    server.sin_addr.s_addr = INADDR_ANY;
+X    server.sin_port = htons (port);
+X    if (bind (s, (struct sockaddr *) & server, sizeof (server))) {
+X	perror ("binding stream socket");
+X	close (s);
+X	exit (4);
+X    }
+X    listen (s, 5);
+X    return s;
+X}
+X
+Xstruct text_block *make_text_block(const char *s, int n)
+X{
+X	struct text_block *p;
+X
+X	MALLOC(p, struct text_block, 1);
+X	MALLOC(p->buf, char, n);
+X	bcopy (s, p->buf, n);
+X	p->nchars = n;
+X	p->start = p->buf;
+X	p->nxt = 0;
+X	return p;
+X}
+X
+Xvoid free_text_block (struct text_block *t)
+X{
+X	FREE (t->buf);
+X	FREE ((char *) t);
+X}
+X
+Xvoid add_to_queue(struct text_queue *q, const char *b, int n)
+X{
+X    struct text_block *p;
+X
+X    if (n == 0) return;
+X
+X    p = make_text_block (b, n);
+X    p->nxt = 0;
+X    *q->tail = p;
+X    q->tail = &p->nxt;
+X}
+X
+Xint flush_queue(struct text_queue *q, int n)
+X{
+X        struct text_block *p;
+X	int really_flushed = 0;
+X	
+X	n += strlen(flushed_message);
+X
+X	while (n > 0 && (p = q->head)) {
+X	    n -= p->nchars;
+X	    really_flushed += p->nchars;
+X	    q->head = p->nxt;
+X	    free_text_block (p);
+X	}
+X	p = make_text_block(flushed_message, strlen(flushed_message));
+X	p->nxt = q->head;
+X	q->head = p;
+X	if (!p->nxt)
+X	    q->tail = &p->nxt;
+X	really_flushed -= p->nchars;
+X	return really_flushed;
+X}
+X
+Xint queue_write(struct descriptor_data *d, const char *b, int n)
+X{
+X    int space;
+X
+X    space = MAX_OUTPUT - d->output_size - n;
+X    if (space < 0)
+X        d->output_size -= flush_queue(&d->output, -space);
+X    add_to_queue (&d->output, b, n);
+X    d->output_size += n;
+X    return n;
+X}
+X
+Xint queue_string(struct descriptor_data *d, const char *s)
+X{
+X    return queue_write (d, s, strlen (s));
+X}
+X
+Xint process_output(struct descriptor_data *d)
+X{
+X    struct text_block **qp, *cur;
+X    int cnt;
+X
+X    for (qp = &d->output.head; cur = *qp;) {
+X	cnt = write (d->descriptor, cur -> start, cur -> nchars);
+X	if (cnt < 0) {
+X	    if (errno == EWOULDBLOCK)
+X		return 1;
+X	    return 0;
+X	}
+X	d->output_size -= cnt;
+X	if (cnt == cur -> nchars) {
+X	    if (!cur -> nxt)
+X		d->output.tail = qp;
+X	    *qp = cur -> nxt;
+X	    free_text_block (cur);
+X	    continue;		/* do not adv ptr */
+X	}
+X	cur -> nchars -= cnt;
+X	cur -> start += cnt;
+X	break;
+X    }
+X    return 1;
+X}
+X
+Xvoid make_nonblocking(int s)
+X{
+X    if (fcntl (s, F_SETFL, FNDELAY) == -1) {
+X	perror ("make_nonblocking: fcntl");
+X	panic ("FNDELAY fcntl failed");
+X    }
+X}
+X
+Xvoid freeqs(struct descriptor_data *d)
+X{
+X    struct text_block *cur, *next;
+X
+X    cur = d->output.head;
+X    while (cur) {
+X	next = cur -> nxt;
+X	free_text_block (cur);
+X	cur = next;
+X    }
+X    d->output.head = 0;
+X    d->output.tail = &d->output.head;
+X
+X    cur = d->input.head;
+X    while (cur) {
+X	next = cur -> nxt;
+X	free_text_block (cur);
+X	cur = next;
+X    }
+X    d->input.head = 0;
+X    d->input.tail = &d->input.head;
+X
+X    if (d->raw_input)
+X        FREE (d->raw_input);
+X    d->raw_input = 0;
+X    d->raw_input_at = 0;
+X}
+X
+Xvoid welcome_user(struct descriptor_data *d)
+X{ 
+X    queue_string (d, WELCOME_MESSAGE);
+X# ifdef CONNECT_FILE
+X    do_connect_msg(d, CONNECT_FILE);
+X# endif
+X}
+X
+Xvoid goodbye_user(struct descriptor_data *d)
+X{
+X    write (d->descriptor, LEAVE_MESSAGE, strlen (LEAVE_MESSAGE));
+X}
+X
+Xchar *strsave (const char *s)
+X{
+X    char *p;
+X
+X    MALLOC (p, char, strlen(s) + 1);
+X
+X    if (p)
+X	strcpy (p, s);
+X    return p;
+X}
+X
+Xvoid save_command (struct descriptor_data *d, const char *command)
+X{
+X    add_to_queue (&d->input, command, strlen(command)+1);
+X}
+X
+Xint process_input (struct descriptor_data *d)
+X{
+X    char buf[1024];
+X    int got;
+X    char *p, *pend, *q, *qend;
+X
+X    got = read (d->descriptor, buf, sizeof buf);
+X    if (got <= 0)
+X	return 0;
+X    if (!d->raw_input) {
+X	MALLOC(d->raw_input,char,MAX_COMMAND_LEN);
+X	d->raw_input_at = d->raw_input;
+X    }
+X    p = d->raw_input_at;
+X    pend = d->raw_input + MAX_COMMAND_LEN - 1;
+X    for (q=buf, qend = buf + got; q < qend; q++) {
+X	if (*q == '\n') {
+X	    *p = '\0';
+X	    if (p > d->raw_input)
+X		save_command (d, d->raw_input);
+X	    p = d->raw_input;
+X	} else if (p < pend && isascii (*q) && isprint (*q)) {
+X	    *p++ = *q;
+X	}
+X    }
+X    if(p > d->raw_input) {
+X	d->raw_input_at = p;
+X    } else {
+X	FREE(d->raw_input);
+X	d->raw_input = 0;
+X	d->raw_input_at = 0;
+X    }
+X    return 1;
+X}
+X
+Xvoid set_userstring (char **userstring, const char *command)
+X{
+X    if (*userstring) {
+X	FREE(*userstring);
+X	*userstring = 0;
+X    }
+X    while (*command && isascii (*command) && isspace (*command))
+X	command++;
+X    if (*command)
+X	*userstring = strsave (command);
+X}
+X
+Xvoid process_commands(void)
+X{
+X    int nprocessed;
+X    struct descriptor_data *d, *dnext;
+X    struct text_block *t;
+X
+X    do {
+X	nprocessed = 0;
+X	for (d = descriptor_list; d; d = dnext) {
+X	    dnext = d->next;
+X	    if (d -> quota > 0 && (t = d -> input.head)) {
+X		d -> quota--;
+X		nprocessed++;
+X		if (!do_command (d, t -> start)) {
+X		    shutdownsock (d);
+X		} else {
+X		    d -> input.head = t -> nxt;
+X		    if (!d -> input.head)
+X			d -> input.tail = &d -> input.head;
+X		    free_text_block (t);
+X		}
+X	    }
+X	}
+X    } while (nprocessed > 0);
+X}
+X
+Xint do_command (struct descriptor_data *d, char *command)
+X{
+X    if (!strcmp (command, QUIT_COMMAND)) {
+X	goodbye_user (d);
+X	return 0;
+X    } else if (!strncmp (command, WHO_COMMAND, strlen(WHO_COMMAND))) {
+X	if (d->output_prefix) {
+X	    queue_string (d, d->output_prefix);
+X	    queue_write (d, "\n", 1);
+X	}
+X	dump_users (d, command + strlen(WHO_COMMAND));
+X	if (d->output_suffix) {
+X	    queue_string (d, d->output_suffix);
+X	    queue_write (d, "\n", 1);
+X	}
+X    } else if (d->connected &&
+X	       !strncmp (command, PREFIX_COMMAND, strlen (PREFIX_COMMAND))) {
+X#ifdef ROBOT_MODE
+X	if (!Robot(d->player)) { 
+X#ifndef TINKER
+X	    notify(d->player,
+X		   "Only robots can use OUTPUTPREFIX; contact a Wizard.");
+X#else TINKER
+X	    notify(d->player,
+X		   "Only robots can use OUTPUTPREFIX; contact a Tinker.");
+X#endif TINKER
+X	    return 1;
+X	}
+X	if (!d->connected) return 1;
+X#endif ROBOT_MODE
+X	set_userstring (&d->output_prefix, command+strlen(PREFIX_COMMAND));
+X    } else if (d->connected &&
+X	       !strncmp (command, SUFFIX_COMMAND, strlen (SUFFIX_COMMAND))) {
+X#ifdef ROBOT_MODE
+X	if (!Robot(d->player)) { 
+X#ifndef TINKER
+X	    notify(d->player,
+X		   "Only robots can use OUTPUTSUFFIX; contact a Wizard.");
+X#else TINKER
+X	    notify(d->player,
+X		   "Only robots can use OUTPUTSUFFIX; contact a Tinker.");
+X#endif TINKER
+X	    return 1;
+X	}
+X#endif ROBOT_MODE
+X	set_userstring (&d->output_suffix, command+strlen(SUFFIX_COMMAND));
+X    } else {
+X	if (d->connected) {
+X	    if (d->output_prefix) {
+X		queue_string (d, d->output_prefix);
+X		queue_write (d, "\n", 1);
+X	    }
+X	    process_command (d->player, command);
+X	    if (d->output_suffix) {
+X		queue_string (d, d->output_suffix);
+X		queue_write (d, "\n", 1);
+X	    }
+X	} else {
+X	    check_connect (d, command);
+X	}
+X    }
+X    return 1;
+X}
+X
+Xvoid check_connect (struct descriptor_data *d, const char *msg)
+X{
+X    char command[MAX_COMMAND_LEN];
+X    char user[MAX_COMMAND_LEN];
+X    char password[MAX_COMMAND_LEN];
+X    dbref player;
+X
+X    parse_connect (msg, command, user, password);
+X
+X    if (!strncmp (command, "co", 2)) {
+X	player = connect_player (user, password);
+X	if (player == NOTHING) {
+X	    queue_string (d, connect_fail);
+X	    writelog("FAILED CONNECT %s on %d %s\n",
+X		     user, d->descriptor, d->hostname);
+X	} else {
+X	    writelog("CONNECTED %s(%d) on %d %s\n",
+X		     db[player].name, player, d->descriptor, d->hostname);
+X	    d->connected = 1;
+X	    d->connected_at = time(NULL);
+X	    d->player = player;
+X
+X	    do_motd (player);
+X	    do_look_around (player);
+X#ifdef CONNECT_MESSAGES
+X	    announce_connect(player);
+X#endif CONNECT_MESSAGES
+X	}
+X    } else if (!strncmp (command, "cr", 2)) {
+X#ifndef REGISTRATION	
+X	player = create_player (user, password);
+X	if (player == NOTHING) {
+X	    queue_string (d, create_fail);
+X	    writelog("FAILED CREATE %s on %d %s\n",
+X		     user, d->descriptor, d->hostname);
+X	} else {
+X	    writelog("CREATED %s(%d) on descriptor %d %s\n",
+X		     db[player].name, player, d->descriptor, d->hostname);
+X	    d->connected = 1;
+X	    d->connected_at = time(NULL);
+X	    d->player = player;
+X
+X	    do_motd (player);
+X	    do_look_around (player);
+X#ifdef CONNECT_MESSAGES
+X	    announce_connect(player);
+X#endif CONNECT_MESSAGES
+X	}
+X#else
+X	queue_string (d, REGISTER_MESSAGE);
+X#endif REGISTRATION	
+X    } else {
+X	welcome_user (d);
+X    }
+X}
+X
+Xvoid parse_connect (const char *msg, char *command, char *user, char *pass)
+X{
+X    char *p;
+X
+X    while (*msg && isascii(*msg) && isspace (*msg))
+X	msg++;
+X    p = command;
+X    while (*msg && isascii(*msg) && !isspace (*msg))
+X	*p++ = *msg++;
+X    *p = '\0';
+X    while (*msg && isascii(*msg) && isspace (*msg))
+X	msg++;
+X    p = user;
+X    while (*msg && isascii(*msg) && !isspace (*msg))
+X	*p++ = *msg++;
+X    *p = '\0';
+X    while (*msg && isascii(*msg) && isspace (*msg))
+X	msg++;
+X    p = pass;
+X    while (*msg && isascii(*msg) && !isspace (*msg))
+X	*p++ = *msg++;
+X    *p = '\0';
+X}
+X
+Xvoid close_sockets(void)
+X{
+X    struct descriptor_data *d, *dnext;
+X
+X    for (d = descriptor_list; d; d = dnext) {
+X	dnext = d->next;
+X	write (d->descriptor, shutdown_message, strlen (shutdown_message));
+X	if (shutdown (d->descriptor, 2) < 0)
+X	    perror ("shutdown");
+X	close (d->descriptor);
+X    }
+X    close (sock);
+X}
+X
+Xvoid emergency_shutdown(void)
+X{
+X	close_sockets();
+X}
+X
+Xvoid boot_off(dbref player)
+X{
+X    struct descriptor_data *d, *dnext;
+X    for (d = descriptor_list; d; d = dnext) {
+X      dnext = d->next;
+X      if (d->connected && d->player == player) {
+X          process_output(d);
+X	  shutdownsock(d);
+X      }
+X    }
+X}
+X
+Xint bailout (int sig, int code, struct sigcontext *scp)
+X{
+X    long *ptr;
+X    int i;
+X    
+X    writelog("BAILOUT: caught signal %d code %d\n", sig, code);
+X    ptr = (long *) scp;
+X    for (i=0; i<sizeof(struct sigcontext); i++)
+X	writelog("  %08lx\n", *ptr);
+X    panic("PANIC on spurious signal");
+X    _exit(7);
+X    return 0;
+X}
+X
+Xint sigshutdown (int sig, int code, struct sigcontext *scp)
+X{
+X    writelog("SHUTDOWN: on signal %d code %d\n", sig, code);
+X    shutdown_flag = 1;
+X    return 0;
+X}
+X
+X#ifdef DETACH
+Xint logsynch (int sig, int code, struct sigcontext *scp)
+X{
+X    freopen(logfile, "a", stderr);
+X    setbuf(stderr, NULL);
+X    writelog("log file reopened\n");
+X    return 0;
+X}
+X#endif DETACH    
+X
+Xvoid dump_users(struct descriptor_data *e, char *user)
+X{
+X    struct descriptor_data *d;
+X    long now;
+X    char buf[1024];
+X    int wizard;
+X    int reversed, tabular;
+X
+X    while (*user && isspace(*user)) user++;
+X    if (!*user) user = NULL;
+X
+X    reversed = e->connected && Flag(e->player,REVERSED_WHO);
+X    tabular = e->connected && Flag(e->player,TABULAR_WHO);
+X
+X    (void) time (&now);
+X    queue_string(e,
+X		 tabular ? "Player Name          On For Idle\n" : "Current Players:\n");
+X#ifdef GOD_MODE
+X    wizard = e->connected && God(e->player);
+X#else GOD_MODE    
+X    wizard = e->connected && Wizard(e->player);
+X#endif GOD_MODE
+X
+X    d = descriptor_list;
+X    
+X    if (reversed)
+X	while (d && d->next) d = d->next;
+X
+X    while (d) {
+X	if (d->connected &&
+X	    (!user || string_prefix(db[d->player].name, user))) {
+X	    if (tabular) {
+X		sprintf(buf,"%-16s %10s %4s",
+X			db[d->player].name,
+X			time_format_1(now - d->connected_at),
+X			time_format_2(now - d->last_time));
+X		if (wizard) 
+X		    sprintf(buf+strlen(buf),
+X			    " %s", d->hostname);
+X	    } else {
+X		sprintf(buf,
+X			"%s idle %d seconds",
+X			db[d->player].name,
+X			now - d->last_time);
+X		if (wizard) 
+X		    sprintf(buf+strlen(buf),
+X			    " from host %s", d->hostname);
+X	    }
+X	    strcat(buf,"\n");
+X	    queue_string (e, buf);
+X	}
+X	if (reversed) d = d->prev; else d = d->next;
+X    }
+X}
+X
+Xchar *time_format_1(long dt)
+X{
+X    register struct tm *delta;
+X    static char buf[64];
+X    
+X    delta = gmtime(&dt);
+X    if (delta->tm_yday > 0)
+X	sprintf(buf, "%dd %02d:%02d",
+X		delta->tm_yday, delta->tm_hour, delta->tm_min);
+X    else
+X	sprintf(buf, "%02d:%02d",
+X		delta->tm_hour, delta->tm_min);
+X    return buf;
+X}
+X
+Xchar *time_format_2(long dt)
+X{
+X    register struct tm *delta;
+X    static char buf[64];
+X    
+X    delta = gmtime(&dt);
+X    if (delta->tm_yday > 0)
+X	sprintf(buf, "%dd", delta->tm_yday);
+X    else if (delta->tm_hour > 0)
+X	sprintf(buf, "%dh", delta->tm_hour);
+X    else if (delta->tm_min > 0)
+X	sprintf(buf, "%dm", delta->tm_min);
+X    else
+X	sprintf(buf, "%ds", delta->tm_sec);
+X    return buf;
+X}
+X
+X#ifdef CONNECT_MESSAGES
+Xvoid announce_connect(dbref player)
+X{
+X    dbref loc;
+X    char buf[BUFFER_LEN];
+X
+X    if ((loc = getloc(player)) == NOTHING) return;
+X    if (Dark(player) || Dark(loc)) return;
+X
+X    sprintf(buf, "%s has connected.", db[player].name);
+X
+X    notify_except(db[loc].contents, player, buf);
+X}
+X
+Xvoid announce_disconnect(dbref player)
+X{
+X    dbref loc;
+X    char buf[BUFFER_LEN];
+X
+X    if ((loc = getloc(player)) == NOTHING) return;
+X    if (Dark(player) || Dark(loc)) return;
+X
+X    sprintf(buf, "%s has disconnected.", db[player].name);
+X
+X    notify_except(db[loc].contents, player, buf);
+X}
+X#endif CONNECT_MESSAGES
+Xint do_connect_msg(struct descriptor_data * d, const char *filename)
+X{
+X  FILE           *f;
+X  char            buf[BUFFER_LEN];
+X  char           *p;
+X
+X  if ((f = fopen(filename, "r")) == NULL)
+X  {
+X    return (0);
+X  } else
+X  {
+X    while (fgets(buf, sizeof buf, f))
+X    {
+X      queue_string(d, (char *)buf);
+X
+X    }
+X    fclose(f);
+X    return (1);
+X  }
+X}
+END_OF_FILE
+if test 24677 -ne `wc -c <'oldinterface.c'`; then
+    echo shar: \"'oldinterface.c'\" unpacked with wrong size!
+fi
+# end of 'oldinterface.c'
+fi
+echo shar: End of archive 8 \(of 10\).
+cp /dev/null ark8isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 10 archives.
+    echo ">>> now type 'sh joinspl.sh'"
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

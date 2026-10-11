@@ -1,0 +1,1942 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,d15c5f6daf5ee360,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1992-09-08 03:28:54 PST
+Path: sparky!uunet!zephyr.ens.tek.com!master!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v14i083:  okbridge2 - computer-mediated bridge game, Part05/14
+Message-ID: <3522@master.CNA.TEK.COM>
+Date: 7 Sep 92 21:41:34 GMT
+Sender: news@master.CNA.TEK.COM
+Lines: 1926
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: mclegg@cs.UCSD.EDU (Matthew Clegg)
+Posting-number: Volume 14, Issue 83
+Archive-name: okbridge2/Part05
+Supersedes: okbridge: Volume 13, Issue 16-22
+Environment: BSD-derived Unix, NeXT, curses, sockets
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 5 (of 14)."
+# Contents:  boards.c network.h
+# Wrapped by billr@saab on Mon Sep  7 14:33:36 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'boards.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'boards.c'\"
+else
+echo shar: Extracting \"'boards.c'\" \(36085 characters\)
+sed "s/^X//" >'boards.c' <<'END_OF_FILE'
+X/* boards.c -- routines for manipulating boards.
+X *
+X ! Copyright (C) 1990-1992 by Matthew Clegg.  All Rights Reserved
+X ! 
+X ! OKbridge is made available as a free service to the Internet.
+X ! Accordingly, the following restrictions are placed on its use:
+X ! 
+X ! 1.  OKbridge may not be modified in any way without the explicit 
+X !     permission of Matthew Clegg.  
+X ! 
+X ! 2.  OKbridge may not be used in any way for commercial advantage.
+X !     It may not be placed on for-profit networks or on for-profit
+X !     computer systems.  It may not be bundled as part of a package
+X !     or service provided by a for-profit organization.
+X ! 
+X ! If you have questions about restrictions on the use of OKbridge,
+X ! write to mclegg@cs.ucsd.edu.
+X ! 
+X ! DISCLAIMER:  The user of OKbridge accepts full responsibility for any
+X ! damage which may be caused by OKbridge.
+X *
+X */
+X
+X/* This module provides routines for manipulating the set of boards.
+X   Conceptually, the interface to this module is a local database for
+X   accessing and updating boards.  However, this module also contains
+X   routines for reading and writing boards from files and also
+X   routines for transmitting and receiving boards over the network.
+X*/
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include <time.h>
+X#include <string.h>
+X
+X#define _BOARDS_
+X
+X#include "types.h"
+X#include "cipher.h"
+X#include "boards.h"
+X/* #include "socket.h" */
+X/* #include "parser.h" */
+X/* #include "protocol.h" */
+X/* #include "network.h" */
+X#include "scoring.h"
+X
+X#ifdef GCC
+Xextern sscanf (), strcasecmp (), fgetc (), fprintf (), bcopy ();
+Xextern time_t time ();
+X#endif
+X
+Xextern char *month_names[];
+Xextern char *malloc ();
+Xextern char *strdup ();
+Xextern void free ();
+Xextern void qsort ();
+Xextern int  rand  ();
+X
+X#define random(n) ((rand()/64) % (n))
+X
+Xint Header_has_been_generated = 0;
+Xchar Email_header_buffer[80];
+X
+Xchar *local_source = NULL;
+X  /* The source to which locally generated boards will be attributed. */
+Xint   local_seq_no = 0;
+X  /* The sequence number which will be assigned to the next locally
+X     generated board. */
+X
+Xstatic Board *board_freelist = NULL;
+Xstatic Play_record *play_record_freelist = NULL;
+X
+X/* The following primitives are for manipulating the boards and play
+X   records. */
+X
+XBoard *Allocate_board ()
+X/* Returns a pointer to a newly allocated board.  Does not fill in any
+X   of the fields. */
+X{
+X  Board *b;
+X
+X  if (board_freelist == NULL)
+X    b = (Board *) malloc(sizeof(Board));
+X  else {
+X    b = board_freelist;
+X    board_freelist = b->next;
+X  }
+X
+X  b->source = NULL;
+X  b->serial_no = 0;
+X  b->part_score[0] = b->part_score[1] = 0;
+X  b->mps_computed = b->imps_computed = 0;
+X  b->startup_comment = NULL;
+X  b->play_records = NULL;
+X
+X  return (b);
+X}
+X
+X
+Xvoid Deallocate_board (b)
+X     Board *b;
+X/* Deallocates the board b.  This includes freeing up strings which are
+X   part of the structure and de-allocating the play records associated to
+X   this board. */
+X{
+X  Play_record *p;
+X
+X  if (b->source != NULL) free(b->source);
+X  if (b->startup_comment != NULL) free (b->startup_comment);
+X
+X  while (b->play_records != NULL) {
+X    p = b->play_records;
+X    b->play_records = p->next;
+X    Deallocate_play_record (p);
+X  }
+X
+X  b->next = board_freelist;
+X  board_freelist = b;
+X
+X}
+X
+X
+XPlay_record *Allocate_play_record (n, e, s, w)
+X     char *n;
+X     char *e;
+X     char *s;
+X     char *w;
+X/* Returns a pointer to a newly allocated play record.  Does not fill in any
+X   of the fields. */
+X{
+X  Play_record *p;
+X
+X  if (play_record_freelist == NULL)
+X    p = (Play_record *) malloc(sizeof(Play_record));
+X  else {
+X    p = play_record_freelist;
+X    play_record_freelist = p->next;
+X  }
+X
+X  p->player_names[0] = NULL;
+X  p->player_names[1] = NULL;
+X  p->player_names[2] = NULL;
+X  p->player_names[3] = NULL;
+X
+X  if (n != NULL)
+X    p->player_names[PLAYER_NORTH] = strdup (n);
+X  if (e != NULL)
+X    p->player_names[PLAYER_EAST]  = strdup (e);
+X  if (s != NULL)
+X    p->player_names[PLAYER_SOUTH] = strdup (s);
+X  if (w != NULL)
+X    p->player_names[PLAYER_WEST]  = strdup (w);
+X
+X  p->table = 0;
+X  p->no_bids = 0;
+X  p->no_plays = 0;
+X  p->bidding_completed = 0;
+X  p->hand_completed = 0;
+X  p->contract = p->doubled = p->declarer = 0;
+X  p->result = 0;
+X  p->tricks[0] = p->tricks[1] = 0;
+X  p->above_line[0] = p->above_line[1] = 0;
+X  p->below_line[0] = p->below_line[1] = 0;
+X  p->match_points[0] = p->match_points[1] = 0.0;
+X  p->imatch_points[0] = p->imatch_points[1] = 0.0;
+X  p->mimp_points[0] = p->mimp_points[1] = 0;
+X  p->next = 0;
+X
+X  return (p);
+X}
+X
+Xvoid Deallocate_play_record (p)
+X     Play_record *p;
+X/* Deallocates the play record p.  This includes freeing up strings
+X   which are part of the structure. */
+X{
+X  if (p->player_names[0] != NULL) free (p->player_names[0]);
+X  if (p->player_names[1] != NULL) free (p->player_names[1]);
+X  if (p->player_names[2] != NULL) free (p->player_names[2]);
+X  if (p->player_names[3] != NULL) free (p->player_names[3]);
+X
+X  p->next = play_record_freelist;
+X  play_record_freelist = p;
+X
+X}
+X
+X
+Xvoid Erase_board_list (list)
+X     Board **list;
+X/* Deallocates all of the boards in the Board_list. */
+X{
+X  Board *b;
+X
+X  while (*list != NULL) {
+X    b = *list;
+X    *list = b->next;
+X    Deallocate_board (b);
+X  }
+X}
+X
+Xvoid Append_board (list, b)
+X     Board **list;
+X     Board *b;
+X/* Appends the board b to the list of unplayed boards. */
+X{
+X  Board *l;
+X
+X  if (*list == NULL)
+X    *list = b;
+X  else {
+X    for (l = *list; l->next != NULL; l = l->next);
+X    l->next = b;
+X  }
+X  b->next = NULL;
+X}
+X
+Xvoid Append_play_record (b, p)
+X     Board *b;
+X     Play_record *p;
+X/* Appends the play record p to the list of play records associated to the
+X   board b. */
+X{
+X  Play_record *q;
+X
+X  if (b->play_records == NULL)
+X    b->play_records = p;
+X  else {
+X    for (q = b->play_records; q->next != NULL; q = q->next);
+X    q->next = p;
+X  }
+X  p->next = NULL;
+X}
+X
+Xstatic int  Locate_field (buf, field_no)
+X     char *buf;
+X     int field_no;
+X/* Returns the index in buf of the first character of field_no. */
+X{
+X  int i, n;
+X
+X  for (i = 0; (buf[i] == ' ') || (buf[i] == '\t'); i++);
+X  n = 1;
+X  while ((buf[i] != '\0') && (n < field_no)) {
+X    while ((buf[i] != ' ') && (buf[i] != '\t') && (buf[i] != '\0')) i++;
+X    while ((buf[i] == ' ') || (buf[i] == '\t')) i++;
+X    n++;
+X  }
+X  return (i);
+X}
+X
+Xvoid Encode_board (b, buf1, buf2)
+X     Board *b;
+X     char *buf1;
+X     char *buf2;
+X/* Encodes the board in the string array buf1, buf2.  This encoding does not 
+X   include the play records. */
+X{
+X  int i;
+X
+X  sprintf (buf1, "%d %d %d %d %s %s", b->serial_no, 
+X	   b->scoring_mode, b->part_score[0], b->part_score[1],
+X	   b->source, (b->startup_comment == NULL)? " ": b->startup_comment);
+X  buf2[0] = b->dealer + '0';
+X  buf2[1] = b->vulnerable[0] + '0';
+X  buf2[2] = b->vulnerable[1] + '0';
+X  for (i = 0; i < 52; i++)
+X    buf2[i+3] = b->deal[i] + '0';
+X  buf2[52+3] = '\0';
+X}
+X
+X
+XBoard *Decode_board (buf1, buf2)
+X     char *buf1;
+X     char *buf2;
+X/* Decodes the string array buf and returns a corresponding board structure. */
+X{
+X  Board *b;
+X  char source_buf[80];
+X  int i, comment_index;
+X
+X  b = Allocate_board ();
+X  sscanf (buf1, "%d %d %d %d %s", &(b->serial_no), &(b->scoring_mode),
+X	  &(b->part_score[0]), &(b->part_score[1]),
+X	  source_buf);
+X  comment_index = Locate_field (buf1, 6);
+X  b->source = strdup (source_buf);
+X  b->startup_comment = strdup (buf1 + comment_index);
+X  
+X  b->dealer = buf2[0] - '0';
+X  b->vulnerable[0] = buf2[1] - '0';
+X  b->vulnerable[1] = buf2[2] - '0';
+X  for (i = 0; i < 52; i++)
+X    b->deal[i] = buf2[i+3] - '0';
+X
+X  return (b);
+X}
+X
+X
+Xvoid Encode_play_record (p, buf1, buf2, buf3)
+X     Play_record *p;
+X     char *buf1;
+X     char *buf2;
+X     char *buf3;
+X/* Encodes the play_record p into buffers buf1 .. buf3. */
+X{
+X  int i, j;
+X
+X  sprintf (buf1, "%d %d %d %d %d %d %d %d %d %s %s %s %s",
+X	   p->bidding_completed, p->hand_completed, p->result,
+X	   p->tricks[0], p->tricks[1],
+X	   p->above_line[0], p->above_line[1], 
+X	   p->below_line[0], p->below_line[1],
+X	   p->player_names[0], p->player_names[1],
+X	   p->player_names[2], p->player_names[3]);
+X
+X  for (i = j = 0; i < p->no_bids; i++) {
+X    buf2[j++] = p->bids[i] + 'A';
+X    if (p->alerts[i]) buf2[j++] = '!';
+X  }
+X  buf2[j++] = '\0';
+X
+X  for (i = 0; i < p->no_plays; i++)
+X    buf3[i] = (p->play_list[i] < 26)? 
+X      'a' + p->play_list[i]: 'A' + p->play_list[i]-26;
+X  buf3[p->no_plays] = '\0';
+X  
+X}
+X
+XPlay_record *Decode_play_record (buf1, buf2, buf3)
+X     char *buf1;
+X     char *buf2;
+X     char *buf3;
+X/* Decodes the strings buf1 .. buf3, returning a corresponding play record
+X   structure.  Returns NULL if an error occurs in the decoding.  */
+X{
+X  Play_record *p;
+X  int i, n;
+X  char p0[15], p1[15], p2[15], p3[15];
+X
+X  p = Allocate_play_record (NULL, NULL, NULL, NULL);
+X  n = sscanf (buf1, "%d %d %d %d %d %d %d %d %d %s %s %s %s",
+X	      &(p->bidding_completed), &(p->hand_completed), &(p->result),
+X	      &(p->tricks[0]), &(p->tricks[1]), 
+X	      &(p->above_line[0]), &(p->above_line[1]), 
+X	      &(p->below_line[0]), &(p->below_line[1]),
+X	      p0, p1, p2, p3);
+X
+X  if (n < 9) {
+X    Deallocate_play_record (p);
+X    return (NULL);
+X  }
+X
+X  p->player_names[0] = strdup(p0);
+X  p->player_names[1] = strdup(p1);
+X  p->player_names[2] = strdup(p2);
+X  p->player_names[3] = strdup(p3);
+X
+X  for (i = p->no_bids = 0; buf2[i] != '\0';) {
+X    p->bids[p->no_bids] = buf2[i++] - 'A';
+X    if ((p->bids[p->no_bids] < 0) || (37 < p->bids[p->no_bids])) {
+X      Deallocate_play_record (p);
+X      return (NULL);
+X    }
+X    if (buf2[i] == '!') {
+X      p->alerts[p->no_bids] = 1;
+X      i++;
+X    } else
+X      p->alerts[p->no_bids] = 0;
+X    p->no_bids++;
+X  }
+X  
+X  p->no_plays = strlen(buf3);
+X  for (i = 0; i < p->no_plays; i++)
+X    if (('a' <= buf3[i]) && (buf3[i] <= 'z'))
+X      p->play_list[i] = buf3[i] - 'a';
+X    else if (('A' <= buf3[i]) && (buf3[i] <= 'Z'))
+X      p->play_list[i] = buf3[i] - 'A' + 26;
+X    else {
+X      Deallocate_play_record (p);
+X      return (NULL);
+X    }
+X
+X  return (p);
+X}
+X
+X
+X/* Routines for searching boards and play records. */
+X
+Xstatic Board *Search_for_board (list, b)
+X     Board *list;
+X     Board *b;
+X/* Searches the current set of email duplicate boards for a board which
+X   matches b.  Returns a pointer to the matching board if it is found,
+X   or NULL otherwise. */
+X{
+X  int j, matches;
+X  Board *c;
+X
+X  for (c = list; c != NULL; c = c->next) {
+X    matches = 1;
+X    for (j = 0; (j < 52) && matches; j++)
+X      if (b->deal[j] != c->deal[j])
+X	matches = 0;
+X    if (matches)
+X      return (c);
+X  }
+X  return (NULL);
+X}
+X
+XPlay_record *Search_for_play_record (b, p)
+X     Board *b;
+X     Play_record *p;
+X/* Searches the list of play records associated with the board b for a
+X   record of play by the same players as mentioned in p.  If such a
+X   record is found, then returns a pointer to it.  Otherwise, returns
+X   NULL. */
+X{
+X  Play_record *q;
+X  int i, match;
+X
+X  for (q = b->play_records; q != NULL; q = q->next) {
+X    match = 1;
+X    for (i = 0; (i < 4) && match; i++)
+X      if (strcasecmp(p->player_names[i], q->player_names[i]))
+X	match = 0;
+X    if (match)
+X      return (q);
+X  }
+X  return (NULL);
+X}
+X
+XPlay_record *Locate_play_record_by_foursome 
+X  (b, n, e, s, w)
+X     Board *b;
+X     char *n;
+X     char *e;
+X     char *s;
+X     char *w;
+X/* Searches the list of play records associated with the board b for a record
+X   where the names of the players exactly match n, e, s, and w, in order.
+X   Returns the play record if found, or NULL if no matching record is found. 
+X*/
+X{
+X  Play_record *p;
+X
+X  for (p = b->play_records; p != NULL; p = p->next) {
+X    if (!strcmp(p->player_names[PLAYER_NORTH], n) &&
+X	!strcmp(p->player_names[PLAYER_EAST], e)  &&
+X	!strcmp(p->player_names[PLAYER_SOUTH], s) &&
+X	!strcmp(p->player_names[PLAYER_WEST], w))
+X      return (p);
+X  }
+X  return (NULL);
+X
+X}
+X
+Xstatic Play_record *Locate_play_record_by_partnership 
+X  (bd, a, b, side)
+X     Board *bd;
+X     char *a;
+X     char *b;
+X     int *side;
+X/* Searches the list of play records associated with the board b for a
+X   record where the names of one of the partnerships matches those of a
+X   and b. If such a record is found, returns a pointer to the play record
+X   and sets side to the side of the matching partnership.  If no match
+X   is found, returns NULL.
+X*/
+X{
+X  Play_record *p;
+X
+X  for (p = bd->play_records; p != NULL; p = p->next) {
+X    if ((!strcmp(p->player_names[PLAYER_NORTH], a) &&
+X	 !strcmp(p->player_names[PLAYER_SOUTH], b)) ||
+X	(!strcmp(p->player_names[PLAYER_SOUTH], a) &&
+X	 !strcmp(p->player_names[PLAYER_NORTH], b))) {
+X      *side = SIDE_NS;
+X      return (p);
+X    }
+X    if ((!strcmp(p->player_names[PLAYER_EAST], a) &&
+X	 !strcmp(p->player_names[PLAYER_WEST], b)) ||
+X	(!strcmp(p->player_names[PLAYER_WEST], a) &&
+X	 !strcmp(p->player_names[PLAYER_EAST], b))) {
+X      *side = SIDE_EW;
+X      return (p);
+X    }
+X  }
+X  return (NULL);
+X}
+X
+Xstatic Play_record *Locate_play_record_by_player (b, p, pos)
+X     Board *b;
+X     char *p;
+X     int *pos;
+X/* Searches the list of play records associated with the board b for a
+X   record where one the players has the same name as p.  If such a record
+X   is found, returns a pointer to the play record and sets pos to the
+X   position of the matching name.  If no match is found, returns NULL.
+X*/
+X{
+X  Play_record *pr;
+X  int i;
+X
+X  for (pr = b->play_records; pr != NULL; pr = pr->next) {
+X    for (i = 0; i < 4; i++) {
+X      if (!strcasecmp(pr->player_names[i], p)) {
+X	*pos = i;
+X	return (pr);
+X      }
+X    }
+X  }
+X  return (NULL);
+X}
+X
+X
+X/* Primitives for accessing email duplicate files: */
+X
+Xstatic void Generate_email_header ()
+X{
+X  if (Header_has_been_generated)
+X    return;
+X
+X  sprintf (Email_header_buffer,"%s %s",
+X	   "This is an email duplicate file for OKBridge version",
+X	   major_revision_level);
+X  Header_has_been_generated = 1;
+X}
+X
+Xstatic int Get_line (f, buf, buflen)
+X     FILE *f;
+X     char *buf;
+X     int buflen;
+X/* Reads a line from file f, placing up to buflen-1 characters into buf,
+X   terminated by a '\0'.  Returns the number of characters actually read
+X   or -1 if EOF.
+X*/
+X{
+X	int n, ch;
+X
+X	if (fgets(buf, buflen, f) == NULL)
+X	  return (-1);
+X
+X	n = strlen(buf);
+X	if ((n >= buflen) && (buf[n-1] != '\n'))
+X	  do
+X	    { ch = fgetc (f); }
+X	  while ((ch != '\n') && (ch != EOF));
+X	else
+X	  buf[--n] = '\0';
+X
+X	return (n);
+X}
+X
+Xint Read_Email_Header (f)
+X     FILE *f;
+X/* Searches the file f until an email header is found.  If the header
+X   is found, then returns 0.  Otherwise, returns 1. */
+X{
+X  char buf[100];
+X
+X  Generate_email_header ();
+X  while (Get_line (f, buf, 100) >= 0) {
+X    if (!strcmp(buf, Email_header_buffer))
+X      return (0);
+X  }
+X
+X  return (1);
+X}
+X
+Xvoid Write_Email_Header (f)
+X     FILE *f;
+X/* Writes an email header to the file f. */
+X{
+X  Generate_email_header ();
+X  fprintf (f, "%s\n", Email_header_buffer);
+X}
+X
+X
+Xint Read_Email_Board (f, c, b)
+X     FILE *f;
+X     Cipher *c;
+X     Board **b;
+X/* Reads a board from the file f using the cipher descriptor c.
+X   Stores in b a pointer to an allocated board record containing the
+X   data which has been read.  If successful, returns 0.  If the end of 
+X   file is reached, returns 1.  If some other error occurs, returns -1.
+X*/
+X{
+X  char buf1[100], buf2[100], buf3[100];
+X  Play_record *p;
+X
+X  if (Read_Ciphered_Line (f, c, buf1, 100) < 0)
+X    return (1);
+X
+X  if (Read_Ciphered_Line (f, c, buf2, 100) != 55)
+X    return (-1);
+X
+X  *b = Decode_board (buf1, buf2);
+X  (*b)->play_records = NULL;
+X
+X  if (Read_Ciphered_Line (f, c, buf1, 100) < 0) return (-1);
+X  while (strcmp(buf1, "--")) {
+X    if (Read_Ciphered_Line (f, c, buf2, 100) < 0) return (-1);
+X    if (Read_Ciphered_Line (f, c, buf3, 100) < 0) return (-1);
+X    if (!strcmp(buf2, "--") || !strcmp(buf3, "--")) return (-1);
+X
+X    p = Decode_play_record (buf1, buf2, buf3);
+X    if (p == NULL)
+X      return (-1);
+X
+X    p->next = (*b)->play_records;
+X    (*b)->play_records = p;
+X    if (Read_Ciphered_Line (f, c, buf1, 100) < 0) return (-1);
+X  }
+X  return (0);
+X}
+X
+Xvoid Write_Email_Board (f, c, b)
+X     FILE *f;
+X     Cipher *c;
+X     Board *b;
+X/* Writes the board b to the file f using the cipher descriptor c. */
+X{
+X  char buf1[100], buf2[100], buf3[100];
+X  Play_record *p;
+X
+X  Encode_board (b, buf1, buf2);
+X  Write_Ciphered_Line (f, c, buf1);
+X  Write_Ciphered_Line (f, c, buf2);
+X
+X  for (p = b->play_records; p != NULL; p = p->next) {
+X    Encode_play_record (p, buf1, buf2, buf3);
+X    Write_Ciphered_Line (f, c, buf1);
+X    Write_Ciphered_Line (f, c, buf2);
+X    Write_Ciphered_Line (f, c, buf3);
+X  }
+X  fprintf (f, "--\n");
+X}
+X
+Xstatic void Copy_play_record (p, q)
+X     Play_record *p;
+X     Play_record *q;
+X/* Copies the contents of the play record p to q, without destroying
+X   q's next field. */
+X{
+X  Play_record *r = q->next;
+X  int i;
+X
+X  for (i = 0; i < 4; i++)
+X    if (q->player_names[i] != NULL)
+X      free (q->player_names[i]);
+X
+X  bcopy (p, q, sizeof(Play_record));
+X  q->next = r;
+X  free (p);
+X}
+X
+Xvoid Merge_play_record (b, p)
+X     Board *b;
+X     Play_record *p;
+X/* Links p into the list of play records for the board b.  If b already
+X   has a record of play for the players listed in p, then the older record
+X   is deleted.
+X*/
+X{
+X  Play_record *q;
+X  int i, match;
+X
+X  for (q = b->play_records; q->next != NULL; q = q->next) {
+X    match = 1;
+X    for (i = 0; (i < 4) && match; i++)
+X      if (strcasecmp(p->player_names[i], q->player_names[i]))
+X	match = 0;
+X    if (match) {
+X      if (p->hand_completed)
+X	Copy_play_record (p, q);
+X      else if (p->bidding_completed && !q->hand_completed)
+X	Copy_play_record (p, q);
+X      else if (!q->bidding_completed)
+X	Copy_play_record (p, q);
+X      else
+X	Deallocate_play_record (p);
+X      return;
+X    }
+X  }
+X
+X}
+X
+Xstatic int Merge_board (list, b)
+X     Board *list;
+X     Board *b;
+X/* Searches the board list for a board matching b.  If one is found,
+X   then destructively merges the play records in b with those in the 
+X   matching record.  If no matching board is found, then does nothing.
+X   Returns 0 if successful, and 1 if no match is found.
+X*/
+X{
+X  Board *c;
+X  Play_record *p, *q;
+X
+X  c = Search_for_board (list, b);
+X  if (c == NULL)
+X    return (1);
+X
+X  p = b->play_records;
+X  while (p != NULL) {
+X    q = p->next;
+X    p->next = NULL;
+X    Merge_play_record (c, p);
+X    p = q;
+X  }
+X  b->play_records = NULL;
+X  Deallocate_board (b);
+X
+X  return (0);
+X}
+X
+Xint Load_Email_Duplicate_File (f)
+X     FILE *f;
+X/* Reads an entire email duplicate file, recording each of the hands 
+X   read from the file into the current list of boards. */
+X{
+X  Board *b, *tail;
+X  Cipher c;
+X  int status;
+X
+X  if (Read_Email_Header (f))
+X    return (1);
+X
+X  if (Read_Cipher_Descriptor(f, &c))
+X    return (-1);
+X
+X  tail = Unplayed_boards;
+X  if (tail != NULL)
+X    while (tail->next != NULL) tail = tail->next;
+X
+X  status = Read_Email_Board (f, &c, &b);
+X  while (status == 0) {
+X    if ((Unplayed_boards == NULL) || Merge_board (Unplayed_boards, b)) {
+X      if (tail == NULL) {
+X	Unplayed_boards = tail = b;
+X      } else {
+X	tail->next = b;
+X	tail = b;
+X      }
+X      b->next = NULL;
+X    }
+X    status = Read_Email_Board (f, &c, &b);
+X  }
+X
+X  if (status == 1)
+X    return (0);
+X  else
+X    return (1);
+X}
+X
+Xint Merge_Email_Duplicate_File (f, list)
+X     FILE *f;
+X     Board *list;
+X/* Reads an email duplicate file.  For each board found in the file,
+X   if the same board occurs among the list of boards, then updates
+X   the data associated with that board using the data read from the file.
+X   Discards boards which do not match those stored in memory.
+X   If successful, returns 0.  If the header could not be found, returns 1.
+X   If some other error occurs, returns -1.
+X*/
+X{
+X  Board *b;
+X  Cipher c;
+X  int status;
+X
+X  if (Read_Email_Header (f))
+X    return (1);
+X
+X  if (Read_Cipher_Descriptor(f, &c))
+X    return (-1);
+X
+X  status = Read_Email_Board (f, &c, &b);
+X  while (status == 0) {
+X    if (!Merge_board (list, b))
+X      Deallocate_board (b);
+X    status = Read_Email_Board (f, &c, &b);
+X  }
+X
+X  if (status == 1)
+X    return (0);
+X  else
+X    return (1);
+X}
+X
+Xvoid Write_Email_Duplicate_File (f)
+X     FILE *f;
+X/* Writes the list of played and unplayed boards to the file f. */
+X{
+X  Board *b;
+X  Cipher c;
+X
+X  Write_Email_Header (f);
+X  Create_Cipher_Descriptor (f, &c);
+X  Write_Cipher_Descriptor (f, &c);
+X
+X  for (b = Played_boards; b != NULL; b = b->next)
+X    Write_Email_Board (f, &c, b);
+X
+X  for (b = Unplayed_boards; b != NULL; b = b->next)
+X    Write_Email_Board (f, &c, b);
+X  
+X}
+X
+X
+X/* Routines for accessing and updating the current set of email 
+X   duplicate boards. */
+X
+X
+Xvoid Generate_local_source_name ()
+X{
+X  char buf[20];
+X  time_t current_time;
+X  struct tm *decoded_time;
+X
+X  time (&current_time);
+X  decoded_time = localtime (&current_time);
+X  sprintf (buf, "%s%0d", month_names[decoded_time->tm_mon],
+X	   decoded_time->tm_mday);
+X  local_source = strdup(buf);
+X
+X}
+X
+Xstatic void shuffle_the_deck (cards)
+X	deal cards;
+X/* Using the algorithm suggested by Douglas Foxvog.  Thanks, Doug! */
+X{
+X	int i, t, c;
+X	deal shuffle;
+X 
+X	for (i = 0; i < 52; i++) 
+X		shuffle [i] = i;
+X	for (i = 0; i < 51; i++) {
+X		c = random (52 - i);
+X		t = shuffle[i+c]; 
+X		shuffle[i+c] = shuffle[i];
+X		shuffle[i] = t;
+X	};
+X	for (i = 0; i < 52; i++)
+X		cards[shuffle[i]] = (i % 4);
+X		
+X}
+X
+XBoard *Generate_Random_Match_Board (scoring, prevboard)
+X     int scoring;
+X     Board *prevboard;
+X/* Generates a random match board and appends it to the Board_list. */
+X{
+X  int r;
+X  Board *b;
+X
+X  if (local_source == NULL)
+X    Generate_local_source_name ();
+X
+X  b = Allocate_board ();
+X
+X  b->source = strdup (local_source);
+X  b->serial_no = ++local_seq_no;
+X
+X  if (prevboard == NULL)
+X    r = local_seq_no + ROTATION_LENGTH - 1;
+X  else {
+X    for (r = 0; r < ROTATION_LENGTH; r++)
+X      if ((prevboard->dealer == dealer_list[r]) &&
+X	  (prevboard->vulnerable[SIDE_NS] == ns_vulnerability_list[r]) &&
+X	  (prevboard->vulnerable[SIDE_EW] == ew_vulnerability_list[r]))
+X	break;
+X    r += 1;
+X  }
+X  r %= ROTATION_LENGTH;
+X
+X  b->dealer = dealer_list[r];
+X  b->vulnerable[SIDE_NS] = ns_vulnerability_list[r];
+X  b->vulnerable[SIDE_EW] = ew_vulnerability_list[r];
+X  b->scoring_mode = scoring;
+X  shuffle_the_deck (b->deal);
+X  
+X  return (b);
+X}
+X
+XBoard *Generate_Random_Rubber_Board (prevboard, prevplay)
+X     Board *prevboard;
+X     Play_record *prevplay;
+X/* Generates a random rubber board and returns a pointer to it,
+X   based upon the part score and result recorded in the previously
+X   played board b and play record p.  If b or p is NULL, then
+X   generates a board with neither side vulnerable and a 0 part score.
+X*/
+X{
+X  int r;
+X  Board *b;
+X
+X  if (local_source == NULL)
+X    Generate_local_source_name ();
+X
+X  b = Allocate_board ();
+X
+X  b->source = strdup (local_source);
+X  b->serial_no = local_seq_no + 1;
+X
+X  if ((prevboard == NULL) || (prevplay == NULL)) {
+X    r = local_seq_no++ % ROTATION_LENGTH;
+X    b->dealer = dealer_list [r];
+X    b->vulnerable[SIDE_NS] = ns_vulnerability_list[r];
+X    b->vulnerable[SIDE_EW] = ew_vulnerability_list[r];
+X  } else {
+X    b->dealer = player_next [prevboard->dealer];
+X    b->vulnerable[SIDE_NS] = prevboard->vulnerable[SIDE_NS];
+X    b->vulnerable[SIDE_EW] = prevboard->vulnerable[SIDE_EW];
+X    b->part_score[SIDE_NS] = prevboard->part_score[SIDE_NS] +
+X      prevplay->below_line[SIDE_NS];
+X    b->part_score[SIDE_EW] = prevboard->part_score[SIDE_EW] +
+X      prevplay->below_line[SIDE_EW];
+X    if (b->part_score[SIDE_NS] > 100) {
+X      if (prevboard->vulnerable[SIDE_NS])
+X	b->vulnerable[SIDE_NS] = b->vulnerable[SIDE_EW] = 0;
+X      else
+X	b->vulnerable[SIDE_NS] = 1;
+X      b->part_score[SIDE_NS] = b->part_score[SIDE_EW] = 0;
+X    } else if (b->part_score[SIDE_EW] > 100) {
+X      if (prevboard->vulnerable[SIDE_EW] > 100)
+X	b->vulnerable[SIDE_EW] = b->vulnerable[SIDE_NS] = 0;
+X      else
+X	b->vulnerable[SIDE_EW] = 1;
+X      b->part_score[SIDE_NS] = b->part_score[SIDE_EW] = 0;
+X    }
+X  }
+X
+X  b->scoring_mode = RUBBER_SCORING;
+X  shuffle_the_deck (b->deal);
+X  
+X  return (b);
+X}
+X
+X
+X
+Xvoid Clear_All_Boards ()
+X/* Clears the list of played and unplayed boards. */
+X{
+X  Erase_board_list (&Unplayed_boards);
+X  Erase_board_list (&Played_boards);
+X
+X  Unplayed_boards = NULL;
+X  Played_boards = NULL;
+X  Played_boards_tail = NULL;
+X}
+X
+Xint Board_is_Available ()
+X/* Returns true if there is a board available in the list of unplayed
+X   boards. */
+X{
+X  return (Unplayed_boards != NULL);
+X}
+X
+XBoard *Next_Unplayed_Board ()
+X/* If there is a board on the list of unplayed boards, then unlinks it and
+X   returns it.  Otherwise, returns NULL. */
+X{
+X  Board *b;
+X
+X  if (Unplayed_boards != NULL) {
+X    b = Unplayed_boards;
+X    Unplayed_boards = b->next;
+X    b->next = NULL;
+X  } else
+X    b = NULL;
+X
+X  return (b);
+X}
+X
+Xvoid Record_Played_Board (b)
+X     Board *b;
+X/* Appends the board to the list of played boards. */
+X{
+X  if (Played_boards == NULL) {
+X    Played_boards = Played_boards_tail = b;
+X  } else {
+X    Played_boards_tail->next = b;
+X    Played_boards_tail = b;
+X  }
+X  Played_boards_tail->next = NULL;
+X}
+X
+X/* Scoring routines: */
+X
+X
+Xint Highcard_points (b, side)
+X     Board *b;
+X     int side;
+X/* Returns the number of highcard points held by the partnership 'side'. */
+X{
+X  int partner = side + 2;
+X  int i, hcp = 0;
+X
+X  for (i = 0; i < 52; i++)
+X    if ((b->deal[i] == side) || (b->deal[i] == partner)) {
+X      if (rank_of(i) > 8)
+X	hcp += rank_of(i) - 8;
+X    }
+X  return (hcp);
+X
+X}
+X
+Xvoid Compute_total_score_by_partnership 
+X  (list, a, b, d, mp, imp)
+X     Board *list;
+X     char *a;
+X     char *b;
+X     int *d;
+X     float *mp;
+X     float *imp;
+X/* Computes the total scores for the partnership (a,b).  Returns in d the
+X   total of the (duplicate) scores, in mp the total of the match point scores,
+X   and in imp the total of the imp scores.
+X*/
+X{
+X  int s;
+X  Play_record *p;
+X  Board *bd;
+X
+X  *d = 0;
+X  *mp = *imp = 0.0;
+X  for (bd = list; bd != NULL; bd = bd->next) {
+X    if (!bd->mps_computed)
+X      Compute_Matchpoints (bd);
+X    if (!bd->imps_computed)
+X      Compute_Intl_Matchpoints (bd);
+X
+X    p = Locate_play_record_by_partnership (bd, a, b, &s);
+X    if (p != NULL) {
+X      *d += p->below_line[s];
+X      *mp += p->match_points[s];
+X      *imp += p->imatch_points[s];
+X    }
+X  }
+X}
+X
+Xvoid Compute_total_score_by_player
+X  (list, n, d, mp, imp)
+X     Board *list;
+X     char *n;
+X     int *d;
+X     float *mp;
+X     float *imp;
+X/* Computes the total score for the player p.  Returns in d the total of
+X   the (duplicate) scores, in mp the total of the match point scores, and
+X   in mp the total of the imp scores. */
+X{
+X  int s, pos;
+X  Board *b;
+X  Play_record *p;
+X
+X  *d = 0;
+X  *mp = *imp = 0.0;
+X  for (b = list; b != NULL; b = b->next) {
+X    if (!b->mps_computed)
+X      Compute_Matchpoints (b);
+X    if (!b->imps_computed)
+X      Compute_Intl_Matchpoints (b);
+X
+X    p = Locate_play_record_by_player (b, n, &pos);
+X    s = side_of(pos);
+X    if (p != NULL) {
+X      *d += p->below_line[s];
+X      *mp += p->match_points[s];
+X      *imp += p->imatch_points[s];
+X    }
+X  }
+X}
+X
+X
+Xstatic int NS_score (p)
+X     Play_record *p;
+X{
+X  return (p->below_line[SIDE_NS] - p->below_line[SIDE_EW]);
+X}
+X
+Xint score_compare (p1, p2)
+X     Play_record **p1;
+X     Play_record **p2;
+X{
+X  if (NS_score(*p1) < NS_score(*p2))
+X    return (-1);
+X  else if (NS_score(*p1) == NS_score(*p2))
+X    return (0);
+X  else
+X    return (1);
+X}
+X
+Xvoid Compute_Matchpoints (b)
+X     Board *b;
+X/* Computes the match point totals for the current board. */
+X{
+X  Play_record *Play_array[100], *p;
+X  int i, j, n, t, score_compare();
+X  float base;
+X
+X  b->mps_computed = 1;
+X  if ((b->play_records == NULL) || (b->play_records->next == NULL))
+X    return;
+X
+X  n = 0;
+X  for (p = b->play_records; p != NULL; p = p->next) {
+X    p->match_points[0] = p->match_points[1] = 0.0;
+X    if (p->hand_completed)
+X      Play_array[n++] = p;
+X  }
+X
+X  qsort (Play_array, n, sizeof(Play_record *), score_compare);
+X  
+X  i = 0;
+X  base = 0.5 / ((float) (n-1));
+X  while (i < n) {
+X    for (t = i; (t < n) && 
+X	 (NS_score(Play_array[i]) == NS_score(Play_array[t])); t++);
+X    for (j = i; j < t; j++) {
+X      Play_array[j]->match_points[0] = ((float) t + i - 1) * base;
+X      Play_array[j]->match_points[1] = 
+X	1.0 - Play_array[j]->match_points[0];
+X    }
+X    i = t;
+X  }
+X
+X}
+X
+Xvoid Compute_Intl_Matchpoints (b)
+X     Board *b;
+X/* Computes the internation match point totals for the current board. */
+X{
+X  Play_record *p, *q;
+X  int pdiff, qdiff;
+X  int contractor, defender;
+X  int no_tables = -1;
+X
+X  b->imps_computed = 1;
+X  if (b->play_records == NULL)
+X    return;
+X  else if (b->play_records->next == NULL) {
+X    p = b->play_records;
+X    Compute_MIMP_points (b, p);
+X    return;
+X  }
+X
+X  for (p = b->play_records; p != NULL; p = p->next) {
+X    p->imatch_points[0] = p->imatch_points[1] = 0.0;
+X    contractor = side_of (p->declarer);
+X    defender   = 1 - contractor;
+X    if (!p->hand_completed)
+X      continue;
+X    no_tables += 1;
+X    pdiff = p->below_line[contractor] - p->below_line[defender];
+X    for (q = b->play_records; q != NULL; q = q->next) {
+X      if (!q->hand_completed)
+X	continue;
+X      qdiff = q->below_line[contractor] - q->below_line[defender];
+X      if (pdiff > qdiff)
+X	p->imatch_points[contractor] += 
+X	  ((float) IMP_rating (pdiff - qdiff)) * 0.5;
+X      else if (pdiff < qdiff)
+X	p->imatch_points[contractor] -= 
+X	  ((float) IMP_rating (qdiff - pdiff)) * 0.5;
+X    }
+X    p->imatch_points[defender] = -p->imatch_points[contractor];
+X  }
+X
+X  if (no_tables > 0)
+X    for (p = b->play_records; p != NULL; p = p->next) {
+X      p->imatch_points[0] = p->imatch_points[0] / ((float) no_tables);
+X      p->imatch_points[1] = p->imatch_points[1] / ((float) no_tables);
+X    }
+X}
+X
+Xvoid Compute_contract (b, p)
+X     Board *b;
+X     Play_record *p;
+X/* Computes the contract for the play record p based upon the bids present
+X   in the bidding list. */
+X{
+X  int i, bidder, contractor;
+X
+X  p->contract = BID_PASS;
+X  p->doubled  = 0;
+X  p->declarer = PLAYER_NORTH;
+X
+X  if (p->no_bids == 0)
+X    return;
+X
+X  i = p->no_bids - 1;
+X  switch (i%4) {
+X  case 0: bidder = b->dealer; break;
+X  case 1: bidder = player_next[b->dealer]; break;
+X  case 2: bidder = player_partner[b->dealer]; break;
+X  case 3: bidder = player_prev[b->dealer]; break;
+X  }
+X
+X  do {
+X    if (p->bids[i] == BID_REDOUBLE)
+X      p->doubled = 2;
+X    else if (p->bids[i] == BID_DOUBLE) {
+X      if (!p->doubled)
+X	p->doubled = 1;
+X    } else if (p->bids[i] != BID_PASS) {
+X      p->contract = p->bids[i];
+X      contractor  = side_of (bidder);
+X      break;
+X    }
+X    bidder = player_prev[bidder];
+X    i = i - 1;
+X  } while (i >= 0);
+X
+X  if (p->contract != BID_PASS) {
+X    bidder = b->dealer;
+X    for (i = 0; i < p->no_bids; i++) {
+X      if ((side_of(bidder) == contractor) && 
+X	  (trumpsuit_of(p->bids[i]) == trumpsuit_of(p->contract))) {
+X	p->declarer = bidder;
+X	break;
+X      } else
+X	bidder = player_next[bidder];
+X    }
+X  }
+X}
+X
+X
+X
+Xvoid Compute_MIMP_points (b, p)
+X     Board *b;
+X     Play_record *p;
+X/* Computes the number of MIMP points for the play record p, based upon
+X   the scoring information found in the play record.  In addition,
+X   we compute simulated match_point and imp values for the play record
+X   which are based upon the number of MIMP's.
+X*/
+X{
+X  int hcp, diff;
+X  int contractor = side_of (p->declarer);
+X  int level      = level_of (p->contract);
+X  int trumpsuit  = trumpsuit_of (p->contract);
+X
+X  p->mimp_points[0] = p->mimp_points[1] = 0;
+X  if (!p->hand_completed)
+X    return;
+X
+X  hcp = Highcard_points (b, side_of(p->declarer));
+X  if (p->result >= 0)
+X    p->mimp_points[side_of(p->declarer)] = 
+X      MIMP_score_made 
+X	(b->vulnerable[contractor], level, trumpsuit, 
+X	 p->doubled, p->result, hcp);
+X  else
+X    p->mimp_points[side_of(p->declarer)] = 
+X      MIMP_score_set 
+X	(b->vulnerable[contractor], level, trumpsuit, 
+X	 p->doubled, p->result, hcp);
+X
+X  p->imatch_points[0] = ((float) p->mimp_points[0] * 0.5);
+X  p->imatch_points[1] = ((float) p->mimp_points[1] * 0.5);
+X  
+X  p->match_points[0] = p->match_points[1] = 0.0;
+X  diff = p->mimp_points[0] - p->mimp_points[1];
+X  if (diff >= 1)
+X    p->match_points[0] = 1.0;
+X  else if (diff <= -1)
+X    p->match_points[1] = 1.0;
+X  else
+X    p->match_points[0] = p->match_points[1] = 0.5;
+X
+X}
+X
+X
+Xint Index_of_Last_Bid (b, p, player)
+X     Board *b;
+X     Play_record *p;
+X     int player;
+X/* Returns the index in the bid list p of the last bid made by the given
+X   player, or -1 if the player has not made any bids.
+X*/
+X{
+X  int index, bidder;
+X
+X  index = p->no_bids - 1;
+X
+X  switch (p->no_bids % 4) {
+X  case 1: bidder = b->dealer; break;
+X  case 2: bidder = player_next[b->dealer]; break;
+X  case 3: bidder = player_partner[b->dealer]; break;
+X  case 0: bidder = player_prev[b->dealer];
+X  }
+X
+X  while ((index >= 0) && (bidder != player)) {
+X    index -= 1;
+X    bidder = player_prev[bidder];
+X  }
+X  
+X  return (index);
+X}
+X
+X
+Xvoid Generate_valid_bids (p, player, minimum_bid, double_ok, redouble_ok)
+X     Play_record *p;
+X     int player;
+X     int *minimum_bid;
+X     int *double_ok;
+X     int *redouble_ok;
+X/* Determines the valid bids for the player, based on the information
+X   contained in the play record p.  Assumes the declarer, contract
+X   and doubled fields of p have been correctly computed from the bid
+X   list.
+X*/
+X{
+X  if (p->contract == BID_PASS)
+X    *minimum_bid = 3;   /* The code for the 1C bid. */
+X  else
+X    *minimum_bid = p->contract + 1;
+X
+X  if (side_of(player) == side_of(p->declarer)) {
+X    *double_ok = 0;
+X    if (p->doubled == 1)
+X      *redouble_ok = 1;
+X    else
+X      *redouble_ok = 0;
+X  } else {
+X    *redouble_ok = 0;
+X    *double_ok = 0;
+X    if (!p->doubled && (p->contract != BID_PASS))
+X      *double_ok = 1;
+X  }
+X}
+X
+Xvoid Generate_holdings (b, plays, no_plays, player, h)
+X     Board *b;
+X     card_type *plays;
+X     int no_plays;
+X     int player;
+X     card_type *h;
+X/* Records in the hand h the cards held by the given player, based on the
+X   deal contained in the board b and on the past no_plays recorded plays. 
+X   The holdings of the player are recorded as a boolean string in h, so that
+X     h[c] == true iff the player holds the card c.
+X*/
+X{
+X  int i;
+X
+X  for (i = 0; i < 52; i++)
+X    if (b->deal[i] == player)
+X      h[i] = 1;
+X    else
+X      h[i] = 0;
+X
+X  for (i = 0; i < no_plays; i++)
+X    h[plays[i]] = 0;
+X}
+X
+Xvoid Generate_valid_leads (b, p, player, h)
+X     Board *b;
+X     Play_record *p;
+X     int player;
+X     card_type *h;
+X/* Records in the hand h the set of cards which the player may lead,
+X   based upon the plays which have already been recorded in p.
+X   The valid plays are stored as a boolean string in h, so that
+X     h[c] == true iff it is legal to play card c.
+X*/
+X{
+X  Generate_holdings (b, p->play_list, p->no_plays, player, h);
+X}
+X
+Xvoid Generate_valid_follows 
+X  (b, p, player, lead, h)
+X     Board *b;
+X     Play_record *p;
+X     int player;
+X     int lead;
+X     card_type *h;
+X/* Records in the hand h the set of cards which the player may play to
+X   follow the given lead, based upon the plays which have already been
+X   recorded in p.
+X
+X   The valid plays are stored as a boolean string in h, so that
+X     h[c] == true iff it is legal to play card c.
+X*/
+X{
+X  int i;
+X  int lead_suit  = suit_of (lead);
+X  int has_lead_suit = 0;
+X
+X  Generate_holdings (b, p->play_list, p->no_plays, player, h);
+X
+X  for (i = 0; (i < 13) && !has_lead_suit; i++)
+X    if (h[card_code(lead_suit, i)])
+X      has_lead_suit = 1;
+X
+X  if (has_lead_suit)
+X    for (i = 0; i < 52; i++)
+X      if (suit_of(i) != lead_suit)
+X	h[i] = 0;
+X}
+X
+Xint Next_Player (p)
+X     Play_record *p;
+X/* Returns the index of the next person who should play, or -1 if the
+X   hand has been completed. */
+X{
+X  if (p->hand_completed)
+X    return (-1);
+X  else if (p->next_player == player_partner[p->declarer])
+X    return (p->declarer);
+X  else
+X    return (p->next_player);
+X     
+X}
+X
+Xstatic int outranks (c1, c2, t)
+X    int c1, c2, t;
+X/* Returns true if c1 outranks c2, according to the current trump suit t.
+X * If c1 and c2 are of different suits, neither of which is the trump suit t,
+X * then returns false.
+X */
+X{
+X	if (suit_of (c1) == suit_of (c2))
+X		return (rank_of(c1) > rank_of(c2));
+X	else
+X		return (suit_of (c1) == t);
+X}
+X
+Xint Winning_card (trump_suit, leader, c_l, c_lho, c_p, c_rho)
+X     int trump_suit;
+X     int leader;
+X     int c_l;
+X     int c_lho;
+X     int c_p;
+X     int c_rho;
+X/* Returns the index of the player who played the winning card from
+X   the cards c_l, c_lho, c_p, c_rho, based on the given trump suit
+X   and that c_l was the card lead.
+X*/
+X{
+X  int w = leader;
+X  int c = c_l;
+X
+X  if (outranks (c_lho, c, trump_suit)) {
+X    c = c_lho;
+X    w = player_next [leader];
+X  }
+X
+X  if (outranks (c_p, c, trump_suit)) {
+X    c = c_p;
+X    w = player_partner [leader];
+X  }
+X
+X  if (outranks (c_rho, c, trump_suit))
+X    w = player_prev [leader];
+X
+X  return (w);
+X}
+X
+END_OF_FILE
+if test 36085 -ne `wc -c <'boards.c'`; then
+    echo shar: \"'boards.c'\" unpacked with wrong size!
+fi
+# end of 'boards.c'
+fi
+if test -f 'network.h' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'network.h'\"
+else
+echo shar: Extracting \"'network.h'\" \(15537 characters\)
+sed "s/^X//" >'network.h' <<'END_OF_FILE'
+X/* network.h
+X *
+X ! Copyright (C) 1990-1992 by Matthew Clegg.  All Rights Reserved
+X ! 
+X ! OKbridge is made available as a free service to the Internet.
+X ! Accordingly, the following restrictions are placed on its use:
+X ! 
+X ! 1.  OKbridge may not be modified in any way without the explicit 
+X !     permission of Matthew Clegg.  
+X ! 
+X ! 2.  OKbridge may not be used in any way for commercial advantage.
+X !     It may not be placed on for-profit networks or on for-profit
+X !     computer systems.  It may not be bundled as part of a package
+X !     or service provided by a for-profit organization.
+X ! 
+X ! If you have questions about restrictions on the use of OKbridge,
+X ! write to mclegg@cs.ucsd.edu.
+X ! 
+X ! DISCLAIMER:  The user of OKbridge accepts full responsibility for any
+X ! damage which may be caused by OKbridge.
+X *
+X * The network module provides an interface between the network and
+X * the bridge program which is mostly independent of whether or not
+X * the local player is the server or a client.  In version 1.6, the
+X * network module has much more intelligence -- i.e., this module
+X * now parses all incoming messages and even processes some of them,
+X * only passing up to the input module those messages which are relevant
+X * to the play.
+X *
+X */  
+X
+X#ifndef TYPES_INCLUDED
+X#include "types.h"
+X#endif
+X
+X#ifndef PROTOCOL_INCLUDED
+X#include "protocol.h"
+X#endif
+X
+X#ifndef BOARDS_INCLUDED
+X#include "boards.h"
+X#endif
+X 
+X#define NETWORK_INCLUDED
+X
+X/* The following definitions define the possible states of a connection. */
+X#define CSTATE_CONNECTED  1  /* Connected but waiting for handshakes to
+X				complete. */
+X#define CSTATE_PLAYING    2  /* Playing or ready to play. */
+X
+X
+X#define DEFAULT_PORT     1729 /* The default port to which we will try
+X				 to connect. */
+X
+Xtypedef struct Message_struct {
+X  struct Message_struct *next;
+X  struct Connection_struct *source;
+X    /* The connection from which the message was received. */
+X  int    private;
+X    /* TRUE if this message should not be forwarded to the other players. */
+X  int    loopback;
+X    /* TRUE if this message originated from the local player. */
+X  struct player_command_struct p;
+X} *Message;
+X
+Xtypedef struct Message_queue_struct {
+X  Message head, tail;
+X} *message_queue;
+X
+X/* If we are in server mode, then we maintain a Connection structure for
+X   each client connection.  All of the Connection structures are maintained
+X   on a global input list which is continuously monitored for incoming
+X   messages.  In addition, each Connection structure will be on an
+X   output list which is determined by the table and seat occupied by
+X   the player.  All of the connection lists contain dummy header elements,
+X   so that a connection may be deleted from a list without reference to
+X   the head of the list.
+X*/
+X
+X/* typedef struct Table_struct; */
+X
+Xtypedef struct Connection_struct {
+X  int  channel;            /* The socket descriptor for communication */
+X  int  local;              /* True if this connection represents the local
+X			      player.  In this case, channel is meaningless */
+X  int  state;              /* The state of the connection, as above. */
+X  name_buffer player_name; /* The name of the player. */
+X  message_buffer fullname; /* The full name of the player. */
+X  message_buffer email;    /* The email address of the player. */
+X  message_buffer registry; /* A unique registration name for the player. */
+X  int  seat;               /* The seat assigned to the player. */
+X  int  spectator;          /* True if this player is in spectator mode. */
+X  struct Table_struct *table;  /* The table where this player is located */
+X  struct Connection_struct *iprev, *inext;
+X  struct Connection_struct *oprev, *onext;
+X} *Connection;
+X
+Xtypedef struct Seat_struct {
+X  char  player_name[10];
+X  int   occupied;          /* A boolean flag indicating this seat is occupied*/
+X  int   skipping;          /* A boolean flag indicating that this player has
+X			      not yet acknowledge a skip request. */
+X  Connection connection;   /* NULL if there is no one sitting here. */
+X} *Seat;
+X
+Xtypedef struct Table_struct {
+X  int table_no;                            /* A unique number identifying
+X					      this table. */
+X  struct Seat_struct Seats[PLAYER_TYPES];  /* The sitting players. */
+X  Connection    Players;                   /* The list of players,
+X					      including observers. */
+X  message_queue protocol_queue;            /* Pending messages on the
+X					      protocol queue. */
+X  message_queue conversation_queue;        /* Pending messages on the 
+X					      conversation queue. */
+X  message_queue game_queue;                /* Pending messages on the
+X					      game queue. */
+X  int    game_mode;                        /* The current state of the game:
+X					      STARTUP, BIDDING, PLAYING
+X					      or SCORING. */
+X  int  playing_mode;                      /* The current mode of play:
+X					     CLUB, PRACTICE or FORMAL. */
+X  int  above_line[2];                     /* Total above-the-line score 
+X					     for this table. */
+X  int  below_line[2];                     /* Total below-the-line score 
+X					     for this table. */
+X  Board  *board;                           /* The current board which is
+X					      being played. */
+X  Play_record *play_record;                /* The record of play for the
+X					      current board. */
+X  struct Table_struct *next, *prev;
+X} *Table;
+X
+X#define OCCUPIED(t,s)    (((s) < 4) && t->Seats[s].occupied)
+X#define VACANT(t,s)      !OCCUPIED(t,s)
+X#define PLAYER_NAME(t,s) Local_table->Seats[s].player_name
+X#define MODERATOR(t)     t->Players
+X
+X#define CLUB(t)          ((t)->playing_mode == CLUB_PLAYING_MODE)
+X#define FORMAL(t)        ((t)->playing_mode == FORMAL_PLAYING_MODE)
+X#define PRACTICE(t)      ((t)->playing_mode == PRACTICE_PLAYING_MODE)
+X
+X#ifdef _NETWORK_
+X
+X  Table Table_List = NULL;
+X    /* If we are the server, then a list of the currently playing tables.
+X       If we are a client, then a descriptor of the particular table
+X       where we are sitting. */
+X
+X  Connection Connections = NULL;
+X    /* Connections which have been established. */
+X
+X  Connection Local_Player_Connection = NULL;
+X    /* A dummy connection representing the local player. */
+X
+X  int    server_mode = 0;
+X    /* A boolean flag which is true if we are acting as the server. */
+X  int    client_mode = 0;
+X    /* A boolean flag which is true if we are a client. */
+X
+X  char  *server_name = NULL;
+X    /* The server to which we will try to connect by default. */
+X  int    network_port = DEFAULT_PORT;
+X    /* The port number to be used for network communications. */
+X
+X  char Server_Start_time [40];
+X    /* The time at which we entered server mode. */
+X
+X  /* The following information is maintained in order so that we
+X     can quickly identify ourselves to the GPS server. */
+X
+X  char Host_IP [60];
+X    /* The IP number of the local host, in ascii format. */
+X  int  Host_IP_is_known = 0;
+X    /* A boolean flag indicating that the host IP number (or name) is known. */
+X  char Host_name [100];
+X    /* The name of the local host. */
+X  char User_name [20];
+X    /* The login name of the local user. */
+X  char User_fullname [60];
+X    /* The full name of the local user, as taken from the password file. */
+X  char *Registration = NULL;
+X    /* A unique name assigned to the local user which identifies him to
+X       the GPS. */
+X  char *Timezone_name = NULL;
+X    /* A string naming the time zone of the local player. */
+X
+X#else
+X
+X  extern Table Table_List;
+X  extern Connection Connections;
+X  extern Connection Local_Player_Connection;
+X  extern int server_mode, client_mode, network_port;
+X  extern char *server_name;
+X  extern char Host_IP[], Host_name[], User_name[], User_fullname[],
+X              Server_Start_time[];
+X  extern int Host_IP_is_known;
+X  extern char *Registration;
+X  extern char *Timezone_name;
+X
+X#endif
+X
+X/* Procedures for manipulating command queues: */
+X
+Xextern int message_available ();
+X/* extern int message_available (message_queue queue); */
+X/* Returns true if the given queue is nonempty. */
+X
+Xextern Message dequeue_message ();
+X/* extern Message dequeue_message (message_queue queue); */
+X/* Deletes the first message from the given queue and returns a pointer
+X   to that message. 
+X*/
+X
+Xextern void enqueue_message ();
+X/* extern void enqueue_message (message_queue queue, Message m); */
+X/* Appends m to the list of messages stored in the given message queue. */
+X
+Xextern Message allocate_message ();
+X/* extern Message allocate_message (void); */
+X/* Allocates a message structure and returns a pointer to the structure.
+X   Copies the message text mtest into the message structure. */
+X
+Xextern void deallocate_message ();
+X/* extern void deallocate_message (Message m); */
+X/* Returns the message structure m to the pool of free message structs. */
+X
+Xextern void clear_message_queue ();
+X/* extern void clear_message_queue (message_queue queue); */
+X/* Deletes all messages from the named queue. */
+X
+Xextern void clear_all_message_queues ();
+X/* extern void clear_all_message_queues (Table t); */
+X/* Clears all of the message queues for the table t. */
+X
+X
+X
+X/*  SEND ROUTINES
+X *
+X *  The following routines provide various options for sending messages
+X *  to the other players.  
+X *
+X *  The client and also any routine at the conversation level or above 
+X *  will use exclusively the send_message procedure.  However, server
+X *  routines in the cs module may need to use some of these other
+X *  send routines. 
+X */
+X
+Xextern Message send_message ();
+X/* void send_message (Table t, int msg_type, char *message); */
+X/* If in server mode, sends a message to each of the clients at table t.
+X   If in client mode, sends a message to the server.  Returns a pointer
+X   to the message which is put onto the protocol queue.
+X  
+X   NOTE 1: This is the main send routine, and should be used by all
+X   routines operating at the conversation level or higher.
+X 
+X   NOTE 2: As a side effect, the message sent by this routine is
+X   also queued onto the protocol queue of the table t.
+X*/
+X
+X/* SEND Primitives.
+X
+X   NOTE:  The following routines should only be used if we are in
+X   server mode.
+X*/
+X
+Xextern int server_send_unformatted ();
+X/* int server_send_unformatted (Connection c, char *message); */
+X/* Transmits the message to the given player.  Returns 0 if successful or 1
+X   if an error.  If an error occurs, then the connection is closed.
+X
+X   NOTE:  If the connection c is a local connection, then the message
+X   is dropped.  To cause the message to be received at the local table,
+X   the routine send_private_message must be used.   
+X*/
+X
+Xextern int server_send ();
+X/* int server_send (Connection c, int source, char *player_name, 
+X     char *message); */
+X/* Formats a message and sends it across the given connection.
+X   Returns 0 if successful or 1 if an error.  If an error occurs,
+X   then the connection is closed.  If the connection c is that
+X   of the local player, then the message is dropped.  If this is
+X   not desired, then send_private_message should be used.
+X*/
+X
+Xextern void Relay_message ();
+X/* void Relay_message (Table t, Connection c, int msg_type, char *message); */
+X/* Relays the message from c to all of the other players at table t who
+X   are allowed to receive the message.  Does NOT put the message onto
+X   the local protocol queue.
+X*/
+X
+Xextern Message loopback_message_unformatted ();
+X/* void loopback_message_unformatted (Table t, Connection c, char *message); */
+X/* Constructs a message structure using the the given message.
+X   Assumes that the message is in the format which is used by the
+X   client in transmitting messages.  Appends the message structure
+X   to the protocol queue for the table t.  Returns a pointer to the
+X   message which is enqueued.
+X*/
+X
+Xextern Message loopback_message ();
+X/* void loopback_message (Table t, Connection c, char *message); */
+X/* Appends the message to the protocol queue of the table t. 
+X   Returns a pointer to the message which is enqueued.
+X*/ 
+X
+Xextern void server_broadcast_unformatted ();
+X/* void server_broadcast_unformatted (Table t, int msg_type, char *message); */
+X/* Broadcasts the message to all of the people sitting at table t who are
+X   entitled to receive the message.  This includes putting the message
+X   onto the local protocol queue if we are sitting at the table t.
+X*/
+X
+Xextern void server_broadcast ();
+X/* void server_broadcast (Table t, int source, msg_type, char *player_name, 
+X     char *message); */
+X/* Formats and broadcasts the message to all of the people sitting at table t
+X   who are entitled to receive the message.  Puts the message onto the
+X   local protocol queue if we are sitting at the table t.
+X*/
+X
+Xextern void send_server_message ();
+X/* void send_server_message (Table t, int msg_type, char *message); */
+X/* Sends a message which originates from the 'SERVER'. */
+X
+Xextern void send_private_message ();
+X/* void send_private_message (Connection c, char *message); */
+X/* Only to be used in server mode.  Sends a message from the 'server'
+X   to the connection c.  If the connection c is the local player,
+X   then appends the message to the protocol queue of the table of
+X   the local player.
+X*/
+X
+X
+X/* The following routines are for transmitting and receiving boards and
+X   play records.  These routines are special in that boards and
+X   play records are transmitted and received as in-line data, and so
+X   are not handled by the normal parsing mechanisms.
+X*/
+X
+Xextern void Transmit_board ();
+X/* void Transmit_board (Table t, Board *b); */
+X/* If we are the server, then transmits the board b to each of the players
+X   at the table t.  If we are a client, then transmits the board b to
+X   the server. */
+X
+Xextern void Transmit_play_record ();
+X/* void Transmit_play_record (Table t, Play_record *p); */
+X/* If we are the server, then transmits the play record p to each of the
+X   players at the table t.  If we are a client, then transmits the play
+X   record p to the server. */
+X
+Xextern void Relay_board ();
+X/* void Relay_board (Table t, Connection c, Board *b); */
+X/* Relays the in-line board data from the connection c to the other players
+X   at the table t.
+X*/
+X
+Xextern void Relay_play_record ();
+X/* void Relay_play_record (Table t, Connection c, Play_record *p); */
+X/* Relays the in-line play record from the connection c to the other players
+X   at the table t.
+X*/
+X
+X
+X/* Top level routines for accessing the network: */ 
+X
+Xextern void Initialize_Network ();
+X/* Initializes the network data structures. */
+X
+Xextern void Attempt_to_connect ();
+X/* Attempts to connect to the server named above as server_name at
+X   the port specified above as network_port.  
+X*/
+X
+Xextern void Setup_server ();
+X/* Sets up the local player as a server.  Attempts to use the specified
+X   port, but if this does not work, then a new port will be chosen.
+X*/
+X
+Xextern void Wait_for_network_event ();
+X/* Waits for an input event to occur.  If a network event occurs, then
+X   parses the message and places it onto the proper player queue.
+X*/
+X
+Xextern void close_connection ();
+X/* void close_connection (Connection c) */
+X/* Closes the connection to c. */
+X
+Xextern void Close_all_connections ();
+X/* Closes all current network connections. */
+X
+Xextern void Switch_Table ();
+X/* void Switch_Table (Connection c, Table new_table); */
+X/* Unlinks the connection c from the current table and links it into
+X   the new table.
+X*/
+X
+X/* The following two macros are for iterating through the set of all
+X   connections and through the set of all players at a given table,
+X   respectively.
+X*/
+X
+X#define FOREACH_CONNECTION(x) for(x = Connections->inext; x != NULL; x = x->inext)
+X#define FOREACH_PLAYER(x,t)   for(x = t->Players->onext; x != NULL; x = x->onext)
+END_OF_FILE
+if test 15537 -ne `wc -c <'network.h'`; then
+    echo shar: \"'network.h'\" unpacked with wrong size!
+fi
+# end of 'network.h'
+fi
+echo shar: End of archive 5 \(of 14\).
+cp /dev/null ark5isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 14 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

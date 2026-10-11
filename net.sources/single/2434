@@ -1,0 +1,811 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,7aa9805fc744356f,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-02-12 11:03:14 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site sdcc3.UUCP
+Path: utzoo!watmath!clyde!bonnie!akgua!sdcsvax!sdcc3!muller
+From: muller@sdcc3.UUCP (Keith Muller)
+Newsgroups: net.sources
+Subject: load control system (6 of 8)
+Message-ID: <2681@sdcc3.UUCP>
+Date: Tue, 12-Feb-85 14:03:14 EST
+Article-I.D.: sdcc3.2681
+Posted: Tue Feb 12 14:03:14 1985
+Date-Received: Thu, 14-Feb-85 01:26:14 EST
+Organization: U.C. San Diego, Academic Computer Center
+Lines: 791
+
+This is part 6 of the the load control system. Part 1 must be unpacked before
+any other part.
+	Keith Muller
+	ucbvax!sdcsvax!muller
+
+
+# This is a shell archive.  Remove anything before this line,
+# then unpack it by saving it in a file and typing "sh file".
+#
+# Wrapped by sdcc3!muller on Sat Feb  9 13:56:47 PST 1985
+# Contents:  server/Makefile server/data.c server/globals.c server/main.c
+ 
+echo x - server/Makefile
+sed 's/^@//' > "server/Makefile" <<'@//E*O*F server/Makefile//'
+#
+# Makefile for batch server
+#
+
+CFLAGS= -O
+
+BGID=	lddgrp
+
+DEST=	/etc
+
+HDR=	../h/common.h ../h/server.h
+
+SRC=	main.c data.c globals.c setup.c commands.c
+
+OBJ=	main.o data.o globals.o setup.o commands.o
+
+all:	ldd
+
+ldd:    $(OBJ)
+	cc -o ldd $(OBJ)
+
+$(OBJ):	 $(HDR)
+
+install: $(DEST)/ldd
+
+$(DEST)/ldd: ldd
+	install -c -m 700 -o root -g $(BGID) ldd $(DEST)
+
+clean:
+	rm -f $(OBJ) core ldd
+
+lint:
+	lint -abchx $(SRC)
+@//E*O*F server/Makefile//
+chmod u=r,g=r,o=r server/Makefile
+ 
+echo x - server/data.c
+sed 's/^@//' > "server/data.c" <<'@//E*O*F server/data.c//'
+
+/*-------------------------------------------------------------------------
+ * data.c - server
+ *
+ * routines that deal with the data structures maintained by the server.
+ * the server uses a double linked list with qhead pointing at the head
+ * and qtail pointing at the tail. if the queue is not empty then
+ * qhead->back is always QNIL and qtail->fow is always QNIL. Insertions
+ * also require that the time field increase (older to younger) from qhead
+ * to qtail. 
+ *
+ * NOTE: that when nodes are added to the free list only the fow
+ * link is altered so procedures that search through the list with the
+ * intention of calling rmqueue must search from qtail to qhead because
+ * rmqueue will destroy the nodes fow link.
+ *-------------------------------------------------------------------------
+ */
+
+/* $Log$ */
+
+#include "../h/common.h"
+#include "../h/server.h"
+
+extern struct qnode *qhead;
+extern struct qnode *qtail;
+extern struct qnode *freequeue;
+extern int qcount;
+extern int newlist;
+extern int newstatus;
+
+/*------------------------------------------------------------------------
+ * rmqueue
+ *
+ * remove the node pointed at by work from the double linked list.
+ *------------------------------------------------------------------------
+ */
+rmqueue(work)
+struct qnode *work;
+{
+	/*
+	 * set flags to indicate the list and status files are out of date
+	 */
+	newlist = 1;
+	newstatus = 1;
+	qcount--;
+
+	/*
+	 * splice the job out of the queue
+	 */
+	if (work->back == QNIL)
+		qhead = work->fow;
+	if (work->fow == QNIL)
+		qtail = work->back;
+	if (work->fow != QNIL)
+		(work->fow)->back = work->back;
+	if (work->back != QNIL)
+		(work->back)->fow = work->fow;
+	work->fow = freequeue;
+	freequeue = work;
+}
+
+/*-------------------------------------------------------------------------
+ * addqueue
+ *
+ * add a node to the queue if it is not already in it.
+ * note that when clients poll the server to see if it is still alive they
+ * send another "queue" command. This is why addqueue must 
+ * check if the job is still queued.
+ *-------------------------------------------------------------------------
+ */
+addqueue(work)
+struct request *work;
+{
+	register struct qnode *spot;
+	register struct qnode *spot2;
+	register struct qnode *ptr;
+	extern int full;
+	extern char *malloc();
+	extern char *strcpy();
+
+	/*
+	 * find the place in the queue for this request. The
+	 * time field is used for this oldest requests belong closer
+	 * to the head of the queue.
+	 */
+	for (spot = qtail; spot != QNIL; spot = spot->back){
+		/*
+		 * it might be already in the queue as a client
+		 * is just polling the server to see if the server is
+		 * still alive
+		 */
+		if (spot->pid == work->pid)
+			return(1);
+
+		/*
+		 * check to see if this job is older
+		 */
+		if (work->time > spot->time)
+			break;
+	}
+
+	/*
+	 * At this point, job is not in the queue at the correct point.
+	 * either is a new job or a client checking to see if server is
+	 * alive. If this is a check, look for job higher up in the queue.
+	 */
+	if (work->type != POLLCMD){
+		/*
+	 	 * at this point the node is a new one, reject if the
+	 	 * queue is full.
+	 	 */
+		if (qcount >= full)
+			return(-2);
+	}else if (spot != QNIL){
+		/*
+		 * this job is just checking up to see if it is still
+		 * queued.
+		 */
+		for (spot2 = spot->back; spot2 != QNIL; spot2 = spot2->back){
+			/*
+			 * job must have been moved
+			 */
+			if (spot2->pid == work->pid)
+				return(1);
+		}
+
+		/*
+		 * at this point the job is missing. it should have
+		 * been in the queue. so put it back.
+		 */
+	}
+
+	/*
+	 * allocate space for qnode, check freelist first
+	 */
+	if (freequeue == QNIL)
+		ptr = (struct qnode *)malloc(sizeof(struct qnode));
+	else{
+		ptr = freequeue;
+		freequeue = ptr->fow;
+	}
+	if (ptr == QNIL){
+		errlog("no space for a qnode");
+		return(-1);
+	}
+
+	/*
+	 * copy in the data from the datagram
+	 */
+	ptr->pid = work->pid;
+	ptr->uid = work->uid;
+	ptr->time = work->time;
+	(void)strcpy(ptr->com, work->com);
+
+	/*
+	 * special case if queue was empty
+	 */
+	if (qcount == 0){
+		if ((qhead != QNIL) || (qtail != QNIL)){
+			errlog("Addqueue: qcount should not be 0");
+			cleanup();
+		}
+		qhead = qtail = ptr;
+		ptr->fow = ptr->back = QNIL;
+		newlist = 1;
+		newstatus = 1;
+		qcount = 1;
+		return(0);
+	}
+	/*
+	 * do two integrity checks, yes we are paranoid
+	 */
+	if (qhead == QNIL){
+		errlog("Addqueue: qhead should not be QNIL");
+		cleanup();
+	}
+	if (qtail == QNIL){
+		errlog("Addqueue: qtail should not be QNIL");
+		cleanup();
+	}
+
+	/*
+	 * if spot == qhead, belongs at very beginning of queue
+	 */
+	if (spot == QNIL){
+		qhead->back = ptr;
+		ptr->fow = qhead;
+		ptr->back = QNIL;
+		qhead = ptr;
+	}else{
+		/*
+		 * insert into the queue
+		 */
+		ptr->fow = spot->fow;
+		ptr->back = spot;
+		if (spot->fow != QNIL)
+			(spot->fow)->back = ptr;
+		else
+			qtail = ptr;
+		spot->fow = ptr;
+	}
+	/*
+	 * change newlist to show queue has changed
+	 */
+	newlist = 1;
+	newstatus = 1;
+	qcount++;
+	return(1);
+}
+
+
+/*-------------------------------------------------------------------------
+ * movequeue
+ *
+ * move the job pid to posistion pos in the queue. Note to maintain
+ * insertion date requirements, the time field in the moved job is
+ * altered.
+ *-------------------------------------------------------------------------
+ */
+movequeue(pos,pid)
+u_long pos;
+u_long pid;
+{
+	register struct qnode *ptr;
+	register struct qnode *work;
+	extern int qcount;
+
+	work = QNIL;
+	for (ptr = qhead; ptr != QNIL; ptr = ptr->fow){
+		/*
+		 * look for the requested node, set work to point
+		 */
+		if (ptr->pid == pid){
+			work = ptr;
+			break;
+		}
+	}
+
+	/*
+	 * if not found return -1 as no such pid, or return 0
+	 * if only one job queued
+	 */
+	if (work == QNIL)
+		return(-1);
+	if (qcount == 1)
+		return(0);
+
+	/*
+	 * set ptr to point a position to move work to
+	 * note: first position in queue is 1 (not 0).
+	 */
+	for (ptr = qhead; ((ptr != QNIL) && (pos > 1)); ptr = ptr->fow){
+		if (ptr != work)
+			/*
+			 * must be moving the job to a lower position
+			 * in the queue. So cannot count self.
+			 */
+			pos--;
+	}
+
+	/*
+	 * if it is already at the requested position, or the pos is
+	 * after the last node and the pid IS the last node, return
+	 */
+	if ((ptr == work) || ((ptr == QNIL) && (qtail == work)))
+		return(0);
+	
+	newlist = 1;
+	/*
+	 * splice the node out of the queue
+	 */
+	if (work->fow != QNIL)
+		(work->fow)->back = work->back;
+	if (work->back != QNIL)
+		(work->back)->fow = work->fow;
+	if (qtail == work)
+		qtail = work->back;
+	if (qhead == work)
+		qhead = work->fow;
+	/*
+	 * splice the node into the new position.
+	 */
+	if (ptr == QNIL){
+		/*
+		 * put at the end of the queue
+		 */
+		work->back = qtail;
+		work->fow = QNIL;
+		work->time = qtail->time + 1;
+		qtail->fow = work;
+		qtail = work;
+	}else{
+		/*
+		 * belongs in the queue as ptr points at a node
+		 */
+		work->fow = ptr;
+		work->back = ptr->back;
+		/*
+		 * see if the pid is being put at the head of the list
+		 */
+		if (ptr->back != QNIL){
+			(ptr->back)->fow = work;
+			work->time = ptr->time-((ptr->time-(ptr->back)->time)/2);
+		}else{
+			qhead = work;
+			work->time = ptr->time - 1;
+		}
+		ptr->back = work;
+	}
+	return(0);
+}
+@//E*O*F server/data.c//
+chmod u=r,g=r,o=r server/data.c
+ 
+echo x - server/globals.c
+sed 's/^@//' > "server/globals.c" <<'@//E*O*F server/globals.c//'
+
+/*-------------------------------------------------------------------------
+ * globals.c - server
+ *
+ * allocation of the variables that are global to the server.
+ *-------------------------------------------------------------------------
+ */
+
+/* $Log$ */
+
+#include "../h/common.h"
+#include "../h/server.h"
+#include <sys/uio.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/time.h>
+#include <stdio.h>
+
+int kmem = -1;				/* file desc for kmem to get load */
+int cntrlsock = -1;			/* socket desc for control messages*/
+int msgsock = -1;			/* socket for queue requests */
+int qcount = 0;				/* count job in the queue */
+int newlist = 1;			/* 1 when queue is new than last list*/
+int newstatus = 1;			/* 1 when status variable are changed*/
+int errorcount = 0;			/* count of number of recovered error*/
+int timerstop = 1;			/* when when timer stopped, 0 runs */
+u_long mqtime = MAXQTIME;		/* max time a job can be in queue */
+int descsize = 0;			/* desc table size for select */
+long loadaddr = 0;			/* address of load aver in kmem */
+int alrmmask = 0;			/* mask for blocking SIGALRM */
+int full = MAXINQUEUE;			/* max number of jobs waiting to run */
+FILE *errfile;				/* file where errors are logged */
+struct qnode *qhead = QNIL;		/* points at queue head */
+struct qnode *qtail = QNIL;		/* points at queue tail */
+struct qnode *freequeue = QNIL;		/* pointer to local freelist of qnode*/
+struct itimerval startalrm = {{ALRMTIME,0},{ALRMTIME,0}}; /* alrm time */
+struct itimerval stopalrm = {{0,0},{0,0}}; /* value used to stop timer */
+struct timeval polltime = {WAITTIME,0};    /* wait time during poll */
+
+#ifdef sun
+long loadlevel = (long)(MAXLOAD*256);	/* load at which queueing starts */
+#else
+double loadlevel = MAXLOAD;		/* load at which queueing starts */
+#endif
+@//E*O*F server/globals.c//
+chmod u=r,g=r,o=r server/globals.c
+ 
+echo x - server/main.c
+sed 's/^@//' > "server/main.c" <<'@//E*O*F server/main.c//'
+
+/*-------------------------------------------------------------------------
+ * main.c - server
+ *
+ * The server takes requests from client processes and the control
+ * program, and performs various operations. The servers major task is
+ * to attempt to maintain the systems load average close to a set limit
+ * loadlevel. Client processes are kept in a queue and are waiting for a
+ * command from the server (to run or abort). The server reads /dev/kmem
+ * every ALRMTIME seconds checking to see if the load level has dropped
+ * below the required loadlevel. If the queue is empty the timer is turned
+ * off. While the timer is off, the server will only read /dev/kmem at the
+ * receipt of a request to run from a client program.
+ *
+ * The server was designed to be as fault tolerant as possible and maintains
+ * an errorfile of detectable errors. The server can safely be aborted and
+ * restarted without deadlocking the clients. The server when restarted
+ * will rebuild the queue of waiting processes to the state that exsisted
+ * before the prvious server exited. The entire system was designed to allow
+ * execution of user programs (even those under load control) even if the
+ * server is not functioning properly! (user jobs will ALWAYS run, the system
+ * will never hang).
+ *
+ * The effectiveness of the system depends on what fraction of the programs
+ * that are causing the system overload are maintained under this system.
+ * Processes can only remain in queue a maximium of "mqtime" seconds 
+ * REGARDLESS of the loadlevel setting. This was done in case the programs 
+ * that are keeping the systems loadlevel above the threshold are not
+ * controlled by the server! So eventually all jobs will run.
+ *
+ * The control program allows users to remove their jobs from the queue and
+ * allows root to adjust the operating parameters of the server while the
+ * server is running.
+ * 
+ * All the programs and routines are commented and warnings about certain
+ * sections of code are given when the code might be vague.
+ * 
+ * This system has ONLY BEEN RUN ON 4.2 UNIX (sun, vax and pyramid) and uses
+ * datagrams in the AF_UNIX domain. (which seems to be extremely reliable).
+ *
+ * Author: Keith Muller
+ *         University of California, San Diego
+ *         Academic Computer Center C - 010
+ *	   La Jolla, Ca 92093
+ *	   (ucbvax!sdcsvax!sdcc3!muller)
+ *	   (619) 452-6090
+ *-------------------------------------------------------------------------
+ */
+
+/* $Log$ */
+
+#include "../h/common.h"
+#include "../h/server.h"
+#include <sys/time.h>
+#include <sys/file.h>
+#include <stdio.h>
+#include <errno.h>
+
+/*--------------------------------------------------------------------------
+ * main
+ *
+ *--------------------------------------------------------------------------
+ */
+main(argc, argv)
+int argc;
+char **argv;
+{
+	register int msgmask;
+	register int cntrlmask;
+	int numfds;
+	int readfds;
+	int readmask;
+	extern int msgsock;
+	extern int cntrlsock;
+	extern int descsize;
+	extern int errno;
+
+	/*
+	 * check the command line args
+	 */
+	doargs(argc, argv);
+
+	/*
+	 * setup the server
+	 */
+	setup();
+
+	/*
+	 * create all the sockets
+	 */
+	crsock();
+
+	/*
+	 * scan the spool for waiting clients and send them a POLLCMD
+	 */
+	scanspool();
+
+	/*
+	 * create the bit mask used by select to determine which descriptors
+	 * are checked for available input ( datagrams).
+	 */
+	msgmask = 1 << msgsock;
+	cntrlmask = 1 << cntrlsock;
+	readmask = msgmask | cntrlmask;
+
+	/*
+	 * do this forever
+	 */
+	for(;;){
+		readfds = readmask;
+
+		/*
+		 * wait for a datagram to arrive
+		 */
+		numfds = select(descsize,&readfds,(int *)0,(int *)0,(struct timeval *)0);
+		if ((numfds < 0) && (errno != EINTR)){
+			errlog("select error");
+			cleanup();
+		}
+
+		/*
+		 * if the interval timer interrupted us, go back to the select
+		 */
+		if (numfds <= 0)
+			continue;
+		/*
+		 * WARNING! note that BOTH SOCKETS are always checked 
+		 * when the select indicates at least one datagram is waiting.
+		 * This was done to prevent a situation where one socket
+		 * "locks" out the other if it is subject to high traffic!
+		 */
+
+		/*
+		 * first check to see if there is a control message
+		 */
+		if (readfds & cntrlmask)
+			cntrldis();
+
+		/*
+		 * now see if there is a queue message
+		 */
+		if (readfds & msgmask)
+			msgdis();
+	}
+
+}
+
+
+/*--------------------------------------------------------------------------
+ * onalrm
+ *
+ * handler for the SIGALRM sent by the interval timer. This routine checks
+ * the queue to see if there is any jobs that can be run. The two conditions
+ * for running a job is that the load on the machine is below loadlimit or
+ * the oldest job in the queue has exceed the maximium queue time and should
+ * be run regardless of the load.
+ *--------------------------------------------------------------------------
+ */
+onalrm()
+{
+	register int count;
+	struct timezone zone;
+	struct timeval now;
+	struct itimerval oldalrm;
+	extern struct itimerval stopalrm;
+	extern struct qnode *qhead;
+	extern u_long mqtime;
+	extern int qcount;
+	extern int timerstop;
+	extern int newstatus;
+
+	/*
+	 * if the load average is below the limit run as many jobs as
+	 * possable to bring the load up to the loadlimit.
+	 * this could cause an overshoot of the loadlimit, but in most
+	 * cases this overshoot will be small. This prevents excessive
+	 * waiting of jobs due to momentary load peaks.
+	 */
+	if ((count = getrun()) != 0){
+		while ((count > 0) && (qcount > 0)){
+			/*
+			 * only decrement count if there was really
+			 * a waiting client (the client could be dead)
+			 */
+			if (outmsg(qhead->pid, RUNCMD) == 0)
+				count--;
+			rmqueue(qhead);
+		}
+	}else if (qcount > 0){
+		/*
+		 * load is too high to run a job, check if oldest can be run
+		 */
+		if (gettimeofday(&now, &zone) < 0){
+			errlog("onalrm cannot get time");
+			return;
+		}
+		while ((qcount>0)&&(((u_long)now.tv_sec - qhead->time)>mqtime)){
+			/*
+			 * determined oldest job can run. if job is
+			 * dead try next one
+			 */
+			if (outmsg(qhead->pid, RUNCMD) == 0){
+				rmqueue(qhead);
+				break;
+			}else
+				rmqueue(qhead);
+		}
+	}
+
+	/*
+	 * if the queue is not empty or the interval timer is stopped
+	 * then return
+	 */
+	if ((qcount != 0) || (timerstop == 1))
+		return;
+
+	/*
+	 * otherwise stop the timer
+	 */
+	if (setitimer(ITIMER_REAL,&stopalrm, &oldalrm) < 0)
+		errlog("stop timer error");
+	else{
+		timerstop = 1;
+		newstatus = 1;
+	}
+}
+
+
+/*-------------------------------------------------------------------------
+ * getrun
+ *
+ * determines how many jobs can be run after obtaining current 1 minute
+ * load average. since the load obtained from kmeme is an average, this
+ * should provide some hysteresis so the server doesn't thrash around
+ *-------------------------------------------------------------------------
+ */
+getrun()
+{
+	extern int qcount;
+	extern int kmem;
+	extern long loadaddr;
+#ifdef sun
+	long load;
+	long run;
+	extern long loadlevel;
+#else
+	double load;
+	double run;
+	extern double loadlevel;
+#endif sun
+	extern long lseek();
+
+	/*
+	 * seek out into kmem (yuck!!!)
+	 */
+	if (lseek(kmem, loadaddr, L_SET) == -1){
+		errlog("lseek error");
+		cleanup();
+	}
+
+	/*
+	 * read the load
+	 */
+	if (read(kmem, (char *)&load, sizeof(load)) < 0){
+		errlog("kmem read error");
+		cleanup();
+	}
+
+	/*
+	 * calculate the number of jobs that can run
+	 * (will always overshoot by the fraction)
+	 */
+	if ((run = loadlevel - load) > 0){
+#ifdef sun
+		/*
+	 	 * sun encodes the load average in a long. It is the
+	 	 * load average * 256
+	 	 */
+		return(1 + (int)(run >> 8));
+#else
+		return(1 + (int)run);
+#endif
+	}else
+		return(0);
+}
+
+
+/*------------------------------------------------------------------------
+ * errlog
+ *
+ * log the erros into a log. should be small number (hopefully zero!!)
+ *------------------------------------------------------------------------
+ */
+errlog (mess)
+char *mess;
+
+{
+	struct timeval now;
+	struct timezone zone;
+	extern char *ctime();
+	extern int errorcount;
+	extern int errno;
+	extern int sys_nerr;
+	extern char *sys_errlist[];
+	extern FILE *errfile;
+
+	/*
+	 * increase the errorcount
+	 */
+	errorcount = errorcount + 1;
+
+	/*
+	 * if called with an arg, print it first
+	 */
+	if (mess != (char *)0)
+		fprintf(errfile,"%s: ", mess);
+	/*
+	 * if a valid error print the human message
+	 */
+	if ((errno > 0) && (errno < sys_nerr))
+		fprintf(errfile," %s ", sys_errlist[errno]);
+	/*
+	 * stamp the time of occurance
+	 */
+	if (gettimeofday(&now, &zone) < 0)
+		fprintf(errfile,"errlog cannot get time of day\n");
+	else
+		fprintf(errfile,"%s", ctime(&(now.tv_sec)));
+	(void)fflush(errfile);
+}
+
+
+/*-------------------------------------------------------------------------
+ * cleanup
+ *
+ * the whole system fell apart. close down the sockets log the server
+ * termination and exit.
+ *-------------------------------------------------------------------------
+ */
+cleanup()
+{
+	extern int msgsock;
+	extern int cntrlsock;
+	extern int errno;
+	extern FILE *errfile;
+
+	(void)close(msgsock);
+	(void)close(cntrlsock);
+	(void)unlink(MSGPATH);
+	(void)unlink(CNTRLPATH);
+	errno = 0;
+	errlog("Server aborting at");
+	(void)fclose(errfile);
+	exit(1);
+}
+@//E*O*F server/main.c//
+chmod u=r,g=r,o=r server/main.c
+ 
+echo Inspecting for damage in transit...
+temp=/tmp/shar$$; dtemp=/tmp/.shar$$
+trap "rm -f $temp $dtemp; exit" 0 1 2 3 15
+cat > $temp <<\!!!
+      33      62     411 Makefile
+     311    1144    7097 data.c
+      44     288    1782 globals.c
+     355    1341    9080 main.c
+     743    2835   18370 total
+!!!
+wc  server/Makefile server/data.c server/globals.c server/main.c | sed 's=[^ ]*/==' | diff -b $temp - >$dtemp
+if [ -s $dtemp ]
+then echo "Ouch [diff of wc output]:" ; cat $dtemp
+else echo "No problems found."
+fi
+exit 0
+
+

@@ -1,0 +1,302 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,2017b48d8684af35,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-06-27 11:00:54 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site ur-cvsvax.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!think!harvard!seismo!rochester!ur-cvsvax!bill
+From: bill@ur-cvsvax.UUCP (Bill Vaughn)
+Newsgroups: net.sources
+Subject: A faster /usr/bin/spell
+Message-ID: <197@ur-cvsvax.UUCP>
+Date: Thu, 27-Jun-85 14:00:54 EDT
+Article-I.D.: ur-cvsva.197
+Posted: Thu Jun 27 14:00:54 1985
+Date-Received: Sat, 29-Jun-85 00:33:14 EDT
+Distribution: net
+Organization: Center for Visual Science, U. of Rochester
+Lines: 281
+
+Here's a program that nicely speeds up /usr/bin/spell. It replaces both of
+the "sort -u"'s in the pipeline toward the end of that shell script.  If this
+is an 'old wheel' you've seen before, I'm sorry; just ignore it.  Otherwise,
+I think you'll find it useful and easy to install.
+
+Installation procedure:
+
+1) Store the program to follow somewhere(/usr/src/usr.bin/spell is logical)
+   and compile it with:
+   	cc -O funiq.c -o funiq
+   (If you want statistics on its use to be saved, compile it with:
+   	cc -O -DSTATS funiq.c -o funiq
+   and create a file calleds 'bstats' in /usr/dict.)
+
+2) Move 'funiq' to an accessible place in the directory tree.
+
+3) Edit /usr/bin/spell and replace the two instances of 'sort -u' with
+   'funiq'. You might want to retain the old version for backup and for
+   timing comparisons.
+
+I think the program is commented well enough so that I don't have to say much
+more. Enjoy!
+
+Bill Vaughn
+Center for Visual Science
+Univ. of Rochester
+Rochester, NY 14627
+{seismo,allegra,decvax}!rochester!ur-cvsvax!bill
+
+Please post bugs/enhancements of funiq.c to net.sources.bugs
+
+-----------------------------cut here------------------------------------
+/* funiq.c
+ *
+ * Written by Bill Vaughn,
+ *		CVS, Univ. of Rochester, Rochester, NY
+ *		{seismo,allegra,decvax}!rochester!ur-cvsvax!bill
+ *
+ * This program reads one line from the standard input, searches for
+ * the line in an evolving binary tree sorted alphabetically.
+ * If the line is NOT found, it is inserted in the tree and put on
+ * the standard output. No action is taken if the line IS found.
+ *
+ * The program is intended to work with one-word-per-line input,
+ * but doesn't enforce that rule. The input to 'funiq' should be
+ * random, NOT sorted. Sorted input gives worst case running time.
+ * The program dynamically allocates all of its array space and uses
+ * a binary tree storage method which, according to theory, has an
+ * average search time proportional to log(N), where N is the number
+ * of nodes in the tree at the time the search is performed.
+ *
+ * Principal uses:
+ * 1) 'Funiq' can replace the 'sort -u' in the pipeline in /usr/bin/spell. 
+ *    'Funiq' will not block the pipe and it will run faster than sort.
+ *    The input to /usr/lib/spell doesn't have to be sorted anyway; the
+ *    final sort in the pipe does that. The reason for the 'sort -u' at
+ *    that point in the pipeline is to limit the calls to the hashing
+ *    function in /usr/lib/spell.  'Funiq' accomplishes this task much
+ *    more efficiently.
+ *
+ * 2) Also, 'funiq' can replace the default mode of 'uniq' in cases where
+ *    the output need not be sorted.  The input should not be sorted
+ *    (as opposed to 'uniq', where is must be sorted.)
+ *
+ * Possible improvements:
+ *	Use a balancing method on the binary tree to improve
+ *	performance. See Knuth, 'Searching and Sorting', pp. 451-463
+ *      for an algorithm to balance binary trees during insertion.
+ *      It will require an extra byte of data per node however.
+ *	(Further analysis reveals that this might not be worth the effort.)
+ *
+ * Compilation:
+ *		cc -O funiq.c -o funiq
+ * or		cc -O -DSTATS funiq.c -o funiq	 (produces statistics)
+ */
+
+#include <stdio.h>
+
+/* The following defines the binary tree node structure
+ */
+
+struct btreenode {
+	char *str;
+	struct btreenode *left, *right;
+};
+
+struct btreenode *head;		/* binary tree head*/
+struct btreenode *alloc, *hend;	/* allocator pointers */
+char *cstore, *cend;		/* character array begining and end */
+
+char *nextstr(), *allocstr();
+struct btreenode *nextnode(), *allocbtree();
+char *calloc(), *malloc(), *gets();
+
+/* Feel free to change the following allocation parameters as desired/needed.
+ * One can spend as much or as little time in 'malloc/calloc' as one wants.
+ */
+#define NODES	4096	/* Initial allocation for btree nodes */
+#define STR	8192	/* Initial allocation for strings */
+#define ADDNOD	1024	/* Additional allocation for btree nodes */
+#define ADDSTR	2048	/* Additional allocation for strings */
+
+#ifdef STATS
+int charsused = 0;
+char statfile[] = "/usr/dict/bstats";
+#endif
+
+main(argc,argv)
+char *argv[];
+{
+	register int n;
+	register char *q;
+	register struct btreenode *r;
+#ifdef STATS
+	register ncmps = 0;
+	register maxdepth = 0;
+	register nodesused = 0;
+	register depth;
+	register total = 0;
+	FILE *f;
+#endif
+
+	if (argc > 1) {
+		if (freopen(argv[1],"r",stdin) == NULL) {
+			fprintf(stderr,"funiq: %s not accessible\n",argv[1]);
+			exit(1);
+		}
+	}
+
+	/* Initialize the binary tree with first string of the input.
+	 * Being a little more selective here might help
+	 * balance the tree, but who knows? Random input is
+	 * supposed to produce a reasonably balanced tree.
+	 */
+
+	q = cstore = allocstr(STR);	/* allocate string space */
+	cend = cstore + STR;
+	if (gets(q)==NULL)	/* get first line */
+		exit(0);
+
+	alloc = head = allocbtree(NODES);/* allocate tree nodes */
+	hend = head + NODES;	/* we're depending upon 'calloc' */
+	alloc->str = q;		/* to set all the pointers to NULL */
+	puts(q);		/* output the sucker */
+#ifdef STATS
+	total++;
+	nodesused++;
+#endif
+	q = nextstr(q);		/* get new string pointer. */
+
+	/* Traverse tree with each input line, inserting and printing
+	 * it if it's NOT found and discarding it if it is.
+	 */
+	while(gets(q)!=NULL) {
+		r = head;
+#ifdef STATS
+		total++;
+		depth=0;
+		while ((ncmps++ , (n = strcmp(q,r->str))) != 0) {
+#else
+		while ((n = strcmp(q,r->str)) != 0) {
+#endif
+			if (n < 0) {
+				if (r->left != NULL) {
+					r = r->left;
+#ifdef STATS
+					depth++;
+#endif
+					continue;	/* traversing left */
+				}
+				else {
+					/* Creating a left subtree */
+					r->left = nextnode();
+#ifdef STATS
+					nodesused++;
+#endif
+					puts( (r->left)->str = q );
+					q = nextstr(q);
+					break;	/* get next line */
+				}
+			}
+			else {
+				if (r->right != NULL) {
+					r = r->right;
+#ifdef STATS
+					depth++;
+#endif
+					continue;	/* traversing right */
+				}
+				else {
+					/* Creating a right subtree */
+					r->right = nextnode();
+#ifdef STATS
+					nodesused++;
+#endif
+					puts( (r->right)->str = q );
+					q = nextstr(q);
+					break;	/* get next line */
+				}
+			}
+		}
+#ifdef STATS
+		if (++depth > maxdepth)
+			maxdepth = depth;
+	}
+	f = fopen(statfile,"a");
+	fprintf(f,"%d\t%d\t%d\t%d\t%d\n",
+	        charsused,nodesused,total,ncmps,maxdepth);
+	fclose(f);
+#else
+	}
+#endif
+	exit(0);	/* That was fairly simple wasn't it? */
+}
+
+/*
+ * Returns pointer to an array of 'n' btree nodes.
+ */
+struct btreenode *allocbtree(n)
+{
+	register struct btreenode *x;
+
+	x = (struct btreenode *)
+	     calloc((unsigned)n,(unsigned)sizeof(struct btreenode));
+	if (x == NULL) {
+		fprintf(stderr,"funiq: not enough memory for tree nodes\n");
+		exit(1);
+	}
+	return(x);
+}
+
+/*
+ * Returns a pointer to the next available btree node.
+ * Gets more space if necessary.
+ */
+struct btreenode *nextnode()
+{
+	if (++alloc >= hend ) {
+		alloc = allocbtree(ADDNOD);
+		hend = alloc + ADDNOD;
+	}
+	return(alloc);
+}
+
+/*
+ * Returns pointer to 'n' bytes for character string storage.
+ */
+char *allocstr(n)
+{
+	register char *x;
+
+	x = malloc((unsigned)n);
+	if (x == NULL) {
+		fprintf(stderr,"funiq: not enough memory for strings\n");
+		exit(1);
+	}
+	return(x);
+}
+
+/*
+ * Returns a pointer to the next available string space.
+ * Gets more space if necessary.
+ */
+char *nextstr(s)
+register char *s;
+{
+	register char *x;
+	register int i;
+
+#ifdef STATS
+	charsused += (i = strlen(s) + 1);
+#else
+	i = strlen(s) + 1;
+#endif
+
+	if ((x = s + i) >= cend) {
+		x = allocstr(ADDSTR);
+		cend = x + ADDSTR;
+	}
+	return(x);
+}
+
+

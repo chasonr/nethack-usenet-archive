@@ -1,0 +1,2085 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 162299,f3cbce20e8af3f3d,start
+X-Google-Attributes: gid162299,public
+X-Google-ArrivalTime: 1986-05-03 21:01:00 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/17/84; site think.ARPA
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!think!ejb
+From: ejb@think.ARPA (Erik Bailey)
+Newsgroups: net.sources.games
+Subject: WAR Part 2 *REPOSTING*
+Message-ID: <5090@think.ARPA>
+Date: Sun, 4-May-86 00:01:00 EDT
+Article-I.D.: think.5090
+Posted: Sun May  4 00:01:00 1986
+Date-Received: Tue, 6-May-86 03:53:53 EDT
+Reply-To: ejb@godot.UUCP (Erik Bailey)
+Distribution: net
+Organization: Thinking Machines, Cambridge, MA
+Lines: 2063
+
+#---Cut here and place in it's own directory, then feed to Bourne shell---
+# This is a shell archive.  Remove anything before this line, then
+# unpack it by saving it in a file and typing "sh file".  (Files
+# unpacked will be owned by you and have default permissions.)
+# This archive contains:
+#   cmd.c (7867 chars)
+#   init.c (18991 chars)
+#   main.c (8760 chars)
+#   scan.c (3505 chars)
+#   talk.c (7531 chars)
+#   view.c (6135 chars)
+#
+echo x - cmd.c
+sed -e 's/^X//' > "cmd.c" << '//E*O*F cmd.c//'
+X#ifdef SCCS
+Xstatic char *sccsid = "@(#)cmd.c	1.2	4/5/85";
+Xstatic char *cpyrid = "@(#)Copyright (C) 1985 by D Bell";
+X#endif
+X
+X#include "war.h"
+X
+Xint	testblast();		/* routine to test is blasting is ok */
+Xint	testfight();		/* routine to test if fighting is ok */
+X
+X/*
+X * Read any command from us and set them for the object to work on.
+X * This routine never blocks for input.  Partially finished commands
+X * will be delayed until they are complete.  Such partial commands
+X * can be edited.  Command errors ring the terminal bell.
+X */
+Xdocommands()
+X{
+X	register char	*cp;			/* character pointer */
+X	register int	ch;			/* current character */
+X	register int	objchar;		/* character for object */
+X	char	buf[SCAN_SIZE+1];		/* input buffer */
+X
+X	if (setjmp(ttyjmp) == SCAN_EOF) {	/* done with commands */
+X		runcommands();
+X		sendinfo('r', 0, 0, 0);
+X		return;
+X	}
+X	objchar = scanchar();			/* get object char */
+X	if ((objchar == ' ') || (objchar == '\n') || (objchar == '\033'))
+X		scanabort();
+X	if (ch == '\014') {
+X		dpyredraw();
+X		scanabort();
+X	}
+X	cp = buf;
+X	while (1) {				/* get commands for object */
+X		ch = scanchar();
+X		if ((ch == ' ') || (ch == '\n')) break;
+X		if (ch == '\033') scanabort();
+X		*cp++ = ch;
+X	}
+X	*cp = '\0';
+X	if (setcmds(findobject(objchar), buf))
+X		write(STDERR, "\7", 1);
+X	scanabort();
+X}
+X
+X
+X/*
+X * Routine call by scanchar to read the next input character from
+X * the terminal.  Longjmps away if a character is not ready yet.
+X */
+Xttychar()
+X{
+X	long	n;			/* char count */
+X	unsigned char	ch;		/* char to return */
+X
+X	if (playing && (ioctl(STDIN, FIONREAD, &n) == 0) && (n <= 0)) {
+X		scaneof();		/* no char available now */
+X	}
+X	do {
+X		errno = 0;
+X		n = read(STDIN, &ch, 1);	/* read one char */
+X	} while ((n < 0) && (errno == EINTR));
+X	return((int)(ch &= 0x7f));
+X}
+X
+X
+X
+X/*
+X * Execute one move's worth of commands for all of the user's objects.
+X * Returns nonzero if something at all moved.
+X */
+Xruncommands()
+X{
+X	register struct	object	*obj;		/* current object */
+X	register int	trymore;		/* nonzero if try again */
+X	register int	moved;			/* something moved */
+X
+X	for (obj = objects; obj < endobjects; obj++)
+X		obj->o_flags &= ~F_MOVED;
+X	moved = 0;
+X	do {
+X		trymore = 0;
+X		for (obj = objects; obj < endobjects; obj++) {
+X			trymore |= runobject(obj);
+X		}
+X		moved |= trymore;
+X	} while (trymore);
+X	return(moved);
+X}
+X
+X
+X/*
+X * Attempt to run one move's worth of commands for an object.
+X * Returns nonzero if a command was actually executed.
+X * In addition, the object is flagged as having made it's move.
+X */
+Xrunobject(obj)
+X	register struct	object	*obj;		/* object to execute */
+X{
+X	register struct	cmd	*cmd;		/* current command to execute */
+X	register struct	cell	*cell;		/* current cell */
+X	register struct	cell	*newcell;	/* new cell */
+X	register struct	object	*newobj;	/* other object */
+X	int	trying;				/* trying to do commands */
+X
+X	if ((obj->o_side != myside) || (obj->o_flags & F_MOVED)) return(0);
+X	cell = obj->o_cell;
+X	if (cell == NULL) return(0);
+X	trying = 0;
+X	for (cmd = obj->o_cmds; cmd->c_type; cmd++) {
+X		if (cmd->c_count <= 0) continue;
+X		newcell = NULL;
+X		switch (cmd->c_type) {
+X			case 'b':		/* blast a wall */
+X				if (tryblast(obj, cmd->c_subtype)) return(1);
+X				break;
+X			case 'f':		/* fight the enemy */
+X				if (tryfight(obj, cmd->c_subtype)) return(1);
+X				break;
+X			case 'h':		/* move left */
+X				newcell = cell->c_left;
+X				break;
+X			case 'j':		/* move down */
+X				newcell = cell->c_down;
+X				break;
+X			case 'k':		/* move up */
+X				newcell = cell->c_up;
+X				break;
+X			case 'l':		/* move right */
+X				newcell = cell->c_right;
+X				break;
+X			default:
+X				panic("running unknown command");
+X		}
+X		if ((newcell == NULL) || (newcell == &edge)) continue;
+X		newobj = newcell->c_obj;
+X		if (newobj) {
+X			trying |= ((newobj->o_flags & F_WALL) == 0);
+X			continue;
+X		}
+X		placeobject(obj, newcell->c_row, newcell->c_col);
+X		sendinfo('p', newcell->c_row, newcell->c_col, obj->o_id);
+X		obj->o_flags |= F_MOVED;
+X		if (cmd->c_count < INFINITY) cmd->c_count--;
+X		return(1);
+X	}
+X	return(0);
+X}
+X
+X
+X/*
+X * Attempt to blast a wall in a given direction.
+X * Returns nonzero if we actually tried to do it.
+X */
+Xtryblast(obj, dir)
+X	register struct	object	*obj;		/* object doing fighting */
+X{
+X	register struct	cell	*cc;		/* current cell */
+X
+X	if ((obj->o_flags & F_MOVED) || ((obj->o_flags & F_BLAST) == 0))
+X		return(0);
+X	cc = pickdir(obj->o_cell, dir, testblast);
+X	if (cc == NULL) return(0);
+X	obj->o_flags |= F_MOVED;
+X	obj = cc->c_obj;
+X	if ((obj->o_life >= 100) ||
+X		((obj->o_life > 0) && (random() % obj->o_life)))
+X			return(1);
+X	removeobject(cc->c_row, cc->c_col);
+X	sendinfo('b', cc->c_row, cc->c_col, 0);
+X	return(1);
+X}
+X
+X
+X/* See if a location is worth blasting */
+Xtestblast(cc)
+X	register struct	cell *cc;		/* cell to check */
+X{
+X	return((cc != &edge) && cc->c_obj && (cc->c_obj->o_flags & F_WALL));
+X}
+X
+X
+X/*
+X * Attempt to fight in a given certain direction.
+X * Returns nonzero if we actually did fight.
+X */
+Xtryfight(obj, dir)
+X	register struct	object	*obj;		/* object doing fighting */
+X{
+X	register struct	cell	*cc;		/* current cell */
+X
+X	if ((obj->o_flags & F_MOVED) || ((obj->o_flags & F_FIGHT) == 0))
+X		return(0);
+X	cc = pickdir(obj->o_cell, dir, testfight);
+X	if (cc == NULL) return(0);
+X	obj->o_flags |= F_MOVED;
+X	if (random() % 2) return(1);
+X	sendinfo('h', cc->c_row, cc->c_col, 0);
+X	hitobject(cc->c_row, cc->c_col);
+X	return(1);
+X}
+X
+X
+X/* See if a cell is worth fighting */
+Xtestfight(cc)
+X	struct	cell *cc;			/* cell to check */
+X{
+X	register struct	object	*obj;		/* object to fight */
+X
+X	obj = cc->c_obj;
+X	if (obj == NULL) return(0);
+X	return(((obj->o_flags&(F_WALL|F_EDGE))== 0) && (obj->o_side != myside));
+X}
+X
+X
+X/*
+X * Specify the given list of commands to the specified object.
+X * Returns nonzero if a bad command is given or if too many are specified.
+X * If the string is valid, any previous commands are cancelled and
+X * the new ones are in effect.
+X */
+Xsetcmds(obj, str)
+X	register struct	object	*obj;		/* current object */
+X	register char	*str;			/* command string */
+X{
+X	register struct	cmd	*cmd;		/* next command to store */
+X	register int	count;			/* count for command */
+X	register int	gotcount;		/* got a count */
+X	struct	cmd	newcmds[CMDS];		/* new commands */
+X
+X	if ((obj == NULL) || (obj->o_side != myside)) return(1);
+X	cmd = newcmds;
+X	while (*str) {
+X		count = 0;			/* read numeric argument */
+X		gotcount = 0;
+X		while ((*str >= '0') && (*str <= '9')) {
+X			count = (count * 10) + *str++ - '0';
+X			gotcount = 1;
+X		}
+X		if (count >= (INFINITY - 1)) count = (INFINITY - 1);
+X		if (gotcount == 0) count = INFINITY;
+X		if (count <= 0) return(1);
+X		switch (*str) {
+X			case 'b':		/* blast in a direction */
+X			case 'f':		/* fight in a direction */
+X				if (cmd >= &newcmds[CMDS-2]) return(1);
+X				cmd->c_type = *str++;
+X				switch (*str) {		/* verify */
+X					case 'h': case 'l':
+X					case 'j': case 'k':
+X					case 'a': case 'n':
+X						cmd->c_subtype = *str++;
+X						cmd->c_count = INFINITY;
+X						cmd++;
+X						continue;
+X				}
+X				return(1);
+X
+X			case 'h':		/* move left small amount */
+X			case 'j':		/* move down small amount */
+X			case 'k':		/* move up small amount */
+X			case 'l':		/* move right small amount */
+X				if (cmd >= &newcmds[CMDS-2]) return(1);
+X				if (gotcount == 0) count = 1;
+X				cmd->c_type = *str++;
+X				cmd->c_subtype = '\0';
+X				cmd->c_count = count;
+X				cmd++;
+X				continue;
+X
+X			case 'H':		/* move left large amount */
+X			case 'J':		/* move down large amount */
+X			case 'K':		/* move up large amount */
+X			case 'L':		/* move right large amount */
+X				if (cmd >= &newcmds[CMDS-2]) return(1);
+X				cmd->c_type = *str++ - 'A' + 'a';
+X				cmd->c_subtype = '\0';
+X				cmd->c_count = count;
+X				cmd++;
+X				continue;
+X
+X			default:		/* illegal */
+X				return(1);
+X		}
+X	}
+X	cmd->c_type = 'f';			/* add default fight command */
+X	cmd->c_subtype = 'a';
+X	cmd->c_count = INFINITY;
+X	cmd++;
+X	cmd->c_type = '\0';			/* end command table */
+X	bcopy(newcmds, obj->o_cmds, sizeof(obj->o_cmds));	/* set cmds */
+X	return(0);
+X}
+//E*O*F cmd.c//
+echo x - init.c
+sed -e 's/^X//' > "init.c" << '//E*O*F init.c//'
+X#ifdef SCCS
+Xstatic char *sccsid = "@(#)init.c	1.2	4/5/85";
+Xstatic char *cpyrid = "@(#)Copyright (C) 1985 by D Bell";
+X#endif
+X
+X#include "war.h"
+X
+Xstatic	int	checkcount;		/* counter for board checking */
+Xstatic	int	didescape;		/* did escape */
+Xchar	*ask();				/* routine to ask a question */
+Xint	getaskchar();			/* routine to get chars */
+XFILE	*opensetupfile();		/* open setup files */
+X
+X
+X/*
+X * Get commands from the user to initialize the board.
+X */
+Xuserinit()
+X{
+X	register struct	object	*obj;	/* object being placed */
+X	register int	ch;		/* current character */
+X	register char	*str;		/* answer for user's question */
+X	register int	countone;	/* command count defaulted to one */
+X	register int	countinf;	/* count defaulted to infinity */
+X	int	gotcount;		/* true if read a count */
+X	int	row;			/* row to place it on */
+X	int	col;			/* column to place it on */
+X
+X	row = 0;
+X	col = 0;
+X	obj = NULL;
+X	newstat = 1;
+X	setjmp(ttyjmp);			/* come back here for every command */
+X	if (newstat) viewstats();
+X	dpymove(row, col);
+X	dpyupdate();
+X	countone = 0;
+X	gotcount = 0;
+X	while (1) {			/* read numeric argument if any */
+X		ch = scanchar();
+X		if ((ch < '0') || (ch > '9')) break;
+X		countone = (countone * 10) + ch - '0';
+X		gotcount = 1;
+X	}
+X	if (countone < 0) countone = 0;
+X	if (countone > 100) countone = 100;
+X	countinf = countone;
+X	if (gotcount == 0) {		/* default values if necessary */
+X		countone = 1;
+X		countinf = 100;
+X	}
+X	switch (ch) {
+X		case '\033':		/* ESCAPE - ignore command */
+X			break;
+X		case '\014':		/* ^L - redraw screen */
+X			dpyredraw();
+X			break;
+X		case '\n':		/* move to next line */
+X			row += countone;
+X			if (row > HOMEROW) row = HOMEROW;
+X			col = 0;
+X			break;
+X		case '-':		/* move to previous line */
+X			row -= countone;
+X			if (row < 0) row = 0;
+X			col = 0;
+X			break;
+X		case '\t':		/* move to next tab stop */
+X			while ((col < (COLS-1)) && (++col % 8)) ;
+X			break;
+X		case '^':		/* move to beginning of row */
+X			col = 0;
+X			break;
+X		case '$':		/* move to end of row */
+X			col = (COLS - 1);
+X			break;
+X		case 'h':		/* move left */
+X			col -= countone;
+X			if (col < 0) col = 0;
+X			break;
+X		case 'j':		/* move down */
+X			row += countone;
+X			if (row > HOMEROW) row = HOMEROW;
+X			break;
+X		case 'k':		/* move up */
+X			row -= countone;
+X			if (row < 0) row = 0;
+X			break;
+X		case 'l':		/* move right */
+X		case ' ':
+X			col += countone;
+X			if (col >= COLS) col = COLS - 1;
+X			break;
+X		case 'y':		/* move to upper left */
+X			while (countone-- && (row > 0) && (col > 0)) {
+X				row--;
+X				col--;
+X			}
+X			break;
+X		case 'u':		/* move to upper right */
+X			while (countone-- && (row > 0) && (col < COLS-1)) {
+X				row--;
+X				col++;
+X			}
+X			break;
+X		case 'b':		/* move to lower left */
+X			while (countone-- && (row < HOMEROW) && (col > 0)) {
+X				row++;
+X				col--;
+X			}
+X			break;
+X		case 'n':		/* move to lower right */
+X			while (countone-- && (row<HOMEROW) && (col<COLS-1)) {
+X				row++;
+X				col++;
+X			}
+X			break;
+X		case 'f':		/* flip board left-right */
+X			flipboard();
+X			break;
+X		case 'p':		/* place an object */
+X			obj = findobject(scanchar());
+X			/* proceed into next case */
+X		case '.':		/* place same object */
+X			placeobject(obj, row, col);
+X			break;
+X		case 'x':		/* delete an object */
+X			while (countone--) {
+X				removeobject(row, col);
+X				if (col >= (COLS-1)) break;
+X				col++;
+X			}
+X			break;
+X		case 'H':		/* place lots left */
+X			placeline(obj, &row, &col, 0, -1, countinf);
+X			break;
+X		case 'J':		/* place lots down */
+X			placeline(obj, &row, &col, 1, 0, countinf);
+X			break;
+X		case 'K':		/* place lots up */
+X			placeline(obj, &row, &col, -1, 0, countinf);
+X			break;
+X		case 'L':		/* place lots right */
+X			placeline(obj, &row, &col, 0, 1, countinf);
+X			break;
+X		case 'Y':		/* place lots to upper left */
+X			placeline(obj, &row, &col, -1, -1, countinf);
+X			break;
+X		case 'U':		/* place lots to upper right */
+X			placeline(obj, &row, &col, -1, 1, countinf);
+X			break;
+X		case 'B':		/* place lots to lower left */
+X			placeline(obj, &row, &col, 1, -1, countinf);
+X			break;
+X		case 'N':		/* place lots to lower right */
+X			placeline(obj, &row, &col, 1, 1, countinf);
+X			break;
+X		case 's':		/* start to play */
+X			if (editflag || checksetup()) {
+X				beep();
+X				break;
+X			}
+X			if (yesno("Ready to start playing? ")) return;
+X			break;
+X		case 'q':		/* want to quit */
+X			if (yesno("Want to quit? ")) quit(0);
+X			break;
+X		case 'w':		/* write the setup */
+X			str = ask("Write setup named: ");
+X			if (str == NULL) break;
+X			if (writesetup(setupfile, str)) beep();
+X			break;
+X		case 'r':		/* read a setup */
+X			str = ask("Read setup named: ");
+X			if (str == NULL) break;
+X			if (readsetup(setupfile, str)) beep();
+X			break;
+X		case 'c':		/* clear board */
+X			if (yesno("Want to clear the board? ")) clearboard();
+X			break;
+X		default:
+X			beep();
+X			break;
+X	}
+X	scanabort();			/* go back up for next command */
+X}
+X
+X
+X/*
+X * Ask a question and see if the answer is yes.
+X * Returns nonzero if so.
+X */
+Xyesno(str)
+X	register char	*str;		/* string to ask, and answer */
+X{
+X	str = ask(str);
+X	if (str == NULL) return(0);
+X	return((strcmp(str, "y") == 0) || (strcmp(str, "yes") == 0)
+X		|| (strcmp(str, "Y") == 0) || (strcmp(str, "YES") == 0));
+X}
+X
+X
+X/*
+X * Ask the player a question and get an answer.
+X * Leading and trailing spaces are removed from the answer.
+X * If an escape or a null answer is given, a null pointer is returned.
+X */
+Xchar *
+Xask(str)
+X{
+X	register char	*cp;		/* current character */
+X	static	char	buf[100];	/* buffer */
+X
+X	didescape = 0;
+X	scanreset();
+X	dpywindow(-1, -1, 2, COLS);
+X	cp = buf;
+X	cp += dpyread(str, getaskchar, cp, sizeof(buf));
+X	if (cp < buf) cp = buf;
+X	*cp-- = '\0';
+X	while ((cp >= buf) && ((*cp == ' ') || (*cp == '\t'))) *cp-- = '\0';
+X	for (cp = buf; ((*cp == ' ') || (*cp == '\t')); cp++) ;
+X	dpyhome();
+X	dpyclrwindow();
+X	dpywindow(0, -1, 1, COLS);
+X	if (didescape || (*cp == '\0')) cp = NULL;
+X	return(cp);
+X}
+X
+X
+X/* Routine called by dpyread to get characters */
+Xgetaskchar()
+X{
+X	char	ch;
+X
+X	if ((read(STDIN, &ch, 1) != 1) || (ch == '\033')) {
+X		didescape = 1;
+X		return(-1);
+X	}
+X	if (ch == '\n') return(-1);
+X	return((int)(ch & 0x7f));
+X}
+X
+X
+X/*
+X * Place a run of an object in a certain direction until it is illegal
+X * or until the count runs out.  The new row and column are returned
+X * through pointers.
+X */
+Xplaceline(obj, rowptr, colptr, rowsign, colsign, count)
+X	register struct	object	*obj;	/* object to place */
+X	unsigned int	*rowptr;	/* current row */
+X	unsigned int	*colptr;	/* current column */
+X	register int	rowsign;	/* changes to make in rows */
+X	register int	colsign;	/* changes to make in columns */
+X{
+X	register unsigned int	row;	/* current row */
+X	register unsigned int	col;	/* current column */
+X
+X	row = *rowptr;
+X	col = *colptr;
+X	while (count-- > 0) {
+X		if (placeobject(obj, row, col)) break;
+X		row += rowsign;
+X		col += colsign;
+X		if ((row > HOMEROW) || (col >= COLS)) {
+X			row -= rowsign;
+X			col -= colsign;
+X			break;
+X		}
+X		if (board[row][col].c_obj) break;
+X	}
+X	*rowptr = row;
+X	*colptr = col;
+X}
+X
+X
+X/*
+X * Clear everything from the home area of the board.
+X */
+Xclearboard()
+X{
+X	register struct	cell *cc;	/* current cell */
+X
+X	for (cc = homecell; cc; cc = cc->c_next) {
+X		if (cc->c_obj) removeobject(cc->c_row, cc->c_col);
+X	}
+X}
+X
+X
+X/*
+X * Flip the board left to right during the initialization phase
+X */
+Xflipboard()
+X{
+X	register int	row;		/* current row */
+X	register struct	cell	*lc;	/* left cell */
+X	register struct	cell	*rc;	/* right cell */
+X	register struct	object	*lobj;	/* left object */
+X	register struct	object	*robj;	/* right object */
+X
+X	for (row = 0; row <= HOMEROW; row++) {
+X		lc = &board[row][0];
+X		rc = &board[row][COLS-1];
+X		for (; lc < rc; lc = lc->c_right, rc = rc->c_left) {
+X			lobj = lc->c_obj;
+X			robj = rc->c_obj;
+X			if (lobj == robj) continue;
+X			lc->c_obj = robj;
+X			rc->c_obj = lobj;
+X			if (lobj && (lobj->o_max <= 1)) lobj->o_cell = rc;
+X			if (robj && (robj->o_max <= 1)) robj->o_cell = lc;
+X			if (lobj) dpyplace(lc->c_row, lc->c_col, ' ');
+X			if (robj) dpyplace(rc->c_row, rc->c_col, ' ');
+X			if (lobj) dpyplace(rc->c_row, rc->c_col, lobj->o_ownch);
+X			if (robj) dpyplace(lc->c_row, lc->c_col, robj->o_ownch);
+X		}
+X	}
+X}
+X
+X
+X/*
+X * Check the setup to make sure we are using all the men we are supposed to.
+X * Returns nonzero if some men are missing.
+X */
+Xchecksetup()
+X{
+X	register struct	object	*obj;	/* current object */
+X
+X	for (obj = objects; obj < endobjects; obj++) {
+X		if (obj->o_side != myside) continue;
+X		if (obj->o_count < obj->o_min) return(1);
+X	}
+X	return(0);
+X}
+X
+X
+X/*
+X * Determine if an object just placed on the board leaves a legal layout.
+X * This means that each board location is reachable by some path which does
+X * not need to cross objects which can be multiply-placed (such as walls).
+X * Returns nonzero if the layout is illegal.
+X */
+Xcheckboard(nc)
+X	register struct	cell *nc;	/* new cell just placed */
+X{
+X	register struct	cell *cc;	/* current cell */
+X	register struct	cell *rc;	/* beginning of row cell */
+X	register struct	cell **ptr;	/* pointer to adjacent cells */
+X
+X	if ((nc == NULL) || (nc->c_obj == NULL)) panic("checkboard");
+X	if (((nc->c_obj->o_flags&F_WALL) == 0) || (nc->c_obj->o_side != myside))
+X		return(0);
+X	/*
+X	 * See if the placing of the object is trivially known to be legal.
+X	 * This is true if nothing surrounds the object, or if a single
+X	 * object lies next to it which isn't surrounded.  We must search
+X	 * in all eight directions for this check.
+X	 */
+X	cc = NULL;
+X	for (ptr = nc->c_dirs; ptr < &nc->c_dirs[8]; ptr++) {
+X		rc = *ptr;
+X		if ((rc->c_obj == NULL) || ((rc->c_obj->o_flags & F_WALL) == 0))
+X			continue;
+X		if (cc) goto hard;
+X		cc = rc;
+X	}
+X	if (cc == NULL) return(0);
+X	for (ptr = cc->c_dirs; ptr < &cc->c_dirs[8]; ptr++) {
+X		rc = *ptr;
+X		if ((rc->c_obj == NULL) || ((rc->c_obj->o_flags & F_WALL) == 0))
+X			return(0);
+X	}
+X	/*
+X	 * At least two other objects lie next to the new one.
+X	 * We must do the brute force check now.
+X	 */
+Xhard:	rc = &board[HOMEROW+1][0];
+X	rc->c_checkcount = ++checkcount;
+X	checkboardloop(rc);
+X	for (rc = homecell; rc; rc = rc->c_next)
+X		if (rc->c_checkcount != checkcount) return(1);
+X	return(0);
+X}
+X
+X
+X/*
+X * Recursive subroutine used for marking accessible locations on the board.
+X * Call ourself for each new cell in the four orthagonal directions from
+X * the given cell.
+X */
+Xcheckboardloop(cc)
+X	register struct	cell	*cc;	/* current cell to check */
+X{
+X	register struct	cell	*tc;	/* temporary cell */
+X	register struct	cell	**ptr;	/* cell pointer */
+X	register int	count;		/* count of cells to check */
+X	struct	cell	*celltab[4];	/* table of cells to check */
+X
+X	while (1) {
+X		count = 0;
+X		for (ptr = cc->c_dirs; ptr < &cc->c_dirs[4]; ptr++) {
+X			tc = *ptr;
+X			if (tc->c_obj == &edgeobj) continue;
+X			if (tc->c_row > (HOMEROW + 1)) continue;
+X			if (tc->c_checkcount == checkcount) continue;
+X			tc->c_checkcount = checkcount;
+X			if (tc->c_obj && (tc->c_obj->o_flags & F_WALL))
+X				continue;
+X			celltab[count++] = tc;
+X		}
+X		if (count != 1) break;
+X		cc = celltab[0];	/* only one, no recursion needed */
+X	}
+X	while (count > 0) checkboardloop(celltab[--count]);
+X}
+X
+X
+X/*
+X * Initialize the cells of the board
+X */
+Xboardinit()
+X{
+X	register struct	cell *cc;	/* current cell */
+X	register int	row;		/* current row */
+X	register int	col;		/* current column */
+X	register int	ch;		/* character */
+X
+X	cc = &edge;
+X	cc->c_row = -1;
+X	cc->c_col = -1;
+X	cc->c_up = cc;
+X	cc->c_down = cc;
+X	cc->c_left = cc;
+X	cc->c_right = cc;
+X	cc->c_ul = cc;
+X	cc->c_ur = cc;
+X	cc->c_ll = cc;
+X	cc->c_lr = cc;
+X	cc->c_obj = &edgeobj;
+X	edgeobj.o_ownch = '*';
+X	edgeobj.o_altch = '*';
+X	edgeobj.o_side = -1;
+X	edgeobj.o_flags = (F_WALL|F_EDGE);
+X	for (row = 0; row < ROWS; row++) {
+X		for (col = 0; col < COLS; col++) {
+X			cc = &board[row][col];
+X			cc->c_row = row;
+X			cc->c_col = col;
+X			cc->c_up = &board[row-1][col];
+X			cc->c_down = &board[row+1][col];
+X			cc->c_left = &board[row][col-1];
+X			cc->c_right = &board[row][col+1];
+X			cc->c_ul = &board[row-1][col-1];
+X			cc->c_ur = &board[row-1][col+1];
+X			cc->c_ll = &board[row+1][col-1];
+X			cc->c_lr = &board[row+1][col+1];
+X			cc->c_next = cc->c_left;
+X			cc->c_obj = NULL;
+X		}
+X		cc = &board[row][0];
+X		cc->c_left = &edge;
+X		cc->c_ul = &edge;
+X		cc->c_ll = &edge;
+X		cc->c_next = &board[row-1][COLS-1];
+X		cc = &board[row][COLS-1];
+X		cc->c_right = &edge;
+X		cc->c_ur = &edge;
+X		cc->c_lr = &edge;
+X	}
+X	for (col = 0; col < COLS; col++) {
+X		cc = &board[0][col];
+X		cc->c_up = &edge;
+X		cc->c_ul = &edge;
+X		cc->c_ur = &edge;
+X		cc = &board[ROWS-1][col];
+X		cc->c_down = &edge;
+X		cc->c_ll = &edge;
+X		cc->c_lr = &edge;
+X	}
+X	board[0][0].c_next = NULL;
+X	firstcell = &board[ROWS-1][COLS-1];
+X	homecell = &board[HOMEROW][COLS-1];
+X	/*
+X	 * Initialize the looks of the board
+X	 */
+X	for (row = 0; row < ROWS; row++) {
+X		ch = '|';
+X		if ((row == HOMEROW) || (row == (ROWS - HOMEROW - 1))) ch = '+';
+X		dpychar(ch);
+X		for (col = 0; col < COLS; col++) dpychar(' ');
+X		dpychar(ch);
+X		dpychar('\n');
+X	}
+X	dpywindow(0, -1, 1, COLS);
+X}
+X
+X
+X/*
+X * Clear the board and read in a setup from a board file.
+X * If a null board name is specified, a default one in the user's home
+X * directory is used.  Returns nonzero if the file cannot be found.
+X */
+Xreadsetup(setupfile, setupname)
+X	char	*setupfile;		/* filename for board setups */
+X	register char	*setupname;	/* name of setup */
+X{
+X	register char	*cp;		/* current character */
+X	register int	row;		/* current row */
+X	register int	col;		/* current column */
+X	register FILE	*fd;		/* file handle */
+X	char	buf[200];		/* line of the file */
+X
+X	if (setupname == NULL) return(0);
+X	/*
+X	 * Open file and search for setup name
+X	 */
+X	fd = opensetupfile(setupfile, "r");
+X	if (fd == NULL) return(1);
+X	do {
+X		cp = buf;
+X		if (fgets(cp, sizeof(buf), fd) == NULL) {
+X			fclose(fd);
+X			return(1);
+X		}
+X		if (*cp++ != '"') continue;
+X		while (*cp && (*cp != '"') && (*cp != '\n')) cp++;
+X		*cp = '\0';
+X	} while (strcmp(setupname, &buf[1]));
+X	/*
+X	 * Found the setup, clear the board and read it in
+X	 */
+X	clearboard();
+X	for (row = 0; row <= HOMEROW; row++) {
+X		cp = buf;
+X		if (fgets(cp, sizeof(buf), fd) == NULL) break;
+X		if (*cp == '"') break;
+X		for (col = 0; (col < COLS) && *cp; col++, cp++) {
+X			if (*cp == '\n') break;
+X			if (*cp == '\t') col |= 7;
+X			if ((*cp <= ' ') || (*cp == 0177)) continue;
+X			placeobject(findobject(*cp), row, col);
+X		}
+X	}
+X	fclose(fd);
+X	return(0);
+X}
+X
+X
+X/*
+X * Append the current setup to the specified file.
+X * Existing setups by the same name are not removed (which is a bug).
+X * This is to make the algorithm easy.
+X */
+Xwritesetup(setupfile, setupname)
+X	char	*setupfile;		/* filename for board setups */
+X	char	*setupname;		/* name of setup */
+X{
+X	register struct	cell	*rc;	/* cell at front of row */
+X	register struct	cell	*cc;	/* current cell in row */
+X	register char	*cp;		/* current character */
+X	register FILE	*fd;		/* file handle */
+X	int	error;			/* error flag */
+X	char	buf[COLS+2];		/* data to write */
+X
+X	if (setupname == NULL) return(1);
+X	fd = opensetupfile(setupfile, "a");
+X	if (fd == NULL) return(1);
+X	fprintf(fd, "\"%s\"\n", setupname);
+X	for (rc = &board[0][0]; rc->c_row <= HOMEROW; rc = rc->c_down) {
+X		for (cc = rc, cp = buf; cc != &edge; cc = cc->c_right) {
+X			*cp++ = cc->c_obj ? cc->c_obj->o_ownch : ' ';
+X		}
+X		cp = &buf[COLS-1];
+X		while ((cp >= buf) && (*cp == ' ')) cp--;
+X		*++cp = '\n';
+X		*++cp = '\0';
+X		fputs(buf, fd);
+X	}
+X	error = ferror(fd);
+X	fclose(fd);
+X	return(error);
+X}
+X
+X
+X/*
+X * Open the given setup file name, defaulting it if necessary.
+X * Returns a stdio FILE pointer if successfull, or NULL on an error.
+X */
+XFILE *
+Xopensetupfile(name, mode)
+X	register char	*name;		/* file name, or NULL for default */
+X	char	*mode;			/* mode to open file in */
+X{
+X	char	buf[200];		/* buffer for default name */
+X
+X	if ((name == NULL) || (*name == '\0')) {
+X		name = (char *) getenv("HOME");
+X		if (name == NULL) return(NULL);
+X		sprintf(buf, "%s/%s", name, SETUPFILE);
+X		name = buf;
+X	}
+X	return(fopen(name, mode));
+X}
+X
+X
+X/*
+X * Read in the parameters for the objects from the specified file.
+X * If a null name is given, the default file is used.
+X * Doesn't return if an error is encountered.
+X */
+Xreadobjects(name)
+X	register char	*name;		/* filename for objects */
+X{
+X	register FILE	*fd;		/* file variable */
+X	register struct	object	*obj;	/* current object */
+X	register int	line;		/* line number */
+X	register int	err;		/* error occurred */
+X	register int	count;		/* token count */
+X	char	flags[21];		/* flag characters */
+X	char	seen[3];		/* characters seen as */
+X	char	eol[2];			/* end of line character */
+X	int	life;			/* life of the object */
+X	int	view;			/* viewing range of the object */
+X	int	min;			/* minimum number of objects */
+X	int	max;			/* maximum number of objects */
+X	char	buf[200];		/* data buffer */
+X	char	altname[200];		/* alternate name */
+X
+X	if ((name == NULL) || (*name == '\0')) name = OBJECTFILE;
+X	fd = fopen(name, "r");
+X	if (fd == NULL) {
+X		if (index(name, '/') == 0) {
+X			sprintf(altname, "%s/%s", LIBDIR, name);
+X			name = altname;
+X			fd = fopen(name, "r");
+X		}
+X		if (fd == NULL) {
+X			perror(name);
+X			quit(1);
+X		}
+X	}
+X	for (endobjects = objects, err = 0, line = 1; ; line++) {
+X		fgets(buf, sizeof(buf), fd);
+X		if (feof(fd) || ferror(fd)) break;
+X		if (buf[0] == '#') continue;		/* comment line */
+X		eol[0] = '#';
+X		count = sscanf(buf, "%20s%2s%d%d%d%d%1s\n",
+X			flags, seen, &life, &view, &min, &max, eol);
+X		if ((count < 6) || (seen[0] < ' ') || (seen[0] == 0177)
+X			|| (view < 0) || (min < 0) || (max < min)
+X			|| (eol[0] != '#')) {
+X				fprintf(stderr, "%s, line %d: bad object\n",
+X					name, line);
+X				err = 1;
+X				continue;
+X		}
+X		if (endobjects >= &objects[OBJS-1]) {
+X			fprintf(stderr, "%s: Too many objects\n", name);
+X			quit(1);
+X		}
+X		obj = endobjects++;		/* allocate object */
+X		obj->o_side = 0;
+X		obj->o_id = (line * 2);
+X		obj->o_ownch = seen[0];
+X		obj->o_altch = seen[1];
+X		if ((obj->o_altch < ' ') || (obj->o_altch == 0177))
+X			obj->o_altch = ' ';
+X		obj->o_view = view;
+X		obj->o_life = life;
+X		obj->o_min = min;
+X		obj->o_max = max;
+X		obj->o_count = 0;
+X		obj->o_cell = NULL;
+X		if (setflags(obj, flags)) {
+X			fprintf(stderr, "%s, line %d: bad flag bits\n",
+X				name, line);
+X			err = 1;
+X		}
+X		setcmds(obj, "");		/* set to fight */
+X		if ((obj->o_life == 0) && (obj->o_flags & F_GOAL))
+X			obj->o_life = 1;
+X		if (obj->o_max > 1) {
+X			obj->o_flags |= F_IMMOB;
+X			obj->o_flags &= ~(F_FIGHT|F_BLAST);
+X		}
+X		*endobjects = *obj;		/* duplicate for other side */
+X		endobjects->o_side = 1;
+X		endobjects->o_id++;
+X		endobjects++;
+X	}
+X	if (err) quit(1);
+X	if (ferror(fd)) {
+X		perror(name);
+X		quit(1);
+X	}
+X	fclose(fd);
+X	myside = 1;
+X}
+X
+X
+X/*
+X * Parse the flag string for an object and set the appropriate flags.
+X * Returns nonzero if they were illegal.
+X */
+Xsetflags(obj, str)
+X	register struct	object	*obj;	/* object to set flags for */
+X	register char	*str;		/* string */
+X{
+X	register int	flags;		/* flag bits */
+X
+X	flags = 0;
+X	while (*str) switch (*str++) {
+X		case 'b':	flags |= F_BLAST; break;
+X		case 'f':	flags |= F_FIGHT; break;
+X		case 'g':	flags |= F_GOAL; break;
+X		case 'i':	flags |= F_IMMOB; break;
+X		case 't':	flags |= F_TRANS; break;
+X		case 'v':	flags |= F_VIS; break;
+X		case 'w':	flags |= (F_WALL|F_IMMOB); break;
+X		case 'x':	flags |= F_XRAY; break;
+X		case '-':	break;
+X		default:	return(1);
+X	}
+X	obj->o_flags = flags;
+X	return(0);
+X}
+//E*O*F init.c//
+echo x - main.c
+sed -e 's/^X//' > "main.c" << '//E*O*F main.c//'
+Xstatic char *sccsid = "@(#)main.c	1.2	4/5/85";
+Xstatic char *cpyrid = "@(#)Copyright (C) 1985 by D Bell";
+X
+X/*
+X * Two player war game played in mazes (by David I. Bell).
+X * These war game sources are in the public domain, and can be copied
+X * or used as desired, with the following restrictions:
+X * 1.	All copyright notices (and this notice) must be preserved.
+X * 2.	The war game sources (even if modified) cannot be sold for profit.
+X * 3.	If any sources are modified, a sentence must exist by the
+X *	copyright notice of each modified source file which says that
+X *	the file has been modified.
+X */
+X
+X#include "war.h"
+X
+Xint	sigint();		/* interrupt signal catcher */
+X
+Xmain(argc, argv)
+X	register int	argc;		/* argument count */
+X	register char	**argv;		/* argument name */
+X{
+X	register char	*errstr;	/* reason for option error */
+X
+X	while (argc-- > 1) {
+X		argv++;
+X		if (**argv != '-') {		/* not option, must be name */
+X			if (enemyname) usage();
+X			enemyname = *argv;
+X			if ((argc > 1) && (argv[1][0] != '-')) {
+X				enemytty = *++argv;
+X				argc--;
+X			}
+X			continue;
+X		}
+X		errstr = NULL;
+X		switch (argv[0][1]) {
+X		case 'e':			/* just editing */
+X			editflag = 1;
+X			break;
+X		case 'f':			/* setup file */
+X			errstr = "setup file";
+X			setupfile = *++argv;
+X			argc--;
+X			break;
+X		case 'o':			/* object file */
+X			errstr = "object file";
+X			objectfile = *++argv;
+X			argc--;
+X			break;
+X		case 's':			/* setup name */
+X			errstr = "setup";
+X			setupname = *++argv;
+X			argc--;
+X			break;
+X		default:			/* errors */
+X			usage();
+X		}
+X		if (errstr && ((*argv == NULL) || (**argv == '-'))) {
+X			fprintf(stderr, "missing %s name\n", errstr);
+X			exit(1);
+X		}
+X	}
+X	if ((enemyname == NULL) && (editflag == 0)) usage();
+X	if (editflag == 0) findplayer(enemyname, enemytty);
+X	signal(SIGINT, sigint);
+X	if (dpyinit(NULL, NULL)) exit(1);
+X	scaninit(ttychar, ttyjmp);
+X	boardinit();				/* build the board */
+X	if (readobjects(objectfile)) {		/* read in objects */
+X		fprintf(stderr, "bad object file\n");
+X		exit(1);
+X	}
+X	if (readsetup(setupfile, setupname)) {	/* read in setup */
+X		fprintf(stderr, "cannot get setup\n");
+X		exit(1);
+X	}
+X	userinit();
+X	dpymove(0, 0);
+X	talkinit();				/* set up talking with enemy */
+X	while (1) {
+X		readinfo();			/* get enemy's changes */
+X		view();				/* show current board */
+X		sleep(1);			/* wait a bit */
+X		docommands();			/* read and execute commands */
+X	}
+X}
+X
+X
+X/*
+X * Tell how to run the game and exit
+X */
+Xusage()
+X{
+X	fprintf(stderr, "\
+Xusage:  war [-f setupfile] [-s setupname] [-o objectfile] username [ttyname]\n\
+X   or:  war -e [-f setupfile] [-s setupname] [-o objectfile]\n");
+X	exit(1);
+X}
+X
+X
+X/*
+X * Find the object of ours with the given character.
+X * Lower case letters are converted to upper case if reasonable.
+X * Returns NULL if the object cannot be found.
+X */
+Xstruct object *
+Xfindobject(ch)
+X{
+X	register struct	object	*obj;		/* current object */
+X
+X	for (obj = objects; obj < endobjects; obj++) {
+X		if ((obj->o_ownch == ch) && (obj->o_side == myside)
+X			&& ((playing == 0) || obj->o_count))
+X				return(obj);
+X	}
+X	if ((ch >= 'a') && (ch <= 'z'))		/* try upper case */
+X		return(findobject(ch - 'a' + 'A'));
+X	return(NULL);
+X}
+X
+X
+X/*
+X * Find the object which has the given id.
+X * Fails if the object could not be found.
+X */
+Xstruct object *
+Xfindid(id)
+X{
+X	register struct	object	*obj;	/* found object */
+X
+X	for (obj = objects; obj < endobjects; obj++) {
+X		if (obj->o_id == id)
+X			return(obj);
+X	}
+X	panic("unknown object");
+X}
+X
+X
+X/*
+X * Place an object at a particular location.  If the object is incapable
+X * of being multiply placed, it is removed from its old location.
+X * If another object is currently at this location, it is removed.
+X * If the object can be multiply placed then a check is made to insure
+X * that all multiply paced objects can be reached from the common area.
+X * Returns nonzero if placement cannot be done.
+X * The screen database is also updated.
+X */
+Xplaceobject(obj, row, col)
+X	register struct	object	*obj;	/* object to place */
+X	unsigned int	row;		/* row to place object at */
+X	unsigned int	col;		/* column to place object at */
+X{
+X	register struct	cell	*cc;	/* cell location */
+X	register struct	object	*oldobj;/* old object at this location */
+X
+X	if (obj == NULL) return(0);
+X	if ((row >= ROWS) || (col >= COLS)) panic("placeloc");
+X	/*
+X	 * Remove any object already at this location
+X	 */
+X	oldobj = board[row][col].c_obj;
+X	if (oldobj) {
+X		if (oldobj == obj) return(0);	/* already here */
+X		removeobject(row, col);
+X	}
+X	/*
+X	 * If we are elsewhere on the board, remove us from there
+X	 */
+X	cc = obj->o_cell;
+X	if (cc) {
+X		if (cc->c_obj != obj) panic("badcell");
+X		removeobject(cc->c_row, cc->c_col);
+X	}
+X	/*
+X	 * Put object at the current location
+X	 */
+X	cc = &board[row][col];
+X	cc->c_obj = obj;
+X	cc->c_seen = ((obj->o_side == myside) || (obj->o_flags & F_VIS));
+X	if (obj->o_max <= 1) obj->o_cell = cc;
+X	if (cc->c_seen) dpyplace(row, col, objectchar(obj));
+X	obj->o_count++;
+X	adjustdata(obj, 1);
+X	/*
+X	 * Verify that this placement is legal
+X	 */
+X	if (obj->o_side != myside) return(0);
+X	if ((obj->o_count > obj->o_max) || checkboard(cc)) {
+X		removeobject(row, col);
+X		placeobject(oldobj, row, col);
+X		return(1);
+X	}
+X	return(0);
+X}
+X
+X
+X/*
+X * Remove an object from the board at a given coordinate.
+X * The screen database is also updated.
+X */
+Xremoveobject(row, col)
+X	unsigned int	row;		/* row to remove object from */
+X	unsigned int	col;		/* column to remove object from */
+X{
+X	register struct	cell	*cc;	/* cell location */
+X	register struct	object	*obj;	/* object to remove */
+X
+X	if ((row >= ROWS) || (col >= COLS)) panic("removeloc");
+X	cc = &board[row][col];
+X	obj = cc->c_obj;
+X	if (obj == NULL) return;
+X	adjustdata(obj, -1);
+X	obj->o_count--;
+X	obj->o_cell = NULL;
+X	cc->c_obj = NULL;
+X	dpyplace(row, col, ' ');
+X}
+X
+X
+X/*
+X * Adjust the data counts as necessary when an object is added or removed.
+X * Delta is 1 if the object is being added, and -1 if the object is
+X * being removed.
+X */
+Xadjustdata(obj, delta)
+X	register struct	object	*obj;	/* object being added/removed */
+X	register int	delta;		/* change to be made */
+X{
+X	register struct	data	*dp;	/* pointer to appropriate data */
+X	register int	flags;		/* flag bits */
+X	register int	deltalife;	/* total life change for object */
+X
+X	dp = &hisdata;
+X	if (obj->o_side == myside) dp = &mydata;
+X	flags = obj->o_flags;
+X	deltalife = (obj->o_life * delta);
+X	if ((flags & F_IMMOB) == 0) {		/* movable men */
+X		dp->d_movemen += delta;
+X		dp->d_movelife += deltalife;
+X	}
+X	if (flags & F_FIGHT) {			/* fighting men */
+X		dp->d_fightmen += delta;
+X		dp->d_fightlife += deltalife;
+X	}
+X	if (flags & F_BLAST) {			/* blasting men */
+X		dp->d_blastmen += delta;
+X		dp->d_blastlife += deltalife;
+X	}
+X	if (flags & F_GOAL) {			/* goals */
+X		dp->d_goalmen += delta;
+X		dp->d_goallife += deltalife;
+X	}
+X	if ((flags & F_WALL) == 0) {		/* total men */
+X		dp->d_totalmen += delta;
+X		dp->d_totallife += deltalife;
+X	}
+X	if (flags & F_WALL) {			/* walls */
+X		dp->d_totalwalls += delta;
+X	}
+X	newstat = 1;
+X}
+X
+X
+X/*
+X * Pick one of a specified set of directions from a cell.
+X * Each applicable direction is tested using a supplied routine.
+X * The routine returns nonzero if the cell in a direction is acceptable.
+X * Returns the cell in the picked direction.
+X */
+Xstruct cell *
+Xpickdir(cc, dir, routine)
+X	register struct	cell	*cc;	/* cell to move from */
+X	int	dir;			/* direction to pick */
+X	int	(*routine)();		/* routine to decide */
+X{
+X	register struct	cell	*tc;	/* test cell */
+X	register int	count;		/* number of enemies */
+X	register int	i;		/* index */
+X	struct	cell	*table[4];	/* possible directions */
+X
+X	switch (dir) {
+X		case 'h':	tc = cc->c_left; break;
+X		case 'j':	tc = cc->c_down; break;
+X		case 'k':	tc = cc->c_up; break;
+X		case 'l':	tc = cc->c_right; break;
+X		case 'a':	tc = NULL; break;
+X		default:	return(NULL);
+X	}
+X	if (tc) {				/* try specified direction */
+X		if (routine(tc) == 0) tc = NULL;
+X		return(tc);
+X	}
+X	for (count = 0, i = 0; i < 4; i++) {	/* search all directions */
+X		tc = cc->c_dirs[i];
+X		if (routine(tc)) table[count++] = tc;
+X	}
+X	if (count == 0) return(NULL);
+X	if (count > 1) count = (random() % count) + 1;
+X	return(table[count - 1]);
+X}
+X
+X
+X/*
+X * Remove one hit point from an object at a given location.
+X * If it goes to zero, kill the object.
+X */
+Xhitobject(row, col)
+X{
+X	register struct	object	*obj;
+X
+X	obj = board[row][col].c_obj;
+X	if (obj == NULL) return;
+X	adjustdata(obj, -1);
+X	obj->o_life--;
+X	adjustdata(obj, 1);
+X	if (obj->o_life <= 0) removeobject(row, col);
+X	newstat = 1;
+X}
+X
+X
+X/*
+X * Write a single bell to warn the user of an error
+X */
+Xbeep()
+X{
+X	write(STDERR, "\7", 1);
+X}
+X
+X
+X/*
+X * Fatal error routine
+X */
+Xpanic(str)
+X	char	*str;
+X{
+X	dpyclose();
+X	fprintf(stderr, "Fatal error: %s\n", str);
+X	exit(1);
+X}
+X
+X
+X/*
+X * Reset the terminal modes and exit
+X */
+Xquit(status)
+X{
+X	dpyclose();
+X	exit(status);
+X}
+X
+X
+X/*
+X * Here on an interrupt to quit.
+X */
+Xsigint()
+X{
+X	dpyclose();
+X	exit(0);
+X}
+//E*O*F main.c//
+echo x - scan.c
+sed -e 's/^X//' > "scan.c" << '//E*O*F scan.c//'
+X#ifdef SCCS
+Xstatic char *sccsid = "@(#)scan.c	1.1	4/5/85";
+Xstatic char *cpyrid = "@(#)Copyright (C) 1985 by D Bell";
+X#endif
+X
+X/* Module to read self-terminating input while allowing editing of the input */
+X
+X#include "war.h"
+X
+Xjmp_buf	*scanjumpbuf;			/* jump buffer to use in scanchar */
+Xchar	scanbuffer[SCAN_SIZE+1];	/* storage for characters */
+Xchar	*scanreadptr;			/* current read pointer */
+Xchar	*scanwriteptr;			/* current write pointer */
+Xchar	(*scanroutine)();		/* routine to read characters */
+Xstatic	char	rubchar;		/* erase letter character */
+Xstatic	char	rubword;		/* erase word character */
+Xstatic	char	rubline;		/* erase line character */
+Xstatic	char	litchar;		/* literal input */
+X
+X
+X/*
+X * Initialize for later calls to scanchar.
+X */
+Xscaninit(routine, jumpbuf)
+X	char	(*routine)();		/* routine to get characters */
+X	jmp_buf	*jumpbuf;		/* jump buffer to use later */
+X{
+X	struct	sgttyb	sgbuf;		/* basic tty structure */
+X	struct	ltchars	ltbuf;		/* local tty structure */
+X
+X	scanroutine = routine;		/* init static variables */
+X	scanjumpbuf = jumpbuf;
+X	scanwriteptr = scanbuffer;
+X	scanreadptr = scanbuffer;
+X	sgbuf.sg_erase = CERASE;	/* set defaults in case ioctls fail */
+X	sgbuf.sg_kill = CKILL;
+X	ltbuf.t_werasc = CWERASE;
+X	ltbuf.t_lnextc = CLNEXT;
+X	ioctl(STDIN, TIOCGETP, &sgbuf);	/* get and save editing characters */
+X	ioctl(STDIN, TIOCGLTC, &ltbuf);
+X	rubchar = sgbuf.sg_erase;
+X	rubline = sgbuf.sg_kill;
+X	rubword = ltbuf.t_werasc;
+X	litchar = ltbuf.t_lnextc;
+X}
+X
+X
+X/*
+X * Read the next input character.  If it is an editing character,
+X * abort the current context and longjmp back to the last setjmp.
+X * NOTE: for proper results, the caller should not alter the global
+X * state until the full command has been read in.  This includes such
+X * things as prompting for input or saving values.  Otherwise, improper
+X * results will occur if the user edits the command.
+X */
+Xscanchar()
+X{
+X	register int	ch;			/* current character */
+X
+Xloop:	if (scanreadptr < scanwriteptr)		/* get saved char if have any */
+X		return(*scanreadptr++);
+X	ch = scanroutine() & 0x7f;		/* get new character */
+X	if (ch == litchar) {			/* literal input */
+X		ch = scanroutine() & 0x7f;
+X		goto store;
+X	}
+X	if (ch == rubchar) {			/* character erase */
+X		if (scanwriteptr <= scanbuffer) {
+X			write(STDERR, "\007", 1);
+X			goto loop;
+X		}
+X		scanwriteptr--;
+X		scanreadptr = scanbuffer;
+X		longjmp(scanjumpbuf, SCAN_EDIT);
+X	}
+X	if (ch == rubword) {			/* word erase */
+X		if (scanwriteptr <= scanbuffer) goto loop;
+X		while ((--scanwriteptr >= scanbuffer) &&
+X			((*scanwriteptr == ' ') || (*scanwriteptr == '\t'))) ;
+X		scanwriteptr++;
+X		while ((--scanwriteptr >= scanbuffer) &&
+X			((*scanwriteptr != ' ') && (*scanwriteptr != '\t'))) ;
+X		scanwriteptr++;
+X		scanreadptr = scanbuffer;
+X		longjmp(scanjumpbuf, SCAN_EDIT);
+X	}
+X	if (ch == rubline) {			/* line erase */
+X		if (scanwriteptr <= scanbuffer) goto loop;
+X		scanwriteptr = scanbuffer;
+X		scanreadptr = scanbuffer;
+X		longjmp(scanjumpbuf, SCAN_EDIT);
+X	}
+X
+Xstore:	if (scanwriteptr >= scanbuffer + SCAN_SIZE) {
+X		write(STDERR, "\007", 1);
+X		goto loop;
+X	}
+X	*scanwriteptr++ = ch;
+X	return(*scanreadptr++);
+X}
+X
+X
+X/* Abort reading of the current command */
+Xscanabort()
+X{
+X	scanreadptr = scanbuffer;
+X	scanwriteptr = scanbuffer;
+X	longjmp(scanjumpbuf, SCAN_ABORT);
+X}
+X
+X
+X/* Indicate no more characters ready yet */
+Xscaneof()
+X{
+X	scanreadptr = scanbuffer;
+X	longjmp(scanjumpbuf, SCAN_EOF);
+X}
+X
+X
+X/* Simply reset input and output pointers without longjmping */
+Xscanreset()
+X{
+X	scanreadptr = scanbuffer;
+X	scanwriteptr = scanbuffer;
+X}
+//E*O*F scan.c//
+echo x - talk.c
+sed -e 's/^X//' > "talk.c" << '//E*O*F talk.c//'
+X#ifdef SCCS
+Xstatic char *sccsid = "@(#)talk.c	1.1	4/5/85";
+Xstatic char *cpyrid = "@(#)Copyright (C) 1985 by D Bell";
+X#endif
+X
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include <sys/socket.h>
+X#include <utmp.h>
+X#include "war.h"
+X
+X#define	NAMELEN	(sizeof(ud.ut_name))		/* length of name field */
+X#define	LINELEN	(sizeof(ud.ut_line))		/* length of line field */
+X#define	DEVLEN	(sizeof(dev) - 1)		/* length of device string */
+X#define	FULLEN	(LINELEN + DEVLEN + 1)		/* length of full tty name */
+X#define	INFO	20				/* number of messages */
+X
+Xchar	utmp[] = "/etc/utmp";	/* logged in user file */
+Xchar	dev[] = "/dev/";	/* prefix for tty names */
+Xint	sd;			/* descriptor for socket */
+Xint	serverflag;		/* nonzero if we are the server */
+Xstruct	sockaddr addr;		/* name of our socket */
+Xint	infocount;		/* number of queued messages */
+Xstruct	info	info[INFO];	/* messages queued for sending */
+X
+X
+X/*
+X * Set the socket address used for connecting to the other player.
+X * We find the other player by his user name (and his tty name if necessary).
+X * The address is generated using the device numbers of our two terminals.
+X * Exits if an error is detected.  If successful, saves the socket address
+X * and remembers whether we are to be the server or the client.
+X */
+Xfindplayer(user, tty)
+X	register char	*user;		/* other player's user name */
+X	register char	*tty;		/* other player's tty name, or NULL */
+X{
+X	register FILE	*fd;		/* file pointer */
+X	register char	*shortname;	/* short tty name */
+X	register int	count;		/* times user is logged in */
+X	int	sawme;			/* true if saw myself */
+X	int	dev1;			/* device of first tty */
+X	int	dev2;			/* device of second tty */
+X	struct	stat	sb;		/* file status */
+X	struct	utmp	ud;		/* utmp entry */
+X	char	fullname[FULLEN];	/* full tty name */
+X
+X	if (fstat(STDERR, &sb)) {	/* we aren't on a tty */
+X		perror("stderr");
+X		exit(1);
+X	}
+X	if ((sb.st_mode & S_IFMT) != S_IFCHR) {
+X		fprintf(stderr, "stderr: not a character device\n");
+X		exit(1);
+X	}
+X	dev1 = sb.st_rdev;
+X	fd = fopen(utmp, "r");
+X	if (fd == NULL) {
+X		perror(utmp);
+X		exit(1);
+X	}
+X	strcpy(fullname, dev);
+X	shortname = &fullname[DEVLEN];
+X	shortname[LINELEN] = '\0';
+X	count = 0;
+X	sawme = 0;
+X	while (fread(&ud, sizeof(ud), 1, fd)) {
+X		if (ud.ut_name[0] == '\0') continue;
+X		if (strncmp(user, ud.ut_name, NAMELEN)) continue;
+X		strncpy(shortname, ud.ut_line, LINELEN);
+X		if (stat(fullname, &sb) < 0) continue;
+X		if ((sb.st_mode & S_IFMT) != S_IFCHR) continue;
+X		if (sb.st_rdev == dev1) {	/* see if this is myself */
+X			sawme = 1;
+X			continue;
+X		}
+X		dev2 = sb.st_rdev;
+X		count++;
+X		if ((tty == NULL) || strcmp(tty, shortname)) continue;
+X		count = 1;			/* found user on tty */
+X		break;
+X	}
+X	fclose(fd);
+X	if (count <= 0) {
+X		if (sawme)
+X			fprintf(stderr, "you are not logged in elsewhere\n");
+X		else
+X			fprintf(stderr, "%s is not logged in\n", user);
+X		exit(1);
+X	}
+X	if (tty && strcmp(tty, shortname)) {
+X		fprintf(stderr, "%s is not logged in on %s\n", user, tty);
+X		exit(1);
+X	}
+X	if (count > 1) {
+X		fprintf(stderr, "%s is logged in more than once\n", user);
+X		exit(1);
+X	}
+X	if (dev1 > dev2) {		/* order the devices */
+X		count = dev1;
+X		dev1 = dev2;
+X		dev2 = count;
+X		serverflag = 1;
+X	}
+X	sprintf(addr.sa_data, "WAR.%d.%d", dev1, dev2);
+X}
+X
+X
+X
+X/*
+X * Initialize to talk to the other player.
+X */
+Xtalkinit()
+X{
+X	if (chdir(GAMEDIR)) {		/* go to right place */
+X		perror(GAMEDIR);
+X		exit(1);
+X	}
+X	dpymove(-1, 1);
+X	dpystr("Waiting for other player...");
+X	dpyhome();
+X	dpyupdate();
+X	if (serverflag) {		/* we are the server */
+X		serverinit();
+X		dpymove(-1, 1);
+X		dpyclrwindow();
+X		sendboard();
+X	} else {			/* we are the client */
+X		clientinit();
+X		dpymove(-1, 1);
+X		dpyclrwindow();
+X		readinfo();
+X		sendboard();
+X	}
+X	beep();
+X	playing = 1;
+X	newstat = 1;
+X}
+X
+X
+X/*
+X * Here if we are the server process, to create the binding.
+X * Wait for a connection from the client.
+X */
+Xserverinit()
+X{
+X	register int	s;		/* socket descriptor */
+X	int	dummylen;		/* dummy length */
+X	struct	sockaddr dummyaddr;	/* name of our socket */
+X
+X	s = socket(AF_UNIX, SOCK_STREAM, PF_UNSPEC);	/* create socket */
+X	if (s < 0) {
+X		perror("socket");
+X		exit(1);
+X	}
+X	unlink(addr.sa_data);			/* remove binding name */
+X	if (bind(s, &addr, sizeof(addr)) < 0) {		/* declare ourself */
+X		perror("bind");
+X		exit(1);
+X	}
+X	if (listen(s, 1) < 0) {			/* allow one connection */
+X		perror("listen");
+X		exit(1);
+X	}
+X	dummylen = sizeof(dummyaddr);
+X	sd = accept(s, &dummyaddr, &dummylen);
+X	if (sd < 0) {
+X		perror("accept");
+X		exit(1);
+X	}
+X	close(s);
+X}
+X
+X
+X/*
+X * Here if we are the client process, to connect to the binded address.
+X * We just continuously try to connect to the address.
+X */
+Xclientinit()
+X{
+X	sd = socket(AF_UNIX, SOCK_STREAM, PF_UNSPEC); /* create socket */
+X	if (sd < 0) {
+X		perror("socket");
+X		exit(1);
+X	}
+X	while (connect(sd, &addr, sizeof(addr)) < 0) {
+X		if ((errno != ECONNREFUSED) && (errno != ENOENT)) {
+X			perror("connect");
+X			exit(1);
+X		}
+X		sleep(1);
+X	}
+X}
+X
+X
+X/*
+X * Send the initial board layout
+X */
+Xsendboard()
+X{
+X	register struct	cell *cc;	/* current cell within row */
+X	register struct	object *obj;	/* object at this location */
+X
+X	for (cc = homecell; cc; cc = cc->c_next) {
+X		obj = cc->c_obj;
+X		if ((obj == NULL) || (obj->o_side != myside)) continue;
+X		sendinfo('p', cc->c_row, cc->c_col, obj->o_id);
+X	}
+X	sendinfo('r', 0, 0, 0);
+X}
+X
+X
+X/*
+X * Send an information message to the other player.
+X * Successive message are buffered up and sent together in one write.
+X * All pending messages are flushed when an 'r' message type is used.
+X */
+Xsendinfo(type, row, col, id)
+X	register int	type;		/* message type */
+X	unsigned int	row;
+X	unsigned int	col;
+X{
+X	register struct	info	*ip;	/* pointer to current info block */
+X
+X	if ((row >= ROWS) || (col >= COLS)) panic("badsend");
+X	ip = &info[infocount++];
+X	ip->i_type = type;
+X	ip->i_row = row;
+X	ip->i_col = col;
+X	ip->i_id = id;
+X	if ((type != 'r') && (infocount < INFO))
+X		return;			/* wait till later */
+X	type = (infocount * sizeof(struct info));
+X	if (write(sd, info, type) != type) {
+X		dpyclose();
+X		fprintf(stderr, "other player quit\n");
+X		exit(0);
+X	}
+X	infocount = 0;
+X}
+X
+X
+X/*
+X * Read and process commands from the other player until we are released
+X * with a ready command.  We transform incoming id's and row numbers.
+X */
+Xreadinfo()
+X{
+X	register int	row;		/* row of interest */
+X	register int	col;		/* column of interest */
+X	register int	id;		/* id of object */
+X	register struct	cell *cc;	/* current cell */
+X	register struct	object *obj;	/* current object */
+X	struct	info	info;		/* command being read */
+X
+X	while (1) {
+X		id = read(sd, &info, sizeof(info));
+X		if (id <= 0) {
+X			dpyclose();
+X			fprintf(stderr, "other player quit\n");
+X			exit(0);
+X		}
+X		if (id != sizeof(info)) panic("short read from socket");
+X		id = info.i_id ^ 1;		/* toggle id */
+X		row = (ROWS - 1) - info.i_row;	/* and row number */
+X		col = info.i_col;
+X		if ((row >= ROWS) || (col >= COLS)) panic("bad coordinates");
+X		cc = &board[row][col];
+X		obj = cc->c_obj;
+X
+X		switch (info.i_type) {
+X
+X		case 'b':		/* wall got blasted */
+X			if ((obj == NULL) || ((obj->o_flags & F_WALL) == 0))
+X				panic("blasting non-wall");
+X			removeobject(row, col);
+X			break;
+X
+X		case 'h':		/* man got hit */
+X			if ((obj == NULL) || (obj->o_side != myside))
+X				panic("missed me");
+X			hitobject(cc->c_row, cc->c_col);
+X			break;
+X
+X		case 'p':		/* object got placed or moved */
+X			if (obj) panic("nested objects");
+X			obj = findid(id);
+X			if (obj->o_side == myside) panic("read my own object"); 
+X			placeobject(obj, row, col);
+X			break;
+X
+X		case 'r':		/* ready for other player */
+X			return;
+X
+X		default:
+X			panic("bad command read from opponent\n");
+X		}
+X	}
+X}
+//E*O*F talk.c//
+echo x - view.c
+sed -e 's/^X//' > "view.c" << '//E*O*F view.c//'
+X#ifdef SCCS
+Xstatic char *sccsid = "@(#)view.c	1.1	4/5/85";
+Xstatic char *cpyrid = "@(#)Copyright (C) 1985 by D Bell";
+X#endif
+X
+X#include "war.h"
+X
+X/*
+X * See what is currently visible by all of our men.
+X */
+Xview()
+X{
+X	register struct	cell	*cc;	/* current cell */
+X	register struct	cell	*tc;	/* test cell */
+X	register struct	object	*obj;	/* object doing viewing */
+X	register int	row;		/* current row */
+X	register int	col;		/* current column */
+X	register int	view;		/* viewing distance */
+X	int	objrow;			/* current row of object */
+X	int	objcol;			/* current column of object */
+X	int	minrow;			/* minimum row for search */
+X	int	maxrow;			/* maximum row for search */
+X	int	mincol;			/* minimum column for search */
+X	int	maxcol;			/* maximum column for search */
+X
+X	/*
+X	 * Remove visibility of movable objects
+X	 */
+X	for (obj = objects; obj < endobjects; obj++) {
+X		if (obj->o_side == myside) continue;
+X		if (obj->o_flags & (F_IMMOB|F_VIS)) continue;
+X		cc = obj->o_cell;
+X		if ((cc == NULL) || (cc->c_seen == 0)) continue;
+X		cc->c_seen = 0;
+X		dpyplace(cc->c_row, cc->c_col, ' ');
+X	}
+X	/*
+X	 * See what is visible now
+X	 */
+X	for (cc = firstcell; cc; cc = cc->c_next) {
+X		obj = cc->c_obj;
+X		if ((obj == NULL) || (obj->o_side != myside)) continue;
+X		view = obj->o_view;
+X		if (view <= 0) continue;
+X		objrow = cc->c_row;
+X		objcol = cc->c_col;
+X		minrow = objrow - view;
+X		maxrow = objrow + view;
+X		mincol = objcol - view;
+X		maxcol = objcol + view;
+X		if (minrow < 0) minrow = 0;
+X		if (maxrow >= ROWS) maxrow = ROWS - 1;
+X		if (mincol < 0) mincol = 0;
+X		if (maxcol >= COLS) maxcol = COLS - 1;
+X		for (row = minrow; row <= maxrow; row++) {
+X			col = mincol;
+X			tc = &board[row][col];
+X			for (; col <= maxcol; col++, tc = tc->c_right) {
+X				if (tc->c_obj == NULL) continue;
+X				if (tc->c_seen) continue;
+X				if (tc->c_obj->o_side == myside) continue;
+X				if (((obj->o_flags & F_XRAY) == 0)
+X					&& obstruct(objcol, objrow, col, row))
+X						continue;
+X				tc->c_seen = 1;
+X				dpyplace(row, col, tc->c_obj->o_altch);
+X			}
+X		}
+X	}
+X	viewstats();
+X	dpyupdate();
+X}
+X
+X
+X/*
+X * Given a rectangle specified by its opposite corners (a,b) and (c,d).
+X * Check whether there exists any object in the rectangle which is within
+X * a distance of 1/2 from the line segment connecting the two corners (the
+X * corners themselves are not tested).  The equation for those points (x,y)
+X * which satisfy this distance requirement is:
+X * 
+X *	4 * square((b-d)x + (c-a)y + (ad-bc)) <= square(b-d) + square(c-a).
+X *
+X * By precomputing the constant parts of this equation, it becomes:
+X *
+X *	4 * square(Ax + By + C) <= D.
+X *
+X * Returns nonzero if some object is within this distance.
+X */
+Xobstruct(a, b, c, d)
+X{
+X	register int	x;		/* x coordinate of test point */
+X	register int	y;		/* y coordinate of test point */
+X	register int	i;		/* number being computed */
+X	register struct	cell	*cc;	/* current cell being checked */
+X	struct	cell	*endc1;		/* cell at first endpoint */
+X	struct	cell	*endc2;		/* cell at last endpoint */
+X	int	A;			/* (b - d) */
+X	int	B;			/* (c - a) */
+X	int	C;			/* (ad - bc) */
+X	int	D;			/* (square(b-d) + square(c-a)) */
+X	int	dy;			/* delta for y coordinate */
+X
+X	if (a > c) {			/* put first point at left */
+X		i = c;
+X		c = a;
+X		a = i;
+X	}
+X	dy = 1;				/* see if line rises or falls */
+X	if (d < b) dy = -1;
+X	A = b - d;			/* compute constants */
+X	B = c - a;
+X	C = (a * d) - (b * c);
+X	D = (A * A) + (B * B);
+X	endc1 = &board[b][a];		/* get cells at endpoints */
+X	endc2 = &board[d][c];
+X	for (y = b; ; y += dy) {
+X		for (x = a, cc = &board[y][x]; x <= c; x++, cc = cc->c_right) {
+X			if (cc == endc2) return(0);
+X			if ((cc->c_obj == NULL) || (cc == endc1)) continue;
+X			if (cc->c_obj->o_flags & F_TRANS) continue;
+X			i = (A * x) + (B * y) + C;
+X			if ((i * i * 4) <= D) return(1);
+X		}
+X	}
+X}
+X
+X
+X/*
+X * Update the status information if necessary
+X */
+Xviewstats()
+X{
+X
+X	if (newstat == 0) return;
+X	viewobjects();
+X	viewdata();
+X	dpywindow(0, -1, 1, INFOCOL - 2);
+X	newstat = 0;
+X}
+X
+X
+X/*
+X * Give comparisons between our men and the enemy
+X */
+Xviewdata()
+X{
+X	register struct	data	*md;	/* pointer to my data */
+X	register struct	data	*hd;	/* pointer to his data */
+X
+X	dpywindow(DATAROW, -1, INFOCOL, -1);
+X	md = &mydata;
+X	hd = &hisdata;
+X	dpyprintf("STATISTIC       YOU   ENEMY\n");
+X	dpyprintf("fight men/life %2d/%-3d %2d/%d\n",
+X		md->d_fightmen, md->d_fightlife,
+X		hd->d_fightmen, hd->d_fightlife);
+X	dpyprintf("move men/life  %2d/%-3d %2d/%d\n",
+X		md->d_movemen, md->d_movelife,
+X		hd->d_movemen, hd->d_movelife);
+X	dpyprintf("blast men/life %2d/%-3d %2d/%d\n",
+X		md->d_blastmen, md->d_blastlife,
+X		hd->d_blastmen, hd->d_blastlife);
+X	dpyprintf("goal men/life  %2d/%-3d %2d/%d\n",
+X		md->d_goalmen, md->d_goallife,
+X		hd->d_goalmen, hd->d_goallife);
+X	dpyprintf("total men/life %2d/%-3d %2d/%d\n",
+X		md->d_totalmen, md->d_totallife,
+X		hd->d_totalmen, hd->d_totallife);
+X	dpyprintf("total walls      %-3d    %-3d\n",
+X		md->d_totalwalls, hd->d_totalwalls);
+X	dpyclrwindow();
+X}
+X
+X
+X/*
+X * Give statistics on our objects
+X */
+Xviewobjects()
+X{
+X	register struct	object	*obj;	/* current object */
+X	register char	*cp;		/* current flag character */
+X	register int	flags;		/* current flags */
+X	char	flagchars[20];		/* flags for object */
+X	char	count[20];		/* value for counts */
+X
+X	dpywindow(0, DATAROW - 2, INFOCOL, -1);
+X	dpystr("OBJ LIFE VIEW FLAGS  COUNT\n");
+X	for (obj = objects; obj < endobjects; obj++) {
+X		if (obj->o_side != myside) continue;
+X		if (playing && (obj->o_count == 0)) continue;
+X		cp = flagchars;
+X		flags = obj->o_flags;
+X		if (flags & F_BLAST) *cp++ = 'b';
+X		if (flags & F_FIGHT) *cp++ = 'f';
+X		if (flags & F_GOAL) *cp++ = 'g';
+X		if (flags & F_IMMOB) *cp++ = 'i';
+X		if (flags & F_TRANS) *cp++ = 't';
+X		if (flags & F_VIS) *cp++ = 'v';
+X		if (flags & F_WALL) *cp++ = 'w';
+X		if (flags & F_XRAY) *cp++ = 'x';
+X		*cp = '\0';
+X		cp = count;
+X		if (playing)
+X			sprintf(cp, "%d  ", obj->o_count);
+X		else if (obj->o_min == obj->o_max)
+X			sprintf(cp, "%d  ", obj->o_min);
+X		else if (obj->o_max >= 1000)
+X			sprintf(cp, "%d-INF", obj->o_min);
+X		else
+X			sprintf(cp, "%d-%d", obj->o_min, obj->o_max);
+X		dpyprintf("%c %c %3d %4d   %-7s%s\n",
+X			obj->o_ownch, obj->o_altch, obj->o_life,
+X			obj->o_view, flagchars, count);
+X	}
+X	dpyclrwindow();
+X}
+//E*O*F view.c//
+echo done
+-- 
+
+Erik Bailey        -- 7 Oak Knoll                 (USENET courtesy of
+ihnp4!think!ejb       Arlington, MA  02174        Thinking Machines Corp.
+ejb@think.com         (617) 643-0732              Cambridge, MA)
+
+	   It takes thought to make a program that thinks.
+	   But it takes work to make a program that works.
+
+

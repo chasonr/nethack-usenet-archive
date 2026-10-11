@@ -1,0 +1,2715 @@
+X-Google-Thread: fdc89,dc0b99170ff94dc6,start
+X-Google-Attributes: gidfdc89,public
+X-Google-Language: ENGLISH,ASCII-7-bit
+Path: g2news1.google.com!news3.google.com!border1.nntp.dca.giganews.com!border2.nntp.dca.giganews.com!nntp.giganews.com!ngpeer.news.aol.com!newsstand.cit.cornell.edu!not-for-mail
+From: jimrandomh <usenet@jimrandomh.org>
+Newsgroups: rec.games.roguelike.nethack
+Subject: [PATCH] Duplicate NetHack
+Date: Fri, 11 Nov 2005 02:54:07 +0000 (UTC)
+Organization: Cornell University
+Lines: 2694
+Sender: jab299@cornell.invalid
+Message-ID: <Xns970ADE77298AFjimrandomh@132.236.56.8>
+NNTP-Posting-Host: cpe-24-59-121-227.twcny.res.rr.com
+X-Trace: ruby.cit.cornell.edu 1131677647 3335 24.59.121.227 (11 Nov 2005 02:54:07 GMT)
+X-Complaints-To: newsmgr@cornell.edu
+NNTP-Posting-Date: Fri, 11 Nov 2005 02:54:07 +0000 (UTC)
+User-Agent: Xnews/5.04.25
+Xref: g2news1.google.com rec.games.roguelike.nethack:20241
+
+Duplicate NetHack adds the option of rigging NetHack's random number 
+generator so that two games can will have the same dungeon, items, 
+monsters, and events.
+
+To use it, apply the patch, compile and run NetHack with the -S option
+  nethack -S somedungeon
+Where 'somedungeon' is an arbitrary string which is used as a seed. 
+Anyone who uses the same seed with the same version of NetHack will 
+play a duplicate of your game.
+
+
+How much will be the same?
+
+- All dungeon levels (except the quest, if not playing the same 
+  class) will have the same layout, trap locations, and items on the 
+  floor. (Monsters may vary because they depend on player level).
+
+- Monsters will be the same subject to level, meaning that if the 
+  first randomly generated 9th-level creature player A sees is a mind 
+  flayer, then the first 9th-level creature player B sees will be 
+  a mind flayer too. (They could be in completely different places, 
+  though; and player B might never see a 9th level monster at all.)
+
+- Kicking sinks, drinking from fountains, and the like will produce 
+  the same results, even if not from the same fountain. (Different 
+  luck scores could change the result, though.)
+
+- Item descriptions, the castle tune, and the result of asking for a 
+  random class/race/alignment will not  be the same. These are 
+  specific exceptions. (This means that player A might get a wish 
+  from a smoky potion while player B doesn't, and that player A might 
+  have a ring he can engrave with while player B doesn't.)
+
+- Neither player will find or leave bones. It's the only way to be 
+  fair.
+
+
+How does it work?
+
+This patch gives players choose the random number generator seed, so 
+they can take the same sequence of random numbers. It also splits up 
+the random number generator so that a number which gets used as an 
+attack roll in game A won't get used as a random item in game B, and so 
+on. In effect, it creates one RNG for attack rolls, another for item 
+types, and so on.
+
+Actually, it creates a separate random number generator for every place 
+where dice are rolled. (There are about 2000 such places in NetHack. 
+Also, when building a level, each dungeon level has its own set).
+
+When the random number generator is called, a macro takes the file and 
+line number of the call, the dungeon branch/level (if currently making 
+a level), and possibly some other information, and hashes it toghether 
+with MD5. Each hash value is a random number generator, which is 
+created as-needed with an initial state that depends on the hash and on 
+the seed.
+
+
+Caveats
+
+- Applying the patch breaks saved game compatibility.
+- If you change any of the files in the src/ directory, your game may 
+  not be comparable to others using the same seed.
+- CPU usage, memory usage, and saved game size are all higher.
+
+
+Suggestions
+
+The main use of this is to play the same game as other people are 
+playing, so that after you die you can compare scores and trade 
+notes. Try playing game "nethack -S rgrn" and posting how it went.
+
+
+Future Development
+
+It would be nice if the game would automatically assign seeds, in such 
+a way that you would never get the same seed twice but you would 
+usually get a seed which other people have already used. Then, the 
+scoreboard could show how you did compared to other people who played 
+the same dungeon.
+
+When random-type traps are placed in a new level, their type should not 
+be decided immediately. Instead, it should be decided when the player 
+first detects or triggers it. That way, if player A fell through a trap 
+door, player B probably will too.
+
+There's lots of room to speed up and improve the distribution of the 
+random numbers produced. In fact, the present algorithm is probably the 
+worst one that could possibly work.
+
+Genociding or extincting a monster will cause players to see different 
+monsters within that monster level, even if the genocided/extinct 
+monster wouldn't normally appear. The ideal behaviour would be to 
+generate the same sequence in both cases, but skip invalid monsters 
+within that sequence.
+
+Milky potions and smoky potions shouldn't be randomized, since that 
+could lead to one player getting an extra wish or a nasty surprise. 
+Rings should be shuffled, but which rings can engrave shouldn't.
+
+Item generation should be handled more cleverly on the quest, to 
+prevent the case where one player gets something nice (like a wand of 
+wishing) and the other doesn't.
+
+
+The patch itself:
+
+------------------------CUT HERE----------------------------
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/include/config.h NEW/include/config.h
+--- OLD/include/config.h	2003-12-07 18:39:13.000000000 -0500
++++ NEW/include/config.h	2005-11-10 18:25:13.406250000 -0500
+@@ -350,6 +351,8 @@
+ 
+ /*#define GOLDOBJ */	/* Gold is kept on obj chains - Helge Hafting */
+ /*#define AUTOPICKUP_EXCEPTIONS */ /* exceptions to autopickup */
++#define SEEDED_GAME       /* Allow fudging of the RNG for duplicate games. */
++                          /* (Use 'nethack -S some_seed') */
+ 
+ /* End of Section 5 */
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/include/extern.h NEW/include/extern.h
+--- OLD/include/extern.h	2003-12-07 18:39:13.000000000 -0500
++++ NEW/include/extern.h	2005-11-10 17:22:53.343750000 -0500
+@@ -1698,12 +1698,12 @@
+ 
+ /* ### rnd.c ### */
+ 
+-E int FDECL(rn2, (int));
+-E int FDECL(rnl, (int));
+-E int FDECL(rnd, (int));
+-E int FDECL(d, (int,int));
+-E int FDECL(rne, (int));
+-E int FDECL(rnz, (int));
++E int FDECL(rn2U, (int));
++E int FDECL(rnlU, (int));
++E int FDECL(rndU, (int));
++E int FDECL(dU, (int,int));
++E int FDECL(rneU, (int));
++E int FDECL(rnzU, (int));
+ 
+ /* ### role.c ### */
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/include/hack.h NEW/include/hack.h
+--- OLD/include/hack.h	2003-12-07 18:39:13.000000000 -0500
++++ NEW/include/hack.h	2005-11-09 17:02:01.703125000 -0500
+@@ -90,6 +90,7 @@
+ #include "wintype.h"
+ #include "decl.h"
+ #include "timeout.h"
++#include "rnd.h"
+ 
+ NEARDATA extern coord bhitpos;	/* place where throw or zap hits or stops */
+ 
+@@ -289,6 +290,7 @@
+ #define onlineu(xx,yy)	online2((int)(xx),(int)(yy),(int)u.ux,(int)u.uy)
+ 
+ #define rn1(x,y)	(rn2(x)+(y))
++#define rn1S(x,y,s)	(rn2S(x,s)+(y))
+ 
+ /* negative armor class is randomly weakened to prevent invulnerability */
+ #define AC_VALUE(AC)	((AC) >= 0 ? (AC) : -rnd(-(AC)))
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/include/rnd.h NEW/include/rnd.h
+--- OLD/include/rnd.h	1969-12-31 19:00:00.000000000 -0500
++++ NEW/include/rnd.h	2005-11-10 19:57:06.546875000 -0500
+@@ -0,0 +1,88 @@
++#ifndef RND_H
++#define RND_H
++
++
++#ifdef SEEDED_GAME
++
++typedef struct {
++	int key[4];
++	int offset;
++} rng_state;
++
++extern void FDECL(set_rng_seed, (char*));
++extern rng_state* VDECL(rng_from, (int, ...));
++extern int FDECL(rand_from, (rng_state*));
++extern int NDECL(rng_is_seeded);
++
++extern void FDECL(save_rng, (int,int));
++extern void FDECL(restore_rng, (int));
++
++#define rngMkDun (in_mklev ? ((u.uz.dnum<<8)+u.uz.dlevel) : -1)
++
++/* Doesn't depend on the level being created */
++#define rng           rng_from(2, RNG_FILE_NUM, __LINE__)
++#define rng1(x)       rng_from(3, RNG_FILE_NUM, __LINE__, (x))
++#define rng2(x,y)     rng_from(4, RNG_FILE_NUM, __LINE__, (x),(y))
++#define rng3(x,y,z)   rng_from(5, RNG_FILE_NUM, __LINE__, (x),(y),(z))
++#define rng4(x,y,z,a) rng_from(6, RNG_FILE_NUM, __LINE__, (x),(y),(z),(a))
++
++/* Depends on the level being created (default) */
++#define rngL           rng_from(3, RNG_FILE_NUM, __LINE__, rngMkDun)
++#define rng1L(x)       rng_from(4, RNG_FILE_NUM, __LINE__, (x), rngMkDun)
++#define rng2L(x,y)     rng_from(5, RNG_FILE_NUM, __LINE__, (x),(y), rngMkDun)
++#define rng3L(x,y,z)   rng_from(6, RNG_FILE_NUM, __LINE__, (x),(y),(z), rngMkDun)
++#define rng4L(x,y,z,a) rng_from(7, RNG_FILE_NUM, __LINE__, (x),(y),(z),(a), rngMkDun)
++
++/*
++ * rn2 = random number with default options
++ * rn2S = random number with a particular seed
++ * rn2U = random number with no seed
++ * The same suffixes (S,U) apply to rnl, rnd, d, rne, and rnz.
++ */
++
++#define rn2(x) rn2S((x),  rngL)
++#define rnl(x) rnlS((x),  rngL)
++#define rnd(x) rndS((x),  rngL)
++#define d(x,y) dS((x),(y),rngL)
++#define rne(x) rneS((x),  rngL)
++#define rnz(x) rnzS((x),  rngL)
++
++extern int FDECL(rn2S, (int,rng_state*));
++extern int FDECL(rnlS, (int,rng_state*));
++extern int FDECL(rndS, (int,rng_state*));
++extern int FDECL(dS, (int,int,rng_state*));
++extern int FDECL(rneS, (int,rng_state*));
++extern int FDECL(rnzS, (int,rng_state*));
++
++#else
++
++#define rng_is_seeded() 0
++
++#define rng           NULL
++#define rng1(x)       NULL
++#define rng2(x,y)     NULL
++#define rng3(x,y,z)   NULL
++#define rng4(x,y,z,a) NULL
++#define rngL           NULL
++#define rng1L(x)       NULL
++#define rng2L(x,y)     NULL
++#define rng3L(x,y,z)   NULL
++#define rng4L(x,y,z,a) NULL
++
++#define rn2(x) rn2U((x))
++#define rnl(x) rnlU((x))
++#define rnd(x) rndU((x))
++#define d(x,y) dU((x),(y))
++#define rne(x) rneU((x))
++#define rnz(x) rnzU((x))
++
++#define rn2S(x,s) rn2U((x))
++#define rnlS(x,s) rnlU((x))
++#define rndS(x,s) rndU((x))
++#define dS(x,y,s) dU((x),(y))
++#define rneS(x,s) rneU((x))
++#define rnzS(x,s) rnzU((x))
++
++#endif
++
++#endif
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/allmain.c NEW/src/allmain.c
+--- OLD/src/allmain.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/allmain.c	2005-11-10 00:08:49.625000000 -0500
+@@ -6,6 +6,8 @@
+ 
+ #include "hack.h"
+ 
++#define RNG_FILE_NUM 2
++
+ #ifndef NO_SIGNAL
+ #include <signal.h>
+ #endif
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/apply.c NEW/src/apply.c
+--- OLD/src/apply.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/apply.c	2005-11-10 00:09:05.031250000 -0500
+@@ -5,6 +5,8 @@
+ #include "hack.h"
+ #include "edog.h"
+ 
++#define RNG_FILE_NUM 3
++
+ #ifdef OVLB
+ 
+ static const char tools[] = { TOOL_CLASS, WEAPON_CLASS, WAND_CLASS, 0 };
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/artifact.c NEW/src/artifact.c
+--- OLD/src/artifact.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/artifact.c	2005-11-10 00:09:35.015625000 -0500
+@@ -9,6 +9,9 @@
+ #else
+ STATIC_DCL struct artifact artilist[];
+ #endif
++
++#define RNG_FILE_NUM 4
++
+ /*
+  * Note:  both artilist[] and artiexist[] have a dummy element #0,
+  *	  so loops over them should normally start at #1.  The primary
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/attrib.c NEW/src/attrib.c
+--- OLD/src/attrib.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/attrib.c	2005-11-10 00:09:40.578125000 -0500
+@@ -6,6 +6,8 @@
+ 
+ #include "hack.h"
+ 
++#define RNG_FILE_NUM 5
++
+ /* #define DEBUG */	/* uncomment for debugging info */
+ 
+ #ifdef OVLB
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/ball.c NEW/src/ball.c
+--- OLD/src/ball.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/ball.c	2005-11-10 00:09:44.468750000 -0500
+@@ -6,6 +6,8 @@
+ 
+ #include "hack.h"
+ 
++#define RNG_FILE_NUM 6
++
+ STATIC_DCL int NDECL(bc_order);
+ STATIC_DCL void NDECL(litter);
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/bones.c NEW/src/bones.c
+--- OLD/src/bones.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/bones.c	2005-11-10 17:34:37.515625000 -0500
+@@ -5,6 +5,8 @@
+ #include "hack.h"
+ #include "lev.h"
+ 
++#define RNG_FILE_NUM 7
++
+ extern char bones[];	/* from files.c */
+ #ifdef MFLOPPY
+ extern long bytes_counted;
+@@ -31,6 +33,10 @@
+ 		|| Is_botlevel(lev) || (Is_branchlev(lev) && lev->dlevel > 1)
+ 		   /* no bones in the invocation level               */
+ 		|| (In_hell(lev) && lev->dlevel == dunlevs_in_dungeon(lev) - 1)
++#ifdef SEEDED_GAME
++		   /* no bones in games with specified RNG seed */
++		|| rng_is_seeded()
++#endif
+ 		);
+ }
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/botl.c NEW/src/botl.c
+--- OLD/src/botl.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/botl.c	2005-11-10 00:10:04.453125000 -0500
+@@ -4,6 +4,8 @@
+ 
+ #include "hack.h"
+ 
++#define RNG_FILE_NUM 8
++
+ #ifdef OVL0
+ extern const char *hu_stat[];	/* defined in eat.c */
+
+
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/cmd.c NEW/src/cmd.c
+--- OLD/src/cmd.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/cmd.c	2005-11-10 00:10:12.734375000 -0500
+@@ -4,6 +4,9 @@
+ 
+ #include "hack.h"
+ #include "func_tab.h"
++
++#define RNG_FILE_NUM 9
++
+ /* #define DEBUG */	/* uncomment for debugging */
+ 
+ /*
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/dbridge.c NEW/src/dbridge.c
+--- OLD/src/dbridge.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/dbridge.c	2005-11-10 00:10:18.671875000 -0500
+@@ -12,6 +12,8 @@
+ 
+ #include "hack.h"
+ 
++#define RNG_FILE_NUM 10
++
+ #ifdef OVLB
+ STATIC_DCL void FDECL(get_wall_for_db, (int *, int *));
+ STATIC_DCL struct entity *FDECL(e_at, (int, int));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/detect.c NEW/src/detect.c
+--- OLD/src/detect.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/detect.c	2005-11-10 00:10:56.062500000 -0500
+@@ -10,6 +10,8 @@
+ #include "hack.h"
+ #include "artifact.h"
+ 
++#define RNG_FILE_NUM 11
++
+ extern boolean known;	/* from read.c */
+ 
+ STATIC_DCL void FDECL(do_dknown_of, (struct obj *));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/dig.c NEW/src/dig.c
+--- OLD/src/dig.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/dig.c	2005-11-10 00:11:03.218750000 -0500
+@@ -6,6 +6,8 @@
+ #include "edog.h"
+ /* #define DEBUG */	/* turn on for diagnostics */
+ 
++#define RNG_FILE_NUM 12
++
+ #ifdef OVLB
+ 
+ static NEARDATA boolean did_dig_msg;
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/display.c NEW/src/display.c
+--- OLD/src/display.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/display.c	2005-11-10 00:11:19.796875000 -0500
+@@ -118,6 +118,8 @@
+ #include "hack.h"
+ #include "region.h"
+ 
++#define RNG_FILE_NUM 13
++
+ STATIC_DCL void FDECL(display_monster,(XCHAR_P,XCHAR_P,struct monst *,int,XCHAR_P));
+ STATIC_DCL int FDECL(swallow_to_glyph, (int, int));
+ STATIC_DCL void FDECL(display_warning,(struct monst *));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/do.c NEW/src/do.c
+--- OLD/src/do.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/do.c	2005-11-10 00:11:41.250000000 -0500
+@@ -7,6 +7,8 @@
+ #include "hack.h"
+ #include "lev.h"
+ 
++#define RNG_FILE_NUM 14
++
+ #ifdef SINKS
+ # ifdef OVLB
+ STATIC_DCL void FDECL(trycall, (struct obj *));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/do_name.c NEW/src/do_name.c
+--- OLD/src/do_name.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/do_name.c	2005-11-10 00:11:52.937500000 -0500
+@@ -4,6 +4,8 @@
+ 
+ #include "hack.h"
+ 
++#define RNG_FILE_NUM 15
++
+ #ifdef OVLB
+ 
+ STATIC_DCL void FDECL(do_oname, (struct obj *));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/do_wear.c NEW/src/do_wear.c
+--- OLD/src/do_wear.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/do_wear.c	2005-11-10 00:12:06.109375000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 16
+ 
+ #ifndef OVLB
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/dog.c NEW/src/dog.c
+--- OLD/src/dog.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/dog.c	2005-11-10 00:12:12.296875000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "edog.h"
++#define RNG_FILE_NUM 17
+ 
+ #ifdef OVLB
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/dogmove.c NEW/src/dogmove.c
+--- OLD/src/dogmove.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/dogmove.c	2005-11-10 00:12:17.468750000 -0500
+@@ -7,6 +7,8 @@
+ #include "mfndpos.h"
+ #include "edog.h"
+ 
++#define RNG_FILE_NUM 18
++
+ extern boolean notonhead;
+ 
+ #ifdef OVL0
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/dokick.c NEW/src/dokick.c
+--- OLD/src/dokick.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/dokick.c	2005-11-10 00:12:21.593750000 -0500
+@@ -5,6 +5,8 @@
+ #include "hack.h"
+ #include "eshk.h"
+ 
++#define RNG_FILE_NUM 19
++
+ #define is_bigfoot(x)	((x) == &mons[PM_SASQUATCH])
+ #define martial()	(martial_bonus() || is_bigfoot(youmonst.data) || \
+ 		(uarmf && uarmf->otyp == KICKING_BOOTS))
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/dothrow.c NEW/src/dothrow.c
+--- OLD/src/dothrow.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/dothrow.c	2005-11-10 00:12:31.890625000 -0500
+@@ -7,6 +7,8 @@
+ #include "hack.h"
+ #include "edog.h"
+ 
++#define RNG_FILE_NUM 20
++
+ STATIC_DCL int FDECL(throw_obj, (struct obj *,int));
+ STATIC_DCL void NDECL(autoquiver);
+ STATIC_DCL int FDECL(gem_accept, (struct monst *, struct obj *));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/dungeon.c NEW/src/dungeon.c
+--- OLD/src/dungeon.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/dungeon.c	2005-11-10 13:37:14.921875000 -0500
+@@ -6,6 +6,8 @@
+ #include "dgn_file.h"
+ #include "dlb.h"
+ 
++#define RNG_FILE_NUM 21
++
+ #ifdef OVL1
+ 
+ #define DUNGEON_FILE	"dungeon"
+@@ -840,7 +842,7 @@
+ 	}
+ 	(void) dlb_fclose(dgn_file);
+ 
+-	for (i = 0; i < 5; i++) tune[i] = 'A' + rn2(7);
++	for (i = 0; i < 5; i++) tune[i] = 'A' + rn2U(7);
+ 	tune[5] = 0;
+ 
+ 	/*
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/eat.c NEW/src/eat.c
+--- OLD/src/eat.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/eat.c	2005-11-10 00:13:06.875000000 -0500
+@@ -5,6 +5,8 @@
+ #include "hack.h"
+ /* #define DEBUG */	/* uncomment to enable new eat code debugging */
+ 
++#define RNG_FILE_NUM 22
++
+ #ifdef DEBUG
+ # ifdef WIZARD
+ #define debugpline	if (wizard) pline
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/engrave.c NEW/src/engrave.c
+--- OLD/src/engrave.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/engrave.c	2005-11-10 00:13:54.640625000 -0500
+@@ -6,6 +6,8 @@
+ #include "lev.h"
+ #include <ctype.h>
+ 
++#define RNG_FILE_NUM 23
++
+ STATIC_VAR NEARDATA struct engr *head_engr;
+ 
+ #ifdef OVLB
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/exper.c NEW/src/exper.c
+--- OLD/src/exper.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/exper.c	2005-11-10 00:14:03.921875000 -0500
+@@ -4,6 +4,8 @@
+ 
+ #include "hack.h"
+ 
++#define RNG_FILE_NUM 24
++
+ STATIC_DCL long FDECL(newuexp, (int));
+ STATIC_DCL int FDECL(enermod, (int));
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/explode.c NEW/src/explode.c
+--- OLD/src/explode.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/explode.c	2005-11-10 00:14:13.390625000 -0500
+@@ -4,6 +4,8 @@
+ 
+ #include "hack.h"
+ 
++#define RNG_FILE_NUM 25
++
+ #ifdef OVL0
+ 
+ /* Note: Arrays are column first, while the screen is row first */
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/extralev.c NEW/src/extralev.c
+--- OLD/src/extralev.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/extralev.c	2005-11-10 00:14:17.843750000 -0500
+@@ -8,6 +8,8 @@
+ 
+ #include "hack.h"
+ 
++#define RNG_FILE_NUM 26
++
+ #ifdef REINCARNATION
+ 
+ struct rogueroom {
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/fountain.c NEW/src/fountain.c
+--- OLD/src/fountain.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/fountain.c	2005-11-10 00:14:34.000000000 -0500
+@@ -6,6 +6,8 @@
+ 
+ #include "hack.h"
+ 
++#define RNG_FILE_NUM 27
++
+ STATIC_DCL void NDECL(dowatersnakes);
+ STATIC_DCL void NDECL(dowaterdemon);
+ STATIC_DCL void NDECL(dowaternymph);
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/hack.c NEW/src/hack.c
+--- OLD/src/hack.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/hack.c	2005-11-10 00:14:37.859375000 -0500
+@@ -4,6 +4,8 @@
+ 
+ #include "hack.h"
+ 
++#define RNG_FILE_NUM 28
++
+ #ifdef OVL1
+ STATIC_DCL void NDECL(maybe_wail);
+ #endif /*OVL1*/
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/invent.c NEW/src/invent.c
+--- OLD/src/invent.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/invent.c	2005-11-10 00:15:02.500000000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 29
+ 
+ #define NOINVSYM	'#'
+ #define CONTAINED_SYM	'>'	/* designator for inside a container */
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/light.c NEW/src/light.c
+--- OLD/src/light.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/light.c	2005-11-10 00:15:08.531250000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "lev.h"	/* for checking save modes */
++#define RNG_FILE_NUM 30
+ 
+ /*
+  * Mobile light sources.
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/lock.c NEW/src/lock.c
+--- OLD/src/lock.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/lock.c	2005-11-10 00:15:14.031250000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 31
+ 
+ STATIC_PTR int NDECL(picklock);
+ STATIC_PTR int NDECL(forcelock);
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mail.c NEW/src/mail.c
+--- OLD/src/mail.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mail.c	2005-11-10 00:15:20.843750000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 32
+ 
+ #ifdef MAIL
+ #include "mail.h"
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/makemon.c NEW/src/makemon.c
+--- OLD/src/makemon.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/makemon.c	2005-11-10 19:58:09.250000000 -0500
+@@ -9,6 +9,7 @@
+ #ifdef REINCARNATION
+ #include <ctype.h>
+ #endif
++#define RNG_FILE_NUM 33
+ 
+ STATIC_VAR NEARDATA struct monst zeromonst;
+ 
+@@ -1199,12 +1200,18 @@
+ {
+ 	register struct permonst *ptr;
+ 	register int mndx, ct;
++	int zlevel, minmlev, maxmlev;
+ 
+ 	if (u.uz.dnum == quest_dnum && rn2(7) && (ptr = qt_montype()) != 0)
+ 	    return ptr;
+ 
++	zlevel = level_difficulty();
++	/* determine the level of the weakest monster to make. */
++	minmlev = zlevel / 6;
++	/* determine the level of the strongest monster to make. */
++	maxmlev = (zlevel + u.ulevel) / 2;
++	
+ 	if (rndmonst_state.choice_count < 0) {	/* need to recalculate */
+-	    int zlevel, minmlev, maxmlev;
+ 	    boolean elemlevel;
+ #ifdef REINCARNATION
+ 	    boolean upper;
+@@ -1223,11 +1230,6 @@
+ #endif
+ 		return (struct permonst *)0;
+ 	    } /* else `mndx' now ready for use below */
+-	    zlevel = level_difficulty();
+-	    /* determine the level of the weakest monster to make. */
+-	    minmlev = zlevel / 6;
+-	    /* determine the level of the strongest monster to make. */
+-	    maxmlev = (zlevel + u.ulevel) / 2;
+ #ifdef REINCARNATION
+ 	    upper = Is_rogue_level(&u.uz);
+ #endif
+@@ -1271,10 +1273,35 @@
+ /*
+  *	Now, select a monster at random.
+  */
+-	ct = rnd(rndmonst_state.choice_count);
+-	for (mndx = LOW_PM; mndx < SPECIAL_PM; mndx++)
+-	    if ((ct -= (int)rndmonst_state.mchoices[mndx]) <= 0) break;
+-
++ 	if(rng_is_seeded())
++ 	{
++	    /* First, we're going to *pretend* to pick a monster, just to see
++	     * what level it would be. Then we'll pick a monster at random from
++	     * that level. (This will cause players with the same seed to see
++	     * the same monsters more often). */
++	    int lev;
++	    
++	    ct = rndS(rndmonst_state.choice_count, rng2(minmlev, maxmlev));
++	    for (mndx = LOW_PM; mndx < SPECIAL_PM; mndx++)
++		if ((ct -= (int)rndmonst_state.mchoices[mndx]) <= 0) break;
++	    lev = monstr[mndx];
++	    
++	    /* HACKHACK: Just keep re-picking until we get one that's the right
++	     * level. (There exists such a monster because it was picked
++	     * before, so this is merely slow, not infinite.) */
++	    do {
++	        ct = rndS(rndmonst_state.choice_count, rng2(minmlev, maxmlev));
++	        for (mndx = LOW_PM; mndx < SPECIAL_PM; mndx++)
++		    if ((ct -= (int)rndmonst_state.mchoices[mndx]) <= 0) break;
++	    } while(lev != monstr[mndx]);
++	}
++	else
++	{
++	    ct = rndS(rndmonst_state.choice_count, rng2(minmlev, maxmlev));
++	    for (mndx = LOW_PM; mndx < SPECIAL_PM; mndx++)
++	        if ((ct -= (int)rndmonst_state.mchoices[mndx]) <= 0) break;
++	}
++	
+ 	if (mndx == SPECIAL_PM || uncommon(mndx)) {	/* shouldn't happen */
+ 	    impossible("rndmonst: bad `mndx' [#%d]", mndx);
+ 	    return (struct permonst *)0;
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mapglyph.c NEW/src/mapglyph.c
+--- OLD/src/mapglyph.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mapglyph.c	2005-11-10 00:15:46.312500000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 34
+ #if defined(TTY_GRAPHICS)
+ #include "wintty.h"	/* for prototype of has_color() only */
+ #endif
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mcastu.c NEW/src/mcastu.c
+--- OLD/src/mcastu.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mcastu.c	2005-11-10 00:16:04.031250000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 35
+ 
+ /* monster mage spells */
+ #define MGC_PSI_BOLT	 0
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mhitm.c NEW/src/mhitm.c
+--- OLD/src/mhitm.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mhitm.c	2005-11-10 00:16:09.593750000 -0500
+@@ -5,6 +5,7 @@
+ #include "hack.h"
+ #include "artifact.h"
+ #include "edog.h"
++#define RNG_FILE_NUM 36
+ 
+ extern boolean notonhead;
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mhitu.c NEW/src/mhitu.c
+--- OLD/src/mhitu.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mhitu.c	2005-11-10 00:16:13.718750000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "artifact.h"
++#define RNG_FILE_NUM 37
+ 
+ STATIC_VAR NEARDATA struct obj *otmp;
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/minion.c NEW/src/minion.c
+--- OLD/src/minion.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/minion.c	2005-11-10 00:16:16.328125000 -0500
+@@ -5,6 +5,7 @@
+ #include "hack.h"
+ #include "emin.h"
+ #include "epri.h"
++#define RNG_FILE_NUM 38
+ 
+ void
+ msummon(mon)		/* mon summons a monster */
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mklev.c NEW/src/mklev.c
+--- OLD/src/mklev.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mklev.c	2005-11-10 17:25:37.359375000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 39
+ /* #define DEBUG */	/* uncomment to enable code debugging */
+ 
+ #ifdef DEBUG
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mkmap.c NEW/src/mkmap.c
+--- OLD/src/mkmap.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mkmap.c	2005-11-10 17:26:12.468750000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "sp_lev.h"
++#define RNG_FILE_NUM 40
+ 
+ #define HEIGHT	(ROWNO - 1)
+ #define WIDTH	(COLNO - 2)
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mkmaze.c NEW/src/mkmaze.c
+--- OLD/src/mkmaze.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mkmaze.c	2005-11-10 00:16:32.656250000 -0500
+@@ -5,6 +5,7 @@
+ #include "hack.h"
+ #include "sp_lev.h"
+ #include "lev.h"	/* save & restore info */
++#define RNG_FILE_NUM 41
+ 
+ /* from sp_lev.c, for fixup_special() */
+ extern char *lev_message;
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mkobj.c NEW/src/mkobj.c
+--- OLD/src/mkobj.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mkobj.c	2005-11-10 20:27:34.390625000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "prop.h"
++#define RNG_FILE_NUM 42
+ 
+ STATIC_DCL void FDECL(mkbox_cnts,(struct obj *));
+ STATIC_DCL void FDECL(obj_timer_checks,(struct obj *, XCHAR_P, XCHAR_P, int));
+@@ -385,22 +386,22 @@
+ 	if (!objects[otmp->otyp].oc_uses_known)
+ 		otmp->known = 1;
+ #ifdef INVISIBLE_OBJECTS
+-	otmp->oinvis = !rn2(1250);
++	otmp->oinvis = !rn2S(1250, rng1L(otyp));
+ #endif
+ 	if (init) switch (let) {
+ 	case WEAPON_CLASS:
+ 		otmp->quan = is_multigen(otmp) ? (long) rn1(6,6) : 1L;
+-		if(!rn2(11)) {
+-			otmp->spe = rne(3);
+-			otmp->blessed = rn2(2);
+-		} else if(!rn2(10)) {
++		if(!rn2S(11, rng1L(otyp))) {
++			otmp->spe = rneS(3, rng1L(otyp));
++			otmp->blessed = rn2S(2, rng1L(otyp));
++		} else if(!rn2S(10, rng1L(otyp))) {
+ 			curse(otmp);
+-			otmp->spe = -rne(3);
++			otmp->spe = -rneS(3, rng1L(otyp));
+ 		} else	blessorcurse(otmp, 10);
+-		if (is_poisonable(otmp) && !rn2(100))
++		if (is_poisonable(otmp) && !rn2S(100, rng1L(otyp)))
+ 			otmp->opoisoned = 1;
+ 
+-		if (artif && !rn2(20))
++		if (artif && !rn2S(20, rng1L(otyp)))
+ 		    otmp = mk_artifact(otmp, (aligntyp)A_NONE);
+ 		break;
+ 	case FOOD_CLASS:
+@@ -548,18 +549,18 @@
+ 		blessorcurse(otmp, 17);
+ 		break;
+ 	case ARMOR_CLASS:
+-		if(rn2(10) && (otmp->otyp == FUMBLE_BOOTS ||
++		if(rn2S(10,rng1L(otmp->otyp)) && (otmp->otyp == FUMBLE_BOOTS ||
+ 		   otmp->otyp == LEVITATION_BOOTS ||
+ 		   otmp->otyp == HELM_OF_OPPOSITE_ALIGNMENT ||
+ 		   otmp->otyp == GAUNTLETS_OF_FUMBLING ||
+-		   !rn2(11))) {
++		   !rn2S(11,rng1L(otmp->otyp)))) {
+ 			curse(otmp);
+-			otmp->spe = -rne(3);
++			otmp->spe = -rneS(3, rng1L(otmp->otyp));
+ 		} else if(!rn2(10)) {
+-			otmp->blessed = rn2(2);
+-			otmp->spe = rne(3);
++			otmp->blessed = rn2S(2,rng1L(otmp->otyp));
++			otmp->spe = rneS(3,rng1L(otmp->otyp));
+ 		} else	blessorcurse(otmp, 10);
+-		if (artif && !rn2(40))                
++		if (artif && !rn2S(40,rng1L(otmp->otyp)))
+ 		    otmp = mk_artifact(otmp, (aligntyp)A_NONE);
+ 		/* simulate lacquered armor for samurai */
+ 		if (Role_if(PM_SAMURAI) && otmp->otyp == SPLINT_MAIL &&
+@@ -574,28 +575,37 @@
+ 		}
+ 		break;
+ 	case WAND_CLASS:
+-		if(otmp->otyp == WAN_WISHING) otmp->spe = rnd(3); else
+-		otmp->spe = rn1(5,
+-			(objects[otmp->otyp].oc_dir == NODIR) ? 11 : 4);
++		if(otmp->otyp == WAN_WISHING) otmp->spe = rnd(3);
++		else otmp->spe = rn1S(5,
++			    (objects[otmp->otyp].oc_dir == NODIR) ? 11 : 4,
++			    rng1L(otmp->otyp));
+ 		blessorcurse(otmp, 17);
+ 		otmp->recharged = 0; /* used to control recharging */
+ 		break;
+ 	case RING_CLASS:
+ 		if(objects[otmp->otyp].oc_charged) {
+ 		    blessorcurse(otmp, 3);
+-		    if(rn2(10)) {
+-			if(rn2(10) && bcsign(otmp))
+-			    otmp->spe = bcsign(otmp) * rne(3);
+-			else otmp->spe = rn2(2) ? rne(3) : -rne(3);
++		    if(rn2S(10,rng1L(otmp->otyp))) {
++			if(rn2S(10,rng1L(otmp->otyp)) && bcsign(otmp))
++			    otmp->spe = bcsign(otmp) * rneS(3,rng1L(otmp->otyp));
++			else
++			    otmp->spe = rn2S(2,rng1L(otmp->otyp)) ?
++			        rneS(3,rng1L(otmp->otyp)) :
++			        -rneS(3,rng1L(otmp->otyp));
+ 		    }
+ 		    /* make useless +0 rings much less common */
+-		    if (otmp->spe == 0) otmp->spe = rn2(4) - rn2(3);
++		    if (otmp->spe == 0)
++		        otmp->spe = rn2S(4,rng1L(otmp->otyp)) -
++		            rn2S(3,rng1L(otmp->otyp));
+ 		    /* negative rings are usually cursed */
+-		    if (otmp->spe < 0 && rn2(5)) curse(otmp);
+-		} else if(rn2(10) && (otmp->otyp == RIN_TELEPORTATION ||
+-			  otmp->otyp == RIN_POLYMORPH ||
+-			  otmp->otyp == RIN_AGGRAVATE_MONSTER ||
+-			  otmp->otyp == RIN_HUNGER || !rn2(9))) {
++		    if (otmp->spe < 0 && rn2S(5,rng1L(otmp->otyp)))
++		        curse(otmp);
++		} else if(rn2S(10,rng1L(otmp->otyp)) &&
++		         (otmp->otyp == RIN_TELEPORTATION ||
++		          otmp->otyp == RIN_POLYMORPH ||
++		          otmp->otyp == RIN_AGGRAVATE_MONSTER ||
++		          otmp->otyp == RIN_HUNGER ||
++		          !rn2S(9,rng1L(otmp->otyp)))) {
+ 			curse(otmp);
+ 		}
+ 		break;
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mkroom.c NEW/src/mkroom.c
+--- OLD/src/mkroom.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mkroom.c	2005-11-10 17:17:49.781250000 -0500
+@@ -14,6 +14,7 @@
+  */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 43
+ 
+ #ifdef OVLB
+ STATIC_DCL boolean FDECL(isbig, (struct mkroom *));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mon.c NEW/src/mon.c
+--- OLD/src/mon.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mon.c	2005-11-10 17:06:36.859375000 -0500
+@@ -11,6 +11,7 @@
+ #include "mfndpos.h"
+ #include "edog.h"
+ #include <ctype.h>
++#define RNG_FILE_NUM 44
+ 
+ STATIC_DCL boolean FDECL(restrap,(struct monst *));
+ STATIC_DCL long FDECL(mm_aggression, (struct monst *,struct monst *));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mondata.c NEW/src/mondata.c
+--- OLD/src/mondata.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mondata.c	2005-11-10 00:16:50.171875000 -0500
+@@ -5,6 +5,7 @@
+ #include "hack.h"
+ #include "eshk.h"
+ #include "epri.h"
++#define RNG_FILE_NUM 45
+ 
+ /*	These routines provide basic data for any type of monster. */
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/monmove.c NEW/src/monmove.c
+--- OLD/src/monmove.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/monmove.c	2005-11-10 00:16:54.828125000 -0500
+@@ -6,6 +6,7 @@
+ #include "mfndpos.h"
+ #include "artifact.h"
+ #include "epri.h"
++#define RNG_FILE_NUM 46
+ 
+ extern boolean notonhead;
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/monst.c NEW/src/monst.c
+--- OLD/src/monst.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/monst.c	2005-11-10 00:17:05.484375000 -0500
+@@ -9,6 +9,7 @@
+ #include "eshk.h"
+ #include "vault.h"
+ #include "epri.h"
++#define RNG_FILE_NUM 47
+ 
+ #define NO_ATTK {0,0,0,0}
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mplayer.c NEW/src/mplayer.c
+--- OLD/src/mplayer.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mplayer.c	2005-11-10 00:21:58.718750000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 48
+ 
+ STATIC_DCL const char *NDECL(dev_name);
+ STATIC_DCL void FDECL(get_mplname, (struct monst *, char *));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/mthrowu.c NEW/src/mthrowu.c
+--- OLD/src/mthrowu.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/mthrowu.c	2005-11-10 00:22:01.781250000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 49
+ 
+ STATIC_DCL int FDECL(drop_throw,(struct obj *,BOOLEAN_P,int,int));
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/muse.c NEW/src/muse.c
+--- OLD/src/muse.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/muse.c	2005-11-10 00:22:06.984375000 -0500
+@@ -8,6 +8,7 @@
+ 
+ #include "hack.h"
+ #include "edog.h"
++#define RNG_FILE_NUM 50
+ 
+ extern const int monstr[];
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/music.c NEW/src/music.c
+--- OLD/src/music.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/music.c	2005-11-10 00:22:10.312500000 -0500
+@@ -27,6 +27,7 @@
+  */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 51
+ 
+ STATIC_DCL void FDECL(awaken_monsters,(int));
+ STATIC_DCL void FDECL(put_monsters_to_sleep,(int));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/o_init.c NEW/src/o_init.c
+--- OLD/src/o_init.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/o_init.c	2005-11-10 15:49:57.265625000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "lev.h"	/* save & restore info */
++#define RNG_FILE_NUM 52
+ 
+ STATIC_DCL void FDECL(setgemprobs, (d_level*));
+ STATIC_DCL void FDECL(shuffle,(int,int,BOOLEAN_P));
+@@ -84,7 +85,7 @@
+ 	for (j=o_low; j <= o_high; j++) {
+ 		if (objects[j].oc_name_known) continue;
+ 		do
+-			i = j + rn2(o_high-j+1);
++			i = j + rn2U(o_high-j+1);
+ 		while (objects[i].oc_name_known);
+ 		sw = objects[j].oc_descr_idx;
+ 		objects[j].oc_descr_idx = objects[i].oc_descr_idx;
+@@ -138,13 +139,13 @@
+ 		if (oclass == GEM_CLASS) {
+ 			setgemprobs((d_level *)0);
+ 
+-			if (rn2(2)) { /* change turquoise from green to blue? */
++			if (rn2U(2)) { /* change turquoise from green to blue? */
+ 			    COPY_OBJ_DESCR(objects[TURQUOISE],objects[SAPPHIRE]);
+ 			}
+-			if (rn2(2)) { /* change aquamarine from green to blue? */
++			if (rn2U(2)) { /* change aquamarine from green to blue? */
+ 			    COPY_OBJ_DESCR(objects[AQUAMARINE],objects[SAPPHIRE]);
+ 			}
+-			switch (rn2(4)) { /* change fluorite from violet? */
++			switch (rn2U(4)) { /* change fluorite from violet? */
+ 			    case 0:  break;
+ 			    case 1:	/* blue */
+ 				COPY_OBJ_DESCR(objects[FLUORITE],objects[SAPPHIRE]);
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/objnam.c NEW/src/objnam.c
+--- OLD/src/objnam.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/objnam.c	2005-11-10 18:59:35.609375000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 53
+ 
+ /* "an uncursed greased partly eaten guardian naga hatchling [corpse]" */
+ #define PREFIX	80	/* (56) */
+@@ -2729,7 +2730,7 @@
+ 	for(i=first; i<=last; i++)
+ 		sum += objects[i].oc_prob;
+ 	if (!sum) /* all zero */
+-		return first + rn2(last-first+1);
++		return first + rn2S(last-first+1, rng2L(first,last));
+ 	x = rnd(sum);
+ 	for(i=first; i<=last; i++)
+ 		if (objects[i].oc_prob && (x -= objects[i].oc_prob) <= 0)
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/options.c NEW/src/options.c
+--- OLD/src/options.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/options.c	2005-11-10 12:47:29.203125000 -0500
+@@ -15,6 +15,8 @@
+ #include <ctype.h>
+ #endif
+ 
++#define RNG_FILE_NUM 89
++
+ #define WINTYPELEN 16
+ 
+ #ifdef DEFAULT_WC_TILED_MAP
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/pager.c NEW/src/pager.c
+--- OLD/src/pager.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/pager.c	2005-11-10 00:22:29.156250000 -0500
+@@ -7,6 +7,7 @@
+ 
+ #include "hack.h"
+ #include "dlb.h"
++#define RNG_FILE_NUM 54
+ 
+ STATIC_DCL boolean FDECL(is_swallow_sym, (int));
+ STATIC_DCL int FDECL(append_str, (char *, const char *));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/pickup.c NEW/src/pickup.c
+--- OLD/src/pickup.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/pickup.c	2005-11-10 00:22:32.468750000 -0500
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 55
+ 
+ STATIC_DCL void FDECL(simple_look, (struct obj *,BOOLEAN_P));
+ #ifndef GOLDOBJ
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/polyself.c NEW/src/polyself.c
+--- OLD/src/polyself.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/polyself.c	2005-11-10 00:22:39.625000000 -0500
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 56
+ 
+ #ifdef OVLB
+ STATIC_DCL void FDECL(polyman, (const char *,const char *));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/potion.c NEW/src/potion.c
+--- OLD/src/potion.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/potion.c	2005-11-10 00:22:42.750000000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 57
+ 
+ #ifdef OVLB
+ boolean notonhead = FALSE;
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/pray.c NEW/src/pray.c
+--- OLD/src/pray.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/pray.c	2005-11-10 00:22:45.531250000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "epri.h"
++#define RNG_FILE_NUM 58
+ 
+ STATIC_PTR int NDECL(prayer_done);
+ STATIC_DCL struct obj *NDECL(worst_cursed_item);
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/priest.c NEW/src/priest.c
+--- OLD/src/priest.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/priest.c	2005-11-10 00:22:48.656250000 -0500
+@@ -7,6 +7,7 @@
+ #include "eshk.h"
+ #include "epri.h"
+ #include "emin.h"
++#define RNG_FILE_NUM 59
+ 
+ /* this matches the categorizations shown by enlightenment */
+ #define ALGN_SINNED	(-4)	/* worse than strayed */
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/quest.c NEW/src/quest.c
+--- OLD/src/quest.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/quest.c	2005-11-10 00:22:52.359375000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 60
+ 
+ /*  quest dungeon branch routines. */
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/questpgr.c NEW/src/questpgr.c
+--- OLD/src/questpgr.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/questpgr.c	2005-11-10 00:22:54.687500000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "dlb.h"
++#define RNG_FILE_NUM 61
+ 
+ /*  quest-specific pager routines. */
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/read.c NEW/src/read.c
+--- OLD/src/read.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/read.c	2005-11-10 00:22:56.812500000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 62
+ 
+ /* KMH -- Copied from pray.c; this really belongs in a header file */
+ #define DEVOUT 14
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/rect.c NEW/src/rect.c
+--- OLD/src/rect.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/rect.c	2005-11-10 00:22:58.953125000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 63
+ 
+ int FDECL(get_rect_ind, (NhRect *));
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/region.c NEW/src/region.c
+--- OLD/src/region.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/region.c	2005-11-10 00:23:01.562500000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "lev.h"
++#define RNG_FILE_NUM 64
+ 
+ /*
+  * This should really go into the level structure, but
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/restore.c NEW/src/restore.c
+--- OLD/src/restore.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/restore.c	2005-11-10 16:53:40.296875000 -0500
+@@ -445,6 +445,9 @@
+ 
+ 	restnames(fd);
+ 	restore_waterlevel(fd);
++#ifdef SEEDED_GAME
++	restore_rng(fd);
++#endif
+ 	/* must come after all mons & objs are restored */
+ 	relink_timers(FALSE);
+ 	relink_light_sources(FALSE);
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/rnd.c NEW/src/rnd.c
+--- OLD/src/rnd.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/rnd.c	2005-11-10 20:50:34.640625000 -0500
+@@ -1,36 +1,178 @@
+ /*	SCCS Id: @(#)rnd.c	3.4	1996/02/07	*/
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
++#define NEED_VARARGS
+ #include "hack.h"
++#include "lev.h"
+ 
++#define RNG_FILE_NUM 1
++
++/* Always use special internal RNG if playing a duplicate game */
++#ifdef SEEDED_GAME
++#define RND(x,s) (int)(rand_from(s) % (long)(x))
++#else /* SEEDED_GAME */
+ /* "Rand()"s definition is determined by [OS]conf.h */
+ #if defined(LINT) && defined(UNIX)	/* rand() is long... */
+ extern int NDECL(rand);
+-#define RND(x)	(rand() % x)
++#define RND(x,s)	(rand() % x)
+ #else /* LINT */
+ # if defined(UNIX) || defined(RANDOM)
+-#define RND(x)	(int)(Rand() % (long)(x))
++#define RND(x,s)	(int)(Rand() % (long)(x))
+ # else
+ /* Good luck: the bottom order bits are cyclic. */
+-#define RND(x)	(int)((Rand()>>3) % (x))
++#define RND(x,s)	(int)((Rand()>>3) % (x))
+ # endif
+ #endif /* LINT */
++#endif /* SEEDED_GAME */
++
++#ifdef OVL0
++
++int
++rn2U(x)		/* 0 <= rn2(x) < x */
++register int x;
++{
++#ifdef DEBUG
++	if (x <= 0) {
++		impossible("rn2(%d) attempted", x);
++		return(0);
++	}
++	x = RND(x,NULL);
++	return(x);
++#else
++	return(RND(x,NULL));
++#endif
++}
++
++#endif /* OVL0 */
++#ifdef OVLB
++
++int
++rnlU(x)		/* 0 <= rnl(x) < x; sometimes subtracting Luck */
++register int x;	/* good luck approaches 0, bad luck approaches (x-1) */
++{
++	register int i;
++
++#ifdef DEBUG
++	if (x <= 0) {
++		impossible("rnl(%d) attempted", x);
++		return(0);
++	}
++#endif
++	i = RND(x,NULL);
++
++	if (Luck && rn2U(50 - Luck)) {
++	    i -= (x <= 15 && Luck >= -5 ? Luck/3 : Luck);
++	    if (i < 0) i = 0;
++	    else if (i >= x) i = x-1;
++	}
++
++	return i;
++}
++
++#endif /* OVLB */
++#ifdef OVL0
++
++int
++rndU(x)		/* 1 <= rnd(x) <= x */
++register int x;
++{
++#ifdef DEBUG
++	if (x <= 0) {
++		impossible("rnd(%d) attempted", x);
++		return(1);
++	}
++	x = RND(x,NULL)+1;
++	return(x);
++#else
++	return(RND(x,NULL)+1);
++#endif
++}
++
++#endif /* OVL0 */
++#ifdef OVL1
++
++int
++dU(n,x)		/* n <= d(n,x) <= (n*x) */
++register int n, x;
++{
++	register int tmp = n;
++
++#ifdef DEBUG
++	if (x < 0 || n < 0 || (x == 0 && n != 0)) {
++		impossible("d(%d,%d) attempted", n, x);
++		return(1);
++	}
++#endif
++	while(n--) tmp += RND(x,NULL);
++	return(tmp); /* Alea iacta est. -- J.C. */
++}
++
++#endif /* OVL1 */
++#ifdef OVLB
++
++int
++rneU(x)
++register int x;
++{
++	register int tmp, utmp;
++
++	utmp = (u.ulevel < 15) ? 5 : u.ulevel/3;
++	tmp = 1;
++	while (tmp < utmp && !rn2U(x))
++		tmp++;
++	return tmp;
++
++	/* was:
++	 *	tmp = 1;
++	 *	while(!rn2(x)) tmp++;
++	 *	return(min(tmp,(u.ulevel < 15) ? 5 : u.ulevel/3));
++	 * which is clearer but less efficient and stands a vanishingly
++	 * small chance of overflowing tmp
++	 */
++}
++
++int
++rnzU(i)
++int i;
++{
++#ifdef LINT
++	int x = i;
++	int tmp = 1000;
++#else
++	register long x = i;
++	register long tmp = 1000;
++#endif
++	tmp += rn2U(1000);
++	tmp *= rneU(4);
++	if (rn2U(2)) { x *= tmp; x /= 1000; }
++	else { x *= 1000; x /= tmp; }
++	return((int)x);
++}
++
++#endif /* OVLB */
++
++
++
++/* Seeded versions of these same functions */
++
++#ifdef SEEDED_GAME
+ 
+ #ifdef OVL0
+ 
+ int
+-rn2(x)		/* 0 <= rn2(x) < x */
++rn2S(x,s)		/* 0 <= rn2(x) < x */
+ register int x;
++rng_state *s;
+ {
+ #ifdef DEBUG
+ 	if (x <= 0) {
+ 		impossible("rn2(%d) attempted", x);
+ 		return(0);
+ 	}
+-	x = RND(x);
++	x = RND(x,s);
+ 	return(x);
+ #else
+-	return(RND(x));
++	return(RND(x,s));
+ #endif
+ }
+ 
+@@ -38,10 +180,12 @@
+ #ifdef OVLB
+ 
+ int
+-rnl(x)		/* 0 <= rnl(x) < x; sometimes subtracting Luck */
++rnlS(x,s)		/* 0 <= rnl(x) < x; sometimes subtracting Luck */
+ register int x;	/* good luck approaches 0, bad luck approaches (x-1) */
++rng_state *s;
+ {
+ 	register int i;
++	register int use_luck;
+ 
+ #ifdef DEBUG
+ 	if (x <= 0) {
+@@ -49,9 +193,10 @@
+ 		return(0);
+ 	}
+ #endif
+-	i = RND(x);
++	i = RND(x,NULL);
++	use_luck = rn2S(50-Luck,s);
+ 
+-	if (Luck && rn2(50 - Luck)) {
++	if (Luck && use_luck) {
+ 	    i -= (x <= 15 && Luck >= -5 ? Luck/3 : Luck);
+ 	    if (i < 0) i = 0;
+ 	    else if (i >= x) i = x-1;
+@@ -64,18 +209,19 @@
+ #ifdef OVL0
+ 
+ int
+-rnd(x)		/* 1 <= rnd(x) <= x */
++rndS(x,s)		/* 1 <= rnd(x) <= x */
+ register int x;
++rng_state *s;
+ {
+ #ifdef DEBUG
+ 	if (x <= 0) {
+ 		impossible("rnd(%d) attempted", x);
+ 		return(1);
+ 	}
+-	x = RND(x)+1;
++	x = RND(x,s)+1;
+ 	return(x);
+ #else
+-	return(RND(x)+1);
++	return(RND(x,s)+1);
+ #endif
+ }
+ 
+@@ -83,8 +229,9 @@
+ #ifdef OVL1
+ 
+ int
+-d(n,x)		/* n <= d(n,x) <= (n*x) */
++dS(n,x,s)		/* n <= d(n,x) <= (n*x) */
+ register int n, x;
++rng_state *s;
+ {
+ 	register int tmp = n;
+ 
+@@ -94,7 +241,7 @@
+ 		return(1);
+ 	}
+ #endif
+-	while(n--) tmp += RND(x);
++	while(n--) tmp += RND(x,s);
+ 	return(tmp); /* Alea iacta est. -- J.C. */
+ }
+ 
+@@ -102,14 +249,15 @@
+ #ifdef OVLB
+ 
+ int
+-rne(x)
++rneS(x,s)
+ register int x;
++rng_state *s;
+ {
+ 	register int tmp, utmp;
+ 
+ 	utmp = (u.ulevel < 15) ? 5 : u.ulevel/3;
+ 	tmp = 1;
+-	while (tmp < utmp && !rn2(x))
++	while (tmp < utmp && !rn2S(x,s))
+ 		tmp++;
+ 	return tmp;
+ 
+@@ -123,8 +271,9 @@
+ }
+ 
+ int
+-rnz(i)
++rnzS(i,s)
+ int i;
++rng_state *s;
+ {
+ #ifdef LINT
+ 	int x = i;
+@@ -133,13 +282,669 @@
+ 	register long x = i;
+ 	register long tmp = 1000;
+ #endif
+-	tmp += rn2(1000);
+-	tmp *= rne(4);
+-	if (rn2(2)) { x *= tmp; x /= 1000; }
++	tmp += rn2S(1000,s);
++	tmp *= rneS(4,s);
++	if (rn2S(2,s)) { x *= tmp; x /= 1000; }
+ 	else { x *= 1000; x /= tmp; }
+ 	return((int)x);
+ }
+ 
+ #endif /* OVLB */
+ 
++
++/* Variables for keeping track of random number generation state */
++#define KEYLENGTH (16/sizeof(int))
++#define SALTSIZE 16
++
++static char salt[SALTSIZE];
++
++struct rng_node {
++	rng_state value;
++	struct rng_node *next;
++};
++typedef struct rng_node rng_node;
++
++static unsigned hash_size = 0,
++                hash_size_log2 = 0,
++                hash_mask = 0,
++                hash_entries = 0;
++static rng_node **rng_hash_table = NULL;
++
++static rng_state *rng_lookup(int *key);
++static rng_state init_rng(int *key);
++static void init_hash(void);
++static void expand_rng_table(void);
++
++
++/* MD5 hash stuff. (This should probably be cut out and replaced with a lighter
++ * algorithm). */
++typedef struct md5_state_s {
++    unsigned int count[2];	/* message length in bits, lsw first */
++    unsigned int abcd[4];		/* digest buffer */
++    unsigned char buf[64];		/* accumulate block */
++} md5_state_t;
++void md5_init(md5_state_t *pms);
++void md5_append(md5_state_t *pms, const unsigned char *data, int nbytes);
++void md5_finish(md5_state_t *pms, unsigned char digest[16]);
++
++static int seeded = 0;
++
++int
++rng_is_seeded(void)
++{
++	return seeded;
++}
++
++/* Convert a string into 16 bytes to use for the RNG */
++void
++set_rng_seed(string)
++	char *string;
++{
++	char *strpos = string;
++	int saltpos = 0;
++	
++	seeded = 1;
++	memset(salt, 0, SALTSIZE);
++	while(*strpos) {
++		salt[saltpos++] += *(strpos++);
++		if(saltpos >= SALTSIZE)
++			saltpos = 0;
++	}
++}
++
++
++/* Hash together all the arguments, salt them, and return an RNG uniquely
++ * identified by that result. */
++rng_state *
++rng_from VA_DECL(int, numParams)
++	int md5size; 
++	int nums[32];;
++	int ii;
++	md5_state_t md5state;
++	char digest[16];
++	
++	if(!seeded)
++		return NULL;
++	
++	md5size = SALTSIZE + sizeof(int) * numParams;
++	
++	VA_START(numParams);
++	
++	/* Collect the arguments */
++	va_start(the_args, numParams);
++	for(ii=0; ii<numParams; ii++) {
++		VA_NEXT(nums[ii], int);
++	}
++	VA_END();
++	
++	memcpy(nums+ii, salt, SALTSIZE);
++	
++	/* MD5 them */
++	md5_init(&md5state);
++	md5_append(&md5state, (char*)nums, md5size);
++	md5_finish(&md5state, digest);
++	
++	return rng_lookup((int*)digest);
++}
++
++void
++init_hash()
++{
++	hash_size = 64;
++	hash_entries = 0;
++	hash_size_log2 = 6;
++	hash_mask = 0x3F;
++	rng_hash_table = (rng_node**)malloc(sizeof(rng_node*)*hash_size);
++	memset(rng_hash_table, 0, sizeof(rng_node*)*hash_size);
++}
++
++void
++expand_rng_table()
++{
++	unsigned old_size = hash_size;
++	unsigned move_mask = 1 << hash_size_log2;
++	int ii;
++	rng_node **prev_ptr, *next;
++	
++	hash_mask = 2*hash_mask + 1;
++	hash_size *= 2;
++	hash_size_log2++;
++	
++	rng_hash_table = (rng_node**)realloc(rng_hash_table,
++	                    sizeof(rng_node*) * hash_size);
++	for(ii=old_size; ii<hash_size; ii++)
++		rng_hash_table[ii] = NULL;
++	for(ii=0; ii<old_size; ii++) {
++		prev_ptr = &rng_hash_table[ii];
++		while(*prev_ptr) {
++			if( ((*prev_ptr)->value.key[0] & move_mask) ) {
++				next = (*prev_ptr)->next;
++				(*prev_ptr)->next = rng_hash_table[ii+old_size];
++				rng_hash_table[ii+old_size] = *prev_ptr;
++				*prev_ptr = next;
++			} else {
++				prev_ptr = &((*prev_ptr)->next);
++			}
++		}
++	}
++}
++
++rng_state*
++rng_lookup(key)
++	int *key;
++{
++	int ii, match;
++	rng_node *pos, *newnode;
++	unsigned start;
++	
++	if(!rng_hash_table)
++		init_hash();
++	
++	start = key[0] & hash_mask;
++	pos = rng_hash_table[start];
++	
++	while(pos)
++	{
++		match = 1;
++		for(ii=0; ii<KEYLENGTH; ii++) {
++			if(pos->value.key[ii] != key[ii]) {
++				match = 0;
++				break;
++			}
++		}
++		if(match) {
++			return &(pos->value);
++		}
++		pos = pos->next;
++	}
++	
++	newnode = (rng_node*)malloc(sizeof(rng_node));
++	memcpy(newnode->value.key, key, KEYLENGTH*sizeof(int));
++	newnode->value = init_rng(key);
++	newnode->next = rng_hash_table[start];
++	rng_hash_table[start] = newnode;
++	hash_entries++;
++	
++	if(hash_entries > 2*hash_size)
++		expand_rng_table();
++	
++	return &(newnode->value);
++}
++
++
++rng_state
++init_rng(key)
++	int *key;
++{
++	rng_state ret;
++	memcpy(ret.key, key, 4*sizeof(int));
++	ret.offset = 0;
++	return ret;
++}
++
++int rand_from(RNG)
++	rng_state *RNG;
++{
++	int ret;
++	if(RNG) {
++		ret = (RNG->key[0] + RNG->offset*16807) % 2147483647;
++		RNG->offset++;
++		return ret ^ (ret>>16);
++	} else {
++		return Rand();
++	}
++}
++
++
++void
++save_rng(fd,mode)
++	int fd;
++	int mode;
++{
++	int ii;
++	int vals_written = 0;
++	rng_node *pos, *next;
++	
++	bwrite(fd, (genericptr_t)&seeded, sizeof seeded);
++	if(!seeded)
++	    return;
++	
++	bwrite(fd, (genericptr_t)salt, SALTSIZE);
++	bwrite(fd, (genericptr_t)&hash_entries, sizeof hash_entries);
++	
++	for(ii=0; ii<hash_size; ii++)
++	{
++	    pos = rng_hash_table[ii];
++	    while(pos) {
++	        vals_written++;
++	        bwrite(fd, (genericptr_t)&(pos->value), sizeof pos->value);
++	        pos = pos->next;
++	    }
+
+
++	}
++	
++	if(release_data(mode))
++	{
++	    for(ii=0; ii<hash_size; ii++)
++	    {
++	        pos = rng_hash_table[ii];
++	        while(pos) {
++	            next = pos->next;
++	            free(pos);
++	            pos = next;
++	        }
++	    }
++	    free(rng_hash_table);
++	    rng_hash_table = NULL;
++	}
++}
++
++
++void
++restore_rng(fd)
++	int fd;
++{
++	int ii;
++	int entries;
++	
++	mread(fd, (genericptr_t)&seeded, sizeof seeded);
++	if(!seeded)
++	    return;
++	
++	mread(fd, (genericptr_t)salt, SALTSIZE);
++	mread(fd, (genericptr_t)&entries, sizeof entries);
++	
++	for(ii=0; ii<entries; ii++)
++	{
++		rng_state v;
++		mread(fd, (genericptr_t)&v, sizeof v);
++		rng_lookup(v.key)->offset = v.offset;
++	}
++}
++
++/*
++ * MD5 hash algorithm, for generating RNG seeds
++ * Modified for context, but still a mismatch.
++ */
++
++/****************************************************************************/
++/*
++  Copyright (C) 1999, 2000, 2002 Aladdin Enterprises.  All rights reserved.
++
++  This software is provided 'as-is', without any express or implied
++  warranty.  In no event will the authors be held liable for any damages
++  arising from the use of this software.
++
++  Permission is granted to anyone to use this software for any purpose,
++  including commercial applications, and to alter it and redistribute it
++  freely, subject to the following restrictions:
++
++  1. The origin of this software must not be misrepresented; you must not
++     claim that you wrote the original software. If you use this software
++     in a product, an acknowledgment in the product documentation would be
++     appreciated but is not required.
++  2. Altered source versions must be plainly marked as such, and must not be
++     misrepresented as being the original software.
++  3. This notice may not be removed or altered from any source distribution.
++
++  L. Peter Deutsch
++  ghost@aladdin.com
++
++ */
++/*
++  Independent implementation of MD5 (RFC 1321).
++
++  This code implements the MD5 Algorithm defined in RFC 1321, whose
++  text is available at
++	http://www.ietf.org/rfc/rfc1321.txt
++  The code is derived from the text of the RFC, including the test suite
++  (section A.5) but excluding the rest of Appendix A.  It does not include
++  any code or documentation that is identified in the RFC as being
++  copyrighted.
++
++  The original and principal author of md5.c is L. Peter Deutsch
++  <ghost@aladdin.com>.  Other authors are noted in the change history
++  that follows (in reverse chronological order):
++
++  2002-04-13 lpd Clarified derivation from RFC 1321; now handles byte order
++	either statically or dynamically; added missing #include <string.h>
++	in library.
++  2002-03-11 lpd Corrected argument list for main(), and added int return
++	type, in test program and T value program.
++  2002-02-21 lpd Added missing #include <stdio.h> in test program.
++  2000-07-03 lpd Patched to eliminate warnings about "constant is
++	unsigned in ANSI C, signed in traditional"; made test program
++	self-checking.
++  1999-11-04 lpd Edited comments slightly for automatic TOC extraction.
++  1999-10-18 lpd Fixed typo in header comment (ansi2knr rather than md5).
++  1999-05-03 lpd Original version.
++ */
++
++#undef BYTE_ORDER	/* 1 = big-endian, -1 = little-endian, 0 = unknown */
++#ifdef ARCH_IS_BIG_ENDIAN
++#  define BYTE_ORDER (ARCH_IS_BIG_ENDIAN ? 1 : -1)
++#else
++#  define BYTE_ORDER 0
++#endif
++
++#define T_MASK ((unsigned int)~0)
++#define T1 /* 0xd76aa478 */ (T_MASK ^ 0x28955b87)
++#define T2 /* 0xe8c7b756 */ (T_MASK ^ 0x173848a9)
++#define T3    0x242070db
++#define T4 /* 0xc1bdceee */ (T_MASK ^ 0x3e423111)
++#define T5 /* 0xf57c0faf */ (T_MASK ^ 0x0a83f050)
++#define T6    0x4787c62a
++#define T7 /* 0xa8304613 */ (T_MASK ^ 0x57cfb9ec)
++#define T8 /* 0xfd469501 */ (T_MASK ^ 0x02b96afe)
++#define T9    0x698098d8
++#define T10 /* 0x8b44f7af */ (T_MASK ^ 0x74bb0850)
++#define T11 /* 0xffff5bb1 */ (T_MASK ^ 0x0000a44e)
++#define T12 /* 0x895cd7be */ (T_MASK ^ 0x76a32841)
++#define T13    0x6b901122
++#define T14 /* 0xfd987193 */ (T_MASK ^ 0x02678e6c)
++#define T15 /* 0xa679438e */ (T_MASK ^ 0x5986bc71)
++#define T16    0x49b40821
++#define T17 /* 0xf61e2562 */ (T_MASK ^ 0x09e1da9d)
++#define T18 /* 0xc040b340 */ (T_MASK ^ 0x3fbf4cbf)
++#define T19    0x265e5a51
++#define T20 /* 0xe9b6c7aa */ (T_MASK ^ 0x16493855)
++#define T21 /* 0xd62f105d */ (T_MASK ^ 0x29d0efa2)
++#define T22    0x02441453
++#define T23 /* 0xd8a1e681 */ (T_MASK ^ 0x275e197e)
++#define T24 /* 0xe7d3fbc8 */ (T_MASK ^ 0x182c0437)
++#define T25    0x21e1cde6
++#define T26 /* 0xc33707d6 */ (T_MASK ^ 0x3cc8f829)
++#define T27 /* 0xf4d50d87 */ (T_MASK ^ 0x0b2af278)
++#define T28    0x455a14ed
++#define T29 /* 0xa9e3e905 */ (T_MASK ^ 0x561c16fa)
++#define T30 /* 0xfcefa3f8 */ (T_MASK ^ 0x03105c07)
++#define T31    0x676f02d9
++#define T32 /* 0x8d2a4c8a */ (T_MASK ^ 0x72d5b375)
++#define T33 /* 0xfffa3942 */ (T_MASK ^ 0x0005c6bd)
++#define T34 /* 0x8771f681 */ (T_MASK ^ 0x788e097e)
++#define T35    0x6d9d6122
++#define T36 /* 0xfde5380c */ (T_MASK ^ 0x021ac7f3)
++#define T37 /* 0xa4beea44 */ (T_MASK ^ 0x5b4115bb)
++#define T38    0x4bdecfa9
++#define T39 /* 0xf6bb4b60 */ (T_MASK ^ 0x0944b49f)
++#define T40 /* 0xbebfbc70 */ (T_MASK ^ 0x4140438f)
++#define T41    0x289b7ec6
++#define T42 /* 0xeaa127fa */ (T_MASK ^ 0x155ed805)
++#define T43 /* 0xd4ef3085 */ (T_MASK ^ 0x2b10cf7a)
++#define T44    0x04881d05
++#define T45 /* 0xd9d4d039 */ (T_MASK ^ 0x262b2fc6)
++#define T46 /* 0xe6db99e5 */ (T_MASK ^ 0x1924661a)
++#define T47    0x1fa27cf8
++#define T48 /* 0xc4ac5665 */ (T_MASK ^ 0x3b53a99a)
++#define T49 /* 0xf4292244 */ (T_MASK ^ 0x0bd6ddbb)
++#define T50    0x432aff97
++#define T51 /* 0xab9423a7 */ (T_MASK ^ 0x546bdc58)
++#define T52 /* 0xfc93a039 */ (T_MASK ^ 0x036c5fc6)
++#define T53    0x655b59c3
++#define T54 /* 0x8f0ccc92 */ (T_MASK ^ 0x70f3336d)
++#define T55 /* 0xffeff47d */ (T_MASK ^ 0x00100b82)
++#define T56 /* 0x85845dd1 */ (T_MASK ^ 0x7a7ba22e)
++#define T57    0x6fa87e4f
++#define T58 /* 0xfe2ce6e0 */ (T_MASK ^ 0x01d3191f)
++#define T59 /* 0xa3014314 */ (T_MASK ^ 0x5cfebceb)
++#define T60    0x4e0811a1
++#define T61 /* 0xf7537e82 */ (T_MASK ^ 0x08ac817d)
++#define T62 /* 0xbd3af235 */ (T_MASK ^ 0x42c50dca)
++#define T63    0x2ad7d2bb
++#define T64 /* 0xeb86d391 */ (T_MASK ^ 0x14792c6e)
++
++
++static void
++md5_process(md5_state_t *pms, const unsigned char *data /*[64]*/)
++{
++    unsigned int
++	a = pms->abcd[0], b = pms->abcd[1],
++	c = pms->abcd[2], d = pms->abcd[3];
++    unsigned int t;
++#if BYTE_ORDER > 0
++    /* Define storage only for big-endian CPUs. */
++    unsigned int X[16];
++#else
++    /* Define storage for little-endian or both types of CPUs. */
++    unsigned int xbuf[16];
++    const unsigned int *X;
++#endif
++
++    {
++#if BYTE_ORDER == 0
++	/*
++	 * Determine dynamically whether this is a big-endian or
++	 * little-endian machine, since we can use a more efficient
++	 * algorithm on the latter.
++	 */
++	static const int w = 1;
++
++	if (*((const unsigned char*)&w)) /* dynamic little-endian */
++#endif
++#if BYTE_ORDER <= 0		/* little-endian */
++	{
++	    /*
++	     * On little-endian machines, we can process properly aligned
++	     * data without copying it.
++	     */
++	    if (!((data - (const unsigned char*)0) & 3)) {
++		/* data are properly aligned */
++		X = (const unsigned int *)data;
++	    } else {
++		/* not aligned */
++		memcpy(xbuf, data, 64);
++		X = xbuf;
++	    }
++	}
++#endif
++#if BYTE_ORDER == 0
++	else			/* dynamic big-endian */
++#endif
++#if BYTE_ORDER >= 0		/* big-endian */
++	{
++	    /*
++	     * On big-endian machines, we must arrange the bytes in the
++	     * right order.
++	     */
++	    const unsigned char *xp = data;
++	    int i;
++
++#  if BYTE_ORDER == 0
++	    X = xbuf;		/* (dynamic only) */
++#  else
++#    define xbuf X		/* (static only) */
++#  endif
++	    for (i = 0; i < 16; ++i, xp += 4)
++		xbuf[i] = xp[0] + (xp[1] << 8) + (xp[2] << 16) + (xp[3] << 24);
++	}
++#endif
++    }
++
++#define ROTATE_LEFT(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
++
++    /* Round 1. */
++    /* Let [abcd k s i] denote the operation
+
++       a = b + ((a + F(b,c,d) + X[k] + T[i]) <<< s). */
++#define F(x, y, z) (((x) & (y)) | (~(x) & (z)))
++#define SET(a, b, c, d, k, s, Ti)\
++  t = a + F(b,c,d) + X[k] + Ti;\
++  a = ROTATE_LEFT(t, s) + b
++    /* Do the following 16 operations. */
++    SET(a, b, c, d,  0,  7,  T1);
++    SET(d, a, b, c,  1, 12,  T2);
++    SET(c, d, a, b,  2, 17,  T3);
++    SET(b, c, d, a,  3, 22,  T4);
++    SET(a, b, c, d,  4,  7,  T5);
++    SET(d, a, b, c,  5, 12,  T6);
++    SET(c, d, a, b,  6, 17,  T7);
++    SET(b, c, d, a,  7, 22,  T8);
++    SET(a, b, c, d,  8,  7,  T9);
++    SET(d, a, b, c,  9, 12, T10);
++    SET(c, d, a, b, 10, 17, T11);
++    SET(b, c, d, a, 11, 22, T12);
++    SET(a, b, c, d, 12,  7, T13);
++    SET(d, a, b, c, 13, 12, T14);
++    SET(c, d, a, b, 14, 17, T15);
++    SET(b, c, d, a, 15, 22, T16);
++#undef SET
++
++     /* Round 2. */
++     /* Let [abcd k s i] denote the operation
++          a = b + ((a + G(b,c,d) + X[k] + T[i]) <<< s). */
++#define G(x, y, z) (((x) & (z)) | ((y) & ~(z)))
++#define SET(a, b, c, d, k, s, Ti)\
++  t = a + G(b,c,d) + X[k] + Ti;\
++  a = ROTATE_LEFT(t, s) + b
++     /* Do the following 16 operations. */
++    SET(a, b, c, d,  1,  5, T17);
++    SET(d, a, b, c,  6,  9, T18);
++    SET(c, d, a, b, 11, 14, T19);
++    SET(b, c, d, a,  0, 20, T20);
++    SET(a, b, c, d,  5,  5, T21);
++    SET(d, a, b, c, 10,  9, T22);
++    SET(c, d, a, b, 15, 14, T23);
++    SET(b, c, d, a,  4, 20, T24);
++    SET(a, b, c, d,  9,  5, T25);
++    SET(d, a, b, c, 14,  9, T26);
++    SET(c, d, a, b,  3, 14, T27);
++    SET(b, c, d, a,  8, 20, T28);
++    SET(a, b, c, d, 13,  5, T29);
++    SET(d, a, b, c,  2,  9, T30);
++    SET(c, d, a, b,  7, 14, T31);
++    SET(b, c, d, a, 12, 20, T32);
++#undef SET
++
++     /* Round 3. */
++     /* Let [abcd k s t] denote the operation
++          a = b + ((a + H(b,c,d) + X[k] + T[i]) <<< s). */
++#define H(x, y, z) ((x) ^ (y) ^ (z))
++#define SET(a, b, c, d, k, s, Ti)\
++  t = a + H(b,c,d) + X[k] + Ti;\
++  a = ROTATE_LEFT(t, s) + b
++     /* Do the following 16 operations. */
++    SET(a, b, c, d,  5,  4, T33);
++    SET(d, a, b, c,  8, 11, T34);
++    SET(c, d, a, b, 11, 16, T35);
++    SET(b, c, d, a, 14, 23, T36);
++    SET(a, b, c, d,  1,  4, T37);
++    SET(d, a, b, c,  4, 11, T38);
++    SET(c, d, a, b,  7, 16, T39);
++    SET(b, c, d, a, 10, 23, T40);
++    SET(a, b, c, d, 13,  4, T41);
++    SET(d, a, b, c,  0, 11, T42);
++    SET(c, d, a, b,  3, 16, T43);
++    SET(b, c, d, a,  6, 23, T44);
++    SET(a, b, c, d,  9,  4, T45);
++    SET(d, a, b, c, 12, 11, T46);
++    SET(c, d, a, b, 15, 16, T47);
++    SET(b, c, d, a,  2, 23, T48);
++#undef SET
++
++     /* Round 4. */
++     /* Let [abcd k s t] denote the operation
++          a = b + ((a + I(b,c,d) + X[k] + T[i]) <<< s). */
++#define I(x, y, z) ((y) ^ ((x) | ~(z)))
++#define SET(a, b, c, d, k, s, Ti)\
++  t = a + I(b,c,d) + X[k] + Ti;\
++  a = ROTATE_LEFT(t, s) + b
++     /* Do the following 16 operations. */
++    SET(a, b, c, d,  0,  6, T49);
++    SET(d, a, b, c,  7, 10, T50);
++    SET(c, d, a, b, 14, 15, T51);
++    SET(b, c, d, a,  5, 21, T52);
++    SET(a, b, c, d, 12,  6, T53);
++    SET(d, a, b, c,  3, 10, T54);
++    SET(c, d, a, b, 10, 15, T55);
++    SET(b, c, d, a,  1, 21, T56);
++    SET(a, b, c, d,  8,  6, T57);
++    SET(d, a, b, c, 15, 10, T58);
++    SET(c, d, a, b,  6, 15, T59);
++    SET(b, c, d, a, 13, 21, T60);
++    SET(a, b, c, d,  4,  6, T61);
++    SET(d, a, b, c, 11, 10, T62);
++    SET(c, d, a, b,  2, 15, T63);
++    SET(b, c, d, a,  9, 21, T64);
++#undef SET
++
++     /* Then perform the following additions. (That is increment each
++        of the four registers by the value it had before this block
++        was started.) */
++    pms->abcd[0] += a;
++    pms->abcd[1] += b;
++    pms->abcd[2] += c;
++    pms->abcd[3] += d;
++}
++
++void
++md5_init(md5_state_t *pms)
++{
++    pms->count[0] = pms->count[1] = 0;
++    pms->abcd[0] = 0x67452301;
++    pms->abcd[1] = /*0xefcdab89*/ T_MASK ^ 0x10325476;
++    pms->abcd[2] = /*0x98badcfe*/ T_MASK ^ 0x67452301;
++    pms->abcd[3] = 0x10325476;
++}
++
++void
++md5_append(md5_state_t *pms, const unsigned char *data, int nbytes)
++{
++    const unsigned char *p = data;
++    int left = nbytes;
++    int offset = (pms->count[0] >> 3) & 63;
++    unsigned int nbits = (unsigned int)(nbytes << 3);
++
++    if (nbytes <= 0)
++	return;
++
++    /* Update the message length. */
++    pms->count[1] += nbytes >> 29;
++    pms->count[0] += nbits;
++    if (pms->count[0] < nbits)
++	pms->count[1]++;
++
++    /* Process an initial partial block. */
++    if (offset) {
++	int copy = (offset + nbytes > 64 ? 64 - offset : nbytes);
++
++	memcpy(pms->buf + offset, p, copy);
++	if (offset + copy < 64)
++	    return;
++	p += copy;
++	left -= copy;
++	md5_process(pms, pms->buf);
++    }
++
++    /* Process full blocks. */
++    for (; left >= 64; p += 64, left -= 64)
++	md5_process(pms, p);
++
++    /* Process a final partial block. */
++    if (left)
++	memcpy(pms->buf, p, left);
++}
++
++void
++md5_finish(md5_state_t *pms, unsigned char digest[16])
++{
++    static const unsigned char pad[64] = {
++	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
++    };
++    unsigned char data[8];
++    int i;
++
++    /* Save the length before padding. */
++    for (i = 0; i < 8; ++i)
++	data[i] = (unsigned char)(pms->count[i >> 2] >> ((i & 3) << 3));
++    /* Pad to 56 bytes mod 64. */
++    md5_append(pms, pad, ((55 - (pms->count[0] >> 3)) & 63) + 1);
++    /* Append the length. */
++    md5_append(pms, data, 8);
++    for (i = 0; i < 16; ++i)
++	digest[i] = (unsigned char)(pms->abcd[i >> 2] >> ((i & 3) << 3));
++}
++
++#endif /* SEEDED_GAME */
++
+ /*rnd.c*/
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/role.c NEW/src/role.c
+--- OLD/src/role.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/role.c	2005-11-10 13:29:56.984375000 -0500
+@@ -3,7 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
+-
++#define RNG_FILE_NUM 65
+ 
+ /*** Table of all roles ***/
+ /* According to AD&D, HD for some classes (ex. Wizard) should be smaller
+@@ -521,7 +521,7 @@
+ int
+ randrole()
+ {
+-	return (rn2(SIZE(roles)-1));
++	return (rn2U(SIZE(roles)-1));
+ }
+ 
+ 
+@@ -581,7 +581,7 @@
+ 
+ 	/* Pick a random race */
+ 	/* Use a factor of 100 in case of bad random number generators */
+-	if (n) n = rn2(n*100)/100;
++	if (n) n = rn2U(n*100)/100;
+ 	for (i = 0; races[i].noun; i++)
+ 	    if (roles[rolenum].allow & races[i].allow & ROLE_RACEMASK) {
+ 	    	if (n) n--;
+@@ -589,7 +589,7 @@
+ 	    }
+ 
+ 	/* This role has no permitted races? */
+-	return (rn2(SIZE(races)-1));
++	return (rn2U(SIZE(races)-1));
+ }
+ 
+ 
+@@ -647,7 +647,7 @@
+ 	    	n++;
+ 
+ 	/* Pick a random gender */
+-	if (n) n = rn2(n);
++	if (n) n = rn2U(n);
+ 	for (i = 0; i < ROLE_GENDERS; i++)
+ 	    if (roles[rolenum].allow & races[racenum].allow &
+ 	    		genders[i].allow & ROLE_GENDMASK) {
+@@ -656,7 +656,7 @@
+ 	    }
+ 
+ 	/* This role/race has no permitted genders? */
+-	return (rn2(ROLE_GENDERS));
++	return (rn2U(ROLE_GENDERS));
+ }
+ 
+ 
+@@ -713,7 +713,7 @@
+ 	    	n++;
+ 
+ 	/* Pick a random alignment */
+-	if (n) n = rn2(n);
++	if (n) n = rn2U(n);
+ 	for (i = 0; i < ROLE_ALIGNS; i++)
+ 	    if (roles[rolenum].allow & races[racenum].allow &
+ 	    		aligns[i].allow & ROLE_ALIGNMASK) {
+@@ -722,7 +722,7 @@
+ 	    }
+ 
+ 	/* This role/race has no permitted alignments? */
+-	return (rn2(ROLE_ALIGNS));
++	return (rn2U(ROLE_ALIGNS));
+ }
+ 
+ 
+@@ -808,7 +808,7 @@
+     }
+     if (roles_ok == 0 || (roles_ok > 1 && pickhow == PICK_RIGID))
+ 	return ROLE_NONE;
+-    roles_ok = rn2(roles_ok);
++    roles_ok = rn2U(roles_ok);
+     for (i = 0; i < SIZE(roles)-1; i++) {
+ 	if (ok_role(i, racenum, gendnum, alignnum)) {
+ 	    if (roles_ok == 0)
+@@ -874,7 +874,7 @@
+     }
+     if (races_ok == 0 || (races_ok > 1 && pickhow == PICK_RIGID))
+ 	return ROLE_NONE;
+
+-    races_ok = rn2(races_ok);
++    races_ok = rn2U(races_ok);
+     for (i = 0; i < SIZE(races)-1; i++) {
+ 	if (ok_race(rolenum, i, gendnum, alignnum)) {
+ 	    if (races_ok == 0)
+@@ -936,7 +936,7 @@
+     }
+     if (gends_ok == 0 || (gends_ok > 1 && pickhow == PICK_RIGID))
+ 	return ROLE_NONE;
+-    gends_ok = rn2(gends_ok);
++    gends_ok = rn2U(gends_ok);
+     for (i = 0; i < ROLE_GENDERS; i++) {
+ 	if (ok_gend(rolenum, racenum, i, alignnum)) {
+ 	    if (gends_ok == 0)
+@@ -998,7 +998,7 @@
+     }
+     if (aligns_ok == 0 || (aligns_ok > 1 && pickhow == PICK_RIGID))
+ 	return ROLE_NONE;
+-    aligns_ok = rn2(aligns_ok);
++    aligns_ok = rn2U(aligns_ok);
+     for (i = 0; i < ROLE_ALIGNS; i++) {
+ 	if (ok_align(rolenum, racenum, gendnum, i)) {
+ 	    if (aligns_ok == 0)
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/rumors.c NEW/src/rumors.c
+--- OLD/src/rumors.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/rumors.c	2005-11-10 00:23:34.203125000 -0500
+@@ -5,6 +5,7 @@
+ #include "hack.h"
+ #include "lev.h"
+ #include "dlb.h"
++#define RNG_FILE_NUM 66
+ 
+ /*	[note: this comment is fairly old, but still accurate for 3.1]
+  * Rumors have been entirely rewritten to speed up the access.  This is
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/save.c NEW/src/save.c
+--- OLD/src/save.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/save.c	2005-11-10 16:53:31.828125000 -0500
+@@ -319,6 +319,9 @@
+ 	savefruitchn(fd, mode);
+ 	savenames(fd, mode);
+ 	save_waterlevel(fd, mode);
++#ifdef SEEDED_GAME
++	save_rng(fd, mode);
++#endif
+ 	bflush(fd);
+ }
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/shk.c NEW/src/shk.c
+--- OLD/src/shk.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/shk.c	2005-11-10 00:23:48.343750000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "eshk.h"
++#define RNG_FILE_NUM 67
+ 
+ /*#define DEBUG*/
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/shknam.c NEW/src/shknam.c
+--- OLD/src/shknam.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/shknam.c	2005-11-10 00:23:52.625000000 -0500
+@@ -6,6 +6,7 @@
+ 
+ #include "hack.h"
+ #include "eshk.h"
++#define RNG_FILE_NUM 68
+ 
+ #ifndef OVLB
+ extern const struct shclass shtypes[];
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/sit.c NEW/src/sit.c
+--- OLD/src/sit.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/sit.c	2005-11-10 00:23:55.156250000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "artifact.h"
++#define RNG_FILE_NUM 69
+ 
+ void
+ take_gold()
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/sounds.c NEW/src/sounds.c
+--- OLD/src/sounds.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/sounds.c	2005-11-10 00:24:00.640625000 -0500
+@@ -9,6 +9,7 @@
+ #include <regex.h>
+ # endif
+ #endif
++#define RNG_FILE_NUM 70
+ 
+ #ifdef OVLB
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/sp_lev.c NEW/src/sp_lev.c
+--- OLD/src/sp_lev.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/sp_lev.c	2005-11-10 00:24:05.156250000 -0500
+@@ -11,6 +11,7 @@
+ 
+ #include "hack.h"
+ #include "dlb.h"
++#define RNG_FILE_NUM 71
+ /* #define DEBUG */	/* uncomment to enable code debugging */
+ 
+ #ifdef DEBUG
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/spell.c NEW/src/spell.c
+--- OLD/src/spell.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/spell.c	2005-11-10 00:24:13.031250000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 72
+ 
+ static NEARDATA schar delay;		/* moves left for this spell */
+ static NEARDATA struct obj *book;	/* last/current book being xscribed */
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/steal.c NEW/src/steal.c
+--- OLD/src/steal.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/steal.c	2005-11-10 00:24:16.765625000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 73
+ 
+ STATIC_PTR int NDECL(stealarm);
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/steed.c NEW/src/steed.c
+--- OLD/src/steed.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/steed.c	2005-11-10 00:24:20.343750000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 74
+ 
+ 
+ #ifdef STEED
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/teleport.c NEW/src/teleport.c
+--- OLD/src/teleport.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/teleport.c	2005-11-10 00:24:25.453125000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 75
+ 
+ STATIC_DCL boolean FDECL(tele_jump_ok, (int,int,int,int));
+ STATIC_DCL boolean FDECL(teleok, (int,int,BOOLEAN_P));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/timeout.c NEW/src/timeout.c
+--- OLD/src/timeout.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/timeout.c	2005-11-10 00:24:52.156250000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "lev.h"	/* for checking save modes */
++#define RNG_FILE_NUM 76
+ 
+ STATIC_DCL void NDECL(stoned_dialogue);
+ STATIC_DCL void NDECL(vomiting_dialogue);
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/topten.c NEW/src/topten.c
+--- OLD/src/topten.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/topten.c	2005-11-10 12:48:04.968750000 -0500
+@@ -9,6 +9,7 @@
+ #else
+ #include "patchlevel.h"
+ #endif
++#define RNG_FILE_NUM 90
+ 
+ #ifdef VMS
+  /* We don't want to rewrite the whole file, because that entails	 */
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/trap.c NEW/src/trap.c
+--- OLD/src/trap.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/trap.c	2005-11-10 00:25:32.734375000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 77
+ 
+ extern const char * const destroy_strings[];	/* from zap.c */
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/u_init.c NEW/src/u_init.c
+--- OLD/src/u_init.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/u_init.c	2005-11-10 00:25:37.359375000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 78
+ 
+ struct trobj {
+ 	short trotyp;
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/uhitm.c NEW/src/uhitm.c
+--- OLD/src/uhitm.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/uhitm.c	2005-11-10 00:25:41.968750000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 79
+ 
+ STATIC_DCL boolean FDECL(known_hitum, (struct monst *,int *,struct attack *));
+ STATIC_DCL void FDECL(steal_it, (struct monst *, struct attack *));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/vault.c NEW/src/vault.c
+--- OLD/src/vault.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/vault.c	2005-11-10 00:26:19.531250000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "vault.h"
++#define RNG_FILE_NUM 80
+ 
+ STATIC_DCL struct monst *NDECL(findgd);
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/weapon.c NEW/src/weapon.c
+--- OLD/src/weapon.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/weapon.c	2005-11-10 00:26:50.265625000 -0500
+@@ -8,6 +8,7 @@
+  *	code for monsters.
+  */
+ #include "hack.h"
++#define RNG_FILE_NUM 81
+ 
+ /* Categories whose names don't come from OBJ_NAME(objects[type])
+  */
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/were.c NEW/src/were.c
+--- OLD/src/were.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/were.c	2005-11-10 00:26:55.296875000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 82
+ 
+ #ifdef OVL0
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/wield.c NEW/src/wield.c
+--- OLD/src/wield.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/wield.c	2005-11-10 00:27:08.875000000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 83
+ 
+ /* KMH -- Differences between the three weapon slots.
+  *
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/wizard.c NEW/src/wizard.c
+--- OLD/src/wizard.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/wizard.c	2005-11-10 00:27:20.703125000 -0500
+@@ -10,6 +10,7 @@
+ #include "hack.h"
+ #include "qtext.h"
+ #include "epri.h"
++#define RNG_FILE_NUM 84
+ 
+ extern const int monstr[];
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/worm.c NEW/src/worm.c
+--- OLD/src/worm.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/worm.c	2005-11-10 00:27:31.890625000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include "hack.h"
+ #include "lev.h"
++#define RNG_FILE_NUM 85
+ 
+ #define newseg()		(struct wseg *) alloc(sizeof(struct wseg))
+ #define dealloc_seg(wseg)	free((genericptr_t) (wseg))
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/worn.c NEW/src/worn.c
+--- OLD/src/worn.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/worn.c	2005-11-10 00:27:36.296875000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 86
+ 
+ STATIC_DCL void FDECL(m_lose_armor, (struct monst *,struct obj *));
+ STATIC_DCL void FDECL(m_dowear_type, (struct monst *,long, BOOLEAN_P, BOOLEAN_P));
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/write.c NEW/src/write.c
+--- OLD/src/write.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/write.c	2005-11-10 00:27:41.562500000 -0500
+@@ -2,6 +2,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 87
+ 
+ STATIC_DCL int FDECL(cost,(struct obj *));
+ 
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/src/zap.c NEW/src/zap.c
+--- OLD/src/zap.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/src/zap.c	2005-11-10 00:27:45.375000000 -0500
+@@ -3,6 +3,7 @@
+ /* NetHack may be freely redistributed.  See license for details. */
+ 
+ #include "hack.h"
++#define RNG_FILE_NUM 88
+ 
+ /* Disintegration rays have special treatment; corpses are never left.
+  * But the routine which calculates the damage is separate from the routine
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/sys/be/bemain.c NEW/sys/be/bemain.c
+--- OLD/sys/be/bemain.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/sys/be/bemain.c	2005-11-10 18:08:59.343750000 -0500
+@@ -213,6 +213,17 @@
+ 			    	flags.initrace = i;
+ 			}
+ 			break;
++#ifdef SEEDED_GAME
++		case 'S': /* seed */
++			if(argc > 1) {
++				set_rng_seed(argv[1]);
++				argv++;
++				argc--;
++			} else {
++				raw_print("Seed expected after -S");
++			}
++			break;
++#endif
+ 		case '@':
+ 			flags.randomall = 1;
+ 			break;
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/sys/share/pcmain.c NEW/sys/share/pcmain.c
+--- OLD/sys/share/pcmain.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/sys/share/pcmain.c	2005-11-10 18:08:24.171875000 -0500
+@@ -573,6 +573,17 @@
+ 			bigscreen = -1;
+ 			break;
+ #endif
++#ifdef SEEDED_GAME
++		case 'S': /* seed */
++			if(argc > 1) {
++				set_rng_seed(argv[1]);
++				argv++;
++				argc--;
++			} else {
++				raw_print("Seed expected after -S");
++			}
++			break;
++#endif
+ 		case '@':
+ 			flags.randomall = 1;
+ 			break;
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/sys/unix/unixmain.c NEW/sys/unix/unixmain.c
+--- OLD/sys/unix/unixmain.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/sys/unix/unixmain.c	2005-11-10 16:42:47.593750000 -0500
+@@ -385,6 +385,17 @@
+ 			    	flags.initrace = i;
+ 			}
+ 			break;
++#ifdef SEEDED_GAME
++		case 'S': /* seed */
++			if(argc > 1) {
++				set_rng_seed(argv[1]);
++				argv++;
++				argc--;
++			} else {
++				raw_print("Seed expected after -S");
++			}
++			break;
++#endif
+ 		case '@':
+ 			flags.randomall = 1;
+ 			break;
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/sys/vms/vmsmain.c NEW/sys/vms/vmsmain.c
+--- OLD/sys/vms/vmsmain.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/sys/vms/vmsmain.c	2005-11-10 18:08:36.531250000 -0500
+@@ -303,6 +303,17 @@
+ 			    	flags.initrace = i;
+ 			}
+ 			break;
++#ifdef SEEDED_GAME
++		case 'S': /* seed */
++			if(argc > 1) {
++				set_rng_seed(argv[1]);
++				argv++;
++				argc--;
++			} else {
++				raw_print("Seed expected after -S");
++			}
++			break;
++#endif
+ 		case '@':
+ 			flags.randomall = 1;
+ 			break;
+diff -U 3 -Nr -x Makefile -x '*.exe' -x unixconf.h OLD/util/makedefs.c NEW/util/makedefs.c
+--- OLD/util/makedefs.c	2003-12-07 18:39:13.000000000 -0500
++++ NEW/util/makedefs.c	2005-11-10 16:42:19.015625000 -0500
+@@ -447,6 +447,9 @@
+ #ifdef SINKS
+ 			| (1L <<  2)
+ #endif
++#ifdef SEEDED_GAME
++			| (1L <<  3)
++#endif
+ 		/* monsters (5..9) */
+ #ifdef KOPS
+ 			| (1L <<  6)
+@@ -702,6 +705,9 @@
+ #ifdef REINCARNATION
+ 		"rogue level",
+ #endif
++#ifdef SEEDED_GAME
++		"seeded games",
++#endif
+ #ifdef STEED
+ 		"saddles and riding",
+ #endif
+
+
+

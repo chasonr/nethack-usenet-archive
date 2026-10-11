@@ -1,0 +1,2039 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,bfea35a6e5a39955,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1992-09-08 06:29:22 PST
+Path: sparky!uunet!zephyr.ens.tek.com!master!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v14i086:  okbridge2 - computer-mediated bridge game, Part08/14
+Message-ID: <3525@master.CNA.TEK.COM>
+Date: 7 Sep 92 21:42:11 GMT
+Sender: news@master.CNA.TEK.COM
+Lines: 2023
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: mclegg@cs.UCSD.EDU (Matthew Clegg)
+Posting-number: Volume 14, Issue 86
+Archive-name: okbridge2/Part08
+Supersedes: okbridge: Volume 13, Issue 16-22
+Environment: BSD-derived Unix, NeXT, curses, sockets
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 8 (of 14)."
+# Contents:  gps.c input.c
+# Wrapped by billr@saab on Mon Sep  7 14:33:37 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'gps.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'gps.c'\"
+else
+echo shar: Extracting \"'gps.c'\" \(20883 characters\)
+sed "s/^X//" >'gps.c' <<'END_OF_FILE'
+X/* GPS.c -- global playing service
+X
+X   Copyright (C) 1990-1992 by Matthew Clegg.  All Rights Reserved
+X
+X   OKbridge is made available as a free service to the Internet.
+X   Accordingly, the following restrictions are placed on its use:
+X
+X   1.  OKbridge may not be modified in any way without the explicit 
+X       permission of Matthew Clegg.  
+X
+X   2.  OKbridge may not be used in any way for commercial advantage.
+X       It may not be placed on for-profit networks or on for-profit
+X       computer systems.  It may not be bundled as part of a package
+X       or service provided by a for-profit organization.
+X
+X   If you have questions about restrictions on the use of OKbridge,
+X   write to mclegg@cs.ucsd.edu.
+X
+X   DISCLAIMER:  The user of OKbridge accepts full responsibility for any
+X   damage which may be caused by OKbridge.
+X
+X
+X   The global playing service is a global database of player information.
+X   In the initial implementation, it will contain only information
+X   about currently playing tables.  At a later date, we will add
+X   capabilities for downloading sets of boards and playing competitively.
+X
+X   Implementation Notes:
+X
+X   1. The GPS is implemented on a strictly request/response basis,
+X      similar in principle to a remote procedure call.  However,
+X      rather than using RPC, we use TCP streams.  This is done because
+X      I don't know if a standard implementation of RPC is available 
+X      on all BSD systems.  Also, some of the data we communicate doesn't
+X      seem to fit easily into the RPC model.
+X
+X   2. When we first start up, we will attempt to connect to the GPS
+X      and print out a message of the day along with a list of
+X      currently playing tables.  Thereafter, we will hold open the
+X      GPS connection.
+X
+X   3. When a GPS request is made, we may not even have the connection
+X      open.  Therefore, the request/response loop will have the 
+X      following structure:
+X
+X        A. Determine if the connection is still open.
+X           If not, attempt to connect.  If the attempt is unsuccessful,
+X           then exit with an error.
+X
+X        B. Transfer our request to the GPS.
+X
+X	C. Enter a wait-loop waiting for the response.  In this loop,
+X           we should monitor the other communication channels (e.g.,
+X           the keyboard and network) so as to allow a user interrupt
+X           if necessary.
+X
+X	D. Process the GPS response.
+X
+X   Unfortunately, this module is not re-entrant.  This can be a bit of a
+X   pain since the GPS_read_line procedure calls Wait_for_input in
+X   input.c, which in turn calls Wait_for_event in network.c.
+X
+X*/
+X
+X#include <stdio.h>
+X#include <string.h>
+X#include <errno.h>
+X#include <ctype.h>
+X#include <time.h>
+X
+X#define GPS
+X#include "types.h"
+X#include "state.h"
+X#include "display.h"
+X#include "parser.h"
+X#include "socket.h"
+X#include "terminal.h"
+X#include "conversation.h"
+X#include "input.h"
+X#include "gps_info.h"
+X#include "gps.h"
+X
+X#ifdef GCC
+Xextern void close ();
+Xextern int  getpid ();
+Xextern void srand ();
+Xextern sscanf ();
+Xextern fclose ();
+Xextern fprintf ();
+X#endif
+X
+Xextern int  No_connections ();
+Xextern char *strdup ();
+X
+Xextern char *sys_errlist[];
+Xextern int errno;
+X
+Xstatic char GPS_buf [100];
+Xstatic char GPS_error_buf [100];
+X
+X#ifdef LOGFILE
+Xextern FILE *net_log;
+X#endif
+X
+Xstatic void GPS_Comment (msg)
+X     char *msg;
+X{
+X  Display_Player_Comment (COMMENT_PRIVATE, "GPS", msg);
+X}
+X
+X
+Xstatic void GPS_transmit (buf)
+X     char *buf;
+X/* Transmits the buf to the GPS. */
+X{
+X  int n = strlen(buf);
+X
+X  if (n > 0)
+X    fd_writeln (GPS_socket, buf);
+X  else
+X    fd_writeln (GPS_socket, " ");
+X
+X#ifdef LOGFILE
+X  fprintf (net_log, "GPS> %s\n", buf);
+X  fflush (net_log);
+X#endif
+X}
+X
+Xstatic void Close_GPS_socket ()
+X/* If we are connected to the GPS, then closes the current connection. */
+X{
+X  if (GPS_socket > 0)
+X    close (GPS_socket);
+X
+X  GPS_socket = 0;
+X  GPS_request_in_progress = 0;
+X}
+X
+Xvoid GPS_Reset ()
+X{
+X  Close_GPS_socket ();
+X}
+X
+Xstatic int GPS_data_available_event ()
+X{
+X  return(Check_for_data (GPS_socket));
+X}
+X
+Xstatic int GPS_readline (buf, buflen)
+X     char *buf; int buflen;
+X/* Reads a line of data from the GPS without blocking.  Returns -1 if
+X   the "end-of-request" marker is received and -2 if an error occurs
+X   during the read.  Otherwise, returns the number of bytes transferred.
+X*/
+X{
+X  int status;
+X
+X  if (GPS_unavailable || !Use_GPS)
+X    return (-2);
+X
+X  Refresh_Input_Buffers ();
+X  Wait_for_event_at_game_level (GPS_data_available_event);
+X  status = Check_for_data (GPS_socket);
+X
+X  if (status < 0) {
+X    Close_GPS_socket ();
+X    return (-2);
+X  }
+X
+X  status = fd_readln (GPS_socket, buf, buflen);
+X
+X  if (status < 0) {
+X    if (status == 0)
+X      GPS_Comment ("Zero length transmission.");
+X    Close_GPS_socket ();
+X    return (-2);
+X  }
+X
+X  while ((status > 0) && isspace(buf[status-1]))
+X    buf[--status] = '\0';
+X
+X#ifdef LOGFILE
+X  fprintf (net_log, "GPS< %s\n", buf);
+X  fflush (net_log);
+X#endif
+X
+X  if(!strcmp(buf, GPS_RESPONSE_MARKER)) {
+X    GPS_request_in_progress = 0;
+X    return (-1);
+X  } else
+X    return (status);
+X}
+X
+Xstatic void GPS_Ask_for_response ()
+X{
+X  GPS_transmit (GPS_REQUEST_MARKER);
+X}
+X
+Xstatic void Conclude_GPS_request ()
+X/* Reads data from the GPS socket until the end of request is encountered. */
+X{
+X  while (GPS_request_in_progress)
+X    GPS_readline (GPS_buf, 100);
+X}
+X
+Xstatic void Check_GPS_connection ()
+X/* Checks if the connection to the GPS has been closed or if an
+X   interrupt occurred during the last transmit operation.  If so, then
+X   resets the connection to a state from which we can proceed. 
+X*/
+X{
+X  char buf[100];
+X  int status;
+X
+X  if (GPS_request_in_progress) {
+X    Close_GPS_socket ();
+X    return;
+X  }
+X
+X  if (GPS_socket == 0)
+X    return;
+X
+X  status = Check_for_data (GPS_socket);
+X  while (status) {
+X    if (status < 0) {
+X      Close_GPS_socket ();
+X      return;
+X    }
+X    status = fd_readln (GPS_socket, buf, 100);
+X    if (status <= 0) {
+X      Close_GPS_socket ();
+X      return;
+X    }
+X    status = Check_for_data (GPS_socket);
+X  }
+X}
+X
+Xstatic int Perform_GPS_handshake ()
+X/* Sends the handshake information to the GPS to test and also
+X   requests handshake information in return.  Verifies that we are
+X   running the same version as the server.  If the verification succeeds,
+X   then returns 0.  If we are running different versions, then returns 1.
+X   If some other error occurs, then returns -1.
+X*/
+X{
+X  char mbuf[100], kbuf[100];
+X
+X  sprintf (mbuf, "GPS %s", GPS_version);
+X  GPS_transmit (mbuf);
+X
+X  GPS_readline(kbuf, 100);
+X  if (strcmp(mbuf, kbuf)) {
+X    sprintf (GPS_error_buf, 
+X	     "GPS SERVER IS INCOMPATIBLE -- SERVER REPORTS VERSION %s", kbuf);
+X    return (1);
+X  }
+X
+X  if (local_player_email != NULL)
+X    sprintf (mbuf, "%s%s %s %s %s %s", 
+X	     major_revision_level, minor_revision_level,
+X	     Host_IP, Registration, User_name, User_fullname);
+X  else
+X    sprintf (mbuf, "%s%s %s %s %s %s", 
+X	     major_revision_level, minor_revision_level,
+X	     Host_IP, Host_name, User_name, User_fullname);
+X
+X  GPS_transmit (mbuf);
+X  return (0);
+X}
+X
+Xstatic int Open_GPS_connection ()
+X/* Opens the connection to the GPS.  If an error occurs, then sets
+X   GPS_unavailable to 1 and exits with code -1.  If no error occurs,
+X   returns 0.
+X*/
+X{
+X  int status;
+X
+X  Check_GPS_connection ();
+X
+X  GPS_request_in_progress = 1;
+X  if (GPS_socket > 0)
+X    return (0);
+X
+X  Status ("CONNECTING TO GLOBAL PLAYER SERVICE ...");
+X  restore_cursor ();
+X  status = client_init (GPS_IP, GPS_port, 1);
+X  if (status < 0) {
+X    Status ("CONNECTING TO GLOBAL PLAYER SERVICE ... UNABLE TO CONNECT");
+X    GPS_unavailable = 1;
+X    GPS_request_in_progress = 0;
+X    return (-1);
+X  }
+X
+X  GPS_socket = status;
+X  status = Perform_GPS_handshake ();
+X  if (status < 0) {
+X    Status ("CONNECTING TO GLOBAL PLAYER SERVICE ... ERROR IN HANDSHAKE");
+X    restore_cursor ();
+X    Close_GPS_socket ();
+X    GPS_unavailable = 1;
+X    GPS_request_in_progress = 0;
+X    return (-1);
+X  } else if (status) {
+X    GPS_Comment (GPS_error_buf);
+X    GPS_Comment ("DO YOU NEED TO UPDATE YOUR COPY OF OKBRIDGE?");
+X    restore_cursor ();
+X    GPS_unavailable = 1;
+X    GPS_request_in_progress = 0;
+X    return (-1);
+X  }
+X
+X  Status ("CONNECTING TO GLOBAL PLAYER SERVICE ... CONNECTION ESTABLISHED");
+X  Refresh_Input_Buffers ();
+X  return (0);
+X}
+X
+X
+X#define CHECK_GPS(x)  if(GPS_check_status()) x
+X
+Xstatic int GPS_check_status ()
+X/* Checks the current status of our GPS connection.  If there is a
+X   reason that we cannot honor a request at the moment, we display
+X   an appropriate error message and return 1.  Otherwise, we return 0.
+X*/
+X{
+X  if (!Use_GPS) {
+X    Status ("WE ARE NOT USING THE GLOBAL PLAYER SERVICE NOW.");
+X    return (1);
+X  } else if (GPS_unavailable) {
+X    Status ("THE GLOBAL PLAYER SERVICE IS CURRENTLY UNAVAILABLE.");
+X    return (1);
+X  } else if (GPS_request_in_progress) {
+X#ifdef LOGFILE
+X    fprintf 
+X      (net_log, "GPS ** ERROR -- WE ARE ALREADY PROCESSING A GPS REQUEST.\n");
+X    fflush (net_log);
+X#endif
+X    Status ("ERROR -- WE ARE ALREADY PROCESSING A GPS REQUEST.");
+X    return (1);
+X  } else if (Open_GPS_connection()) {
+X    GPS_Comment ("UNABLE TO CONTACT GLOBAL PLAYER SERVICE.");
+X    return (1);
+X  }
+X  return (0);
+X
+X}
+X
+Xvoid GPS_Get_Message_of_the_Day ()
+X/* Contacts the GPS and prints out the "message of the day". */
+X{
+X  int status;
+X
+X  CHECK_GPS(return);
+X
+X  GPS_transmit ("MOTD");
+X  GPS_Ask_for_response ();
+X
+X  status = GPS_readline (GPS_buf, 100);
+X  while (status >= 0) {
+X    GPS_Comment (GPS_buf);
+X    status = GPS_readline (GPS_buf, 100);
+X  }
+X}
+X
+Xint GPS_Get_Server_IP (server_name, location, port)
+X     char *server_name, *location; int *port;
+X/* Searches the list of currently playing tables for a server whose name
+X   matches server_name.  If one is found, then copies the corresponding
+X   location and port to the buffers provided by the caller, and returns 0.
+X   If no match is found, returns 1.
+X*/
+X{
+X  int status;
+X
+X  CHECK_GPS(return(1));
+X
+X  GPS_transmit("FIND_TABLE");
+X  if (server_name != NULL)
+X    GPS_transmit(server_name);
+X  GPS_Ask_for_response ();
+X
+X  status = GPS_readline (GPS_buf, 100);
+X  if (status < 0)
+X    return (1);
+X
+X  sscanf (GPS_buf, "%s %d", location, port);
+X  Conclude_GPS_request ();
+X  return (0);
+X}
+X
+Xvoid GPS_Broadcast_Server ()
+X/* Sends a message to the global player service notifying it that we
+X   are serving a table.  Sends the names of each of the players at the
+X   table in the message.
+X*/
+X{
+X  Connection c;
+X
+X  CHECK_GPS(return);
+X
+X  GPS_transmit("SERVER");
+X  sprintf (GPS_buf, "%s %d %d %d %s",
+X	   Host_IP, network_port, getpid (), No_connections (Local_table), 
+X	   local_player_name);
+X  GPS_transmit (GPS_buf);
+X  GPS_transmit (Server_Start_time);
+X
+X/*
+X  sprintf (GPS_buf, "%9s %s %s", seat_names[local_player], local_player_name);
+X  GPS_transmit (GPS_buf);
+X*/
+X
+X  FOREACH_PLAYER (c, Local_table) {
+X    sprintf (GPS_buf, "%-9s %-8s %s", seat_names[c->seat], c->player_name,
+X	     c->fullname);
+X    GPS_transmit (GPS_buf);
+X  }
+X  GPS_Ask_for_response ();
+X  Conclude_GPS_request ();
+X}
+X
+Xvoid GPS_Broadcast_Server_Silently ()
+X/* Same as GPS_Broadcast_Server but does not print an error message if
+X   we are not using the GPS or if the GPS was found to be unavailable
+X   in a previous call.
+X*/
+X{
+X  if (!Use_GPS || GPS_unavailable)
+X    return;
+X
+X  GPS_Broadcast_Server ();
+X}
+X
+Xvoid GPS_Advertise_Message (message)
+X     char *message;
+X/* If we are in server mode, then displays the given message along with
+X   our table announcement in the tables display. */
+X{
+X  CHECK_GPS(return);
+X
+X  GPS_transmit("MESSAGE");
+X  sprintf (GPS_buf, "%s %d", Host_IP, getpid ());
+X  GPS_transmit (GPS_buf);
+X
+X  if (message != NULL)
+X    GPS_transmit (message);
+X
+X  GPS_Ask_for_response ();
+X  Conclude_GPS_request ();
+X  
+X}
+X
+Xvoid GPS_List_Tables ()
+X/* Contacts the GPS for a list of the currently playing tables.
+X   Lists the tables at the terminal.
+X*/
+X{
+X  int status, no_tables, no_players, port;
+X  char name_buf[10], time_buf[40], out_buf[80], ip_buf[40];
+X
+X  CHECK_GPS(return);
+X
+X  GPS_transmit("TABLES");
+X  GPS_Ask_for_response ();
+X  
+X  no_tables = 0;
+X  status = GPS_readline(GPS_buf, 100);
+X  while (status > 0) {
+X    if ((no_tables == 0) && (display_mode == TALK_DISPLAY)) {
+X/*      GPS_Comment (" "); */
+X      if (terminal_lines < 25)
+X	Clear_Comment_Display ();
+X      GPS_Comment ("LIST OF CURRENTLY PLAYING TABLES");
+X      GPS_Comment (" ");
+X      GPS_Comment ("Name      IP Number        Port  Players   Start Time");
+X      GPS_Comment ("----      ---------        ----  -------   ----------");
+X    }
+X    status = GPS_readline (time_buf, 40);
+X    sscanf (GPS_buf, "%d %s %d %s", &no_players, ip_buf, &port, name_buf);
+X    sprintf (out_buf, "%-8s  %-16s %4d       %2d   %s", 
+X	     name_buf, ip_buf, port, no_players, time_buf);
+X    GPS_Comment (out_buf);
+X    no_tables++;
+X    status = GPS_readline(GPS_buf, 100);
+X  }
+X
+X  if (no_tables == 0) {
+X    GPS_Comment ("THERE ARE NO CURRENTLY PLAYING TABLES.");
+X    if (server_mode)
+X      GPS_Comment 
+X	("TYPE '/PUBLISH' TO PUBLISH THIS TABLE IN THE GPS DATABASE.");
+X    else
+X      GPS_Comment 
+X	("TYPE '/SERVE' IF YOU WOULD LIKE TO SERVE A TABLE YOURSELF.");
+X  } else if (display_mode == TALK_DISPLAY) {
+X    GPS_Comment (" ");
+X    GPS_Comment ("TYPE '/JOIN name' TO JOIN THE TABLE SERVED BY name.");
+X    GPS_Comment 
+X      ("TYPE '/PLAYERS name' TO SEE WHO IS PLAYING AT name's TABLE.");
+X  }
+X  Conclude_GPS_request ();
+X}
+X
+X
+Xvoid GPS_List_Players (server)
+X     char *server;
+X/* Lists the players at the given table. */
+X{
+X  int status, no_players;
+X  int current_display_mode = display_mode;
+X  int current_input_mode   = input_mode;
+X  int lines_left_on_page;
+X  char buf[80];
+X
+X  CHECK_GPS(return);
+X
+X  GPS_transmit ("PLAYERS");
+X  GPS_transmit ((server == NULL)? "*ALL*": server);
+X  GPS_Ask_for_response ();
+X
+X  no_players = 0;
+X  if (server != NULL) {
+X    status = GPS_readline(GPS_buf, 100);
+X    while (status >= 0) {
+X      if ((no_players == 0) && (display_mode == TALK_DISPLAY)) {
+X	GPS_Comment (" ");
+X	sprintf (buf, "LIST OF PLAYERS AT %s's TABLE:", server);
+X	GPS_Comment (buf);
+X      }
+X      GPS_Comment (GPS_buf);
+X      status = GPS_readline(GPS_buf, 100);
+X      no_players += 1;
+X    }
+X    if (no_players == 0) {
+X      sprintf (buf, "%s IS NOT HOSTING A TABLE.", server);
+X      GPS_Comment (buf);
+X    }
+X  } else {
+X    status = GPS_readline(GPS_buf, 100);
+X    lines_left_on_page = 0;
+X    while (status >= 0) {
+X      if (lines_left_on_page <= 0) {
+X	if (no_players == 0) {
+X	  Set_Display_Mode (TALK_DISPLAY);
+X	  Set_Input_Mode (TALK_INPUT);
+X	} else
+X	  Pause ("PRESS <ESC> TO SEE THE NEXT PAGE OF PLAYERS.");
+X	Clear_Comment_Display ();
+X	GPS_Comment (" ");
+X	sprintf (buf, "%-10s %-8s %s", "TABLE", "SEAT", "NAME");
+X	GPS_Comment (buf);
+X	sprintf (buf, "%-10s %-8s %s", "-----", "----", "----");
+X	GPS_Comment (buf);
+X	lines_left_on_page = terminal_lines - 9;
+X      }
+X      GPS_Comment (GPS_buf);
+X      status = GPS_readline(GPS_buf, 100);
+X      no_players += 1;
+X      lines_left_on_page -= 1;
+X    }
+X    if ((current_display_mode != TALK_DISPLAY) && (no_players > 0))
+X      Pause ("PRESS <ESC> TO CONTINUE ...");
+X    Set_Display_Mode (current_display_mode);
+X    Set_Input_Mode (current_input_mode);
+X    if (no_players == 0)
+X      GPS_Comment ("NO TABLES ARE CURRENTLY BEING SERVED.");
+X  }
+X
+X  GPS_request_in_progress = 0;
+X
+X}
+X
+Xvoid GPS_End_Server_Mode ()
+X{
+X  char buf[80];
+X
+X  CHECK_GPS(return);
+X
+X  GPS_transmit ("END_TABLE");
+X  sprintf (buf, "%s %d %d", Host_IP, getpid(), hands_played);
+X  GPS_transmit (buf);
+X  GPS_Ask_for_response ();
+X  Conclude_GPS_request ();
+X  hands_played = 0;
+X
+X}
+X
+Xvoid GPS_Directory ()
+X/* Returns a listing of the email duplicate files which are available. */
+X{
+X  int status;
+X
+X  CHECK_GPS(return);
+X
+X  GPS_transmit ("DIR");
+X  GPS_Ask_for_response ();
+X
+X  status = GPS_readline (GPS_buf, 100);
+X  while (status > 0) {
+X    GPS_Comment (GPS_buf);
+X    status = GPS_readline (GPS_buf, 100);
+X  }
+X}
+X
+Xvoid GPS_Download (download_file)
+X     char *download_file;
+X/* Downloads the specified file from the global player service. */
+X{
+X  int status;
+X  FILE *fp;
+X
+X  CHECK_GPS(return);
+X
+X  fp = fopen (download_file, "w");
+X  if (fp == NULL) {
+X    sprintf (GPS_buf, "ERROR OPENING LOCAL FILE %s: %s", download_file,
+X	     sys_errlist[errno]);
+X    Moderator_Comment (GPS_buf);
+X    return;
+X  }
+X
+X  GPS_transmit ("DOWNLOAD");
+X  GPS_transmit (download_file);
+X  GPS_Ask_for_response ();
+X
+X  status = GPS_readline (GPS_buf, 100);
+X  if (status < 0) {
+X    Status ("ERROR IN ACCESSING DOWNLOAD FILE.");
+X    fclose (fp);
+X    return;
+X  }
+X
+X  if ((GPS_buf[0] == 'E') && (GPS_buf[1] == 'R') && (GPS_buf[2] == 'R')) {
+X    sprintf (GPS_buf, "THERE IS NO SUCH DUPLICATE FILE %s.", download_file);
+X    Status (GPS_buf);
+X    fclose (fp);
+X    return;
+X  }
+X
+X  Status ("DOWNLOADING FILE FROM GPS ...");
+X  restore_cursor ();
+X  while (status > 0) {
+X    fprintf (fp, "%s\n", GPS_buf);
+X    status = GPS_readline (GPS_buf, 100);
+X  }
+X  fclose (fp);
+X}
+X
+Xvoid GPS_Dup (scoring_mode)
+X     char *scoring_mode;
+X/* Initiates gps duplicate mode.  Scoring mode should be either 
+X * MP, IMP or END.
+X */
+X{
+X  CHECK_GPS(return);
+X
+X  GPS_transmit ("DUP");
+X  GPS_transmit (scoring_mode);
+X  GPS_Ask_for_response ();
+X  Conclude_GPS_request ();
+X}
+X
+Xstatic Board *GPS_Download_Board ()
+X/* Downloads a board from the GPS.  Returns NULL if no board available or
+X   if an error occurred.
+X */
+X{
+X  Board *b;
+X  Play_record *p;
+X  char buf1[100], buf2[100], buf3[100];
+X  int status;
+X
+X  status = GPS_readline (buf1, 100);
+X  if (status < 0)
+X    return (NULL);
+X
+X  GPS_readline (buf2, 100);
+X  b = Decode_board (buf1, buf2);
+X  if (b == NULL)
+X    return (NULL);
+X
+X  status = GPS_readline (buf1, 100);
+X  while ((status > 0) && (buf1[0] != '-')) {
+X    GPS_readline (buf2, 100);
+X    GPS_readline (buf3, 100);
+X    p = Decode_play_record (buf1, buf2, buf3);
+X    if (p == NULL)
+X      return (NULL);
+X    if (p->bidding_completed)
+X      Compute_contract (b, p);
+X    if (p->hand_completed)
+X      Compute_MIMP_points (b, p);
+X    p->next = b->play_records;
+X    b->play_records = p;
+X    status = GPS_readline (buf1, 100);
+X  }
+X  Compute_Intl_Matchpoints (b);
+X  Compute_Matchpoints (b);
+X
+X  if (b->scoring_mode == MP_SCORING)
+X    Sort_play_records_by_matchpoints (b);
+X  else if (b->scoring_mode == IMP_SCORING)
+X    Sort_play_records_by_imps (b);
+X
+X  return (b);
+X}
+X
+XBoard *GPS_Get_Next_Board ()
+X/* Downloads the next duplicate board from the GPS. */
+X{
+X  Board *b;
+X
+X  CHECK_GPS(return(NULL));
+X
+X  GPS_transmit ("BOARD");
+X  sprintf (GPS_buf, "%s %s %s %s",
+X	   PLAYER_NAME(Local_table, PLAYER_NORTH),
+X	   PLAYER_NAME(Local_table, PLAYER_EAST),
+X	   PLAYER_NAME(Local_table, PLAYER_SOUTH),
+X	   PLAYER_NAME(Local_table, PLAYER_WEST));
+X  GPS_transmit (GPS_buf);
+X  GPS_Ask_for_response ();
+X
+X  Status ("DOWNLOADING NEXT BOARD FROM GPS ...");
+X  restore_cursor ();
+X
+X  b = GPS_Download_Board ();
+X  Conclude_GPS_request ();
+X  Clear_Status ();
+X  return (b);
+X}
+X
+Xvoid GPS_Upload_Play_Record (p)
+X     Play_record *p;
+X/* Uploads the play record p for the current email board to the GPS. */
+X{
+X  char buf1[100], buf2[100], buf3[100];
+X
+X  CHECK_GPS(return);
+X
+X  GPS_transmit ("PLAYREC");
+X  Encode_play_record (p, buf1, buf2, buf3);
+X  GPS_transmit (buf1);
+X  GPS_transmit (buf2);
+X  GPS_transmit (buf3);
+X  GPS_Ask_for_response ();
+X  Conclude_GPS_request ();
+X}
+X
+XBoard *GPS_Download_Results (player_name)
+X     char *player_name;
+X/* Downloads the all of the recorded results in the GPS for the given 
+X * player.  Returns a list of boards or NULL if no results are available.
+X */
+X{
+X  Board *results_head, *results_tail;
+X
+X  CHECK_GPS (return(NULL));
+X
+X  GPS_transmit("RESULTS");
+X  GPS_transmit(player_name);
+X  GPS_Ask_for_response ();
+X
+X  results_head = results_tail = GPS_Download_Board ();
+X  while (results_tail != NULL) {
+X    results_tail->next = GPS_Download_Board ();
+X    results_tail = results_tail->next;
+X  }
+X  Conclude_GPS_request ();
+X  return (results_head);
+X}
+X
+X
+Xvoid  GPS_Send_Playing_Time (seconds)
+X     long int seconds;
+X/* Sends the playing time for the local player in seconds to the GPS. */
+X{
+X  CHECK_GPS (return);
+X
+X  GPS_transmit ("USAGE");
+X  sprintf (GPS_buf, "%s %s %8.2f", 
+X	   Host_IP, User_name,
+X	   ((float) seconds) / ((float) 60.0));
+X  GPS_transmit (GPS_buf);
+X  GPS_Ask_for_response ();
+X  Conclude_GPS_request ();
+X}
+X
+Xvoid GPS_Display_Scoreboard ()
+X/* Downloads the scoreboard from the GPS and displays it. */
+X{
+X  int line_no = 1;
+X  int status;
+X  int current_display_mode = display_mode;
+X  int current_input_mode = input_mode;
+X  char buf[80];
+X
+X  CHECK_GPS (return);
+X
+X  GPS_transmit ("SCOREBOARD");
+X  GPS_Ask_for_response ();
+X
+X  Set_Display_Mode (MANUAL_DISPLAY);
+X  Set_Input_Mode (TALK_INPUT);
+X
+X  status = GPS_readline (buf, 80);
+X  while (status >= 0) {
+X    print (line_no++, 1, buf);
+X    status = GPS_readline (buf, 80);
+X  }
+X
+X  Press_Return_to_Continue ("");
+X  Set_Display_Mode (current_display_mode);
+X  Set_Input_Mode (current_input_mode);
+X  Conclude_GPS_request ();
+X}
+X
+Xvoid GPS_Change_Name (old_name, new_name)
+X     char *old_name, *new_name;
+X{
+X  CHECK_GPS(return);
+X
+X  GPS_transmit("NEWNAME");
+X  GPS_transmit(old_name);
+X  GPS_transmit(new_name);
+X  GPS_Ask_for_response ();
+X  Conclude_GPS_request ();
+X}
+END_OF_FILE
+if test 20883 -ne `wc -c <'gps.c'`; then
+    echo shar: \"'gps.c'\" unpacked with wrong size!
+fi
+# end of 'gps.c'
+fi
+if test -f 'input.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'input.c'\"
+else
+echo shar: Extracting \"'input.c'\" \(29960 characters\)
+sed "s/^X//" >'input.c' <<'END_OF_FILE'
+X/* input.c -- Input driver for the bridge program.
+X *
+X ! Copyright (C) 1990-1992 by Matthew Clegg.  All Rights Reserved
+X ! 
+X ! OKbridge is made available as a free service to the Internet.
+X ! Accordingly, the following restrictions are placed on its use:
+X ! 
+X ! 1.  OKbridge may not be modified in any way without the explicit 
+X !     permission of Matthew Clegg.  
+X ! 
+X ! 2.  OKbridge may not be used in any way for commercial advantage.
+X !     It may not be placed on for-profit networks or on for-profit
+X !     computer systems.  It may not be bundled as part of a package
+X !     or service provided by a for-profit organization.
+X ! 
+X ! If you have questions about restrictions on the use of OKbridge,
+X ! write to mclegg@cs.ucsd.edu.
+X ! 
+X ! DISCLAIMER:  The user of OKbridge accepts full responsibility for any
+X ! damage which may be caused by OKbridge.
+X *
+X */
+X 
+X#define _INPUT_
+X 
+X 
+X#include <ctype.h>
+X#include <stdio.h>
+X#include <string.h>
+X/* #include <time.h> */
+X#include <sys/time.h>
+X 
+X#include "types.h"
+X#include "state.h"
+X#include "terminal.h"
+X#include "display.h"
+X#include "commands.h"
+X#include "conversation.h"
+X
+X#include "help.h"
+X#include "input.h"
+X#include "gps.h"
+X
+X#ifndef index
+Xextern char *index();
+X#endif
+X
+Xextern gettimeofday (), strcasecmp ();
+X
+Xextern int errno;
+Xextern char *sys_errlist[];
+Xextern char *strdup ();
+Xextern char *malloc ();
+X
+Xextern int Terminate_Program ();
+X
+X#define random(n) ((rand()/64) % (n))
+X
+X#define MAPUPPER(c) ((('a' <= (c)) && ((c) <= 'z'))? ((c) + 'A' - 'a') : (c))
+X
+X
+Xtypedef struct input_buffer_struct {
+X	char	buf[91];
+X	int	row, col, length;	/* aspects of the screen display. */
+X	int	pos;			/* cursor position in buffer. */
+X	int     defaulted;              /* true if input buffer contains the
+X					   default input. */
+X	char    default_input[80];      /* a default input response which
+X					   will be displayed if the user
+X					   presses return on a blank line. */
+X	int     active;                 /* true if this buffer is active. */
+X	int     focus;                  /* true if this is the focus buffer. */
+X	struct input_buffer_struct *next; /* next buffer to choose if we
+X					     rotate the focus. */
+X} *input_buffer;
+X
+Xstatic input_buffer talk_buffer    = NULL;
+Xstatic input_buffer play_buffer    = NULL;
+Xstatic input_buffer ask_buffer     = NULL;
+Xstatic input_buffer focus_buffer   = NULL;
+X
+Xint Escape_key = 27;            /* The key which will be recognized as
+X				   the <ESC> key for terminating pauses.
+X				*/
+X
+Xint pause_mode = 0;             /* A boolean flag which if true indicates we
+X				   are waiting for the local player to press
+X				   <ESC> */
+X
+Xstatic int query_complete = 0;  /* During QUERY mode, this boolean flag
+X				   records whether or not the user has
+X				   given an answer. */
+X
+Xstatic int query_response = 0;  /* The user's response to a query.
+X				   1 = YES, 0 = NO. */
+X
+Xstatic struct timeval hand_start;  /* time at which the current hand
+X				      was begun. */
+X
+Xstatic struct timeval play_start;  /* time at which the current player
+X				      was notified of his turn. */
+X
+Xstatic int total_seconds_for_hand=0; /* the total number of seconds played
+X					in the current hand. */
+X
+Xstatic int local_seconds_for_hand=0; /* the number of seconds used by the
+X					local player. */
+X
+Xstatic int clock_is_running = 0;     /* true if we are currently timing
+X					the local player. */
+X
+Xint timer_is_on = 1;                 /* true if we should display the
+X					timer after each bid/play. */
+X
+X
+Xvoid Begin_timer_for_hand ()
+X{
+X  gettimeofday (&hand_start, NULL);
+X  total_seconds_for_hand = 0;
+X  local_seconds_for_hand = 0;
+X
+X  Display_Total_Time ("", "");
+X}
+X
+Xvoid End_timer_for_hand ()
+X{
+X  struct timeval hand_end;
+X
+X  gettimeofday (&hand_end, NULL);
+X  total_seconds_for_hand = hand_end.tv_sec - hand_start.tv_sec;
+X}
+X
+Xvoid Display_timer ()
+X{
+X  char local_time_buf[20], total_time_buf[20];
+X  struct timeval hand_end;
+X  int secs;
+X
+X  if (clock_is_running) {
+X    secs = play_start.tv_sec;
+X    gettimeofday (&play_start, NULL);
+X    local_seconds_for_hand += play_start.tv_sec - secs;
+X  }
+X
+X  gettimeofday (&hand_end, NULL);
+X  total_seconds_for_hand = hand_end.tv_sec - hand_start.tv_sec;
+X  if (total_seconds_for_hand == 0)
+X    total_seconds_for_hand = 1;
+X
+X  if (timer_is_on) {
+X    sprintf (local_time_buf, "%2d:%02d", 
+X	     local_seconds_for_hand/60, local_seconds_for_hand % 60);
+X    sprintf (total_time_buf, "%2d:%02d",
+X	     total_seconds_for_hand/60, total_seconds_for_hand % 60);
+X    Display_Total_Time (total_time_buf, local_time_buf);
+X  }
+X}
+X
+Xvoid Update_and_Display_Total_Time ()
+X{
+X  char time_buf[80];
+X  struct timeval hand_end;
+X
+X  gettimeofday (&hand_end, NULL);
+X  total_seconds_for_hand = hand_end.tv_sec - hand_start.tv_sec;
+X  Display_timer ();
+X}
+X
+Xvoid Begin_timer_for_play ()
+X{
+X  gettimeofday (&play_start, NULL);
+X  clock_is_running = 1;
+X}
+X
+Xvoid End_timer_for_play ()
+X{
+X  struct timeval play_end;
+X
+X  if (!clock_is_running)
+X    return;
+X
+X  clock_is_running = 0;
+X  gettimeofday (&play_end, NULL);
+X  total_seconds_for_hand = play_end.tv_sec - hand_start.tv_sec;
+X  local_seconds_for_hand += play_end.tv_sec - play_start.tv_sec;
+X  Display_timer ((char *) NULL);
+X
+X}
+X
+Xvoid Broadcast_Comment (c)
+X	char *c;
+X{
+X	Send_comment (Local_table, c);
+X}
+X
+Xvoid clear_input_buffer (ib)
+X	input_buffer ib;
+X/* Clears the screen display representing the input buffer, and
+X * resets the cursor position.
+X */
+X{
+X	int i;
+X
+X	for (i = 0; i < ib->length; i++)
+X	  ib->buf[i] = ' ';
+X	ib->buf[ib->length+1] = '\0';
+X	print (ib->row, ib->col, ib->buf);
+X
+X	set_cursor (ib->row, ib->col);
+X	ib->defaulted = 0;
+X	ib->buf[0]   = '\0';
+X	ib->pos      =   0;
+X }
+X
+Xstatic void Refresh_input_buffer (ib)
+X     input_buffer ib;
+X/* Re-displays the contents of the given buffer. */
+X{
+X  print (ib->row, ib->col, ib->buf);
+X  set_cursor (ib->row, ib->col+ib->pos);
+X}
+X
+Xvoid Refresh_Input_Buffers ()
+X{
+X  
+X  if (talk_buffer->active)
+X    Refresh_input_buffer (talk_buffer);
+X  if (ask_buffer->active)
+X    Refresh_input_buffer (ask_buffer);
+X  if (play_buffer->active)
+X    Refresh_input_buffer (play_buffer);
+X
+X  /* Perform an additional refresh on the focus buffer so that the
+X     cursor will be positioned properly: */
+X  if ((focus_buffer == NULL) || !focus_buffer->active)
+X    focus_buffer = talk_buffer;
+X  Refresh_input_buffer (focus_buffer);
+X}
+X
+Xvoid Clear_Focus_Buffer ()
+X/* Clears the focus buffer and places the cursor at the beginning of
+X * the line.
+X */
+X{
+X  clear_input_buffer (focus_buffer);
+X}
+X
+Xint Talking ()
+X/* Returns TRUE if the focus is currently on the talk buffer. */
+X{
+X  return (focus_buffer == talk_buffer);
+X}
+X
+Xstatic void Rotate_Focus_Buffer ()
+X/* If multiple input buffers are active, then rotates the focus to the
+X   next active buffer. */
+X{
+X  do {
+X    focus_buffer = focus_buffer->next;
+X  } while (!focus_buffer->active);
+X  Refresh_input_buffer (focus_buffer);
+X  restore_cursor ();
+X}
+X
+Xint update_input_buffer (ib, ch)
+X        input_buffer ib; int ch;
+X/* Adds the character ch to the input buffer, or if it is a control
+X . character, then modifies the cursor position or buffer appropriately.
+X . If the user has indicated he is through entering input, by entering
+X . i.e. <^J> or <^M>, then TRUE is returned.  Otherwise, FALSE is
+X . returned.
+X */
+X{
+X  char chbuf[2], *def, message_buf[80];
+X  
+X  chbuf[1] = '\0';
+X  if (ch == Escape_key)
+X    pause_mode = 0;
+X
+X  if (isprint(ch) && (ib->pos < ib->length)) {
+X    if (ib->defaulted)
+X      clear_input_buffer (ib);
+X    chbuf[0] = ch;
+X    print (ib->row, ib->col+ib->pos, chbuf);
+X    ib->buf[ib->pos++] = ch;
+X    ib->buf[ib->pos] = '\0';
+X  } else if ((ch == '\010') || (ch == '\177')) {
+X    if (ib->pos > 0) {
+X      chbuf[0] = ' ';
+X      ib->buf[--ib->pos] = '\0';
+X      print (ib->row, ib->col+ib->pos, chbuf);
+X    }
+X    ib->defaulted = 0;
+X  } else if (ch == '\001') {              /* ^A - alert partner's bid */
+X    if (IS_OBSERVER(local_player))
+X      Status ("OBSERVERS MAY NOT USE THE ALERT COMMAND.");
+X    else if (Local_table->game_mode != BIDDING_MODE)
+X      Status ("YOU MAY ONLY ALERT DURING BIDDING MODE.");
+X    else if (Index_of_Last_Bid (Local_board, Local_play, 
+X				player_partner[local_player]) < 0)
+X      Status ("YOUR PARTNER HAS NOT BID YET.");
+X    else
+X      Send_alert (Local_table, !FORMAL(Local_table));
+X  } else if (ch == '\002') {              /* ^B - review bidding. */
+X    Clear_Status ();
+X    Review_Bidding ();
+X    return (0);
+X  } else if (ch == '\004') {              /* ^D - toggle default mode */
+X    Clear_Status ();
+X    default_plays = default_plays? 0: 1;
+X    sprintf (message_buf, "DEFAULT INPUT MODE IS NOW %s",
+X	     default_plays? "ON": "OFF");
+X    Status (message_buf);
+X  } else if (ch == '\007') {              /* ^G - toggle bell. */
+X    Clear_Status ();
+X    bell_is_on = bell_is_on? 0: 1;
+X    sprintf (message_buf, "THE BELL IS NOW %s", bell_is_on? "ON": "OFF");
+X    Status (message_buf);
+X    ring_bell ();
+X  } else if (ch == '\011') {              /* ^I - rotate focus buffer */
+X    Rotate_Focus_Buffer ();
+X    return (0);
+X  } else if (ch == '\020') {              /* ^P - toggle prompt mode */
+X    Clear_Status ();
+X    prompt_dummy = prompt_dummy? 0: 1;
+X    sprintf (message_buf, "PROMPT MODE IS NOW %s",
+X	     prompt_dummy? "ON": "OFF");
+X    Status (message_buf);
+X  } else if (ch == '\022') {             /* ^R - refresh display. */
+X    Refresh_Display ();
+X    Refresh_Input_Buffers ();
+X  } else if (ch == '\024') {             /* ^T - rotate focus buffer. */
+X    Display_timer ();
+X    Rotate_Focus_Buffer ();
+X    return (0);
+X  } else if (ch == '\025') {             /* ^U - erase input buffer. */
+X    clear_input_buffer (ib);
+X  } else if (ch == '\027') {             /* ^W - wake up partner. */
+X    Wakeup_player ((char *) NULL);
+X#ifdef DEBUG
+X  } else if (ch == '\030') {             /* ^X - abort program. */
+X    Continue_Comment_Display ();
+X    Terminate_Program ("INTERRUPT RECEIVED -- TERMINATING PROGRAM");
+X#endif
+X  } else if (ch == '\0') {
+X    print (ib->row, ib->col, ib->buf);
+X  } else if ((ch == '\012') || (ch == '\015')) {
+X    /* First, we strip trailing blanks from the input buffer ... */
+X    while ((ib->pos > 0) && (ib->buf[ib->pos-1] == ' '))
+X      ib->buf[--ib->pos] = '\0';
+X
+X    if (ib->pos > 0)
+X      return (1);
+X    else {
+X      /* If the user presses return on an empty line, we check to see
+X	 if there is a default input available.  If so, we copy it to
+X	 the input buffer and display it. */
+X      if (default_plays && (ib->default_input[0] != '\0')) {
+X	for (def = ib->default_input; *def != '\0'; def++)
+X	  ib->buf[ib->pos++] = *def;
+X	ib->buf[ib->pos] = '\0';
+X	print (ib->row, ib->col, ib->default_input);
+X	ib->defaulted = 1;
+X      }
+X    }
+X  }
+X  set_cursor (ib->row, ib->col+ib->pos);
+X  return (0);
+X}
+X 
+Xstatic int Has_suit (h, s)
+X     hand h; int s;
+X/* Returns 1 if h contains a card of suit s, or 0 otherwise. */
+X{
+X  int i;
+X
+X  for (i = 0; i < 13; i++)
+X    if (h[13*s + i])
+X      return (1);
+X
+X  return (0);
+X}
+X
+Xstatic int Unique_suit (h)
+X     hand h;
+X/* If all of the cards in h are from a single suit, then returns that suit.
+X   Otherwise, returns -1. */
+X{
+X  int i, n, s;
+X
+X  s = -1;
+X  for (i = n = 0; i < 4; i++)
+X    if (Has_suit (h, i)) {
+X      s = i; 
+X      n++;
+X    }
+X
+X  if (n == 1)
+X    return (s);
+X  else
+X    return (-1);
+X}
+X
+X
+Xvoid Initialize_Input ()
+X/* This routine should be called once when the program first begins,
+X *  in order to set up the input buffers correctly.
+X */
+X{
+X  talk_buffer=(input_buffer) malloc (sizeof(struct input_buffer_struct));
+X  play_buffer=(input_buffer) malloc (sizeof(struct input_buffer_struct));
+X  ask_buffer =(input_buffer) malloc (sizeof(struct input_buffer_struct));
+X  
+X  talk_buffer->row = TALK_ROW;
+X  talk_buffer->col = TALK_COL + 6;
+X  talk_buffer->length = TALK_LENGTH - 8;
+X  talk_buffer->pos = 0;
+X  talk_buffer->defaulted = 0;
+X  talk_buffer->buf[0] = '\0';
+X  
+X  play_buffer->row = PLAY_ROW;
+X  play_buffer->col = PLAY_COL + 6;
+X  play_buffer->length = PLAY_LENGTH - 6;
+X  play_buffer->pos = 0;
+X  play_buffer->defaulted = 0;
+X  play_buffer->buf[0] = '\0';
+X  
+X  ask_buffer->row = TALK_ROW + 1;
+X  ask_buffer->col = 1;
+X  ask_buffer->length = 5;
+X  ask_buffer->pos = 0;
+X  ask_buffer->defaulted = 0;
+X  ask_buffer->buf[0] = '\0';
+X
+X  talk_buffer->next = ask_buffer;
+X  ask_buffer->next = play_buffer;
+X  play_buffer->next = talk_buffer;
+X
+X  Set_Input_Mode (TALK_INPUT);
+X}
+X
+Xvoid Reinitialize_Input ()
+X/* Clears all of the input buffers. */
+X{
+X  clear_input_buffer (talk_buffer);
+X  clear_input_buffer (play_buffer);
+X  clear_input_buffer (ask_buffer);
+X  Refresh_Input_Buffers ();
+X}
+X
+Xvoid Set_Input_Mode (new_mode)
+X     int new_mode;
+X/* Sets the input mode to the given mode.  Redisplays the talk and
+X * query buffers, if appropriate.  If the new mode is BID_INPUT (resp.
+X * PLAY_INPUT), the set of legal bids (resp. plays) is computed and
+X * the default bid (play) is also computed.
+X */
+X{
+X  if ((display_mode == TALK_DISPLAY) || (display_mode == HELP_DISPLAY)) {
+X    talk_buffer->row = terminal_lines - 1;
+X    ask_buffer->row  = terminal_lines;
+X  } else {
+X    talk_buffer->row = TALK_ROW;
+X    ask_buffer->row  = TALK_ROW+1;
+X  }
+X
+X  switch (new_mode) {
+X  case TALK_INPUT:
+X    play_buffer->active = ask_buffer->active = 0;
+X    talk_buffer->active = 1;
+X    focus_buffer = talk_buffer;
+X    break;
+X
+X  case BID_INPUT:
+X    play_buffer->active = 1;
+X    ask_buffer->active = 0;
+X    focus_buffer = play_buffer;
+X    sprintf (play_buffer->default_input, "PASS");
+X    break;
+X
+X  case PLAY_INPUT:
+X    play_buffer->active = 1;
+X    ask_buffer->active = 0;
+X    play_buffer->default_input[0] = '\0';
+X    break;
+X
+X  case QUERY_INPUT:
+X    ask_buffer->active = 1;
+X    focus_buffer = ask_buffer;
+X    break;
+X  }
+X
+X  Refresh_Input_Buffers ();
+X  input_mode = new_mode;
+X}
+X
+Xstatic void Process_help_input ()
+X/* Processes the talk buffer when we are in help mode.  If the buffer is
+X   non-empty, then we display the corresponding topic.  Otherwise,
+X   we exit help mode.
+X*/
+X{
+X  browse_help (talk_buffer->buf);
+X}
+X
+Xint Reserved_message (message)
+X     char *message;
+X/* Compares the given message to the list of card and bid names.  If a
+X   match is found, then returns true.  Otherwise, returns false.
+X   The purpose of this routine is to discourage players from sending
+X   talk messages which reveal intended bids or plays.
+X*/
+X{
+X  char compare_buff[100], *ch, buf2[5];
+X  int i;
+X
+X  if (!strlen(message))
+X    return (1);
+X
+X  strcpy (compare_buff, message);
+X  ch = compare_buff;
+X  for (ch = compare_buff; *ch != '\0'; ch++)
+X    *ch = MAPUPPER(*ch);
+X
+X  if (strlen(compare_buff) == 1)
+X    if (index("23456789TJQKACDHS", compare_buff[0]) != NULL)
+X      return (1);
+X
+X  for (i=0; i < 52; i++)
+X    if (!strcmp(card_names[i], compare_buff))
+X      return (1);
+X
+X  if (strlen(compare_buff) == 2) {
+X    buf2[0] = compare_buff[1];
+X    buf2[1] = compare_buff[0];
+X    buf2[2] = '\0';
+X    for (i=0; i < 52; i++)
+X      if (!strcmp(card_names[i], buf2))
+X	return (1);
+X  }
+X
+X  if ((strlen(compare_buff) == 2) && (compare_buff[1] == 'N')){
+X    compare_buff[2] = 'T';
+X    compare_buff[3] = '\0';
+X  }
+X
+X  for (i=0; i < 38; i++)
+X    if (!strcmp(bid_names[i], compare_buff))
+X      return (1);
+X
+X  return (0);
+X  
+X}
+X
+Xstatic void Process_talk_input ()
+X/* Processes the talk buffer.  If the first character of the buffer is 
+X   slash '/', then the buffer is interpreted as a command.  Otherwise,
+X   it is sent as a message to the other players.
+X */
+X{
+X  int f = IS_PLAYER(local_player) && FORMAL(Local_table);
+X
+X  if (talk_buffer->buf[0] == '\0')
+X    return;
+X
+X  if (talk_buffer->buf[0] == '/') {
+X    Parse_Input_Command (talk_buffer->buf);
+X    return;
+X  }
+X  
+X  if (talk_buffer->buf[0] == '%') {
+X    if (client_mode)
+X      Send_servereq (Local_table, talk_buffer->buf+1);
+X    else
+X      Status ("SERVER COMMAND IGNORED.");
+X    return;
+X  }
+X
+X  if (Reserved_message(talk_buffer->buf)) {
+X    if ((Local_table->game_mode == BIDDING_MODE) &&
+X	(Local_play->next_player == local_player))
+X      Status ("PRESS <TAB> TO ENTER YOUR BID.");
+X    else if (Local_table->game_mode == PLAYING_MODE)
+X      Status ("PRESS <TAB> TO ENTER YOUR PLAY.");
+X  } else if (!Reserved_message (talk_buffer->buf)) {
+X    if (spectator_mode && !PRACTICE(Local_table))
+X      Send_talk (Local_table, TALK_RCPT_SPEC, talk_buffer->buf);
+X    else if ((Local_table->game_mode == BIDDING_MODE) ||
+X	    (Local_table->game_mode == PLAYING_MODE))
+X      Send_talk (Local_table, f? TALK_RCPT_OPPS: TALK_RCPT_ALL, 
+X		 talk_buffer->buf);
+X    else
+X      Send_talk (Local_table, TALK_RCPT_ALL, talk_buffer->buf);
+X  }
+X  
+X}
+X
+Xstatic int Parse_bid_input (b, level, alert)
+X     char *b; int *level, *alert;
+X/* Parses the string b, looking for a bid.  If the bid can be parsed
+X   correctly, then sets the level and alert flags appropriately and
+X   returns 0.  Otherwise, displays an error message in the status line
+X   and returns 1.
+X*/
+X{
+X  int i, n;
+X  char bid_buf[80];
+X
+X  n = 0;
+X  while ((b[n] != '\0') && isspace(b[n])) n++;
+X
+X  sprintf (bid_buf, "%s", b+n);
+X  n = strlen(bid_buf);
+X  while ((n > 0) && isspace(bid_buf[n-1])) n--;
+X  if (n == 0) {
+X    sprintf (bid_buf, "%s %s", 
+X	     "THE FORMAT OF A CORRECT BID IS <LEVEL> <TRUMPSUIT>", 
+X	     " OR P OR X OR XX");
+X    Status (bid_buf);
+X    return (1);
+X  }
+X
+X  if ((n > 0) && (bid_buf[n-1]) == '!') {
+X    *alert = 1;
+X    bid_buf[--n] = '\0';
+X  } else
+X    *alert = 0;
+X
+X  while ((n > 0) && isspace(bid_buf[n-1])) n--;
+X  if (n == 0) {
+X    sprintf (bid_buf, "%s %s", 
+X	     "THE FORMAT OF A CORRECT BID IS <LEVEL> <TRUMPSUIT>", 
+X	     " OR P OR X OR XX");
+X    Status (bid_buf);
+X    return (1);
+X  }
+X
+X  if (!strcasecmp (bid_buf, "P"))
+X    *level = BID_PASS;
+X  else if (!strcasecmp (bid_buf, "PASS"))
+X    *level = BID_PASS;
+X  else if (!strcasecmp (bid_buf, "X"))
+X    *level = BID_DOUBLE;
+X  else if (!strcasecmp (bid_buf, "DOUBLE"))
+X    *level = BID_DOUBLE;
+X  else if (!strcasecmp (bid_buf, "XX"))
+X    *level = BID_REDOUBLE;
+X  else if (!strcasecmp (bid_buf, "REDOUBLE"))
+X    *level = BID_REDOUBLE;
+X  else {
+X    i = 0;
+X    if ((strlen(bid_buf) == 2) && (MAPUPPER(bid_buf[1]) == 'N')) {
+X      bid_buf[2] = 'T';
+X      bid_buf[3] = '\0';
+X    }
+X    while ((bid_names[i] != NULL) && strcasecmp(bid_names[i], bid_buf))
+X      i++;
+X    if (bid_names[i] == NULL) {
+X      sprintf (bid_buf, "%s %s", 
+X	       "THE FORMAT OF A CORRECT BID IS <LEVEL> <TRUMPSUIT>", 
+X	       " OR P OR X OR XX");
+X      Status (bid_buf);
+X      return (1);
+X    }
+X    *level = i;
+X  }
+X
+X  return (0);
+X}
+X
+Xstatic void display_valid_bids 
+X  (player, minimum_bid, double_ok, redouble_ok)
+X     int player;
+X     int minimum_bid;
+X     int double_ok;
+X     int redouble_ok;
+X{
+X  char double_string[40], bid_string[80];
+X
+X  if (double_ok)
+X    sprintf (double_string, "; DOUBLE IS OK");
+X  else if (redouble_ok)
+X    sprintf (double_string, "; REDOUBLE IS OK");
+X  else
+X    double_string[0] = '\0';
+X  
+X  if (bid_names[minimum_bid] == NULL) {
+X    if (double_ok)
+X      sprintf (bid_string, "ERROR -- THE ONLY LEGAL BIDS ARE PASS %s.",
+X	       "AND DOUBLE");
+X    else if (redouble_ok)
+X      sprintf (bid_string, "ERROR -- THE ONLY LEGAL BIDS ARE PASS %s.",
+X	       "AND REDOUBLE");
+X    else
+X      sprintf (bid_string, "ERROR -- THE ONLY LEGAL BID IS PASS.");
+X  } else
+X    sprintf (bid_string, "ERROR -- MINIMUM BID IS %s%s",
+X	     bid_names[minimum_bid], double_string);
+X  Status (bid_string);
+X}
+X
+Xstatic int legal_bid (bid, minimum_bid, double_ok, redouble_ok)
+X     int bid;
+X     int minimum_bid;
+X     int double_ok;
+X     int redouble_ok;
+X/* Returns true if the given bid is legal in the current context. */
+X{
+X  if (bid < 0)
+X    return (0);
+X  else if (bid == BID_PASS)
+X    return (1);
+X  else if (bid == BID_DOUBLE)
+X    return (double_ok);
+X  else if (bid == BID_REDOUBLE)
+X    return (redouble_ok);
+X  else
+X    return (minimum_bid <= bid);
+X}
+X
+Xstatic void Process_bid_input ()
+X{
+X  int level, alert;
+X  int minimum_bid, double_ok, redouble_ok;
+X
+X  if (play_buffer->buf[0] == '\0')
+X    return;
+X
+X  if (play_buffer->buf[0] == '/') {
+X    Parse_Input_Command (play_buffer->buf);
+X    return;
+X  }
+X
+X  if (play_buffer->buf[0] == '%') {
+X    if (client_mode)
+X      Send_servereq (Local_table, play_buffer->buf+1);
+X    else
+X      Status ("SERVER COMMAND IGNORED.");
+X    return;
+X  }
+X
+X  if ((Local_play->next_player != local_player) || pause_mode) {
+X    Status ("IT IS NOT YOUR TURN TO BID.");
+X    return;
+X  }
+X
+X  if (Parse_bid_input (play_buffer->buf, &level, &alert))
+X    return;
+X
+X  Generate_valid_bids (Local_play, local_player, &minimum_bid, &double_ok,
+X		       &redouble_ok);
+X
+X  if (local_player != Local_play->next_player) {
+X    Status ("IT IS NOT YOUR TURN TO BID.");
+X    return;
+X  } else if (!legal_bid (level, minimum_bid, double_ok, redouble_ok)) {
+X    display_valid_bids (local_player, minimum_bid, double_ok, redouble_ok);
+X    return;
+X  }
+X
+X  if (!strcasecmp(local_player_name, "worf"))
+X    if (level == 15) {
+X      alert = 1;
+X      Broadcast_Comment ("PUTZ ALERT!");
+X    }
+X
+X  Send_bid (Local_table, level, alert);
+X}
+X
+Xstatic int Default_card (h, suit, rank)
+X     hand h; int suit, rank;
+X/* Determines the first card in the hand h which has rank
+X . s and suit r, where either s or r can be specified as -1 indicating
+X . to take the minimum value.  If a matching card was found, then returns
+X . the index of that card.  Otherwise, returns -1 - the number of possible
+X . cards.
+X */
+X{
+X  int i, s, r, n, c;
+X
+X  /* First, we count how many cards match the input specifications: */
+X  c = n = 0;
+X  for (i = 0; i < 52; i++) {
+X    s = suit_of(i);
+X    r = rank_of(i);
+X    if ((s == suit) || (suit == -1))
+X      if ((r == rank) || (rank == -1))
+X	if (h[i]) {
+X	  if (n == 0)
+X	    c = i; 
+X	  n++;
+X	}
+X  }
+X
+X  /* If exactly one card matched, or if multiple cards match but the suit
+X     was specified, then we return the lowest ranking matching card. */
+X
+X  if (n == 1)
+X    return (c);
+X  else if ((suit != -1) && (n > 0))
+X    return (c);
+X
+X  return (-1-n);
+X}
+X
+Xvoid Compute_Legal_Plays (legal_plays)
+X     card_type *legal_plays;
+X/* Computes the set of legal plays for the local player, and places
+X   them into the array legal_plays.
+X*/
+X{
+X  int i, lead_index;
+X
+X  for (i = 0; i < 52; i++)
+X    legal_plays[i] = 0;
+X
+X  if (Local_play->no_plays % 4 == 0)
+X    Generate_valid_leads (Local_board, Local_play, 
+X			  Local_play->next_player, legal_plays);
+X  else {
+X    lead_index = Local_play->no_plays - (Local_play->no_plays % 4);
+X    Generate_valid_follows (Local_board, Local_play, Local_play->next_player,
+X			    Local_play->play_list[lead_index], legal_plays);
+X  }
+X
+X}
+X
+Xvoid Compute_Default_Play ()
+X/* Computes the default play for the local player, based upon the informaion
+X   contained in Local_board and Local_play. 
+X*/
+X{
+X  hand legal_plays;
+X  int card, suit;
+X
+X  play_buffer->default_input[0] = '\0';
+X  play_buffer->defaulted = 0;
+X
+X  Compute_Legal_Plays (legal_plays);
+X
+X  card = Default_card (legal_plays, -1, -1);
+X  if (card >= 0) {
+X    sprintf (play_buffer->default_input, "%s", card_names[card]);
+X    sprintf (play_buffer->buf, "%s", card_names[card]);
+X    play_buffer->defaulted = 1;
+X    play_buffer->pos = strlen(play_buffer->buf);
+X    return;
+X  }
+X
+X  suit = Unique_suit (legal_plays);
+X  if (suit < 0)
+X    return;
+X
+X  card = Default_card (legal_plays, suit, -1);
+X  if (card < 0)
+X    return;
+X    
+X  sprintf (play_buffer->default_input, "%s", card_names[card]);
+X}
+X
+Xvoid Clear_Default_Play ()
+X/* Clears a default play which may have been set earlier. */
+X{
+X  if (play_buffer->defaulted)
+X    clear_input_buffer (play_buffer);
+X
+X  play_buffer->default_input[0] = '\0';
+X}
+X
+Xstatic int Parse_play_input (p, c, legal_plays)
+X     char *p; int *c; hand legal_plays;
+X/* Parses the string p, looking for a card.  If the card can be parsed
+X   correctly, then sets the variable c to the index of the card and
+X   returns 0.  Otherwise, displays an error message in the status line
+X   and returns 1.
+X*/
+X{
+X  char *suit_string = "CDHS", *s;
+X  char *rank_string = "23456789TJQKA", *r;
+X  int rank, suit, card;
+X
+X  /* First we have to decode the card specified, to see if it is something
+X     reasonable. */
+X  if (strlen(p) > 2) {
+X    Status ("ERROR -- THE FORMAT OF A PLAY IS <suit> <rank>");
+X    return (1);
+X  }
+X
+X  if (strlen(p) == 1) {
+X    /* The player has omitted either the suit or the rank.  We must 
+X       determine which. */
+X    if ((s = index(suit_string, MAPUPPER(*p))) != NULL) {
+X      suit = s - suit_string;
+X      card = Default_card (legal_plays, suit, -1);
+X      if (card < 0) {
+X	Status ("ERROR -- YOU CANNOT PLAY A CARD FROM THAT SUIT");
+X	return (1);
+X      }
+X    } else if ((r = index(rank_string, MAPUPPER(*p))) != NULL) {
+X      rank = r - rank_string;
+X      card = Default_card (legal_plays, -1, rank);
+X      if (card < 0) {
+X	if (card == -1)
+X	  Status ("ERROR -- YOU CANNOT PLAY A CARD OF THAT RANK.");
+X	else
+X	  Status ("ERROR -- THAT DOES NOT SPECIFY A UNIQUE CARD.");
+X	return (1);
+X      }
+X    } else {
+X      Status ("ERROR -- THE FORMAT OF A PLAY IS <suit> <rank>");
+X      return (1);
+X    }
+X  } else {
+X    for (card = 0; (card_names[card] != NULL) 
+X	 && strcasecmp(card_names[card], p); card++);
+X    if (card_names[card] == NULL) {
+X      card = p[0]; p[0] = p[1]; p[1] = card;
+X      for (card = 0; (card_names[card] != NULL) 
+X	   && strcasecmp(card_names[card], p); card++);
+X    }
+X    if (card_names[card] == NULL) {
+X      Status ("ERROR -- THE FORMAT OF A PLAY IS <suit> <rank>");
+X      return (1);
+X    }
+X  }
+X
+X  *c = card;
+X  return (0);
+X}
+X
+Xstatic void display_valid_plays (current_hand)
+X     hand current_hand;
+X{
+X  char card_string [60], card_message[80];
+X  int i, j, c;
+X  
+X  c = 0;
+X  for (i = 0; i < 52; i++) {
+X    if (current_hand[i]) {
+X      for (j = 0; card_names[i][j] != '\0'; j++)
+X	card_string[c++] = card_names[i][j];
+X      card_string[c++] = ' ';
+X    }
+X  }
+X  card_string[c++] = '\0';
+X  sprintf (card_message,"ERROR -- VALID PLAYS ARE %s", card_string);
+X  Status (card_message);
+X}
+X
+X
+Xstatic void Process_play_input ()
+X{
+X  int play;
+X  hand legal_plays;
+X
+X  if (play_buffer->buf[0] == '\0')
+X    return;
+X
+X  if (play_buffer->buf[0] == '/') {
+X    Parse_Input_Command (play_buffer->buf);
+X    return;
+X  }
+X
+X  if (play_buffer->buf[0] == '%') {
+X    if (client_mode)
+X      Send_servereq (Local_table, play_buffer->buf+1);
+X    else
+X      Status ("SERVER COMMAND IGNORED.");
+X    return;
+X  }
+X
+X  if (Local_table->playing_mode != PRACTICE_PLAYING_MODE)
+X    if ((Next_Player (Local_play) != local_player) || pause_mode) {
+X      Status ("IT IS NOT YOUR TURN TO PLAY.");
+X      return;
+X    }
+X
+X  Compute_Legal_Plays (legal_plays);
+X  if (Parse_play_input (play_buffer->buf, &play, legal_plays))
+X    return;
+X
+X  if (!legal_plays [play]) {
+X    display_valid_plays (legal_plays);
+X    return;
+X  }
+X
+X  Clear_Default_Play ();
+X  if (Local_table->playing_mode == PRACTICE_PLAYING_MODE)
+X    Send_playreq (Local_table, play, Local_play->no_plays);
+X  else
+X    Send_play (Local_table, play);
+X
+X  pause_mode = 1;  /* This is a kludge intended to prevent a player
+X		      from playing a card twice. */
+X}
+X
+Xstatic void Process_ask_input ()
+X{
+X  int resp = ask_buffer->buf[0];
+X
+X  if (resp == '\0')
+X    return;
+X
+X  if ((resp == 'y') || (resp == 'Y')) {
+X    query_response = 1;
+X    query_complete = 1;
+X  } else if ((resp == 'n') || (resp == 'N')) {
+X    query_response = 0;
+X    query_complete = 1;
+X  } else
+X    ring_bell ();
+X}
+X
+X
+Xvoid Accept_Keyboard_Characters ()
+X/* If any keyboard characters are available, then reads them and adds
+X * them to the current focus buffer.  This may result in a change of
+X * state of the program or in messages being transmitted to the other
+X * players.
+X */
+X{
+X  while (char_avail()) {
+X    if (update_input_buffer (focus_buffer, input_char ())) {
+X      Clear_Status ();
+X      if (focus_buffer == talk_buffer) {
+X	if (display_mode == HELP_DISPLAY)
+X	  Process_help_input ();
+X	else
+X	  Process_talk_input ();
+X      } else if (focus_buffer == ask_buffer)
+X	Process_ask_input ();
+X      else if (input_mode == BID_INPUT)
+X	Process_bid_input ();
+X      else if (input_mode == PLAY_INPUT)
+X	Process_play_input ();
+X        clear_input_buffer (focus_buffer);
+X        update_input_buffer (focus_buffer, '\0');
+X    }
+X  }
+X}
+X
+Xstatic int Pause_mode_exit_event ()
+X{
+X  return (!pause_mode);
+X}
+X
+Xvoid Pause (pause_message)
+X     char *pause_message;
+X/* Displays the given message on the status line, and waits for the
+X * user to press the escape key.  Returns after escape has been pressed.
+X */
+X{
+X  int prev_pause = pause_mode;
+X
+X  if ((pause_message == NULL) || (strlen(pause_message) == 0))
+X    Lock_Status ("PRESS <ESC> TO CONTINUE ...");
+X  else
+X    Lock_Status (pause_message);
+X
+X  pause_mode = 1;
+X
+X  ring_bell ();
+X  Refresh_Input_Buffers ();
+X  Wait_for_event_at_game_level (Pause_mode_exit_event);
+X  Unlock_Status ();
+X  pause_mode = prev_pause;
+X}
+X
+Xstatic int Query_complete_event ()
+X{
+X  return (query_complete);
+X}
+X
+Xint  Ask (question)
+X     char *question;
+X/* Presents the question to the player and asks for a response.
+X * Returns 1 if 'y' was entered and '0' otherwise.
+X */
+X{
+X  int prev_mode = input_mode;
+X  input_buffer prev_focus = focus_buffer;
+X
+X  int prev_ask_col = ask_buffer->col;
+X    /* We save the current location of the beginning of the ask buffer
+X       in case this is a re-entrant call. */
+X
+X  ask_buffer->col = strlen(question) + 2;
+X  clear_input_buffer (ask_buffer);
+X  Clear_Status ();
+X  Lock_Status (question);
+X  ring_bell ();
+X
+X  Set_Input_Mode (QUERY_INPUT);
+X  if (default_plays)
+X    sprintf (ask_buffer->default_input, "NO");
+X  else
+X    ask_buffer->default_input[0] = '\0';
+X
+X  query_complete = 0;
+X  Refresh_Input_Buffers ();
+X  Wait_for_event_at_game_level (Query_complete_event);
+X  Unlock_Status ();
+X
+X  focus_buffer = prev_focus;
+X  ask_buffer->col = prev_ask_col;
+X  Set_Input_Mode (prev_mode);
+X  query_complete = 0;
+X  return (query_response);
+X}
+X
+Xvoid Press_Return_to_Continue (msg)
+X     char *msg;
+X/* Prints the message on the status line and then waits for the user
+X   to press return.
+X */
+X{
+X  char buf[100];
+X  int ch;
+X
+X  if (strlen(msg) == 0)
+X    Lock_Status ("PRESS RETURN TO CONTINUE ...");
+X  else {
+X    sprintf (buf, "%s -- PRESS RETURN TO CONTINUE ...", msg);
+X    Lock_Status (buf);
+X  }
+X  ring_bell ();
+X
+X  while (1) {
+X    Wait_for_event_at_game_level (char_avail);
+X    ch = input_char ();
+X    if ((ch == '\012') || (ch == '\015')) {
+X      Unlock_Status ();
+X      return;
+X    }
+X  }
+X  
+X}
+END_OF_FILE
+if test 29960 -ne `wc -c <'input.c'`; then
+    echo shar: \"'input.c'\" unpacked with wrong size!
+fi
+# end of 'input.c'
+fi
+echo shar: End of archive 8 \(of 14\).
+cp /dev/null ark8isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 14 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

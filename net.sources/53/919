@@ -1,0 +1,1484 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,47e542d765234109,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-12-30 11:31:24 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83 (MC830919); site mcvax.UUCP
+Path: utzoo!linus!philabs!mcvax!guido
+From: guido@mcvax.UUCP (Guido van Rossum)
+Newsgroups: net.sources
+Subject: Re: Read your news with Emacs -- sources
+Message-ID: <5568@mcvax.UUCP>
+Date: Fri, 30-Dec-83 14:31:24 EST
+Article-I.D.: mcvax.5568
+Posted: Fri Dec 30 14:31:24 1983
+Date-Received: Sat, 31-Dec-83 11:31:52 EST
+References: <5567@mcvax.UUCP>
+Organization: Math.Centre, Amsterdam
+Lines: 1463
+
+Here is the promised posting of enews.  I hope this format is
+convenient for all of you.  
+
+To check for transmission errors, you can say "sum *"; it should print
+
+23008     1 Makefile
+22637     2 README
+18639    12 endex.c
+23669     1 enews-help
+30510    10 enews.ml
+40673     2 followup.ml
+51465     2 reply.ml
+
+(Maybe the second column can differ due to different block sizes?).
+
+========== Feed the rest of this file to /bin/sh ==========
+
+echo 'x README'
+cat >README <<'XyZZy.README'
+This directory contains the files necessary to build 'enews', an
+interface to news 2.10 based on Emacs.  Very probably it won't run for
+older news versions.
+
+You need Gosling's Emacs #85 to run it.  If you have Emacs #264, it may
+run after changing all "error-occured" (with three r's) into
+"error-occurred" (with four r's).
+
+To make the C support program endex, type "make" in this directory.  If
+your news system has different names for "/usr/spool/news",
+"/usr/lib/news/active" or ".newsrc", first change the corresponding
+#define lines in the source.
+
+Before installation, first choose directories where the shell script to
+invoke it, the Emacs MLisp files and the C-support should live, and
+change the definitions for DESTDIR, MACLIB and DESTLIB respectively in
+"Makefile".  Preferably MACLIB should be Emacs' default macro library
+(if you have write access to it).  Also change the line saying
+("setq-default news-library ...) in file "enews.ml" (almost at the
+end).
+
+There is a reference to "/usr/lib/news/recmail" in "reply.ml"; this
+program is used to post the letter.  Check if this works on your
+system; if not, find an alternative or live without the 'r' command.
+
+If all seems ok or is fixed, you can type "make install" to install
+everything.
+XyZZy.README
+echo 'x Makefile'
+cat >Makefile <<'XyZZy.Makefile'
+DESTLIB=/usr/lib
+DESTDIR=/usr/bin
+MACLIB=/usr/lib/emacs/maclib
+EMACS=emacs
+
+CFLAGS=-O
+
+endex: endex.o
+	rm -f core gmon.out
+	cc $(LDFLAGS) endex.o -o endex
+
+enews.sh: Makefile
+	echo EPATH=$(MACLIB) >enews.sh
+	echo 'export EPATH' >>enews.sh
+	echo 'exec $(EMACS) -l"enews.ml" -e"read-news-then-exit"' >>enews.sh
+	echo ': "This file is created by Makefile, dont edit it!"' >>enews.sh
+
+install: endex enews.sh
+	cp endex $(DESTLIB)/endex
+	cp enews-help $(DESTLIB)/enews-help
+	cp enews.ml $(MACLIB)/enews.ml
+	cp followup.ml $(MACLIB)/followup.ml
+	cp reply.ml $(MACLIB)/reply.ml
+	cp enews.sh $(DESTDIR)/enews
+XyZZy.Makefile
+echo 'x endex.c'
+cat >endex.c <<'XyZZy.endex.c'
+/*
+ * endex [-u]
+ *
+ * Process .newsrc and news spooling directories to aid enews.
+ * Without -u, prints newsgroups and article file names of unread news;
+ * with -u, reads such a list and marks starred articles as read.
+ *
+ * DISCLAIMER: this code probably only works with news 2.10.
+ */
+
+/*
+ * This software is copyright (c) Mathematical Centre, Amsterdam, 1983.
+ * Permission is granted to use and copy this software, but not for profit,
+ * and provided that these same conditions are imposed on any person
+ * receiving or using the software.
+ */
+
+
+#include <stdio.h>
+#include <ctype.h>
+#include <sys/types.h>
+#include <sys/dir.h>
+
+typedef char *string;
+
+#define Strequ(s, t) (strcmp((s), (t)) == 0)
+#define Strnequ(s, t, n) (strncmp((s), (t), (n)) == 0)
+
+string rindex();
+string index();
+string strcpy();
+string strncpy();
+string malloc();
+string strcat();
+string strncat();
+string getenv();
+
+
+#define NEWSRC "/.newsrc" /* Must include a slash, $HOME is prepended! */
+#define ACTIVE "/usr/lib/news/active"
+#define NEWSDIR "/usr/spool/news/"
+
+#define MAXOPTIONS 1000
+#define MAXOPTLINES 100
+#define MAXACTIVE 1000
+#define MAXBUF 1000
+#define MAXBITS 32000
+#define BITSPBYTE 8
+
+#define BITSPW (BITSPBYTE*sizeof(int))
+#define BITWORDS (MAXBITS/BITSPW + 1)
+
+
+typedef int bool;
+typedef char BUF[MAXBUF];
+typedef int BITS[BITWORDS];
+
+#define Yes 1
+#define No 0
+
+#define Setbit(b, i) ((b)[(i)/BITSPW] |= (1<<(i)%BITSPW))
+#define Clrbit(b, i) ((b)[(i)/BITSPW] &= ~(1<<(i)%BITSPW))
+#define Bitset(b, i) ((b)[(i)/BITSPW] & (1<<(i)%BITSPW))
+
+
+struct active {
+	string	a_name;
+	int 	a_maxart;
+	bool	a_off;
+	string	a_data;
+};
+
+string defoptions[] =
+	{"announce", "general", "all.announce", "all.general",
+		(string)NULL};
+
+struct active active[MAXACTIVE];
+int nactive;
+
+string optlines[MAXOPTLINES];
+int noptlines;
+string options[MAXOPTIONS];
+int noptions;
+
+string whoami;
+bool updating;
+BUF newsrc;
+
+
+main(argc, argv)
+	int argc;
+	string argv[];
+{
+	getargs(argc, argv);
+	mknewsrc();
+	getnewsrc();
+	if (updating)
+		getcommands();
+	mainloop();
+	if (updating)
+		putnewsrc();
+	return 0;
+}
+
+
+getargs(argc, argv)
+	int argc;
+	string argv[];
+{
+	int i;
+	string cp;
+
+	whoami = argv[0];
+	cp = rindex(whoami, '/');
+	if (cp)
+		whoami = cp+1;
+
+	for (i = 1; i < argc && argv[i][0] == '-'; ++i) {
+		switch (argv[i][1]) {
+		case 'u':
+			updating = Yes;
+			continue;
+		}
+		break;
+	}
+	if (i < argc) {
+		fprintf(stderr, "usage: %s [-u]\n", whoami);
+		exit(2);
+	}
+}
+
+
+mknewsrc()
+{
+	string home;
+
+	home = getenv("HOME");
+	if (!home) {
+		warning("$HOME not set, assumed current directory");
+		home = ".";
+	}
+	strcpy(newsrc, home);
+	strcat(newsrc, NEWSRC);
+}
+
+
+string
+copystring(str)
+	string str;
+{
+	string cpy;
+
+	cpy = malloc(strlen(str) + 1);
+	if (!cpy)
+		fatal("out of memory");
+	strcpy(cpy, str);
+	return cpy;
+}
+
+
+getnewsrc()
+{
+	BUF linebuf;
+	FILE *fp;
+
+	setdefoptions();
+	fp = fopen(newsrc, "r");
+	if (fp) {
+		if (!fgets(linebuf, MAXBUF, fp) || !getoptions(fp, linebuf)) {
+			fclose(fp);
+			fp = (FILE*)NULL;
+		}
+	}
+	addoption("!junk");
+	addoption("!control");
+	getactive();
+	if (fp) {
+		do {
+			getdata(linebuf);
+		} while (fgets(linebuf, MAXBUF, fp));
+		fclose(fp);
+	}
+}
+
+
+setdefoptions()
+{
+	string *p;
+
+	for (p = defoptions; *p; ++p)
+		addoption(*p);
+}
+
+
+mainloop()
+{
+	int ng;
+	auto int minart;
+	int maxart;
+	BITS b;
+	BUF namebuf;
+
+	for (ng = 0; ng < nactive; ++ng) {
+		if (active[ng].a_off)
+			continue;
+		unpackdata(ng, b, &minart);
+		maxart = active[ng].a_maxart;
+		if (minart <= maxart) {
+			mkname(ng, namebuf);
+			getdir(namebuf, b, minart, maxart);
+			if (updating)
+				packdata(ng, b, minart);
+			else
+				showdata(namebuf, ng, b, minart, maxart);
+		}
+	}
+}
+
+
+showdata(namebuf, ng, b, minart, maxart)
+	int ng;
+	BITS b;
+	int minart;
+	int maxart;
+{
+	while (minart <= maxart && Bitset(b, minart))
+		++minart;
+	if (minart <= maxart) {
+		printf("N%s\n", active[ng].a_name);
+		for (; minart <= maxart; ++minart) {
+			if (!Bitset(b, minart))
+				printf(" %s/%d\n", namebuf, minart);
+		}
+	}
+}
+
+
+mkname(ng, namebuf)
+	int ng;
+	BUF namebuf;
+{
+	string cp;
+
+	strcpy(namebuf, NEWSDIR);
+	namebuf += strlen(namebuf);
+	cp = active[ng].a_name;
+	for (; *cp; ++namebuf, ++cp) {
+		if (*cp == '.')
+			*namebuf = '/';
+		else
+			*namebuf = *cp;
+	}
+	*namebuf = '\0';
+}
+
+
+bool
+match(str, pat)
+	register string str;
+	register string pat;
+{
+	while (*pat) {
+		if (pat[0] == 'a' && pat[1] == 'l' && pat[2] == 'l') {
+			pat += 3;
+			for (;;) {
+				while (*str && *str != '.' && *str != *pat)
+					++str;
+				if (match(str, pat))
+					return Yes;
+				if (!*str || *str == '.')
+					return No;
+				++str;
+			}
+		}
+		if (*str != *pat)
+			return No;
+		++str;
+		++pat;
+	}
+	return !*str || *str == '.';
+}
+
+
+int
+findng(name)
+	register string name;
+{	
+	register int ng;
+
+	for (ng = 0; ng < nactive; ++ng) {
+		if (Strequ(name, active[ng].a_name))
+			return ng;
+	}
+	return -1;
+}
+
+
+addoption(name)
+	string name;
+{
+	if (noptions >= MAXOPTIONS) {
+		warning("too many options");
+		return;
+	}
+	options[noptions] = copystring(name);
+	++noptions;
+}
+
+
+bool
+selected(name)
+	register string name;
+{
+	register bool neg;
+	int i;
+	register string pat;
+	bool ok;
+
+	ok = No;
+	for (i = 0; i < noptions; ++i) {
+		pat = options[i];
+		neg = *pat == '!';
+		if (neg)
+			++pat;
+		if (match(name, pat)) {
+			ok = !neg;
+			if (Strequ(name, pat))
+				break;
+		}
+	}
+	return ok;
+}
+
+
+clearbits(b)
+	register BITS b;
+{
+	register int i;
+
+	for (i = 0; i < BITWORDS; ++i)
+		b[i] = 0;
+}
+
+
+string getword(cpp)
+	string *cpp;
+{
+	register string wp;
+	register string cp;
+
+	cp = *cpp;
+	while (isspace(*cp) || *cp == ',')
+		++cp;
+	if (!*cp) {
+		*cpp = (string)NULL;
+		return (string)NULL;
+	}
+	wp = cp;
+	while (*cp && !isspace(*cp) && *cp != ',')
+		++cp;
+	if (*cp) {
+		*cp = '\0';
+		++cp;
+	}
+	*cpp = cp;
+	return wp;
+}
+
+
+bool
+getoptions(fp, linebuf)
+	FILE *fp;
+	BUF linebuf;
+{
+	auto string cp;
+	string wp;
+
+	if (!Strnequ(linebuf, "options ", 8))
+		return Yes;
+
+	for (cp = linebuf+7; isspace(*cp); cp = linebuf) {
+		if (noptlines >= MAXOPTLINES)
+			warning("too many option lines");
+		else {
+			optlines[noptlines] = copystring(linebuf);
+			++noptlines;
+		}
+		while (wp = getword(&cp)) {
+			if (Strequ(wp, "-n")) {
+				while ((wp = getword(&cp)) && wp[0] != '-')
+					addoption(wp);
+			}
+		}
+		if (!fgets(linebuf, MAXBUF, fp))
+			return No;
+	}
+	return Yes;
+}
+
+
+getactive()
+{
+	FILE *fp;
+	BUF linebuf;
+	auto string cp;
+	string wp;
+	int maxart;
+
+	fp = fopen(ACTIVE, "r");
+	if (!fp) {
+		perror(ACTIVE);
+		fatal("can't read %s", ACTIVE);
+	}
+	while (fgets(linebuf, MAXBUF, fp)) {
+		cp = linebuf;
+		wp = getword(&cp);
+		if (!wp) {
+			warning("empty line in %s", ACTIVE);
+			continue;
+		}
+		if (!selected(wp))
+			continue;
+		if (nactive >= MAXACTIVE) {
+			warning("too many active newsgroups in %s", ACTIVE);
+			break;
+		}
+		active[nactive].a_name = copystring(wp);
+		wp = getword(&cp);
+		if (wp) {
+			maxart = atoi(wp);
+				if (maxart > MAXBITS) {
+				warning("Newsgroup %s: too many articles",
+					active[nactive].a_name);
+				maxart = MAXBITS;
+			}
+			active[nactive].a_maxart = maxart;
+		}
+		++nactive;
+	}
+	fclose(fp);
+}
+
+
+getdir(name, b, minart, maxart)
+	string name;
+	BITS b;
+	int minart;
+	int maxart;
+{
+	BITS here;
+	DIR *dp;
+	struct direct *dirent;
+	auto string cp;
+	auto int artno;
+
+	dp = opendir(name);
+	clearbits(here);
+	if (dp) {
+		while (dirent = readdir(dp)) {
+			cp = dirent->d_name;
+			if (getint(&cp, &artno) && !*cp && !dupfile(dirent)
+				&& artno >= minart && artno <= maxart)
+				Setbit(here, artno);
+		}
+		closedir(dp);
+	}
+	for (; minart <= maxart; ++minart) {
+		if (!Bitset(here, minart))
+			Setbit(b, minart);
+	}
+}
+
+
+bool
+dupfile(dirent)
+	struct direct *dirent;
+{
+	static BITS inodes;
+	long ino;
+
+	ino = dirent->d_ino;
+	if (ino >= 1 && ino <= MAXBITS) {
+		if (Bitset(inodes, ino))
+			return Yes;
+		Setbit(inodes, ino);
+	}
+	return No;
+}
+
+
+putnewsrc()
+{
+	int i;
+	FILE *fp;
+
+	fp = fopen(newsrc, "w");
+	if (!fp) {
+		perror(newsrc);
+		fatal("can't rewrite %s", newsrc);
+	}
+	for (i = 0; i < noptlines; ++i)
+		fputs(optlines[i], fp);
+	for (i = 0; i < nactive; ++i) {
+		if (!active[i].a_data && !active[i].a_off)
+			continue;
+		fprintf(fp, "%s%c %s\n",
+			active[i].a_name,
+			active[i].a_off ? '!' : ':',
+			active[i].a_data ? active[i].a_data : "");
+	}
+	if (fclose(fp) == EOF) {
+		perror(newsrc);
+		fatal("can't flush %s", newsrc);
+	}
+}
+
+
+getcommands()
+{
+	BUF linebuf;
+	BITS b;
+	string cp;
+	string name;
+	int ng;
+	int artno;
+	int curng;
+	int minart;
+
+	curng = -1;
+	while (fgets(linebuf, MAXBUF, stdin)) {
+		cp = index(linebuf, '\n');
+		if (cp)
+				*cp = '\0';
+		switch (linebuf[0]) {
+		case 'N':
+			break;
+
+		case 'S':
+		case 'U':
+			ng = findng(linebuf+1);
+			if (ng < 0)
+				warning("Newsgroup %s: not found", linebuf+1);
+			else
+				active[ng].a_off = linebuf[0] == 'U';
+			break;
+
+		case 'e':
+		case ' ':
+		case '*':
+			cp = rindex(linebuf+1, '/');
+			if (!cp) {
+				warning("bad input line: `%s'", linebuf);
+				break;
+			}
+			*cp = '\0';
+			++cp;
+			if (!getint(&cp, &artno) || *cp) {
+				warning("bad article number in input line `%s/%s'",
+					linebuf, cp);
+				break;
+			}
+			name = linebuf+1;
+			if (Strnequ(name, NEWSDIR, sizeof NEWSDIR - 1))
+				name += sizeof NEWSDIR - 1;
+			for (cp = name; *cp; ++cp) {
+				if (*cp == '/')
+					*cp = '.';
+			}
+			ng = findng(name);
+			if (ng < 0) {
+				warning("newsgroup not found: %s", name);
+				break;
+			}
+			if (ng != curng) {
+				if (curng >= 0)
+					packdata(curng, b, minart);
+				unpackdata(ng, b, &minart);
+				curng = ng;
+			}
+			if (linebuf[0] == '*')
+				Setbit(b, artno);
+			else if (linebuf[0] == 'e')
+				Clrbit(b, artno);
+			break;
+
+		default:
+			warning("bad key character `%c'", linebuf[0]);
+		}
+	}
+	if (curng > 0)
+		packdata(curng, b, minart);
+}
+
+
+getdata(linebuf)
+	string linebuf;
+{
+	string cp;
+	string ep;
+	int c;
+	int ng;
+
+	cp = linebuf;
+	while (*cp && *cp != ':' && *cp != '!' && !isspace(*cp))
+		++cp;
+	c = *cp;
+	if (c) {
+		*cp = '\0';
+		++cp;
+	}
+	if (!*linebuf) {
+		warning("bad line in %s", newsrc);
+		return;
+	}
+	ng = findng(linebuf);
+	if (ng < 0) {
+		ng = nactive;
+		if (ng >= MAXACTIVE) {
+			warning("too many lines in %s", newsrc);
+			return;
+		}
+		active[ng].a_name = copystring(linebuf);
+		c = '!';
+		++nactive;
+	}
+	while (*cp && isspace(*cp))
+		++cp;
+	if (*cp) {
+		ep = index(cp, '\n');
+		if (ep)
+			*ep = '\0';
+		if (active[ng].a_data)
+			free(active[ng].a_data);
+		active[ng].a_data = copystring(cp);
+	}
+	active[ng].a_off = c == '!';
+}
+
+
+unpackdata(ng, b, pminart)
+	int ng;
+	BITS b;
+	int *pminart;
+{
+	auto int u;
+	auto int v;
+	auto string data;
+	int minart;
+	int maxart;
+
+	data = active[ng].a_data;
+	maxart = active[ng].a_maxart;
+	minart = 1;
+	clearbits(b);
+	while (getint(&data, &u)) {
+		v = u;
+		if (*data == '-') {
+			++data;
+			getint(&data, &v);
+		}
+		if (v > maxart)
+			v = maxart;
+		if (u <= minart)
+			minart = u = v+1;
+		for (; u <= v; ++u)
+			Setbit(b, u);
+		while (*data == ',' || isspace(*data))
+			++data;
+	}
+	*pminart = minart;
+}
+
+packdata(ng, b, minart)
+	int ng;
+	BITS b;
+	int minart;
+{
+	int maxart;
+	BUF data;
+	string cp = data;
+	int low;
+
+	maxart = active[ng].a_maxart;
+	low = 1;
+	while (low <= maxart) {
+		while (minart <= maxart && Bitset(b, minart))
+			++minart;
+		if (minart > low) {
+			if (cp > data) {
+				*cp = ',';
+				++cp;
+			}
+			sprintf(cp, "%d", low);
+			cp += strlen(cp);
+			if (minart > low+1) {
+				sprintf(cp, "-%d", minart-1);
+				cp += strlen(cp);
+			}
+		}
+		while (minart <= maxart && !Bitset(b, minart))
+			++minart;
+		low = minart;
+	}
+	if (active[ng].a_data)
+		free(active[ng].a_data);
+	active[ng].a_data = cp > data ? copystring(data) : (string)NULL;
+}
+
+
+bool
+getint(cpp, ip)
+	string *cpp;
+	int *ip;
+{
+	int i;
+	string cp;
+
+	cp = *cpp;
+	if (!isdigit(*cp))
+		return No;
+	i = 0;
+	do {
+		i = i*10 + *cp - '0';
+		++cp;
+	} while (isdigit(*cp));
+	*ip = i;
+	*cpp = cp;
+	return Yes;
+}
+
+
+/* VARARGS 1 */
+fatal(str, a1, a2, a3, a4, a5)
+	string str;
+{
+	fprintf(stderr, "%s: ", whoami);
+	fprintf(stderr, str, a1, a2, a3, a4, a5);
+	fprintf(stderr, "\n");
+	exit(1);
+}
+
+
+/* VARARGS 1 */
+warning(str, a1, a2, a3, a4, a5)
+	string str;
+{
+	fprintf(stderr, "%s: ", whoami);
+	fprintf(stderr, str, a1, a2, a3, a4, a5);
+	fprintf(stderr, " (warning)\n");
+}
+XyZZy.endex.c
+echo 'x enews.ml'
+cat >enews.ml <<'XyZZy.enews.ml'
+; Read your news with Emacs! (but only at high speeds...)
+
+; Given some C support to compare the news database with the contents
+; of "$HOME/.newsrc", Emacs shows you each article in turn in a window.
+; Finally the C support updates the ".newsrc" file.
+;
+; The C support consists of the program "endex", that lives is
+; directories ~guido/src/enews (sources) and ~guido/lib (binaries).
+; For a command summary, read the file news-help.
+
+; ----------------------------------------------------------------------
+(message "Loading the news system, please wait...")
+(sit-for 0)
+
+; Subroutines
+
+(defun
+	(find-current-article
+		(pop-to-buffer "news-index")
+		(exchange-dot-and-mark)
+		(beginning-of-line)
+		(set-mark)
+	)
+)
+(defun
+	(find-current-newsgroup
+		(find-current-article)
+		(if (error-occured (re-search-reverse "^[UN]"))
+			(error-message "First newsgroup.")
+		)
+		(beginning-of-line)
+	)
+)
+(defun
+	(find-next-article
+		(find-current-article)
+		(forward-character)
+		(if (error-occured (re-search-forward "^[ e*]"))
+			(error-message "Last article.")
+		)
+		(beginning-of-line)
+		(set-mark)
+	)
+)
+(defun
+	(find-first-article
+		(pop-to-buffer "news-index")
+		(beginning-of-file)
+		(set-mark)
+		(find-next-article)
+		(set-mark)
+	)
+)
+(defun
+	(find-next-newsgroup
+		(find-current-article)
+		(if (error-occured (re-search-forward "^[NU]"))
+			(error-message "Last newsgroup.")
+		)
+		(beginning-of-line)
+	)
+)
+(defun
+	(find-next-newsgroup-to-read
+		(find-current-article)
+		(forward-character)
+		(if (error-occured (re-search-forward "^N"))
+			(error-message "Last newsgroup.")
+		)
+		(beginning-of-line)
+	)
+)
+(defun
+	(find-next-article-to-read
+		(find-current-article)
+		(forward-character)
+		(if (error-occured (re-search-forward "^ "))
+			(error-message "Last article.")
+		)
+		(beginning-of-line)
+		(set-mark)
+	)
+)
+(defun
+	(find-previous-article
+		(find-current-article)
+		(backward-character)
+		(if (error-occured (re-search-reverse "^[ e*]"))
+			(error-message "First article.")
+		)
+		(beginning-of-line)
+		(set-mark)
+	)
+)
+(defun
+	(mark-current-article-read
+		(save-window-excursion
+			(find-current-article)
+			(if (looking-at " ")
+				(progn
+					(delete-next-character)
+					(insert-character '*')
+				)
+			)
+		)
+	)
+)
+
+; ----------------------------------------------------------------------
+
+(defun
+	(show-article    file-name
+		(save-window-excursion
+			(find-current-article)
+			(forward-character)
+			(set-mark)
+			(end-of-line)
+			(setq file-name (region-to-string))
+		)
+		(pop-to-buffer "news-article")
+		(read-file file-name)
+		(show-news-headers)
+		(if (error-occured (re-search-forward "^Lines:"))
+			(beginning-of-file)
+		;else
+			(line-to-top-of-window)
+		)
+		(end-of-window)
+		(beginning-of-line)
+		(novalue)
+	)
+)
+(defun
+	(show-news-headers    old-case-fold-search
+		(pop-to-buffer "news-headers")
+		(erase-buffer)
+		(pop-to-buffer "news-article")
+		(beginning-of-file)
+		(set-mark)
+		(re-search-forward "^$")
+		(narrow-region)
+		(setq old-case-fold-search case-fold-search)
+		(setq case-fold-search 1)
+		(app-news-header "^Subject" "news-headers")
+		(app-news-header "^Title" "news-headers")
+		(app-news-header "^Newsgroup" "news-headers")
+		(app-news-header "^From" "news-headers")
+		(app-news-header "^Date" "news-headers")
+		(setq case-fold-search old-case-fold-search)
+		(widen-region)
+		(pop-to-buffer "news-headers")
+		(delete-other-windows) ; This puts the headers window at the top
+		(pop-to-buffer "news-article")
+		(pop-to-buffer "news-headers")
+		(while (> (window-height) 4) ; Stupid Emacs misspells function names!
+			(shrink-window)
+		)
+		(pop-to-buffer "news-article")
+		(novalue)
+	)
+)
+(defun
+	(app-news-header
+		(beginning-of-file)
+		(if (! (error-occured
+				(re-search-forward (arg 1))))
+			(progn
+				(beginning-of-line)
+				(set-mark)
+				(next-line)
+				(append-region-to-buffer (arg 2))
+			)
+		)
+	)
+)
+
+; ----------------------------------------------------------------------
+
+(defun
+	(simple-next-article
+		(save-window-excursion
+			(mark-current-article-read)
+			(prefix-argument-loop
+				(find-next-article)
+			)
+		)
+		(show-article)
+	)
+)
+(defun
+	(next-article
+		(save-window-excursion
+			(mark-current-article-read)
+			(prefix-argument-loop
+				(find-next-article-to-read)
+			)
+		)
+		(show-article)
+	)
+)
+(defun
+	(previous-article
+		(save-window-excursion
+			(prefix-argument-loop
+				(find-previous-article)
+			)
+		)
+		(show-article)
+	)
+)
+(defun
+	(next-page-or-article
+		(pop-to-buffer "news-article")
+		(end-of-window)
+		(if (eobp)
+			(next-article)
+		;else
+			(progn
+				(next-page)
+				(end-of-window)
+				(beginning-of-line)
+			)
+		)
+		(novalue)
+	)
+)
+(defun
+	(save-article    file-name
+		(mark-current-article-read)
+		(pop-to-buffer "news-article")
+		(setq file-name (arg 1 "Append to file: (default Articles) "))
+		(if (= file-name "")
+			(setq file-name "Articles")
+		)
+		(append-to-file file-name)
+		(setq buffer-is-modified 0)
+		(message (concat "Appended to file " (expand-file-name file-name)))
+		(novalue)
+	)
+)
+(defun
+	(quit-news
+		(mark-current-article-read)
+		(pop-to-buffer "news-index")
+		(delete-other-windows)
+		(update-newsrc)
+		(exit-emacs)
+	)
+)
+(defun
+	(quit-news-save-files
+		(mark-current-article-read)
+		(pop-to-buffer "news-index")
+		(delete-other-windows)
+		(update-newsrc)
+		(write-file-exit)
+	)
+)
+(defun
+	(next-newsgroup
+		(save-window-excursion
+			(find-next-newsgroup-to-read)
+			(next-line)
+			(set-mark)
+			(find-next-article-to-read)
+		)
+		(show-article)
+	)
+)
+(defun
+	(kill-newsgroup
+		(save-window-excursion
+			(find-current-article)
+			(while (! (looking-at "[UN]"))
+				(if (looking-at " ")
+					(progn
+						(delete-next-character)
+						(insert-character '*')
+					)
+				)
+				(next-line)
+				(beginning-of-line)
+				(if (eobp)
+					(error-message "Last newsgroup.")
+				)
+			)
+			(set-mark)
+			(find-next-article-to-read)
+		)
+		(show-article)
+	)
+)
+(defun
+	(unsubscribe-newsgroup
+		(save-window-excursion
+			(find-current-newsgroup)
+			(delete-next-character)
+			(insert-character 'U')
+			(set-mark)
+			(end-of-line)
+			(message
+				(concat "Unsubscribing to newsgroup " (region-to-string)))
+			(find-next-newsgroup-to-read)
+			(set-mark)
+			(find-next-article-to-read)
+		)
+		(show-article)
+	)
+)
+(defun
+	(news-help
+		(delete-other-windows) ; Avoid help showing in tiny headers window
+		(save-excursion
+			(visit-file (concat news-library "enews-help"))
+			(init-article-buffer "news-help")
+		)
+		(novalue)
+	)
+)
+(defun
+	(show-headers
+		(if (= (current-buffer-name) "news-headers")
+			(pop-to-buffer "news-article")
+			(pop-to-buffer "news-headers")
+		)
+		(novalue)
+	)
+)
+(defun
+	(full-headers
+		(if
+			(if (= (current-buffer-name) "news-article")
+				(progn
+					(beginning-of-window)
+					(bobp)
+				)
+			)
+			(progn
+				(exchange-dot-and-mark)
+				(line-to-top-of-window)
+				(set-mark)
+				(end-of-window)
+			)
+			(progn
+				(pop-to-buffer "news-article")
+				(beginning-of-window)
+				(if (! (bobp))
+					(progn
+						(set-mark)
+						(beginning-of-file)
+					)
+				)
+			)
+		)
+		(novalue)
+	)
+)
+(defun
+	(show-news-index
+		(if (= (current-buffer-name) "news-article")
+			(switch-to-buffer "news-index")
+		;else
+			(show-article)
+		)
+		(novalue)
+	)
+)
+(defun
+	(erase-article-read
+		(save-window-excursion
+			(find-current-article)
+			(delete-next-character)
+			(insert-character 'e')
+		)
+		(message "Article assumed unread")
+		(find-next-article-to-read)
+		(show-article)
+	)
+)
+
+; ----------------------------------------------------------------------
+
+(defun
+	(make-news-index
+		(pop-to-buffer "news-index")
+		(erase-buffer)
+		(message "Reading news index, please wait...")
+		(sit-for 0) ; Screen refresh
+		(set-mark)
+		(filter-region (concat "exec " news-library "endex"))
+		(setq buffer-is-modified 0)
+		(beginning-of-file)
+		(if (eobp)
+			(error-message "No news."))
+		(novalue)
+	)
+)
+(defun
+	(update-newsrc
+		(save-window-excursion
+			(pop-to-buffer "news-index")
+			(if buffer-is-modified
+				(progn
+					(message "Updating .newsrc, please wait...")
+					(sit-for 0) ; Screen refresh
+					(end-of-file)
+					(set-mark)
+					(beginning-of-file)
+					(filter-region (concat "exec " news-library "endex -u"))
+					(setq buffer-is-modified 0)
+				)
+			)
+		)
+		(novalue)
+	)
+)
+
+(autoload "followup-article" "followup.ml")
+(autoload "reply-by-mail" "reply.ml")
+
+(defun
+	(init-article-buffer    i
+		(pop-to-buffer (arg 1 ": init-article-buffer "))
+		(setq needs-checkpointing 0)
+		(setq mode-string "news")
+		(setq i ' ')
+		(while (< i 127)
+			(local-bind-to-key "illegal-operation" i)
+			(setq i (+ 1 i))
+		)
+		(local-bind-to-key "next-page-or-article" '^M') ; RETURN
+		(local-bind-to-key "next-page-or-article" ' ')
+		(local-bind-to-key "next-page-or-article" 'y') ; to be compatible
+		(local-bind-to-key "news-help" '?')
+		(local-bind-to-key "previous-article" '-')
+		(local-bind-to-key "simple-next-article" '+')
+		(local-bind-to-key "erase-article-read" 'e')
+		(local-bind-to-key "followup-article" 'f')
+		(local-bind-to-key "show-headers" 'h')
+		(local-bind-to-key "full-headers" 'H')
+		(local-bind-to-key "show-news-index" 'i')
+		(local-bind-to-key "kill-newsgroup" 'K')
+		(local-bind-to-key "next-article" 'n')
+		(local-bind-to-key "next-newsgroup" 'N')
+		(local-bind-to-key "quit-news" 'q')
+		(local-bind-to-key "quit-news-save-files" "\^X\^F")
+		(local-bind-to-key "reply-by-mail" 'r')
+		(local-bind-to-key "save-article" 's')
+		(local-bind-to-key "unsubscribe-newsgroup" 'U')
+		(local-bind-to-key "exit-emacs" 'x')
+		(novalue)
+	)
+)
+
+(defun
+	(read-news
+		(save-window-excursion
+			(init-article-buffer "news-index")
+			(make-news-index)
+			(init-article-buffer "news-headers")
+			(init-article-buffer "news-article")
+			(find-first-article)
+			(show-article)
+			(recursive-edit)
+		)
+	)
+)
+(defun
+	(read-news-then-exit
+		(argc) ; To avoid editing files from .emacs_NN (NN = your uid)
+		(pop-to-buffer "news-index")
+		(read-news)
+		(exit-emacs)
+	)
+)
+
+(setq-default news-library "~guido/lib/") ; Change this line!
+
+(message "")
+
+(novalue)
+XyZZy.enews.ml
+echo 'x reply.ml'
+cat >reply.ml <<'XyZZy.reply.ml'
+; Supplement to enews.ml for reply by mail.
+
+(defun
+	(reply-by-mail    old-case-fold-search
+		(pop-to-buffer "news-reply")
+		(erase-buffer)
+		(pop-to-buffer "news-article")
+		(beginning-of-file)
+		(set-mark)
+		(if (error-occured (re-search-forward "^$"))
+			(end-of-file)
+		)
+		(narrow-region)
+		(setq old-case-fold-search case-fold-search)
+		(setq case-fold-search 1)
+		(app-news-header "^Path" "news-reply")
+		(app-news-header "^Subject" "news-reply")
+		(app-news-header "^Title" "news-reply")
+		(app-news-header "^Reference" "news-reply")
+		(app-news-header "Message-id" "news-reply")
+		(widen-region)
+		(setq case-fold-search old-case-fold-search)
+		(pop-to-buffer "news-reply")
+		(beginning-of-file)
+		(setq old-case-fold-search case-fold-search)
+		(setq case-fold-search 1)
+		(error-occured (re-replace-string "^Path" "To"))
+		(error-occured (re-replace-string "^Title" "Subject"))
+		(error-occured (re-replace-string "^Subject" "Subject: Re"))
+		(error-occured ; Remove multiple 'Re: Re:'
+			(re-replace-string "^Subject: Re:[ 	]*Re" "Subject: Re"))
+		(if (! (error-occured (re-search-forward "^Reference")))
+			(if (! (error-occured (re-search-forward "^Message-id")))
+				(progn
+					(beginning-of-line)
+					(re-replace-string "^Message-id:[ 	]*" " ")
+					(beginning-of-line)
+					(delete-previous-character)
+				)
+			)
+		;else
+			(error-occured (re-replace-string "^Message-id" "References"))
+		)
+		(end-of-file)
+		(setq case-fold-search old-case-fold-search)
+		(insert-character '\n')
+		(message "Type reply; to post it, type ctrl-X-ctrl-C.")
+		(delete-other-windows)
+		(setq buffer-is-modified 0)
+		(recursive-edit)
+		(if buffer-is-modified
+			(progn
+				(beginning-of-file)
+				(set-mark)
+				(end-of-file)
+				(message "Posting reply, please wait...")
+				(sit-for 0)
+				(filter-region "/usr/lib/news/recmail -t")
+			)
+		)
+		(show-article)
+		(novalue)
+	)
+)
+XyZZy.reply.ml
+echo 'x followup.ml'
+cat >followup.ml <<'XyZZy.followup.ml'
+; Supplement to enews.ml for followup article.
+
+(defun
+	(followup-article    old-case-fold-search
+		(pop-to-buffer "news-followup")
+		(erase-buffer)
+		(pop-to-buffer "news-article")
+		(beginning-of-file)
+		(set-mark)
+		(if (error-occured (re-search-forward "^$"))
+			(end-of-file)
+		)
+		(narrow-region)
+		(setq old-case-fold-search case-fold-search)
+		(setq case-fold-search 1)
+		(app-news-header "^Newsgroup" "news-followup")
+		(app-news-header "^Subject" "news-followup")
+		(app-news-header "^Title" "news-followup")
+		(app-news-header "^Reference" "news-followup")
+		(app-news-header "Message-id" "news-followup")
+		(widen-region)
+		(setq case-fold-search old-case-fold-search)
+		(pop-to-buffer "news-followup")
+		(beginning-of-file)
+		(setq old-case-fold-search case-fold-search)
+		(setq case-fold-search 1)
+		(error-occured (re-replace-string "^Title" "Subject"))
+		(error-occured (re-replace-string "^Subject" "Subject: Re"))
+		(error-occured ; Remove multiple 'Re: Re:'
+			(re-replace-string "^Subject:[ 	]*Re:[ 	]*Re" "Subject: Re"))
+		(if (! (error-occured (re-search-forward "^Reference")))
+			(if (! (error-occured (re-search-forward "^Message-id")))
+				(progn
+					(beginning-of-line)
+					(re-replace-string "^Message-id:[ 	]*" " ")
+					(beginning-of-line)
+					(delete-previous-character)
+				)
+			)
+		;else
+			(error-occured (re-replace-string "^Message-id" "References"))
+		)
+		(end-of-file)
+		(setq case-fold-search old-case-fold-search)
+		(insert-character '\n')
+		(message "Type followup article; to post it, type ctrl-X-ctrl-C.")
+		(delete-other-windows)
+		(setq buffer-is-modified 0)
+		(recursive-edit)
+		(if buffer-is-modified
+			(progn
+				(beginning-of-file)
+				(set-mark)
+				(end-of-file)
+				(message "Posting followup article, please wait...")
+				(sit-for 0)
+				(filter-region "inews -h")
+			)
+		)
+		(show-article)
+		(novalue)
+	)
+)
+XyZZy.followup.ml
+echo 'x enews-help'
+cat >enews-help <<'XyZZy.enews-help'
+space  shows more of the article, or the next article if there isn't more.
+ -     previous article.
+ +     next article, even if this was already read.
+ e     ('erase') forget the article was read.
+ h     toggles between window containing headers and article.
+ H     goes to top of article buffer, (where full headers are shown).
+ n     next unread article (assuming the current article has been read).
+ q     quits Emacs and updates ".newsrc".
+ s     save (append) the article to a file, whose name is prompted for.
+ x     quits without updating.                      (ESC-^V for more help)
+ ?     shows help window.
+ N     next newsgroup.
+ U     Unsubscribe current newsgroup.
+ K     Kill newsgroup: assume 'n' for all articles in it this time.
+ f     Issue follow-up article.
+ r     Reply by mail to article's author.
+XyZZy.enews-help
+
+

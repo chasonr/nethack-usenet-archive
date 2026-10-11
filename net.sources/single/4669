@@ -1,0 +1,645 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,2f83e3184452b392,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-08-04 20:42:24 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!bellcore!decvax!mcnc!ncsu!uvacs!edison!dca
+From: dca@edison.UUCP (David Albrecht)
+Newsgroups: net.sources
+Subject: shortc
+Message-ID: <831@edison.UUCP>
+Date: Mon, 4-Aug-86 23:42:24 EDT
+Article-I.D.: edison.831
+Posted: Mon Aug  4 23:42:24 1986
+Date-Received: Thu, 7-Aug-86 03:18:54 EDT
+Organization: General Electric Company, Charlottesville, VA
+Lines: 626
+
+I have a UNIX PC which has the unfortunate affliction of possessing
+a C compiler which needs unique short names.  It also doesn't support
+long defines in the cpp.  Faced with altering the original source
+I wasn't too impressed with the shortc utilities prepending of
+characters to the name.  Therefore, I altered shortc to instead
+produce recapitalization of the offending words to unmatch them.
+I wasn't particularly enamored of writing a sed script to do the
+conversion either so I also added an option (-c) which substitutes the
+words and their remappings into a C program template (called template.c)
+and emits it on stdout.  The C program right now is pretty rudimentary
+but if you feel so inclined will be easy to extend.
+If you get motivated and extend the template to not messing with
+string contents etc.. please send me a copy.
+
+Enjoy,
+
+David Albrecht
+----------- cut here ---------
+#!/bin/sh
+echo 'Start of /usr/spool/uucppublic/shortc, part 01 of 01:'
+echo 'x - shortc.c'
+sed 's/^X//' > shortc.c << '/'
+Xchar ID[] = "@(#) shortc";
+Xchar Usage[] = "usage: shortc [-symlen] [-p] file ... > Short.h\n";
+X/*
+X   Produce a set of preprocessor defines which guarantee that all identifiers
+X   in the files are unique in the first symlen (default 7) characters.
+X   Include the output into each file (or into a common header file).
+X   Since the symbols being redefined are ambiguous within symlen chars
+X   (that was the problem in the first place), the files must be compiled
+X   using a flexnames version of cpp.
+X   Lacking that, turn the output into a sed script and massage the source
+X   files.  In this case, you may need to specify -p to parse preprocessor
+X   lines, but watch for things like include-file names.
+X   If using cpp, preprocessor symbols should be weeded out by hand; otherwise
+X   they will cause (innocuous) redefinition messages.
+X */
+X
+X#include <ctype.h>
+X#include <stdio.h>
+X
+X#define SYMLEN  7           /* symbols must be unique within ... chars */
+X#define MAXLEN  128         /* need a limit for tokenizing */
+X#define HASHSIZ 2048        /* power of 2; not an upper limit */
+X#define TRUE 1
+X#define FALSE 0
+X#define MAXSTRING 160
+X
+Xtypedef struct Symbol symbol;
+Xstruct Symbol {
+X	symbol  *link;          /* hash chain */
+X	union {
+X	    long chcase_mask;  /* re-capitalize for mapped name if flag > SEEN */
+X	    symbol *xtrunc;    /* symbol which truncates to this one
+X				  if flag == TRUNC */
+X	} x;
+X	char    flag;
+X	char    inname[1];
+X};
+X#define chcase  x.chcase_mask
+X#define trunc   x.xtrunc
+X#define NOTSEEN 0           /* symbol never seen */
+X#define TRUNC   1           /* trunc points to symbol which truncates to
+X			       this one */
+X#define SEEN    2           /* there is no conflict with this symbol */
+X#define MULT    3	    /* re-capitalize to resolve conflict */
+X
+Xsymbol  *symtab[HASHSIZ];
+X
+Xstruct subsnames {
+X    char *from_name;
+X    char *to_name;
+X    struct subsnames *next;
+X    } *subsname_list = NULL;
+X
+Xint c_prog = FALSE;
+X
+Xint     symlen  = SYMLEN;
+Xchar    parsepp;            /* if set, parse preprocessor lines */
+X
+Xsymbol  *lookup();
+Xchar    *token(), *truncname();
+Xchar    *myalloc();
+X
+Xextern  char *strcpy(), *strncpy();
+Xextern  char *malloc();
+X
+Xmain (argc, argv) register char **argv; register argc; /*: entry point */
+X{
+X	while( --argc > 0 )
+X	    doarg(*++argv);
+X
+X	dump();
+X	exit(0);
+X}
+X
+Xdoarg (arg) char *arg; /*: process one file or flag arg */
+X{
+X	register char *s;
+X	register symbol *y;
+X
+X	if( *arg == '-' )
+X	{   arg++;
+X	    if( isdigit(*arg) )
+X		symlen = atoi(arg);
+X	    else if( *arg == 'p' )
+X		parsepp = 1;
+X	    else if( *arg == 'c' )
+X		c_prog = TRUE;
+X	    else fputs(Usage, stderr);
+X	    return;
+X	}
+X
+X	if( freopen(arg, "r", stdin) == NULL )
+X	{   perror(arg);
+X	    return;
+X	}
+X
+X	while( s = token() )
+X	    if( (y = lookup(s))->flag < SEEN )
+X		newname(y);
+X}
+X
+Xnewname (y) register symbol *y; /*: pick a new non-colliding name */
+X{
+X	register symbol *a;
+X
+X	/* repeat until no collision */
+X	for( ;; )
+X	{   /* pick another name */
+X	    nextname(y);
+X	    /* check its truncation for conflicts */
+X	    a = lookup(truncname(y));
+X	    if( a->flag == NOTSEEN )
+X		break;
+X	    /* if this is an original symbol and it collides with another
+X	     * (maybe modified) symbol, fix the other one instead of this one
+X	     */
+X	    if( a->flag == TRUNC && y->flag == SEEN )
+X	    {   newname(a->trunc);
+X		break;
+X	    }
+X	    /* if already a short name, ok */
+X	    if( a == y )
+X		return;
+X	}
+X	/* flag what this truncates to */
+X	a->trunc = y;
+X	a->flag = TRUNC;
+X}
+X
+Xnextname (y) register symbol *y; /*: find next possible name for this symbol */
+X{
+X	register char *s, *p;
+X	register n;
+X
+X	switch( y->flag )
+X	{   case TRUNC:
+X		/* if another symbol truncates to this one, fix it not to */
+X		newname(y->trunc);
+X	    case NOTSEEN:
+X		/* this symbol's name is available, so use it */
+X		y->flag = SEEN;
+X		y->chcase = 0;
+X		return;
+X	}
+X	y->flag = MULT;
+X	y->chcase++;
+X}
+X
+Xchar *truncname (y) register symbol *y; /*: return symbol name truncated to symlen chars */
+X{
+X	static char buf[MAXLEN+10];
+X
+X	register long chcase_mask = y->chcase;
+X	register i;
+X	register char *str = y->inname, *str1 = buf, c;
+X
+X        for(i = 0; i < symlen; i++) {
+X	    if (chcase_mask & 01) {
+X		c = *(str++);
+X		if (isupper(c)) c = tolower(c);
+X		else c = toupper(c);
+X		*(str1++) = c;
+X 	    }
+X	    else {
+X		*(str1++) = *(str++);
+X	    }
+X	    chcase_mask >>= 1;
+X	}
+X	return buf;
+X}
+X
+Xsymbol *lookup(s) char *s; /*: find name in symbol table */
+X{
+X	register h;
+X
+X	{   register char *p;
+X	    register c;
+X
+X	    for( h = 0, p = s; (c = *p++); )
+X		h += h + c;
+X	}
+X
+X	{   register symbol *y, **yy;
+X
+X	    for( y = *(yy = &symtab[h & HASHSIZ-1]);; y = y->link )
+X	    {   if( !y )
+X		{   y = (symbol *)myalloc(sizeof *y + strlen(s));
+X		    strcpy(y->inname, s);
+X		    y->flag = NOTSEEN;
+X		    y->link = *yy;
+X		    *yy = y;
+X		    break;
+X		}
+X		if( strcmp(y->inname, s) == 0 )
+X		    break;
+X	    }
+X	    return y;
+X	}
+X}
+X
+Xdump () /*: output all mappings */
+X{
+X	register symbol *y;
+X	register n,i;
+X	register char c, *str;
+X	struct subsnames *new_name, *curr_name, *prev_name;
+X	FILE *template_file;
+X	char in_string[MAXSTRING];
+X
+X    if (!c_prog) {
+X	for( n = HASHSIZ; --n >= 0; ) {
+X	    for( y = symtab[n]; y; y = y->link ) {
+X		if( y->flag == MULT ) {
+X		    str = y->inname;
+X		    i = y->chcase;
+X		    printf("#define %s ", y->inname);
+X		    while (c = *(str++)) {
+X			if (i & 01) {
+X			    if (isupper(c)) c = tolower(c);
+X			    else c = toupper(c);
+X			    putchar(c);
+X			}
+X			else {
+X			    putchar(c);
+X			}
+X			i >>= 1;
+X		    }
+X		    putchar('\n');
+X		}
+X	    }
+X	}
+X    }
+X    else {
+X	for( n = HASHSIZ; --n >= 0; ) {
+X	    for( y = symtab[n]; y; y = y->link ) {
+X		if( y->flag == MULT ) {
+X		    i = y->chcase;
+X		    new_name = (struct subsnames *) malloc(sizeof(*new_name));
+X		    new_name->from_name =(char *) malloc(strlen(y->inname) + 1);
+X		    new_name->to_name = (char *) malloc(strlen(y->inname) + 1);
+X		    strcpy(new_name->from_name, y->inname);
+X		    strcpy(new_name->to_name, y->inname); 
+X		    str = new_name->to_name;
+X		    while (c = *(str++)) {
+X			if (i & 01) {
+X			    if (isupper(c)) c = tolower(c);
+X			    else c = toupper(c);
+X			    *(str - 1) = c;
+X			}
+X			i >>= 1;
+X		    }
+X		    prev_name = NULL;
+X		    curr_name = subsname_list;
+X		    str = new_name->from_name;
+X		    while (curr_name && strcmp(curr_name->from_name,str) < 0) {
+X			prev_name = curr_name;
+X			curr_name = prev_name->next;
+X		    }
+X		    if (!prev_name) {
+X			new_name->next = subsname_list;
+X			subsname_list = new_name;
+X		    }
+X		    else {
+X			new_name->next = prev_name->next;
+X			prev_name->next = new_name;
+X		    }
+X		}
+X	    }
+X	}
+X	template_file = fopen("/usr/src/local/shortc/template.c","r");
+X	if (!template_file) {
+X	    fprintf(stderr, "unable to open template file\n");
+X	    exit(1);
+X	}
+X	i = TRUE;
+X	n = -1;
+X	while (fgets(in_string, MAXSTRING - 1, template_file)) {
+X	    if (!i && !strncmp(in_string,"/*E*/",5)) i = TRUE;
+X	    if (i) fputs(in_string, stdout);
+X
+X	    if (!strncmp(in_string,"/*1*/",5)) {
+X		curr_name = subsname_list;
+X		while (curr_name) {
+X		    n++;
+X		    if (curr_name->next) {
+X			printf("	\"%s\",\n", curr_name->from_name);
+X		    }
+X		    else {
+X			printf("	\"%s\"\n", curr_name->from_name);
+X		    }
+X		    curr_name = curr_name->next;
+X		}
+X		i = FALSE;
+X	    }
+X	    else if (!strncmp(in_string,"/*2*/",5)) {
+X		curr_name = subsname_list;
+X		while (curr_name) {
+X		    if (curr_name->next) {
+X			printf("	\"%s\",\n", curr_name->to_name);
+X		    }
+X		    else {
+X			printf("	\"%s\"\n", curr_name->to_name);
+X		    }
+X		    curr_name = curr_name->next;
+X		}
+X		i = FALSE;
+X	    }
+X	    else if (!strncmp(in_string,"/*3*/",5)) {
+X		printf("	%d\n", n);
+X		i = FALSE;
+X	    }
+X	}
+X	close(template_file);
+X    }
+X}
+X
+Xchar *token () /*: return next interesting identifier */
+X{
+X	register c, state = 0;
+X	register char *p;
+X	static char buf[MAXLEN+1];
+X
+X	for( p = buf; (c = getchar()) != EOF; )
+X	{   if( state )
+X	    switch( state )
+X	    {   case '/':
+X		    if( c != '*' )
+X		    {   state = 0;
+X			break;
+X		    }
+X		    state = c;
+X		    continue;
+X
+X		case 'S':
+X		    if( c == '/' )
+X			state = 0;
+X		    else
+X			state = '*';
+X		case '*':
+X		    if( c == state )
+X			state = 'S';
+X		    continue;
+X
+X		default:
+X		    if( c == '\\' )
+X			(void) getchar();
+X		    else if( c == state )
+X			state = 0;
+X		    continue;
+X	    }
+X	    if( isalnum(c) || c == '_' )
+X	    {   if( p < &buf[sizeof buf - 1] )
+X		    *p++ = c;
+X		continue;
+X	    }
+X	    if( p > buf )
+X	    {   if( p-buf >= symlen && !isdigit(*buf) )
+X		{   *p = '\0';
+X		    ungetc(c, stdin);
+X		    return buf;
+X		}
+X		p = buf;
+X	    }
+X	    if( c == '"' || c == '\'' || c == '/' )
+X		state = c;
+X	    else if( c == '#' && !parsepp )
+X		state = '\n';
+X	}
+X	return NULL;
+X}
+X
+Xchar *myalloc(n) /*: malloc with error detection */
+X{
+X	register char *p;
+X
+X	if( !(p = malloc((unsigned)n)) )
+X	{   fprintf(stderr, "Out of space\n");
+X	    exit(1);
+X	}
+X	return p;
+X}
+X
+X
+X
+/
+echo 'x - template.c'
+sed 's/^X//' > template.c << '/'
+X#define MAXSTRING 160
+X#include <stdio.h>
+X#include <ctype.h>
+X
+Xchar *from_words[]={
+X/*1*/
+X	"CleartoEOLN",
+X	"_cleartoeoln",
+X	"_transmit_on",
+X	"address1",
+X	"addressII",
+X	"alternate_prompt",
+X	"alternative_addresses",
+X	"current_length",
+X	"current_record",
+X	"current_time",
+X	"default_editor",
+X	"default_weedlist",
+X	"define_softkeys",
+X	"display_central_message",
+X	"display_error",
+X	"display_headers",
+X	"display_title",
+X	"expand_env",
+X	"expand_filename",
+X	"expand_group",
+X	"expand_site",
+X	"expand_system",
+X	"expanded",
+X	"expanded_to",
+X	"filename",
+X	"forwarded",
+X	"get_return",
+X	"header_page",
+X	"header_rec",
+X	"header_table",
+X	"last_line",
+X	"machine_group",
+X	"mailbox_defined",
+X	"message_count",
+X	"message_number",
+X	"newaliases",
+X	"optimize_and_add",
+X	"optimize_arpa",
+X	"optimize_cmplx_arpa",
+X	"optimize_return",
+X	"optionally_enter",
+X	"original_cc",
+X	"original_msg_num",
+X	"parse_arpa_date",
+X	"parse_arpa_from",
+X	"pattern_enter",
+X	"pattern_match",
+X	"read_alias_files",
+X	"remove_domains",
+X	"remove_header",
+X	"reply_to",
+X	"resolve_received",
+X	"ret_addr",
+X	"return_value",
+X	"return_value_of",
+X	"sendmail",
+X	"show_menu",
+X	"show_msg_status",
+X	"softkeys_off",
+X	"subject_matches",
+X	"subjectbuffer",
+X	"system_call",
+X	"system_data",
+X	"system_data_file",
+X	"system_files",
+X	"system_hash_file",
+X	"system_hash_table",
+X	"system_record",
+X	"tail_of_string",
+X	"talk_to_sys",
+X	"temp_file",
+X	"timebuff",
+X	"timebuffer",
+X	"top_of_screen_left",
+X	"unexpanded_to"
+X/*E*/
+X};
+Xchar *to_words[]={
+X/*2*/
+X	"cleartoEOLN",
+X	"_Cleartoeoln",
+X	"_Transmit_on",
+X	"Address1",
+X	"aDdressII",
+X	"Alternate_prompt",
+X	"aLternative_addresses",
+X	"CUrrent_length",
+X	"cUrrent_record",
+X	"Current_time",
+X	"Default_editor",
+X	"dEfault_weedlist",
+X	"Define_softkeys",
+X	"DIsplay_central_message",
+X	"Display_error",
+X	"dIsplay_headers",
+X	"diSplay_title",
+X	"ExPand_env",
+X	"exPand_filename",
+X	"eXpand_group",
+X	"EXpand_site",
+X	"Expand_system",
+X	"Expanded",
+X	"eXpanded_to",
+X	"Filename",
+X	"Forwarded",
+X	"Get_return",
+X	"HEader_page",
+X	"Header_rec",
+X	"hEader_table",
+X	"Last_line",
+X	"Machine_group",
+X	"Mailbox_defined",
+X	"Message_count",
+X	"mEssage_number",
+X	"Newaliases",
+X	"oPtimize_and_add",
+X	"opTimize_arpa",
+X	"OPtimize_cmplx_arpa",
+X	"Optimize_return",
+X	"Optionally_enter",
+X	"oRiginal_cc",
+X	"Original_msg_num",
+X	"pArse_arpa_date",
+X	"Parse_arpa_from",
+X	"Pattern_enter",
+X	"pAttern_match",
+X	"Read_alias_files",
+X	"Remove_domains",
+X	"rEmove_header",
+X	"Reply_to",
+X	"Resolve_received",
+X	"Ret_addr",
+X	"rEturn_value",
+X	"Return_value_of",
+X	"Sendmail",
+X	"Show_menu",
+X	"Show_msg_status",
+X	"Softkeys_off",
+X	"sUbject_matches",
+X	"Subjectbuffer",
+X	"sYStem_call",
+X	"SYstem_data",
+X	"syStem_data_file",
+X	"SyStem_files",
+X	"System_hash_file",
+X	"sYstem_hash_table",
+X	"SYStem_record",
+X	"Tail_of_string",
+X	"Talk_to_sys",
+X	"Temp_file",
+X	"Timebuff",
+X	"tImebuffer",
+X	"Top_of_screen_left",
+X	"Unexpanded_to"
+X/*E*/
+X};
+X
+Xmain(argc,argv)
+Xint argc;
+Xchar **argv;
+X{   char word[MAXSTRING], *wnext_ch = word;
+X    int c;
+X
+X    while ((c = getchar()) != EOF) {
+X	if (isalpha(c) || (wnext_ch != word && isdigit(c)) || c == '_') {
+X	    *(wnext_ch++) = c;
+X	}
+X	else {
+X	    if (wnext_ch != word) {
+X		*wnext_ch = '\0';
+X		output_word(word);
+X		wnext_ch = word;
+X	    }
+X	    putchar(c);
+X	}
+X    }
+X    if (wnext_ch != word) {
+X	*wnext_ch = '\0';
+X	output_word(word);
+X	wnext_ch = word;
+X    }
+X}
+X 
+Xoutput_word(word)
+Xchar *word;
+X
+X{   register int low_word, high_word, cmp_result, word_num;
+X
+X    low_word = 0;
+X    high_word =
+X/*3*/
+X/*E*/
+X;
+X    while (high_word >= low_word) {
+X	word_num = (high_word + low_word) >> 1;
+X	if (!(cmp_result = strcmp(word, from_words[word_num]))) {
+X	    fputs(to_words[word_num], stdout);
+X	    return;
+X	}
+X	else if (cmp_result < 0) {
+X	    high_word = word_num - 1;
+X	}
+X	else {
+X	    low_word = word_num + 1;
+X	}
+X    }
+X    fputs(word, stdout);
+X}
+/
+echo 'Part 01 of /usr/spool/uucppublic/shortc complete.'
+exit
+
+

@@ -1,0 +1,2491 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,8d8fcf8c64b105d4,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1988-10-19 09:36:32 PST
+Path: utzoo!attcan!uunet!tektronix!tekgen!tekred!games
+From: games@tekred.TEK.COM
+Newsgroups: comp.sources.games
+Subject: v05i076:  hunt2 - multi-player maze exploration (V2) [BSD only], Part02/04
+Message-ID: <3185@tekred.TEK.COM>
+Date: 19 Oct 88 16:36:32 GMT
+Sender: billr@tekred.TEK.COM
+Lines: 2475
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted by: conrad@cgl.ucsf.edu
+Comp.sources.games: Volume 5, Issue 76
+Archive-name: hunt2/Part02
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 2 (of 4)."
+# Contents:  ctl.c driver.c execute.c hunt.6 playit.c
+# Wrapped by billr@saab on Wed Oct 19 09:23:33 1988
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'ctl.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'ctl.c'\"
+else
+echo shar: Extracting \"'ctl.c'\" \(1262 characters\)
+sed "s/^X//" >'ctl.c' <<'END_OF_FILE'
+X/*
+X * Copyright (c) 1983 Regents of the University of California.
+X * All rights reserved.  The Berkeley software License Agreement
+X * specifies the terms and conditions for redistribution.
+X */
+X
+X#include "bsd.h"
+X
+X#if	defined(TALK_43) || defined(TALK_42) 
+X
+X#ifndef lint
+Xstatic char sccsid[] = "@(#)ctl.c	5.2 (Berkeley) 3/13/86";
+X#endif not lint
+X
+X/*
+X * This file handles haggling with the various talk daemons to
+X * get a socket to talk to. sockt is opened and connected in
+X * the progress
+X */
+X
+X#include "talk_ctl.h"
+X
+Xstruct	sockaddr_in daemon_addr = { AF_INET };
+Xstruct	sockaddr_in ctl_addr = { AF_INET };
+X
+X	/* inet addresses of the two machines */
+Xstruct	in_addr my_machine_addr;
+Xstruct	in_addr his_machine_addr;
+X
+Xu_short daemon_port;	/* port number of the talk daemon */
+X
+Xint	ctl_sockt;
+X
+XCTL_MSG msg;
+X
+X/* open the ctl socket */
+Xopen_ctl() 
+X{
+X	int length;
+X
+X	ctl_addr.sin_port = 0;
+X	ctl_addr.sin_addr = my_machine_addr;
+X	ctl_sockt = socket(AF_INET, SOCK_DGRAM, 0);
+X	if (ctl_sockt <= 0)
+X		p_error("Bad socket");
+X	if (bind(ctl_sockt, &ctl_addr, sizeof(ctl_addr)) != 0)
+X		p_error("Couldn't bind to control socket");
+X	length = sizeof(ctl_addr);
+X	if (getsockname(ctl_sockt, (struct sockaddr *) &ctl_addr, &length) < 0)
+X		p_error("Bad address for ctl socket");
+X}
+X#endif
+END_OF_FILE
+if test 1262 -ne `wc -c <'ctl.c'`; then
+    echo shar: \"'ctl.c'\" unpacked with wrong size!
+fi
+# end of 'ctl.c'
+fi
+if test -f 'driver.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'driver.c'\"
+else
+echo shar: Extracting \"'driver.c'\" \(18735 characters\)
+sed "s/^X//" >'driver.c' <<'END_OF_FILE'
+X/*
+X *  Hunt
+X *  Copyright (c) 1985 Conrad C. Huang, Gregory S. Couch, Kenneth C.R.C. Arnold
+X *  San Francisco, California
+X *
+X *  Copyright (c) 1985 Regents of the University of California.
+X *  All rights reserved.  The Berkeley software License Agreement
+X *  specifies the terms and conditions for redistribution.
+X */
+X
+X# include	"hunt.h"
+X# include	<signal.h>
+X# include	<errno.h>
+X# include	<sys/ioctl.h>
+X# ifndef HPUX
+X# include	<sys/time.h>
+X# else
+X# include	<time.h>
+X# endif
+X
+X# ifndef pdp11
+X# define	RN	(((Seed = Seed * 11109 + 13849) >> 16) & 0xffff)
+X# else pdp11
+X# define	RN	((Seed = Seed * 11109 + 13849) & 0x7fff)
+X# endif pdp11
+X
+Xint	Seed = 0;
+X
+X
+XSOCKET	Daemon;
+Xchar	*First_arg;		/* pointer to argv[0] */
+Xchar	*Last_arg;		/* pointer to end of argv/environ */
+X# ifdef	INTERNET
+Xint	Test_socket;		/* test socket to answer datagrams */
+XFLAG	inetd_spawned;		/* invoked via inetd */
+XFLAG	standard_port = TRUE;	/* true if listening on standard port */
+Xu_short	sock_port;		/* port # of tcp listen socket */
+X# define	DAEMON_SIZE	(sizeof Daemon)
+X# else INTERNET
+X# define	DAEMON_SIZE	(sizeof Daemon - 1)
+X# endif	INTERNET
+X
+X/*
+X * main:
+X *	The main program.
+X */
+Xmain(ac, av, ep)
+Xint	ac;
+Xchar	**av, **ep;
+X{
+X	register PLAYER	*pp;
+X	register int	had_char;
+X# ifdef INTERNET
+X	register long	test_mask;
+X	u_short		msg;
+X	short		port_num, reply;
+X	int		namelen;
+X	SOCKET		test;
+X# endif INTERNET
+X	static long	read_fds;
+X	static FLAG	first = TRUE;
+X	static FLAG	server = FALSE;
+X	extern int	optind;
+X	extern char	*optarg;
+X	int		c;
+X	static struct timeval	linger = {	90, 0	};
+X
+X	First_arg = av[0];
+X	if (ep == NULL || *ep == NULL)
+X		ep = av + ac;
+X	while (*ep)
+X		ep++;
+X	Last_arg = ep[-1] + strlen(ep[-1]);
+X
+X	while ((c = getopt(ac, av, "sp:")) != EOF) {
+X		switch (c) {
+X		  case 's':
+X			server = TRUE;
+X			break;
+X		  case 'p':
+X			standard_port = FALSE;
+X			Test_port = atoi(optarg);
+X			break;
+X		  default:
+Xerred:
+X			fprintf(stderr, "Usage: %s [-s] [-p port]\n", av[0]);
+X			exit(1);
+X		}
+X	}
+X	if (optind < ac)
+X		goto erred;
+X
+X	init();
+X	Sock_mask = (1 << Socket);
+X# ifdef INTERNET
+X	test_mask = (1 << Test_socket);
+X# endif INTERNET
+X
+X
+Xagain:
+X	do {
+X		read_fds = Fds_mask;
+X		errno = 0;
+X		while (select(Num_fds, &read_fds, (int *) NULL,
+X		    (int *) NULL, (struct timeval *) NULL) < 0)
+X		{
+X			if (errno != EINTR)
+X# ifdef LOG
+X				syslog(LOG_WARNING, "select: %m");
+X# else LOG
+X				perror("select");
+X# endif LOG
+X			errno = 0;
+X		}
+X		Have_inp = read_fds;
+X# ifdef INTERNET
+X		if (read_fds & test_mask) {
+X			namelen = DAEMON_SIZE;
+X			port_num = htons(sock_port);
+X			(void) recvfrom(Test_socket, (char *) &msg, sizeof msg,
+X				0, (struct sockaddr *) &test, &namelen);
+X			msg = ntohs(msg);
+X			if (msg == C_MESSAGE)
+X				reply = htons((u_short) Nplayer);
+X			else
+X				reply = port_num;
+X			if (msg == C_PLAYER || Nplayer > 0)
+X				(void) sendto(Test_socket, (char *) &reply,
+X					sizeof reply, 0,
+X					(struct sockaddr *) &test, DAEMON_SIZE);
+X		}
+X# endif INTERNET
+X		for (;;) {
+X			had_char = FALSE;
+X			for (pp = Player; pp < End_player; pp++)
+X				if (havechar(pp)) {
+X					execute(pp);
+X					pp->p_nexec++;
+X					had_char++;
+X				}
+X# ifdef MONITOR
+X			for (pp = Monitor; pp < End_monitor; pp++)
+X				if (havechar(pp)) {
+X					mon_execute(pp);
+X					pp->p_nexec++;
+X					had_char++;
+X				}
+X# endif MONITOR
+X			if (!had_char)
+X				break;
+X			moveshots();
+X			for (pp = Player; pp < End_player; )
+X				if (pp->p_death[0] != '\0')
+X					zap(pp, TRUE);
+X				else
+X					pp++;
+X# ifdef MONITOR
+X			for (pp = Monitor; pp < End_monitor; )
+X				if (pp->p_death[0] != '\0')
+X					zap(pp, FALSE);
+X				else
+X					pp++;
+X# endif MONITOR
+X		}
+X		if (read_fds & Sock_mask)
+X			if (answer()) {
+X				if (first && standard_port)
+X					faketalk();
+X				first = FALSE;
+X			}
+X		for (pp = Player; pp < End_player; pp++) {
+X			if (read_fds & pp->p_mask)
+X				sendcom(pp, READY, pp->p_nexec);
+X			pp->p_nexec = 0;
+X			(void) fflush(pp->p_output);
+X		}
+X# ifdef MONITOR
+X		for (pp = Monitor; pp < End_monitor; pp++) {
+X			if (read_fds & pp->p_mask)
+X				sendcom(pp, READY, pp->p_nexec);
+X			pp->p_nexec = 0;
+X			(void) fflush(pp->p_output);
+X		}
+X# endif MONITOR
+X	} while (Nplayer > 0);
+X
+X	read_fds = Fds_mask;
+X	if (select(Num_fds, &read_fds, (int *) NULL, (int *) NULL,
+X		   &linger) > 0) {
+X		goto again;
+X	}
+X	if (server) {
+X		clear_scores();
+X		makemaze();
+X		clearwalls();
+X# ifdef BOOTS
+X		makeboots();
+X# endif BOOTS
+X		first = TRUE;
+X		goto again;
+X	}
+X
+X# ifdef MONITOR
+X	for (pp = Monitor; pp < End_monitor; )
+X		zap(pp, FALSE);
+X# endif MONITOR
+X	cleanup(0);
+X}
+X
+X/*
+X * init:
+X *	Initialize the global parameters.
+X */
+Xinit()
+X{
+X	register int	i;
+X# ifdef	INTERNET
+X	auto SOCKET	test_port;
+X	auto int	msg;
+X	auto int	len;
+X# endif	INTERNET
+X
+X# ifndef DEBUG
+X# ifdef TIOCNOTTY
+X	(void) ioctl(fileno(stdout), TIOCNOTTY, NULL);
+X# endif
+X	(void) setpgrp(getpid(), getpid());
+X	(void) signal(SIGHUP, SIG_IGN);
+X	(void) signal(SIGINT, SIG_IGN);
+X	(void) signal(SIGQUIT, SIG_IGN);
+X	(void) signal(SIGTERM, cleanup);
+X# endif DEBUG
+X
+X	(void) chdir("/usr/tmp");	/* just in case it core dumps */
+X	(void) umask(0);		/* No privacy at all! */
+X	(void) signal(SIGPIPE, SIG_IGN);
+X
+X# ifdef LOG
+X# ifdef	SYSLOG_43
+X	openlog("HUNT", LOG_PID, LOG_DAEMON);
+X# endif
+X# ifdef	SYSLOG_42
+X	openlog("HUNT", LOG_PID);
+X# endif
+X# endif
+X
+X# ifdef	INTERNET
+X	Daemon.sin_family = SOCK_FAMILY;
+X	Daemon.sin_addr.s_addr = INADDR_ANY;
+X	Daemon.sin_port = 0;
+X# else INTERNET
+X	Daemon.sun_family = SOCK_FAMILY;
+X	(void) strcpy(Daemon.sun_path, Sock_name);
+X# endif INTERNET
+X
+X	Socket = socket(SOCK_FAMILY, SOCK_STREAM, 0);
+X# if defined(INTERNET)
+X	msg = 1;
+X	if (setsockopt(Socket, SOL_SOCKET, SO_USELOOPBACK, &msg, sizeof msg)<0)
+X# ifdef LOG
+X		syslog(LOG_WARNING, "setsockopt loopback %m");
+X# else LOG
+X		perror("setsockopt loopback");
+X# endif LOG
+X# endif INTERNET
+X	if (bind(Socket, (struct sockaddr *) &Daemon, DAEMON_SIZE) < 0) {
+X		if (errno == EADDRINUSE)
+X			exit(0);
+X		else {
+X# ifdef LOG
+X			syslog(LOG_ERR, "bind: %m");
+X# else LOG
+X			perror("bind");
+X# endif LOG
+X			cleanup(1);
+X		}
+X	}
+X	(void) listen(Socket, 5);
+X
+X# ifdef INTERNET
+X	len = sizeof (SOCKET);
+X	if (getsockname(Socket, (struct sockaddr *) &Daemon, &len) < 0)  {
+X# ifdef LOG
+X		syslog(LOG_ERR, "getsockname: %m");
+X# else LOG
+X		perror("getsockname");
+X# endif LOG
+X		exit(1);
+X	}
+X	sock_port = ntohs(Daemon.sin_port);
+X# endif INTERNET
+X	Fds_mask = (1 << Socket);
+X	Num_fds = Socket + 1;
+X
+X# ifdef INTERNET
+X	len = sizeof (SOCKET);
+X	if (getsockname(0, (struct sockaddr *) &test_port, &len) >= 0
+X	&& test_port.sin_family == AF_INET) {
+X		inetd_spawned = TRUE;
+X		Test_socket = 0;
+X		if (test_port.sin_port != htons((u_short) Test_port)) {
+X			standard_port = FALSE;
+X			Test_port = ntohs(test_port.sin_port);
+X		}
+X	} else {
+X		test_port = Daemon;
+X		test_port.sin_port = htons((u_short) Test_port);
+X
+X		Test_socket = socket(SOCK_FAMILY, SOCK_DGRAM, 0);
+X		if (bind(Test_socket, (struct sockaddr *) &test_port,
+X		    DAEMON_SIZE) < 0) {
+X# ifdef LOG
+X			syslog(LOG_ERR, "bind: %m");
+X# else LOG
+X			perror("bind");
+X# endif LOG
+X			exit(1);
+X		}
+X		(void) listen(Test_socket, 5);
+X	}
+X
+X	Fds_mask |= (1 << Test_socket);
+X	if (Test_socket > Socket)
+X		Num_fds = Test_socket + 1;
+X# endif	INTERNET
+X
+X	Seed = getpid() + time((time_t *) NULL);
+X	makemaze();
+X# ifdef BOOTS
+X	makeboots();
+X# endif BOOTS
+X
+X	for (i = 0; i < NASCII; i++)
+X		See_over[i] = TRUE;
+X	See_over[DOOR] = FALSE;
+X	See_over[WALL1] = FALSE;
+X	See_over[WALL2] = FALSE;
+X	See_over[WALL3] = FALSE;
+X# ifdef REFLECT
+X	See_over[WALL4] = FALSE;
+X	See_over[WALL5] = FALSE;
+X# endif REFLECT
+X
+X}
+X
+X# ifdef BOOTS
+X/*
+X * makeboots:
+X *	Put the boots in the maze
+X */
+Xmakeboots()
+X{
+X	register int	x, y;
+X	register PLAYER	*pp;
+X
+X	do {
+X		x = rand_num(WIDTH - 1) + 1;
+X		y = rand_num(HEIGHT - 1) + 1;
+X	} while (Maze[y][x] != SPACE);
+X	Maze[y][x] = BOOT_PAIR;
+X	for (pp = Boot; pp < &Boot[NBOOTS]; pp++)
+X		pp->p_flying = -1;
+X}
+X# endif
+X
+X
+X/*
+X * checkdam:
+X *	Check the damage to the given player, and see if s/he is killed
+X */
+Xcheckdam(ouch, gotcha, credit, amt, shot_type)
+Xregister PLAYER	*ouch, *gotcha;
+Xregister IDENT	*credit;
+Xint		amt;
+Xchar		shot_type;
+X{
+X	register char	*cp;
+X
+X	if (ouch->p_death[0] != '\0')
+X		return;
+X# ifdef BOOTS
+X	if (shot_type == SLIME)
+X		switch (ouch->p_nboots) {
+X		  default:
+X			break;
+X		  case 1:
+X			amt = (amt + 1) / 2;
+X			break;
+X		  case 2:
+X			if (gotcha != NULL)
+X				message(gotcha, "He has boots on!");
+X			return;
+X		}
+X# endif
+X	ouch->p_damage += amt;
+X	if (ouch->p_damage <= ouch->p_damcap) {
+X		(void) sprintf(Buf, "%2d", ouch->p_damage);
+X		cgoto(ouch, STAT_DAM_ROW, STAT_VALUE_COL);
+X		outstr(ouch, Buf, 2);
+X		return;
+X	}
+X
+X	/* Someone DIED */
+X	switch (shot_type) {
+X	  default:
+X		cp = "Killed";
+X		break;
+X# ifdef FLY
+X	  case FALL:
+X		cp = "Killed on impact";
+X		break;
+X# endif FLY
+X	  case KNIFE:
+X		cp = "Stabbed to death";
+X		ouch->p_ammo = 0;		/* No exploding */
+X		break;
+X	  case SHOT:
+X		cp = "Shot to death";
+X		break;
+X	  case GRENADE:
+X	  case SATCHEL:
+X	  case BOMB:
+X		cp = "Bombed";
+X		break;
+X	  case MINE:
+X	  case GMINE:
+X		cp = "Blown apart";
+X		break;
+X# ifdef	OOZE
+X	  case SLIME:
+X		cp = "Slimed";
+X		if (credit != NULL)
+X			credit->i_slime++;
+X		break;
+X# endif OOZE
+X# ifdef	VOLCANO
+X	  case LAVA:
+X		cp = "Baked";
+X		break;
+X# endif VOLCANO
+X# ifdef DRONE
+X	  case DSHOT:
+X		cp = "Eliminated";
+X		break;
+X# endif DRONE
+X	}
+X	if (credit == NULL) {
+X		(void) sprintf(ouch->p_death, "| %s by %s |", cp,
+X			(shot_type == MINE || shot_type == GMINE) ?
+X			"a mine" : "act of God");
+X		return;
+X	}
+X
+X	(void) sprintf(ouch->p_death, "| %s by %s |", cp, credit->i_name);
+X
+X	if (ouch == gotcha) {		/* No use killing yourself */
+X		credit->i_kills--;
+X		credit->i_bkills++;
+X	}
+X	else if (ouch->p_ident->i_team == ' '
+X	|| ouch->p_ident->i_team != credit->i_team) {
+X		credit->i_kills++;
+X		credit->i_gkills++;
+X	}
+X	else {
+X		credit->i_kills--;
+X		credit->i_bkills++;
+X	}
+X	credit->i_score = credit->i_kills / (double) credit->i_entries;
+X	ouch->p_ident->i_deaths++;
+X	if (ouch->p_nchar == 0)
+X		ouch->p_ident->i_stillb++;
+X	if (gotcha == NULL)
+X		return;
+X	gotcha->p_damcap += STABDAM;
+X	gotcha->p_damage -= STABDAM;
+X	if (gotcha->p_damage < 0)
+X		gotcha->p_damage = 0;
+X	(void) sprintf(Buf, "%2d/%2d", gotcha->p_damage, gotcha->p_damcap);
+X	cgoto(gotcha, STAT_DAM_ROW, STAT_VALUE_COL);
+X	outstr(gotcha, Buf, 5);
+X	(void) sprintf(Buf, "%3d", (gotcha->p_damcap - MAXDAM) / 2);
+X	cgoto(gotcha, STAT_KILL_ROW, STAT_VALUE_COL);
+X	outstr(gotcha, Buf, 3);
+X	(void) sprintf(Buf, "%5.2f", gotcha->p_ident->i_score);
+X	for (ouch = Player; ouch < End_player; ouch++) {
+X		cgoto(ouch, STAT_PLAY_ROW + 1 + (gotcha - Player),
+X			STAT_NAME_COL);
+X		outstr(ouch, Buf, 5);
+X	}
+X# ifdef MONITOR
+X	for (ouch = Monitor; ouch < End_monitor; ouch++) {
+X		cgoto(ouch, STAT_PLAY_ROW + 1 + (gotcha - Player),
+X			STAT_NAME_COL);
+X		outstr(ouch, Buf, 5);
+X	}
+X# endif MONITOR
+X}
+X
+X/*
+X * zap:
+X *	Kill off a player and take him out of the game.
+X */
+Xzap(pp, was_player)
+Xregister PLAYER	*pp;
+XFLAG		was_player;
+X{
+X	register int	i, len;
+X	register BULLET	*bp;
+X	register PLAYER	*np;
+X	register int	x, y;
+X	int		savefd, savemask;
+X
+X	if (was_player) {
+X		if (pp->p_undershot)
+X			fixshots(pp->p_y, pp->p_x, pp->p_over);
+X		drawplayer(pp, FALSE);
+X		Nplayer--;
+X	}
+X
+X	len = strlen(pp->p_death);	/* Display the cause of death */
+X	x = (WIDTH - len) / 2;
+X	cgoto(pp, HEIGHT / 2, x);
+X	outstr(pp, pp->p_death, len);
+X	for (i = 1; i < len; i++)
+X		pp->p_death[i] = '-';
+X	pp->p_death[0] = '+';
+X	pp->p_death[len - 1] = '+';
+X	cgoto(pp, HEIGHT / 2 - 1, x);
+X	outstr(pp, pp->p_death, len);
+X	cgoto(pp, HEIGHT / 2 + 1, x);
+X	outstr(pp, pp->p_death, len);
+X	cgoto(pp, HEIGHT, 0);
+X
+X	savefd = pp->p_fd;
+X	savemask = pp->p_mask;
+X
+X# ifdef MONITOR
+X	if (was_player) {
+X# endif MONITOR
+X		dump_stats();
+X		for (bp = Bullets; bp != NULL; bp = bp->b_next) {
+X			if (bp->b_owner == pp)
+X				bp->b_owner = NULL;
+X			if (bp->b_x == pp->p_x && bp->b_y == pp->p_y)
+X				bp->b_over = SPACE;
+X		}
+X
+X		i = rand_num(pp->p_ammo);
+X		x = rand_num(pp->p_ammo);
+X		if (x > i)
+X			i = x;
+X		if (pp->p_ammo == 0)
+X			x = 0;
+X		else if (i == pp->p_ammo - 1) {
+X			x = pp->p_ammo;
+X			len = SLIME;
+X		}
+X		else {
+X			for (x = MAXBOMB - 1; x > 0; x--)
+X				if (i >= shot_req[x])
+X					break;
+X			for (y = MAXSLIME - 1; y > 0; y--)
+X				if (i >= slime_req[y])
+X					break;
+X			if (y >= 0 && slime_req[y] > shot_req[x]) {
+X				x = slime_req[y];
+X				len = SLIME;
+X			}
+X			else if (x != 0) {
+X				len = shot_type[x];
+X				x = shot_req[x];
+X			}
+X		}
+X		if (x > 0) {
+X			(void) add_shot(len, pp->p_y, pp->p_x, pp->p_face, x,
+X				(PLAYER *) NULL, TRUE, SPACE);
+X			(void) sprintf(Buf, "%s detonated.",
+X				pp->p_ident->i_name);
+X			for (np = Player; np < End_player; np++)
+X				message(np, Buf);
+X# ifdef MONITOR
+X			for (np = Monitor; np < End_monitor; np++)
+X				message(np, Buf);
+X# endif MONITOR
+X# ifdef BOOTS
+X			while (pp->p_nboots-- > 0) {
+X				for (np = Boot; np < &Boot[NBOOTS]; np++)
+X					if (np->p_flying < 0)
+X						break;
+X				if (np >= &Boot[NBOOTS])
+X					abort(1, "Too many boots");
+X				np->p_undershot = FALSE;
+X				np->p_x = pp->p_x;
+X				np->p_y = pp->p_y;
+X				np->p_flying = rand_num(20);
+X				np->p_flyx = 2 * rand_num(6) - 5;
+X				np->p_flyy = 2 * rand_num(6) - 5;
+X				np->p_over = SPACE;
+X				np->p_face = BOOT;
+X				showexpl(np->p_y, np->p_x, BOOT);
+X			}
+X# endif BOOTS
+X		}
+X# ifdef BOOTS
+X		else if (pp->p_nboots > 0) {
+X			if (pp->p_nboots == 2)
+X				Maze[pp->p_y][pp->p_x] = BOOT_PAIR;
+X			else
+X				Maze[pp->p_y][pp->p_x] = BOOT;
+X			if (pp->p_undershot)
+X				fixshots(pp->p_y, pp->p_x,
+X					Maze[pp->p_y][pp->p_x]);
+X		}
+X# endif BOOTS
+X
+X# ifdef VOLCANO
+X		volcano += pp->p_ammo - x;
+X		if (rand_num(100) < volcano / 50) {
+X			do {
+X				x = rand_num(WIDTH / 2) + WIDTH / 4;
+X				y = rand_num(HEIGHT / 2) + HEIGHT / 4;
+X			} while (Maze[y][x] != SPACE);
+X			(void) add_shot(LAVA, y, x, LEFTS, volcano,
+X				(PLAYER *) NULL, TRUE, SPACE);
+X			for (np = Player; np < End_player; np++)
+X				message(np, "Volcano eruption.");
+X			volcano = 0;
+X		}
+X# endif VOLCANO
+X
+X# ifdef	DRONE
+X		if (rand_num(100) < 2) {
+X			do {
+X				x = rand_num(WIDTH / 2) + WIDTH / 4;
+X				y = rand_num(HEIGHT / 2) + HEIGHT / 4;
+X			} while (Maze[y][x] != SPACE);
+X			add_shot(DSHOT, y, x, rand_dir(),
+X				shot_req[MINDSHOT +
+X				rand_num(MAXBOMB - MINDSHOT)],
+X				(PLAYER *) NULL, FALSE, SPACE);
+X		}
+X# endif	DRONE
+X
+X		sendcom(pp, ENDWIN);
+X		(void) fclose(pp->p_output);
+X
+X		End_player--;
+X		if (pp != End_player) {
+X			bcopy((char *) End_player, (char *) pp,
+X				sizeof (PLAYER));
+X			(void) sprintf(Buf, "%5.2f%c%-10.10s %c",
+X				pp->p_ident->i_score, stat_char(pp),
+X				pp->p_ident->i_name, pp->p_ident->i_team);
+X			i = STAT_PLAY_ROW + 1 + (pp - Player);
+X			for (np = Player; np < End_player; np++) {
+X				cgoto(np, i, STAT_NAME_COL);
+X				outstr(np, Buf, STAT_NAME_LEN);
+X			}
+X# ifdef MONITOR
+X			for (np = Monitor; np < End_monitor; np++) {
+X				cgoto(np, i, STAT_NAME_COL);
+X				outstr(np, Buf, STAT_NAME_LEN);
+X			}
+X# endif MONITOR
+X		}
+X
+X		/* Erase the last player */
+X		i = STAT_PLAY_ROW + 1 + Nplayer;
+X		for (np = Player; np < End_player; np++) {
+X			cgoto(np, i, STAT_NAME_COL);
+X			ce(np);
+X		}
+X# ifdef MONITOR
+X		for (np = Monitor; np < End_monitor; np++) {
+X			cgoto(np, i, STAT_NAME_COL);
+X			ce(np);
+X		}
+X	}
+X	else {
+X		sendcom(pp, ENDWIN);
+X		(void) putc(LAST_PLAYER, pp->p_output);
+X		(void) fclose(pp->p_output);
+X
+X		End_monitor--;
+X		if (pp != End_monitor) {
+X			bcopy((char *) End_monitor, (char *) pp,
+X				sizeof (PLAYER));
+X			(void) sprintf(Buf, "%5.5s %-10.10s %c", " ",
+X				pp->p_ident->i_name, pp->p_ident->i_team);
+X			i = STAT_MON_ROW + 1 + (pp - Player);
+X			for (np = Player; np < End_player; np++) {
+X				cgoto(np, i, STAT_NAME_COL);
+X				outstr(np, Buf, STAT_NAME_LEN);
+X			}
+X			for (np = Monitor; np < End_monitor; np++) {
+X				cgoto(np, i, STAT_NAME_COL);
+X				outstr(np, Buf, STAT_NAME_LEN);
+X			}
+X		}
+X
+X		/* Erase the last monitor */
+X		i = STAT_MON_ROW + 1 + (End_monitor - Monitor);
+X		for (np = Player; np < End_player; np++) {
+X			cgoto(np, i, STAT_NAME_COL);
+X			ce(np);
+X		}
+X		for (np = Monitor; np < End_monitor; np++) {
+X			cgoto(np, i, STAT_NAME_COL);
+X			ce(np);
+X		}
+X
+X	}
+X# endif MONITOR
+X
+X	Fds_mask &= ~savemask;
+X	if (Num_fds == savefd + 1) {
+X		Num_fds = Socket;
+X# ifdef INTERNET
+X		if (Test_socket > Socket)
+X			Num_fds = Test_socket;
+X# endif INTERNET
+X		for (np = Player; np < End_player; np++)
+X			if (np->p_fd > Num_fds)
+X				Num_fds = np->p_fd;
+X# ifdef MONITOR
+X		for (np = Monitor; np < End_monitor; np++)
+X			if (np->p_fd > Num_fds)
+X				Num_fds = np->p_fd;
+X# endif MONITOR
+X		Num_fds++;
+X	}
+X}
+X
+X/*
+X * rand_num:
+X *	Return a random number in a given range.
+X */
+Xrand_num(range)
+Xint	range;
+X{
+X	return (range == 0 ? 0 : RN % range);
+X}
+X
+X/*
+X * havechar:
+X *	Check to see if we have any characters in the input queue; if
+X *	we do, read them, stash them away, and return TRUE; else return
+X *	FALSE.
+X */
+Xhavechar(pp)
+Xregister PLAYER	*pp;
+X{
+X	extern int	errno;
+X
+X	if (pp->p_ncount < pp->p_nchar)
+X		return TRUE;
+X	if (!(Have_inp & pp->p_mask))
+X		return FALSE;
+X	Have_inp &= ~pp->p_mask;
+Xcheck_again:
+X	errno = 0;
+X	if ((pp->p_nchar = read(pp->p_fd, pp->p_cbuf, sizeof pp->p_cbuf)) <= 0)
+X	{
+X		if (errno == EINTR)
+X			goto check_again;
+X		pp->p_cbuf[0] = 'q';
+X	}
+X	pp->p_ncount = 0;
+X	return TRUE;
+X}
+X
+X/*
+X * cleanup:
+X *	Exit with the given value, cleaning up any droppings lying around
+X */
+Xcleanup(eval)
+Xint	eval;
+X{
+X	register PLAYER	*pp;
+X
+X	for (pp = Player; pp < End_player; pp++) {
+X		cgoto(pp, HEIGHT, 0);
+X		sendcom(pp, ENDWIN);
+X		(void) putc(LAST_PLAYER, pp->p_output);
+X		(void) fclose(pp->p_output);
+X	}
+X# ifdef MONITOR
+X	for (pp = Monitor; pp < End_monitor; pp++) {
+X		cgoto(pp, HEIGHT, 0);
+X		sendcom(pp, ENDWIN);
+X		(void) putc(LAST_PLAYER, pp->p_output);
+X		(void) fclose(pp->p_output);
+X	}
+X# endif MONITOR
+X	(void) close(Socket);
+X# ifdef AF_UNIX_HACK
+X	(void) unlink(Sock_name);
+X# endif AF_UNIX_HACK
+X
+X	dump_stats();
+X	exit(eval);
+X}
+X
+X/*
+X * dump_stats:
+X *	Print absorption stats
+X */
+Xdump_stats()
+X{
+X	register IDENT	*ip;
+X	register FILE	*fp;
+X	extern char	*Stat_file;
+X
+X	if ((fp = fopen(Stat_file, "w")) != NULL) {
+X		fputs("Name\t\tScore\tDucked\tAbsorb\tFaced\tShot\tRobbed\tMissed\tSlimeK\n", fp);
+X		for (ip = Scores; ip != NULL; ip = ip->i_next) {
+X			fprintf(fp, "%s\t", ip->i_name);
+X			if (strlen(ip->i_name) < 8)
+X				putc('\t', fp);
+X			fprintf(fp, "%.2f\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+X				ip->i_score, ip->i_ducked, ip->i_absorbed,
+X				ip->i_faced, ip->i_shot, ip->i_robbed,
+X				ip->i_missed, ip->i_slime);
+X		}
+X		fputs("\n\nName\t\tEnemy\tFriend\tDeaths\tStill\tSaved\n", fp);
+X		for (ip = Scores; ip != NULL; ip = ip->i_next) {
+X			if (ip->i_team == ' ') {
+X				fprintf(fp, "%s\t", ip->i_name);
+X				if (strlen(ip->i_name) < 8)
+X					putc('\t', fp);
+X			}
+X			else {
+X				fprintf(fp, "%s[%c]\t", ip->i_name, ip->i_team);
+X				if (strlen(ip->i_name) + 3 < 8)
+X					putc('\t', fp);
+X			}
+X			fprintf(fp, "%d\t%d\t%d\t%d\t%d\n",
+X				ip->i_gkills, ip->i_bkills, ip->i_deaths,
+X				ip->i_stillb, ip->i_saved);
+X		}
+X		(void) fclose(fp);
+X	}
+X}
+X
+X/*
+X * clear_scores:
+X *	Clear out the scores so the next session start clean
+X */
+Xclear_scores()
+X{
+X	register IDENT	*ip, *nextip;
+X
+X	for (ip = Scores; ip != NULL; ip = nextip) {
+X		nextip = ip->i_next;
+X		(void) free((char *) ip);
+X	}
+X	Scores = NULL;
+X}
+END_OF_FILE
+if test 18735 -ne `wc -c <'driver.c'`; then
+    echo shar: \"'driver.c'\" unpacked with wrong size!
+fi
+# end of 'driver.c'
+fi
+if test -f 'execute.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'execute.c'\"
+else
+echo shar: Extracting \"'execute.c'\" \(9940 characters\)
+sed "s/^X//" >'execute.c' <<'END_OF_FILE'
+X/*
+X *  Hunt
+X *  Copyright (c) 1985 Conrad C. Huang, Gregory S. Couch, Kenneth C.R.C. Arnold
+X *  San Francisco, California
+X *
+X *  Copyright (c) 1985 Regents of the University of California.
+X *  All rights reserved.  The Berkeley software License Agreement
+X *  specifies the terms and conditions for redistribution.
+X */
+X
+X# include	"hunt.h"
+X
+X# undef CTRL
+X# define	CTRL(x)	('x' & 037)
+X
+X# ifdef MONITOR
+X/*
+X * mon_execute:
+X *	Execute a single monitor command
+X */
+Xmon_execute(pp)
+Xregister PLAYER	*pp;
+X{
+X	register char	ch;
+X
+X	ch = pp->p_cbuf[pp->p_ncount++];
+X	switch (ch) {
+X	  case CTRL(L):
+X		sendcom(pp, REDRAW);
+X		break;
+X	  case 'q':
+X		(void) strcpy(pp->p_death, "| Quit |");
+X		break;
+X	}
+X}
+X# endif MONITOR
+X
+X/*
+X * execute:
+X *	Execute a single command
+X */
+Xexecute(pp)
+Xregister PLAYER	*pp;
+X{
+X	register char	ch;
+X
+X	ch = pp->p_cbuf[pp->p_ncount++];
+X
+X# ifdef	FLY
+X	if (pp->p_flying >= 0) {
+X		switch (ch) {
+X		  case CTRL(L):
+X			sendcom(pp, REDRAW);
+X			break;
+X		  case 'q':
+X			(void) strcpy(pp->p_death, "| Quit |");
+X			break;
+X		}
+X		return;
+X	}
+X# endif	FLY
+X
+X	switch (ch) {
+X	  case CTRL(L):
+X		sendcom(pp, REDRAW);
+X		break;
+X	  case 'h':
+X		move(pp, LEFTS);
+X		break;
+X	  case 'H':
+X		face(pp, LEFTS);
+X		break;
+X	  case 'j':
+X		move(pp, BELOW);
+X		break;
+X	  case 'J':
+X		face(pp, BELOW);
+X		break;
+X	  case 'k':
+X		move(pp, ABOVE);
+X		break;
+X	  case 'K':
+X		face(pp, ABOVE);
+X		break;
+X	  case 'l':
+X		move(pp, RIGHT);
+X		break;
+X	  case 'L':
+X		face(pp, RIGHT);
+X		break;
+X	  case 'f':
+X	  case '1':
+X		fire(pp, 0);		/* SHOT */
+X		break;
+X	  case 'g':
+X	  case '2':
+X		fire(pp, 1);		/* GRENADE */
+X		break;
+X	  case 'F':
+X	  case '3':
+X		fire(pp, 2);		/* SATCHEL */
+X		break;
+X	  case 'G':
+X	  case '4':
+X		fire(pp, 3);		/* 7x7 BOMB */
+X		break;
+X	  case '5':
+X		fire(pp, 4);		/* 9x9 BOMB */
+X		break;
+X	  case '6':
+X		fire(pp, 5);		/* 11x11 BOMB */
+X		break;
+X	  case '7':
+X		fire(pp, 6);		/* 13x13 BOMB */
+X		break;
+X	  case '8':
+X		fire(pp, 7);		/* 15x15 BOMB */
+X		break;
+X	  case '9':
+X		fire(pp, 8);		/* 17x17 BOMB */
+X		break;
+X	  case '0':
+X		fire(pp, 9);		/* 19x19 BOMB */
+X		break;
+X	  case '@':
+X		fire(pp, 10);		/* 21x21 BOMB */
+X		break;
+X# ifdef	OOZE
+X	  case 'o':
+X		fire_slime(pp, 0);	/* SLIME */
+X		break;
+X	  case 'O':
+X		fire_slime(pp, 1);	/* SSLIME */
+X		break;
+X	  case 'p':
+X		fire_slime(pp, 2);
+X		break;
+X	  case 'P':
+X		fire_slime(pp, 3);
+X		break;
+X# endif	OOZE
+X	  case 's':
+X		scan(pp);
+X		break;
+X	  case 'c':
+X		cloak(pp);
+X		break;
+X	  case 'q':
+X		(void) strcpy(pp->p_death, "| Quit |");
+X		break;
+X	}
+X}
+X
+X/*
+X * move:
+X *	Execute a move in the given direction
+X */
+Xmove(pp, dir)
+Xregister PLAYER	*pp;
+Xint		dir;
+X{
+X	register PLAYER	*newp;
+X	register int	x, y;
+X	register FLAG	moved;
+X	register BULLET	*bp;
+X
+X	y = pp->p_y;
+X	x = pp->p_x;
+X
+X	switch (dir) {
+X	  case LEFTS:
+X		x--;
+X		break;
+X	  case RIGHT:
+X		x++;
+X		break;
+X	  case ABOVE:
+X		y--;
+X		break;
+X	  case BELOW:
+X		y++;
+X		break;
+X	}
+X
+X	moved = FALSE;
+X	switch (Maze[y][x]) {
+X	  case SPACE:
+X# ifdef RANDOM
+X	  case DOOR:
+X# endif RANDOM
+X		moved = TRUE;
+X		break;
+X	  case WALL1:
+X	  case WALL2:
+X	  case WALL3:
+X# ifdef REFLECT
+X	  case WALL4:
+X	  case WALL5:
+X# endif REFLECT
+X		break;
+X	  case MINE:
+X	  case GMINE:
+X		if (dir == pp->p_face)
+X			pickup(pp, y, x, 2, Maze[y][x]);
+X		else if (opposite(dir, pp->p_face))
+X			pickup(pp, y, x, 95, Maze[y][x]);
+X		else
+X			pickup(pp, y, x, 50, Maze[y][x]);
+X		Maze[y][x] = SPACE;
+X		moved = TRUE;
+X		break;
+X	  case SHOT:
+X	  case GRENADE:
+X	  case SATCHEL:
+X	  case BOMB:
+X# ifdef OOZE
+X	  case SLIME:
+X# endif OOZE
+X# ifdef DRONE
+X	  case DSHOT:
+X# endif DRONE
+X		bp = is_bullet(y, x);
+X		if (bp != NULL)
+X			bp->b_expl = TRUE;
+X		Maze[y][x] = SPACE;
+X		moved = TRUE;
+X		break;
+X	  case LEFTS:
+X	  case RIGHT:
+X	  case ABOVE:
+X	  case BELOW:
+X		if (dir != pp->p_face)
+X			sendcom(pp, BELL);
+X		else {
+X			newp = play_at(y, x);
+X			checkdam(newp, pp, pp->p_ident, STABDAM, KNIFE);
+X		}
+X		break;
+X# ifdef FLY
+X	  case FLYER:
+X		newp = play_at(y, x);
+X		message(newp, "Oooh, there's a short guy waving at you!");
+X		message(pp, "You couldn't quite reach him!");
+X		break;
+X# endif FLY
+X# ifdef BOOTS
+X	  case BOOT:
+X	  case BOOT_PAIR:
+X		if (Maze[y][x] == BOOT)
+X			pp->p_nboots++;
+X		else
+X			pp->p_nboots += 2;
+X		for (newp = Boot; newp < &Boot[NBOOTS]; newp++) {
+X			if (newp->p_flying < 0)
+X				continue;
+X			if (newp->p_y == y && newp->p_x == x) {
+X				newp->p_flying = -1;
+X				if (newp->p_undershot)
+X					fixshots(y, x, newp->p_over);
+X			}
+X		}
+X		if (pp->p_nboots == 2)
+X			message(pp, "Wow!  A pair of boots!");
+X		else
+X			message(pp, "You can hobble around on one boot.");
+X		Maze[y][x] = SPACE;
+X		moved = TRUE;
+X		break;
+X# endif BOOTS
+X	}
+X	if (moved) {
+X		if (pp->p_ncshot > 0)
+X			if (--pp->p_ncshot == MAXNCSHOT) {
+X				cgoto(pp, STAT_GUN_ROW, STAT_VALUE_COL);
+X				outstr(pp, " ok", 3);
+X			}
+X		if (pp->p_undershot) {
+X			fixshots(pp->p_y, pp->p_x, pp->p_over);
+X			pp->p_undershot = FALSE;
+X		}
+X		drawplayer(pp, FALSE);
+X		pp->p_over = Maze[y][x];
+X		pp->p_y = y;
+X		pp->p_x = x;
+X		drawplayer(pp, TRUE);
+X	}
+X}
+X
+X/*
+X * face:
+X *	Change the direction the player is facing
+X */
+Xface(pp, dir)
+Xregister PLAYER	*pp;
+Xregister int	dir;
+X{
+X	if (pp->p_face != dir) {
+X		pp->p_face = dir;
+X		drawplayer(pp, TRUE);
+X	}
+X}
+X
+X/*
+X * fire:
+X *	Fire a shot of the given type in the given direction
+X */
+Xfire(pp, req_index)
+Xregister PLAYER	*pp;
+Xregister int	req_index;
+X{
+X	if (pp == NULL)
+X		return;
+X# ifdef DEBUG
+X	if (req_index < 0 || req_index >= MAXBOMB)
+X		message(pp, "What you do?");
+X# endif DEBUG
+X	while (req_index >= 0 && pp->p_ammo < shot_req[req_index])
+X		req_index--;
+X	if (req_index < 0) {
+X		message(pp, "Not enough charges.");
+X		return;
+X	}
+X	if (pp->p_ncshot > MAXNCSHOT)
+X		return;
+X	if (pp->p_ncshot++ == MAXNCSHOT) {
+X		cgoto(pp, STAT_GUN_ROW, STAT_VALUE_COL);
+X		outstr(pp, "   ", 3);
+X	}
+X	pp->p_ammo -= shot_req[req_index];
+X	(void) sprintf(Buf, "%3d", pp->p_ammo);
+X	cgoto(pp, STAT_AMMO_ROW, STAT_VALUE_COL);
+X	outstr(pp, Buf, 3);
+X
+X	add_shot(shot_type[req_index], pp->p_y, pp->p_x, pp->p_face,
+X		shot_req[req_index], pp, FALSE, pp->p_face);
+X	pp->p_undershot = TRUE;
+X
+X	/*
+X	 * Show the object to everyone
+X	 */
+X	showexpl(pp->p_y, pp->p_x, shot_type[req_index]);
+X	for (pp = Player; pp < End_player; pp++)
+X		sendcom(pp, REFRESH);
+X# ifdef MONITOR
+X	for (pp = Monitor; pp < End_monitor; pp++)
+X		sendcom(pp, REFRESH);
+X# endif MONITOR
+X}
+X
+X# ifdef	OOZE
+X/*
+X * fire_slime:
+X *	Fire a slime shot in the given direction
+X */
+Xfire_slime(pp, req_index)
+Xregister PLAYER	*pp;
+Xregister int	req_index;
+X{
+X	if (pp == NULL)
+X		return;
+X# ifdef DEBUG
+X	if (req_index < 0 || req_index >= MAXSLIME)
+X		message(pp, "What you do?");
+X# endif DEBUG
+X	while (req_index >= 0 && pp->p_ammo < slime_req[req_index])
+X		req_index--;
+X	if (req_index < 0) {
+X		message(pp, "Not enough charges.");
+X		return;
+X	}
+X	if (pp->p_ncshot > MAXNCSHOT)
+X		return;
+X	if (pp->p_ncshot++ == MAXNCSHOT) {
+X		cgoto(pp, STAT_GUN_ROW, STAT_VALUE_COL);
+X		outstr(pp, "   ", 3);
+X	}
+X	pp->p_ammo -= slime_req[req_index];
+X	(void) sprintf(Buf, "%3d", pp->p_ammo);
+X	cgoto(pp, STAT_AMMO_ROW, STAT_VALUE_COL);
+X	outstr(pp, Buf, 3);
+X
+X	add_shot(SLIME, pp->p_y, pp->p_x, pp->p_face,
+X		slime_req[req_index] * SLIME_FACTOR, pp, FALSE, pp->p_face);
+X	pp->p_undershot = TRUE;
+X
+X	/*
+X	 * Show the object to everyone
+X	 */
+X	showexpl(pp->p_y, pp->p_x, SLIME);
+X	for (pp = Player; pp < End_player; pp++)
+X		sendcom(pp, REFRESH);
+X# ifdef MONITOR
+X	for (pp = Monitor; pp < End_monitor; pp++)
+X		sendcom(pp, REFRESH);
+X# endif MONITOR
+X}
+X# endif	OOZE
+X
+X/*
+X * add_shot:
+X *	Create a shot with the given properties
+X */
+Xadd_shot(type, y, x, face, charge, owner, expl, over)
+Xint	type;
+Xint	y, x;
+Xchar	face;
+Xint	charge;
+XPLAYER	*owner;
+Xint	expl;
+Xchar	over;
+X{
+X	register BULLET	*bp;
+X	register int	size;
+X
+X	switch (type) {
+X	  case SHOT:
+X	  case MINE:
+X		size = 1;
+X		break;
+X	  case GRENADE:
+X	  case GMINE:
+X		size = 2;
+X		break;
+X	  case SATCHEL:
+X		size = 3;
+X		break;
+X	  case BOMB:
+X		for (size = 3; size < MAXBOMB; size++)
+X			if (shot_req[size] >= charge)
+X				break;
+X		size++;
+X		break;
+X	  default:
+X		size = 0;
+X		break;
+X	}
+X
+X	bp = create_shot(type, y, x, face, charge, size, owner,
+X		(owner == NULL) ? NULL : owner->p_ident, expl, over);
+X	bp->b_next = Bullets;
+X	Bullets = bp;
+X}
+X
+XBULLET *
+Xcreate_shot(type, y, x, face, charge, size, owner, score, expl, over)
+Xint	type;
+Xint	y, x;
+Xchar	face;
+Xint	charge;
+Xint	size;
+XPLAYER	*owner;
+XIDENT	*score;
+Xint	expl;
+Xchar	over;
+X{
+X	register BULLET	*bp;
+X
+X	bp = (BULLET *) malloc(sizeof (BULLET));	/* NOSTRICT */
+X	if (bp == NULL) {
+X		if (owner != NULL)
+X			message(owner, "Out of memory");
+X		return NULL;
+X	}
+X
+X	bp->b_face = face;
+X	bp->b_x = x;
+X	bp->b_y = y;
+X	bp->b_charge = charge;
+X	bp->b_owner = owner;
+X	bp->b_score = score;
+X	bp->b_type = type;
+X	bp->b_size = size;
+X	bp->b_expl = expl;
+X	bp->b_over = over;
+X	bp->b_next = NULL;
+X
+X	return bp;
+X}
+X
+X/*
+X * cloak:
+X *	Turn on or increase length of a cloak
+X */
+Xcloak(pp)
+Xregister PLAYER	*pp;
+X{
+X	if (pp->p_ammo <= 0) {
+X		message(pp, "No more charges");
+X		return;
+X	}
+X# ifdef BOOTS
+X	if (pp->p_nboots > 0) {
+X		message(pp, "Boots are too noisy to cloak!");
+X		return;
+X	}
+X# endif BOOTS
+X	(void) sprintf(Buf, "%3d", --pp->p_ammo);
+X	cgoto(pp, STAT_AMMO_ROW, STAT_VALUE_COL);
+X	outstr(pp, Buf, 3);
+X
+X	pp->p_cloak += CLOAKLEN;
+X
+X	if (pp->p_scan >= 0)
+X		pp->p_scan = -1;
+X
+X	showstat(pp);
+X}
+X
+X/*
+X * scan:
+X *	Turn on or increase length of a scan
+X */
+Xscan(pp)
+Xregister PLAYER	*pp;
+X{
+X	if (pp->p_ammo <= 0) {
+X		message(pp, "No more charges");
+X		return;
+X	}
+X	(void) sprintf(Buf, "%3d", --pp->p_ammo);
+X	cgoto(pp, STAT_AMMO_ROW, STAT_VALUE_COL);
+X	outstr(pp, Buf, 3);
+X
+X	pp->p_scan += SCANLEN;
+X
+X	if (pp->p_cloak >= 0)
+X		pp->p_cloak = -1;
+X
+X	showstat(pp);
+X}
+X
+X/*
+X * pickup:
+X *	check whether the object blew up or whether he picked it up
+X */
+Xpickup(pp, y, x, prob, obj)
+Xregister PLAYER	*pp;
+Xregister int	y, x;
+Xint		prob;
+Xint		obj;
+X{
+X	register int	req;
+X
+X	switch (obj) {
+X	  case MINE:
+X		req = BULREQ;
+X		break;
+X	  case GMINE:
+X		req = GRENREQ;
+X		break;
+X	  default:
+X		abort();
+X	}
+X	if (rand_num(100) < prob)
+X		add_shot(obj, y, x, LEFTS, req, (PLAYER *) NULL,
+X			TRUE, pp->p_face);
+X	else {
+X		pp->p_ammo += req;
+X		(void) sprintf(Buf, "%3d", pp->p_ammo);
+X		cgoto(pp, STAT_AMMO_ROW, STAT_VALUE_COL);
+X		outstr(pp, Buf, 3);
+X	}
+X}
+END_OF_FILE
+if test 9940 -ne `wc -c <'execute.c'`; then
+    echo shar: \"'execute.c'\" unpacked with wrong size!
+fi
+# end of 'execute.c'
+fi
+if test -f 'hunt.6' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'hunt.6'\"
+else
+echo shar: Extracting \"'hunt.6'\" \(10501 characters\)
+sed "s/^X//" >'hunt.6' <<'END_OF_FILE'
+X.\"  hunt
+X.\"  Copyright (c) 1985 Conrad C. Huang, Gregory S. Couch, Kenneth C.R.C. Arnold
+X.\"  San Francisco, California
+X.\"
+X.\"  Copyright (c) 1985 Regents of the University of California.
+X.\"  All rights reserved.  The Berkeley software License Agreement
+X.\"  specifies the terms and conditions for redistribution.
+X.\"
+X.TH HUNT 6 "21 August 1986"
+X.UC 4
+X.SH NAME
+Xhunt \- a multi-player multi-terminal game
+X.SH SYNOPSIS
+X\fB/usr/games/hunt\fP [ \fB\-qmcsfb\fP ] [ \fB\-n\fP name ] [ \fB\-t\fP team ] [ \fB\-p\fP port ] [ \fB\-w\fP message ] [ host ]
+X.SH DESCRIPTION
+XThe object of the game
+X.I hunt
+Xis to kill off the other players.
+XThere are no rooms, no treasures, and no monsters.
+XInstead, you wander around a maze, find grenades, trip mines, and shoot down
+Xwalls and players.
+XThe more players you kill before you die, the better your score is.
+XIf the
+X.B \-m
+Xflag is given,
+Xyou enter the game as a monitor
+X(you can see the action but you cannot play).
+X.PP
+X.I Hunt
+Xnormally looks for an active game on the local network;
+Xif none is found, it starts one up on the local host.
+XThe location of the game may be specified by giving the
+X.I host
+Xargument.
+XThis presupposes that a hunt game is already running on that host, see
+X.IR huntd (6)
+Xfor details on how to setup a game on a specific host.
+X.PP
+XIf the
+X.B \-q
+Xflag is given,
+X.I hunt
+Xqueries the local network (or specific host) and reports if an active game
+Xis found.
+XThis is useful for shell startup scripts, \fIe.g.\fP csh's .login.
+X.PP
+XThe player name may be specified on the command line by using the
+X.B \-n
+Xoption.
+X.PP
+XThe
+X.BR \-c ,
+X.BR \-s ,
+Xand
+X.B \-f
+Xoptions are for entering the game cloaked, scanning, or flying respectively.
+X.PP
+XThe
+X.B \-b
+Xoption turns off beeping when you reach the typeahead limit.
+X.PP
+XThe
+X.B \-t
+Xoption aids team playing by making everyone else on one's team
+Xappear as the team name.
+XA team name is a single digit to avoid conflicting with other characters
+Xused in the game.
+X.PP
+XThe
+X.B \-p
+X.I port
+Xoption allows the rendezvous port number to be set.
+XThis is a useful way for people playing on dialup lines to avoid playing
+Xwith people on 9600 baud terminals.
+X.PP
+XThe
+X.B \-w
+X.I message
+Xoption is the only way to send a message to everyone else's screen when
+Xyou start up.
+XIt is most often used to say ``eat slime death - NickD's coming in''.
+X.PP
+XWhen you die and are asked if you wish to re-enter the game,
+Xthere are other answers than just yes or no.
+XYou can also reply with a
+X.B w
+Xfor write a message before continuing or
+X.B o
+Xto change how you enter the game (cloaked, scanning, or flying).
+X.PP
+XTo be notified automatically when a
+X.I hunt
+Xstarts up, add your login to the
+X.I hunt-players
+Xmailing list (see
+X.IR huntd (6)).
+X.SH "PLAYING HINTS"
+X.I Hunt
+Xonly works on crt (vdt) terminals with at least 24 lines, 80 columns, and
+Xcursor addressing.
+XThe screen is divided in to 3 areas.
+XOn the right hand side is the status area.
+XIt shows damage sustained,
+Xcharges remaining,
+Xwho's in the game,
+Xwho's scanning (the
+X.B ``*''
+Xin front of the name),
+Xwho's cloaked (the
+X.B ``+''
+Xin front of the name),
+Xand other players' scores.
+XThe rest of the screen is taken up by your map of the maze.
+XThe 24th line
+Xis used for longer messages that don't fit in the status area.
+X.PP
+X.I Hunt
+Xuses the same keys to move as
+X.IR vi (1)
+Xdoes,
+X.IR i.e. ,
+X.BR h ,
+X.BR j ,
+X.BR k ,
+Xand
+X.B l
+Xfor left, down, up, right respectively.
+XTo change which direction you're facing in the maze,
+Xuse the upper case version of the movement key (\c
+X.IR i.e. ,
+X.BR HJKL ).
+XYou can only fire or throw things in the direction you're facing.
+X.TP
+XOther commands are:
+X.sp
+X.nf
+X.ta
+X.ta \w'>\|<\|^\|v\ \ 'u
+Xf or 1	\- Fire a bullet (Takes 1 charge)
+Xg or 2	\- Throw grenade (Takes 9 charges)
+XF or 3	\- Throw satchel charge (Takes 25 charges)
+XG or 4	\- Throw bomb (Takes 49 charges)
+X5	\- Throw big bomb (Takes 81 charges)
+X6	\- Throw even bigger bomb (Takes 121 charges)
+X7	\- Throw even more big bomb (Takes 169 charges)
+X8	\- Throw even more bigger bomb (Takes 225 charges)
+X9	\- Throw very big bomb (Takes 289 charges)
+X0	\- Throw very, very big bomb (Takes 361 charges)
+X@	\- Throw biggest bomb (Takes 441 charges)
+Xo	\- Throw small slime (Takes 15 charges)
+XO	\- Throw big slime (Takes 30 charges)
+Xp	\- Throw bigger slime (Takes 45 charges)
+XP	\- Throw biggest slime (Takes 60 charges)
+Xs	\- Scan (show where other players are) (Takes 1 charge)
+Xc	\- Cloak (hide from scanners) (Takes 1 charge)
+X
+X^L	\- Redraw screen
+Xq	\- Quit
+X.fi
+X.TP
+XThe symbols on the screen are:
+X.sp
+X.nf
+X.ta
+X.ta \w'>\|<\|^\|v\ \ 'u
+X\-\||\|+	\- walls
+X/\|\\	\- diagonal (deflecting) walls
+X#	\- doors (dispersion walls)
+X;	\- small mine
+Xg	\- large mine
+X:	\- bullet
+Xo	\- grenade
+XO	\- satchel charge
+X@	\- bomb
+Xs	\- small slime
+X$	\- big slime
+X>\|<\|^\|v	\- you facing right, left, up, or down
+X}\|{\|i\|!	\- other players facing right, left, up, or down
+X\(**	\- explosion
+X.ne 3
+X.cs R 24
+X.cs I 24
+X\fR\\|/\fP
+X.cs R
+X\fI\-\(**\-\fP	\- grenade and large mine explosion
+X.fl
+X.cs R 24
+X\fR/|\\\fP
+X.cs R
+X.cs I
+X.fi
+X.LP
+XOther helpful hints:
+X.sp
+X.ie n .ds b []
+X.el .ds b \(bu
+X.ta
+X.ta \w'\*b\ \|'u
+X.nr In \n(.i
+X.de MP
+X.br
+X.in \n(Inu+\w'\*b\ \|'u
+X.ti \n(Inu
+X\*b	\c
+X..
+X.MP
+XYou can only fire in the direction you are facing.
+X.MP
+XYou can only fire three shots in a row, then the gun must cool off.
+X.MP
+XShots move 5 times faster than you do.
+X.MP
+XTo stab someone,
+Xyou face that player and move at them.
+X.MP
+XStabbing does 2 points worth of damage and shooting does 5 points.
+X.MP
+XSlime does 5 points of damage each time it hits.
+X.MP
+XYou start with 15 charges and get 5 more every time a player enters
+Xor re-enters.
+X.MP
+XGrenade explosions cover a 3 by 3 area, each larger bomb cover a
+Xcorrespondingly larger area (ranging from 5 by 5 to 21 by 21).
+XAll explosions are centered around the square the shot hits and
+Xdo the most damage in the center.
+X.MP
+XSlime affects all squares it oozes over.
+XThe number of squares is equal to the number of charges used.
+X.MP
+XOne small mine and one large mine is placed in the maze for every new player.
+XA mine has a 2% probability of tripping when you walk forward on to it;
+X50% when going sideways;
+X95% when backing up.
+XTripping a mine costs you 5 points or 10 points respectively.
+XDefusing a mine is worth 1 charge or 9 charges respectively.
+X.MP
+XYou cannot see behind you.
+X.MP
+XCloaking consumes 1 ammo charge per 20 of your moves.
+X.MP
+XScanning consumes 1 ammo charge per (20 \(mu the number of players)
+Xof other player moves.
+X.MP
+XTurning on cloaking turns off scanning \(em turning on scanning turns off
+Xcloaking.
+X.MP
+XWhen you kill someone,
+Xyou get 2 more damage capacity points and 2 damage points get taken away.
+X.MP
+XMaximum typeahead is 5 characters.
+X.MP
+XA shot destroys normal (\c
+X.IR i.e., 
+Xnon-diagonal, non-door) walls.
+X.MP
+XDiagonal walls deflect shots and change orientation.
+X.MP
+XDoors disperse shots in random directions (up, down, left, right).
+X.MP
+XDiagonal walls and doors cannot be destroyed by direct shots but may
+Xbe destroyed by an adjacent grenade explosion.
+X.MP
+XSlime goes around walls, not through them.
+X.MP
+XWalls regenerate, reappearing in the order they were destroyed.
+XOne percent of the regenerated walls will be diagonal walls or doors.
+XWhen a wall is generated directly beneath a player, he is thrown in
+Xa random direction for a random period of time.  When he lands, he
+Xsustains damage (up to 20 percent of the amount of damage already
+Xsustained);
+X.IR i.e. ,
+Xthe less damage he had, the more nimble he is and
+Xtherefore less likely to hurt himself on landing.
+X.\"MP
+X.\"There is a volcano close to the center of the maze which goes off
+X.\"close to every 30 deaths.
+X.MP
+XEvery 30 deaths or so, a
+X.B ``?''
+Xwill appear.
+XIt is a wandering bomb which will explode when it hits someone, or
+Xwhen it is slimed.
+X.MP
+XIf no one moves, everything stands still.
+X.MP
+XThe environment variable
+X.B HUNT
+Xis checked to get the player name.
+XIf you don't have this variable set,
+X.I hunt
+Xwill ask you what name you want to play under.
+XIf you wish to set other options than just your name,
+Xyou can enumerate the options as follows:
+X.br
+X.ti +1i
+Xsetenv HUNT "name=Sneaky,team=1,cloak,mapkey=zoFfGg1f2g3F4G"
+X.br
+Xsets the player name to Sneaky,
+Xsets the team to one,
+Xsets the enter game attribute to cloaked,
+Xand the maps \fBz\fP to \fBo\fP, \fBF\fP to \fBf\fP, \fBG\fP to \fBg\fP,
+X\fB1\fP to \fBf\fP,
+X\fB2\fP to \fBg\fP, \fB3\fP to \fBF\fP, and \fB4\fP to \fBG\fP.
+XThe \fImapkey\fP option must be last.
+XOther options are: scan, fly, nobeep, port=string, host=string,
+Xand message=string \(em which correspond to the command line options.
+XString options cannot contain commas since commas
+Xare used to separate options.
+X.MP
+XIt's a boring game if you're the only one playing.
+X.PP
+XYour score is the decayed average of the ratio of number of kills to number
+Xof times you entered the game and is only kept for the duration
+Xof a single session of \fIhunt\fP.
+X.PP
+X.I Hunt
+Xnormally drives up the load average to be approximately
+X(number_of_players + 0.5) greater than it would be without a
+X.I hunt 
+Xgame executing.
+X.SH STATISTICS
+XThe
+X.I hunt
+Xserver keeps track of some game statististics in a file
+X.IR /usr/tmp/hunt.stats .
+XThe meaning of the column headings are as follows:
+X.I score
+X\(em the player's last score;
+X.I ducked
+X\(em
+Xhow many shots a player ducked;
+X.I absorb
+X\(em how many shots a player absorbed;
+X.I faced
+X\(em how many shots were fired at player's face;
+X.I shot
+X\(em how many shots were fired at player;
+X.I robbed
+X\(em how many of player's shots were absorbed;
+X.I missed
+X\(em how many of player's shots were ducked;
+X.I slimeK
+X\(em how many slime kills player had;
+X.I enemy
+X\(em how many enemies were killed;
+X.I friend
+X\(em how many friends were killed (self and same team);
+X.I deaths
+X\(em how many times player died;
+X.I still
+X\(em how many times player died without typing in any commands;
+X.I saved
+X\(em how many times a shot/bomb would have killed player if he hadn't
+Xducked or absorbed it.
+X.SH FILES
+X.nf
+X.ta
+X.ta \w'/usr/games/lib/huntd\ \ \ 'u
+X/usr/games/lib/huntd	game coordinator
+X/usr/tmp/hunt.stats	rudimentary game statistics
+X.DT
+X.fi
+X.SH "SEE ALSO"
+Xhuntd(6)
+X.SH AUTHORS
+XConrad Huang, Ken Arnold, and Greg Couch;
+X.br
+XUniversity of California, San Francisco, Computer Graphics Lab
+X.SH ACKNOWLEDGEMENTS
+XWe thank Don Kneller,
+XJohn Thomason, Eric Pettersen, Mark Day,
+Xand Scott Weiner for providing
+Xendless hours of play-testing to improve the character of the game.
+XWe hope their significant others will forgive them;
+Xwe certainly don't.
+X.SH BUGS
+XTo keep up the pace, not everything is as realistic as possible.
+END_OF_FILE
+if test 10501 -ne `wc -c <'hunt.6'`; then
+    echo shar: \"'hunt.6'\" unpacked with wrong size!
+fi
+# end of 'hunt.6'
+fi
+if test -f 'playit.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'playit.c'\"
+else
+echo shar: Extracting \"'playit.c'\" \(10343 characters\)
+sed "s/^X//" >'playit.c' <<'END_OF_FILE'
+X/*
+X *  Hunt
+X *  Copyright (c) 1985 Conrad C. Huang, Gregory S. Couch, Kenneth C.R.C. Arnold
+X *  San Francisco, California
+X *
+X *  Copyright (c) 1985 Regents of the University of California.
+X *  All rights reserved.  The Berkeley software License Agreement
+X *  specifies the terms and conditions for redistribution.
+X */
+X
+X# include	<curses.h>
+X# include	<ctype.h>
+X# include	<signal.h>
+X# include	<errno.h>
+X# include	"hunt.h"
+X# include	<sys/file.h>
+X# ifdef TERMINFO
+X# include	<term.h>
+X
+X# define	AM		auto_right_margin
+X# define	XN		eat_newline_glitch
+X# define	CL		clear_screen
+X# define	CE		clr_eol
+X# define	_putchar	_outchar
+X# endif
+X
+Xint		input();
+Xstatic int	nchar_send;
+Xstatic int	in	= FREAD;
+Xchar		screen[SCREEN_HEIGHT][SCREEN_WIDTH2], blanks[SCREEN_WIDTH];
+Xint		cur_row, cur_col;
+X# ifdef OTTO
+Xint		Otto_count;
+Xint		Otto_mode;
+Xstatic int	otto_y, otto_x;
+Xstatic char	otto_face;
+X# endif OTTO
+X
+X# define	MAX_SEND	5
+X
+X/*
+X * ibuf is the input buffer used for the stream from the driver.
+X * It is small because we do not check for user input when there
+X * are characters in the input buffer.
+X */
+Xstatic char	ibuf[20];
+X
+X#define	GETCHR(fd)	(--(fd)->_cnt < 0 ? getchr(fd) \
+X				: *((unsigned char *) (fd)->_ptr++))
+X
+X/*
+X * playit:
+X *	Play a given game, handling all the curses commands from
+X *	the driver.
+X */
+Xplayit()
+X{
+X	register FILE		*inf;
+X	register int		ch;
+X	register int		y, x;
+X	extern int		errno;
+X	extern int		_putchar();
+X	long			version;
+X
+X	if (read(Socket, (char *) &version, LONGLEN) != LONGLEN) {
+X		bad_con();
+X		/* NOTREACHED */
+X	}
+X	if (ntohl(version) != HUNT_VERSION) {
+X		bad_ver();
+X		/* NOTREACHED */
+X	}
+X	errno = 0;
+X	while ((inf = fdopen(Socket, "r")) == NULL)
+X		if (errno == EINTR)
+X			errno = 0;
+X		else {
+X			perror("fdopen of socket");
+X			exit(1);
+X		}
+X# ifdef L_ctermid
+X	setvbuf(inf, ibuf, _IOFBF, sizeof ibuf);
+X# else
+X	setbuffer(inf, ibuf, sizeof ibuf);
+X# endif
+X# ifdef OTTO
+X	Otto_count = 0;
+X# endif OTTO
+X	nchar_send = MAX_SEND;
+X	while ((ch = GETCHR(inf)) != EOF) {
+X# ifdef DEBUG
+X		fputc(ch, stderr);
+X# endif DEBUG
+X		switch (ch & 0377) {
+X		  case MOVE:
+X			y = GETCHR(inf);
+X			x = GETCHR(inf);
+X			mvcur(cur_row, cur_col, y, x);
+X			cur_row = y;
+X			cur_col = x;
+X			break;
+X		  case ADDCH:
+X			ch = GETCHR(inf);
+X# ifdef OTTO
+X			switch (ch) {
+X
+X			case '<':
+X			case '>':
+X			case '^':
+X			case 'v':
+X				otto_face = ch;
+X				otto_y = cur_row;
+X				otto_x = cur_col;
+X				break;
+X			}
+X# endif OTTO
+X			put_ch(ch);
+X			break;
+X		  case CLRTOEOL:
+X			clear_eol();
+X			break;
+X		  case CLEAR:
+X			clear_the_screen();
+X			break;
+X		  case REFRESH:
+X			fflush(stdout);
+X			break;
+X		  case REDRAW:
+X			redraw_screen();
+X			fflush(stdout);
+X			break;
+X		  case ENDWIN:
+X			fflush(stdout);
+X			if ((ch = GETCHR(inf)) == LAST_PLAYER)
+X				Last_player = TRUE;
+X			ch = EOF;
+X			goto out;
+X		  case BELL:
+X			putchar(CTRL(G));
+X			break;
+X		  case READY:
+X			(void) fflush(stdout);
+X			if (nchar_send < 0)
+X# ifndef TCFLSH
+X				(void) ioctl(fileno(stdin), TIOCFLUSH, &in);
+X# else
+X				(void) ioctl(fileno(stdin), TCFLSH, 0);
+X# endif
+X			nchar_send = MAX_SEND;
+X# ifndef OTTO
+X			(void) GETCHR(inf);
+X# else OTTO
+X			Otto_count -= (GETCHR(inf) & 255);
+X			if (!Am_monitor) {
+X# ifdef DEBUG
+X				fputc('0' + Otto_count, stderr);
+X# endif DEBUG
+X				if (Otto_count == 0 && Otto_mode)
+X					otto(otto_y, otto_x, otto_face);
+X			}
+X# endif OTTO
+X			break;
+X		  default:
+X# ifdef OTTO
+X			switch (ch) {
+X
+X			case '<':
+X			case '>':
+X			case '^':
+X			case 'v':
+X				otto_face = ch;
+X				otto_y = cur_row;
+X				otto_x = cur_col;
+X				break;
+X			}
+X# endif OTTO
+X			put_ch(ch);
+X			break;
+X		}
+X	}
+Xout:
+X	(void) fclose(inf);
+X}
+X
+X/*
+X * getchr:
+X *	Grab input and pass it along to the driver
+X *	Return any characters from the driver
+X *	When this routine is called by GETCHR, we already know there are
+X *	no characters in the input buffer.
+X */
+Xgetchr(fd)
+Xregister FILE	*fd;
+X{
+X	long	readfds, s_readfds;
+X	int	driver_mask, stdin_mask;
+X	int	nfds, s_nfds;
+X
+X	driver_mask = 1L << fileno(fd);
+X	stdin_mask = 1L << fileno(stdin);
+X	s_readfds = driver_mask | stdin_mask;
+X	s_nfds = (fileno(fd) > fileno(stdin)) ? fileno(fd) : fileno(stdin);
+X	s_nfds++;
+X
+Xone_more_time:
+X	do {
+X		errno = 0;
+X		readfds = s_readfds;
+X		nfds = s_nfds;
+X		nfds = select(nfds, &readfds, NULL, NULL, NULL);
+X	} while (nfds <= 0 && errno == EINTR);
+X
+X	if (readfds & stdin_mask)
+X		send_stuff();
+X	if ((readfds & driver_mask) == 0)
+X		goto one_more_time;
+X	return _filbuf(fd);
+X}
+X
+X/*
+X * send_stuff:
+X *	Send standard input characters to the driver
+X */
+Xsend_stuff()
+X{
+X	register int	count;
+X	register char	*sp, *nsp;
+X	static char	inp[sizeof Buf];
+X
+X	count = read(fileno(stdin), Buf, sizeof Buf);
+X	if (count <= 0)
+X		return;
+X	if (nchar_send <= 0 && !no_beep) {
+X		(void) write(1, "\7", 1);	/* CTRL(G) */
+X		return;
+X	}
+X
+X	/*
+X	 * look for 'q'uit commands; if we find one,
+X	 * confirm it.  If it is not confirmed, strip
+X	 * it out of the input
+X	 */
+X	Buf[count] = '\0';
+X	nsp = inp;
+X	for (sp = Buf; *sp != '\0'; sp++)
+X		if ((*nsp = map_key[*sp]) == 'q')
+X			intr();
+X# ifdef OTTO
+X		else if (*nsp == CTRL(O))
+X			Otto_mode = !Otto_mode;
+X# endif OTTO
+X		else
+X			nsp++;
+X	count = nsp - inp;
+X	if (count) {
+X# ifdef OTTO
+X		Otto_count += count;
+X# endif OTTO
+X		nchar_send -= count;
+X		if (nchar_send < 0)
+X			count += nchar_send;
+X		(void) write(Socket, inp, count);
+X	}
+X}
+X
+X/*
+X * quit:
+X *	Handle the end of the game when the player dies
+X */
+Xlong
+Xquit(old_status)
+Xlong	old_status;
+X{
+X	register int	explain, ch;
+X
+X	if (Last_player)
+X		return Q_QUIT;
+X# ifdef OTTO
+X	if (Otto_mode)
+X		return Q_CLOAK;
+X# endif OTTO
+X	mvcur(cur_row, cur_col, HEIGHT, 0);
+X	cur_row = HEIGHT;
+X	cur_col = 0;
+X	put_str("Re-enter game [ynwo]? ");
+X	clear_eol();
+X	fflush(stdout);
+X	explain = FALSE;
+X	for (;;) {
+X		if (isupper(ch = getchar()))
+X			ch = tolower(ch);
+X		if (ch == 'y')
+X			return old_status;
+X		else if (ch == 'o')
+X			break;
+X		else if (ch == 'n') {
+X# ifndef INTERNET
+X			return Q_QUIT;
+X# else
+X			mvcur(cur_row, cur_col, HEIGHT, 0);
+X			cur_row = HEIGHT;
+X			cur_col = 0;
+X			put_str("Write a parting message [yn]? ");
+X			clear_eol();
+X			for (;;) {
+X				if (isupper(ch = getchar()))
+X					ch = tolower(ch);
+X				if (ch == 'y')
+X					goto get_message;
+X				if (ch == 'n')
+X					return Q_QUIT;
+X			}
+X# endif
+X		}
+X# ifdef INTERNET
+X		else if (ch == 'w') {
+X			static	char	buf[WIDTH + WIDTH % 2];
+X			char		*cp, c;
+X
+Xget_message:
+X			c = ch;		/* save how we got here */
+X			mvcur(cur_row, cur_col, HEIGHT, 0);
+X			cur_row = HEIGHT;
+X			cur_col = 0;
+X			put_str("Message: ");
+X			clear_eol();
+X			cp = buf;
+X			while ((ch = getchar()) != '\n' && ch != '\r') {
+X# ifdef TERMINFO
+X				if (ch == erasechar())
+X# else
+X				if (ch == _tty.sg_erase)
+X# endif
+X				{
+X					if (cp > buf) {
+X						mvcur(cur_row, cur_col, cur_row,
+X								cur_col - 1);
+X						cur_col -= 1;
+X						cp -= 1;
+X						clear_eol();
+X					}
+X					continue;
+X# ifdef TERMINFO
+X				} else if (ch == killchar()) {
+X# else
+X				} else if (ch == _tty.sg_kill) {
+X# endif
+X					mvcur(cur_row, cur_col, cur_row,
+X							cur_col - (cp - buf));
+X					cur_col -= cp - buf;
+X					cp = buf;
+X					clear_eol();
+X					continue;
+X				}
+X				put_ch(ch);
+X				*cp++ = ch;
+X				if (cp + 1 >= buf + sizeof buf)
+X					break;
+X			}
+X			*cp = '\0';
+X			Send_message = buf;
+X			return (c == 'w') ? old_status : Q_MESSAGE;
+X		}
+X# endif INTERNET
+X		(void) putchar(CTRL(G));
+X		if (!explain) {
+X			put_str("(Yes, No, Write message, or Options) ");
+X			explain = TRUE;
+X		}
+X		fflush(stdout);
+X	}
+X
+X	mvcur(cur_row, cur_col, HEIGHT, 0);
+X	cur_row = HEIGHT;
+X	cur_col = 0;
+X# ifdef FLY
+X	put_str("Scan, Cloak, Flying, or Quit? ");
+X# else
+X	put_str("Scan, Cloak, or Quit? ");
+X# endif FLY
+X	clear_eol();
+X	fflush(stdout);
+X	explain = FALSE;
+X	for (;;) {
+X		if (isupper(ch = getchar()))
+X			ch = tolower(ch);
+X		if (ch == 's')
+X			return Q_SCAN;
+X		else if (ch == 'c')
+X			return Q_CLOAK;
+X# ifdef FLY
+X		else if (ch == 'f')
+X			return Q_FLY;
+X# endif FLY
+X		else if (ch == 'q')
+X			return Q_QUIT;
+X		(void) putchar(CTRL(G));
+X		if (!explain) {
+X# ifdef FLY
+X			put_str("[SCFQ] ");
+X# else
+X			put_str("[SCQ] ");
+X# endif FLY
+X			explain = TRUE;
+X		}
+X		fflush(stdout);
+X	}
+X}
+X
+Xput_ch(ch)
+X	char	ch;
+X{
+X	if (!isprint(ch)) {
+X		fprintf(stderr, "r,c,ch: %d,%d,%d", cur_row, cur_col, ch);
+X		return;
+X	}
+X	screen[cur_row][cur_col] = ch;
+X	putchar(ch);
+X	if (++cur_col >= COLS) {
+X		if (!AM || XN)
+X			putchar('\n');
+X		cur_col = 0;
+X		if (++cur_row >= LINES)
+X			cur_row = LINES;
+X	}
+X}
+X
+Xput_str(s)
+X	char	*s;
+X{
+X	while (*s)
+X		put_ch(*s++);
+X}
+X
+Xclear_the_screen()
+X{
+X	register int	i;
+X
+X	if (blanks[0] == '\0')
+X		for (i = 0; i < SCREEN_WIDTH; i++)
+X			blanks[i] = ' ';
+X
+X	if (CL != NULL) {
+X		tputs(CL, LINES, _putchar);
+X		for (i = 0; i < SCREEN_HEIGHT; i++)
+X			bcopy(blanks, screen[i], SCREEN_WIDTH);
+X	} else {
+X		for (i = 0; i < SCREEN_HEIGHT; i++) {
+X			mvcur(cur_row, cur_col, i, 0);
+X			cur_row = i;
+X			cur_col = 0;
+X			clear_eol();
+X		}
+X		mvcur(cur_row, cur_col, 0, 0);
+X	}
+X	cur_row = cur_col = 0;
+X#ifdef TERMINFO
+X	move(0, 0);
+X	refresh();
+X#endif
+X}
+X
+Xclear_eol()
+X{
+X	if (CE != NULL)
+X		tputs(CE, 1, _putchar);
+X	else {
+X		fwrite(blanks, sizeof (char), SCREEN_WIDTH - cur_col, stdout);
+X		if (COLS != SCREEN_WIDTH)
+X			mvcur(cur_row, SCREEN_WIDTH, cur_row, cur_col);
+X		else if (AM)
+X			mvcur(cur_row + 1, 0, cur_row, cur_col);
+X		else
+X			mvcur(cur_row, SCREEN_WIDTH - 1, cur_row, cur_col);
+X	}
+X	bcopy(blanks, &screen[cur_row][cur_col], SCREEN_WIDTH - cur_col);
+X}
+X
+Xredraw_screen()
+X{
+X	register int	i;
+X# ifndef NOCURSES
+X	static int	first = 1;
+X
+X	if (first) {
+X		curscr = newwin(SCREEN_HEIGHT, SCREEN_WIDTH, 0, 0);
+X		if (curscr == NULL) {
+X			fprintf(stderr, "Can't create curscr\n");
+X			exit(1);
+X		}
+X		for (i = 0; i < SCREEN_HEIGHT; i++)
+X			curscr->_y[i] = screen[i];
+X		first = 0;
+X	}
+X	curscr->_cury = cur_row;
+X	curscr->_curx = cur_col;
+X	clearok(curscr, TRUE);
+X	touchwin(curscr);
+X	wrefresh(curscr);
+X#else
+X	mvcur(cur_row, cur_col, 0, 0);
+X	for (i = 0; i < SCREEN_HEIGHT - 1; i++) {
+X		fwrite(screen[i], sizeof (char), SCREEN_WIDTH, stdout);
+X		if (COLS > SCREEN_WIDTH || (COLS == SCREEN_WIDTH && !AM))
+X			putchar('\n');
+X	}
+X	fwrite(screen[SCREEN_HEIGHT - 1], sizeof (char), SCREEN_WIDTH - 1,
+X		stdout);
+X	mvcur(SCREEN_HEIGHT - 1, SCREEN_WIDTH - 1, cur_row, cur_col);
+X#endif
+X}
+X
+X/*
+X * do_message:
+X *	Send a message to the driver and return
+X */
+Xdo_message()
+X{
+X	extern int	errno;
+X	long		version;
+X
+X	if (read(Socket, (char *) &version, LONGLEN) != LONGLEN) {
+X		bad_con();
+X		/* NOTREACHED */
+X	}
+X	if (ntohl(version) != HUNT_VERSION) {
+X		bad_ver();
+X		/* NOTREACHED */
+X	}
+X	if (write(Socket, Send_message, strlen(Send_message)) < 0) {
+X		bad_con();
+X		/* NOTREACHED */
+X	}
+X	(void) close(Socket);
+X}
+END_OF_FILE
+if test 10343 -ne `wc -c <'playit.c'`; then
+    echo shar: \"'playit.c'\" unpacked with wrong size!
+fi
+# end of 'playit.c'
+fi
+echo shar: End of archive 2 \(of 4\).
+cp /dev/null ark2isdone
+MISSING=""
+for I in 1 2 3 4 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 4 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

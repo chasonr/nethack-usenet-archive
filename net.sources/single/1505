@@ -1,0 +1,732 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 169ae0,79f41a8bcfc7b2f2,start
+X-Google-Attributes: gid169ae0,public
+X-Google-Thread: 159752,79f41a8bcfc7b2f2,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-08-13 17:05:06 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site umcp-cs.UUCP
+Path: utzoo!watmath!clyde!burl!mgnetp!ihnp4!zehntel!dual!amd!decwrl!decvax!linus!philabs!cmcl2!seismo!rlgvax!cvl!umcp-cs!chris
+From: chris@umcp-cs.UUCP
+Newsgroups: net.sources,net.unix-wizards
+Subject: Mods to dz.c; also, tiny comm program
+Message-ID: <8106@umcp-cs.UUCP>
+Date: Mon, 13-Aug-84 20:05:06 EDT
+Article-I.D.: umcp-cs.8106
+Posted: Mon Aug 13 20:05:06 1984
+Date-Received: Thu, 16-Aug-84 02:31:18 EDT
+Distribution: net
+Organization: U of Maryland, Computer Science Dept., College Park, MD
+Lines: 709
+
+Contents:
+1.  Mods to 4.2BSD dz.c for dial-out pseudo-device
+
+2.  Tiny little 4.2BSD communications program that can be used to
+    test the new dial-out code.
+
+I've received an overwhelming number of requests for these changes,
+so here they are.
+
+Step 1: modify vaxuba/dz.c.  (Our header says it's version 6.1 83/07/29.)
+
+RCS file: RCS/dz.c,v
+retrieving revision 1.1
+diff -b -c1 -r1.1 dz.c
+*** /tmp/,RCSt1022039	Mon Aug 13 19:41:08 1984
+--- dz.c	Thu Aug  2 08:25:36 1984
+***************
+*** 25,26
+   */
+  #include "bk.h"
+
+--- 9,11 -----
+   */
++ #include "dzo.h"
+  #include "bk.h"
+***************
+*** 73,74
+  char	dzsoftCAR[NDZ];
+  char	dz_lnen[NDZ];	/* saved line enable bits for DZ32 */
+
+--- 58,63 -----
+  char	dzsoftCAR[NDZ];
++ #if NDZO > 0
++ char	dz_inout[NDZ];		/* outgoing mode flags */
++ char	dz_flags[NDZ];		/* permanent copy of flags */
++ #endif
+  char	dz_lnen[NDZ];		/* saved line enable bits for DZ32 */
+***************
+*** 133,134
+  	}
+  	dzsoftCAR[ui->ui_unit] = ui->ui_flags;
+
+--- 122,124 -----
+  	}
++ #if NDZO == 0
+  	dzsoftCAR[ui->ui_unit] = ui->ui_flags;
+***************
+*** 134,135
+  	dzsoftCAR[ui->ui_unit] = ui->ui_flags;
+  	if (dz_timer == 0) {
+
+--- 124,128 -----
+  	dzsoftCAR[ui->ui_unit] = ui->ui_flags;
++ #else
++ 	dzsoftCAR[ui->ui_unit] = dz_flags[ui->ui_unit] = ui->ui_flags;
++ #endif
+  	if (dz_timer == 0) {
+***************
+*** 146,147
+  	register int unit;
+   
+
+--- 139,143 -----
+  	register int unit;
++ #if NDZO > 0
++ 	register int dz, bit;
++ #endif
+   
+***************
+*** 160,162
+  		dzparam(unit);
+! 	} else if (tp->t_state&TS_XCLUDE && u.u_uid != 0)
+  		return (EBUSY);
+
+--- 156,161 -----
+  		dzparam(unit);
+! 	}
+! 	else {
+! #if NDZO == 0
+! 		if (tp->t_state&TS_XCLUDE && u.u_uid != 0)
+  			return (EBUSY);
+***************
+*** 162,163
+  		return (EBUSY);
+  	(void) dzmctl(dev, DZ_ON, DMSET);
+
+--- 161,167 -----
+  			return (EBUSY);
++ #else
++ 		if ((tp->t_state&TS_XCLUDE || flag < 0) && u.u_uid != 0)
++ 			return (EBUSY);
++ #endif
++ 	}
+  	(void) dzmctl(dev, DZ_ON, DMSET);
+***************
+*** 164,165
+  	(void) spl5();
+  	while ((tp->t_state & TS_CARR_ON) == 0) {
+
+--- 168,170 -----
+  	(void) spl5();
++ #if NDZO == 0
+  	while ((tp->t_state & TS_CARR_ON) == 0) {
+***************
+*** 168,169
+  	}
+  	(void) spl0();
+
+--- 173,187 -----
+  	}
++ #else
++ 	dz = unit >> 3;
++ 	bit = 1 << (unit & 07);
++ 	if (flag < 0) {
++ 		dz_inout[dz] |= bit;	/* outgoing mode on */
++ 		dzsoftCAR[dz] |= bit;	/* fake carrier on */
++ 	}
++ 	while (!(tp->t_state&TS_CARR_ON) || (dz_inout[dz]&bit && flag >= 0)) {
++ 		(void) dzmctl(dev, DZ_ON, DMSET);
++ 		tp->t_state |= TS_WOPEN;
++ 		csleep((caddr_t)&tp->t_rawq, TTIPRI, "MODEM");
++ 	}
++ #endif
+  	(void) spl0();
+***************
+*** 193,194
+  	ttyclose(tp);
+  }
+
+--- 211,224 -----
+  	ttyclose(tp);
++ #if NDZO > 0
++ 	if (flag < 0) {		/* closing outgoing mode line */
++ 		int bit = 1 << (unit & 07);
++ 
++ 		dz_inout[dz] &= ~bit;/* clear outgoing flag */
++ 		if (dz_flags[dz] & bit)/* restore softCAR flag */
++ 			dzsoftCAR[dz] |= bit;
++ 		else
++ 			dzsoftCAR[dz] &= ~bit;
++ 		wakeup((caddr_t)&tp->t_rawq);
++ 	}
++ #endif
+  }
+***************
+*** 569,571
+  {
+! 	register i;
+  	register struct dzdevice *dzaddr;
+
+--- 599,601 -----
+  {
+! 	register int i;
+  	register struct dzdevice *dzaddr;
+***************
+*** 571,573
+  	register struct dzdevice *dzaddr;
+! 	register bit;
+  	register struct tty *tp;
+
+--- 601,603 -----
+  	register struct dzdevice *dzaddr;
+! 	register int bit;
+  	register struct tty *tp;
+***************
+*** 573,575
+  	register struct tty *tp;
+! 	register car;
+   
+
+--- 603,606 -----
+  	register struct tty *tp;
+! 	register int car;
+! 	int realcar;
+   
+***************
+*** 581,586
+  		bit = 1<<(i&07);
+! 		car = 0;
+! 		if (dzsoftCAR[i>>3]&bit)
+! 			car = 1;
+! 		else if (dzaddr->dzcsr & DZ_32) {
+  			dzaddr->dzlcs = i&07;
+
+--- 612,614 -----
+  		bit = 1<<(i&07);
+! 		if (dzaddr->dzcsr & DZ_32) {
+  			dzaddr->dzlcs = i&07;
+***************
+*** 587,589
+  			dzwait(dzaddr);
+! 			car = dzaddr->dzlcs & DZ_CD;
+  		} else
+
+--- 615,617 -----
+  			dzwait(dzaddr);
+! 			realcar = dzaddr->dzlcs & DZ_CD;
+  		} else
+***************
+*** 589,591
+  		} else
+! 			car = dzaddr->dzmsr&bit;
+  		if (car) {
+
+--- 617,622 -----
+  		} else
+! 			realcar = dzaddr->dzmsr&bit;
+! 		car = 0;
+! 		if (realcar || dzsoftCAR[i>>3]&bit)
+! 			car++;
+  		if (car) {
+***************
+*** 592,593
+  			/* carrier present */
+  			if ((tp->t_state & TS_CARR_ON) == 0) {
+
+--- 623,628 -----
+  			/* carrier present */
++ #if NDZO > 0
++ 			if (realcar)
++ 				dzsoftCAR[i>>3] &= ~bit;
++ #endif
+  			if ((tp->t_state & TS_CARR_ON) == 0) {
+***************
+*** 596,599
+  			}
+! 		} else {
+! 			if ((tp->t_state&TS_CARR_ON) &&
+  			    (tp->t_flags&NOHANG) == 0) {
+
+--- 631,643 -----
+  			}
+! 			else if (tp->t_state&TS_TTSTOP && tp->t_flags&MDMBUF) {
+! 				tp->t_state &= ~TS_TTSTOP;
+! 				ttstart(tp);
+! 			}
+! 		}
+! 		else {
+! 			if (tp->t_flags&MDMBUF) {
+! 				tp->t_state |= TS_TTSTOP;
+! 				dzstop(tp, 0);
+! 			}
+! 			else if ((tp->t_state&TS_CARR_ON) &&
+  			    (tp->t_flags&NOHANG) == 0) {
+
+Step 2:  add vaxuba/dzo.c.
+
+/* $Header$ */
+
+#include "dz.h"
+#if NDZ > 0
+#include "dzo.h"
+#if NDZO > 0
+/*
+ * DZ-11 ``outgoing mode'' driver
+ *
+ * Requires hooks in dz.c
+ */
+#include "../h/types.h"
+
+/*
+ * Open a DZ11 line in outgoing mode
+ */
+/*ARGSUSED*/
+dzoopen(dev, flag)
+dev_t dev;
+{
+	return dzopen(dev, -1);
+}
+
+/*
+ * Close a DZ11 outgoing mode line
+ */
+/*ARGSUSED*/
+dzoclose(dev, flag)
+dev_t dev;
+{
+	dzclose(dev, -1);
+}
+#endif NDZO > 0
+#endif NDZ > 0
+
+Step 3: add dzo pseudo-device in conf/files.vax.
+
+RCS file: RCS/files.vax,v
+retrieving revision 1.1
+diff -b -c1 -r1.1 files.vax
+*** /tmp/,RCSt1022061	Mon Aug 13 19:41:46 1984
+--- files.vax	Thu Aug  2 08:28:12 1984
+***************
+*** 38,39
+  vaxuba/dh.c		optional dh device-driver
+  vaxuba/dmf.c		optional dmf device-driver
+
+--- 38,41 -----
+  vaxuba/dh.c		optional dh device-driver
++ vaxuba/dho.c		optional dho device-driver
++ vaxuba/dhp.c		optional dhp device-driver
+  vaxuba/dmf.c		optional dmf device-driver
+***************
+*** 41,42
+  vaxuba/dz.c		optional dz device-driver
+  vaxuba/gpib.c		optional gpib device-driver
+
+--- 43,45 -----
+  vaxuba/dz.c		optional dz device-driver
++ vaxuba/dzo.c		optional dzo device-driver
+  vaxuba/gpib.c		optional gpib device-driver
+
+Step 4: add dzo entry to cdevsw table in vax/conf.c.  (Yours will probably
+not look much like ours.  The dhoopen stuff is like the dzoopen stuff,
+and dhpopen isn't quite working at the moment.)
+
+RCS file: conf.c,v
+retrieving revision 1.1
+diff -b -c1 -r1.1 conf.c
+*** /tmp/,RCSt1022093	Mon Aug 13 19:42:22 1984
+--- conf.c	Thu Aug  2 08:22:57 1984
+***************
+*** 295,296
+  #define	dh11	0
+  #else
+
+--- 276,281 -----
+  #define	dh11	0
++ #define dhoopen nodev
++ #define dhoclose nodev
++ #define dhpopen nodev
++ #define dhpclose nodev
+  #else
+***************
+*** 298,299
+  struct	tty dh11[];
+  #endif
+
+--- 283,290 -----
+  struct	tty dh11[];
++ #include "dho.h"
++ #if NDHO > 0
++ int	dhoopen(),dhoclose();
++ #else
++ #define	dhoopen nodev
++ #define dhoclose nodev
+  #endif
+***************
+*** 299,300
+  #endif
+  
+
+--- 290,299 -----
+  #endif
++ #include "dhp.h"
++ #if NDHP > 0
++ int	dhpopen(),dhpclose();
++ #else
++ #define dhpopen nodev
++ #define dhpclose nodev
++ #endif
++ #endif
+  
+***************
+*** 337,338
+  struct	tty dz_tty[];
+  #endif
+
+--- 336,343 -----
+  struct	tty dz_tty[];
++ #include "dzo.h"
++ #if NDZO > 0
++ int	dzoopen(),dzoclose();
++ #else
++ #define dzoopen nodev
++ #define dzoclose nodev
+  #endif
+***************
+*** 338,339
+  #endif
+  
+
+--- 343,345 -----
+  #endif
++ #endif
+  
+***************
+*** 707,708
+  	mgselect,	nodev,
+  };
+
+--- 713,728 -----
+  	mgselect,	nodev,
++ 
++ /* U of MD additions */
++ 
++ 	dzoopen,	dzoclose,	dzread,		dzwrite,	/*41*/
++ 	dzioctl,	dzstop,		dzreset,	dz_tty,
++ 	ttselect,	nodev,
++ 
++ 	dhoopen,	dhoclose,	dhread,		dhwrite,	/*42*/
++ 	dhioctl,	dhstop,		dhreset,	dh11,
++ 	ttselect,	nodev,
++ 
++ 	dhpopen,	dhpclose,	dhread,		dhwrite,	/*43*/
++ 	dhioctl,	dhstop,		dhreset,	dh11,
++ 	ttselect,	nodev,
+  };
+
+Step 5: add a ``pseudo-device dzo'' to your configuration file.
+
+Step 6: run /etc/config and rebuild the kernel as usual.
+
+Step 7: make a /dev entry for the new dial devices.  We use the same
+	names as the dial in devices, but with ``dial'' in place of
+	``tty''.  Thus /dev/dial04 is
+
+	crw-------  1 dsn       41,   4 Aug 13 18:30 /dev/dial04
+
+	(apparently ``dsn'' used it last) and corresponds to /dev/tty04.
+
+Step 8. TEST the sucker.  Here's a short but occasionally useful
+	communications program.  It needs Henry Spencer's getopt()
+	routines and the ``error'' routine, which is machine-
+	dependent.  I've tacked on the Vax version at the end.
+
+	If you run ``c -l /dev/dial04 -s 1200'' you should be talking
+	to the modem on tty/dial04, in raw mode, at 1200 baud.
+
+#include <stdio.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/file.h>
+#include <sgtty.h>
+
+/*
+ * Usage: c -l link [ -s speed ] [ -p e|o|0|1 ] [ -e escapechar ]
+ *
+ * Comm program, cheapo version
+ */
+
+extern char *ProgName;
+extern int   errno;
+extern char *optarg;
+
+char *link;
+int   speed;
+int   escchar;
+int   parbis;
+int   parbic;
+char *partab;
+
+char  evenpar[128] = {
+	0x00, 0x81, 0x82, 0x03, 0x84, 0x05, 0x06, 0x87,
+	0x88, 0x09, 0x0a, 0x8b, 0x0c, 0x8d, 0x8e, 0x0f,
+	0x90, 0x11, 0x12, 0x93, 0x14, 0x95, 0x96, 0x17,
+	0x18, 0x99, 0x9a, 0x1b, 0x9c, 0x1d, 0x1e, 0x9f,
+	0xa0, 0x21, 0x22, 0xa3, 0x24, 0xa5, 0xa6, 0x27,
+	0x28, 0xa9, 0xaa, 0x2b, 0xac, 0x2d, 0x2e, 0xaf,
+	0x30, 0xb1, 0xb2, 0x33, 0xb4, 0x35, 0x36, 0xb7,
+	0xb8, 0x39, 0x3a, 0xbb, 0x3c, 0xbd, 0xbe, 0x3f,
+	0xc0, 0x41, 0x42, 0xc3, 0x44, 0xc5, 0xc6, 0x47,
+	0x48, 0xc9, 0xca, 0x4b, 0xcc, 0x4d, 0x4e, 0xcf,
+	0x50, 0xd1, 0xd2, 0x53, 0xd4, 0x55, 0x56, 0xd7,
+	0xd8, 0x59, 0x5a, 0xdb, 0x5c, 0xdd, 0xde, 0x5f,
+	0x60, 0xe1, 0xe2, 0x63, 0xe4, 0x65, 0x66, 0xe7,
+	0xe8, 0x69, 0x6a, 0xeb, 0x6c, 0xed, 0xee, 0x6f,
+	0xf0, 0x71, 0x72, 0xf3, 0x74, 0xf5, 0xf6, 0x77,
+	0x78, 0xf9, 0xfa, 0x7b, 0xfc, 0x7d, 0x7e, 0xff,
+};
+char  oddpar[128] = {
+	0x80, 0x01, 0x02, 0x83, 0x04, 0x85, 0x86, 0x07,
+	0x08, 0x89, 0x8a, 0x0b, 0x8c, 0x0d, 0x0e, 0x8f,
+	0x10, 0x91, 0x92, 0x13, 0x94, 0x15, 0x16, 0x97,
+	0x98, 0x19, 0x1a, 0x9b, 0x1c, 0x9d, 0x9e, 0x1f,
+	0x20, 0xa1, 0xa2, 0x23, 0xa4, 0x25, 0x26, 0xa7,
+	0xa8, 0x29, 0x2a, 0xab, 0x2c, 0xad, 0xae, 0x2f,
+	0xb0, 0x31, 0x32, 0xb3, 0x34, 0xb5, 0xb6, 0x37,
+	0x38, 0xb9, 0xba, 0x3b, 0xbc, 0x3d, 0x3e, 0xbf,
+	0x40, 0xc1, 0xc2, 0x43, 0xc4, 0x45, 0x46, 0xc7,
+	0xc8, 0x49, 0x4a, 0xcb, 0x4c, 0xcd, 0xce, 0x4f,
+	0xd0, 0x51, 0x52, 0xd3, 0x54, 0xd5, 0xd6, 0x57,
+	0x58, 0xd9, 0xda, 0x5b, 0xdc, 0x5d, 0x5e, 0xdf,
+	0xe0, 0x61, 0x62, 0xe3, 0x64, 0xe5, 0xe6, 0x67,
+	0x68, 0xe9, 0xea, 0x6b, 0xec, 0x6d, 0x6e, 0xef,
+	0x70, 0xf1, 0xf2, 0x73, 0xf4, 0x75, 0x76, 0xf7,
+	0xf8, 0x79, 0x7a, 0xfb, 0x7c, 0xfd, 0xfe, 0x7f,
+};
+
+struct sgttyb sgbuf;
+
+main (argc, argv)
+int argc;
+char **argv;
+{
+    register int fd, c;
+    static int state;
+
+    ProgName = *argv;
+    speed = B1200;
+    partab = evenpar;
+    escchar = 27;
+    while ((c = getopt (argc, argv, "s:p:l:e:")) != EOF) {
+	switch (c) {
+	    case '?':
+usage:
+		error (1, 0, "usage: c -l link [-s speed] [-p par] [-e esc]");
+		/* NOTREACHED */
+	    case 'l':
+		if (link)
+		    error (1, 0, "use only one -l option");
+		link = optarg;
+		break;
+	    case 's':
+		if ((speed = findspeed (atoi (optarg))) < 0)
+		    error (1, 0, "invalid speed %s", optarg);
+		break;
+	    case 'p':
+		if (*optarg == 'e') {
+		    partab = evenpar;
+		    parbis = parbic = 0;
+		}
+		else if (*optarg == 'o') {
+		    partab = oddpar;
+		    parbis = parbic = 0;
+		}
+		else if (*optarg == '1') {
+		    parbis = 0x80;
+		    parbic = 0;
+		}
+		else if (*optarg == '0') {
+		    parbis = 0;
+		    parbic = 0x80;
+		}
+		else
+		    error (1, 0, "use one of 'e', 'o', '1', or '0'");
+		break;
+	    case 'e':
+		if (optarg[1] == 0)
+		    escchar = *optarg;
+		else if (optarg[0] == '^')
+		    escchar = optarg[1] == '?' ? 0x7f : *optarg & 0x1f;
+		else
+		    escchar = atoi (optarg);
+		printf ("escape set to %s%c.\n",
+			escchar >= 0x20 && escchar < 0x7f ? "" : "^",
+			escchar >= 0x20 ? (escchar == 0x7f ? '?' : escchar) :
+				escchar + '@');
+		break;
+	    default:
+		error (1, 0, "bad case in switch");
+	}
+    }
+
+    if (link == 0)
+	goto usage;
+
+#ifdef HIGHPRIORITY
+    if (geteuid ())
+	error (1, 0, "this program must be setuid to root!");
+
+    (void) nice (-10);
+    (void) setuid (getuid ());
+#endif HIGHPRIORITY
+
+    fd = open (link, O_RDWR, 0);
+    if (fd < 0)
+	error (1, errno, "can't open %s", link);
+
+    {
+	struct sgttyb l;
+	l.sg_ispeed = l.sg_ospeed = speed;
+	l.sg_flags = RAW;
+	(void) ioctl (fd, TIOCSETP, &l);
+    }
+
+    rawtty ();
+    printf ("open\r\n");
+
+    for (;;) {
+	int inbits = 1 | (1 << fd);
+	int ch;
+
+	ch = select (fd+1, &inbits, (int *)0, (int *)0, (struct timeval *)0);
+	if (ch == 0) {
+	    error (0, errno, "select");
+	    cleanup (1);
+	}
+	if (inbits & 1) {
+	    if (read (0, &ch, 1) != 1) {
+		error (0, errno, "read(1)");
+		cleanup (1);
+	    }
+	    ch &= 0x7f;
+	    if (state) {
+		state = 0;
+		if (ch == escchar)
+		    goto put;
+		switch (ch) {
+		case 'q':
+		    cleanup (0);
+		    /*NOTREACHED*/
+		case 'z':
+		    printf ("\r\nsuspend\r\n");
+		    susp ();
+		    printf ("resumed\r\n");
+		    break;
+		default:
+beep:
+		    ch = 7;
+		    (void) write (1, &ch, 1);
+		    break;
+		}
+	    }
+	    else if (ch == escchar) {
+		state = 1;
+		goto beep;
+	    }
+	    else {
+put:
+		ch = (partab[ch] | parbis) & ~parbic;
+		if (write (fd, &ch, 1) != 1) {
+		    error (1, errno, "write(%d)", fd);
+		    cleanup (1);
+		}
+	    }
+	}
+	if (inbits & (1 << fd)) {
+	    if (read (fd, &ch, 1) != 1) {
+		error (0, errno, "read(%d)", fd);
+		cleanup (1);
+	    }
+	    if (write (1, &ch, 1) != 1) {
+		error (0, errno, "write(1)");
+		cleanup (1);
+	    }
+	}
+    }
+}
+
+cleanup (code)
+int code;
+{
+    printf ("\r\nclosed\r\n");
+    (void) ioctl (0, TIOCSETP, &sgbuf);
+    exit (code);
+}
+
+rawtty () {
+    struct sgttyb raw;
+
+    if (ioctl (0, TIOCGETP, &sgbuf))
+	error (1, errno, "ioctl TIOCGETP");
+    raw = sgbuf;
+    raw.sg_flags = RAW;
+    (void) ioctl (0, TIOCSETP, &raw);
+}
+
+susp () {
+    (void) ioctl (0, TIOCSETP, &sgbuf);
+    kill (0, SIGTSTP);
+    rawtty ();
+}
+
+struct speeds { int sp; int sp_b; } speeds[] = {
+	300, B300, 600, B600, 1200, B1200, 2400, B2400,
+	4800, B4800, 9600, B9600, -1, -1 };
+
+findspeed (sp) {
+    register struct speeds *spp = speeds;
+
+    while (spp -> sp >= 0) {
+	if (spp -> sp == sp)
+	    return spp -> sp_b;
+	spp++;
+    }
+    return -1;
+}
+
+/*
+ * error
+ *
+ * Useful for printing error messages.  Will print the program name
+ * and (optionally) the system error associated with the values in
+ * <errno.h>.
+ *
+ * Note that the type (and even the existence!) of ``arg'' is undefined.
+ */
+error (quit, e, fmt, arg)
+int quit;
+register int e;
+char *fmt;
+{
+    extern   char *sys_errlist[];
+    extern   int   sys_nerr;
+    register char *p = ProgName;
+
+    if (p == NULL)
+	p = "tomb of the unknown program";
+    fprintf (stderr, "%s: ", p);
+    _doprnt (fmt, &arg, stderr);	/* magic */
+    if (e > 0) {
+	p = e < sys_nerr ? sys_errlist[e] : "unknown error";
+	fprintf (stderr, ": %s", p);
+    }
+    putc ('\n', stderr);
+    fflush (stderr);
+    if (quit)
+	exit (quit);
+}
+
+--that's all!--
+
+

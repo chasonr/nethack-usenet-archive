@@ -1,0 +1,1479 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,97d822e2927d4992,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-06-01 11:03:24 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site mulga.OZ
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxl!houxm!houxz!vax135!floyd!whuxle!mit-eddie!genrad!decvax!mulga!isaac
+From: isaac@mulga.OZ (Isaac Balbin)
+Newsgroups: net.sources
+Subject: seebib and seeref (revision)
+Message-ID: <302@mulga.OZ>
+Date: Fri, 1-Jun-84 14:03:24 EDT
+Article-I.D.: mulga.302
+Posted: Fri Jun  1 14:03:24 1984
+Date-Received: Tue, 5-Jun-84 08:47:23 EDT
+Organization: Comp Sci, Melbourne Uni, Australia
+Lines: 1459
+
+-----------------------
+[ going going goanna ]
+
+Thanks to those who made comments regarding my earlier posting, especially
+Mark Plotnick who suggested changes to incorporate (if you have it) Mark
+Horton's new curses package and USG UNIX. The latter is only relevant if
+you cannot dup2 and need to fcntl instead. Both require -DNEWCURSES and
+-DUSG respectively. As well, I have modified seebib so that it is now 2
+programs in one. It will work whether you use indxbib (refer family) to
+create your index (*.i[abc] files) or invert (bib family) to create INDEX.
+Invocation is seeref if you used indxbib (or equivalent) or seebib if you
+used invert. Before compiling check that "hunt" and "lookup" are actually
+in the homes #defined in seebib.c.  Some complaints regarding seeref when
+you have say Ind.i[abc] and your bib files are say R[bv]* (as is the case in
+/usr/dict/papers) are (and were) covered in the manual. Just invoke it
+as "seeref Ind".Since some do not have indxbib (it is trivial anyway) I
+will include it here. Interestingly, seebib is a lot faster than seeref
+-- probably the only bib family program which is faster than a refer family
+program. Let me know of any bugs problems etc.
+				{decvax, vax135}!mulga!isaac
+
+<------------------Cut here and run sh on the file----------------------------->
+echo x - Makefile
+cat > Makefile << '!EOF!'
+#******************************************************************************
+#
+#		(C) 1984	Isaac Balbin
+#				Department of Computer Science,
+#				University of Melbourne,
+#				Parkville 3052,
+#				Melbourne, AUSTRALIA
+#				UUCP: ...{decvax, vax135}!mulga!isaac
+#
+#		All rights reserved. This program may not be sold, however,
+#		permission is given to distribute it provided that this header
+#		remains intact.
+#		Mail any comments etc to the author.
+#******************************************************************************
+
+SOURCES	=		seebib.c popen2.c
+OBJECTS	=		seebib.o popen2.o
+LFLAGS	=		-lcurses -ltermcap
+CFLAGS	=		-O
+DEST	=		/mnt/pgrad/isaac/bin
+
+all	:	seebib seeref
+
+seeref	:	seebib
+		/bin/rm -f seeref
+		ln seebib seeref
+
+seebib	:	$(OBJECTS)
+			$(CC) -o seebib $(CFLAGS) $(OBJECTS) $(LFLAGS)
+
+install	:	all
+			/bin/rm -f seeref $(DEST)/seeref
+			chmod 711 seebib
+			mv seebib $(DEST)
+			ln $(DEST)/seebib $(DEST)/seeref
+clean	:	
+			/bin/rm -f $(OBJECTS)
+!EOF!
+echo x - seebib.c
+cat > seebib.c << '!EOF!'
+/******************************************************************************
++
++		(C) 1984	Isaac Balbin
++				Department of Computer Science,
++				University of Melbourne,
++				Parkville 3052,
++				Melbourne, AUSTRALIA
++				UUCP: ...{decvax, vax135}!mulga!isaac
++
++		All rights reserved. This program may not be sold, however,
++		permission is given to distribute it provided that this header
++		remains intact.
++		Mail any comments etc to the author.
++******************************************************************************/
+
+#ifndef lint
+static char *sccsid = "@(#)seebib.c	2.0 (Melbourne) 7/5/84";
+#endif
+
+/*
+**			seebib & seeref.
+**
+**	Visually displays and formats entries from
+**	a bibliography database according to Key words
+**	Uses lookup if invoked as seebib; uses hunt if invoked as seeref
+**	If you are using Mark Horton's new curses package then -DNEWCURSES
+**	If you are using AT&T UNIX then -DUSG (if you cant dup2 and need fcntl)
+*/
+
+#ifndef MULGA
+#define HUNTHOME	"/usr/lib/refer/hunt"
+#define LOOKUPHOME	"/usr/lib/bib/lookup"
+#else
+#define HUNTHOME	"/mnt/pgrad/isaac/lib/refer/hunt"
+#define LOOKUPHOME	"/mnt/pgrad/isaac/bin/lookup"
+#endif
+
+/* Flags for which prog we are using	*/
+#define _Lookup		0
+#define _Hunt		1
+
+#define HUNTMAX		"1024"	/* max found matching refs by hunt */
+#define MAXREFS		8128
+#define LARGE		1024
+#define	MEDIUM		256
+#define LINE		80
+#define	SMALL		64
+#define TINY 		16
+#define ALPHABET	26
+#define UNUSED		1
+#define SLEEP		2
+#define addblank(S)	if (S[0] != '\0') { strcat(S," ");   }
+#define addcomma(S)	if (S[0] != '\0') { strcat(S,",  "); }
+#define preamble(S)	wstandout(big);mvwaddstr(big,cury++,0,S);wstandend(big);
+#define ord(S)		(S - 'A')
+#define cntrl(S)	(S  & 037)
+
+#include <curses.h>
+#include <signal.h>
+#include <ctype.h>
+
+FILE *pin,*pout,*perrin;	/* file ptrs for i/o with access prog	*/
+WINDOW *big,*small;		/* top and bottom windows		*/
+
+char A[MEDIUM];			/* author				*/
+char B[MEDIUM];			/* book					*/
+char C[MEDIUM];			/* city					*/
+char D[SMALL];			/* date					*/
+char E[MEDIUM];			/* editors				*/
+char F[UNUSED];			/* footnote number			*/
+char G[UNUSED];			/* government order number		*/
+char H[SMALL];			/* header rubbish			*/
+char I[MEDIUM];			/* institute				*/
+char J[MEDIUM];			/* journal				*/
+char K[MEDIUM];			/* extra key words			*/
+char L[SMALL];			/* refer override label			*/
+char M[UNUSED];			/* bell labs rubbish			*/
+char N[TINY];			/* number				*/
+char O[LARGE];			/* other                    		*/
+char P[SMALL];			/* page number(s)			*/
+char Q[MEDIUM];			/* Corporate or foreign author		*/
+char R[MEDIUM];			/* research report			*/
+char S[MEDIUM];			/* series title				*/
+char T[MEDIUM];			/* title				*/
+char U[UNUSED];			/* unused				*/
+char V[TINY];			/* volume				*/
+char W[UNUSED];			/* unused				*/
+char X[LARGE];			/* abstract				*/
+char Y[MEDIUM];			/* who owns the reference		*/
+char Z[UNUSED];			/* unused				*/
+
+struct {
+	char *s;		/* string */
+	char *p;		/* prompt  NOTE: SHOULD ALL BE THE SAME LENGTH*/
+	int   l;		/* max buffer length */
+}	refs[ALPHABET] = {
+	&(A[0]),	"Author(s): ",	MEDIUM,
+	&(B[0]),	"Book     : ",	MEDIUM,
+	&(C[0]),	"City     : ",	MEDIUM,
+	&(D[0]),	"Date     : ",	SMALL,
+	&(E[0]),	"Editor(s): ",	MEDIUM,
+	&(F[0]),	(char *)NULL,	UNUSED,
+	&(G[0]),	(char *)NULL,	UNUSED,
+	&(H[0]),	"Header   : ",	SMALL,
+	&(I[0]),	"Institute: ",	MEDIUM,
+	&(J[0]),	"Journal  : ",	MEDIUM,
+	&(K[0]),	"Keywords : ",	MEDIUM,
+	&(L[0]),	"Label    : ",	SMALL,
+	&(M[0]),	(char *)NULL,	UNUSED,
+	&(N[0]),	"Number   : ",	TINY,
+	&(O[0]),	"Other    : ",	LARGE,
+	&(P[0]),	"Pages    : ",	SMALL,
+	&(Q[0]),	"Author(s): ",	MEDIUM,
+	&(R[0]),	"Report   : ",	MEDIUM,
+	&(S[0]),	"Series   : ",	MEDIUM,
+	&(T[0]),	"Title    : ",	MEDIUM,
+	&(U[0]),	(char *)NULL,	UNUSED,
+	&(V[0]),	"Volume   : ",	TINY,
+	&(W[0]),	(char *)NULL,	UNUSED,
+	&(X[0]),	"Abstract : ",	LARGE,
+	&(Y[0]),	"Owned-by : ",	MEDIUM,
+	&(Z[0]),	(char *)NULL,	UNUSED,
+};
+
+long offsets[MAXREFS];		/* holds byte offset of ref in tmp file */
+
+/* 
+** 	order holds the order in which we want to print out the entries	
+**	ie 0 == A(uthor) is first, 19 == T(itle) is second etc 
+*/
+int order[ALPHABET] =
+{ 0,19,18,9,1,4,17,8,2,21,13,3,15,11,10,24,23,14,7,-1,-1,-1,-1,-1,-1,-1};
+/*A T  S  J B E R  I C V  N  D P  L  K  Y  X  O  H			*/
+
+extern	char *strcpy(),*strcat(),*rindex(),*index();
+int	nrefs = 0;		/* running total of refs found		*/
+int 	totrefs = 0;		/* sum of refs found in first pass	*/
+int	number = 0;		/* optional number before a command	*/
+int	prompt_length;		/* the CONSTANT length of the prompt	*/
+int	Prog;			/* whether hunt or lookup or ...	*/
+char	temp[20];		/* holds temporary file name		*/
+char	mbuf[LINE];		/* buffer for messages			*/
+char	prog[LINE];		/* hunt or lookup			*/
+char 	acc_buf[LINE];		/* list of files to check access on	*/
+char	bib_file[LINE];		/* name of bib_file			*/
+char	bib_buf[LINE];		/* buffer for new bib files		*/
+char	user[40];		/* holds name of user output file	*/
+char	*progv[5] =		{&(prog[0]),(char *)0,(char *)0,(char *)0,NULL};
+bool	tty = TRUE;		/* true if terminal has cursor movement	*/
+bool	Terse_flag = FALSE;	/* terse mode flag			*/
+bool	Safe_flag = FALSE;	/* only allows q to skip past last ref	*/
+
+FILE	*userf;			/* file pointer for user file		*/
+FILE	*tmpf;			/* holds result of hunt search		*/
+
+main( argc, argv )
+	int argc;
+	char **argv;
+{
+	FILE *fopen();
+	char s[MEDIUM], *get_key_word();
+	register char *c;
+	int die(),psigpipe();
+	bool finished = FALSE;
+
+	get_prog_name(*argv);
+	while(--argc > 0 && (*++argv)[0] == '-')
+		switch(*(argv[0] + 1))
+		{
+		case 't':
+			Terse_flag = TRUE;
+			break;
+		case 's':
+			Safe_flag = TRUE;
+			break;
+		default:
+			usage();
+		}
+	if ( argc > 1 )
+		usage();
+	else
+		if ( argc == 1 )
+			strcpy(bib_file, *argv);
+		else
+			if( Prog == _Lookup )
+				strcpy(bib_file,"INDEX");/* set up default */
+			else	/* hunt */
+				strcpy(bib_file,"bib");	/* set up default */
+
+	sprintf(temp,"/tmp/see%06d",getpid());
+	if ( Prog == _Lookup )
+	{
+		sprintf(s, "%s", bib_file);
+		if ( looka (bib_file) == -1 )
+		{
+			fprintf(stderr,"Index file %s doesn't exist\n",acc_buf);
+			exit(1);
+		}
+		progv[1] = "-p";
+		progv[2] = &(bib_file[0]);
+	}
+	else	/* hunt */
+	{
+		if ( hunta(bib_file) == -1 )
+		{
+			fprintf(stderr,"Index file %s doesn't exist\n",acc_buf);
+			exit(1);
+		}
+		sprintf(s, "%s.ia", bib_file);
+		progv[1] = "-l";
+		progv[2] = HUNTMAX;
+		progv[3] = &(bib_file[0]);
+	}
+	signal(SIGINT,die);
+	signal(SIGPIPE,psigpipe);
+	initscr();
+#ifndef NEWCURSES
+	if ( strlen(CM) == 0 ) 
+	{
+		fprintf(stderr,
+		"Visual mode needs terminal with cursor motion capability\n");
+		fprintf(stderr,"Using non-visual (open) mode...\n\n");
+		tty = FALSE;
+		Safe_flag = TRUE;
+	}
+#endif
+	clear();
+	signal(SIGINT,die);
+	fflush(stdin);
+	addstr("Instructions? (y/n) ");
+	crmode();
+	refresh();
+	if ( getchar() == 'y')
+		instruct();
+	clear();
+	refresh();
+	if ( tty ) 
+	{
+		big = newwin(LINES-2,COLS,0,0);
+		small = newwin(1,COLS,LINES-1,0);
+	}
+	 /* only one screen needed */
+	else
+		big = small = stdscr; 
+	wstandout(small);
+	get_prompt_length();
+	while ( ! finished ) 
+	{
+		if ( tty )
+		{
+			wclear(big);
+			wrefresh(big);
+		}
+		wclear(small);
+		do_prompt();
+		if ( get_key_word(s) != NULL )
+		{
+			for( c = &(s[0]); isspace(*c); c++ )
+				;
+			if ( strcmp(c,"?\n") == 0 ) 
+			{
+				instruct();
+				clear();
+				refresh();
+				continue;
+			}
+			if ( c[0] == '<' )
+			{
+				if ( sscanf(c,"<%s",bib_buf) == -1 ) /* trick */
+				{
+					print_bib_file();
+					continue;
+				}
+				if ( Prog == _Lookup && looka(bib_buf) == -1)
+					error_index(acc_buf);
+				else
+				if ( Prog == _Hunt  && hunta(bib_buf) == -1)
+					error_index(acc_buf);
+				else
+				{
+					strcpy(bib_file,bib_buf);
+					print_bib_file();
+				}
+				continue;
+			}
+			if ( strlen(c) > 3 ) { /* key words <=2 + \n are out */
+				message("Searching database ...");
+				noecho();
+				wclear(small);
+				if( strncmp(c,"$all",4) !=0 )
+				{
+					popen2(progv,&pin,&pout,&perrin);
+					map_lower(c);
+					fprintf(pout,"%s",c);
+					fclose(pout);
+					nrefs = process_lines();
+					if ( !do_err() && nrefs == 0)
+					{
+						message("No Match");
+						sleep(SLEEP);
+					}
+					pclose2(pin,pout,perrin);
+				}
+				/* just use "cat" instead of "hunt"*/
+				else if ( Prog == _Hunt ) 
+				{ 
+					if ( (pin = fopen(bib_file,"r"))!= NULL)
+					{
+						process_lines();
+						fclose(pin);
+					}
+				}
+				echo();
+			}
+		}
+		else 
+		{
+			finished = TRUE;
+		}
+	}
+	die();
+}
+
+map_lower(s)		/* map string s to lower case */
+	register char *s;
+{
+	for ( ; *s; ++s)
+		if ( isupper(*s) )
+			*s = tolower(*s);
+}
+
+char map_upper(s)		/* map character s to upper case */
+	register char s;
+{
+	if ( islower(s) ) 
+		s = toupper(s);
+	return(s);
+}
+
+instruct()
+{
+	register int c;
+	noecho();
+	mvaddstr(2,0,"Type key words (eg Author and Date) after the prompt.");
+	mvaddstr(3,0,"References with those key words are shown if they exist");
+	mvaddstr(4,0,"if nothing matches you are given another prompt.");
+	if( Prog == _Lookup )
+	mvaddstr(5,0,"To quit seebib, press CTRL-d after the > prompt.");
+	else if( Prog == _Hunt)
+	mvaddstr(5,0,"To quit seeref, press CTRL-d after the > prompt.");
+	mvaddstr(6,0,"NOTE: key words <=2 characters long are ignored,");
+	mvaddstr(7,0,"and only the first 6 characters are significant.");
+	if ( Prog == _Hunt )
+	mvaddstr(8,0,"The special key word \"$all\" lists every reference.");
+	else if ( Prog == _Lookup )
+	mvaddstr(8,0,"The special keyword \"$all\" is NOT applicable.");
+	mvaddstr(9,0,"Cntrl L will redraw the screen.");
+	mvaddstr(10,0,"Cntrl T toggles between terse and verbose mode.");
+	mvaddstr(11,0,"It is possible to save the results of a search by");
+	mvaddstr(12,0,"following the keywords with '> filename'");
+	mvaddstr(13,0,"You can change index files by typing '< index_file' in");
+	mvaddstr(14,0,"in response to the prompt.");
+	mvaddstr(15,0,"'<' on its own will show the name of the index_file.");
+	if( Prog == _Lookup)
+	mvaddstr(16,0,"Multiple index files are possible as long as they are seperated by commas");
+	mvaddstr(LINES-1,0,"Press <space> to continue <q> to quit");
+	refresh();
+	while( (c = getchar()) != ' ' )
+		if ( c == 'q' )
+			die();
+		else 
+			write(fileno(stdout),"\07",1);
+	echo();
+}
+
+die()
+{
+	signal(SIGINT,SIG_IGN);
+	unlink(temp);
+	echo();
+	clear();
+	refresh();
+	nocrmode();
+	if ( tty )
+		mvcur(0,COLS-1,LINES-1,0);
+	else
+		wmove(small,0,0);
+	endwin();
+	exit(0);
+}
+
+static char info[LARGE];
+static bool fname;	/* true if redirect to filename */
+
+process_lines()
+{
+	char map_upper();
+	register char *cc;
+	register char *pos;
+	register int newline;
+	register int i;
+	int type = 0;
+	int icount = 0;
+
+	init_refs();
+	nrefs = 0;
+	totrefs = 0;
+	newline = 1;
+
+	if ( fname && ((userf = fopen(user,"a")) == NULL) )
+	{
+		sprintf(mbuf,"Can't open %s",user);
+		message(mbuf);
+		fname = FALSE;
+		sleep(SLEEP);
+		message("Searching database ...");
+	}
+	if ( !Terse_flag)
+	{
+		if ( (tmpf = fopen(temp,"w")) == NULL )
+			return(icount);
+		while( fgets(info,LARGE,pin) != NULL ) 
+		{
+			if ( info[0] == '.' )
+			{
+				if (info[1] == '[') 
+				{
+					newline = 1;
+					continue;
+				}
+				if ( info[1] == ']')
+					continue;
+			}
+			if (*info == '\n')
+				newline = 1;
+			else
+			{
+				if ( *info == '%' && newline) 
+				{
+					icount++;
+					newline = 0;
+					offsets[++totrefs] = ftell(tmpf);
+				}
+			}
+			fputs(info,tmpf);
+			if ( fname ) 
+				fputs(info,userf);
+		}
+		putc('\n',tmpf);/* need blank line to make loop homogeneous */
+		fclose(tmpf);
+		if ( fname ) 
+			fclose(userf);
+
+		/*
+		 * Read refs again, displaying them ...
+		 */
+
+		if ( (tmpf = fopen(temp,"r")) == NULL )
+			return(icount);
+	}
+	else 
+		tmpf = pin;
+
+	while( fgets(info,LARGE,tmpf) != NULL ) 
+	{
+		if ( info[0] == '.' && (info[1] == '['||info[1] == ']') )
+				continue;
+		if ( Terse_flag && fname )
+			fputs(info,userf);
+		if ( *info != '\n' ) 
+		{
+			*rindex(info,'\n') = '\0';
+			pos = info;
+			if ( info[0] == '%' )
+			{
+				icount++;
+				for(pos +=3;isspace(*pos);pos++)
+					;
+				type = map_upper(info[1]);
+			}
+			/*ignore unused */
+			if ( type == 0 || refs[ord(type)].p == (char *)NULL )
+				continue;
+			cc = refs[ord(type)].s;
+			i = refs[ord(type)].l  - strlen(cc);
+			if ( i > 2 )
+			{
+				if ( type != 'A' && type != 'E' )
+				{
+					addblank(cc);
+					if ( *cc != '\0' )
+						i--;
+				}
+				else
+				{
+					addcomma(cc);
+					if ( *cc != '\0' )
+						i -= 2;
+				}
+				if ( i < strlen(pos) )
+				{
+					pos[i - 2] = '>';
+					pos[i - 1] = '\0';
+				}
+				strcat(cc,pos);
+			}
+		}
+		else
+		{
+			print_refs();
+			type = 0;
+		}
+	}
+	if (*T || *B || *A)
+		print_refs();
+	if (Terse_flag && fname) 
+		fclose(userf);
+	return(icount);
+}
+
+char *get_key_word(s)
+	register char *s;
+{
+	char *save = s;
+	fname = FALSE;
+	if ( tty ) 
+		noecho();
+	while( (*s = getchar()) != '\n') 
+	{
+		if (*s == cntrl('t'))
+		{
+			wstandout(small);
+			if ( Terse_flag )
+			{
+				message("Exiting terse mode");
+				Terse_flag = FALSE;
+			}
+			else
+			{
+				message("Entering terse mode");
+				Terse_flag = TRUE;
+			}
+			if ( !tty ) 
+				sleep(SLEEP);
+			do_prompt();
+			continue;
+		}
+		if (*s == cntrl('d'))
+			return(NULL);
+		if (*s == cntrl('l')) 
+		{
+			clearok(curscr,TRUE);
+			if ( tty )
+				touchwin(big);
+			touchwin(small);
+			if ( tty )
+				wrefresh(big);
+			wrefresh(small);
+			continue;
+		}
+#ifdef NEWCURSES
+		if ( *s == killchar() )
+#else
+		if ( *s == _tty.sg_kill ) 
+#endif
+		{
+			s = save;
+			break;
+		}
+#ifdef NEWCURSES
+		if (*s == erasechar() || *s == '\b')
+#else
+		if (*s == _tty.sg_erase || *s == '\b')
+#endif
+		{
+			if ( s == save )
+				write(fileno(stdout),"\07",1);
+			else 
+			{
+#ifdef NEWCURSES
+#define BS 1
+#endif
+				if ( BS )
+					waddstr(small,"\b \b");
+				else 
+				{
+					s = save;
+					break;
+				}
+				s--;
+			}
+		}
+		else 
+		{
+			if ( !(isprint(*s) || *s == ' ') )
+				*s = '?';
+			waddch(small,*s++);
+		}
+		if ( tty ) 
+			wrefresh(small);
+	}
+	*++s = '\0';
+	echo();
+	wstandout(small);
+	parse(save);
+	return(save);
+}
+
+parse(s)
+	register char *s;
+{
+	char key[MEDIUM];
+
+	if ( (sscanf(s,"%[^>]>%s",key,user)) == 2 )
+		fname = TRUE;
+	strcpy(s,key);
+}
+
+init_refs()
+{
+	register int i;
+	for( i = 0; i < ALPHABET; i++ )
+		refs[i].s[0] = '\0';
+}
+
+static int cury;
+
+display()
+{
+	register int i,j;
+	cury = 0;
+	for( i = 0; i < ALPHABET; i++) 
+	{
+		j = order[i];
+		if (  j != -1 && refs[j].s[0] != '\0') 
+		{
+			preamble(refs[j].p);
+			exhume(refs[j].s);
+		}
+	}
+	wrefresh(big);
+	init_refs();
+}
+
+getint(pn)
+	register int *pn;
+{
+	register int c;
+	*pn = 0;
+	while ( (c = getchar()) >= '0' && c <= '9' )
+		*pn = 10 * *pn + c - '0';
+	return(c);
+}
+
+any_more()
+{
+	int more = ' ';
+	wstandout(small);
+	do 
+	{
+		if ( ! Terse_flag )
+			mvwaddstr(small,0,0,
+			"<space> to continue, <-> to back up, <q> to quit");
+		else
+			mvwaddstr(small,0,0,
+			"<space> to continue, <q> to quit");
+		wrefresh(small);
+		clearerr(stdin);
+		if (!Terse_flag) 
+			more = getint(&number);
+		else 
+			more = getchar();
+	} while ( ferror(stdin) != 0 );
+	wstandend(small);
+	return(more);
+}
+
+exhume(s)
+	register char *s;
+{
+	register char *c;
+	c = s;
+	while ( strlen(c) > COLS - prompt_length )
+	{
+		c = &(s[COLS - prompt_length]);
+		while(*c != ' ')
+			c--;
+		*c = '\0';
+		if ( cury > big->_maxy )
+			break;
+		else
+			waddstr(big,s);
+		wmove(big,cury++,prompt_length);
+		s = ++c;
+	}
+	if ( cury <= big->_maxy )
+		waddstr(big,s);
+	else
+		message("Ref. too long - truncated");
+}
+
+put_out(n)
+	register int n;
+{
+	wstandout(small);
+	if ( Terse_flag )
+		sprintf(mbuf,"Reference %d",n);
+	else
+		sprintf(mbuf,"Reference %d of %d",n,totrefs);
+	message(mbuf);
+}
+
+print_refs()
+{
+	bool finished = FALSE;
+	if ( !*T && !*B && !*A )
+		return;
+#ifdef NEWCURSES
+	/* prevent superfluous redrawing of big	*/
+	wnoutrefresh(big);
+#endif
+	put_out(++nrefs);
+	display();
+	while ( ! finished ) 
+	{
+		switch( any_more() ) 
+		{
+		case 'q':
+			if ( Terse_flag )
+				fclose(tmpf);
+			else
+				fseek(tmpf,0L,2);
+			finished = TRUE;
+			break;
+		case cntrl('l'):
+			if ( !tty ) 
+			{
+				fseek(tmpf,offsets[nrefs],0);
+				wclear(big);
+				nrefs--;
+				finished = TRUE;
+				break;
+			}
+			clearok(curscr,TRUE);
+			if ( tty )
+				touchwin(big);
+			touchwin(small);
+			if ( tty )
+				wrefresh(big);
+			wrefresh(small);
+			break;
+		case '-':
+			if ( !Terse_flag && nrefs > 1 ) 
+			{
+				if ( number > 1 ) 
+					nrefs -= number-1;
+				if ( nrefs > 1 ) 
+				{
+					nrefs--;
+					fseek(tmpf, offsets[nrefs],0);
+					nrefs--;
+				}
+				else 
+				{
+					nrefs = 0;
+					fseek(tmpf,0L,0);
+				}
+				wclear(big);
+				finished = TRUE;
+			}
+			else
+				write(fileno(stdout),"\07",1);
+			break;
+		case ' ':
+			wclear(big);
+			if (!Terse_flag)
+			{
+				if ( nrefs == totrefs && Safe_flag ) 
+				{
+					write(fileno(stdout),"\07",1);
+					break;
+				} 
+				else 
+				{
+					if ( number > 0 ) 
+					{
+						nrefs += number;
+						if ( nrefs > totrefs )
+							nrefs = totrefs;
+						fseek(tmpf,offsets[nrefs],0);
+						nrefs--;
+					}
+				}
+			}
+			if ( nrefs == totrefs && Safe_flag )
+			{
+				write(fileno(stdout),"\07",1);
+				break;
+			} 
+			else
+				finished = TRUE;
+			break;
+		default:
+			write(fileno(stdout),"\07",1);
+			break;
+		}
+	}
+}
+
+usage()
+{
+	fprintf(stderr,"Usage: see[bib|ref] [-t] [-s] [database]\n");
+	exit(0);
+}
+
+print_bib_file()
+{
+	wstandout(small);
+	sprintf(mbuf,"Processing Bib File '%s'",bib_file);
+	message(mbuf);
+	wstandend(small);
+	sleep(SLEEP);
+	wclear(small);
+}
+
+do_prompt()
+{
+	wstandout(small);
+	mvwaddstr(small,0,0,"key(s)[? for help]> ");
+	wrefresh(small);
+	wstandend(small);
+}
+
+message(s)
+	register char *s;
+{
+	wclear(small);
+	if ( tty )
+		wmove(small,0,COLS - strlen(s) -1);
+	else
+		wmove(small,0,0);
+	waddstr(small,s);
+	wrefresh(small);
+}
+
+get_prompt_length()
+{
+	register int i;
+	for ( i=0; i < ALPHABET; i++)
+		if( (prompt_length = strlen(refs[i].p)) > 0 )
+			break;
+}
+
+get_prog_name(s)
+	register char *s;
+{
+	if ( rindex(s,'/') != (char *)NULL)
+		s = rindex(s,'/') + sizeof(char);
+
+	if ( strcmp(s,"seeref") == 0 )
+	{
+		Prog = _Hunt;
+		if ( access(HUNTHOME,1) == -1 )
+			exit(perror(HUNTHOME));
+		strcpy(prog,HUNTHOME);
+	}
+	else
+	if ( strcmp(s,"seebib") == 0 )
+	{
+		Prog = _Lookup;
+		if ( access(LOOKUPHOME,1) == -1 )
+			exit(perror(LOOKUPHOME));
+		strcpy(prog,LOOKUPHOME);
+	}
+	else
+	{
+		fprintf(stderr,"Program invoked must be seebib or seeref\n");
+		exit(0);
+	}
+}
+
+error_index(s)
+	char *s;
+{
+	sprintf(mbuf,"Index file %s not found", s);
+	message(mbuf);
+	wclear(small);
+	sleep(SLEEP);
+}
+
+/* 
+** check the access on index files to lookup
+** possibly separated by ','
+** return -1 after first file which cant be accessed or 0 if all ok
+*/
+
+
+looka(files)
+	char *files;
+{
+	register char *s,*f,*bb;
+
+	for ( s = f = files; *s != '\0' && *s != '\n'; )
+	{
+		while ( *f != '\0' && *f != ',' && *f != '\n' )
+			f++;
+		for ( bb = &(acc_buf[0]); s < f; s++,bb++)
+			*bb = *s;
+		*bb = '\0';
+		if ( *f == ',')
+			f++,s++;
+		/* because "" == .    */
+		if (acc_buf[0] == '\0' || access(acc_buf,0) == -1 )
+			return(-1);
+	}
+	return(0);
+}
+
+/*
+**	Checks access to index files .ia .ib and .ic
+*/
+
+hunta(file)
+	char *file;
+{
+	sprintf(acc_buf,"%s.ia",file);
+	if ( access(acc_buf,0) == -1 )
+		return(-1);
+	*rindex(acc_buf,'a') = 'b';
+	if ( access(acc_buf,0) == -1 )
+		return(-1);
+	*rindex(acc_buf,'b') = 'c';
+	if ( access(acc_buf,0) == -1 )
+		return(-1);
+	return(0);
+}
+
+/*
+**	Pretty print any errors from stderr of hunt or lookup
+*/
+
+#define ErrString	"Fatal error ** "
+
+do_err()
+{
+	register int  e = 0;
+	static int Errlen = sizeof(ErrString)-1;
+	sprintf(info,ErrString);
+	while( fgets(&(info[Errlen]), LARGE, perrin) != NULL)
+	{
+		*index(info,'\n') == '\0';
+		message(info);
+		write(fileno(stderr),"\07",1); /*beep*/
+		e++;
+		sleep(SLEEP);
+	}
+	return(e);
+}
+!EOF!
+echo x - popen2.c
+cat > popen2.c << '!EOF!'
+/******************************************************************************
++
++		(C) 1984	David Price  &  Isaac Balbin
++				Department of Computer Science,
++				University of Melbourne,
++				Parkville 3052,
++				Melbourne, AUSTRALIA
++				UUCP: ...{decvax, vax135}!mulga!{dap, isaac}
++
++		All rights reserved. This program may not be sold, however,
++		permission is given to distribute it provided that this header
++		remains intact.
++		Mail any comments etc to the author.
++******************************************************************************/
+
+# include 	<stdio.h>
+# include 	<signal.h>
+#ifdef USG
+# include 	<fcntl.h>
+# define	newfd(o,n) if (o != n) {close(n),fcntl(o,F_DUPFD,n);close(o);}
+#else
+# define	newfd(old,new) if (old != new) {dup2(old,new);close(old);}
+#endif
+
+static int child_pid;
+
+/*
+**	Two way popen: allows one to read and write to process "cmdv[0]"
+**	via File pointers pin, pout and perrin.  The child process has
+**	fd's 0, 1 & 2 (stdin, stdout & stderr) connected via pipes to fp's
+**	pout, pin & perrin respectively.
+**	Call by popen2(cmdv,&pin,&pout,&perrin);...;pclose2(pin,pout,perrin);
+**
+**			David Price
+*/
+
+popen2(cmdv,pinptr,poutptr,perrinptr)
+	char *cmdv[];
+	FILE **pinptr,**poutptr,**perrinptr;
+{
+	int	parentw[2],	/* parent (caller) write file descriptor */
+		childw[2],	/* child  (called) write file descriptor */
+		childerr[2];	/* child  standard error file descriptor */
+
+	fflush(stdout);		/* clear toilet first		  	 */
+
+	if ( pipe(parentw) < 0 || pipe(childw) < 0 || pipe(childerr) < 0 )
+	{
+		perror("popen2: No pipe");
+		exit(1);
+	}
+
+	if( (child_pid = fork()) == 0 )
+	{
+		/*	child	*/
+		signal(SIGPIPE,SIG_DFL);
+		close(parentw[1]);
+		close(childw[0]);
+		close(childerr[0]);
+		newfd(parentw[0],0);
+		newfd(childw[1],1);
+		newfd(childerr[1],2);
+		execv(cmdv[0], cmdv);
+		perror(cmdv[0]);
+		fclose(stdout);
+		fclose(stderr);
+		while (getchar()!=EOF)
+			;
+		exit(1);
+	}
+
+	/*	Else we are parent	*/
+	if( child_pid < 0 )
+	{
+		perror("popen2: Fork fails");
+		exit(1);
+	}
+	close(parentw[0]);
+	close(childw[1]);
+	close(childerr[1]);
+	*pinptr    = fdopen(childw[0],"r");
+	*poutptr   = fdopen(parentw[1],"w");
+	setbuf(*poutptr,(char *) NULL);
+	*perrinptr = fdopen(childerr[0],"r");
+	if (*pinptr == NULL || *poutptr == NULL || *perrinptr == NULL)
+		perror("Bad fdopen");
+}
+
+
+pclose2(pin,pout,perrin)
+	FILE *pin, *pout, *perrin;
+{
+	fclose(pin);
+	fclose(pout);
+	fclose(perrin);
+}
+
+
+psigpipe()
+{
+	signal(SIGPIPE,SIG_IGN);
+	fprintf(stderr,"\rBroken pipe                          \r\n");
+	signal(SIGPIPE,psigpipe);
+}
+!EOF!
+echo x - seebib.1
+cat > seebib.1 << '!EOF!'
+.TH SEEBIB 1 "May 1984"
+.UC 4
+.SH NAME
+seebib \- interrogate a 
+.I bib
+type bibliographic database
+.SH SYNOPSIS
+.B seebib
+[ option ] [ index_files ]
+.LP
+.SH DESCRIPTION
+.I  Seebib
+is a program which allows the user to interrogate a database consisting
+of a bibliography of references which are in 
+.I bib
+format.
+It is assumed that the bibliography has been used to create an inverted index
+by using 
+.I invert
+It differs from 
+.I lookup
+in that the user interface is much more friendly and versatile.
+.PP
+.I Seebib
+(via the
+.I curses
+library) looks in the file
+.I /etc/termcap
+(or the designated 
+.I environment
+variable TERMCAP)
+to determine the terminal characteristics, and to determine the default window sizes.
+.PP
+The command line arguments are:
+.TP
+[ index_files ]
+.br
+The files are created by
+.I invert
+to facilitate retrieval via
+.I
+lookup.
+There may be more than one index file provided they are separated by commas
+with no spaces in between.
+This is the same convention as the -p option to lookup.
+Remember though that the semantics of -p in lookup implies that the search will stop in the first index where references are found matching the keywords.
+The default index_file is "INDEX".
+.IP [-t]
+This enables the terse way of examining the database.
+No backing up of references is possible, nor is a prior count of the number 
+of references matched available.
+.IP [-s]
+This enables the "safe" mode for seebib.
+Normally the user examines successive references by pressing the space bar.
+When the space bar is pressed after the last reference matched, seebib erases 
+all knowledge of the results of the current search and awaits a new keyword(s).
+In the "safe" mode, the user must exit from the last reference matched by 
+typing "q" thus saving the user from the requirement to redo the search if
+he inadvertently hits the space bar.
+.PP
+In Line arguments (in response to the "key(s)[? for help]>" prompt):
+.TP
+.I keyword(s)
+In response to the prompt, the user types key words which seek to identify
+the reference(s) required.
+Backspace and kill characters behave as would be expected whilst unprintable
+characters are echoed as question marks.
+.br
+A sample would be
+.sp 2
+\fBkey(s)[? for help]>\fP	balbin stuart 1983
+.sp 2
+In this case only references which are identified by 
+.I all
+the aforementioned keywords are listed.
+The minimum size of a key word is 3 characters and only the first 6 characters are significant.
+It is possible to redirect the results of a search to filename by typing a ">" followed by a filename.
+An example would be :-
+.sp 2
+\fBkey(s)[? for help]>\fP	logic > results
+.sp 2
+In verbose mode all the references matched will be output to the file.
+In terse mode only those references actually viewed on the screen will be output to the file.
+If the file already exists then the resultant output will be appended to that file otherwise it will be created.
+.IP "< [bib_file]"
+It is possible to interrogate a new bibliography whilst within seebib by 
+giving the new file name after the <.
+Typing < on its own will print the name of the current bibliography file.
+.IP "?"
+If this is typed in response to the prompt (followed by a newline) then the help information is displayed.
+.IP ^T
+This key can be used to toggle between terse and verbose modes.
+In verbose mode two passes of the bibliography are made so that there
+is an indication of how many references are available matching a particular
+keyword (or group of key words).
+.IP ^D
+Used to terminate a session.
+.PP
+In Line commands during output phase of the search:
+.IP [integer]<space>
+By hitting the space bar, the next reference matching the keywords is displayed.
+If the <space> is preceded by an integer then that many references will be skipped.
+.IP [integer]<->
+Allows the user to back up to the previous reference.
+This is enabled only for the verbose mode of
+.I seebib.
+If the <-> is preceded by an integer then that many references will be backed up.
+.IP <q>
+Pressing this key causes the current search to be aborted and the screen to be cleared.
+.IP ^L
+Redraws the screen when necessary.
+.SH AUTHOR
+Isaac Balbin
+.br
+Department of Computer Science,
+.br
+University of Melbourne, Parkville 3052, Australia.
+.br
+UUCP: ...{decvax,vax135}!mulga!isaac
+.SH ACKNOWLEDGEMENTS
+David Price (Univ. of Melb), Baron Grey (UCLA) and John Shepherd (Univ. of Melb).
+.SH FILES
+.DT
+/etc/termcap		Terminal data base
+/tmp/seeXXXX		temporary file
+.SH "SEE ALSO"
+bib(1), invert(1), lookup(1).
+.SH DIAGNOSTICS
+.DT
+Messages indicating that a search is being undertaken or that the mode has switched from terse to verbose are indicated on the lower window.
+Any errors from 
+.I lookup
+are reformatted and  written to the screen.
+If a reference entry is too long and will overflow a buffer, it is truncated and an '>' appears at the last character position on the screen.
+If all a references entries are too long to fit on one screen (very unlikely) then only as much as can be shown will be; an error message is printed.
+.SH BUGS
+!EOF!
+echo x - seeref.1
+cat > seeref.1 << '!EOF!'
+.TH SEEREF 1 "May 1984"
+.UC 4
+.SH NAME
+seeref \- interrogate a 
+.I refer
+type bibliographic database
+.SH SYNOPSIS
+.B seeref
+[ option ] [ file ]
+.LP
+.SH DESCRIPTION
+.I  Seeref
+is a program which allows the user to interrogate a database consisting
+of a bibliography of references which are in 
+.I refer
+format.
+It is assumed that the bibliography has been used to create an inverted index
+in the files, file.ia, file.ib, and file.ic.
+These 
+.I may
+be created by using 
+.I indxbib
+for example.
+If they have not been created by 
+.I indxbib 
+then just invoke 
+.I seeref 
+with the prefix part of the index files.
+It differs from 
+.I lookbib
+in that the user interface is much more friendly and versatile.
+.PP
+.I Seeref
+(via the
+.I curses
+library) looks in the file
+.I /etc/termcap
+(or the designated 
+.I environment
+variable TERMCAP)
+to determine the terminal characteristics, and to determine the default window sizes.
+.PP
+The command line arguments are:
+.TP
+[ file ]
+.br
+The file is used for two reasons.
+Primarily, it is the prefix for the .i[abc] suffixed files which are assumed to
+be resident.
+In the case of multiple files with only one set of inverted index files, the 
+user should run
+.I indxbib
+on the series of files, and then realise that the first file argument to
+.I indxbib 
+will be used as the prefix for the .i[abc] files and hence should 
+also be used
+.B solely
+as the argument to 
+.I seeref
+(or
+.I lookbib
+for that matter.)
+The default filename is "bib".
+.IP [-t]
+This enables the terse way of examining the database.
+No backing up of references is possible, nor is a prior count of the number 
+of references matched available.
+.IP [-s]
+This enables the "safe" mode for seeref.
+Normally the user examines successive references by pressing the space bar.
+When the space bar is pressed after the last reference matched, seeref erases 
+all knowledge of the results of the current search and awaits a new keyword(s).
+In the "safe" mode, the user must exit from the last reference matched by 
+typing "q" thus saving the user from the requirement to redo the search if
+he inadvertently hits the space bar.
+.PP
+In Line arguments (in response to the "key(s)[? for help]>" prompt):
+.TP
+.I keyword(s)
+In response to the prompt, the user types key words which seek to identify
+the reference(s) required.
+Backspace and kill characters behave as would be expected whilst unprintable
+characters are echoed as question marks.
+.br
+A sample would be
+.sp 2
+\fBkey(s)[? for help]>\fP	balbin stuart 1983
+.sp 2
+In this case only references which are identified by 
+.I all
+the aforementioned keywords are listed.
+The minimum size of a key word is 3 characters and only the first 6 characters are significant.
+It is possible to redirect the results of a search to filename by typing a ">" followed by a filename.
+An example would be :-
+.sp 2
+\fBkey(s)[? for help]>\fP	logic > results
+.sp 2
+In verbose mode all the references matched will be output to the file.
+In terse mode only those references actually viewed on the screen will be output to the file.
+If the file already exists then the resultant output will be appended to that file otherwise it will be created.
+.IP \fI$all\fP
+This special key word is used to list every reference in the bibliographic database.
+.IP "< [bib_file]"
+It is possible to interrogate a new bibliography whilst within seeref by 
+giving the new file name after the <.
+Typing < on its own will print the name of the current bibliography file.
+.IP "?"
+If this is typed in response to the prompt (followed by a newline) then the help information is displayed.
+.IP ^T
+This key can be used to toggle between terse and verbose modes.
+In verbose mode two passes of the bibliography are made so that there
+is an indication of how many references are available matching a particular
+keyword (or group of key words).
+.IP ^D
+Used to terminate a session.
+.PP
+In Line commands during output phase of the search:
+.IP [integer]<space>
+By hitting the space bar, the next reference matching the keywords is displayed.
+If the <space> is preceded by an integer then that many references will be skipped.
+.IP [integer]<->
+Allows the user to back up to the previous reference.
+This is enabled only for the verbose mode of
+.I seeref.
+If the <-> is preceded by an integer then that many references will be backed up.
+.IP <q>
+Pressing this key causes the current search to be aborted and the screen to be cleared.
+.IP ^L
+Redraws the screen when necessary.
+.SH AUTHOR
+Isaac Balbin
+.br
+Department of Computer Science,
+.br
+University of Melbourne, Parkville 3052, Australia.
+.br
+UUCP: ...{decvax,vax135}!mulga!isaac
+.SH ACKNOWLEDGEMENTS
+David Price (Univ. of Melb), Baron Grey (UCLA) and John Shepherd (Univ. of Melb).
+.SH FILES
+.DT
+/etc/termcap		Terminal data base
+/tmp/seeXXXX		temporary file
+.SH "SEE ALSO"
+refer(1), indxbib(1), hunt(1), mkey(1), inv(1).
+.SH DIAGNOSTICS
+.DT
+Messages indicating that a search is being undertaken or that the mode has switched from terse to verbose are indicated on the lower window.
+Any errors from 
+.I hunt
+are reformatted and sent to the screen.
+If a reference entry is too long and will overflow a buffer, it is truncated and an '>' appears at the last character position on the screen.
+If all a references entries are too long to fit on one screen (very unlikely) then only as much as can be shown will be; an error message is printed.
+.SH CAVEATS
+The special key word "$all" works properly only when the references are in one file.
+Essentially providing "$all" is not the function of a program which really only formats
+.I hunt
+output.
+Of course,
+.I seeref
+still works properly for any other key words even though the bibliography is in multiple files.
+Note that even if the bibiliography is in a file "papers" and the index files
+are in Ind.ia, Ind.ib and Ind.ic, one invokes 
+.I seeref
+with the file "Ind".
+In such a case, though, "$all" will not work.
+It is possible to modify seeref so that "$all" works on multiple files but we decided against it.
+.SH BUGS
+!EOF!
+echo x - indxbib
+cat > indxbib << '!EOF!'
+#! /bin/sh
+#
+#	@(#)indxbib.sh	4.1	(Berkeley)	83/05/08
+#
+#	indxbib sh script
+#
+if test $1
+	then /usr/lib/refer/mkey $* | /usr/lib/refer/inv _$1
+	mv _$1.ia $1.ia
+	mv _$1.ib $1.ib
+	mv _$1.ic $1.ic
+else
+	echo 'Usage:  indxbib database [ ... ]
+	first argument is the basename for indexes
+	indexes will be called database.{ia,ib,ic}'
+fi
+!EOF!
+
+

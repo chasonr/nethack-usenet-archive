@@ -1,0 +1,1940 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,ebddfcdf1e985d3,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1987-01-14 09:04:08 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!mnetor!seismo!rochester!kodak!keily
+From: keily@kodak.UUCP (dick keily)
+Newsgroups: net.sources
+Subject: MSDOS less source 1 of 3
+Message-ID: <667@kodak.UUCP>
+Date: Wed, 14-Jan-87 12:04:08 EST
+Article-I.D.: kodak.667
+Posted: Wed Jan 14 12:04:08 1987
+Date-Received: Thu, 15-Jan-87 00:58:50 EST
+Reply-To: keily@kodak.UUCP (dick keily)
+Followup-To: ...!seismo!rochester!kodak!keily
+Distribution: world
+Organization: Eastman Kodak Co, Rochester, NY
+Lines: 1917
+Summary: Full source code for pc less implementation
+
+
+This source code was used to compile the new version of less that I just
+posted. See readme for some pertinents. Piping now works. I have tested
+less on all combinations of monitors that I could find. (mono/graphics
+combos included) Repond with any problems.
+		...!seismo!rochester!kodak!keily
+
+==============Edit thru here and run thru sh===========================
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#	ch.c
+#	command.c
+#	help.c
+#	input.c
+#	main.c
+#	dos_port.h
+#	funcs.h
+#	less.h
+#	position.h
+#	regexp.h
+#	regmagic.h
+#	scrn.h
+#	files
+#	makefile
+# This archive created: Wed Jan 14 11:21:44 1987
+export PATH; PATH=/bin:$PATH
+if test -f 'ch.c'
+then
+	echo shar: will not over-write existing file "'ch.c'"
+else
+cat << \SHAR_EOF > 'ch.c'
+/*
+ * Low level character input from the input file.
+ * We use these special purpose routines which optimize moving
+ * both forward and backward from the current read pointer.
+ */
+
+#include "less.h"
+
+public int file = -1;	/* File descriptor of the input file */
+
+/*
+ * Pool of buffers holding the most recently used blocks of the input file.
+ */
+#define BUFSIZ	1024
+static struct buf {
+	struct buf *next, *prev;
+	long block;
+	char data[BUFSIZ];
+};
+static struct buf *bufs = NULL;
+public int nbufs;
+
+/*
+ * The buffer pool is kept as a doubly-linked circular list,
+ * in order from most- to least-recently used.
+ * The circular list is anchored by buf_anchor.
+ */
+static struct {
+	struct buf *next, *prev;
+} buf_anchor;
+#define	END_OF_CHAIN	((struct buf *)&buf_anchor)
+#define	buf_head	buf_anchor.next
+#define	buf_tail	buf_anchor.prev
+
+/*
+ * If we fail to allocate enough memory for buffers, we try to limp
+ * along with a minimum number of buffers.  
+ */
+#define	DEF_NBUFS	2	/* Minimum number of buffers */
+
+extern int clean_data;
+extern int ispipe;
+
+/*
+ * Current position in file.
+ * Stored as a block number and an offset into the block.
+ */
+static long ch_block;
+static int ch_offset;
+
+/* 
+ * Length of file, needed if input is a pipe.
+ */
+static POSITION ch_fsize;
+
+/*
+ * Largest block number read if input is standard input (a pipe).
+ */
+static long last_piped_block;
+
+/*
+ * Get the character pointed to by the read pointer.
+ * ch_get() is a macro which is more efficient to call
+ * than fch_get (the function), in the usual case 
+ * that the block desired is at the head of the chain.
+ */
+#define	ch_get()   ((buf_head->block == ch_block) ? \
+			buf_head->data[ch_offset] : fch_get())
+	static int
+fch_get()
+{
+	register struct buf *bp;
+	register int n;
+	register int end;
+	POSITION pos;
+
+	/*
+	 * Look for a buffer holding the desired block.
+	 */
+	for (bp = buf_head;  bp != END_OF_CHAIN;  bp = bp->next)
+		if (bp->block == ch_block)
+			goto found;
+	/*
+	 * Block is not in a buffer.  
+	 * Take the least recently used buffer 
+	 * and read the desired block into it.
+	 */
+	bp = buf_tail;
+	bp->block = ch_block;
+	pos = ch_block * BUFSIZ;
+	if (ispipe)
+	{
+		/*
+		 * The block requested should be one more than
+		 * the last block read.
+		 */
+		if (ch_block != ++last_piped_block)
+		{
+			/* This "should not happen". */
+			char message[80];
+			sprintf(message, "Pipe error: last %ld, want %ld\n",
+				last_piped_block-1, ch_block);
+			error(message);
+			quit();
+		}
+	} else
+		lseek(file, pos, 0);
+
+	/*
+	 * Read the block.  This may take several reads if the input
+	 * is coming from standard input, due to the nature of pipes.
+	 */
+	end = 0;
+	while ((n = read(file, &bp->data[end], BUFSIZ-end)) > 0)
+		if ((end += n) >= BUFSIZ)
+			break;
+
+	if (n < 0)
+	{
+		error("read error");
+		quit();
+	}
+
+	/*
+	 * Set an EOF marker in the buffered data itself.
+	 * Then ensure the data is "clean": there are no 
+	 * extra EOF chars in the data and that the "meta"
+	 * bit (the 0200 bit) is reset in each char.
+	 */
+	if (end < BUFSIZ)
+	{
+		ch_fsize = pos + end;
+		bp->data[end] = EOF;
+	}
+
+	if (!clean_data)
+		while (--end >= 0)
+		{
+			bp->data[end] &= 0177;
+			if (bp->data[end] == EOF)
+				bp->data[end] = '@';
+		}
+
+    found:
+	/* if (buf_head != bp) {this is guaranteed by the ch_get macro} */
+	{
+		/*
+		 * Move the buffer to the head of the buffer chain.
+		 * This orders the buffer chain, most- to least-recently used.
+		 */
+		bp->next->prev = bp->prev;
+		bp->prev->next = bp->next;
+
+		bp->next = buf_head;
+		bp->prev = END_OF_CHAIN;
+		buf_head->prev = bp;
+		buf_head = bp;
+	}
+	return (bp->data[ch_offset]);
+}
+
+/*
+ * Determine if a specific block is currently in one of the buffers.
+ */
+	static int
+buffered(block)
+	long block;
+{
+	register struct buf *bp;
+
+	for (bp = buf_head;  bp != END_OF_CHAIN;  bp = bp->next)
+		if (bp->block == block)
+			return (1);
+	return (0);
+}
+
+/*
+ * Seek to a specified position in the file.
+ * Return 0 if successful, non-zero if can't seek there.
+ */
+	public int
+ch_seek(pos)
+	register POSITION pos;
+{
+	long new_block;
+
+	new_block = pos / BUFSIZ;
+	if (!ispipe || new_block == last_piped_block + 1 || buffered(new_block))
+	{
+		/*
+		 * Set read pointer.
+		 */
+		ch_block = new_block;
+		ch_offset = pos % BUFSIZ;
+		return (0);
+	}
+	return (1);
+}
+
+/*
+ * Seek to the end of the file.
+ */
+	public int
+ch_end_seek()
+{
+	if (ispipe)
+	{
+		/*
+		 * Do it the slow way: read till end of data.
+		 */
+		while (ch_forw_get() != EOF)
+			;
+	} else
+	{
+		(void) ch_seek((POSITION)(lseek(file, (off_t)0, 2)));
+	}
+	return (0);
+}
+
+/*
+ * Return the length of the file, if known.
+ */
+	public POSITION
+ch_length()
+{
+	if (ispipe)
+		return (ch_fsize);
+	return ((POSITION)(lseek(file, (off_t)0, 2)));
+}
+
+/*
+ * Return the current position in the file.
+ */
+	public POSITION
+ch_tell()
+{
+	return (ch_block * BUFSIZ + ch_offset);
+}
+
+/*
+ * Get the current char and post-increment the read pointer.
+ */
+	public int
+ch_forw_get()
+{
+	register int c;
+
+	c = ch_get();
+	if (c != EOF && ++ch_offset >= BUFSIZ)
+	{
+		ch_offset = 0;
+		ch_block ++;
+	}
+	return (c);
+}
+
+/*
+ * Pre-decrement the read pointer and get the new current char.
+ */
+	public int
+ch_back_get()
+{
+	register int c;
+
+	if (--ch_offset < 0)
+	{
+		if (ch_block <= 0 || (ispipe && !buffered(ch_block-1)))
+		{
+			ch_offset = 0;
+			return (EOF);
+		}
+		ch_offset = BUFSIZ - 1;
+		ch_block--;
+	}
+	c = ch_get();
+	return (c);
+}
+
+/*
+ * Initialize the buffer pool to all empty.
+ * Caller suggests that we use want_nbufs buffers.
+ */
+	public void
+ch_init(want_nbufs)
+	int want_nbufs;
+{
+	register struct buf *bp;
+	char *calloc();
+
+	if (nbufs < want_nbufs)
+	{
+		/*
+		 * We don't have enough buffers.  
+		 * Free what we have (if any) and allocate some new ones.
+		 */
+		if (bufs != NULL)
+			free((char *)bufs);
+		bufs = (struct buf *) calloc(want_nbufs, sizeof(struct buf));
+		nbufs = want_nbufs;
+		if (bufs == NULL)
+		{
+			/*
+			 * Couldn't get that many.
+			 * Try for a small default number of buffers.
+			 */
+			char message[80];
+			sprintf(message,
+			  "Cannot allocate %d buffers.  Using %d buffers.", 
+			  nbufs, DEF_NBUFS);
+			error(message);
+			bufs = (struct buf *) calloc(DEF_NBUFS, sizeof(struct buf));
+			nbufs = DEF_NBUFS;
+			if (bufs == NULL)
+			{
+				/*
+				 * Couldn't even get the smaller number of bufs.
+				 * Something is wrong here, don't continue.
+				 */
+				sprintf(message, 
+				"Cannot even allocate %d buffers!  Quitting.\n",
+				  DEF_NBUFS);
+				error(message);
+				quit();
+				/*NOTREACHED*/
+			}
+		}
+	}
+
+	/*
+	 * Initialize the buffers to empty.
+	 * Set up the circular list.
+	 */
+	for (bp = &bufs[0];  bp < &bufs[nbufs];  bp++)
+	{
+		bp->next = bp + 1;
+		bp->prev = bp - 1;
+		bp->block = (long)(-1);
+	}
+	bufs[0].prev = bufs[nbufs-1].next = END_OF_CHAIN;
+	buf_head = &bufs[0];
+	buf_tail = &bufs[nbufs-1];
+	last_piped_block = -1;
+	ch_fsize = NULL_POSITION;
+	(void) ch_seek((POSITION)0);
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'command.c'
+then
+	echo shar: will not over-write existing file "'command.c'"
+else
+cat << \SHAR_EOF > 'command.c'
+/*
+ * User-level command processor.
+ */
+
+#include "less.h"
+#include "position.h"
+#include <setjmp.h>
+
+extern jmp_buf main_loop;
+extern int erase_char, kill_char;
+extern int pr_type;
+extern int sigs;
+extern int ispipe;
+extern int quit_at_eof;
+extern int hit_eof;
+extern int sc_width, sc_height;
+extern char *first_cmd;
+extern char version[];
+extern char current_file[];
+extern char *editor;
+
+static char cmdbuf[90];		/* Buffer for holding a multi-char command */
+static char *cp;		/* Pointer into cmdbuf */
+static int cmd_col;		/* Current column of the multi-char command */
+static char mcc;		/* The multi-char command letter (e.g. '/') */
+static char last_mcc;		/* The previous mcc */
+
+/*
+ * Reset command buffer (to empty).
+ */
+cmd_reset()
+{
+	cp = cmdbuf;
+}
+
+/*
+ * Backspace in command buffer.
+ */
+	static int
+cmd_erase()
+{
+	if (cp == cmdbuf)
+		/*
+		 * Backspace past beginning of the string:
+		 * this usually means abort the command.
+		 */
+		return (1);
+
+	if (control_char(*--cp))
+	{
+		/*
+		 * Erase an extra character, for the carat.
+		 */
+		backspace();
+		cmd_col--;
+	}
+	backspace();
+	cmd_col--;
+	return (0);
+}
+
+/*
+ * Set up the display to start a new multi-character command.
+ */
+start_mcc()
+{
+	lower_left();
+	clear_eol();
+ 	putc(mcc);
+	cmd_col = 1;
+}
+
+/*
+ * Process a single character of a multi-character command, such as
+ * a number, or the pattern of a search command.
+ */
+	static int
+cmd_char(c)
+	int c;
+{
+	if (c == erase_char)
+	{
+		if (cmd_erase())
+			return (1);
+	} else if (c == kill_char)
+	{
+		/* {{ Could do this faster, but who cares? }} */
+		while (cmd_erase() == 0)
+			;
+	} else
+	{
+		/*
+		 * Append the character to the string,
+		 * if there is room in the buffer and on the screen.
+		 */
+		if (cp < &cmdbuf[sizeof(cmdbuf)-1] && cmd_col < sc_width-3)
+		{
+			*cp++ = c;
+			if (control_char(c))
+			{
+				putc('^');
+				cmd_col++;
+				c = carat_char(c);
+			}
+			putc(c);
+			cmd_col++;
+		} else
+			bell();
+	}
+	return (0);
+}
+
+/*
+ * Return the number currently in the command buffer.
+ */
+	static int
+cmd_int()
+{
+	*cp = '\0';
+	cp = cmdbuf;
+	return (atoi(cmdbuf));
+}
+
+/*
+ * Move the cursor to lower left before executing a command.
+ * This looks nicer if the command takes a long time before
+ * updating the screen.
+ */
+	static void
+cmd_exec()
+{
+	lower_left();
+	flush();
+}
+
+/*
+ * Display the appropriate prompt.
+ */
+	static void
+prompt()
+{
+	register char *p;
+
+	if (first_cmd != NULL && *first_cmd != '\0')
+		/*
+		 * No prompt necessary if commands are from first_cmd
+		 * rather than from the user.
+		 */
+		return;
+
+	/*
+	 * Select the proper prompt and display it.
+	 */
+	p = pr_string();
+	if (p == NULL)
+		putc(':');
+	else
+	{
+		so_enter();
+		puts(p);
+		so_exit();
+	}
+}
+
+/*
+ * Get command character.
+ * The character normally comes from the keyboard,
+ * but may come from the "first_cmd" string.
+ */
+	static int
+getcc()
+{
+	if (first_cmd == NULL)
+		return (getc());
+
+	if (*first_cmd == '\0')
+	{
+		/*
+		 * Reached end of first_cmd input.
+		 */
+		first_cmd = NULL;
+		if (cp > cmdbuf && position(TOP) == NULL_POSITION)
+		{
+			/*
+			 * Command is incomplete, so try to complete it.
+			 * There are only two cases:
+			 * 1. We have "/string" but no newline.  Add the \n.
+			 * 2. We have a number but no command.  Treat as #g.
+			 * (This is all pretty hokey.)
+			 */
+			if (mcc != ':')
+				return ('\n'); 
+			else
+				return ('g');
+		}
+		return (getc());
+	}
+	return (*first_cmd++);
+}
+
+/*
+ * Main command processor.
+ * Accept and execute commands until a quit command, then return.
+ */
+	public void
+commands()
+{
+	register int c;
+	register int n;
+	register int scroll = 10;
+
+	mcc = last_mcc = 0;
+
+	setjmp(main_loop);
+	for (;;)
+	{
+		/*
+		 * Display prompt and accept a character.
+		 */
+		psignals();	/* See if any signals need processing */
+
+		if (quit_at_eof && hit_eof > 1)
+			/*
+			 * After hitting end-of-file for the second time,
+			 * automatically advance to the next file.
+			 * If there are no more files, quit.
+			 */
+			next_file(1);
+
+		cmd_reset();
+		lower_left();
+		clear_eol();
+		prompt();
+		c = getcc();
+
+	again:
+		if (sigs)
+			continue;
+
+		if (mcc)
+		{
+			/*
+			 * We are in a multi-character command.  
+			 * All chars until newline go into the command buffer.
+			 * (Note that mcc == ':' is a special case that
+			 *  means a number is being entered.)
+			 */
+			if (mcc != ':' && (c == '\n' || c == '\r'))
+			{
+				/*
+				 * Execute the command.
+				 */
+				*cp = '\0';
+				cmd_exec();
+				if (mcc == 'E')
+				{
+					char *p;
+					/*
+					 * Ignore leading spaces 
+					 * in the filename.
+					 */
+					for (p = cmdbuf;  *p == ' ';  p++) ;
+					edit(p);
+#if SHELL_ESCAPE
+				} else if (mcc == '!')
+				{
+					lsystem(cmdbuf);
+					error("!done");
+					first_cmd = "r";	/* Repaint */
+#endif
+				} else
+					search(mcc, cmdbuf, n);
+				mcc = 0;
+			} else
+			{
+				if (mcc == ':' && (c < '0' || c > '9') &&
+					c != erase_char && c != kill_char)
+				{
+					/*
+					 * This is not part of the number
+					 * we were entering.  Process
+					 * it as a regular character.
+					 */
+					mcc = 0;
+					goto again;
+				}
+
+				/*
+				 * Append the char to the command buffer.
+				 */
+				if (cmd_char(c))
+				{
+					/* Abort the multi-char command. */
+					mcc = 0;
+					continue;
+				}
+				c = getcc();
+				goto again;
+			}
+		} else switch (c)
+		{
+		case '0': case '1': case '2': case '3': case '4':
+		case '5': case '6': case '7': case '8': case '9':
+			/*
+			 * First digit of a number.
+			 */
+			mcc = ':';
+			start_mcc();
+			goto again;
+
+		case 'f':
+		case ' ':
+		case CONTROL('F'):
+			/*
+			 * Forward one screen.
+			 */
+			n = cmd_int();
+			if (n <= 0)
+				n = sc_height - 1;
+			forward(n, 1);
+			break;
+
+		case 'b':
+		case CONTROL('B'):
+			/*
+			 * Backward one screen.
+			 */
+			n = cmd_int();
+			if (n <= 0)
+				n = sc_height - 1;
+			backward(n, 1);
+			break;
+
+		case 'e':
+		case 'j':
+		case '\r':
+		case '\n':
+		case CONTROL('E'):
+			/*
+			 * Forward N (default 1) line.
+			 */
+			n = cmd_int();
+			if (n <= 0)
+				n = 1;
+			forward(n, 0);
+			break;
+
+		case 'y':
+		case 'k':
+		case CONTROL('K'):
+		case CONTROL('Y'):
+			/*
+			 * Backward N (default 1) line.
+			 */
+			n = cmd_int();
+			if (n <= 0)
+				n = 1;
+			backward(n, 0);
+			break;
+
+		case 'd':
+		case CONTROL('D'):
+			/*
+			 * Forward N lines 
+			 * (default same as last 'd' or 'u' command).
+			 */
+			n = cmd_int();
+			if (n > 0)
+				scroll = n;
+			forward(scroll, 0);
+			break;
+
+		case 'u':
+		case CONTROL('U'):
+			/*
+			 * Forward N lines 
+			 * (default same as last 'd' or 'u' command).
+			 */
+			n = cmd_int();
+			if (n > 0)
+				scroll = n;
+			backward(scroll, 0);
+			break;
+
+		case 'R':
+			/*
+			 * Flush buffers, then repaint screen.
+			 */
+			ch_init(0);
+			/* Fall thru */
+		case 'r':
+		case CONTROL('R'):
+		case CONTROL('L'):
+			/*
+			 * Repaint screen.
+			 */
+			repaint();
+			break;
+
+		case 'g':
+			/*
+			 * Go to line N, default beginning of file.
+			 */
+			n = cmd_int();
+			if (n <= 0)
+				n = 1;
+			cmd_exec();
+			jump_back(n);
+			break;
+
+		case 'p':
+		case '%':
+			/*
+			 * Go to a specified percentage into the file.
+			 */
+			n = cmd_int();
+			if (n < 0)
+				n = 0;
+			if (n > 100)
+				n = 100;
+			cmd_exec();
+			jump_percent(n);
+			break;
+
+		case 'G':
+			/*
+			 * Go to line N, default end of file.
+			 */
+			n = cmd_int();
+			cmd_exec();
+			if (n <= 0)
+				jump_forw();
+			else
+				jump_back(n);
+			break;
+
+		case '=':
+		case CONTROL('G'):
+			/*
+			 * Print file name, etc.
+			 */
+			error(eq_message());
+			break;
+			
+		case 'V':
+			/*
+			 * Print version number, without the "@(#)".
+			 */
+			error(version+4);
+			break;
+
+		case 'q':
+		case 'Q':
+			/*
+			 * Exit.
+			 */
+			return;
+
+		case '/':
+		case '?':
+			/*
+			 * Search for a pattern.
+			 * Accept chars of the pattern until \n.
+			 */
+			n = cmd_int();
+			if (n <= 0)
+				n = 1;
+			mcc = last_mcc = c;
+			start_mcc();
+			c = getcc();
+			goto again;
+
+		case 'n':
+			/*
+			 * Repeat previous search.
+			 */
+			n = cmd_int();
+			if (n <= 0)
+				n = 1;
+			mcc = last_mcc;
+			start_mcc();
+			cmd_exec();
+			search(mcc, (char *)NULL, n);
+			mcc = 0;
+			break;
+
+		case 'h':
+			/*
+			 * Help.
+			 */
+			help();
+			repaint();
+			break;
+
+		case 'E':
+			/*
+			 * Edit a new file.  Get the filename.
+			 */
+			cmd_reset();
+			mcc = 'E';
+			start_mcc();
+#ifdef MSDOS
+			curs_l(1);
+			puts("Edit: ");
+#else
+			puts("dit: ");	/* This looks nicer */
+#endif
+			cmd_col += 5;
+			c = getcc();
+			goto again;
+			
+#if SHELL_ESCAPE
+		case '!':
+			/*
+			 * Shell escape.
+			 */
+			cmd_reset();
+			mcc = '!';
+			start_mcc();
+			c = getcc();
+			goto again;
+#endif
+
+#if EDITOR
+		case 'v':
+			if (ispipe)
+			{
+				error("Cannot edit standard input");
+				break;
+			}
+			sprintf(cmdbuf, "%s %s", editor, current_file);
+			lsystem(cmdbuf);
+			first_cmd = "R";
+			break;
+#endif
+
+		case 'N':
+			/*
+			 * Examine next file.
+			 */
+			n = cmd_int();
+			if (n <= 0)
+				n = 1;
+			next_file(n);
+			break;
+
+		case 'P':
+			/*
+			 * Examine previous file.
+			 */
+			n = cmd_int();
+			if (n <= 0)
+				n = 1;
+			prev_file(n);
+			break;
+
+		case '-':
+			/*
+			 * Toggle a flag setting.
+			 */
+			mcc = '-';
+			start_mcc();
+			c = getcc();
+			mcc = 0;
+			if (c == erase_char || c == kill_char)
+				break;
+			toggle_option(c);
+			break;
+
+		case 'm':
+			/*
+			 * Set a mark.
+			 */
+			lower_left();
+			clear_eol();
+			puts("mark: ");
+			c = getcc();
+			if (c == erase_char || c == kill_char)
+				break;
+			setmark(c);
+			break;
+
+		case '\'':
+			/*
+			 * Go to a mark.
+			 */
+			lower_left();
+			clear_eol();
+			puts("goto mark: ");
+			c = getcc();
+			if (c == erase_char || c == kill_char)
+				break;
+			gomark(c);
+			break;
+
+		default:
+			bell();
+			break;
+		}
+	}
+}
+
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'help.c'
+then
+	echo shar: will not over-write existing file "'help.c'"
+else
+cat << \SHAR_EOF > 'help.c'
+#include  "less.h"
+
+/*
+ * Display some help.
+ * Help is in two pages.
+ */
+	static void
+help0()
+{
+	puts("f, SPACE       Forward one screen.\n");
+	puts("b              Backward one screen.\n");
+	puts("e, j, CR    *  Forward N lines, default 1.\n");
+	puts("y, k        *  Backward N lines, default 1.\n");
+	puts("d           *  Forward N lines, default 10 or last N to d or u command.\n");
+	puts("u           *  Backward N lines, default 10 or last N to d or u command.\n");
+	puts("r              Repaint screen.\n");
+	puts("g           *  Go to line N, default 1.\n");
+	puts("G           *  Like g, but default is last line in file.\n");
+	puts("=              Print current file name\n");
+	puts("/pattern    *  Search forward for N-th occurence of pattern.\n");
+	puts("?pattern    *  Search backward for N-th occurence of pattern.\n");
+	puts("n           *  Repeat previous search (for N-th occurence).\n");
+	puts("q              Exit.\n");
+	error("More help...");
+}
+
+	static void
+help1()
+{
+	char message[100];
+	extern char all_options[];
+
+	puts("R              Repaint screen, discarding buffered input.\n");
+	puts("p, %        *  Position to N percent into the file.\n");
+	puts("m<letter>      Mark the current position with <letter>.\n");
+	puts("'<letter>      Return to a previously marked position.\n");
+	sprintf(message, 
+	     "-X             Toggle a flag (X may be one of \"%s\").\n", 
+				all_options);
+	puts(message);
+	puts("E [file]       Examine a new file.\n");
+	puts("N              Examine the next file (from the command line).\n");
+	puts("P              Examine the previous file (from the command line).\n");
+	puts("V              Print version number.\n");
+#if SHELL_ESCAPE
+	puts("!command       Passes the command to a shell to be executed.\n");
+#endif
+#if EDITOR
+	sprintf(message,
+	     "v              Edit the current file with $EDITOR (default %s).\n",
+				EDIT_PGM);
+	puts(message);
+#endif
+	error("");
+}
+
+	public void
+help()
+{
+	register int i;
+
+	for (i = 0;  i < 2;  i++)
+	{
+		clear();
+		puts("Commands marked with * may be preceeded by a number, N.\n\n");
+
+		switch (i)
+		{
+		case 0:		help0();	break;
+		case 1:		help1();	break;
+		}
+	}
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'input.c'
+then
+	echo shar: will not over-write existing file "'input.c'"
+else
+cat << \SHAR_EOF > 'input.c'
+/*
+ * High level routines dealing with getting lines of input 
+ * from the file being viewed.
+ *
+ * When we speak of "lines" here, we mean PRINTABLE lines;
+ * lines processed with respect to the screen width.
+ * We use the term "raw line" to refer to lines simply
+ * delimited by newlines; not processed with respect to screen width.
+ */
+
+#include "less.h"
+
+extern int do_bs;
+extern int squeeze;
+extern char *line;
+
+/*
+ * Get the next line.
+ * A "current" position is passed and a "new" position is returned.
+ * The current position is the position of the first character of
+ * a line.  The new position is the position of the first character
+ * of the NEXT line.  The line obtained is the line starting at curr_pos.
+ */
+	public POSITION
+forw_line(curr_pos)
+	POSITION curr_pos;
+{
+	POSITION new_pos;
+	register int c;
+
+	if (curr_pos == NULL_POSITION || ch_seek(curr_pos))
+		return (NULL_POSITION);
+
+	c = ch_forw_get();
+	if (c == EOF)
+		return (NULL_POSITION);
+
+	prewind();
+	for (;;)
+	{
+		if (c == '\n' || c == EOF)
+		{
+			/*
+			 * End of the line.
+			 */
+			new_pos = ch_tell();
+			break;
+		}
+
+		/*
+		 * Append the char to the line and get the next char.
+		 */
+		if (pappend(c))
+		{
+			/*
+			 * The char won't fit in the line; the line
+			 * is too long to print in the screen width.
+			 * End the line here.
+			 */
+			new_pos = ch_tell() - 1;
+			break;
+		}
+		c = ch_forw_get();
+	}
+	(void) pappend('\0');
+
+	if (squeeze && *line == '\0')
+	{
+		/*
+		 * This line is blank.
+		 * Skip down to the last contiguous blank line
+		 * and pretend it is the one which we are returning.
+		 */
+		while ((c = ch_forw_get()) == '\n')
+			;
+		if (c != EOF)
+			(void) ch_back_get();
+		new_pos = ch_tell();
+	}
+
+	return (new_pos);
+}
+
+/*
+ * Get the previous line.
+ * A "current" position is passed and a "new" position is returned.
+ * The current position is the position of the first character of
+ * a line.  The new position is the position of the first character
+ * of the PREVIOUS line.  The line obtained is the one starting at new_pos.
+ */
+	public POSITION
+back_line(curr_pos)
+	POSITION curr_pos;
+{
+	POSITION new_pos, begin_new_pos;
+	int c;
+
+	if (curr_pos == NULL_POSITION || curr_pos <= (POSITION)0 ||
+		ch_seek(curr_pos-1))
+		return (NULL_POSITION);
+
+	if (squeeze)
+	{
+		/*
+		 * Find out if the "current" line was blank.
+		 */
+		(void) ch_forw_get();	/* Skip the newline */
+		c = ch_forw_get();	/* First char of "current" line */
+		(void) ch_back_get();	/* Restore our position */
+		(void) ch_back_get();
+
+		if (c == '\n')
+		{
+			/*
+			 * The "current" line was blank.
+			 * Skip over any preceeding blank lines,
+			 * since we skipped them in forw_line().
+			 */
+			while ((c = ch_back_get()) == '\n')
+				;
+			if (c == EOF)
+				return (NULL_POSITION);
+			(void) ch_forw_get();
+		}
+	}
+
+	/*
+	 * Scan backwards until we hit the beginning of the line.
+	 */
+	for (;;)
+	{
+		c = ch_back_get();
+		if (c == '\n')
+		{
+			/*
+			 * This is the newline ending the previous line.
+			 * We have hit the beginning of the line.
+			 */
+			new_pos = ch_tell() + 1;
+			break;
+		}
+		if (c == EOF)
+		{
+			/*
+			 * We have hit the beginning of the file.
+			 * This must be the first line in the file.
+			 * This must, of course, be the beginning of the line.
+			 */
+			new_pos = (POSITION)0;
+			break;
+		}
+	}
+
+	/*
+	 * Now scan forwards from the beginning of this line.
+	 * We keep discarding "printable lines" (based on screen width)
+	 * until we reach the curr_pos.
+	 *
+	 * {{ This algorithm is pretty inefficient if the lines
+	 *    are much longer than the screen width, 
+	 *    but I don't know of any better way. }}
+	 */
+	if (ch_seek(new_pos))
+		return (NULL_POSITION);
+    loop:
+	begin_new_pos = new_pos;
+	prewind();
+
+	do
+	{
+		c = ch_forw_get();
+		new_pos++;
+		if (c == '\n')
+			break;
+		if (pappend(c))
+		{
+			/*
+			 * Got a full printable line, but we haven't
+			 * reached our curr_pos yet.  Discard the line
+			 * and start a new one.
+			 */
+			(void) pappend('\0');
+			(void) ch_back_get();
+			new_pos--;
+			goto loop;
+		}
+	} while (new_pos < curr_pos);
+
+	(void) pappend('\0');
+
+	return (begin_new_pos);
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'main.c'
+then
+	echo shar: will not over-write existing file "'main.c'"
+else
+cat << \SHAR_EOF > 'main.c'
+/*
+ * Entry point, initialization, miscellaneous routines.
+ */
+
+#include "less.h"
+#include "position.h"
+#include <setjmp.h>
+#ifdef MSDOS
+#ifdef MSC
+#include <fcntl.h>	/* needed to open file in untranslated mode */
+#endif
+#endif
+
+public int	ispipe;
+public jmp_buf	main_loop;
+public char *	first_cmd;
+public char *	every_first_cmd;
+public int	new_file;
+public int	is_tty;
+public char 	current_file[128];
+public int ac;
+public char **av;
+public int curr_ac;
+#if EDITOR
+public char *	editor;
+#endif
+
+extern int file;
+extern int nbufs;
+extern int sigs;
+extern int quit_at_eof;
+extern int p_nbufs, f_nbufs;
+extern int back_scroll;
+extern int top_scroll;
+extern int sc_height;
+
+
+/*
+ * Edit a new file.
+ * Filename "-" means standard input.
+ * No filename means the "current" file, from the command line.
+ */
+	public void
+edit(filename)
+	char *filename;
+{
+	register int f;
+	char message[100];
+	static int any_edited = 0;
+	static int hold_scroll = 0;
+
+	if (filename == NULL || *filename == '\0')
+	{
+		if (curr_ac >= ac)
+		{
+			error("No current file");
+			return;
+		}
+		filename = av[curr_ac];
+	}
+	if (strcmp(filename, "-") == 0)
+		f = 0;	/* Standard input */
+#ifdef MSDOS
+#ifdef MSC
+	else if ((f = open(filename, O_BINARY)) < 0)
+		/* untranslated mode */
+		/* needed for MSDOS so that cr-lf translations do not */
+		/* cause problems in the position calculations */
+#else
+	else if ((f = open(filename, 0)) < 0)
+#endif
+#endif
+	{
+		sprintf(message, "Cannot open %.*s", 
+			error_width()-13, filename);
+		if (any_edited)
+			error(message);
+		else
+		{
+			puts(message);
+			hold_scroll = 1;
+#ifdef MSDOS
+			exit(0);
+#endif
+		}
+		return;
+	}
+	if (isatty(f))
+	{
+		/*
+		 * Not really necessary to call this an error,
+		 * but if the control terminal (for commands)
+		 * and the input file (for data) are the same,
+		 * we get weird results at best.
+		 */
+		error("Can't take input from a terminal");
+		if (f > 0)
+			close(f);
+		return;
+	}
+
+	/*
+	 * Close the current input file and set up to use the new one.
+	 */
+	if (file > 0)
+		close(file);
+	new_file = 1;
+	strcpy(current_file, filename);
+	ispipe = (f == 0);
+	file = f;
+	ch_init( (ispipe) ? p_nbufs : f_nbufs );
+	init_mark();
+	if (every_first_cmd != NULL)
+		first_cmd = every_first_cmd;
+	if (is_tty)
+	{
+		any_edited = 1;
+		if (hold_scroll)
+		{
+			/*
+			 * Before erasing the screen contents,
+			 * display the file name and ask for a keystroke.
+			 */
+			error(filename);
+			hold_scroll = 0;
+		}
+		if (first_cmd == NULL || *first_cmd == '\0')
+		{
+			/* 
+			 * Display the first screen. 
+			 */
+			jump_back(1);
+		} else
+		{
+			/* 
+			 * The first_cmd will hopefully redisplay the
+			 * screen, so we need not display anything yet.
+			 * Indicate there is nothing yet on the screen. 
+			 */
+			pos_clear();
+		}
+	}
+}
+
+/*
+ * Edit the next file in the command line list.
+ */
+	public void
+next_file(n)
+	int n;
+{
+	if (curr_ac + n >= ac)
+	{
+		if (quit_at_eof)
+			quit();
+		error("No (N-th) next file");
+	} else
+		edit(av[curr_ac += n]);
+}
+
+/*
+ * Edit the previous file in the command line list.
+ */
+	public void
+prev_file(n)
+	int n;
+{
+	if (curr_ac - n < 0)
+		error("No (N-th) previous file");
+	else
+		edit(av[curr_ac -= n]);
+}
+
+/*
+ * Copy a file directly to standard output.
+ * Used if standard output is not a tty.
+ */
+	static void
+cat_file()
+{
+	register int c;
+
+	while ((c = ch_forw_get()) != EOF)
+		putc(c);
+	flush();
+}
+
+/*
+ * Entry point.
+ */
+main(argc, argv)
+	int argc;
+	char *argv[];
+{
+	char *getenv();
+
+
+	/*
+	 * Process command line arguments and LESS environment arguments.
+	 * Command line arguments override environment arguments.
+	 */
+	init_option();
+	scan_option(getenv("LESS"));
+	argv++;
+	while ( (--argc > 0) && 
+		(argv[0][0] == '-' || argv[0][0] == '+') && 
+		argv[0][1] != '\0')
+		scan_option(*argv++);
+
+#if EDITOR
+	editor = getenv("EDITOR");
+	if (editor == NULL || *editor == '\0')
+		editor = EDIT_PGM;
+#endif
+
+	/*
+	 * Set up list of files to be examined.
+	 */
+	ac = argc;
+	av = argv;
+	curr_ac = 0;
+
+	/*
+	 * Set up terminal, etc.
+	 */
+	is_tty = isatty(1);
+	if (!is_tty)
+	{
+		/*
+		 * Output is not a tty.
+		 * Just copy the input file(s) to output.
+		 */
+		if (ac < 1)
+		{
+			edit("-");
+			cat_file();
+		} else
+		{
+			do
+			{
+				edit((char *)NULL);
+				if (file >= 0)
+					cat_file();
+			} while (++curr_ac < ac);
+		}
+		exit(0);
+	}
+
+	raw_mode(1);
+	get_term();
+	open_getc();
+	init();
+
+	if (back_scroll < 0)
+	{
+		/* {{ KLUDGE }} */
+		back_scroll = sc_height-1;
+		if (top_scroll)
+			back_scroll--;
+	}
+
+	if (setjmp(main_loop))
+		quit();
+	init_signals();
+
+	/*
+	 * Select the first file to examine.
+	 */
+	if (ac < 1)
+		edit("-");	/* Standard input */
+	else 
+	{
+		/*
+		 * Try all the files named as command arguments.
+		 * We are simply looking for one which can be
+		 * opened without error.
+		 */
+		do
+		{
+			edit((char *)NULL);
+			if (file >= 0)
+				/* We can open this file. */
+				break;
+			putc('\n');  flush();
+		} while (++curr_ac < ac);
+	}
+
+	if (file >= 0)
+		commands();
+	quit();
+}
+
+/*
+ * Exit the program.
+ */
+	public void
+quit()
+{
+	/*
+	 * Put cursor at bottom left corner, clear the line,
+	 * reset the terminal modes, and exit.
+	 */
+	lower_left();
+	clear_eol();
+	deinit();
+	flush();
+	raw_mode(0);
+	exit(0);
+}
+
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'dos_port.h'
+then
+	echo shar: will not over-write existing file "'dos_port.h'"
+else
+cat << \SHAR_EOF > 'dos_port.h'
+/* this file is necessary to handle all the defines for building the program
+   using Microsoft C. The compiler will not accept them all on the command
+   line when they are included in the makefile.
+ */
+#ifdef DOSPORT
+#define MSDOS		1
+#define MSC		1	/* only if using Microsoft C compiler */
+#define REGEXP		1
+#define EDITOR		1
+#define EDIT_PGM	"memacs"
+#define SHELL_ESCAPE	1
+#endif
+    
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'funcs.h'
+then
+	echo shar: will not over-write existing file "'funcs.h'"
+else
+cat << \SHAR_EOF > 'funcs.h'
+	public void edit ();
+	public void next_file ();
+	public void prev_file ();
+	public void quit ();
+	public void init_option ();
+	public void toggle_option ();
+	public void scan_option ();
+	public void forward ();
+	public void backward ();
+	public void repaint ();
+	public void jump_forw ();
+	public void jump_back ();
+	public void jump_percent ();
+	public void jump_loc ();
+	public void init_mark ();
+	public void setmark ();
+	public void gomark ();
+	public void search ();
+	public int ch_seek ();
+	public int ch_end_seek ();
+	public POSITION ch_length ();
+	public POSITION ch_tell ();
+	public int ch_forw_get ();
+	public int ch_back_get ();
+	public void ch_init ();
+	public POSITION position ();
+	public void add_forw_pos ();
+	public void add_back_pos ();
+	public void pos_clear ();
+	public int onscreen ();
+	public POSITION forw_line ();
+	public POSITION back_line ();
+	public void put_line ();
+	public int control_char ();
+	public int carat_char ();
+	public void flush ();
+	public void dropout ();
+	public void putc ();
+	public void puts ();
+	public void error ();
+	public int error_width ();
+	public void raw_mode ();
+	public void get_term ();
+	public void init ();
+	public void deinit ();
+	public void home ();
+	public void add_line ();
+	public void lower_left ();
+	public void bell ();
+	public void vbell ();
+	public void clear ();
+	public void clear_eol ();
+	public void so_enter ();
+	public void so_exit ();
+	public void ul_enter ();
+	public void ul_exit ();
+	public void backspace ();
+	public void putbs ();
+	public char * eq_message ();
+	public char * pr_string ();
+	public void prewind ();
+	public int pappend ();
+	public POSITION forw_raw_line ();
+	public POSITION back_raw_line ();
+	public void init_signals ();
+	public void  psignals ();
+	public void lsystem ();
+	public void help ();
+	public void open_getc ();
+	public int getc ();
+	public void commands ();
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'less.h'
+then
+	echo shar: will not over-write existing file "'less.h'"
+else
+cat << \SHAR_EOF > 'less.h'
+/*
+ * Standard include file for "less".
+ */
+
+/*
+ * To get the required defs when porting less to msdos
+ */
+#ifdef DOSPORT
+#include "dos_port.h"
+#endif
+ 
+/*
+ * Language details.
+ */
+#if !VOID
+#define	void  int
+#endif
+#define	public		/* PUBLIC FUNCTION */
+
+/*
+ * Special types and constants.
+ */
+typedef long		POSITION;
+/*
+ * {{ Warning: if POSITION is changed to other than "long",
+ *    you may have to change some of the printfs which use "%ld"
+ *    to print a variable of type POSITION. }}
+ */
+
+#define	END_POSITION	((POSITION)(-2))
+#define	NULL_POSITION	((POSITION)(-1))
+
+#define	EOF		(0)
+#define	NULL		(0)
+
+/* How quiet should we be? */
+#define	NOT_QUIET	0	/* Ring bell at eof and for errors */
+#define	LITTLE_QUIET	1	/* Ring bell only for errors */
+#define	VERY_QUIET	2	/* Never ring bell */
+
+/* How should we prompt? */
+#define	PR_SHORT	0	/* Prompt with colon */
+#define	PR_MEDIUM	1	/* Prompt with message */
+#define	PR_LONG		2	/* Prompt with longer message */
+
+/* How should we handle backspaces? */
+#define	BS_UNDERLINE	0	/* Underlining converted to underline mode */
+#define	BS_NORMAL	1	/* \b treated as normal char; actually output */
+#define	BS_CONTROL	2	/* \b treated as control char; prints as ^H */
+
+/* Flag to eq_message() telling what to put in the message */
+#define	MNAME		001	/* File name */
+#define	MOF		002	/* "file x of y" */
+#define	MBYTE		004	/* "byte x/y" */
+#define	MPCT		010	/* Percentage into the file */
+
+/* Special chars used to tell put_line() to do something special */
+#define	UL_CHAR		'\201'	/* Enter underline mode */
+#define	UE_CHAR		'\202'	/* Exit underline mode */
+
+#define	CONTROL(c)		((c)&037)
+#define	SIGNAL(sig,func)	signal(sig,func)
+
+/* Must locate the typedef of off_t in the Microsoft package. If using
+ * a different compiler --- typedef long off_t  ---.
+ */
+
+#ifdef MSDOS
+#ifdef MSC				/* Microsoft's types.h is needed */
+#include <sys/types.h>
+#endif
+#endif
+
+off_t lseek();
+
+#include "funcs.h"
+
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'position.h'
+then
+	echo shar: will not over-write existing file "'position.h'"
+else
+cat << \SHAR_EOF > 'position.h'
+/*
+ * Include file for interfacing to position.c modules.
+ */
+#define	TOP		0
+#define	TOP_PLUS_ONE	1
+#define	BOTTOM		-1
+#define	BOTTOM_PLUS_ONE	-2
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'regexp.h'
+then
+	echo shar: will not over-write existing file "'regexp.h'"
+else
+cat << \SHAR_EOF > 'regexp.h'
+/*
+ * Definitions etc. for regexp(3) routines.
+ *
+ * Caveat:  this is V8 regexp(3) [actually, a reimplementation thereof],
+ * not the System V one.
+ */
+#define NSUBEXP  10
+typedef struct regexp {
+	char *startp[NSUBEXP];
+	char *endp[NSUBEXP];
+	char regstart;		/* Internal use only. */
+	char reganch;		/* Internal use only. */
+	char *regmust;		/* Internal use only. */
+	int regmlen;		/* Internal use only. */
+	char program[1];	/* Unwarranted chumminess with compiler. */
+} regexp;
+
+extern regexp *regcomp();
+extern int regexec();
+extern void regsub();
+extern void regerror();
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'regmagic.h'
+then
+	echo shar: will not over-write existing file "'regmagic.h'"
+else
+cat << \SHAR_EOF > 'regmagic.h'
+/*
+ * The first byte of the regexp internal "program" is actually this magic
+ * number; the start node begins in the second byte.
+ */
+#define	MAGIC	0234
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'scrn.h'
+then
+	echo shar: will not over-write existing file "'scrn.h'"
+else
+cat << \SHAR_EOF > 'scrn.h'
+#define WHITE_ON_RED	0x47
+#define WHITE_ON_BLUE	0x17
+#define BW		0x07
+#define REV_VID		0x70
+
+
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'files'
+then
+	echo shar: will not over-write existing file "'files'"
+else
+cat << \SHAR_EOF > 'files'
+\lib\ssetargv+
+main+
+ch+
+command+
+help+
+input+
+line+
+option+
+output+
+position+
+prim+
+prompt+
+signal+
+ttyin+
+version+
+regexp+
+regerror+
+scrn
+less/STACK:4096;
+
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'makefile'
+then
+	echo shar: will not over-write existing file "'makefile'"
+else
+cat << \SHAR_EOF > 'makefile'
+# Makefile for less taken from usenet and modified for msdos.
+# For use with microsoft c. (4.0 used but 3.0 will work just fine)
+# This makefile has been kept simple so that just about any make will do.
+# I use the make posted by Neil Russell. If you want a port of it to MSDOS
+#  contact me. Address given in readme. It is virtually Unix compatable.
+OBJS1 = main.obj ch.obj command.obj help.obj input.obj line.obj option.obj
+OBJS2 = option.obj output.obj position.obj prim.obj prompt.obj
+OBJS3 = signal.obj ttyin.obj version.obj
+OBJS4 = regexp.obj regerror.obj scrn.obj
+less.exe : $(OBJS1) $(OBJS2) $(OBJS3) $(OBJS4)
+	link @files
+main.obj : main.c less.h position.h
+	msc -DDOSPORT main;
+option.obj : option.c less.h
+	msc -DDOSPORT option;
+prim.obj : prim.c less.h position.h
+	msc -DDOSPORT prim;
+ch.obj : ch.c less.h
+	msc -DDOSPORT ch;
+position.obj : position.c less.h position.h
+	msc -DDOSPORT position;
+input.obj : input.c less.h
+	msc -DDOSPORT input;
+output.obj : output.c less.h scrn.h
+	msc -DDOSPORT output;
+prompt.obj : prompt.c less.h position.h
+	msc -DDOSPORT prompt;
+line.obj : line.c less.h
+	msc -DDOSPORT line;
+signal.obj : signal.c less.h
+	msc -DDOSPORT signal;
+help.obj : help.c less.h
+	msc -DDOSPORT help;
+ttyin.obj : ttyin.c less.h
+	msc -DDOSPORT ttyin;
+command.obj : command.c less.h position.h
+	msc -DDOSPORT command;
+version.obj : version.c
+	msc -DDOSPORT version;
+regexp.obj : regexp.c regexp.h regmagic.h
+	msc regexp;
+regerror.obj : regerror.c
+	msc -DDOSPORT regerror;
+scrn.obj : scrn.c
+	msc scrn;
+
+SHAR_EOF
+fi # end of overwriting check
+#	End of shell archive
+exit 0
+
+

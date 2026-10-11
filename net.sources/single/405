@@ -1,0 +1,775 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,4a2b8da60630471c,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-07-03 19:33:37 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site umcp-cs.UUCP
+Path: utzoo!linus!philabs!seismo!rlgvax!cvl!umcp-cs!chris
+From: chris@umcp-cs.UUCP
+Newsgroups: net.sources
+Subject: Window source #7 [of 0-7]: TrmTERM.c
+Message-ID: <433@umcp-cs.UUCP>
+Date: Sun, 3-Jul-83 22:33:37 EDT
+Article-I.D.: umcp-cs.433
+Posted: Sun Jul  3 22:33:37 1983
+Date-Received: Mon, 4-Jul-83 16:32:41 EDT
+Organization: Univ. of Maryland, Computer Science Dept.
+Lines: 755
+
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'This thing needs to be rewritten, but it works.'
+/bin/echo 'Extracting TrmTERM.c'
+sed 's/^X//' <<'//go.sysin dd *' >TrmTERM.c
+X/* Copyright (c) 1983 University of Maryland Computer Science Department */
+X/* terminal control module for terminals described by TERMCAP */
+X
+X/* This thing needs a complete rewrite but I'm not ready for that yet.
+X   30 Jun 1983 ACT */
+X
+X/*	Origincal code copyright (c) 1981,1980 James Gosling	*/
+X
+X/*	Modified 1-Dec-80 by Dan Hoey (DJH) to understand C100 underlines
+X *	Modified 2-Dec-80 (DJH) to turn off highlighting on insertline
+X *	Modified 4 Aug 81 by JQ Johnson:  use "dm","ei","pc","mi"
+X *	Modified 24-Aug-81 by Jeff Mogul (JCM) at Stanford
+X *		- uses "nl" instead of \n in case \n is destructive
+X *	Modified 8-Sept-81 by JCM @ Stanford
+X *		- re-integrated changes from Gosling since July '81
+X *	Modified by Chris Torek (ACT) @ Umcp-Cs
+X *		- can hack terminals without erase-to-eol (12-Aug-81)
+X *		- Sets NullsAreSpecial if :in: (12-June-82)
+X *		- Uses "cr" instead of \r (13-June-82)
+X *		- Rewrote cursor positioning routines, added:
+X *			"ms", "ho", "xr", "nc", "xt", "ta", "xn", "ll" (etc)
+X *		- Also cleaned up various things that were cleanable
+X *		- Rewrote all the cursor positioning stuff around 21-June-82
+X *		- Handles :db: (11-Jul-82)
+X *		- Secured the cost algorithms from buffer overflow (16-Jul-82)
+X *		- Does not use standout if 'sg#' is nonzero.
+X *	Modified by Chris Torek (ACT): added %m cursor motion code
+X */
+X
+X/*
+X *	Notes on things not normally in TERMCAP:
+X *	:rn: indicates that \r acts like \r\n
+X *	:nn: indicates that \n doesn't work
+X *	:ds=: gives a "don't send" string; these characters will not
+X *	be written to the terminal for cursor motion (:cm=:).  If this
+X *	is nonempty the terminal MUST have an upline and a backspace.
+X *	If defined, it is assumed to also have a null in it.  If not
+X *	included in a termcap, it defaults to ^D\t\n\r.  To get
+X *	real binary use ":ds=:" to say can send anything.
+X *	:bo=: is bold-start string
+X *	:be=: is bold-end string
+X *	:ws=: is wink-start (ie blink) string
+X *	:we=: is wink-end string
+X */
+X
+X#include <stdio.h>
+X#include <sgtty.h>
+X#include "Trm.h"
+X#include "win.h"
+X
+X/* ACT: This has gotta be at least 800 for some terminals (!!) */
+X#define	CMBUFSIZ	1000	/* Cursor motion buffer size */
+X
+Xstatic
+Xint	curX, curY;
+X
+Xchar *tgetstr (), *getenv ();
+Xchar *UP, *BC, PC;
+Xshort ospeed;
+X
+Xstatic char *ILstr, *DLstr, *ICstr, *DCstr, *ELstr, *ESstr, *HLBstr,
+X	*HLEstr, *ICPstr, *ICPDstr, *CursStr, *CteoDstr,
+X	*TIstr, *TEstr, *VSstr, *VEstr, *HOstr, *TBstr, *LLstr,
+X	*ICEstr, *NDstr, *VBstr, *EDstr, *DMstr, *NLstr, *CRstr,
+X	*DSstr, *WSstr, *WEstr, *ULstr, *UEstr, *BSstr, *BEstr;
+Xstatic int ULflag,	/* DJH -- 1 if terminal has underline */
+X	   MIflag,	/* JQJ -- 1 if safe to move while in insert mode */
+X	   XRflag,	/* ACT -- if (:xr:nc:) CR's don't work correctly */
+X	   XTflag,	/* 1 if can't use tabs for cursor motion */
+X	   XNflag,	/* 1 if can't use \n's for cursor motion */
+X	   HZflag,	/* 1 if hazeltine, can't print tilde */
+X	   RNflag,	/* 1 if \r does a \r\n */
+X	   DBflag,	/* 1 if display retained below */
+X	   MSflag;	/* 1 if safe to move while in standout */
+X
+Xstatic	BOLDOFF, BLINKOFF, ULINEOFF, HLOFF;  /* Bits that tell what
+X						modes arent independent */
+X
+Xstatic
+Xdumpchar (c) register c; {
+X    putchar (c);
+X}
+X
+Xstatic
+Xenum IDmode { m_insert = 1, m_overwrite = 0 }
+X	CurMode, DesMode;
+X
+Xstatic
+XINSmode (new)
+Xregister enum IDmode new; {
+X	DesMode = new;
+X};
+X
+Xstatic curmodes, desmodes;
+Xstatic
+Xmodes (on) {
+X    desmodes = on;
+X}
+X
+X/* This routine needs work! */
+Xstatic
+Xsetmodes () {
+X    register char *com;
+X    int bold, under, blink, hl;
+X    if (curmodes == desmodes)
+X	return;
+X/* The "end" strings are often the same. All this is to get around that. */
+X    bold = desmodes & WBOLD;
+X    under = desmodes & WULINE;
+X    blink = desmodes & WBLINK;
+X    hl = desmodes & WINVERSE;
+X    if (bold==0 && (curmodes & WBOLD)) {/* Then turn off bold */
+X	if (com = BEstr) tputs (com, 0, dumpchar);
+X	curmodes &= ~BOLDOFF;	/* May have turned others off too */
+X    }
+X    if (under==0 && (curmodes & WULINE)) {/* etc */
+X	if (com = UEstr) tputs (com, 0, dumpchar);
+X	curmodes &= ~ULINEOFF;
+X    }
+X    if (blink==0 && (curmodes & WBLINK)) {
+X	if (com = WEstr) tputs (com, 0, dumpchar);
+X	curmodes &= ~BLINKOFF;
+X    }
+X    if (hl==0 && (curmodes & WINVERSE)) {
+X	if (com = HLEstr) tputs (com, 0, dumpchar);
+X	curmodes &= ~HLOFF;
+X    }
+X    if (bold != 0 && (curmodes & WBOLD) == 0 && (com = BSstr))
+X	tputs (com, 0, dumpchar);
+X    if (under != 0 && (curmodes & WULINE) == 0 && (com = ULstr))
+X	tputs (com, 0, dumpchar);
+X    if (blink != 0 && (curmodes & WBLINK) == 0 && (com = WSstr))
+X	tputs (com, 0, dumpchar);
+X    if (hl != 0 && (curmodes & WINVERSE) == 0 && (com = HLBstr))
+X	tputs (com, 0, dumpchar);
+X    curmodes = desmodes;
+X}
+X
+Xstatic
+Xclearmodes () {
+X    if (curmodes) {
+X	register oldes = desmodes;
+X	desmodes = 0;
+X	setmodes ();
+X	desmodes = oldes;
+X    }
+X}
+X
+Xstatic
+Xsetmode () {
+X    if (DesMode == CurMode)
+X	return;
+X    tputs (DesMode==m_insert ? ICstr : ICEstr, 0, dumpchar);
+X    CurMode = DesMode;
+X};
+X
+Xstatic
+Xinslines (n) {
+X    clearmodes ();
+X    while (--n >= 0)
+X	tputs (ILstr, W_tt.t_length-curY, dumpchar);
+X};
+X
+Xstatic
+Xdellines (n) {
+X    register save = n;
+X    while (--n >= 0)
+X	tputs(DLstr, W_tt.t_length-curY, dumpchar);
+X    if (DBflag) {	/* Must clear new lines */
+X	if (CteoDstr) {
+X	    topos (W_tt.t_length - save + 1, 1);
+X	    tputs (CteoDstr, W_tt.t_length-curY, dumpchar);
+X	}
+X	else {
+X	    register i;
+X	    for (i=W_tt.t_length-save+1;i<=W_tt.t_length;++i) {
+X		topos (i, 1);
+X		wipeline (0, W_tt.t_width);
+X	    }
+X	}
+X    }
+X};
+X
+Xstatic
+Xwritechars (start, end)
+Xregister char	*start,
+X		*end; {
+X    setmode ();
+X    setmodes();
+X    while (start <= end) {
+X	if(CurMode == m_insert && ICPstr)
+X	    tputs(ICPstr, W_tt.t_width-curX, dumpchar);
+X			/* DJH -- blank out space before underlines */
+X	if(*start == '_' && CurMode != m_insert && ULflag) {
+X		putchar (' ');
+X		putchar (*BC);
+X	}
+X	if (HZflag && *start == '~') putchar ('`'), ++start;
+X	else putchar (*start++);
+X	if (CurMode == m_insert && ICPDstr)
+X	    tputs(ICPDstr, W_tt.t_width-curX, dumpchar);
+X	curX++;
+X    }
+X};
+X
+Xstatic
+Xblanks (n) {
+X    setmode ();
+X    setmodes ();
+X    while (--n >= 0) {
+X	if (CurMode == m_insert && ICPstr)
+X	    tputs (ICPstr, W_tt.t_width - curX, dumpchar);
+X	putchar (' ');
+X	if (CurMode == m_insert && ICPDstr)
+X	    tputs (ICPDstr, W_tt.t_width - curX, dumpchar);
+X	curX++;
+X    }
+X};
+X
+X/* ACT 8-Sep-1982 Commented all the pad stuff out, termlib already takes care
+X   of it. */
+X
+Xstatic float BaudFactor;
+X
+X/*
+Xstatic pad(n,f)
+Xfloat   f; {
+X    register    k = n * f * BaudFactor;
+X    while (--k >= 0)
+X	putchar (W_tt.t_padc);
+X};
+X*/
+X
+Xstatic char *CM, *bufp, save[CMBUFSIZ], *bufbase;
+Xstatic CMcost, FixCM;
+X
+X#define	SETSTUFF(buf)	bufp=bufbase=buf
+X#define SETBASE(buf)	bufbase=buf
+X
+Xstuffchar (c)
+Xregister char c;
+X{
+X    if (bufp - bufbase < CMBUFSIZ)
+X	*bufp++ = c;
+X}
+X
+X/*
+X * Compute cost for going from (sy, sx) to (dy, dx) with extra (add)
+X * and if less than current least-cost, change current least-cost.
+X * Algorithm is:
+X * 1.	If we can use tabs, then try that; get as close as possible
+X *	without going too far.  Then try using cursor right from there,
+X *	and cursor left from one tab stop later.  Be careful not to go
+X *	past the end of the line.
+X * 2.	Try using cursor right and cursor left.
+X * 3.	Use the least length version of 1 & 2
+X * 4.	Add in up/down motion(s)
+X */
+X
+Xstatic
+Xtestcost (sy, sx, dy, dx, add)
+Xregister sy, sx, dy, dx;
+Xchar *add;
+X{
+X    static char tbuf1[CMBUFSIZ], mbuf[CMBUFSIZ];
+X				/* Buffers for cursor motion stuff */
+X    int tabcost, movecost, tmp, tmp2, tmp3;
+X
+X    if (sx == dx && sy == dy) {
+X	movecost = 0;
+X	goto done;
+X    }
+X    if (dy > sy && !NLstr || dy < sy && !UP)	/* Can't get there from here */
+X	return;
+X    if (!XTflag && sx < dx) {	/* Try tabs */
+X	tmp = sx;
+X	SETSTUFF (tbuf1);
+X	while ((tmp2 = ((tmp - 1) & ~7) + 9) <= dx)
+X	    tputs (TBstr, 0, stuffchar), tmp = tmp2;
+X	if (NDstr) {
+X	    bcopy (tbuf1, mbuf, movecost = bufp - tbuf1);
+X	    tmp3 = tmp;
+X	}
+X	if (tmp < dx) tputs (TBstr, 0, stuffchar), tmp = tmp2;
+X	if (tmp > dx && !BC || tmp > W_tt.t_length)
+X	    tabcost = 9999;
+X	else {
+X	    while (tmp-- > dx) tputs (BC, 0, stuffchar);
+X	    tabcost = bufp - tbuf1;
+X	}
+X	if (NDstr) {
+X	    bufp = mbuf + movecost;
+X	    SETBASE (mbuf);
+X	    tmp = tmp3;
+X	    while (tmp++ < dx) tputs (NDstr, 0, stuffchar);
+X	    movecost = bufp - mbuf;
+X	    if (movecost < tabcost) {
+X		bcopy (mbuf, tbuf1, tabcost = movecost);
+X	    }
+X	}
+X    }
+X    else tabcost = 9999;
+X    if (sx < dx) {
+X	if (NDstr) {
+X	    SETSTUFF (mbuf);
+X	    while (sx++ < dx) tputs (NDstr, 0, stuffchar);
+X	    movecost = bufp - mbuf;
+X	}
+X	else movecost = 9999;
+X    }
+X    else {
+X	if (BC) {
+X	    SETSTUFF (mbuf);
+X	    while (sx-- > dx) tputs (BC, 0, stuffchar);
+X	    movecost = bufp - mbuf;
+X	}
+X	else movecost = 9999;
+X    }
+X    if (movecost == 9999 && tabcost == 9999) return;
+X    if (tabcost < movecost) bcopy (tbuf1, mbuf, movecost = tabcost);
+X    bufp = mbuf + movecost;
+X    SETBASE (mbuf);
+X    if (sy < dy) while (sy++ < dy) tputs (NLstr, 0, stuffchar);
+X    else while (sy-- > dy) tputs (UP, 0, stuffchar);
+X    movecost = bufp - mbuf;
+Xdone:
+X    SETSTUFF (tbuf1);
+X    tputs (add, 0, stuffchar);
+X    tabcost = bufp - tbuf1;	/* I know, it's the wrong variable name */
+X    if (movecost + tabcost < CMcost) {
+X	bcopy (tbuf1, save, tabcost);
+X	bcopy (mbuf, save + tabcost, movecost);
+X	CM = save;
+X	CMcost = movecost + tabcost;
+X    }
+X};
+X
+X/* Perhaps a word of explanation ... in case we manage to get nulls into the
+X   cursor motion string, we change them to 0377s first, or all of the library
+X   routines used will stop after the null.  (0377 is just an "unlikely" code,
+X   especially because it has the high bit on.)  Anyway, these must be
+X   converted back after the library routines are done.  This is a horrible
+X   hack and will probably cause someone untold trouble later.  -ACT */
+X
+Xstatic
+Xtopos (row, column) {
+X    char *tgoto ();
+X
+X    if (curY == row && curX == column) return;
+X
+X    if (CursStr) {
+X	CM = tgoto (CursStr, column-1, row-1);
+X	SETSTUFF (save);
+X	tputs (CM, 0, stuffchar);
+X	CM = save;
+X	CMcost = bufp - save;
+X	if (FixCM) {		/* Must change 0377's to 0's */
+X	    register char *s = save;
+X	    register len = CMcost;
+X	    for (;len--;++s) if ((*s & 0377) == 0377) *s = 0;
+X	}
+X    }
+X    else CMcost = 9999;
+X
+X    if (HOstr) testcost (1, 1, row, column, HOstr);
+X    if (!XRflag) testcost (curY, 1, row, column, CRstr);
+X    if (RNflag && curY < W_tt.t_length)
+X	testcost (curY + 1, 1, row, column, "\r");
+X    testcost (curY, curX, row, column, "");
+X    if (LLstr) testcost (W_tt.t_length, 1, row, column, LLstr);
+X
+X    if (! MSflag)
+X	clearmodes ();		/* many terminals can't hack highlighting
+X				   around cursor positioning.  Silly twits! */
+X    if (CurMode==m_insert && ! MIflag) {
+X	tputs(ICEstr, 0, dumpchar);	/* some terminals can't move in */
+X	CurMode = m_overwrite;		/* insert mode -- JQJ */
+X    }
+X    while (CMcost--) putchar (*CM++);	/* Now, wasn't that easy? */
+X    curX = column;
+X    curY = row;
+X};
+X
+Xstatic
+Xflash () {			/* dump a visible bell */
+X    tputs (VBstr, 0, dumpchar);
+X}
+X
+Xstatic
+Xinit (BaudRate) {
+X    static char tbuf[1024];
+X    static char combuf[1024];
+X    register char *temp;
+X    extern  struct sgttyb WOld;
+X    extern  int		  WTtyFd;
+X    char   *fill = combuf;
+X    static  inited;
+X    if (!inited)
+X	if (tgetent (tbuf, getenv ("TERM")) <= 0) {
+X	    return 1;
+X/*	    stty (WTtyFd, &WOld);
+X	    quit (1,
+X"No environment-specified terminal type -- see TSET(1), sh(1)\n"); */
+X	}
+X    inited = 1;
+X    W_tt.t_needspaces = tgetflag ("in");
+X    XTflag = ((WOld.sg_flags & TBDELAY) == XTABS) || tgetflag ("xt");
+X    XRflag = tgetflag ("nc") || tgetflag ("xr");
+X    XNflag = tgetflag ("xn") || tgetflag ("nn");
+X    MSflag = tgetflag ("ms");
+X    HZflag = tgetflag ("hz");
+X    DBflag = tgetflag ("db");
+X    RNflag = tgetflag ("rn");
+X    DSstr = (temp = tgetstr ("ds", &fill)) ? temp : "\004\t\n\r";
+X    if (!*DSstr) DSstr = 0;
+X    if (!XRflag) CRstr = (temp = tgetstr ("cr", &fill)) ? temp : "\r";
+X    if (!XTflag) TBstr = (temp = tgetstr ("ta", &fill)) ? temp : "\t";
+X    ILstr = tgetstr ("al", &fill);
+X    HOstr = tgetstr ("ho", &fill);
+X    LLstr = tgetstr ("ll", &fill);
+X    DLstr = tgetstr ("dl", &fill);
+X    ICstr = tgetstr ("im", &fill);
+X    ICEstr = tgetstr ("ei", &fill);
+X    MIflag = tgetflag ("mi");	/* can move in insert mode */
+X    DCstr = tgetstr ("dc", &fill);
+X    ELstr = tgetstr ("ce", &fill);
+X    ESstr = tgetstr ("cl", &fill);
+X    if (tgetnum ("sg") < 1) {
+X	HLBstr = tgetstr ("so", &fill);
+X	HLEstr = tgetstr ("se", &fill);
+X    }
+X    if (tgetnum ("ug") < 1) {
+X	ULstr = tgetstr ("us", &fill);
+X	UEstr = tgetstr ("ue", &fill);
+X    }
+X    WSstr = tgetstr ("ws", &fill);
+X    WEstr = tgetstr ("we", &fill);
+X    BSstr = tgetstr ("bo", &fill);
+X    BEstr = tgetstr ("be", &fill);
+X    ICPstr = tgetstr ("ic", &fill);
+X    ICPDstr = tgetstr ("ip", &fill);
+X    CursStr = tgetstr ("cm", &fill);
+X    if (DBflag) CteoDstr = tgetstr ("cd", &fill);
+X    UP = tgetstr ("up", &fill);
+X    NDstr = tgetstr ("nd", &fill);
+X    VBstr = tgetstr ("vb", &fill);
+X    TIstr = tgetstr ("ti", &fill);
+X    TEstr = tgetstr ("te", &fill);
+X    DMstr = tgetstr ("dm", &fill);/* start delete mode */
+X    EDstr = tgetstr ("ed", &fill);/* end delete mode */
+X    VSstr = tgetstr ("vs", &fill);
+X    VEstr = tgetstr ("ve", &fill);/* ``visual'' start/end -ACT */
+X    if (tgetflag ("bs")) BC = "\b";
+X    else BC = tgetstr ("bc", &fill);
+X    ULflag = tgetflag ("ul");	/* DJH -- Find out about underline */
+X    if (!XNflag) NLstr = (temp = tgetstr ("nl", &fill)) ? temp : "\n";
+X    PC = W_tt.t_padc = (temp = tgetstr ("pc", &fill)) ? *temp : 0;
+X/* Where does he get this weird formula?? ACT */
+X/*  BaudFactor = 1 / (1 - (.45 + .3*BaudRate/9600.)) * (BaudRate/10000.);*/
+X    BaudFactor = ((float) BaudRate) / 10000.;
+X    if (!ESstr || (CursStr	? DSstr && !UP && !BC
+X				: !UP || !BC || !NLstr || !NDstr)) {
+X	return 1;
+X/*	stty (WTtyFd, &WOld);
+X	quit (1, "Sorry, this terminal isn't powerful enough to run windows.\n\
+XIt is missing some important features.\n"); */
+X    }
+X    W_tt.t_ILmf = BaudFactor * 0.75;
+X    if (ILstr) W_tt.t_ILov = 2;
+X    else {
+X	W_tt.t_ILov = MissingFeature;
+X	W_tt.t_inslines = W_tt.t_dellines = (int (*) ()) - 1;
+X    }
+X    if (VBstr) W_tt.t_flash = flash;
+X    if (ICstr) {
+X	W_tt.t_ICmf = 1;
+X	W_tt.t_ICov = strlen(ICstr) + (ICEstr ? strlen(ICEstr) : 0) +
+X	    (ICPstr ? strlen(ICPstr) : 0) + (ICPDstr ? strlen(ICPDstr) : 0);
+X    } else W_tt.t_ICmf = W_tt.t_ICov = MissingFeature;
+X    if (DCstr) {
+X	W_tt.t_DCmf = strlen (DCstr);
+X	W_tt.t_DCov = (DMstr ? strlen(DMstr) : 0) + (EDstr ? strlen(EDstr) : 0);
+X    } else W_tt.t_DCmf = W_tt.t_DCov = MissingFeature;
+X    temp = getenv ("PL");	/* (ACT) Test for desired page len */
+X    W_tt.t_length = temp && atoi (temp) ? atoi (temp) : tgetnum ("li");
+X    temp = getenv ("COL");	/* (ACT) Test for desired line len */
+X    W_tt.t_width = (temp && atoi (temp) ? atoi (temp) : tgetnum ("co"))
+X		 - (tgetflag ("am") ? 1 : 0);
+X
+X    BOLDOFF = WBOLD;		/* Turning off bold turns off bold */
+X    BLINKOFF = WBLINK;		/* Turning off blink turns off blink */
+X    ULINEOFF = WULINE;		/* Turning off uline turns off uline */
+X    HLOFF = WINVERSE;		/* Turning off hl turns off hl */
+X    if (lstrcmp (BEstr, WEstr) == 0) {
+X	BOLDOFF |= WBLINK;	/* bold & blink interrelate */
+X	BLINKOFF |= WBOLD;
+X    }
+X    if (lstrcmp (BEstr, UEstr) == 0) {
+X	BOLDOFF |= WULINE;	/* bold & under interrelate */
+X	ULINEOFF |= WBOLD;
+X    }
+X    if (lstrcmp (BEstr, HLEstr) == 0) {
+X	BOLDOFF |= WINVERSE;	/* etc */
+X	HLOFF |= WBOLD;
+X    }
+X    if (lstrcmp (WEstr, UEstr) == 0) {
+X	BLINKOFF |= WULINE;
+X	ULINEOFF |= WBLINK;
+X    }
+X    if (lstrcmp (WEstr, HLEstr) == 0) {
+X	BLINKOFF |= WINVERSE;
+X	HLOFF |= WBLINK;
+X    }
+X    if (lstrcmp (UEstr, HLEstr) == 0) {
+X	ULINEOFF |= WINVERSE;
+X	HLOFF |= WULINE;
+X    }
+X    return 0;
+X};
+X
+Xstatic
+Xlstrcmp (s1, s2)		/* Version of strcmp takes care of NULL */
+Xregister char *s1, *s2;
+X{
+X    if (s1 == 0 || s2 == 0)
+X	return 1;		/* Don't bother -- call 'em different */
+X    while (*s1 == *s2++)
+X    	if (*s1++ == 0)
+X	    return 0;
+X    return 1;			/* Order not important */
+X}
+X
+Xstatic
+Xreset () {
+X    if (TIstr) tputs(TIstr, 0, dumpchar);
+X    if (VSstr) tputs(VSstr, 0, dumpchar);
+X    tputs(ESstr, 0, dumpchar);	/* Also homes cursor: */
+X    curX = curY = 1;
+X    CurMode = m_insert;
+X    DesMode = m_overwrite;
+X};
+X
+Xstatic
+Xcleanup () {
+X    modes (0); setmodes ();
+X    DesMode = m_overwrite;
+X    setmode();
+X    topos (W_tt.t_length, 1);
+X    if (VEstr) tputs(VEstr, 0, dumpchar); 
+X    if (TEstr) tputs(TEstr, 0, dumpchar);
+X};
+X
+Xstatic
+Xwipeline (z,p) register p; {
+X    clearmodes ();
+X    if (ELstr) tputs (ELstr, W_tt.t_width-curX, dumpchar);
+X    else {
+X	register i = p - curX + 1/*, oldX = curX*/;
+X	if (i < 1) return;
+X	if (CurMode == m_insert) {
+X	    tputs(ICEstr, 0, dumpchar);	/* We don't want these inserted */
+X	    CurMode = m_overwrite;
+X	}
+X	while (--i >= 0) putchar(' '), ++curX;
+X/*	topos (curY, oldX);	/* This appears to be unnecessary */
+X    }
+X};
+X
+Xstatic
+Xwipescreen () {
+X    tputs(ESstr, 0, dumpchar);
+X    curX = curY = 1;
+X};
+X
+Xstatic
+Xdelchars (n) {
+X    if (DMstr) {	/* we may have delete mode, or delete == insert */
+X	if (strcmp(DMstr,ICstr) /*ACT*/ == 0 /*END*/) {
+X	    if (CurMode  == m_overwrite) {
+X	        tputs(ICstr,0,dumpchar);
+X		CurMode = m_insert;	/* we're now in both */
+X	    }
+X	}
+X	else {
+X	    if (CurMode == m_insert) {
+X		tputs(ICEstr, 0, dumpchar);
+X		CurMode = m_overwrite;
+X	    }
+X	    tputs(DMstr,0,dumpchar);
+X        }
+X    }
+X    while (--n >= 0) {
+X	tputs(DCstr, W_tt.t_width-curX, dumpchar);
+X    }
+X    if (EDstr) {		/* for some, insert mode == delete mode */
+X		/* bug!  /etc/termcap pads ICEstr but not EDstr */
+X        if (strcmp(DMstr,ICstr) /*ACT*/ == 0 /*END*/)
+X	    CurMode = m_insert;	/* (ACT) But you already did this! */
+X	else
+X	    tputs(EDstr,0,dumpchar);
+X    }
+X};
+X
+XTrmTERM () {
+X	W_tt.t_INSmode = INSmode;
+X	W_tt.t_modes = modes;
+X	W_tt.t_inslines = inslines;
+X	W_tt.t_dellines = dellines;
+X	W_tt.t_blanks = blanks;
+X	W_tt.t_init = init;
+X	W_tt.t_cleanup = cleanup;
+X	W_tt.t_wipeline = wipeline;
+X	W_tt.t_wipescreen = wipescreen;
+X	W_tt.t_topos = topos;
+X	W_tt.t_reset = reset;
+X	W_tt.t_delchars = delchars;
+X	W_tt.t_writechars = writechars;
+X	W_tt.t_window = 0;
+X	W_tt.t_ILmf = 0;
+X	W_tt.t_ILov = 0;
+X	W_tt.t_ICmf = 0;
+X	W_tt.t_ICov = 0;
+X	W_tt.t_length = 24;
+X	W_tt.t_width = 80;
+X	return 0;
+X};
+X
+X/*
+X * A home-brew "tgoto" with some special mods
+X * If termlib ever changes this'll need updating
+X *
+X *	%d	decimal
+X *	%2	%2d
+X *	%3	%3d
+X *	%.	binary, with "don't send"s
+X *	%+x	Adds x, then like binary
+X *	%>xy	if >x add y
+X *	%r	next is col
+X *	%i	Increment row/col
+X *	%%	= %
+X *	%B	BCD
+X *	%D	Backwards BCD
+X *	%m	xor with 0177
+X *	%<foo>	like %+<foo>
+X */
+X
+Xstatic char *
+Xtgoto (CM, col, line)
+Xchar	*CM;
+Xint	col, line;
+X{
+X	static char cmbuf[50], add[20];
+X	register char *cp = CM, *op = cmbuf;
+X	register c;
+X	int val = line, toggle = 0;
+X
+X	if (! cp) return "OOPS";
+X	*add = 0;
+X	*op = 0;
+X	FixCM = 0;
+X	while (c = *cp++) {
+X		if (c != '%') {
+X			*op++ = c;
+X			continue;
+X		}
+X		switch (c = *cp++) {
+X		case 'm':
+X			col ^= 0177;
+X			line ^= 0177;
+X			goto setval;
+X		case 'n':
+X			col ^= 0140;
+X			line ^= 0140;
+X			goto setval;
+X		case 'd':
+X			if (val < 10) goto onedigit;
+X			if (val < 100) goto twodigit;
+X		case '3':
+X			*op++ = (val / 100) + '0';
+X			val %= 100;
+X		case '2':
+Xtwodigit:
+X			*op++ = (val / 10) + '0';
+Xonedigit:
+X			*op++ = (val % 10) + '0';
+Xswap:
+X			toggle = 1 - toggle;
+Xsetval:
+X			val = toggle ? col : line;
+X			continue;
+X		case '>':
+X			if (val > *cp++) val += *cp++;
+X			else cp++;
+X			continue;
+X		case '+':
+X			val += *cp++;
+X		case '.':
+Xuse:
+X			if (DSstr) {
+X				while (val == 0 || index (DSstr, val)) {
+X					strcat (add, toggle ? BC : UP);
+X					++val;
+X				}
+X			}
+X			else if (val == 0) {
+X				*op++ = 0377;
+X				FixCM = 1;
+X				goto swap;
+X			}
+X			*op++ = val;
+X			goto swap;
+X		case 'r':
+X			toggle = 1;
+X			goto setval;
+X		case 'i':
+X			++col, ++line, ++val;
+X			continue;
+X		case '%':
+X			*op++ = c;
+X			continue;
+X		case 'B':
+X			val = ((val / 10) << 4) + val % 10;
+X			continue;
+X		case 'D':
+X			val = val - 2 * (val % 16);
+X			continue;
+X		default:
+X			val += c;
+X			goto use;
+X		}
+X	}
+X	*op = 0;
+X	strcat (op, add);
+X	return cmbuf;
+X}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 TrmTERM.c
+	/bin/echo -n '	'; /bin/ls -ld TrmTERM.c
+fi
+-- 
+UUCP:	{seismo,allegra,brl-bmd}!umcp-cs!chris
+CSNet:	chris@umcp-cs
+ARPA:	chris.umcp-cs@UDel-Relay
+
+

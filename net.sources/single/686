@@ -1,0 +1,1736 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,8867bd4a5e86a0e3,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-10-17 09:57:23 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site watrose.UUCP
+Path: utzoo!watmath!watrose!arwhite
+From: arwhite@watrose.UUCP (Alex White)
+Newsgroups: net.sources
+Subject: Fancier uda50 driver for 4.1bsd
+Message-ID: <110@watrose.UUCP>
+Date: Mon, 17-Oct-83 12:57:23 EDT
+Article-I.D.: watrose.110
+Posted: Mon Oct 17 12:57:23 1983
+Date-Received: Tue, 18-Oct-83 02:04:27 EDT
+Distribution: net.sources
+Organization: U of Waterloo, Ontario
+Lines: 1715
+
+The following uda driver does a few more fancy things like check dynamically
+what type of disk to figure out what size table to use...
+Also, allow wildcarding as in so if one controller is sick just switch unit
+plugs:
+controller	uda0	at uba0 csr 0172150		vector udintr
+controller	uda1	at uba1 csr 0172150		vector udintr
+disk		ra0	at uda? drive 0
+disk		ra1	at uda? drive ?
+disk		ra2	at uda? drive ?
+
+----------------------------dev/uda.c--------------------------------------
+/*	uda.c	1.3	83/03/11 aps	*/
+/*	uda.c	1.3	82/05/12	*/
+/*	uda.c	4.3	82/03/14	*/
+
+#include "ra.h"
+#if NUDA > 0
+/*
+ * UDA50/RAxx disk device driver
+ *
+ * Restrictions:
+ *	Unit numbers must be less than 8.
+ *
+ * Change history
+ *	10/13/83 watmath!arwhite --
+ *			Make udprobe actually go out there and talk to the
+ *			controller.  Make udslave actually go out there and
+ *			verify the units exist; also allow wildcarded drive #.
+ *			Note that these need three changes to autoconf.c:
+ *			  i = (*udp->ud_probe)(reg, um->um_ctlr, um);
+ *			  if ((*udp->ud_slave)(ui, reg, um->um_ctlr)) {
+ *			  i = (*udp->ud_probe)(reg, um->um_ctlr);
+ *			just adding extra args to the probe and slave calls.
+ *			Dynamically determine what type of drive, ie. ra60/ra81
+ *			and index size tables using that.
+ *			Error messages a bit better; some cosmetic changes.
+ *			Dynamically configure a new drive if an available msg
+ *			for it is received and we have a non-configured slot.
+ *			There doesn't seem to be anyway to detect a drive
+ *			going offline! Thats silly!
+ *	2/23/83 aps --	(uderror) Fixed a printf from always saying hard error
+ *			to printing hard or soft conditionally; (uderror) added
+ *			mask to switch statement.
+ *	3/22/83 aps --	(udprobe) udprobe was expecting another argument
+ *			which supposed to be the controller number: this
+ *			was changed to be counted and kept in a static int.
+ *	8/28/83 bwt --  wrote dump code.
+ *	9/05/83 bwt --  fixed udattach() to test dk >= 0 rather than
+ *			just > 0.
+ */
+
+#include "../h/param.h"
+#include "../h/systm.h"
+#include "../h/buf.h"
+#include "../h/conf.h"
+#include "../h/dir.h"
+#include "../h/user.h"
+#include "../h/pte.h"
+#include "../h/map.h"
+#include "../h/vm.h"
+#include "../h/ubareg.h"
+#include "../h/ubavar.h"
+#include "../h/dk.h"
+#include "../h/cpu.h"
+#include "../h/cmap.h"
+
+int udadebug;
+#define	printd	if(udadebug&1)printf
+
+/* set to cause hex dump of error log packets and other messages */
+int udaerror = 1;
+
+/*
+ * Parameters for the communications area
+ */
+
+#define	NRSPL2	3		/* log2 number of response packets */
+#define	NCMDL2	3		/* log2 number of command packets */
+#define	NRSP	(1<<NRSPL2)
+#define	NCMD	(1<<NCMDL2)
+
+#include "../h/udareg.h"
+#include "../h/mscp.h"
+
+struct uda_softc {
+	short	sc_mapped;	/* Unibus map allocated for uda struct? */
+	int	sc_ubainfo;	/* Unibus mapping info */
+	struct uda *sc_uda;	/* Unibus address of uda struct */
+	int	sc_ivec;	/* interrupt vector address */
+	short	sc_credits;	/* transfer credits */
+	short	sc_lastcmd;	/* pointer into command ring */
+	short	sc_lastrsp;	/* pointer into response ring */
+} uda_softc[NUDA];
+
+struct uda {
+	struct udaca	uda_ca;		/* communications area */
+	struct mscp	uda_rsp[NRSP];	/* response packets */
+	struct mscp	uda_cmd[NCMD];	/* command packets */
+} uda[NUDA];
+struct mscp *udawaitrsp();
+
+/* THIS SHOULD BE READ OFF THE PACK, PER DRIVE */
+struct size {
+	daddr_t	nblocks;
+	daddr_t	blkoff;
+} ra81_sizes[8] ={
+	15884,	0,		/* A=blk 0 thru 15883 */
+	33440,	15884,		/* B=blk 15884 thru 49323 */
+	-1,	0,		/* C=blk 0 thru end */
+	130000,	131404,		/* D=blk 131404 thru 261403 */
+	-1,	261404,		/* E=blk 261404 thru end */
+	0,	0,		/* F=unused */
+	82080,	49324,		/* G=blk 29324 thru 131403 */
+	-1,	131404,		/* H=blk 131404 thru end */
+}, ra80_sizes[8] ={
+	15884,	0,		/* A=blk 0 thru 15883 */
+	33440,	15884,		/* B=blk 15884 thru 49323 */
+	-1,	0,		/* C=blk 0 thru end */
+	0,	0,
+	0,	0,
+	0,	0,
+	82080,	49324,		/* G=blk 49324 thru 131403 */
+	-1,	131404,		/* H=blk 131404 thru end */
+}, ra60_sizes[8] ={
+	15884,	0,		/* A=blk 0 thru 15883 */
+	33440,	15884,		/* B=blk 15884 thru 49323 */
+	-1,	0,		/* C=blk 0 thru end */
+	0,	0,
+	0,	0,
+	0,	0,
+	0,	0,
+	-1,	49324,		/* H=blk 49324 thru end */
+};
+/* END OF STUFF WHICH SHOULD BE READ IN PER DISK */
+
+#define	RA80	1			/* Default disk type if we don't know */
+struct size *ra_sizes[] = {
+	0, ra80_sizes, 0, 0, ra60_sizes, ra81_sizes, 0, 0
+};
+daddr_t	radsize[NRA];			/* disk size, from ONLINE end packet */
+/* FYI an ra81 is 891072 blocks so you can do your mkfs's */
+
+int	udprobe(), udslave(), udattach(), udintr();
+struct	mscp *udgetcp();
+struct	uba_ctlr *udminfo[NUDA];
+struct	uba_device *uddinfo[NRA];
+struct	uba_device *udip[NUDA][8];	/* 8 == max number of drives */
+
+u_short	udstd[] = { 0772150, 0 };
+struct	uba_driver udadriver =
+ { udprobe, udslave, udattach, 0, udstd, "ra", uddinfo, "uda", udminfo, 0 };
+struct	buf rudbuf[NRA];
+struct	buf udutab[NRA];
+struct	buf udwtab[NUDA];		/* I/O wait queue, per controller */
+
+#define	b_qsize		b_resid		/* queue size per drive, in udutab */
+#define	b_ubinfo	b_resid		/* Unibus mapping info, per buffer */
+
+udprobe(reg, ctlr, um)
+caddr_t reg;
+int ctlr;
+struct uba_ctlr *um;
+{
+	register int br, cvec;
+	register struct uda_softc *sc;
+
+	if (ctlr > NUDA) {
+		printf("Additional uda's not configured\n");
+		return(0);
+	}
+	sc = &uda_softc[ctlr];
+	/* SHOULD CHECK THAT IT REALLY IS A UDA */
+	br = 0x15;
+	cvec = sc->sc_ivec = (uba_hd[numuba].uh_lastiv -= 4);
+/*****KLUDGE--There should be separate probe & controller attach routines, just
+like there is for slave, and slave attach ****/
+	um->um_alive = 1;
+	um->um_ubanum = numuba;
+	um->um_hd = &uba_hd[numuba];
+	um->um_addr = (caddr_t) reg;
+	udminfo[ctlr] = um;
+	return udinit(ctlr);
+}
+
+#define NTYPES	8	/* # elements in following array */
+static char *udatypes[] = { 0, "ra80", 0, 0, "ra60", "ra81", 0, 0 };
+udslave(ui, reg, d)
+struct uba_device *ui;
+caddr_t reg;
+{
+	register struct mscp *mp;
+	struct uba_ctlr *um;
+	int next = 0;
+	u_char dtype;
+
+	if(ui->ui_unit > NRA) {
+		printf("Additional ra's not configured\n");
+		return 0;
+	}
+	um = udminfo[d];
+tryagain:
+	mp = udgetcp(um);
+	mp->mscp_modifier = ui->ui_slave == -1 ? M_MD_NXUNT : 0;
+	mp->mscp_unit = ui->ui_slave == -1 ? next : ui->ui_slave;
+	if((mp = udawaitrsp(mp, M_OP_GTUNT, reg, d)) == 0)
+		return 0;
+	switch(mp->mscp_status & M_ST_MASK) {
+	case M_ST_SUCC:
+	case M_ST_AVLBL:
+		break;
+	case M_ST_OFFLN:
+		printd("uda%d: Unit %d status %o\n", d, mp->mscp_unit, mp->mscp_status);
+		switch(mp->mscp_status & ~M_ST_MASK) {
+		case M_ST_OFFLN_INOPERATIVE:
+		case M_ST_OFFLN_DUPLICATE:
+		case M_ST_OFFLN_DISABLED:
+			printf("uda%d: Unit %d is offline, status %o\n",
+				d, mp->mscp_unit, mp->mscp_status);
+		case M_ST_OFFLN_UNKNOWN:
+			return 0;	/* Unknown on online to another ctlr */
+		case M_ST_OFFLN_UNMOUNTED:
+			break;
+		}
+		break;
+	default:
+		printf("uda%d: GTUNT failed, ", d);
+		udputstatus(mp->mscp_status);
+		return 0;
+	}
+	if(mp->mscp_unit >= 8) {
+		printf("uda%d: Unit #%d too large\n", d, mp->mscp_unit);
+		if(ui->ui_slave == -1)
+			goto tryagain;
+		return 0;
+	}
+	/*
+	 *  Somebody already has this controller?
+	 */
+	if(udip[d][mp->mscp_unit]) {
+		/*
+		 *  Check if we have been told there are no more units out
+		 *  there.  This is the case if the unit returned is 0, and
+		 *  we were wildcarded for any unit and we weren't trying 0.
+		 */
+		if((mp->mscp_unit != 0  &&  ui->ui_slave == -1)  ||
+		   (mp->mscp_unit == 0  &&  ui->ui_slave == -1 && next == 0)) {
+			next = mp->mscp_unit+1;
+			goto tryagain;
+		}
+		return 0;
+	}
+			
+	dtype = mp->mscp_unitid[3] & 0xff;
+	if(dtype >= NTYPES || udatypes[dtype] == 0) {
+		printf("uda%d: Unit #%d unknown type %d, using ra80 tables\n",
+			d, mp->mscp_unit, dtype);
+		dtype = RA80;
+	}
+	ui->ui_type = dtype;
+	if(ui->ui_slave == -1)
+		ui->ui_slave = mp->mscp_unit;
+	printf("disk %s is ", udatypes[dtype]);	/* Followed by config message */
+	return(1);
+}
+
+udattach(ui)
+register struct uba_device *ui;
+{
+
+	if (ui->ui_dk >= 0)
+		dk_mspw[ui->ui_dk] = 1.0 / (60 * 31 * 256);	/* approx */
+	ui->ui_flags = 0;
+	udip[ui->ui_ctlr][ui->ui_slave] = ui;
+	radsize[ui->ui_unit] = (daddr_t)0xffffff;	/* max possible size */
+}
+
+/*
+ * Open a UDA.  Set the unit online.
+ */
+udopen(dev, flag)
+dev_t dev;
+int flag;
+{
+	register int unit;
+	register struct uba_device *ui;
+	int s;
+
+#ifdef lint
+	flag = flag;
+#endif
+	unit = minor(dev) >> 3;
+	if (unit >= NRA || (ui = uddinfo[unit]) == 0 || ui->ui_alive == 0) {
+		u.u_error = ENXIO;
+		return;
+	}
+	/* SHOULD PROBABLY FORCE AN ONLINE ATTEMPT
+	   TO SEE IF DISK IS REALLY THERE */
+}
+
+/*
+ * Initialize a UDA.  Set up UBA mapping registers,
+ * initialize data structures, and do hardware
+ * initialization sequence.
+ */
+udinit(d)
+int d;
+{
+	struct uda_softc *sc;
+	struct uda *ud, *uud;
+	struct udadevice *udaddr;
+	struct uba_ctlr *um;
+	struct mscp *mp;
+	int retries = 0;
+	int i;
+	struct buf *bp;
+
+	sc = &uda_softc[d];
+	um = udminfo[d];
+	ud = &uda[d];
+	udaddr = (struct udadevice *)um->um_addr;
+	if (sc->sc_mapped == 0) {
+		/*
+		 * Map the communications area and command
+		 * and response packets into Unibus address
+		 * space.
+		 */
+		sc->sc_ubainfo = uballoc(um->um_ubanum, (caddr_t)ud,
+		    sizeof (struct uda), 0);
+		sc->sc_uda = (struct uda *)(sc->sc_ubainfo & 0x3ffff);
+		sc->sc_mapped = 1;
+	}
+
+#define	STEP1MASK	(0177400 & ~(UDA_QB|UDA_DI))
+#define	STEP1GOOD	UDA_STEP1
+#define	STEP2MASK	0174377	/* Ignore Port Type */
+#define	STEP2GOOD	(UDA_STEP2|UDA_IE|(NCMDL2<<3)|NRSPL2)
+#define	STEP3MASK	0174377
+#define	STEP3GOOD	(UDA_STEP3|(sc->sc_ivec/4))
+#define	STEP4MASK	0174000	/* Ignore Controller microcode version */
+#define	STEP4GOOD	UDA_STEP4
+#define	waitcheck(bit, mask, good) \
+		while ((udaddr->udasa & bit) == 0) \
+			; \
+		if((udaddr->udasa & mask) != good) \
+			goto error;
+	/*
+	 *  Do the hardware initialization sequence.
+	 *  On error - ``The port driver must retry the sequence at least once.
+	 *  It is suggested, however, that a second failure be considered
+	 *  as meaning the port/controller is "down"''.
+	 *  We should also have 10 second timeouts on each step.
+	 */
+again:
+	udaddr->udaip = 0;		/* start initialization */
+	waitcheck(UDA_STEP1, STEP1MASK, STEP1GOOD);
+	udaddr->udasa = UDA_ERR|(NCMDL2<<11)|(NRSPL2<<8)|(sc->sc_ivec/4);
+	waitcheck(UDA_STEP2, STEP2MASK, STEP2GOOD);
+	udaddr->udasa = ((int)&sc->sc_uda->uda_ca.ca_ringbase)|
+	    (cpu == VAX_780 ? UDA_PI : 0);
+	waitcheck(UDA_STEP3, STEP3MASK, STEP3GOOD);
+	udaddr->udasa = ((int)&sc->sc_uda->uda_ca.ca_ringbase)>>16;
+	waitcheck(UDA_STEP4, STEP4MASK, STEP4GOOD);
+	udaddr->udasa = UDA_GO;
+	/*
+	 * Initialize the data structures.
+	 */
+	uud = sc->sc_uda;
+	for (i = 0; i < NRSP; i++) {
+		ud->uda_ca.ca_rspdsc[i] = UDA_OWN|UDA_INT|
+			(long)&uud->uda_rsp[i].mscp_cmdref;
+		ud->uda_rsp[i].mscp_dscptr = &ud->uda_ca.ca_rspdsc[i];
+		ud->uda_rsp[i].mscp_header.uda_msglen = sizeof (struct mscp);
+	}
+	for (i = 0; i < NCMD; i++) {
+		ud->uda_ca.ca_cmddsc[i] = UDA_INT|
+			(long)&uud->uda_cmd[i].mscp_cmdref;
+		ud->uda_cmd[i].mscp_dscptr = &ud->uda_ca.ca_cmddsc[i];
+		ud->uda_cmd[i].mscp_header.uda_msglen = sizeof (struct mscp);
+	}
+	bp = &udwtab[d];
+	bp->av_forw = bp->av_back = bp;
+	sc->sc_lastcmd = 0;
+	sc->sc_lastrsp = 0;
+	sc->sc_credits = 1;
+	mp = udgetcp(um);
+	mp->mscp_modifier = 0;
+	mp->mscp_cntflgs = M_CF_ATTN|M_CF_MISC|M_CF_THIS;
+	mp->mscp_version = 0;
+	mp->mscp_hsttmo = 0;
+	if((mp = udawaitrsp(mp, M_OP_STCON, udaddr, d)) == 0)
+		return 0;
+	if((mp->mscp_status & M_ST_MASK) != M_ST_SUCC) {
+		printf("STCON failed, status=%o\n", mp->mscp_status);
+		return 0;
+	}
+	return 1;
+error:
+	printf("uda%d: error bit set during initialization, udasa=0x%x\n",
+		d, udaddr->udasa);
+	if(retries++ < 2)
+		goto again;
+	return 0;
+}
+
+struct mscp *
+udawaitrsp(mp, opcode, udaddr, d)
+struct mscp *mp;
+struct udadevice *udaddr;
+{
+	int s = spl7();	/* Or autoconf may switch R11 & R10 on us */
+	struct uda_softc *sc = &uda_softc[d];
+	struct uda *ud = &uda[d];
+	struct uba_ctlr *um = udminfo[d];
+	int i;
+
+	mp->mscp_opcode = opcode;
+	*((long *)mp->mscp_dscptr) |= UDA_OWN|UDA_INT;
+	i = udaddr->udaip;	/* initiate polling */
+	sc->sc_credits--;
+	for(;;) {
+		if(ud->uda_ca.ca_cmdint)
+			ud->uda_ca.ca_cmdint = 0;
+		if(ud->uda_ca.ca_rspint)
+			break;
+	}
+	ud->uda_ca.ca_rspint = 0;
+	if(ud->uda_ca.ca_rspdsc[sc->sc_lastrsp] & UDA_OWN) {
+		printf("uda%d: No response packet?\n", um->um_ctlr);
+		splx(s);
+		return 0;
+	}
+	mp = &ud->uda_rsp[sc->sc_lastrsp];
+	mp->mscp_header.uda_msglen = sizeof (struct mscp);
+	sc->sc_credits += mp->mscp_header.uda_credits & 0xf;
+	if(mp->mscp_opcode != (opcode|M_OP_END)) {
+		printf("uda%d: Response to %o was %o\n", opcode,
+			mp->mscp_opcode);
+		splx(s);
+		return 0;
+	}
+	ud->uda_ca.ca_rspdsc[sc->sc_lastrsp++] |= UDA_OWN;
+	splx(s);
+	return mp;
+
+}
+
+udstrategy(bp)
+register struct buf *bp;
+{
+	register struct uba_device *ui;
+	register struct uba_ctlr *um;
+	register struct buf *dp;
+	register int unit;
+	register struct size *st;
+	int xunit = minor(bp->b_dev) & 07;
+	daddr_t sz, maxsz;
+	int s;
+	int dtype;
+
+	sz = (bp->b_bcount+511) >> 9;
+	unit = dkunit(bp);
+	if (unit >= NRA)
+		goto bad;
+	ui = uddinfo[unit];
+	um = ui->ui_mi;
+	if (ui == 0 || ui->ui_alive == 0)
+		goto bad;
+	st = &ra_sizes[ui->ui_type][xunit];
+	if ((maxsz = st->nblocks) < 0)
+		maxsz = radsize[unit] - st->blkoff;
+	if (bp->b_blkno < 0 || bp->b_blkno+sz > maxsz ||
+	    st->blkoff >= radsize[unit])
+		goto bad;
+	s = spl5();
+	/*
+	 * Link the buffer onto the drive queue
+	 */
+	dp = &udutab[ui->ui_unit];
+	if (dp->b_actf == 0)
+		dp->b_actf = bp;
+	else
+		dp->b_actl->av_forw = bp;
+	dp->b_actl = bp;
+	bp->av_forw = 0;
+	/*
+	 * Link the drive onto the controller queue
+	 */
+	if (dp->b_active == 0) {
+		dp->b_forw = NULL;
+		if (um->um_tab.b_actf == NULL)
+			um->um_tab.b_actf = dp;
+		else
+			um->um_tab.b_actl->b_forw = dp;
+		um->um_tab.b_actl = dp;
+		dp->b_active = 1;
+	}
+	if (um->um_tab.b_active == 0) {
+#if defined(VAX750)
+		if (cpu == VAX_750) {
+			if (um->um_ubinfo != 0)
+				if (udaerror)
+					printf("uda:ubinfo %x\n",um->um_ubinfo);
+			else
+				um->um_ubinfo =
+					uballoc(um->um_ubanum, (caddr_t)0, 0,
+						UBA_NEEDBDP);
+		}
+#endif
+		(void) udstart(um);
+	}
+	splx(s);
+	return;
+
+bad:
+	bp->b_flags |= B_ERROR;
+	iodone(bp);
+	return;
+}
+
+udstart(um)
+register struct uba_ctlr *um;
+{
+	register struct buf *bp, *dp;
+	register struct mscp *mp;
+	register struct uda_softc *sc;
+	register struct uba_device *ui;
+	struct udadevice *udaddr;
+	int i, s;
+
+	sc = &uda_softc[um->um_ctlr];
+	
+loop:
+	if ((dp = um->um_tab.b_actf) == NULL) {
+		/*
+		 * Release uneeded UBA resources and return
+		 */
+		um->um_tab.b_active = 0;
+#if defined(VAX750)
+		if (cpu == VAX_750) {
+			ubarelse(um->um_ubanum, &um->um_ubinfo);
+		}
+#endif
+		return (0);
+	}
+	if ((bp = dp->b_actf) == NULL) {
+		/*
+		 * No more requests for this drive, remove
+		 * from controller queue and look at next drive.
+		 * We know we're at the head of the controller queue.
+		 */
+		dp->b_active = 0;
+		um->um_tab.b_actf = dp->b_forw;
+		goto loop;
+	}
+	um->um_tab.b_active++;
+	udaddr = (struct udadevice *)um->um_addr;
+	if ((udaddr->udasa&UDA_ERR)) {
+		harderr(bp, "ra");
+		printf("udasa %o\n", udaddr->udasa&0xffff);
+		udinit(um->um_ctlr);
+		/* SHOULD REQUEUE OUTSTANDING REQUESTS, LIKE UDRESET */
+		return (0);
+	}
+	ui = uddinfo[dkunit(bp)];
+	/*
+	 * If no credits, can't issue any commands
+	 * until some outstanding commands complete.
+	 */
+	if (sc->sc_credits < 2)
+		return (0);
+	if (ui->ui_flags == 0) {	/* not online */
+		if ((mp = udgetcp(um)) == NULL)
+			return (0);
+		sc->sc_credits--;
+		mp->mscp_opcode = M_OP_ONLIN;
+		mp->mscp_unit = ui->ui_slave;
+		dp->b_active = 2;
+		um->um_tab.b_actf = dp->b_forw;	/* remove from controller q */
+		printd("uda: bring unit %d online\n", ui->ui_slave);
+		*((long *)mp->mscp_dscptr) |= UDA_OWN|UDA_INT;
+		i = udaddr->udaip;
+		goto loop;
+	}
+	switch (cpu) {
+	case VAX_780:
+		i = UBA_NEEDBDP|UBA_CANTWAIT;
+		break;
+
+	case VAX_750:
+		i = um->um_ubinfo|UBA_HAVEBDP|UBA_CANTWAIT;
+		break;
+
+	case VAX_730:
+		i = UBA_CANTWAIT;
+		break;
+	}
+	/*
+	 *  Probably have run out of BDP's.  We should wait for one to
+	 *  come available but can't cuz we're at interrupt level.
+	 *  Locally, all our uda's are on private uba's so we really
+	 *  shouldn't do anything at all - we have all the bdp's and
+	 *  will be given them back automatically in our interrupt routine
+	 *  which will call us anyway.
+	 *  We should really get the command packet first, but I know
+	 *  how to release uba resources in case of that failure; but
+	 *  not how to release the command packet without doing a command.
+	 *  Doing a get unit status is NOT the correct way as it may well
+	 *  come back immediately while we still have not bdp's in which
+	 *  case we may lock up the uda doing get unit statuses.
+	 *  Note that this only happens for the newer releases of micro-code
+	 *  which have 22 credits, not 15.
+	 */
+	s = spl6();	/* Guard against ubareset */
+	i = ubasetup(um->um_ubanum, bp, i);
+	if (i == 0) {
+		splx(s);
+		return(1);		/* wait for interrupt */
+	}
+	if ((mp = udgetcp(um)) == NULL) {
+		ubarelse(um->um_ubanum, &i);
+		splx(s);
+		return (0);
+	}
+	sc->sc_credits--;
+	mp->mscp_cmdref = (long)bp;	/* pointer to get back */
+	mp->mscp_opcode = bp->b_flags&B_READ ? M_OP_READ : M_OP_WRITE;
+	mp->mscp_unit = ui->ui_slave;
+	mp->mscp_lbn = bp->b_blkno + ra_sizes[ui->ui_type][minor(bp->b_dev)&07].blkoff;
+	mp->mscp_bytecnt = bp->b_bcount;
+	mp->mscp_buffer = (i & 0x3ffff) | (((i>>28)&0xf)<<24);
+#if defined(VAX750)
+	if (cpu == VAX_750)
+		i &= 0xfffffff;		/* mask off bdp */
+#endif
+	bp->b_ubinfo = i;		/* save mapping info */
+	splx(s);
+	*((long *)mp->mscp_dscptr) |= UDA_OWN|UDA_INT;
+	i = udaddr->udaip;		/* initiate polling */
+	if (ui->ui_dk >= 0) {
+		dk_busy |= 1<<ui->ui_dk;
+		dp->b_qsize++;
+		dk_xfer[ui->ui_dk]++;
+		dk_wds[ui->ui_dk] += bp->b_bcount>>6;
+	}
+
+	/*
+	 * Move drive to the end of the controller queue
+	 */
+	if (dp->b_forw != NULL) {
+		um->um_tab.b_actf = dp->b_forw;
+		um->um_tab.b_actl->b_forw = dp;
+		um->um_tab.b_actl = dp;
+		dp->b_forw = NULL;
+	}
+	/*
+	 * Move buffer to I/O wait queue
+	 */
+	dp->b_actf = bp->av_forw;
+	dp = &udwtab[um->um_ctlr];
+	bp->av_forw = dp;
+	bp->av_back = dp->av_back;
+	dp->av_back->av_forw = bp;
+	dp->av_back = bp;
+	goto loop;
+}
+
+/*
+ * UDA interrupt routine.
+ */
+udintr(d)
+int d;
+{
+	register struct uba_ctlr *um = udminfo[d];
+	register struct udadevice *udaddr = (struct udadevice *)um->um_addr;
+	register struct uda_softc *sc = &uda_softc[d];
+	register struct uda *ud = &uda[d];
+	register int i;
+
+	if(d > NUDA  ||  um->um_alive == 0) {
+		printf("udintr%d: not alive\n", d);
+		return;
+	}
+
+	if (udaddr->udasa&UDA_ERR) {
+		printf("uda%d: fatal error (%o)\n", d, udaddr->udasa&0xffff);
+		udaddr->udaip = 0;
+		wakeup((caddr_t)um);
+	}
+
+	/*
+	 * Check for a buffer purge request.
+	 */
+	if (ud->uda_ca.ca_bdp) {
+		/*
+		 * THIS IS A KLUDGE.
+		 * Maybe we should change the entire
+		 * UBA interface structure.
+		 */
+		int s = spl7();
+
+		i = um->um_ubinfo;
+		printd("uda: purge bdp %d\n", ud->uda_ca.ca_bdp);
+		um->um_ubinfo = ud->uda_ca.ca_bdp<<28;
+		ubapurge(um);
+		um->um_ubinfo = i;
+		(void) splx(s);
+		ud->uda_ca.ca_bdp = 0;
+		udaddr->udasa = 0;	/* signal purge complete */
+	}
+
+	/*
+	 * Check for response ring transition.
+	 */
+	if (ud->uda_ca.ca_rspint) {
+		ud->uda_ca.ca_rspint = 0;
+		for (i = sc->sc_lastrsp;; i++) {
+			i %= NRSP;
+			if (ud->uda_ca.ca_rspdsc[i]&UDA_OWN)
+				break;
+			udrsp(um, ud, sc, i);
+			ud->uda_ca.ca_rspdsc[i] |= UDA_OWN;
+		}
+		sc->sc_lastrsp = i;
+	}
+
+	/*
+	 * Check for command ring transition.
+	 */
+	if (ud->uda_ca.ca_cmdint) {
+		ud->uda_ca.ca_cmdint = 0;
+	}
+	(void) udstart(um);
+}
+
+/*
+ * Process a response packet
+ */
+udrsp(um, ud, sc, i)
+register struct uba_ctlr *um;
+register struct uda *ud;
+register struct uda_softc *sc;
+int i;
+{
+	register struct mscp *mp;
+	struct uba_device *ui;
+	struct buf *dp, *bp;
+	int st;
+
+	mp = &ud->uda_rsp[i];
+	mp->mscp_header.uda_msglen = sizeof (struct mscp);
+	sc->sc_credits += mp->mscp_header.uda_credits & 0xf;
+	/*
+	 *  Credits is misnamed, its really a message type in the top 4 bits.
+	 */
+	switch (mp->mscp_header.uda_credits & 0xf0) {
+	case UDA_MSGTYPE_SEQ:
+		break;
+	case UDA_MSGTYPE_DATAGRAM:
+		uderror(um, (struct mslg *)mp);
+		return;
+	case UDA_MSGTYPE_CREDITS:
+		return;
+	case UDA_MSGTYPE_MAINTENANCE:
+	default:
+		printf("uda: unit %d strange message type %o\n",
+			mp->mscp_unit, mp->mscp_header.uda_credits);
+		return;
+	}
+	st = mp->mscp_status&M_ST_MASK;
+
+	/*
+	 *  Operations which are drive specific
+	 */
+	if (mp->mscp_unit >= 8)
+		return;
+	if ((ui = udip[um->um_ctlr][mp->mscp_unit]) == 0) {
+		switch(mp->mscp_opcode) {
+		case M_OP_AVATN:
+			printd("uda%d: unit %d attention\n", um->um_ctlr,
+				mp->mscp_unit);
+			udonline(um->um_ctlr, mp->mscp_unit,
+				mp->mscp_unitid[3] & 0xff);
+			return;
+		}
+		printf("uda%d: unit %d not configured, packet(0%o) ignored\n",
+			um->um_ctlr, mp->mscp_unit, mp->mscp_opcode);
+		return;
+	}
+	switch (mp->mscp_opcode) {
+	case M_OP_ONLIN|M_OP_END:
+		/*
+		 * Link the drive onto the controller queue
+		 */
+		dp = &udutab[ui->ui_unit];
+		dp->b_forw = NULL;
+		if (um->um_tab.b_actf == NULL)
+			um->um_tab.b_actf = dp;
+		else
+			um->um_tab.b_actl->b_forw = dp;
+		um->um_tab.b_actl = dp;
+		if (st == M_ST_SUCC) {
+			ui->ui_flags = 1;	/* mark it online */
+			radsize[ui->ui_unit] = (daddr_t)mp->mscp_untsize;
+			printd("uda: unit %d online\n", mp->mscp_unit);
+		} else {
+			harderr(dp->b_actf, "ra");
+			udputstatus(mp->mscp_status);
+			while (bp = dp->b_actf) {
+				dp->b_actf = bp->av_forw;
+				bp->b_flags |= B_ERROR;
+				iodone(bp);
+			}
+		}
+		dp->b_active = 1;
+		break;
+
+	case M_OP_AVATN:
+		printd("uda: unit %d attention\n", mp->mscp_unit);
+		ui->ui_flags = 0;	/* it went offline and we didn't notice */
+		break;
+
+	case M_OP_READ|M_OP_END:
+	case M_OP_WRITE|M_OP_END:
+		bp = (struct buf *)mp->mscp_cmdref;
+		ubarelse(um->um_ubanum, (int *)&bp->b_ubinfo);
+		/*
+		 * Unlink buffer from I/O wait queue.
+		 */
+		bp->av_back->av_forw = bp->av_forw;
+		bp->av_forw->av_back = bp->av_back;
+		dp = &udutab[ui->ui_unit];
+		if (ui->ui_dk >= 0)
+			if (--dp->b_qsize == 0)
+				dk_busy &= ~(1<<ui->ui_dk);
+		if (st == M_ST_OFFLN || st == M_ST_AVLBL) {
+			ui->ui_flags = 0;	/* mark unit offline */
+			/*
+			 * Link the buffer onto the front of the drive queue
+			 */
+			if ((bp->av_forw = dp->b_actf) == 0)
+				dp->b_actl = bp;
+			dp->b_actf = bp;
+			/*
+			 * Link the drive onto the controller queue
+			 */
+			if (dp->b_active == 0) {
+				dp->b_forw = NULL;
+				if (um->um_tab.b_actf == NULL)
+					um->um_tab.b_actf = dp;
+				else
+					um->um_tab.b_actl->b_forw = dp;
+				um->um_tab.b_actl = dp;
+				dp->b_active = 1;
+			}
+			return;
+		}
+		if (st != M_ST_SUCC) {
+			harderr(bp, "ra");
+			udputstatus(mp->mscp_status);
+			bp->b_flags |= B_ERROR;
+		}
+		bp->b_resid = bp->b_bcount - mp->mscp_bytecnt;
+		iodone(bp);
+		break;
+
+	default:
+		printf("uda: unknown packet\n");
+	}
+}
+
+/*
+ *  Try to dynamically configure a new disk.
+ */
+static
+udonline(ctlr, unit, type)
+{
+	register struct uba_device *ui;
+	register struct uba_ctlr *um;
+	extern int dkn;	/* Left over from autoconf */
+
+	if(ctlr > NUDA  ||
+	   (um = udminfo[ctlr]) == NULL  ||
+	   um->um_alive == 0) {
+		printf("uda%d: unit %d, available attention from unknown uda\n",
+			ctlr, unit);
+		return;
+	}
+	/*
+	 *  First see if the actual ctlr/unit pair is there,
+	 *  if not try for a wildcarded ctlr and or unit.
+	 */
+	for(ui = ubdinit; ui->ui_driver; ui++) {
+		if(ui->ui_driver != &udadriver)
+			continue;
+		if(ui->ui_ctlr == ctlr && ui->ui_slave == unit) {
+			if(ui->ui_alive)
+				return;	/* Cannot happen? */
+			goto found;
+		}
+	}
+	for(ui = ubdinit; ui->ui_driver; ui++) {
+		if(ui->ui_driver != &udadriver)
+			continue;
+		/*
+		 * If a wildcarded ctlr, then must also check for either
+		 * wildcarded ubanumber, or uba being this one
+		 */
+		if((
+			(
+				ui->ui_ctlr == '?' &&
+				(ui->ui_ubanum == '?' ||
+				 ui->ui_ubanum == um->um_ubanum)
+			) ||
+				ui->ui_ctlr == ctlr
+		   ) &&
+			(ui->ui_slave == -1 || ui->ui_slave == unit) &&
+			ui->ui_alive == 0
+		  )
+			goto found;
+	}
+	printf("uda%d: unit %d, available attention, no device configured\n",
+		ctlr, unit);
+	return;
+
+	/*
+	 *  Found a likely spot. Fill in all the fields autoconf normally would.
+	 */
+found:
+	ui->ui_alive = 1;
+	ui->ui_ctlr = ctlr;
+	ui->ui_slave = unit;
+	ui->ui_ubanum = um->um_ubanum;
+	ui->ui_hd = &uba_hd[um->um_ubanum];
+	ui->ui_addr = um->um_addr;
+	ui->ui_physaddr = 0;	/* Hope dump doesn't want this device... */
+	if(dkn < DK_NDRIVE)
+		ui->ui_dk = dkn++;
+	else
+		ui->ui_dk = -1;
+	ui->ui_mi = um;
+	if(type >= NTYPES || udatypes[type] == 0) {
+		printf("uda%d: Unit #%d unknown type %d, using ra80 tables\n",
+			ctlr, unit, type);
+		type = RA80;
+	}
+	ui->ui_type = type;
+	udadriver.ud_dinfo[ui->ui_unit] = ui;
+	printf("CONFIGURING: disk %s is ra%d at uda%d slave %d\n",
+		udatypes[type], ui->ui_unit, ctlr, unit);
+	udattach(ui);
+}
+
+/*
+ * Process an error log message
+ *
+ * For now, just log the error on the console.
+ * Only minimal decoding is done, only "useful"
+ * information is printed.  Eventually should
+ * send message to an error logger.
+ */
+uderror(um, mp)
+register struct uba_ctlr *um;
+register struct mslg *mp;
+{
+	printf("uda%d: %s error, ", um->um_ctlr,
+		mp->mslg_flags&(M_LF_SUCC|M_LF_CONT) ? "soft" : "hard");
+	switch (mp->mslg_format&0377) {
+	case M_FM_CNTERR:
+		printf("controller error\n");
+		break;
+
+	case M_FM_BUSADDR:
+		printf("host memory access error, addr 0%o\n",
+			*((long *)&mp->mslg_busaddr[0]));
+		break;
+
+	case M_FM_DISKTRN:
+		printf("disk transfer error, unit %d\n", mp->mslg_unit);
+		break;
+
+	case M_FM_SDI:
+		printf("SDI error, unit %d\n", mp->mslg_unit);
+		break;
+
+	case M_FM_SMLDSK:
+		printf("small disk error, unit %d, cyl %d\n",
+			mp->mslg_unit, mp->mslg_sdecyl);
+		break;
+
+	default:
+		printf("unknown error, unit %d, format 0%o\n",
+			mp->mslg_unit, mp->mslg_format);
+	}
+	udputstatus(mp->mslg_event);
+
+	if (udaerror) {
+		register short *p = (short *)mp;
+		register int i;
+
+		for (i = 0; i < mp->mslg_header.uda_msglen; i += sizeof(*p))
+			printf("%x ", *p++);
+		printf("\n");
+		for (i = 0; i < mp->mslg_header.uda_msglen; i += sizeof(*p))
+			printf("%o ", *p++);
+		printf("\n");
+	}
+}
+
+/*
+ *  Interpret the status or event code.  It would be nice if it interpretted
+ *  the sub-codes as well.
+ */
+static char *msgs[] = {
+	"Success", "Invalid command", "Command aborted",
+	"Unit offline", "Unit available", "Media format error",
+	"Write protected", "Compare error", "Data error",
+	"Host buffer access error", "Controller error", "Drive error"
+};
+udputstatus(i)
+{
+	printf("Status Code of Packet	");
+	if((i & M_ST_MASK) <= M_ST_DRIVE)
+		printf(msgs[i&M_ST_MASK]);
+	printf("	%o\n", i);
+}
+
+/*
+ * Find an unused command packet
+ */
+struct mscp *
+udgetcp(um)
+struct uba_ctlr *um;
+{
+	register struct mscp *mp;
+	register struct udaca *cp;
+	register struct uda_softc *sc;
+	register int i;
+
+	cp = &uda[um->um_ctlr].uda_ca;
+	sc = &uda_softc[um->um_ctlr];
+	i = sc->sc_lastcmd;
+	if ((cp->ca_cmddsc[i] & (UDA_OWN|UDA_INT)) == UDA_INT) {
+		cp->ca_cmddsc[i] &= ~UDA_INT;
+		mp = &uda[um->um_ctlr].uda_cmd[i];
+		mp->mscp_unit = mp->mscp_modifier = 0;
+		mp->mscp_opcode = mp->mscp_flags = 0;
+		mp->mscp_bytecnt = mp->mscp_buffer = 0;
+		mp->mscp_errlgfl = mp->mscp_copyspd = 0;
+		sc->sc_lastcmd = (i + 1) % NCMD;
+		return(mp);
+	}
+	return(NULL);
+}
+
+udread(dev)
+dev_t dev;
+{
+	register int unit = minor(dev) >> 3;
+
+	if (unit >= NRA)
+		u.u_error = ENXIO;
+	else
+		physio(udstrategy, &rudbuf[unit], dev, B_READ, minphys);
+}
+
+udwrite(dev)
+dev_t dev;
+{
+	register int unit = minor(dev) >> 3;
+
+	if (unit >= NRA)
+		u.u_error = ENXIO;
+	else
+		physio(udstrategy, &rudbuf[unit], dev, B_WRITE, minphys);
+}
+
+udreset(uban)
+int uban;
+{
+	register struct uba_ctlr *um;
+	register struct uba_device *ui;
+	register struct buf *bp, *dp;
+	register int unit;
+	struct buf *nbp;
+	int d;
+
+	for (d = 0; d < NUDA; d++) {
+		if ((um = udminfo[d]) == 0 || um->um_ubanum != uban ||
+		    um->um_alive == 0)
+			continue;
+		printf(" uda%d", d);
+		um->um_tab.b_active = 0;
+		um->um_tab.b_actf = um->um_tab.b_actl = 0;
+		for (unit = 0; unit < NRA; unit++) {
+			if ((ui = uddinfo[unit]) == 0)
+				continue;
+			if (ui->ui_alive == 0 || ui->ui_mi != um)
+				continue;
+			udutab[unit].b_active = 0;
+			udutab[unit].b_qsize = 0;
+		}
+		for (bp = udwtab[d].av_forw; bp != &udwtab[d]; bp = nbp) {
+			nbp = bp->av_forw;
+			ubarelse(uban, (int *)&bp->b_ubinfo);
+			/*
+			 * Link the buffer onto the drive queue
+			 */
+			dp = &udutab[dkunit(bp)];
+			if (dp->b_actf == 0)
+				dp->b_actf = bp;
+			else
+				dp->b_actl->av_forw = bp;
+			dp->b_actl = bp;
+			bp->av_forw = 0;
+			/*
+			 * Link the drive onto the controller queue
+			 */
+			if (dp->b_active == 0) {
+				dp->b_forw = NULL;
+				if (um->um_tab.b_actf == NULL)
+					um->um_tab.b_actf = dp;
+				else
+					um->um_tab.b_actl->b_forw = dp;
+				um->um_tab.b_actl = dp;
+				dp->b_active = 1;
+			}
+		}
+		udinit(d);
+	}
+}
+
+#define DBSIZE 32
+
+#define ca_Rspdsc	ca_rspdsc[0]
+#define ca_Cmddsc	ca_rspdsc[1]
+#define uda_Rsp		uda_rsp[0]
+#define uda_Cmd		uda_cmd[0]
+
+uddump(dev)
+dev_t dev;
+{
+	struct udadevice *udaddr;
+	struct uda *ud_ubaddr;
+	char *start;
+	int num, blk, unit;
+	int maxsz;
+	int blkoff;
+	register struct uba_regs *uba;
+	register struct uba_device *ui;
+	register struct uda *udp;
+	register struct pte *io;
+	register int i;
+
+	unit = minor(dev) >> 3;
+	if (unit >= NRA)
+		return (ENXIO);
+#define	phys(cast, addr) ((cast)((int)addr & 0x7fffffff))
+	ui = phys(struct uba_device *, uddinfo[unit]);
+	if (ui->ui_alive == 0)
+		return (ENXIO);
+	uba = phys(struct uba_hd *, ui->ui_hd)->uh_physuba;
+	ubainit(uba);
+	udaddr = (struct udadevice *)ui->ui_physaddr;
+	DELAY(2000000);
+	udp = phys(struct uda *, &uda[ui->ui_ctlr]);
+
+	num = btoc(sizeof(struct uda)) + 1;
+	io = &uba->uba_map[NUBMREG-num];
+	for(i = 0; i<num; i++)
+		*(int *)io++ = UBAMR_MRV|(btop(udp)+i);
+	ud_ubaddr = (struct uda *)(((int)udp & PGOFSET)|((NUBMREG-num)<<9));
+
+	udaddr->udaip = 0;
+	while ((udaddr->udasa & UDA_STEP1) == 0)
+		if(udaddr->udasa & UDA_ERR) return(EFAULT);
+	udaddr->udasa = UDA_ERR;
+	while ((udaddr->udasa & UDA_STEP2) == 0)
+		if(udaddr->udasa & UDA_ERR) return(EFAULT);
+	udaddr->udasa = (short)&ud_ubaddr->uda_ca.ca_ringbase;
+	while ((udaddr->udasa & UDA_STEP3) == 0)
+		if(udaddr->udasa & UDA_ERR) return(EFAULT);
+	udaddr->udasa = (short)(((int)&ud_ubaddr->uda_ca.ca_ringbase) >> 16);
+	while ((udaddr->udasa & UDA_STEP4) == 0)
+		if(udaddr->udasa & UDA_ERR) return(EFAULT);
+	udaddr->udasa = UDA_GO;
+	udp->uda_ca.ca_Rspdsc = (long)&ud_ubaddr->uda_Rsp.mscp_cmdref;
+	udp->uda_ca.ca_Cmddsc = (long)&ud_ubaddr->uda_Cmd.mscp_cmdref;
+	udp->uda_Cmd.mscp_cntflgs = 0;
+	udp->uda_Cmd.mscp_version = 0;
+	if (udcmd(M_OP_STCON, udp, udaddr) == 0) {
+		return(EFAULT);
+	}
+	udp->uda_Cmd.mscp_unit = ui->ui_slave;
+	if (udcmd(M_OP_ONLIN, udp, udaddr) == 0) {
+		return(EFAULT);
+	}
+
+	num = maxfree;
+	start = 0;
+	/* For dump code, we might not know what type drive is, use RA80 */
+	maxsz = ra_sizes[RA80][minor(dev)&07].nblocks;
+	blkoff = ra_sizes[RA80][minor(dev)&07].blkoff;
+	if(maxsz < 0)
+		maxsz = radsize[unit]-blkoff;
+	if (dumplo < 0 || dumplo + num >= maxsz)
+		return (EINVAL);
+	blkoff += dumplo;
+	while (num > 0) {
+		blk = num > DBSIZE ? DBSIZE : num;
+		io = uba->uba_map;
+		for (i = 0; i < blk; i++)
+			*(int *)io++ = (btop(start)+i) | UBAMR_MRV;
+		*(int *)io = 0;
+		udp->uda_Cmd.mscp_lbn = btop(start) + blkoff;
+		udp->uda_Cmd.mscp_unit = ui->ui_slave;
+		udp->uda_Cmd.mscp_bytecnt = blk*NBPG;
+		udp->uda_Cmd.mscp_buffer = 0;
+		if (udcmd(M_OP_WRITE, udp, udaddr) == 0) {
+			return(EIO);
+		}
+		start += blk*NBPG;
+		num -= blk;
+	}
+	return (0);
+}
+
+udcmd(op, udp, udaddr)
+int op;
+register struct uda *udp;
+struct udadevice *udaddr;
+{
+	int i;
+
+	udp->uda_Cmd.mscp_opcode = op;
+	udp->uda_Rsp.mscp_header.uda_msglen = sizeof (struct mscp);
+	udp->uda_Cmd.mscp_header.uda_msglen = sizeof (struct mscp);
+	udp->uda_ca.ca_Rspdsc |= UDA_OWN|UDA_INT;
+	udp->uda_ca.ca_Cmddsc |= UDA_OWN|UDA_INT;
+	i = udaddr->udaip;
+	for (;;) {
+		if (udp->uda_ca.ca_cmdint)
+			udp->uda_ca.ca_cmdint = 0;
+		if (udp->uda_ca.ca_rspint)
+			break;
+	}
+	udp->uda_ca.ca_rspint = 0;
+	if (udp->uda_Rsp.mscp_opcode != (op|M_OP_END) ||
+	    (udp->uda_Rsp.mscp_status&M_ST_MASK) != M_ST_SUCC) {
+		if(udaddr->udasa&UDA_ERR)
+			printf("error: udasa 0x%x\ndump ", udaddr->udasa);
+		printf("error: com %d opc 0x%x stat 0x%x\ndump ",
+			op,
+			udp->uda_Rsp.mscp_opcode,
+			udp->uda_Rsp.mscp_status);
+		return(0);
+	}
+	return(1);
+}
+#undef uda_Cmd
+#undef uda_Rsp
+#undef uda_Rspdsc
+#undef uda_Cmddsc
+
+#endif
+---------------------------------h/udareg.h---------------------------------
+/*	udareg.h	81/10/26	1.1	*/
+/*
+ * UDA-50 registers and structures
+ */
+
+struct udadevice {
+	short	udaip;		/* initialization and polling */
+	short	udasa;		/* status and address */
+};
+
+#define	UDA_ERR		0100000	/* error bit */
+#define	UDA_STEP4	0040000	/* step 4 has started */
+#define	UDA_STEP3	0020000	/* step 3 has started */
+#define	UDA_STEP2	0010000	/* step 2 has started */
+#define	UDA_STEP1	0004000	/* step 1 has started */
+#define	UDA_NV		0002000	/* no host settable interrupt vector */
+#define	UDA_QB		0001000	/* controller supports Q22 bus */
+#define	UDA_DI		0000400	/* controller implements diagnostics */
+#define	UDA_IE		0000200	/* interrupt enable */
+#define	UDA_PI		0000001	/* host requests adapter purge interrupts */
+#define	UDA_GO		0000001	/* start operation, after init */
+
+
+/*
+ * UDA Communications Area
+ */
+
+struct udaca {
+	short	ca_xxx1;	/* unused */
+	char	ca_xxx2;	/* unused */
+	char	ca_bdp;		/* BDP to purge */
+	short	ca_cmdint;	/* command queue transition interrupt flag */
+	short	ca_rspint;	/* response queue transition interrupt flag */
+	long	ca_rspdsc[NRSP];/* response descriptors */
+	long	ca_cmddsc[NCMD];/* command descriptors */
+};
+
+#define	ca_ringbase	ca_rspdsc[0]
+
+#define	UDA_OWN	0x80000000	/* UDA owns this descriptor */
+#define	UDA_INT	0x40000000	/* allow interrupt on ring transition */
+
+/*
+ * MSCP packet info
+ */
+struct mscp_header {
+	short	uda_msglen;	/* length of MSCP packet */
+	char	uda_credits;	/* low 4 bits: credits, high 4 bits: msgtype */
+	char	uda_vcid;	/* virtual circuit id */
+};
+
+#define	UDA_MSGTYPE_SEQ		0x00	/* Sequential message */
+#define	UDA_MSGTYPE_DATAGRAM	0x10	/* Datagram */
+#define	UDA_MSGTYPE_CREDITS	0x20	/* Credit notification */
+#define	UDA_MSGTYPE_MAINTENANCE	0xf0	/* Who knows */
+-------------------------------h/mscp.h------------------------------------
+/*	mscp.h	81/10/26	1.1	*/
+/*
+ * Definitions for the Mass Storage Control Protocol
+ */
+
+
+/*
+ * Control message opcodes
+ */
+#define	M_OP_ABORT	0001	/* Abort command */
+#define	M_OP_GTCMD	0002	/* Get command status command */
+#define	M_OP_GTUNT	0003	/* Get unit status command */
+#define	M_OP_STCON	0004	/* Set controller characteristics command */
+#define	M_OP_SEREX	0007	/* Serious exception end message */
+#define	M_OP_AVAIL	0010	/* Available command */
+#define	M_OP_ONLIN	0011	/* Online command */
+#define	M_OP_STUNT	0012	/* Set unit characteristics command */
+#define	M_OP_DTACP	0013	/* Determine access paths command */
+#define	M_OP_ACCES	0020	/* Access command */
+#define	M_OP_CMPCD	0021	/* Compare controller data command */
+#define	M_OP_ERASE	0022	/* Erase command */
+#define	M_OP_FLUSH	0023	/* Flush command */
+#define	M_OP_REPLC	0024	/* Replace command */
+#define	M_OP_COMP	0040	/* Compare host data command */
+#define	M_OP_READ	0041	/* Read command */
+#define	M_OP_WRITE	0042	/* Write command */
+#define	M_OP_AVATN	0100	/* Available attention message */
+#define	M_OP_DUPUN	0101	/* Duplicate unit number attention message */
+#define	M_OP_ACPTH	0102	/* Access path attention message */
+#define	M_OP_END	0200	/* End message flag */
+
+
+/*
+ * Generic command modifiers
+ */
+#define	M_MD_EXPRS	0100000		/* Express request */
+#define	M_MD_COMP	0040000		/* Compare */
+#define	M_MD_CLSEX	0020000		/* Clear serious exception */
+#define	M_MD_ERROR	0010000		/* Force error */
+#define	M_MD_SCCHH	0004000		/* Suppress caching (high speed) */
+#define	M_MD_SCCHL	0002000		/* Suppress caching (low speed) */
+#define	M_MD_SECOR	0001000		/* Suppress error correction */
+#define	M_MD_SEREC	0000400		/* Suppress error recovery */
+#define	M_MD_SSHDW	0000200		/* Suppress shadowing */
+#define	M_MD_WBKNV	0000100		/* Write back (non-volatile) */
+#define	M_MD_WBKVL	0000040		/* Write back (volatile) */
+#define	M_MD_WRSEQ	0000020		/* Write shadow set one unit at a time */
+
+/*
+ * AVAILABLE command modifiers
+ */
+#define	M_MD_ALLCD	0000002		/* All class drivers */
+#define	M_MD_SPNDW	0000001		/* Spin down */
+
+/*
+ * FLUSH command modifiers
+ */
+#define	M_MD_FLENU	0000001		/* Flush entire unit */
+#define	M_MD_VOLTL	0000002		/* Volatile only */
+
+/*
+ * GET UNIT STATUS command modifiers
+ */
+#define	M_MD_NXUNT	0000001		/* Next unit */
+
+/*
+ * ONLINE command modifiers
+ */
+#define	M_MD_RIP	0000001		/* Allow self destruction */
+#define	M_MD_IGNMF	0000002		/* Ignore media format error */
+
+/*
+ * ONLINE and SET UNIT CHARACTERISTICS command modifiers
+ */
+#define	M_MD_ALTHI	0000040		/* Alter host identifier */
+#define	M_MD_SHDSP	0000020		/* Shadow unit specified */
+#define	M_MD_CLWBL	0000010		/* Clear write-back data lost */
+#define	M_MD_STWRP	0000004		/* Set write protect */
+
+/*
+ * REPLACE command modifiers
+ */
+#define	M_MD_PRIMR	0000001		/* Primary replacement block */
+
+
+/*
+ * End message flags
+ */
+#define	M_EF_BBLKR	0200	/* Bad block reported */
+#define	M_EF_BBLKU	0100	/* Bad block unreported */
+#define	M_EF_ERLOG	0040	/* Error log generated */
+#define	M_EF_SEREX	0020	/* Serious exception */
+
+
+/*
+ * Controller flags
+ */
+#define	M_CF_ATTN	0200	/* Enable attention messages */
+#define	M_CF_MISC	0100	/* Enable miscellaneous error log messages */
+#define	M_CF_OTHER	0040	/* Enable other host's error log messages */
+#define	M_CF_THIS	0020	/* Enable this host's error log messages */
+#define	M_CF_MLTHS	0004	/* Multi-host */
+#define	M_CF_SHADW	0002	/* Shadowing */
+#define	M_CF_576	0001	/* 576 byte sectors */
+
+
+/*
+ * Unit flags
+ */
+#define	M_UF_REPLC	0100000		/* Controller initiated bad block replacement */
+#define	M_UF_INACT	0040000		/* Inactive shadow set unit */
+#define	M_UF_WRTPH	0020000		/* Write protect (hardware) */
+#define	M_UF_WRTPS	0010000		/* Write protect (software or volume) */
+#define	M_UF_SCCHH	0004000		/* Suppress caching (high speed) */
+#define	M_UF_SCCHL	0002000		/* Suppress caching (low speed) */
+#define	M_UF_RMVBL	0000200		/* Removable media */
+#define	M_UF_WBKNV	0000100		/* Write back (non-volatile) */
+#define	M_UF_576	0000004		/* 576 byte sectors */
+#define	M_UF_CMPWR	0000002		/* Compare writes */
+#define	M_UF_CMPRD	0000001		/* Compare reads */
+
+
+/*
+ * Status codes
+ */
+#define	M_ST_MASK	037		/* Status code mask */
+#define	M_ST_SUCC	000		/* Success */
+#define	M_ST_ICMD	001		/* Invalid command */
+#define	M_ST_ABRTD	002		/* Command aborted */
+#define	M_ST_OFFLN	003		/* Unit offline */
+#define	M_ST_AVLBL	004		/* Unit available */
+#define	M_ST_MFMTE	005		/* Media format error */
+#define	M_ST_WRTPR	006		/* Write protected */
+#define	M_ST_COMP	007		/* Compare error */
+#define	M_ST_DATA	010		/* Data error */
+#define	M_ST_HSTBF	011		/* Host buffer access error */
+#define	M_ST_CNTLR	012		/* Controller error */
+#define	M_ST_DRIVE	013		/* Drive error */
+#define	M_ST_DIAG	037		/* Message from an internal diagnostic */
+
+/*
+ *  Sub-codes of M_ST_SUCC
+ */
+#define	M_ST_SUCC_SPINDOWN	(1*040)	/* Spin-down Ignored */
+#define	M_ST_SUCC_CONNECTED	(2*040)	/* Still Connected */
+#define	M_ST_SUCC_DUPLICATE	(4*040)	/* Duplicate Unit Number */
+#define	M_ST_SUCC_ONLINE	(8*040)	/* Already Online */
+#define	M_ST_SUCC_STILLONLINE	(16*040)/* Still Online */
+
+/*
+ *  Sub-codes of M_ST_ICMD
+ */
+#define	M_ST_ICMD_LENGTH	(0*040)	/* Invalid Message Length */
+
+/*
+ *  Sub-codes of M_ST_OFFLN
+ */
+#define	M_ST_OFFLN_UNKNOWN	(0*040)	/* Unknown on online to another ctlr */
+#define	M_ST_OFFLN_UNMOUNTED	(1*040)	/* Unmounted or run/stop at stop */
+#define	M_ST_OFFLN_INOPERATIVE	(2*040)	/* Inoperative? */
+#define	M_ST_OFFLN_DUPLICATE	(4*040)	/* Duplicate Unit Number */
+#define	M_ST_OFFLN_DISABLED	(8*040)	/* Disabled by FS or diagnostic */
+
+/*
+ *  Sub-codes of M_ST_WRTPR
+ */
+#define	M_ST_WRTPR_HARDWARE	(256*040)/* Hardware Write Protect */
+#define	M_ST_WRTPR_SOFTWARE	(128*040)/* Software Write Protect */
+
+typedef	short	quad[4];		/* a word-aligned quadword */
+
+/*
+ * An MSCP packet
+ */
+
+struct mscp {
+	struct	mscp_header mscp_header;/* device specific header */
+	long	mscp_cmdref;		/* command reference number */
+	short	mscp_unit;		/* unit number */
+	short	mscp_xxx1;		/* unused */
+	u_char	mscp_opcode;		/* opcode */
+	u_char	mscp_flags;		/* end message flags */
+	short	mscp_modifier;		/* modifiers */
+	union {
+	struct {
+		long	Mscp_bytecnt;	/* byte count */
+		long	Mscp_buffer;	/* buffer descriptor */
+		long	Mscp_xxx2[2];	/* unused */
+		long	Mscp_lbn;	/* logical block number */
+		long	Mscp_xxx4;	/* unused */
+		long	*Mscp_dscptr;	/* pointer to descriptor (software) */
+		long	Mscp_sftwds[4];	/* software words, padding */
+	} mscp_generic;
+	struct {
+		short	Mscp_version;	/* MSCP version */
+		short	Mscp_cntflgs;	/* controller flags */
+		short	Mscp_hsttmo;	/* host timeout */
+		short	Mscp_usefrac;	/* use fraction */
+		long	Mscp_time;	/* time and date */
+	} mscp_setcntchar;
+	struct {
+		short	Mscp_multunt;	/* multi-unit code */
+		short	Mscp_unitflgs;	/* unit flags */
+		long	Mscp_hostid;	/* host identifier */
+		quad	Mscp_unitid;	/* unit identifier */
+		long	Mscp_mediaid;	/* media type identifier */
+		short	Mscp_shdwunt;	/* shadow unit */
+		short	Mscp_shdwsts;	/* shadow status */
+		short	Mscp_track;	/* track size */
+		short	Mscp_group;	/* group size */
+		short	Mscp_cylinder;	/* cylinder size */
+		short	Mscp_xxx3;	/* reserved */
+		short	Mscp_rctsize;	/* RCT table size */
+		char	Mscp_rbns;	/* RBNs / track */
+		char	Mscp_rctcpys;	/* RCT copies */
+	} mscp_getunitsts;
+	} mscp_un;
+};
+
+/*
+ * generic packet
+ */
+
+#define	mscp_bytecnt	mscp_un.mscp_generic.Mscp_bytecnt
+#define	mscp_buffer	mscp_un.mscp_generic.Mscp_buffer
+#define	mscp_lbn	mscp_un.mscp_generic.Mscp_lbn
+#define	mscp_dscptr	mscp_un.mscp_generic.Mscp_dscptr
+#define	mscp_sftwds	mscp_un.mscp_generic.Mscp_sftwds
+#define	mscp_status	mscp_modifier
+
+/*
+ * Abort / Get Command Status packet
+ */
+
+#define	mscp_outref	mscp_bytecnt
+
+/*
+ * Online / Set Unit Characteristics packet
+ */
+
+#define	mscp_errlgfl	mscp_lbn
+#define	mscp_copyspd	mscp_shdwsts
+
+/*
+ * Replace packet
+ */
+
+#define	mscp_rbn	mscp_bytecnt
+
+/*
+ * Set Controller Characteristics packet
+ */
+
+#define	mscp_version	mscp_un.mscp_setcntchar.Mscp_version
+#define	mscp_cntflgs	mscp_un.mscp_setcntchar.Mscp_cntflgs
+#define	mscp_hsttmo	mscp_un.mscp_setcntchar.Mscp_hsttmo
+#define	mscp_usefrac	mscp_un.mscp_setcntchar.Mscp_usefrac
+#define	mscp_time	mscp_un.mscp_setcntchar.Mscp_time
+
+/*
+ * Get Unit Status end packet
+ */
+
+#define	mscp_multunt	mscp_un.mscp_getunitsts.Mscp_multunt
+#define	mscp_unitflgs	mscp_un.mscp_getunitsts.Mscp_unitflgs
+#define	mscp_hostid	mscp_un.mscp_getunitsts.Mscp_hostid
+#define	mscp_unitid	mscp_un.mscp_getunitsts.Mscp_unitid
+#define	mscp_mediaid	mscp_un.mscp_getunitsts.Mscp_mediaid
+#define	mscp_shdwunt	mscp_un.mscp_getunitsts.Mscp_shdwunt
+#define	mscp_shdwsts	mscp_un.mscp_getunitsts.Mscp_shdwsts
+#define	mscp_track	mscp_un.mscp_getunitsts.Mscp_track
+#define	mscp_group	mscp_un.mscp_getunitsts.Mscp_group
+#define	mscp_cylinder	mscp_un.mscp_getunitsts.Mscp_cylinder
+#define	mscp_rctsize	mscp_un.mscp_getunitsts.Mscp_rctsize
+#define	mscp_rbns	mscp_un.mscp_getunitsts.Mscp_rbns
+#define	mscp_rctcpys	mscp_un.mscp_getunitsts.Mscp_rctcpys
+
+/*
+ * Online / Set Unit Characteristics end packet
+ */
+
+#define	mscp_untsize	mscp_dscptr
+#define	mscp_volser	mscp_sftwds[0]
+
+/*
+ * Set Controller Characteristics end packet
+ */
+
+#define	mscp_cnttmo	mscp_hsttmo
+#define	mscp_cntcmdl	mscp_usefrac
+#define	mscp_cntid	mscp_unitid
+
+
+/*
+ * Error Log message format codes
+ */
+#define	M_FM_CNTERR	0	/* Controller error */
+#define	M_FM_BUSADDR	1	/* Host memory access error */
+#define	M_FM_DISKTRN	2	/* Disk transfer error */
+#define	M_FM_SDI	3	/* SDI error */
+#define	M_FM_SMLDSK	4	/* Small disk error */
+
+/*
+ * Error Log message flags
+ */
+#define	M_LF_SUCC	0200	/* Operation successful */
+#define	M_LF_CONT	0100	/* Operation continuing */
+#define	M_LF_SQNRS	0001	/* Sequence number reset */
+
+/*
+ * MSCP Error Log packet
+ *
+ *	NOTE: MSCP packet must be padded to this size.
+ */
+
+struct mslg {
+	struct	mscp_header mslg_header;/* device specific header */
+	long	mslg_cmdref;		/* command reference number */
+	short	mslg_unit;		/* unit number */
+	short	mslg_seqnum;		/* sequence number */
+	u_char	mslg_format;		/* format */
+	u_char	mslg_flags;		/* error log message flags */
+	short	mslg_event;		/* event code */
+	quad	mslg_cntid;		/* controller id */
+	u_char	mslg_cntsvr;		/* controller software version */
+	u_char	mslg_cnthvr;		/* controller hardware version */
+	short	mslg_multunt;		/* multi-unit code */
+	quad	mslg_unitid;		/* unit id */
+	u_char	mslg_unitsvr;		/* unit software version */
+	u_char	mslg_unithvr;		/* unit hardware version */
+	short	mslg_group;		/* group */
+	long	mslg_volser;		/* volume serial number */
+	long	mslg_cylinder;		/* cylinder */
+	short	mslg_track;		/* track */
+	short	mslg_sector;		/* sector */
+	long	mslg_lbn;		/* logical block number */
+	u_char	mslg_level;		/* level */
+	u_char	mslg_retry;		/* retry */
+};
+
+#define	mslg_busaddr	mslg_unitid
+#define	mslg_sdecyl	mslg_group
+-------------------------------Bug fixes in /usr/src/cmd/config/* to
+allow wildcards in unibus devices-------------------------------------------
+*** config.y	Tue Oct  4 11:23:37 1983
+--- /usr/distr/4.1//usr/src/cmd/config/config.y	Wed Jul  8 18:44:35 1981
+  newdev(dp)
+  register struct device *dp;
+  {
+  	register struct device *np;
+  
+  	np = (struct device *) malloc(sizeof *np);
+  	*np = *dp;
+  	if (curp == NULL)
+  		dtab = np;
+  	else
+  		curp->d_next = np;
+  	curp = np;
+-	curp->d_next = NULL;      <--------------Add this line
+  }
+*** mkioconf.c	Tue Oct  4 11:46:36 1983
+--- /usr/distr/4.1//usr/src/cmd/config/mkioconf.c	Thu Jul  9 03:51:33 1981
+      /*
+       * Now spew forth the uba_minfo structure
+       */
+      fprintf(fp, "\nstruct uba_ctlr ubminit[] = {\n");
+      fprintf(fp, "/*\t driver,\tctlr,\tubanum,\talive,\tintr,\taddr */\n");
+      for (dp = dtab; dp != NULL; dp = dp->d_next) {
+  	mp = dp->d_conn;
+! 	if (dp->d_unit == QUES ||
+! 	    dp->d_type != CONTROLLER ||
+! 	    mp == TO_NEXUS ||
+! 	    mp == NULL ||
+! 	    !eq(mp->d_name, "uba"))
+! 		continue;
+  	if (dp->d_vec == 0) {
+  		printf("must specify vector for %s%d\n", dp->d_name, dp->d_unit);
+  		continue;
+  	}
+
+-------------------------------------
+      /*
+       * Now spew forth the uba_minfo structure
+       */
+      fprintf(fp, "\nstruct uba_ctlr ubminit[] = {\n");
+      fprintf(fp, "/*\t driver,\tctlr,\tubanum,\talive,\tintr,\taddr */\n");
+      for (dp = dtab; dp != NULL; dp = dp->d_next) {
+  	mp = dp->d_conn;
+! 	if (dp->d_type != CONTROLLER || mp == TO_NEXUS || mp == NULL || !eq(mp->d_name, "uba"))
+! 	    continue;
+  	if (dp->d_vec == 0) {
+  	    printf("must specify vector for %s%d\n", dp->d_name, dp->d_unit);
+  	    continue;
+  	}
+
+

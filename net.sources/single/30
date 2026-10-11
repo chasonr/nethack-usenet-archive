@@ -1,0 +1,2022 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,d15057be6e516a47,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1982-06-11 02:46:03 PST
+Message-ID: <bnews.duke.2205>
+Newsgroups: net.sources
+Path: utzoo!decvax!harpo!duke!ndd
+X-Path: utzoo!decvax!harpo!duke!ndd
+From: duke!ndd
+Date: Fri Jun 11 05:45:55 1982
+Subject: processor status display
+X-Google-Info: Converted from the original B-News header
+Posted: Thu Jun 10 12:01:04 1982
+Received: Fri Jun 11 05:45:55 1982
+
+
+This is the source code for the processor status display program.
+Included is the code for the terminal routines that were used; you
+may prefer to switch to the standard termcap stuff.
+
+
+/*********************************************************
+ *                                                       *
+ *        U N I X   S T A T U S   D I S P L A Y          *
+ *     *******************************************       *
+ *                                                       *
+ *     This is a project to graphically display memory   *
+ *  allocation and task activity on the UNIX system.     *
+ *                                                       *
+ *  PURPOSE:                                             *
+ *                                                       *
+ *     Its purpose is to provide for the general user    *
+ *  a snapshot of all currently active tasks.  The       *
+ *  information displayed is the process name, its       *
+ *  status, location in memory, type of text.  This      *
+ *  information is displayed for each active task.       *
+ *  It is updated as often as the user specifies or      *
+ *  once every second as default.                        *
+ *                                                       *
+ *                                       H. Deas         *
+ *                                       R. Freeman      *
+ *                                       N. Danieley     *
+ *                                       J. Dallen       *
+ *                                                       *
+ *********************************************************/
+
+/*
+ * Compile line: cc -n -s -O disp.c -lterm -o disp
+ *
+ * lterm should be replaced with the name of the archived library
+ * of cursor routines.
+ */
+
+#include <stdio.h>
+#include <a.out.h>
+#include <core.h>
+#include <sys/param.h>
+#include <sys/proc.h>
+#include <sys/tty.h>
+#include <sys/dir.h>
+#include <sys/user.h>
+#include <sys/text.h>
+#include <pwd.h>
+#include <time.h>
+#include <sys/timeb.h>
+
+/*****                                   *****
+ *****         G L O B A L               *****
+ *****   D E C L A R A T I O N S         *****
+ *****                                   *****
+ *****                                   *****/
+
+/*  following declarations inserted by R. freeman */
+
+#define HEADQ 0         /* head of queue pointer          */
+#define TRUE 0
+#define FALSE 1
+           /*  memory allocation symbols */
+#define DASH '-'        /*         normal text            */
+#define KARAT '^'       /*        read-only text          */
+#define EQUAL '='       /*     separate instr. & data     */
+#define PLUS '+'        /*        overlay text            */
+
+/*  following declarations inserted by H. Deas  */
+
+#define UPPER 30        /* upper limit for update rate    */
+#define LOWER 1         /* lower limit for update rate    */
+#define DEF_RATE 1      /* default update rate            */
+#define DEF_GSIZ 64     /* default grain size (bytes)     */
+#define DEF_STARTD 0    /* default display start address  */
+#define DEF_INV 2.      /* default inverse power of 2 for */
+                        /* grain size option              */
+#define MIN_SZ 4	/* minimum grain size (bytes) */
+#define MIN_SZ2 2	/* minimum grain size (power of two */
+#define MAX_SZ2 6	/* maximum grain size (power of two */
+#define LOCK 1          /* constant to lock this in core  */
+#define UNLOCK 0        /* constant to unlock from core   */
+#define MAXSECS 300     /* constant for prompt at end of  */
+                        /* certain time to keep display   */
+                        /* going                          */
+
+
+/*  following declarations inserted by Ned Danieley  */
+
+#define   ASL1    12    /* first asterisk line value */
+#define   ASL2    23    /* second asterisk line value */
+#define   NUML1   13    /* first number line value */
+#define   NUML2   24    /* second number line value */
+#define   DISPL    1    /* heading line value */
+#define   DISPST  25    /* heading column value */
+#define   TIMEST   9    /* time display column value */
+#define   SWAPL    3    /* swap heading line value */
+#define   SWAPST  71    /* swap heading column value */
+#define   ASEXT   64    /* length of line of asterisks */
+#define   INCR    16    /* increment for memory numbering */
+#define   SYMST1  11    /* first symbol line value */
+#define   SYMST2  22    /* second symbol line value */
+#define   NAMEST1  4    /* upper job name line value */
+#define   NAMEST2 15    /* lower job name line value */
+#define   SWJOB    6
+#define   SPACING  8    /* number of * between numbers */
+#define   HIMEM  256    /* top of memory in current system */
+#define   HALF   128    /* half of current memory */
+
+
+
+/* structures used in extracting data from system */
+struct nlist nl[] = {    /* namelist structure  */
+     { "_proc" },
+     { "_swapdev" },
+     { "_swplo" },
+     { "" },
+     };
+struct proc proc[NPROC];        /* process table structure */
+struct user u;                  /* user segment structure  */
+struct process{                 /* process information structure */
+               short start;     /* process start position in words */
+               short psize;     /* process size in words */
+               short pid;       /* process id number */
+               long addr;       /* process address in memory */
+               char pname[8];   /* process name */
+               char flag;       /* location flag (in memory or swapped */
+               char memflag;    /* type of process memory utilization */
+               int rlink;       /* pointer to next process */
+              };
+/* Structure used to transfer data from dtc module to display */
+struct process olist[NPROC*2];
+struct process procq[2][NPROC];
+/* pointers to /dev/mem & /dev/pprocmem respectively */
+char *coref;
+char *coref1;
+char swapflag;	/* flag used to indicate change in swap list */
+char system[] = "sys-schr";
+char unknown[] = "unknown";
+/* file descriptor variables */
+int mem;
+int pmem;
+int swmem;
+int swap;
+char *getptr();        /* function used to find process name */
+daddr_t swplo;
+int psub;              /* process queue subscript */
+int prear;             /* pointer to last entry in process queue */
+long lseek();
+int firsttime;          /* global variable to denote first cycle */
+int file;
+int olist_ptr;		/* Pointer for output list */
+int b_ptr;		/* Pointer for section of output list */
+int term;
+
+
+
+
+/**********************************************************
+ *                                                        *
+ *  ABSTRACT:  main                                       *
+ *                                                        *
+ *     This is the main driver module for the UNIX status *
+ *  display project.  It basically performs the follow-   *
+ *  ing functions:                                        *
+ *                                                        *
+ *          (1) sets up initial conditions for            *
+ *              the terminal                              *
+ *                                                        *
+ *          (2) sets up initial parameters for            *
+ *              all other modules                         *
+ *                                                        *
+ *          (3) checks to see if optional options         *
+ *              were specified and if so prompts          *
+ *              for each of:  update rate, grain          *
+ *              size, and starting address for the        *
+ *              display.  If not, this driver sets        *
+ *              update rate, grain size and start-        *
+ *              ing address to their respective           *
+ *              default values.                           *
+ *                                                        *
+ *          (4) initiates start of first cycle            *
+ *              through the program                       *
+ *                                                        *
+ *          (5) records time for start of cycle           *
+ *                                                        *
+ *          (6) calls extract, dtc, and display           *
+ *              to perform their hidden secrets           *
+ *                                                        *
+ *          (7) checks time now to see if sleeping        *
+ *              is required to correspond to update       *
+ *              rate specified or default                 *
+ *                                                        *
+ *          (8) checks overall time to see if             *
+ *              MAXSECS has elapsed.  If so,              *
+ *              prompt for continuation.  If              *
+ *              not, repeat steps 5 - 8 above.            *
+ *                                                        *
+ *  CALLING SEQUENCE:                                     *
+ *                                                        *
+ *     This is the main routine and is invoked by exe-    *
+ *  cution.                                               *
+ *                                                        *
+ *  SUBROUTINES:                                          *
+ *                                                        *
+ *     lock() - locks program in core during exe-         *
+ *              cution                                    *
+
+ *     time() - returns the system time value in          *
+ *              seconds                                   *
+ *                                                        *
+ *     extract() - extracts the process informa-          *
+ *              tion from system tables, etc.             *
+ *                                                        *
+ *     dtc() - transform data and compare and put         *
+ *              in a format acceptable to display         *
+ *                                                        *
+ *     display() - display information for this           *
+ *              cycle                                     *
+ *                                                        *
+ *                                                        *
+ *                                       Happy Deas       *
+ *                                                        *
+ **********************************************************/
+
+main(argc,argv)
+int argc;
+char *argv[];
+{
+
+long time();              /* system utility to return time of day */
+long lasttime;            /* time at start of current cycle       */
+long newtime;             /* time at end of current cycle         */
+long starttime;           /* time at start of overall program     */
+int rate;                 /* update rate                          */
+int flip;                 /* value to denote old or new list      */
+int tired;                /* secs to sleep after each cycle       */
+int grainsz;              /* grain size (in bytes)                */
+int startd;               /* starting address for display         */
+int copy;                 /* copy of grain size for output        */
+int gsize2;               /* grain size in a power of two         */
+float inv;                /* inverse power of 2 of grain size     */
+int saveg;                /* copy of grainsz to manipulate        */
+int reset;                /* flag to denote start or restart      */
+int i;                    /* loop variable                        */
+char c;                   /* input character                      */
+char input[30];           /* input line for interactive part      */
+
+/* setup for buffering of data to increase speed and efficiency */
+
+setbuf( stdout,SYSBUF );
+
+/*  set firsttime to denote first cycle  */
+
+firsttime = 0;
+
+/*  find out what type of terminal we're running on  */
+
+setterm();
+
+/*  reset denotes start of program or restart after time prompt  */
+
+reset = 1;
+
+/*  flip flips between 0 and 1 and denotes which is the current struc- *
+ *  ture being used.  There is an old and a new structure    */
+
+flip = 1;
+
+/*  issue a system call to lock this program in main memory  */
+
+lock(LOCK);
+
+/*  check if optional parameters were specified, and if not *
+ *  set variables to their respective default values.       */
+
+if (argc == 1) {
+                rate = DEF_RATE;
+                inv = DEF_INV;
+                startd = DEF_STARTD;
+}
+
+/*  Otherwise, prompt for the update rate, grain size and starting *
+ *  address for display.                                           */
+
+else {
+      erase();
+      cursor(5,5);
+
+      printf("** Please enter update rate in seconds for display. Enter a \n");
+      printf("integer number between 1 - 30 followed by a return.\n");
+      printf("** For default of 1 second hit return\n");
+
+      fflush (stdout);
+
+      /*  read in a line of input here  */
+
+      i = 0;
+      while((input[i] = getchar()) != '\n') i++;
+      input[i] = '\0';
+
+      /*  if only a return was input, set rate to default  */
+
+      if (i == 0) rate = DEF_RATE;
+
+      else {
+            rate = atoi(input);
+
+            /*  if invalid input, set rate to default value  */
+
+            if ((rate < LOWER) || (rate > UPPER)) {
+                 printf("INVALID UPDATE RATE SPECIFIED, DEF_RATE ");
+                 printf("VALUE OF %d SECONDS IS ASSUMED\n",DEF_RATE);
+                 rate = DEF_RATE;
+            }
+      }
+
+
+      printf("UPDATE RATE IS %d\n",rate);
+
+      fflush( stdout );
+
+      /*  Now prompt for grain size  */
+
+      printf("\n**** Please enter optional grain size (in bytes)\n");
+      printf(" Enter a value between 256 and %d\n",INCR*HIMEM);
+      printf(" For default of %d words = %d bytes, hit return\n",
+	  INCR*HIMEM/2,INCR*HIMEM);
+
+      fflush( stdout );
+
+      /* read in input here */
+
+      i = 0;
+      while ((input[i] = getchar()) != '\n') i++;
+
+      input[i] = '\0';
+
+      /*  if no input was entered, set grainsz to default  */
+
+      if (i == 0) grainsz = DEF_GSIZ;
+
+      /*  Otherwise, convert input to integer and compute  *
+       *  the inverse power of 2 for the grain size which  *
+       *  is needed by the display routine.                */
+
+      else {
+            grainsz = atoi(input);
+
+            saveg = grainsz;
+            grainsz = grainsz >> 6;
+            if (grainsz < MIN_SZ) grainsz = MIN_SZ;
+            if (grainsz > DEF_GSIZ) grainsz = DEF_GSIZ;
+      }
+
+      gsize2 = MAX_SZ2;
+      copy = grainsz;
+      i = 0;
+
+      while (( grainsz & DEF_GSIZ) == 0) {
+              i++;
+              grainsz = grainsz << 1;
+      }
+
+      if ((grainsz & (DEF_GSIZ-1)) != 0) i--;
+      if ((saveg & DEF_GSIZ-1) != 0) gsize2++;
+
+      /*  if input specified was too large, reset it to default  */
+
+      if (gsize2 > MAX_SZ2) gsize2 = MAX_SZ2;
+      gsize2 = gsize2 -i;
+
+      printf("\nEnter STARTING address for display\n");
+      printf("in K words (range 0 to %d)\n",HIMEM-INCR);
+      printf("For default of location 0 hit return\n");
+
+      fflush( stdout );
+
+      /*  Read in input here  */
+
+      i=0;
+      while ((input[i] = getchar()) != '\n') i++;
+      input[i] = '\0';
+
+       /*  If no input was entered, set startd to default  */
+
+      if (i == 0) startd = 0;
+
+      /*  Otherwise, convert input to an integer and check  */
+      /*  for validity also                                 */
+
+      else {
+            startd = atoi(input);
+            if (startd < 0) startd = 0;
+            if (startd > HIMEM-INCR) {
+                               startd = HIMEM-INCR;
+                               gsize2 = 2;
+            }
+       }
+
+       fflush( stdout );
+
+       /*  Now map grain size to an inverse power of 2 for display  */
+
+       if (gsize2 == 1) inv = 1./16.;
+       if (gsize2 == 2) inv = 1./8.;
+       if (gsize2 == 3) inv = 1./4.;
+       if (gsize2 == 4) inv = 1./2.;
+       if (gsize2 == 5) inv = 1.;
+       if (gsize2 == 6) inv = 2.;
+
+       /*  Pause for 5 seconds so interactive results can be digested */
+
+       sleep(5);
+
+}
+
+/*  set up initial screen format here  */
+
+setscr(rate,startd,inv);
+
+/*  Set starttime to be start of first cycle  */
+
+starttime = time(0);
+
+/*  Loop forever here, only to be exited upon request or  *
+ *  after specified time value (MAXSECS)                  */
+
+for (;;) {
+
+          lasttime = time(0);
+
+         /*  Alternate flip between 0 and 1 to designate old  *
+          *  and new structure lists                          */
+
+          if (flip) flip--;
+              else flip++;
+
+              /*  Now call extract to extract most of the data from *
+               *  the system tables and system area                 */
+
+              extract(flip);
+
+              /*  Now call data transformation and compare to format *
+               *  the data for the display routine                   */
+
+              dtc(flip,reset);
+              reset = 0;
+
+              /*  Now display the results of this cycle  */
+
+              display(startd,inv);
+
+     /*  now find out how much time has elapsed  */
+
+              newtime = time(0);
+
+               /*  If program has run longer than MAXSECS then ask  *
+                *  if user wants to see more display.  If after     *
+                *  10 seconds no response is made, exit without     *
+                *  warning.                                         */
+
+              if ((newtime - starttime) > MAXSECS) {
+                   erase();
+                   cursor(10,10);
+                   printf("**  DO YOU WANT DISPLAY TO CONTINUE?? (y or n)\n");
+                   fflush( stdout );
+                   alarm(10);
+                   c = getchar();
+
+                   /*  Check for valid response  */
+
+                   if (c != 'y') {
+                       lock(UNLOCK);
+                       printf("GOODBYE\n");
+                       exit(0);
+                   }
+
+                   alarm(0);
+
+                   /*  Now reset everything to begin whole process again */
+
+                   while (c != '\n') c = getchar();
+                   reset = 1;
+                   starttime = time(0);
+                   setscr(rate,startd,inv);
+              }
+
+              else {
+
+     /*  Now sleep to keep program on update schedule rate if necessary *
+      *  Sleep rate - elapsed time seconds.  If this cycle was too slow *
+      *  don't dilly dally here, go catch up and get back on schedule   */
+                    tired = (rate - (int)(newtime - lasttime));
+                    if (tired > 0) sleep(tired);
+              }
+
+}
+}
+/***********************************************************
+*                       EXTRACT                            *
+*                                                          *
+*  The main function of this module is to extract the re-  *
+*  quired data from the process table. This module calls   *
+*  two additional modules - init() and getdata(). INIT per-*
+*  forms all the necessary initializations and is called   *
+*  the first time EXTRACT is executed. GETDATA retrieves   *
+*  and stores all required information in an array of      *
+*  structures (queue) that is singly linked. This queue is *
+*  then "passed" to the dtc() module for processing. The   *
+*  process table contains a maximum of seventy-five pro-   *
+*  cesses. It is read into an array of structures (struct  *
+*  proc proc[NPROC]). EXTRACT then loops through this array*
+*  and retrieves the necessary data for all active process-*
+*  es except sleeping root processes. Because of time and  *
+*  access efficiency considerations, the memflag and pro-  *
+*  cess name are not acquired at this point.               *
+*                                                          *
+*  arguments used -                                        *
+*      qsub - subscript for process queue (old or new)     *
+*      NOTE: this module stores data in one of two queues  *
+*            as dictated by the MAIN module. This is done  *
+*            to facilitate comparison procedures in the    *
+*            DTC module.                                   *
+*                                                          *
+*                                 Ruby Freeman             *
+*                                                          *
+***********************************************************/
+extract(qsub)
+ int qsub;
+ {
+  struct proc *p;
+  swapflag = ' ';
+  prear = HEADQ;
+  if (firsttime == TRUE)
+    {
+     firsttime = FALSE;
+     init();
+    }
+/* locate dev swap, base of swap, and process table respectively */
+  lseek(mem,(long)nl[1].n_value,0);
+  read(mem,(char*)&nl[1].n_value,sizeof(nl[1].n_value));
+  lseek(mem,(long)nl[2].n_value,0);
+  read(mem,(char*)&swplo,sizeof(swplo));
+  lseek(pmem,(long)nl[0].n_value,0);
+  read(pmem, (char *)proc, sizeof proc);
+  for (p = proc; p < &proc[NPROC]; p++)
+   {
+    if (p->p_stat == 0)
+      continue;
+    if ((p->p_stat == SSLEEP) && p->p_pid == 0)
+      continue;
+    if ((p->p_pgrp == 0) && (p->p_uid == 0))
+      continue;
+    getdata(p,qsub);
+   }
+ }
+/************************************************************
+*                      INIT                                 *
+*  This routine performs all necessary initializations.     *
+*  The following functions are handled by this module -     *
+*                                                           *
+*         a.) obtains the namelist attributes for the       *
+*             following files -                             *
+*             i.) proc                                      *
+*            ii.) swapdev                                   *
+*           iii.) swplo                                     *
+*                                                           *
+*         b.) opens and establishs file descriptors for     *
+*             the following files -                         *
+*             i.) /dev/mem                                  *
+*            ii.) /dev/procmem                              *
+*           iii.) /dev/swap                                 *
+*                                                           *
+*                                  Ruby Freeman             *
+************************************************************/
+init()
+ {
+  if (chdir("/dev") < 0)
+    {
+     fprintf(stderr,"Can't change to /dev\n");
+     exit(1);
+    }
+  nlist("/unix",nl);
+  if (nl[0].n_type == 0)
+    {
+     fprintf(stderr,"No namelist\n");
+     exit(1);
+    }
+/* memory device driver used to read all system files except */
+/* the process table.                                        */
+  coref = "/dev/mem";
+  if ((mem = open(coref, 0)) < 0)
+    {
+     printf("%d\n",mem);
+     fprintf(stderr,"No mem\n");
+     exit(1);
+    }
+/* memory device driver used to read the process table. data */
+/* is transferred in blocks instead of by bytes.             */
+  coref1 = "/dev/procmem";
+  if ((pmem = open(coref1,0)) < 0)
+    {
+     printf("%d\n",pmem);
+     fprintf(stderr,"No Mem\n");
+     exit(1);
+    }
+  swmem = open(coref,0);
+  if ((swap = open("/dev/swap",0)) < 0)
+   {
+    fprintf(stderr,"Can't open /dev/swap\n");
+    exit(1);
+   }
+ }
+long
+round(a, b)
+ long a, b;
+ {
+  long w= ((a+b-1)/b)*b;
+  return(w);
+ }
+struct map
+ {
+  long b1, e1; long f1;
+  long b2, e2; long f2;
+ };
+struct map datmap;
+/***********************************************************
+*                       GETDATA                            *
+*  GETDATA retrieves data (for specified processes) from   *
+*  the array of process structures and stores in the speci-*
+*  fied queue. Memflag is given a temporary value in this  *
+*  module to indicate to that a process is swapped (memflag*
+*  set to 's') or that it is in core (memflag set to 'x'). *
+*                                                          *
+*  arguments used -                                        *
+*      p - pointer to process in process structure for     *
+*          which data should be extracted.                 *
+*      dum - subscript of queue in which extracted process *
+*            data should be stored.                        *
+*                                                          *
+*                                        Ruby Freeman      *
+*                                                          *
+***********************************************************/
+getdata(p,dum)
+ struct proc *p;
+ int dum;
+ {
+  long addr;
+  int opt;
+  psub = (prear + 1) % NPROC;
+  if (psub == 0)
+    psub = 1;
+  prear = psub;
+  procq[dum][psub].start = p->p_addr;
+  procq[dum][psub].psize = p->p_size;
+  procq[dum][psub].pid = p->p_pid;
+  sprintf(procq[dum][psub].pname, "%d",p->p_pid);
+  procq[dum][psub].rlink = HEADQ;
+  procq[dum][psub-1].rlink = psub;
+  procq[dum][psub].flag = p->p_flag;
+  if (p->p_flag & SLOAD)
+    {
+     procq[dum][psub].addr = ctob((long)p->p_addr);
+     procq[dum][psub].memflag = 'x';
+    }
+  else
+    {
+     procq[dum][psub].addr = (p->p_addr+swplo)<<9;
+     procq[dum][psub].memflag = 's';
+    }
+ }
+/***********************************************************
+*                     GETMEM                               *
+*  GETMEM is called by the DTC module. It retrieves the    *
+*  memflag and optionally the process name from the user   *
+*  area for the specified process.                         *
+*                                                          *
+*  arguments used -                                        *
+*         a.) dum - queue subscript (old or new)           *
+*         b.) psub - index of process within the queue     *
+*         c.) nameopt - extract or not extract process     *
+*                       name                               *
+*                                                          *
+*                                   Ruby Freeman           *
+***********************************************************/
+getmem(dum,psub,nameopt)
+ int dum;
+ int psub;
+ int nameopt;
+ {
+  char abuf[512];
+  register int *ip;
+  register char *cp,*cp1;
+  int c,nbad;
+  long txtsiz,datsiz, stksiz;
+  int septxt;
+  int lw = 60;
+  char **ap;
+  if (procq[dum][psub].flag & SLOAD)
+    file = swmem;
+  else
+    {
+     file = swap;
+     swapflag = 's';
+    }
+/* locate process user segment */
+  lseek(file,procq[dum][psub].addr,0);
+  if (read(file,(char *)&u,sizeof(u)) != sizeof(u))
+    {
+     printf("INVALID FILE\n");
+     fprintf(stderr,"NO USER\n");
+     exit(1);
+    }
+/* set up address maps for process user segment */
+/* this information is used to locate the process */
+/* name in its user segment.                      */
+  txtsiz = ctob(u.u_tsize);
+  datsiz = ctob(u.u_dsize);
+  stksiz = ctob(u.u_ssize);
+  septxt = u.u_sep;
+  datmap.b1 = (septxt ? 0 : round(txtsiz,TXTRNDSIZ));
+  datmap.e1 = datmap.b1+datsiz;
+  datmap.f1 = ctob(USIZE)+procq[dum][psub].addr;
+  datmap.b2 = stackbas(stksiz);
+  datmap.e2 = stacktop(stksiz);
+  datmap.f2 = ctob(USIZE)+(datmap.e1-datmap.b1)+procq[dum][psub].addr;
+/* extract memflag data from user segment */
+  switch (u.u_exdata.A.ux_mag)
+    {
+     case A_MAGIC1:
+       procq[dum][psub].memflag = DASH;
+       break;
+     case A_MAGIC2:
+       procq[dum][psub].memflag = KARAT;
+       break;
+     case A_MAGIC3:
+       procq[dum][psub].memflag = EQUAL;
+       break;
+     case A_MAGIC4:
+       procq[dum][psub].memflag = PLUS;
+       break;
+     default:
+       procq[dum][psub].memflag = 'u';
+       break;
+    }
+  if (swapflag == 's')
+    {
+     procq[dum][psub].memflag = swapflag;
+     swapflag = ' ';
+    }
+  if (procq[dum][psub].pid == 0)
+    {
+     strncpy(procq[dum][psub].pname,system,8);
+     return(1);
+    }
+/* if nameopt argument is set, the user segment is searched for */
+/* the process name. It is possible that the process name has   */
+/* been destroyed since the user process has permission to write*/
+/* in the area where it is stored. This routine picks up the    */
+/* first eight characters of what it thinks is the process name.*/
+/* If the process name is determined to be unprintable characters*/
+/* in the DTC module, it is replaced by the process id number to*/
+/* be displayed. Most of this code was taken from the ss.c status*/
+/* program at DUKE UNIVERSITY.                                  */
+/*                                                              */
+/*                                           Ruby Freeman       */
+/*                                                              */
+ if (nameopt == TRUE)
+  {
+     char b[82];
+  procq[dum][psub].addr += ctob((long)procq[dum][psub].psize) - 512;
+  lseek(file,procq[dum][psub].addr+512-sizeof(char **), 0);
+  if (read(file,(char *)&ap, sizeof(char *)) != sizeof(char *))
+    {
+    strncpy(procq[dum][psub].pname,unknown,7);
+    return(1);
+    }
+  if (ap)
+    {
+     char *bp = b;
+     while ((cp = getptr(ap++)) && cp && (bp<b+lw))
+       {
+        nbad = 0;
+        while ((c = getbyte(cp++)) && (bp<bp+lw))
+          {
+            if (c<' ' || c> '~')
+             {
+              if (nbad++>3)
+                break;
+              continue;
+             }
+           *bp++ = c;
+          }
+        *bp++ = ' ';
+       }
+     *bp++ = 0;
+     bestname(b);
+     strncpy(procq[dum][psub].pname,b,8);
+     return(1);
+    }
+  lseek(file, procq[dum][psub].addr, 0);
+  if (read(file, abuf, sizeof(abuf)) != sizeof(abuf))
+    return(1);
+  for (ip = (int *)&abuf[512]-2; ip > (int *)abuf; )
+    {
+     if (*--ip == -1 || *ip==0)
+       {
+        cp = (char *) (ip+1);
+        if (*cp==0)
+          cp++;
+        nbad = 0;
+        for (cp1 = cp; cp1 < &abuf[512]; cp1++)
+          {
+           c = *cp1&0177;
+           if (c==0)
+             *cp1 = ' ';
+           else
+             if (c < ' ' || c > 0176)
+               {
+                if (++nbad >= 5)
+                  {
+                   *cp1++ = ' ';
+                   break;
+                  }
+                *cp1 = '?';
+               }
+             else
+               if (c=='=')
+                 {
+                  *cp1 = 0;
+                  while (cp1>cp && *--cp1 !=' ')
+                    *cp1 = 0;
+                  break;
+                 }
+         }
+       while (*--cp1==' ')
+         *cp1 = 0;
+       strncpy(b,cp,lw);
+       bestname(b);
+       strncpy(procq[dum][psub].pname,b,8);
+       return(1);
+       }
+     }
+  }
+ }
+/* These three routines getptr(), getbyte() and within() are */
+/* used in finding the process name.                         */
+char *
+getptr(adr)
+char **adr;
+ {
+  char *ptr;
+  register char *p, *pa;
+  register i;
+  ptr = 0;
+  pa = (char *)adr;
+  p = (char *)&ptr;
+  for (i=0; i<sizeof(ptr); i++)
+    *p++ = getbyte(pa++);
+  return(ptr);
+ }
+getbyte(adr)
+char *adr;
+ {
+  register struct map *amap = &datmap;
+  char b;
+  long saddr;
+  if (!within(adr, amap->b1, amap->e1))
+    {
+     if (within(adr, amap->b2, amap->e2))
+       {
+        saddr = (unsigned)adr + amap->f2 - amap->b2;
+        }
+     else
+       return(0);
+    }
+  else
+    saddr = (unsigned)adr + amap->f1 - amap->b1;
+  if (lseek(file, saddr, 0) == -1
+      || read(file, &b, 1)<1)
+    {
+     return(0);
+    }
+    return ((unsigned)b);
+ }
+within(adr,lbd,ubd)
+char *adr;
+long lbd, ubd;
+ {
+  return((unsigned)adr>=lbd && (unsigned)adr<ubd);
+ }
+
+/********************************************************/
+/*							*/
+/*		Best Name Routine			*/
+/*							*/
+/*	This routine finds the process name segment	*/
+/*	located after the last slash in the name	*/
+/*	string.						*/
+/*				John Dallen		*/
+/*							*/
+/********************************************************/
+
+bestname(sname)
+
+int sname[];
+
+{
+
+int i, mark;
+
+mark = -1;
+
+for ( i = 0; i < 51; i++ )
+  {
+    if ( sname[i] == '/' ) mark = i;
+  }
+if ( mark >= 0 )
+  {
+    for ( i = 0; i <= 7; i++ )
+      {
+	sname[i] = sname[mark+i+1];
+      }
+  }
+return;
+}
+
+/********************************************************/
+/*							*/
+/*	Data Transformation and Comparison Module	*/
+/*							*/
+/*	This module takes an input list of processes,	*/
+/*	PROCQ[new] and compares the process I.D. (pid)	*/
+/*	against the pids of an older copy of the input	*/
+/*	list, PROCQ[old].  Results of the comparison	*/
+/*	are placed in one of three sections of an out-	*/
+/*	put list, OLIST.  If a process is new, changed	*/
+/*	in size, or changed in location in memory, an	*/
+/*	entry is made in OLIST indicating the posting	*/
+/*	of new process data.  If a process has been	*/
+/*	removed from memory or otherwise changed in its	*/
+/*	specifications, an entry is made in OLIST indi-	*/
+/*	cating that a blanking process must be per-	*/
+/*	formed ( indicated by a blank in memflag ).	*/
+/*	If a process has been swapped out ( or still	*/
+/*	is ) an entry is made in OLIST with memflag	*/
+/*	set to 's'.  New processes, processes to be	*/
+/*	blanked, and swapped processes are posted to	*/
+/*	different sections of the OLIST array.		*/
+/*							*/
+/*	INPUT DATA:					*/
+/*	     Two "versions" of the input list, PROCQ,	*/
+/*	exist.  When a new version is "sent" to this	*/
+/*	module, the previous version was retained for	*/
+/*	comparison purposes.  These versions are	*/
+/*	"flip-flopped" for each call of the module so	*/
+/*	that the new version becomes the old, etc.	*/
+/*	This saves a requirement to rewrite each new	*/
+/*	list to a storage location.  			*/
+/*	Indication as to which version is the new list	*/
+/*	is passed to the module as a parameter ( 1 or	*/
+/*	0 ), the other value automatically assumed	*/
+/*	to be the old list.  If a complete posting	*/
+/*	of all processes is to be accomplished ( as at	*/
+/*	start-up ), a second parameter value of 1 is	*/
+/*	sent to indicate that any old list is to be	*/
+/*	"zeroed out."					*/
+/*	For each call to dtc, PROCQ[new] initially	*/
+/*	contains only the pid, process size and start	*/
+/*	location in memory, and, if applicable, a 's'	*/
+/*	in memory to indicate that the processed is in	*/
+/*	a swapped-out status.  Process names and memory */
+/*	use types are obtained only if this		*/
+/*	information is not available in the PROCQ[old]	*/
+/*	list.						*/
+/*							*/
+/*	OUTPUT DATA:					*/
+/*	     Output data is a linked list OLIST.	*/
+/*	The list is built with the comparison method	*/
+/*	indicated above according to the following	*/
+/*	specifications.  New processes are added to	*/
+/*	the list in the area of OLIST[0]+ sorted by	*/
+/*	memory start location.  Processes to be blanked	*/
+/*	from the screen are entered at OLIST[NPROC]+,	*/
+/*	also sorted by start locations.  All swapped	*/
+/*	jobs, whether changed or not, are added to	*/
+/*	OLIST[NPROC]-.  As a final step, the three	*/
+/*	sections are concatenated (if not empty)	*/
+/*	in the order:  swapped processes, blanked	*/
+/*	processes, new processes.  A special flag,	*/
+/*	swapflag, is checked to see if any change to	*/
+/*	the previous swap list has been made. If	*/
+/*	yes ( swapflag > 0 ), then the entire swap	*/
+/*	is reposted.					*/
+/*							*/
+/*		Coding: John Dallen			*/
+/*							*/
+/********************************************************/
+
+
+
+dtc(new,start)
+
+int new;	/* Subscript for new input list */
+int start;	/* Flag to send entire input list to OLIST */
+
+{
+
+static int old; /* Subscript for previous input list */
+
+int ptr_new, ptr_old;   /* Pointers for new and old input lists */
+int swap_ptr;		/* Pointer for swap list */
+int swap_flag;		/* Flag to determine if new swaps set */
+int i, entry;		/* Counters and place indicators */
+
+/* Zero out old input list if entire new list is to be sent */
+if ( start == 1 )
+    {
+	if ( new == 0 ) old = 1;
+	else old = 0;
+	procq[old][HEADQ].rlink = HEADQ;
+    }
+
+/* Initialize queue headers and pointers */
+ptr_new = HEADQ; /* Pointer for PROCQ[new] location*/
+olist_ptr = HEADQ; /* Pointer for new process entry location in OLIST */
+swap_ptr = NPROC - 1; /* Pointer for swap list in OLIST */
+swap_flag = 0; /* Flag to indicate change from previous swap list */
+b_ptr = NPROC; /* Pointer for blanked process list in OLIST */
+
+olist[HEADQ].rlink = olist_ptr;
+olist[NPROC].rlink = b_ptr;
+
+
+    /* Loop through entire input list */
+    while ( procq[new][ptr_new].rlink != HEADQ)
+      {
+	ptr_new = procq[new][ptr_new].rlink;
+
+	/* Check for a pid match with old list */
+	if ((entry = find(procq[new][ptr_new].pid,old)) != -1 )
+	  {
+	    /* Match found, first transfer process name */
+	    for (i=0; i<=7; i++) procq[new][ptr_new].pname[i]
+		= procq[old][entry].pname[i];
+
+	    /* Take care of case of process in swapped status */
+	    if ( procq[new][ptr_new].memflag == 's' )
+	      {
+		for ( i = 0; i <= 6; i++ )
+		    olist[swap_ptr].pname[i]=procq[old][entry].pname[i];
+		olist[swap_ptr].pname[7] = NULL;
+		olist[swap_ptr].memflag = 's';
+		olist[swap_ptr].rlink = swap_ptr - 1;
+		swap_ptr--;
+
+		/* If process previously in memory, issue blanking */
+		/* process					   */
+		if ( procq[old][entry].memflag != 's' )
+		  {
+		    procq[old][entry].memflag = ' ';
+		    insert(old,entry);
+		    swap_flag++;
+		  }
+	      }
+
+	    /* Take care of cases where process in memory */
+	    else
+	      {
+		if ( procq[old][entry].memflag == 's' )
+		  {
+		    /* Need new memory use type */
+		    getmem(new,ptr_new,FALSE);
+		    insert(new,ptr_new);
+		    swap_flag++;
+		  }
+
+		/* Check for start or size change */
+		else if ((procq[new][ptr_new].start !=
+			 procq[old][entry].start) ||
+			(procq[new][ptr_new].psize !=
+			procq[old][entry].psize) )
+		  {
+		    procq[new][ptr_new].memflag =
+			procq[old][entry].memflag;
+		    procq[old][entry].memflag = ' ';
+		    insert(old,entry);
+		    insert(new,ptr_new);
+		  }
+	      }
+	    delete(entry,old);
+	  }
+
+	/* Take care of brand new processes ( no pid match ) */
+	else
+	  {
+	    /* Need both process name and memory use type */
+	    getmem(new,ptr_new,TRUE);
+	    procq[new][ptr_new].pname[7] = NULL;
+
+	    /* Case of new process in swap status */
+	    if ( procq[new][ptr_new].memflag == 's')
+	      {
+		for ( i = 0; i <= 6; i++ )
+		    olist[swap_ptr].pname[i] = ' ';
+		if ( procq[new][ptr_new].pname[0] >= 055 &&
+		    procq[new][ptr_new].pname[0] <= 0172 )
+		  {
+		    for ( i = 0; i <= 6; i++ )
+		    olist[swap_ptr].pname[i]=procq[new][ptr_new].pname[i];
+		  }
+		else sprintf(olist[swap_ptr].pname,"%d",
+			procq[new][ptr_new].pid);
+		olist[swap_ptr].memflag = 's';
+		olist[swap_ptr].rlink = swap_ptr - 1;
+		swap_ptr--;
+		swap_flag++;
+	      }
+
+	    /* Case of new process in memory */
+	    else insert(new,ptr_new);
+	  }
+      }
+
+/*							*/
+/*		Post remainder of old list		*/
+/*							*/
+/* Those processes in OLIST[old] that have not been	*/
+/* deleted are no longer active.  A blanking process	*/
+/* entry must be issued for those that were in memory.  */
+/*							*/
+
+    ptr_old = HEADQ;
+
+    while ( procq[old][ptr_old].rlink != HEADQ )
+      {
+	ptr_old = procq[old][ptr_old].rlink;
+	if ( procq[old][ptr_old].memflag != 's' )
+	  {
+	    procq[old][ptr_old].memflag = ' ';
+	    insert(old,ptr_old);
+	  }
+	else swap_flag++;
+      }
+
+/* Perform UNION of blanks and new processes in olist */
+
+    if ( olist[NPROC].rlink != NPROC )
+      {
+	b_ptr = NPROC;
+	while (olist[b_ptr].rlink != NPROC)
+	    b_ptr = olist[b_ptr].rlink;
+	olist[b_ptr].rlink = olist[HEADQ].rlink;
+	olist[HEADQ].rlink = olist[NPROC].rlink;
+      }
+
+/* If necessary, perform UNION of swap list and remainder */
+/* of OLIST */
+
+    if ( swap_flag != 0 )
+      {
+	if ( swap_ptr == NPROC - 1 )
+	  {
+	    for ( i = 0; i <= 6; i++ )
+	      olist[swap_ptr].pname[i] = ' ';
+	    olist[swap_ptr].pname[7] = NULL;
+	    olist[swap_ptr].memflag = 's';
+	    swap_ptr--;
+	  }
+	olist[++swap_ptr].rlink = olist[HEADQ].rlink;
+	olist[HEADQ].rlink = NPROC - 1;
+      }
+
+    old = new;
+    return;
+
+}
+
+
+/********************************************************/
+/*							*/
+/*		FIND PID MATCH ROUTINE			*/
+/*							*/
+/*	This routine accepts as input a process pid	*/
+/*	and a parameter to indicate which list to	*/
+/*	check, and attempts to find a match.		*/
+/*	If a pid match is found, the entry position	*/
+/*	in the list is returned.  If none is found,	*/
+/*	a -1 is returned.				*/
+/*	The predecessor to the matched entry position	*/
+/*	is stored in the header node location		*/
+/*	PROCQ[old][HEADQ].pid for use by the DELETE	*/
+/*	routine.					*/
+/*							*/
+/*		Coding: John Dallen			*/
+/*							*/
+/********************************************************/
+
+find(pid,old)
+
+int pid, old;
+
+{
+
+int ptr_old;
+
+    ptr_old = HEADQ;
+    procq[old][HEADQ].pid = HEADQ;
+
+    while ( procq[old][ptr_old].rlink != HEADQ )
+      {
+	ptr_old = procq[old][ptr_old].rlink;
+	if ( pid == procq[old][ptr_old].pid ) return(ptr_old);
+	procq[old][HEADQ].pid = ptr_old;
+      }
+    return(-1); /*not found*/
+}
+
+/********************************************************/
+/*							*/
+/*		DELETE ROUTINE				*/
+/*							*/
+/*	This routine deletes an entry from PROCQ[old]	*/
+/*	based on the input parameters.  As this routine */
+/*	is always called after the FIND routine, the	*/
+/*	location of the predecessor is found in the	*/
+/*	node location PROCQ[old][HEADQ].pid.		*/
+/*							*/
+/*		Coding: John Dallen			*/
+/*							*/
+/********************************************************/
+
+delete(entry,old)
+
+int entry, old;
+
+{
+
+    procq[old][procq[old][HEADQ].pid].rlink = procq[old][entry].rlink;
+    return;
+}
+
+/********************************************************/
+/*							*/
+/*		INSERT ROUTINE				*/
+/*							*/
+/*	This routine inserts entries into OLIST		*/
+/*	sorted by memory start location.  Processes	*/
+/*	to be entered are extracted from either		*/
+/*	PROCQ[new] or PROCQ[old] based on the passed	*/
+/*	parameter x.  Position in the extraction list	*/
+/*	is passed in the ptr_x parameter.		*/
+/*	Processes to be blanked ar posted to the	*/
+/*	OLIST[NPROC]+ section of OLIST.  New processes  */
+/*	to memory are posted to OLIST[HEADQ]+.		*/
+/*							*/
+/*		Coding: John Dallen			*/
+/*							*/
+/********************************************************/
+
+insert(x,ptr_x)
+
+int x;    /* either new or old input list */
+int ptr_x; /* input list pointer */
+
+{
+
+int position;
+int pre_pos;
+int pointer, head;
+int i;
+
+    /* Set parameters if a blanking process entry */
+    if ( procq[x][ptr_x].memflag != ' ' )
+      {
+	pointer = ++olist_ptr;
+	head = HEADQ;
+      }
+
+    /* Set parameters if a process new to memory */
+    else
+      {
+	pointer = ++b_ptr;
+	head = NPROC;
+      }
+
+    position = olist[head].rlink;
+    pre_pos = head;
+    while ( (position != head) && (olist[position].start <=
+	procq[x][ptr_x].start) )
+      {
+	pre_pos = position;
+	position = olist[position].rlink;
+      }
+
+    /* Attempt to discern if process name is logical */
+    /* If not, replace with pid			     */
+    if ( procq[x][ptr_x].pname[0] >= 055 &&
+        procq[x][ptr_x].pname[0] <= 0172 )
+      {
+        for ( i = 0; i <= 6; i++ )
+    	olist[pointer].pname[i]=procq[x][ptr_x].pname[i];
+      }
+    else
+      {
+	for ( i = 0; i <= 7; i++ ) olist[pointer].pname[i] = NULL;
+	sprintf(olist[pointer].pname,"%d",
+    	    procq[x][ptr_x].pid);
+      }
+
+    olist[pointer].pname[7] = NULL;
+    olist[pointer].start = procq[x][ptr_x].start;
+    olist[pointer].pid = procq[x][ptr_x].pid;
+    olist[pointer].psize  = procq[x][ptr_x].psize;
+    olist[pointer].memflag = procq[x][ptr_x].memflag;
+    olist[pointer].rlink = olist[pre_pos].rlink;
+    olist[pre_pos].rlink = pointer;
+
+return;
+}
+
+
+/********************************************************
+*							*
+*							*
+*                SCREEN SET ROUTINE			*
+*							*
+*							*
+*	This routine clears the screen and sets up the	*
+*	static part of the display. It is passed three	*
+*	parameters: rate, start, and n. Rate is the 	*
+*	number of seconds between screen updates, and	*
+*	is only used for display purposes. Start is the *
+*	starting address (in K words) requested by the	*
+*	user, and is used to generate the memory 	*
+*	indices that are displayed on the screen. N	*
+*	is the grain size, which is calculated in the	*
+*	main procedure, and is used, along with start 	*
+*	to generate the memory indices.			*
+*							*
+*							*
+*		Written by Ned Danieley			*
+*							*
+********************************************************/
+
+
+setscr( rate,start,n )
+
+int  rate, start;
+float n;
+
+{
+  int  i;      /* loop index */
+
+/* clear the screen				*/
+
+  erase();
+
+
+/* print the screen heading		*/
+
+  cursor( DISPL,DISPST );
+  printf("UNIX MEMORY ALLOCATION   %d SEC PER UPDATE",rate);
+  cursor( SWAPL,SWAPST );
+  printf("SWAPPED");
+  cursor( SWAPL+1,SWAPST+1 );
+  printf("JOBS");
+  cursor( SWAPL+2,SWAPST );
+  printf("-------");
+  cursor( ASL1,1 );
+
+/* print the first row of '*'s		*/
+
+  for (i=1; i <= ASEXT; i++)
+        printf("*");
+
+/* print the memory indices 	*/
+
+  for ( i = start + SPACING * n; i <= start + ASEXT * n;
+	i += SPACING * n) {
+	cursor( NUML1,((int)((float)(i - start)/n)) - (i > 100));
+	printf("%d",i);
+      }
+
+/* print the second row of '*'s		*/
+
+  cursor( ASL2,1 );
+  for (i=1; i <= ASEXT; i++)
+	printf("*");
+
+/* print the memory indices 	*/
+
+  for ( i = start + SPACING * n; i <= start + ASEXT * n &&
+     	i + ASEXT * n <= HIMEM; i += SPACING * n) {
+	cursor( NUML2,(int)((float)(i - start)/n) - 1);
+	printf("%d",i + (int)( ASEXT * n ));
+      }
+  cursor( SWJOB,SWAPST );
+}
+/********************************************************
+*							*
+*							*
+*	            DISPLAY ROUTINE			*
+*							*
+*	This routine does the dynamic updating of the	*
+*	screen. It uses the global array olist to get	*
+*	the names and memory information that is posted	*
+*	on the screen. It is passed two parameters, 	*
+*	start and n. Start is the memory start address	*
+*	requested by the user. It is used to determine 	*
+*	the proper screen location for displaying the 	*
+*	job, and for insuring that jobs outside the 	*
+*	desired range are not displayed. N is the grain	*
+*	size, and it is used, along with start and 	*
+*	olist, to determine the amount of screen space 	*
+*	dedicated to a job.				*
+*							*
+*	Because of the limited screen size (assumed to 	*
+*	24 lines by 80 columns), each job will only 	*
+*	have the first seven characters of its name 	*
+*	displayed. In addition, only fifteen swapped 	*
+*	jobs can be displayed.				*
+*							*
+*		Written by Ned Danieley			*
+*							*
+********************************************************/
+
+
+
+display( start,n )
+
+int   start;
+float  n;
+
+{
+
+  int	count=0,     /* number of jobs posted to swap list */
+	symline,     /* screen line where memflag is to be printed */
+	nameline,    /* screen line where current name starts */
+	namecol,     /* screen column where current name starts */
+	memstart,    /* memory start address */
+	startpos,    /* screen start address */
+	memsize,     /* memory size of job */
+	size,	     /* screen size of job */
+	p,           /* index to olist */
+	front,       /* 1 if job starts outside memory range */
+	end;         /* 1 if job ends outside memory range */
+
+  register  int  i;      /* loop index */
+  static  int  length;   /* length of prior swaplist */
+
+  long  timebuf;
+  char  *ap;
+  struct  tm  *tp;
+
+
+  if (olist[olist[HEADQ].rlink].memflag != 's') count=length;
+
+/*  process olist		*/
+
+  for ( p = olist[HEADQ].rlink; p != HEADQ; p = olist[p].rlink) {
+
+/* set up start and size from memstart and memsize, and set *
+*  the flags if necessary.				    */
+
+	memstart = olist[p].start >> 5;
+	if ( memstart > HIMEM ) continue;
+        front = 0;
+	end = 0;
+	memsize = olist[p].psize >> 5;
+	if ((memsize == 0) && (olist[p].memflag != ' ')) memsize = 1;
+	if (( memstart + memsize < start || memstart > start + HALF * n )
+		&& olist[p].memflag != 's' )
+		continue;
+	if ( memstart < start ) {
+		memstart = start + 1;
+		front = 1;
+	     }
+	if ( memstart + memsize > start + HALF * n ) {
+		memsize = start + HALF * n - memstart - 1;
+		end = 1;
+	     }
+	startpos = (memstart - start) / n;
+
+/* set the variables that determine where the job information *
+*  should be printed.					      */
+
+	if ( startpos <= ASEXT ){
+		symline = SYMST1;
+		nameline = NAMEST1;
+	       }
+	else {
+		symline = SYMST2;
+		nameline = NAMEST2;
+		startpos -= ASEXT;
+	       }
+	size = memsize / n;
+
+/* depending on the value of memflag, post a job, blank a job *
+*  or put a job on the swaplist. 			      */
+
+
+	switch( olist[p].memflag ) {
+
+/* post a job to the screen			*/
+
+		case '-':
+		case '=':
+		case '+':
+		case '^':
+		case 'u':
+
+		  	cursor( symline,startpos );
+			if (size > 2) {
+			   if ( front != 1 ) printf("<");
+			   for ( i = 1; i < size - 1; i++) {
+		                if ( i + startpos == ASEXT + 1 )
+					cursor( SYMST2,1 );
+			        printf("%c",olist[p].memflag);
+			     }
+			   if ( i + startpos == ASEXT + 1 )
+					cursor( SYMST2,1 );
+			   if ( end != 1 ) printf(">");
+			  }
+			else {
+			    for ( i = 0; i < size; i++ ) {
+				if ( i + startpos == ASEXT + 1 )
+					cursor( SYMST2,1 );
+				    printf("%c",olist[p].memflag);
+				}
+			   }
+
+		        namecol = startpos + size / 2;
+			if (namecol > ASEXT ) {
+			     namecol -= ASEXT;
+			     nameline = NAMEST2;
+			  }
+			for ( i = 0; i < 7; i++){
+			     cursor( nameline + i,namecol );
+			     printf("%c",olist[p].pname[i]);
+			  }
+			break;
+
+/* blank out a previously posted job    */
+
+		case ' ':
+
+			cursor( symline,startpos );
+			for ( i = 1; i <= size ; i++) {
+			     printf(" ");
+			     if ( i + startpos == ASEXT + 1 )
+			    	cursor( SYMST2,1 );
+			   }
+			namecol = startpos + size / 2;
+			if ( namecol > ASEXT ) {
+			      namecol -= ASEXT;
+			      nameline = NAMEST2;
+			      }
+			for ( i = 0; i < 7; i++) {
+			   cursor( nameline + i, namecol );
+			   printf(" ");
+			      }
+			break;
+
+/* post a job to the swap list    */
+
+		case 's':
+		   if (olist[p].pname[0]=='-') break;
+		   if ( count < 15 ) {
+			cursor( SWJOB + count,SWAPST );
+			printf("%s",olist[p].pname);
+			count += 1;
+		     }
+
+			break;
+
+		default:
+
+			break;
+	    }   /* end of switch */
+
+/* clean up the swap list    */
+
+  if (count < length)
+  	for (i = count + 1; i <=length && i < 25; i++) {
+		cursor( SWJOB + i,SWAPST );
+		printf("       ");
+	      }
+  length = count;
+   }   /* end of for loop */
+
+/* display the current system time on the screen    */
+
+  time(&timebuf);
+  tp = localtime(&timebuf);
+  ap = asctime(tp);
+  cursor( DISPL,TIMEST );
+  printf("%.8s",ap+11);
+  cursor( 1,1 );
+/*BUFFER*/
+  fflush( stdout );
+}
+
+
+/* Routine setterm.c--To add a terminal, put its name at the
+   bottom of the list (before the "").  This is the name to
+   which the cursor moving routines will refer, and should be
+   the same as the one in CURSOR.H for the sake of clarity.   */
+
+/* Originally written by J. Rosenberg; modified by N. Danieley */
+
+
+#include <stdio.h>
+#include "CURSOR.H"
+
+char		*tlist[] =
+	{	"dumb",		/* no cursor or anything */
+		"4014",		/* tektronix 4014 graphics terminal */
+		"adm3",		/* ADM 3 (w/o cursor control ) */
+		"superbee",	/* super beehive (semi-ANSI) */
+		"hz2000",	/* Hazeltine 2000 */
+		"adm1",		/* ADM 1 (maw's) */
+		"b500",		/* Beehive 500 */
+		"b150",		/* Beehive 150 */
+		"PE550",	/* Perkin-Elmer Bantam 550 */
+		"adm3a",	/* ADM3A */
+		"vt100",
+		"912c",		/* JBR's home terminal */
+		"HP2647",	/* HP 2647A graphics terminal */
+		"HP2645",	/* HP 2645 graphics terminal */
+		""
+	};
+
+setterm()
+{
+	/*
+	 * Determine the type of terminal for cursor package.
+	 * get terminal type from the environment
+	 * set external int var "term" to a number
+	 * by searching a table.
+	 */
+	register int	i, ret;
+	register char	*type;
+	char		*getenv();
+
+	extern int	term;
+	extern char	**environ;
+
+	type = getenv("TERM");	/* get pointer to environment info */
+
+#ifdef DEBUG
+	printf("TERM= %s\n", type );
+#endif
+
+	if ( type == NULL )
+		type = "dumb";
+
+	for (i=0; *tlist[i] != NULL; i++)
+	{
+
+#ifdef DEBUG
+		printf("tlist[%d] = %s\n",i,tlist[i]);
+#endif
+
+		if ( strcmp( tlist[i], type ) == 0 )
+			return(term=i);
+	}
+
+#ifdef DEBUG
+	printf( "term = %d\n", term );
+#endif
+
+	return( 0 );
+}
+/*/ Routine curmove.c--To add a terminal, simply include its name
+   in the switch statement with the necessary code (see the user's
+   manual of the particular terminal).				*/
+
+/* Originally written by J. Rosenberg; modified by N. Danieley */
+
+#include "CURSOR.H"
+extern int	term;
+
+curup( num )
+int	num;
+{	/*
+	 * Move active position up num lines on screen.
+	 * Should generate a vertical tab on any terminal with
+	 * the capability.
+	 */
+	register int	i, ret;
+
+	ret = 0;
+	switch ( term )
+	{
+	 case VT100:
+		printf("\033[%dA", num );
+		break;
+
+	case PE550:
+	case B150:
+	case B500:
+	case HP2647:
+		for( i=0; i<num; i++ )
+		{	printf("\033A");  }
+		break;
+
+	case ADM1:
+	case ADM3:
+        case ADM3A:
+	case TV912C:
+		for( i=0; i<num; i++ )
+		{	putchar('\013');	}
+		break;
+
+	default:
+		ret = -1;
+		break;
+	}
+	return( ret );
+}
+
+curdown( num )
+int	num;
+{	/*
+	 * Move active position down num lines on screen.
+	 * On some terminals (i.e., ADM-3A), this causes a line
+	 * feed, and not a vertical tab.
+	 */
+	register int	i, ret;
+
+	ret = 0;
+	switch ( term )
+	{
+	case HP2647:
+	case VT100:
+		printf("\033[%dB", num );
+		break;
+
+	case B150:
+	case B500:
+	case PE550:
+		for( i=0; i<num; i++ )
+		{	printf("\033B");  }
+		break;
+
+	case ADM3:
+        case ADM3A:
+	case TV912C:
+		for( i=0; i<num; i++ )
+		{	putchar('\012');	}
+		break;
+
+	default:
+		ret = -1;
+		break;
+	}
+	return( ret );
+}
+
+curright( num )
+int	num;
+{	/*
+	 * Move active position right num columns on screen.
+	 */
+	register int	i, ret;
+
+	ret = 0;
+	switch ( term )
+	{
+	case HP2647:
+	case VT100:
+		printf("\033[%dC", num );
+		break;
+
+	case B150:
+	case B500:
+	case PE550:
+	case HP2645:
+		for( i=0; i<num; i++ )
+		{	printf("\033C");  }
+		break;
+
+	case ADM1:
+	case TV912C:
+		for( i=0; i<num; i++ )
+		{	putchar('\f');	}
+		break;
+
+	case ADM3:
+        case ADM3A:
+		for( i=0; i<num; i++)
+		{	putchar('\f');}
+		break;
+
+	default:
+		ret = -1;
+		break;
+	}
+	return( ret );
+}
+
+curleft( num )
+int	num;
+{	/*
+	 * Move active position left num columns on screen.
+	 */
+	register int	i, ret;
+
+	ret = 0;
+	switch ( term )
+	{
+	case HP2647:
+	case VT100:
+		printf("\033[%dD", num );
+		break;
+
+	case B150:
+	case B500:
+	case PE550:
+	case HP2645:
+		for( i=0; i<num; i++ )
+		{	printf("\033D");  }
+		break;
+
+	case ADM1:
+	case TV912C:
+		for( i=0; i<num; i++ )
+		{	putchar('\b' );	}
+		break;
+
+	case ADM3:
+	case ADM3A:
+		for( i=0; i<num; i++)
+		{	putchar('\b');}
+		break;
+
+	default:
+		ret = -1;
+		break;
+	}
+	return( ret );
+}
+
+/* Routine erase.c--To add a terminal, simply include its name in
+   the switch statement along with the necessary code (see the
+   user's manual of the particular terminal).			   */
+
+
+/* Originally written by J. Rosenberg; modified by N. Danieley */
+
+
+#include "CURSOR.H"
+# define	FILLCOUNT	16
+
+erase()
+{	/*
+	 * clear screen function
+	 */
+	extern int	term;
+	register int	i;
+
+	switch(term)
+	{
+	case VT100:
+		printf("\033[0H\033[2J");
+		break;
+
+	case HP2645:
+		printf("\033H\033J");
+		break;
+
+	case B150:
+		printf("\033E");
+		for ( i = 0; i < FILLCOUNT; i++ )
+			putchar('\0177');
+		break;
+
+	case B500:
+		printf("\033E");
+		break;
+
+	case SBEE:
+	case PE550:
+		printf("\033K");
+		for ( i = 0; i < FILLCOUNT; i++ )
+			putchar('\0177');
+		break;
+
+	case ADM3:
+	case ADM3A:
+	case TV912C:
+		putchar('\032');
+		break;
+
+	case ADM1:
+		printf("\033:");
+		break;
+
+	case T4014:
+		printf("\033\f");
+		break;
+
+	case HZ2000:
+		printf("\176\034");
+		putchar('\0');
+		putchar('\0');
+		putchar('\0');
+		break;
+
+	default:
+		break;
+	}
+
+	return;
+}
+/* Routine cursor.c--To add a terminal, simply include its name in
+   the switch statement along with the necessary code (see the
+   user's manual of the particular terminal).			   */
+
+
+/* Originally written by J. Rosenberg; modified by N. Danieley */
+
+
+#include "CURSOR.H"
+
+
+cursor(l, c)
+register int l, c;
+{
+/*
+ * cursor address function
+ * Causes cursor to move to line l, column c.
+ * assumes that the first line and column on the screen is called
+ * one by the user.
+ */
+	extern int	term;
+
+	switch ( term )
+	{
+	case VT100:	/* ANSI Standard also */
+		printf("\033[%d;%df",l, c);
+		break;
+
+	case HP2645:
+	case HP2647:
+		printf("\033&a%dy%dC", l - 1, c - 1);
+		break;
+
+	case PE550:
+		printf("\033X%c\033Y%c", ' '+l, ' '+c );
+		break;
+
+	case B150:
+	case B500:
+		printf("\033F");
+		putchar( l + ' ' - 1 );
+		putchar( c + ' ' - 1 );
+		putchar('\0');
+		break;
+
+	case SBEE:
+		printf("\033F%3d%3d", c, l );
+		break;
+
+	case ADM3A:
+	case ADM3:
+	case ADM1:
+	case TV912C:
+		printf("\033=%c%c",037+l,037+c);
+		break;
+
+	case HZ2000:
+		printf("\176\021%c%c",(c<31?c+96:c),l+96);
+		break;
+
+	default:
+		break;
+	}
+}
+/* Routine CURSOR.H--This routine associates numbers with the
+   names of the terminals that the system knows about (or can
+   be informed of).  To add a terminal, put the desired name
+   at the bottom of the list, and assign it the next integer.
+   It is probably best to be consistent and use the same name
+   here and in setterm.c.                                    */
+
+/* Originally written by J. Rosenberg; modified by N. Danieley */
+
+
+#define	DUMB	0
+#define	T4014	1
+#define	ADM3	2
+#define	SBEE	3
+#define	HZ2000	4
+#define	ADM1	5
+#define	B500	6
+#define	B150	7
+#define	PE550	8
+#define	ADM3A	9
+#define	VT100	10
+#define	TV912C	11
+#define HP2647	12
+#define HP2645	13
+
+

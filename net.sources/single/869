@@ -1,0 +1,726 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,b93cb4a05ce6a093,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-12-15 20:57:05 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!security!genrad!decvax!decwrl!flairvax!turtleva!ken
+From: ken@turtleva.UUCP (Ken Turkowski)
+Newsgroups: net.sources
+Subject: Graphics source in C: hsalgs/poly_zsort.c
+Message-ID: <287@turtleva.UUCP>
+Date: Thu, 15-Dec-83 23:57:05 EST
+Article-I.D.: turtleva.287
+Posted: Thu Dec 15 23:57:05 1983
+Date-Received: Sun, 18-Dec-83 23:33:29 EST
+Lines: 708
+
+echo x - hsalgs/poly_zsort.c
+cat >hsalgs/poly_zsort.c <<'!Funky!Stuff!'
+
+
+
+
+
+
+/* --------------------------------------------------------------
+   Clip, sort and display polygonal objects in the standard binary
+   format with a reasonably regular structure not intersecting itself.
+
+	input format is defined in "man hsalg_input"
+  ---------------------------------------------------------------
+*/
+
+
+#include <ctype.h>
+#include <stdio.h>
+
+#define TRUE             1
+#define FALSE            0
+#define NULLCHAR	'\0'
+#define DtoR		3.14159 / 180.
+#define sqr(x)    ((x)*(x))
+#define LINE_LENGTH     160
+#define DET_CODE	0x20746564
+#define VCL_CODE	0x206C6376
+#define PCL_CODE	0x206C6370
+#define IN               0
+#define OUTLFT           1
+#define OUTRGT           2
+#define OUTTOP           4
+#define OUTBOT           8
+#define OUTHTR          16
+#define BIGNUM   100000000.
+#define SUBPIX    .01 /* minimum detail size */
+#define ZRES          1023.
+#define SORTRES       1024
+#define POLYSIZE        64
+#define MAXPTS       32768  /* must be <= 32768 indexed by shorts */
+#define MAXPOLYS     32768  /*  "  */
+#define MAXFRNTFC    32768  /*  "  */
+#define MAXVTCES    131072  /* four times the number of polys */
+#define MAXLTS		16   /* maximum number of light sources */
+#define MAXOBJ          64   /* maximum number of objects  */
+#define HILIT_MIN      .02   /* minimum noticeable highlight intensity */
+#define TRANS_MIN      .02   /* minimum noticeable transmittance */
+
+static double ambnt,ambntcomp;                    /* lighting specifications */
+static double  view_angle,cot_x,cot_y;
+static short nbr_lights;
+static struct {float x,y,z,r,g,b,range;} lights[MAXLTS];
+
+static short objnum,clipping[MAXOBJ],faceted[MAXOBJ],   /* object info */
+             backfaces[MAXOBJ],vertex_clrs[MAXOBJ],poly_clrs[MAXOBJ];
+static double clrred[MAXOBJ],clrgrn[MAXOBJ],clrblu[MAXOBJ],
+              trnsmtnce[MAXOBJ],trns_pwr[MAXOBJ],hilit_exp[MAXOBJ];
+static short pseudo_clr,clrange[MAXOBJ],clrofset[MAXOBJ];/* pseudo color info */
+
+static struct {float x,y,z;} pts[MAXPTS],norms[MAXPTS];
+static struct {float r,g,b,t;} clrs[MAXPTS];
+static short npts,npolys,tpts,tpolys,nvtces,tvtces,nclrs,tclrs;
+static double zmax,zmin;
+static short cnt[MAXPTS],vtces[MAXVTCES];
+static short bfacing[MAXPOLYS],clp[MAXPOLYS],obj_no[MAXPOLYS];
+
+static double matrix[16];		/* current object transform matrix */
+
+/* +++++++++++++++++++++++++ MAIN +++++++++++++++++++++++++++++++++++++++++ */
+main()
+{
+    struct list_entry { short ply;   long vtx;   long ptr; };
+
+    static struct list_entry  polsort[MAXFRNTFC],*buckets[SORTRES];
+
+    char instrg[LINE_LENGTH],keywd[LINE_LENGTH],remainder[LINE_LENGTH],dvc[8];
+    short first_obj,ltop,i,quad,divisions,frmnum;
+    long ivtx;
+    double zscale,atof(),sqrt(),fabs();
+
+    nocore();			/* prevent dumping core on errs */
+
+    objnum = 0;    first_obj = TRUE;
+    tpts = 0; tpolys = 0; tvtces = 0; tclrs = 0;   /* init pts and poly cnts */
+    zmax = 0.0;    zmin = BIGNUM;              /* initialize for depth range */
+    ambnt = .3;	   ambntcomp = .7;    nbr_lights = 0;/* light initialization */
+
+    /* scan input for keywords */
+    while ( gets(instrg) != NULL )
+    {   if (strlen(instrg) > LINE_LENGTH)
+				    error("poly_zsort - input line too long");
+	get_term(instrg,keywd,remainder);	/* get keyword from input */
+
+        if (strcmp(keywd,"device") == 0)	 /* get display device */
+	{   sscanf(remainder,"%s %hd %hd %hd",dvc,&quad,&divisions,&frmnum);
+	    if (strcmp(dvc,"fb") == 0) {  ptilinit(quad);  pseudo_clr = TRUE;  }
+	    else if (strcmp(dvc,"aed") == 0) { aptilinit(); pseudo_clr = TRUE; }
+	    else if (quad == 8) 		 /* big buffer pseudo_clr */
+	    {  bptilinit(frmnum,divisions);   pseudo_clr = TRUE;  }
+	    else 				/* pass to rgb tiler */
+	    {  rgbtilinit(quad,divisions,frmnum);   pseudo_clr = FALSE;  }
+	}
+
+	else if ( strcmp(keywd,"light") == 0 )  /* get light source info */
+	{   sscanf(remainder,"%f%f%f%f%f%f%f",
+	      &lights[nbr_lights].x,&lights[nbr_lights].y,&lights[nbr_lights].z,
+	      &lights[nbr_lights].r,&lights[nbr_lights].g,&lights[nbr_lights].b,
+	      &lights[nbr_lights].range);
+            if (lights[nbr_lights].range==0.) lights[nbr_lights].range = BIGNUM;
+	    if ((lights[nbr_lights].r + lights[nbr_lights].g +
+						    lights[nbr_lights].b) <= 0.)
+	        lights[nbr_lights].r = lights[nbr_lights].g =
+						    lights[nbr_lights].b = 1.;
+	    nbr_lights++;
+	}
+
+	else if ( strcmp(keywd,"ambient_light") == 0 )	/* get ambient light */
+	{   sscanf(remainder,"%f",&ambnt);
+	    ambntcomp = 1.0 - ambnt;
+   	}
+
+	else if ( strcmp(keywd,"view_angle") == 0 )	   /* get view angle */
+	{   double cos(),sin();
+	    sscanf(remainder,"%f",&view_angle);
+	    cot_x = cos(DtoR * view_angle/2.) / sin(DtoR * view_angle/2.);
+	    cot_y = cot_x / .75;
+	    if (strcmp(dvc,"fb") == 0)
+		cot_y *= 640./512.; /* adjust for pixel distortion on 512x484 */
+	    else if (strcmp(dvc,"aed") == 0)
+	        cot_y = cot_x * 512./483.;
+	}
+	else if ( strcmp(keywd,"object") == 0 ) 	/* get an object file */
+	{   if (!first_obj) 		       /* transform, etc. last object */
+	    {   prepare_obj(objnum,dvc);    objnum++;   }
+            npts = 0;  npolys = 0;  nvtces = 0;  nclrs = 0;  first_obj = FALSE;
+            getobject(remainder,&npts,&pts[tpts],&npolys,&nvtces,&vtces[tvtces]);
+	    clipping[objnum] = TRUE;
+        }
+
+        else if ( strcmp(keywd,"transform") == 0 )  /* get eyespace transform */
+            for (i=0; i<16; i+=4) sscanf(gets(instrg),"%F%F%F%F",&matrix[i],
+                                       &matrix[i+1],&matrix[i+2],&matrix[i+3]);
+
+	else if ( strcmp(keywd,"no_clipping") == 0 )	/* need clipping? */
+            clipping[objnum] = FALSE;
+
+	else if ( strcmp(keywd,"color") == 0)  /* get object color, if needed */
+	{   if (pseudo_clr)  sscanf(remainder,"%hd%hd",&clrange[objnum],
+							&clrofset[objnum]);
+	    else	     sscanf(remainder,"%F%F%F",&clrred[objnum],
+					       &clrgrn[objnum],&clrblu[objnum]);
+	}
+
+	else fprintf(stderr,"bad keyword to poly_zsort - %s\n",instrg);
+    }
+    prepare_obj(objnum,dvc);                   /* transform, etc. last object */
+
+
+    /* ------------ get transform for z-coordinates  --------------------- */
+    if (zmin < 0.0) zmin = 0.0;
+    zscale = (zmax - zmin > 0)?  ZRES / (zmax - zmin) : ZRES;
+
+
+    /* ------ run through polygons, if not rejected, find closest vertex
+              and put pointer in appropriate bucket list ------------------  */
+    ivtx = 0;   ltop = 0;    for (i=0; i<SORTRES; i++) buckets[i]=0;
+    for (i=0; i<tpolys; i++)
+    {   short j,jmin,size;   long k;   float min,depth;
+        size = vtces[ivtx++];
+
+	if ((clp[i] >= 0) && (!bfacing[i] || backfaces[obj_no[i]]))/*rejected?*/
+        {   min = BIGNUM;
+            for (k=ivtx; k<ivtx+size; k++)            /* find closest vertex */
+            {   j = vtces[k];
+                depth = (pts[j].z - zmin) * zscale;
+                if (depth < min) min = depth;
+            }
+            jmin = (min < 0.0)?  0.0 : min;
+            polsort[ltop].ply = i;                   /* enter in sort bucket */
+            polsort[ltop].vtx = ivtx-1;
+            polsort[ltop].ptr = (long)buckets[jmin];
+            buckets[jmin] = &polsort[ltop++];
+            if (ltop > MAXFRNTFC)
+            { fprintf(stderr,
+		    "(poly_zsort) excess displayable polys!! %d > MAXFRNTFC\n",
+                                                                         ltop);
+	      ltop--;
+	    }
+        }
+	ivtx += size;
+    }
+
+
+    /* -------- pick up polys in depth order, send to tiler ------------ */
+    for (i=0; i<SORTRES; i++)
+    {   short ii;
+        ii = (pseudo_clr)?  (SORTRES-1 - i) : i;
+        if (buckets[ii] > 0)
+        {   struct { double x,y,z,r,g,b,xn,yn,zn,t; } poly [POLYSIZE],
+                                                      poly2[POLYSIZE];
+            struct { double xn,yn,zn,r,g,b; } hl_nms[POLYSIZE][MAXLTS],
+					      hl_nm2[POLYSIZE][MAXLTS];
+	    struct list_entry *pntr;
+            short k,l,m,obj,polptr,sign,npts,nlts; long j;
+            double hilite,trnsp;
+
+            pntr = (struct list_entry *)buckets[ii];
+            while (pntr > 0)
+            {   polptr = pntr->ply;
+                obj = obj_no[polptr];
+                j = pntr->vtx;
+                npts = vtces[j++];
+                if (npts > POLYSIZE)
+                {   fprintf(stderr,"(poly_zsort) %d > POLYSIZE\n",npts);
+		    npts = POLYSIZE;
+		}
+		sign = bfacing[polptr]?  -1 : 1; /* reverse nrmls if bckfcng  */
+
+                for (l=0; l<npts; l++)                  /* copy polygon */
+                {   k = bfacing[polptr]?  npts-l -1 : l;    /* reverse order  */
+                    m = vtces[j++];			    /* if backfacing  */
+                    poly[k].x = pts[m].x;
+                    poly[k].y = pts[m].y;
+                    poly[k].z = pts[m].z;
+
+                    if (vertex_clrs[obj])		/* color per vertex */
+                    {   poly[k].r = clrs[m].r * clrred[obj];
+                        poly[k].g = clrs[m].g * clrgrn[obj];
+                        poly[k].b = clrs[m].b * clrblu[obj];
+			poly[k].t = clrs[m].t * trnsmtnce[obj];   }
+                    else if (poly_clrs[obj])		/* color per polygon */
+                    {   poly[k].r = clrs[polptr].r * clrred[obj];
+                        poly[k].g = clrs[polptr].g * clrgrn[obj];
+                        poly[k].b = clrs[polptr].b * clrblu[obj];
+			poly[k].t = clrs[polptr].t * trnsmtnce[obj];   }
+                    else
+                    {   poly[k].r = clrred[obj];           /* solid color */
+                        poly[k].g = clrgrn[obj];
+                        poly[k].b = clrblu[obj];
+			poly[k].t = trnsmtnce[obj];   }
+
+                    if (!faceted[obj])			/* smooth shading */
+                    {   poly[k].xn = sign * norms[m].x;
+                        poly[k].yn = sign * norms[m].y;
+                        poly[k].zn = sign * norms[m].z;   }
+                }
+
+                if (faceted[obj])/* get normal vector for polygon, if faceted */
+                {    struct { float x,y,z; } vec;
+                     X_prod(&vec,pts[vtces[j-3]],pts[vtces[j-2]],pts[vtces[j-1]]);
+                     for (k=0; k<npts; k++)
+                     {   poly[k].xn = sign * vec.x;	/* faceted shading */
+                         poly[k].yn = sign * vec.y;
+                         poly[k].zn = sign * vec.z;   }
+                }
+
+		hilite = hilit_exp[obj];	trnsp = trns_pwr[obj];
+                get_shades(npts,poly,&hilite,&trnsp,obj,hl_nms,&nlts);/*shadng*/
+
+                for (k=0; k<npts; k++)       	  /* predistort for clipping */
+                {   poly[k].x *= cot_x;
+		    poly[k].y *= cot_y;
+		}
+                if (clp[polptr] > 0) 				     /* clip */
+		    		 polclp(0,&npts,poly,poly2,nlts,hl_nms,hl_nm2);
+                if (npts > 2)
+                {   for (k=0; k<npts; k++)       /* take to screen space */
+                    {   poly[k].x /= poly[k].z;    poly[k].y /= poly[k].z;
+                        poly[k].z = (poly[k].z - zmin) * zscale;
+                    }
+                    /* scan convert according to characteristics */
+                    if (pseudo_clr)     ptiler(npts,poly);
+                    else if ((hilite > 0.) || (trnsp > 0.))
+					shiny_tlr(npts,poly,hilite,hl_nms,nlts);
+                    else        	rgbtiler(npts,poly);
+                }
+                pntr = (struct list_entry *)pntr->ptr;/* get next list elmnt */
+            }   /* done with one linked list */
+        }
+    }   /* done with outputting sorted list */
+}   /* done with main program */
+
+
+
+
+
+/* ++++++++++++++++++++++++ GETCOLORS ++++++++++++++++++++++++++++++++++++ */
+getcolors(instrg,npts,pts)			/* read in color file */
+    char *instrg;  short *npts;
+    struct { float r,g,b,t; } pts[];
+{   FILE *input;   char fname[LINE_LENGTH];    long code;
+
+    get_term(instrg,fname,instrg);     /* strip leading and trailing blanks */
+    input = fopen(fname,"r");
+    if (input == NULL)
+    {   fprintf(stderr,"(poly_zsort) unable to open %s for input\n",fname);
+	return;   }
+
+    fread(&code,4,1,input);
+    if ((code != PCL_CODE) && (code != VCL_CODE))
+    {   fprintf(stderr,"warning!!  %s not labeled as color file\n",fname);
+	close(input);  input = fopen(fname,"r");/* to be replaced with return */
+    }
+    fread(npts,2,1,input);
+    if (*npts > MAXPTS)
+    {   fprintf(stderr," (poly_zsort) object too big!! %d > MAXPTS\n",*npts);
+	*npts = 0;	return;
+    }
+    fread(pts,4,(*npts)*4,input);
+    fclose(input);
+}
+
+
+
+
+/* ++++++++++++++++++++++++ GETOBJECT ++++++++++++++++++++++++++++++++++++ */
+getobject(instrg,npts,pts,npolys,nvtces,vtces)/* read in object file */
+    char *instrg;  short *npts,*npolys,*nvtces,vtces[];
+    struct { float x,y,z; } pts[];
+{   FILE *input;    short i;    long j,code;
+    char fname[LINE_LENGTH],line[LINE_LENGTH],detail_file[LINE_LENGTH];
+
+    get_term(instrg,fname,instrg);     /* strip leading and trailing blanks */
+    input = fopen(fname,"r");
+    if (input == NULL)
+    {   fprintf(stderr,"(poly_zsort) unable to open %s for input\n",fname);
+	return;   }
+
+    detail_file[0] = NULLCHAR;	/* nullify detail filename */
+
+    while (fgets(line,LINE_LENGTH,input) != NULL)
+    {   char term[LINE_LENGTH];
+	get_term(line,term,line);	/* get keyword */
+
+	if      (strcmp(term,"detail") == 0)
+	    get_term(line,detail_file,line);
+
+	else if (strcmp(term,"poly_colors") == 0)
+	{   if (!vertex_clrs[objnum])
+	    {   poly_clrs[objnum] = TRUE;
+	        getcolors(line,&nclrs,&clrs[tclrs]);
+	    }
+	}
+	else if (strcmp(term,"vertex_colors") == 0)
+	{   if (!poly_clrs[objnum])
+	    {   vertex_clrs[objnum] = TRUE;
+	        getcolors(line,&nclrs,&clrs[tclrs]);
+	    }
+	}
+	else if (strcmp(term,"type") == 0)
+	{   get_term(line,term,line);
+	    if (strcmp(term,"polygon") == 0)
+	        while(strlen(line) > 4)
+		{   get_term(line,term,line);
+		    if      (strcmp(term,"open") == 0)
+						backfaces[objnum] = TRUE;
+		    else if (strcmp(term,"faceted") == 0)
+						faceted[objnum] = TRUE;
+		}
+	}
+	else if (strcmp(term,"color") == 0)
+	    sscanf(line,"%F%F%F",&clrred[objnum],&clrgrn[objnum],
+						 &clrblu[objnum]);
+	else if (strcmp(term,"transmittance") == 0)
+	    sscanf(line,"%F%F",&trnsmtnce[objnum],&trns_pwr[objnum]);
+
+	else if (strcmp(term,"shininess") == 0)
+	    sscanf(line,"%F",&hilit_exp[objnum]);
+    }
+    fclose(input);		/* close ".obj" file and open detail file */
+    input = fopen(detail_file,"r");
+    if (input == NULL)
+	error("poly_zsort: can't open detail file %s\n",detail_file);
+
+    fread(&code,4,1,input);  		/* read file type header */
+    if (code != DET_CODE)
+    {   fprintf(stderr,"poly_zsort: %s not tagged detail file\n",detail_file);
+	close(input);  return;		/* not detail file, give up */
+    }
+    fread(npts,2,1,input);     fread(npolys,2,1,input);
+    if ((*npts > MAXPTS) || (*npolys > MAXPOLYS))
+    {   fprintf(stderr,
+	     " (poly_zsort) object too big!! %d > MAXPTS or %d > MAXPOLYS\n",
+               *npts,*npolys);
+	*npts = 0;	*npolys = 0;	return;
+    }
+    fread(pts,4,(*npts)*3,input);
+
+    j = 0;
+    for (i=0; i<*npolys; i++)
+    {   short  num;    long k;
+        fread(&num,2,1,input);
+        vtces[j++] = num;
+        if ((fread(&vtces[j],2,num,input) < num) || (num < 3))
+ 	{   fprintf(stderr," (poly_zsort) - bad polygon # %d in %s\n",i,fname);
+	    j--;	continue;
+	}
+		    /* offset pointers to point at vertices for right object */
+        for (k=j; k<j+num; k++) vtces[k] += tpts - 1; /*-1 so ptrs strt at 0 */
+        j += num;
+    }
+    *nvtces = j;
+    fclose(input);
+}
+
+
+
+
+/* ++++++++++++++++++++++ GET_SHADES +++++++++++++++++++++++++++++++++++++++ */
+get_shades(npts,poly,hilit,trnsp,obj,hl_nms,nlts)/* get shades, chck on hilit */
+short npts,obj,*nlts;    double *hilit,*trnsp;
+struct { double x,y,z,r,g,b,xn,yn,zn,t; } poly[];
+struct { double xn,yn,zn,r,g,b; } hl_nms[][MAXLTS];
+{   short i,j;
+    double sqrt(),pow(),fabs(),
+	   trans_max,xmax[MAXLTS],ymax[MAXLTS],xmin[MAXLTS],ymin[MAXLTS];
+
+    trans_max = 0;		/* maximum transparency for polygon */
+    for (i=0; i<npts; i++)
+    {   double norm_mag,dot_prod,red,grn,blu;
+        norm_mag = sqrt(sqr(poly[i].xn) + sqr(poly[i].yn) + sqr(poly[i].zn));
+        if (norm_mag <= 0)
+	{   fprintf(stderr,"(get_shades) null normal vector");  norm_mag = 1;  }
+
+	if (*trnsp > 0.)		     /* get transmittance at vertex */
+	{    double eye_mag,cosang;
+	     eye_mag = sqrt(sqr(poly[i].x) + sqr(poly[i].y) + sqr(poly[i].z));
+	     cosang = (-poly[i].x * poly[i].xn - poly[i].y * poly[i].yn
+		      - poly[i].z * poly[i].zn) / (eye_mag * norm_mag);
+	     poly[i].t *= pow(cosang,*trnsp);
+	     if (poly[i].t > trans_max)  trans_max = poly[i].t;
+	}
+
+        red = grn = blu = 0;
+        for (j=0; j<nbr_lights; j++)            /* do for each light source */
+        {   double lx,ly,lz,lit_dst,atten;
+            lx = lights[j].x - poly[i].x;
+            ly = lights[j].y - poly[i].y;
+            lz = lights[j].z - poly[i].z;
+            lit_dst = sqrt(sqr(lx) + sqr(ly) + sqr(lz));  /* dist. from lite */
+            atten = 1.0 - lit_dst/lights[j].range;
+            atten = (atten > 0.)?  sqr(atten) : 0.;  /* distance attenuation */
+            dot_prod = (poly[i].xn*lx + poly[i].yn*ly + poly[i].zn*lz) /
+                                                          (norm_mag * lit_dst);
+            if (dot_prod < 0.0) dot_prod = 0.0;
+	    dot_prod = dot_prod*ambntcomp + ambnt;	/* ambient light */
+            red += poly[i].r * dot_prod * lights[j].r * atten;
+            grn += poly[i].g * dot_prod * lights[j].g * atten;
+            blu += poly[i].b * dot_prod * lights[j].b * atten;
+
+	    if (*hilit > 0.)      /* get reflection vector if hilite possible */
+            {
+		get_vec(lx,ly,lz,lit_dst,&poly[i],&hl_nms[i][j]);
+
+		if (i == 0)	    /* first vertex, set up for min-max tests */
+		{   xmax[j] = xmin[j] = hl_nms[i][j].xn;
+		    ymax[j] = ymin[j] = hl_nms[i][j].yn;   }
+	        else           /* min-max tests for bounding box on highlight */
+	        { if      (hl_nms[i][j].xn > xmax[j]) xmax[j] = hl_nms[i][j].xn;
+	          else if (hl_nms[i][j].xn < xmin[j]) xmin[j] = hl_nms[i][j].xn;
+	          if      (hl_nms[i][j].yn > ymax[j]) ymax[j] = hl_nms[i][j].yn;
+	          else if (hl_nms[i][j].yn < ymin[j]) ymin[j] = hl_nms[i][j].yn;
+	        }
+	    }
+        }
+
+        if (pseudo_clr)
+            poly[i].r = dot_prod * clrange[obj] + clrofset[obj];
+        else
+        {   double fac;
+	    fac = 1.;			/* attenuate overflowing colors */
+	    if (red > fac) fac = red;
+	    if (grn > fac) fac = grn;
+	    if (blu > fac) fac = blu;
+	    fac = 1./fac;
+	    poly[i].r = red*fac;    poly[i].g = grn*fac;    poly[i].b = blu*fac;
+	}
+    }
+
+    *nlts = 0;	/* count number of lights which cause highlights in this poly */
+
+    if (*hilit > 0.) for (j=0; j<nbr_lights; j++)
+    {   short k;
+	xmin[j] = (xmax[j]*xmin[j] < 0.)?  0. :
+			((fabs(xmin[j]) < fabs(xmax[j]))? xmin[j] : xmax[j]);
+        ymin[j] = (ymax[j]*ymin[j] < 0.)?  0. :
+			((fabs(ymin[j]) < fabs(ymax[j]))? ymin[j] : ymax[j]);
+	if (pow(1. - sqr(xmin[j]) - sqr(ymin[j]),*hilit) > HILIT_MIN)
+	{   if (*nlts != j) for (k=0; k<npts; k++)/* highlight!, store normal */
+            {   hl_nms[k][*nlts].xn = hl_nms[k][j].xn;
+                hl_nms[k][*nlts].yn = hl_nms[k][j].yn;
+                hl_nms[k][*nlts].zn = hl_nms[k][j].zn;
+	    }
+	    hl_nms[0][*nlts].r = lights[j].r;	/* store light source color */
+	    hl_nms[0][*nlts].g = lights[j].g;
+	    hl_nms[0][*nlts].b = lights[j].b;
+	    (*nlts)++;
+	}
+    }
+    if ((*nlts) == 0)  *hilit = 0.;  /* zero highlight power if no highlights */
+    if (trans_max < TRANS_MIN) *trnsp = 0.; /* is max. trnsmttnce noticeable? */
+}
+
+
+
+
+/* +++++++++++++++++++++ GET_TERM +++++++++++++++++++++++++++++++++ */
+get_term(instrg,term,remainder)		/* remove first term from string */
+char *instrg,*term,*remainder;  /* blanks, tabs, nulls, commas are separators */
+{   short i,index1,index2;
+    index1 = 0;				/* find first non-separator */
+    while ((instrg[index1] == ' ') 	|| (instrg[index1] == '\t') ||
+	   (instrg[index1] == NULLCHAR) || (instrg[index1] == ',' )) index1++;
+    index2 = index1;			/* find next separator */
+    while ((instrg[index2] != ' ') 	&& (instrg[index2] != '\t') &&
+	   (instrg[index2] != NULLCHAR) && (instrg[index2] != ',' ) &&
+	   (instrg[index2] != '\n'))				     index2++;
+    for (i=index1; i<index2; i++)  term[i-index1] = instrg[i];
+    term[i-index1] = NULLCHAR;
+    while ((instrg[i] != NULLCHAR) && (instrg[i] != '\n'))
+	{  remainder[i-index2] = instrg[i];  i++;  }
+    remainder[i-index2] = NULLCHAR;
+}
+
+
+
+
+/* ++++++++++++++++++++++++++++ GET_VEC ++++++++++++++++++++++++++++++++++ */
+get_vec(lx,ly,lz,lit_dst,vtx,nrml)   /* get vector in ideal reflection space */
+double lx,ly,lz,lit_dst;
+struct { double x,y,z,r,g,b,xn,yn,zn,t; } *vtx;
+struct { double xn,yn,zn,r,g,b; } *nrml;
+{   double eye_mag,rflx,rfly,rflz,cosa,sina,hypota,cosb,sinb,hypotb,
+           tx,ty,tz,tm,sqrt();
+    eye_mag = sqrt(sqr(vtx->x) + sqr(vtx->y) + sqr(vtx->z));
+    rflx = (lx/lit_dst - vtx->x/eye_mag) / 2;       /* get half-angle vector */
+    rfly = (ly/lit_dst - vtx->y/eye_mag) / 2;       /* represents normal at  */
+    rflz = (lz/lit_dst - vtx->z/eye_mag) / 2;       /* middle of highlight   */
+
+    /* rotate normal into space in which half-angle vector is on z-axis */
+    hypota = sqrt(sqr(rflx) + sqr(rflz));
+    cosa = rflz / hypota;    sina = rflx / hypota;
+    hypotb = sqrt(sqr(rfly) + sqr(hypota));
+    cosb = hypota / hypotb;   sinb = rfly / hypotb;
+    tx = cosa * vtx->xn - sina * vtx->zn; 		/* rotate about y */
+    ty = vtx->yn;
+    tz = sina * vtx->xn + cosa * vtx->zn;
+    nrml->xn = tx;					/* rotate about x */
+    nrml->yn = cosb * ty - sinb * tz;
+    nrml->zn = sinb * ty + cosb * tz;
+    tm = sqrt(sqr(vtx->xn) + sqr(vtx->yn) + sqr(vtx->zn));
+    nrml->xn /= tm;    nrml->yn /= tm;    nrml->zn /= tm;	/* normalize */
+}
+
+
+
+
+/* ++++++++++++++++++++++++ POLCLP +++++++++++++++++++++++++++++++++++++ */
+polclp(pass,npts,pts,pt2,nlts,nmls,nml2)        /* polygon clipper (eyespace) */
+    short *npts,pass;    struct { double x,y,z,r,g,b,xn,yn,zn,t; } pts[],pt2[];
+    struct { double xn,yn,zn,r,g,b; } nmls[][MAXLTS],nml2[][MAXLTS];
+{   short i,lk,m;   float dist,last_dist;
+    if ((pass == 4) || (*npts < 3))  return;        /* completion conditions */
+    last_dist = 0.0;    m = 0;    lk = 0;
+    for (i=0; i<=*npts; i++)
+    {   short k,l;
+        k = (i == *npts) ?  0 : i;
+        switch (pass)
+        {   case 0: { dist = pts[k].z+pts[k].x; break; }  /* left side  */
+            case 1: { dist = pts[k].z-pts[k].x; break; }  /* right side */
+            case 2: { dist = pts[k].z+pts[k].y; break; }  /* bottom  */
+            case 3: { dist = pts[k].z-pts[k].y; break; }  /* top  */
+        }
+        if (i == 0) {  last_dist = dist;  lk = k;  continue;  } /* 1st pnt? */
+
+        if (last_dist * dist < 0.0)  /* put out point if clip plane crossed */
+        {   float t,t1;
+            t = dist / (dist - last_dist);  t1 = 1.0 - t;
+            pt2[m].x = pts[k].x * t1 + pts[lk].x * t;
+            pt2[m].y = pts[k].y * t1 + pts[lk].y * t;
+            pt2[m].z = pts[k].z * t1 + pts[lk].z * t;
+            pt2[m].r = pts[k].r * t1 + pts[lk].r * t;
+            pt2[m].g = pts[k].g * t1 + pts[lk].g * t;
+            pt2[m].b = pts[k].b * t1 + pts[lk].b * t;
+            pt2[m].xn = pts[k].xn * t1 + pts[lk].xn * t;
+            pt2[m].yn = pts[k].yn * t1 + pts[lk].yn * t;
+            pt2[m].zn = pts[k].zn * t1 + pts[lk].zn * t;
+            pt2[m].t = pts[k].t * t1 + pts[lk].t * t;
+	    for (l=0; l<nlts; l++)
+	    {   nml2[m][l].xn = nmls[k][l].xn * t1 + nmls[lk][l].xn * t;
+	        nml2[m][l].yn = nmls[k][l].yn * t1 + nmls[lk][l].yn * t;
+	        nml2[m][l].zn = nmls[k][l].zn * t1 + nmls[lk][l].zn * t;
+    	    }
+	    m++;
+        }
+        if (dist >= 0.0)                            /* copy point if inside */
+        {   pt2[m].x = pts[k].x;   pt2[m].y = pts[k].y;
+            pt2[m].z = pts[k].z;   pt2[m].r = pts[k].r;
+            pt2[m].g = pts[k].g;   pt2[m].b = pts[k].b;
+            pt2[m].xn = pts[k].xn; pt2[m].yn = pts[k].yn;
+            pt2[m].zn = pts[k].zn; pt2[m].t = pts[k].t;
+	    for (l=0; l<nlts; l++)
+	    {   nml2[m][l].xn = nmls[k][l].xn;    nml2[m][l].yn = nmls[k][l].yn;
+	        nml2[m][l].zn = nmls[k][l].zn;   }
+            m++;
+        }
+        lk = k;    last_dist = dist;
+    }						   /* recurse for next plane */
+    *npts = m;   polclp(++pass,npts,pt2,pts,nlts,nml2,nmls);
+}
+
+
+
+/* ++++++++++++++++++++++ PREPARE_OBJ ++++++++++++++++++++++++++++++++++ */
+prepare_obj(objnum,dvc)          /* transform vertices, compute normals, etc. */
+short objnum;   char dvc[];
+{   short i;
+    /* ----- run through points, transform, find max and min in z ----- */
+    for (i=tpts; i<tpts+npts; i++)
+    {   transform(&pts[i],matrix,&pts[i]);
+        if (pts[i].z > zmax)  zmax = pts[i].z;
+        else if (pts[i].z < zmin)  zmin = pts[i].z;
+        cnt[i] = IN;                                    /* set clip code */
+        norms[i].x = 0; norms[i].y = 0; norms[i].z = 0; /* init. normals */
+    }
+    if (clipping[objnum]) for (i=tpts; i<tpts+npts; i++)  /* tag if clipping */
+    {   if ( pts[i].z < 0.0)               cnt[i] |= OUTHTR;
+        if ((pts[i].x)*cot_x < -pts[i].z)  cnt[i] |= OUTLFT;
+        if ((pts[i].x)*cot_x >  pts[i].z)  cnt[i] |= OUTRGT;
+        if ((pts[i].y)*cot_y < -pts[i].z)  cnt[i] |= OUTBOT;
+        if ((pts[i].y)*cot_y >  pts[i].z)  cnt[i] |= OUTTOP;
+    }
+
+
+    /* ------------- run through polygons, check backfacing,
+                     sum normals at vertices of frontfacing polys,
+                     and do trivial reject/accept clip  --------------- */
+    {   short in,out;    long ivtx;
+        ivtx = tvtces;    in = out = 0;
+        for (i=tpolys; i<tpolys+npolys; i++)
+        {   struct { float x,y,z; } vec;   short size;   long j;
+
+            size = vtces[ivtx++];
+            if (clipping[objnum])           /* trivial clip test if clipping */
+            {   out = 0;    in = 0;
+                for (j=ivtx; j<ivtx+size; j++)
+                {   out &= cnt[vtces[j]];   in |= cnt[vtces[j]];   }
+            }
+            if (out)   clp[i] = -out;   /* trivial rejection, skip this one */
+            else
+            {   clp[i] = in;      /* store code for trivial acceptance */
+                obj_no[i] = objnum;	/* tag with object ID for shading */
+
+                j = ivtx;            /* get normal vector, do backface test */
+                X_prod(&vec,pts[vtces[j]],pts[vtces[j+1]],pts[vtces[j+2]]);
+                j = vtces[ivtx];
+                if ((vec.x*pts[j].x + vec.y*pts[j].y + vec.z*pts[j].z) >= 0.0)
+                     bfacing[i] = TRUE;                        /* backfacing */
+                else bfacing[i] = FALSE;
+
+                if (!faceted[objnum])
+                    for (j=ivtx; j<ivtx+size; j++)     /* sum vertex normals */
+                    {   short k;                        /* if smooth shading */
+                        k = vtces[j];
+                        norms[k].x += vec.x;
+                        norms[k].y += vec.y;
+                        norms[k].z += vec.z;
+                    }
+            }
+            ivtx += size;                         /* increment to next poly */
+        }
+    }
+    tpts += npts;    tpolys += npolys;    tvtces += nvtces;    tclrs += nclrs;
+}
+
+
+
+/* +++++++++++++++++++++++++ TRANSFORM ++++++++++++++++++++++++++++++++++++ */
+transform(orgpt,mtx,pt)                          /* apply transform to point */
+    struct { float x,y,z; } *orgpt,*pt;    double mtx[16];
+{   float tx,ty,tz;
+    tx = mtx[0]*orgpt->x + mtx[4]*orgpt->y + mtx[8]*orgpt->z   + mtx[12];
+    ty = mtx[1]*orgpt->x + mtx[5]*orgpt->y + mtx[9]*orgpt->z   + mtx[13];
+    tz = mtx[2]*orgpt->x + mtx[6]*orgpt->y + mtx[10]*orgpt->z  + mtx[14];
+    pt->x = tx;    pt->y = ty;    pt->z = tz;
+}
+
+
+
+
+/* ++++++++++++++++++++++++++ X_PROD +++++++++++++++++++++++++++++++++++ */
+X_prod(vec,pt1,pt2,pt3)                        /* vector cross-product */
+    struct { float x,y,z; } *vec,pt1,pt2,pt3;
+{   pt1.x = pt2.x - pt1.x;
+    pt1.y = pt2.y - pt1.y;
+    pt1.z = pt2.z - pt1.z;
+    pt2.x = pt3.x - pt2.x;
+    pt2.y = pt3.y - pt2.y;
+    pt2.z = pt3.z - pt2.z;
+    vec->x = pt1.y*pt2.z - pt1.z*pt2.y;
+    vec->y = pt1.z*pt2.x - pt1.x*pt2.z;
+    vec->z = pt1.x*pt2.y - pt1.y*pt2.x;
+}
+
+
+
+!Funky!Stuff!
+
+

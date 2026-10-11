@@ -1,0 +1,2761 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,47a60f3dbd73fb61,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1987-02-06 07:57:05 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!watmath!clyde!rutgers!seismo!mcvax!ukc!warwick!cudcv
+From: cudcv@warwick.UUCP
+Newsgroups: net.sources
+Subject: dvix27 - DVI to Xerox 2700 driver (Part 1 of 2)
+Message-ID: <325@sol.warwick.ac.uk>
+Date: Fri, 6-Feb-87 10:57:05 EST
+Article-I.D.: sol.325
+Posted: Fri Feb  6 10:57:05 1987
+Date-Received: Mon, 9-Feb-87 02:14:20 EST
+Reply-To: cudcv@sol.warwick.ac.uk (Rob McMahon)
+Followup-To: comp.sources.d
+Organization: Computing Services, Warwick University, UK
+Lines: 2740
+
+<munch>
+
+Here is a dvi to Xerox 2700 driver in C.  It runs under Unix on an
+assortment of machines (VAX, Gould, Sun under 2.0 & 3.0).  It reads PK
+files, as well as PXL files, so might be of interest even to people
+with 2700's.  It is based (heavily) on the dvi2ps that comes with Unix
+TeX.  It works hard to do the best it can with the 2700's limited
+memory, it assembles fonts on the fly, sending only the characters it
+needs.  It tries to load down the fonts for the whole document at
+once, but if it looks like it's running out of memory it will back
+off, print as much as it can, and try again.  It's been running a few
+weeks here and, whilst I expect there are still bugs left, it seems to
+have stabilised (if Christer Lindh <clindh@uucp.sems> is listening - I
+did try to send this to you, but I think there must be a black hole in
+the middle of the English Channel).  One gotcha - laser.setup should
+have the \E's replaced by real ESC characters.  Have fun ...
+------------------ cut here ------------------------------------------
+#!/bin/sh
+echo 'Start of DVI -> 2700 driver, part 01 of 02:'
+echo 'x - dvix27.c'
+sed 's/^X//' > dvix27.c << '/'
+X#define VERSION "2.10"
+X
+X/*
+X *
+X * AUTHOR(s)
+X *     Mark Senn wrote the early versions of this program for the
+X *     BBN BitGraph.  Stephan Bechtolsheim, Bob Brown, Richard
+X *     Furuta, James Schaad and Robert Wells improved it.  Norm
+X *     Hutchinson ported the program to the Sun.  Neal Holtz ported
+X *     it to the Apollo, and from there to producing PostScript
+X *     output. Scott Jones added intelligent font substitution.
+X *     Rob McMahon converted from this version to the Xerox 2700.
+X */
+X
+X/* Basic method:
+X * 
+X * Using the local font cacheing machinery that was in the previewer, we
+X * can easily manage to send the bitmap for each chracter only once.  Two
+X * passes are made over the DVI file.  The first pass simply outputs the
+X * bitmaps for all characters that haven't been sent before for this
+X * section of the document.  The section ends when the font job becomes
+X * too complicated, or at the end of the document.  The second pass on a
+X * section outputs all the character setting and positioning commands.
+X * 
+X */
+X
+X
+X/* Change log:
+X *
+X * Early 1985, (nmh) -- ported sun version to Apollo. 
+X * A little later (nmh) -- changed to continue on in the event of missing
+X *                      font files.
+X * 30-Mar-85 (nmh) -- added -a option to specify a different PXL area
+X * 30-Mar-85 (nmh) -- changed default PXL area to /pxl118
+X * 31-Mar-85 (nmh) -- fixed bug in OpenFontFile() regarding more than MAXOPEN
+X *                    PXL files -- changed to mark files as closed in font_entry.
+X *  7-Apr-85 (nmh) -- made command line argument decoding case insensitive.
+X *                    cleaned up handling of DVI file name argument.
+X * 30-May-85 (nmh) -- new version; hacked to output PostScript commands
+X *  6-Jun-85 (nmh) -- added relative positioning (20% smaller PostScript output)
+X *                    add -m option to specify mag
+X * 11-Jun-85 (nmh) -- fixed bug regarding char spacings in very long "words"
+X * 12-Jun-85 (nmh) -- v1.02 - process DVI pages in reverse order
+X * 13-Jun-85 (nmh) -- fixed bug re PXL files getting opened too often when no PreLoad
+X * 14-Jun-85 (nmh) -- font dict created in PostScript only when 1st char of font downloaded
+X *                    add -m0 -mh -m1 etc. to specify magsteps
+X * 16-Aug-85 (nmh) -- added -c option t0 create output file in spool area (Apollo specific)
+X *                    added -h option to copy header file to output
+X *                    added -o option to pass options through to PostScript
+X * 20-Aug-85 (nmh) -- v1.03
+X * 24-Aug-85 (nmh) -- add -q option (for quiet operation).
+X *                    changed -o option to check PostScript option
+X *                    changed to output coordinates in TeX system (but
+X *                    scaled to raster units) -- (0,0) at 1" in and down from
+X *                      top left (better for use with different size paper).
+X *                 -- v2.00
+X * 25-Aug-85 (nmh) -- added dictionary enclosure to Tex.ps, and output
+X *                      suitable prolog here.
+X * 26-Aug-85 (nmh) -- changes to tex.ps to support Macintosh documents.
+X * 14-Sep-85 (nmh) -- added keyword=value decoding to \special;
+X * 15-Sep-85 (nmh) -- added -i file option.
+X * 23-Sep-85 (saj) -- added font substitution for case when font is
+X *                    unavailable at requested mag. (a frequent occurrence
+X *                    with some macro packages like LaTeX)
+X * 6-Jan-87 (cudcv) - major conversion to Xerox 2700.
+X *			cope with PK files, and with colon separated paths
+X *			for pixel area.
+X */
+X
+X
+X/**********************************************************************/
+X/************************  Global Definitions  ************************/
+X/**********************************************************************/
+X
+X/* This version purports to drive a Xerox 2700 */
+X
+X
+Xtypedef int BOOLEAN;
+X#define NEW(A) ((A *) malloc(sizeof(A)))
+X#define DEBUG   1			/* for massive printing of input */
+X					/* trace information; select by -d */
+X					/* option after filename: */
+X					/* dviview filename -d */
+X#ifdef DEBUG
+Xint Debug = 0;
+X#endif
+X                          /* to enable statistics reporting via -s option */
+X#define STATS
+X
+X#define BINARYOPEN fopen		/* byte-oriented host version */
+X
+X#define ARITHRSHIFT 1                   /* define if ">>" operator is a */
+X                                        /* sign-propagating arithmetic  */
+X                                        /*   right shift */
+X#define USEGLOBALMAG 1			/* when defined, the dvi global */
+X   					/*   magnification is applied   */
+X      
+X/* We can leave USEGLOBALMAG undefined when we have a limited
+X   number of font magnifications (at 300dpi) available.  Otherwise, we
+X   will simply complain about missing PXL files
+X */
+X
+X/* #undef USEGLOBALMAG */
+X
+X                        /* define for "optimal" relative postioning, rather
+X                           than absolute.  Relative can reduce size of postcript
+X                           output 20% (and reduce print time by almost as much */
+X#define USERELPOS 1 
+X
+X#define  DVIFORMAT        2
+X#define  TRUE             1
+X#define  FALSE            0
+X#define  FIRSTPXLCHAR     0
+X#define  LASTPXLCHAR    127
+X
+X#ifndef FONTAREA
+X#define  FONTAREA         "/usr/lib/tex/fonts"
+X#endif
+X
+X#ifdef apollo
+X#ifndef SPOOLFILE
+X#define SPOOLFILE       "/local/spool/laser/tex."
+X#endif
+X#define MAXFLEN 28
+X#endif apollo
+X
+X#ifdef apollo
+X#define  MAXOPEN         45  /* limit on number of open PXL files */
+X#else !apollo
+X#define  MAXOPEN         45	/* limit on number of open PXL files */
+X#endif
+X
+X#define  NPXLCHARS      128
+X#define  PXLID         1001
+X#define	PK_POST	245
+X#define	PK_PRE	247
+X#define	PK_ID	89
+X#define  READ             4  /* for access() */
+X#define  RESOLUTION      300
+X#define  hconvRESOLUTION 300
+X#define  vconvRESOLUTION 300
+X#define  STACKSIZE      100
+X#define  STRSIZE        257
+X#define	MAXnPXLvec	10	/* number of components in PXLpath */
+X#define  NONEXISTANT     -1   /* offset for PXL files not found */
+X#define  NO_FILE        (FILE *)-1
+X#define	FF	'\014'
+X#define	ESC	'\033'
+X#define	DEL	'\177'
+X#define	MAXFONTID	9	/* number of assigned fonts on 2700 */
+X#define	MINCH	32		/* minimum char in 2700 font */
+X#define	MAXCH	254		/* maximum  "   "   "    "   */
+X#define	MAX_PAT	0x40000		/* maximum pattern data in one font */
+X#define	MAX_LDFONTS	14	/* maximum number of loaded fonts */
+X#define	MAX_FONT_DATA	150000	/* maximum number of font bytes */
+X#define	TOP	3500		/* top of page - 1" in pixels for A4 */
+X#define	LEFT	0		/* indent 1" from left margin */
+X
+X/* may need to byte swap for xerox */
+X#ifdef	vax
+X#define	htoxs(x)	(x)
+X#else
+X#define	htoxs(x)	((((x) & 0xff) << 8) | (((x) >> 8) & 0xff))
+X#endif
+X#define	xtohs(x)	htoxs(x)
+X
+X#ifdef apollo           /* define for enabling of -c option (create output file) */
+X#define CREOPT
+X#endif apollo
+X
+X/**********************************************************************/
+X/***********************  external definitions  ***********************/
+X/**********************************************************************/
+X
+X#include "commands.h"
+X#include <sys/param.h>
+X#include <sys/file.h>
+X#include <strings.h>
+X#include <signal.h>
+X#include <stdio.h>
+X#include "findfile.h"
+X#include "fontstr.h"
+X#include <ctype.h>
+X#include <errno.h>
+X
+Xextern int	errno;
+Xint  access();
+Xchar *index();
+Xchar *malloc();
+Xint  free();
+Xchar *rindex();
+Xchar *sprintf();
+Xchar *strcpy(); 
+Xchar *logname();
+X
+X#define EQ(a,b) (strcmp(a,b)==0)
+X
+X                        /* output a formatted string */
+X#define EMIT      (void) fprintf
+X                        /* output a simple string */
+X#define EMITS(s)  fputs(s,outfp)
+X                        /* output an escaped octal number */
+X#define EMITO(c)  PutOct(c)
+X                        /* output a decimal integer */
+X#define EMITN(n)  PutInt(n)
+X                        /* output a byte value in Hex */
+X#define EMITH(h)  (void) putc(*(digit+((h>>4)&0xF)),outfp),\
+X                  (void) putc(*(digit+(h&0xF)),outfp)
+X                        /* output a single character */
+X#define EMITC(c)  (void) putc(c,outfp)
+X                        /* output a scaled X dimension */
+X#define EMITX(x)  PutInt(PixRound(x,hconv))
+X                        /* output a scaled Y dimension */
+X#define EMITY(y)  PutInt(PixRound(y,vconv))
+X
+X                                   /* formatted i/o was killing us, so build some tables */
+Xchar    *digit = "0123456789ABCDEF";
+X
+Xtypedef union {
+X    int code;
+X    struct {
+X#ifndef	vax
+X	unsigned int spare		:24;
+X	unsigned int flag_dyn_f		:4;
+X	unsigned int flag_turn_on	:1;
+X	unsigned int flag_extended	:1;
+X	unsigned int flag_length_prefix	:2;
+X#else
+X	unsigned int flag_length_prefix	:2;
+X	unsigned int flag_extended	:1;
+X	unsigned int flag_turn_on	:1;
+X	unsigned int flag_dyn_f		:4;
+X	unsigned int spare		:24;
+X#endif
+X    } flag_split;
+X} FlagByte;
+X#define	dyn_f		flag_split.flag_dyn_f
+X#define	turn_on		flag_split.flag_turn_on
+X#define	extended	flag_split.flag_extended
+X#define	length_prefix	flag_split.flag_length_prefix
+X
+X/**********************************************************************/
+X/*************************  Global Procedures  ************************/
+X/**********************************************************************/
+X
+X/* Note: Global procedures are declared here in alphabetical order, with
+X   those which do not return values typed "void".  Their bodies occur in
+X   alphabetical order following the main() procedure.  The names are
+X   kept unique in the first 6 characters for portability. */
+X
+Xvoid	AbortRun();
+Xfloat	ActualFactor();
+Xvoid	AllDone();
+XFILE*	BINARYOPEN();
+Xvoid    CopyFile();
+Xvoid    DecodeArgs();
+Xvoid    DoSpecial();
+Xvoid    EmitChar();
+Xvoid	Encode();
+Xvoid	Fatal();
+Xvoid	FindPostAmblePtr();
+Xvoid	FlushXFont();
+Xvoid	GetBytes();
+Xvoid	GetFontDef();
+Xchar   *GetKeyStr();
+Xint     GetKeyVal();
+Xint     HasBeenRead();
+Xint     IsSame();
+Xvoid    lcase();
+Xvoid	MoveDown();
+Xvoid	MoveOver();
+Xint     NoSignExtend();         /* see cautionary note in code, re arithmetic vs logical shifts */
+Xvoid	OpenFontFile();
+X#ifdef CREOPT
+XFILE*   OpenOutput();
+X#endif CREOPT
+Xint	PixRound();
+Xvoid    PutInt();
+Xint	ReadFontDef();
+Xvoid	ReadPostAmble();
+Xvoid	SetChar();
+Xvoid	SetFntNum();
+Xvoid    SetPosn();
+Xvoid	SetRule();
+X/* void    SetString(); */
+Xvoid	SetXFont();
+Xint     SignExtend();           /* see cautionary note in code, re arithmetic vs logical shifts */
+Xvoid	SkipFontDef();
+XFlagByte	SkipSpecials();
+Xvoid	Warning();
+X
+X
+X/**********************************************************************/
+X/***********************  Font Data Structures  ***********************/
+X/**********************************************************************/
+X
+X
+Xstruct char_entry {		/* character entry */
+X   unsigned short width, height;/* width and height in pixels */
+X   short xOffset, yOffset;      /* x offset and y offset in pixels */
+X   struct {
+X       int isloaded;		/* == loadpass if in current load */
+X       union {
+X	   long fileOffset;
+X	   long *pixptr; } address;
+X       struct xfont *xfont;	/* 2700 font this character lives in */
+X       int glyph;		/* position in 2700 font */
+X       } where;
+X   int tfmw;			/* TFM width */
+X   int realw;			/* best the 2700 can do */
+X   int kern;			/* correction for +ve xOffset */
+X   FlagByte flag;		/* PK flag byte */
+X   };
+X
+Xstruct font_entry {  /* font entry */
+X   int k, c, s, d, a, l;
+X   char n[STRSIZE];	/* FNT_DEF command parameters  */
+X   int font_space;	/* computed from FNT_DEF s parameter        */
+X   int font_mag;	/* computed from FNT_DEF s and d parameters */
+X   char name[STRSIZE];	/* full name of PXL file                    */
+X   FILE *font_file_id;  /* file identifier (NO_FILE if none)         */
+X   int type;			/* FONT_PK or FONT_PXL */
+X   long	offset;			/* offset in PK file */
+X   int magnification;	/* magnification read from PXL file         */
+X   int designsize;	/* design size read from PXL file           */
+X   struct char_entry ch[NPXLCHARS];/* character information         */
+X   struct font_entry *next;
+X   int ncdl;            /* # of different chars actually downloaded */
+X#ifdef STATS
+X   int nbpxl;           /* # of bytes of PXL data downloaded        */
+X   int ncts;            /* total # of characters typeset */
+X#endif
+X};
+X#define	FONT_PXL	0	/* this is a PXL font */
+X#define	FONT_PK		1	/* this is a PK font */
+X
+Xstruct pixel_list
+X{
+X    FILE *pixel_file_id;        /* file identifier                          */
+X    struct font_entry *font_entry; /* font entry this refers to */
+X    int use_count;              /* count of "opens"                         */
+X    };
+X
+Xstruct xfont {
+X    struct xfont *next;		/* list of fonts */
+X    char xname[STRSIZE];	/* 2700 font name */
+X    int glyph;			/* maximum glyph in this font so far */
+X    int usage;			/* usage since assignment */
+X};
+X
+X/**********************************************************************/
+X/*************************  Global Variables  *************************/
+X/**********************************************************************/
+X
+Xint   FirstPage = -1000000;     /* first page to print (uses count0)   */
+Xint   LastPage = 1000000;       /* last page to print                    */
+X
+Xchar filename[STRSIZE];         /* DVI file name			   */
+X
+X#ifdef	CREOPT
+Xint   G_create = FALSE;         /* create an output file in spool area ?   */
+X#endif
+Xint   G_errenc = FALSE;	        /* has an error been encountered?          */
+Xchar  G_Logname[STRSIZE];       /* name of log file, if created            */
+Xint   G_logging = 0;            /* Are we logging warning messages?        */
+Xint   G_logfile = FALSE;        /* Are these messages going to a log file? */
+XFILE *G_logfp;                  /* log file pointer (for errors)           */
+Xchar  G_progname[STRSIZE];      /* program name                            */
+Xint   G_quiet = FALSE;          /* for quiet operation                     */
+Xint   G_nowarn = FALSE;         /* don't print out warnings                */
+X
+Xint   hconv, vconv;		/* converts DVI units to pixels             */
+Xint   den;			/* denominator specified in preamble        */
+XFILE *dvifp  = NULL;		/* DVI file pointer                         */
+Xint   PreLoad = TRUE;	        /* preload the font descriptions?	     */
+Xstruct font_entry *prevfont=NULL;  /* font_entry pointer, previous character */
+Xstruct font_entry *fontptr;     /* font_entry pointer                       */
+Xstruct font_entry *hfontptr=NULL;/* font_entry pointer                      */
+Xint   h;			/* current horizontal position              */
+Xint   hh = -9999;		/* current h on device */
+Xint   v;			/* current vertical position                */
+Xint   vv = -9999;		/* current v on device */
+Xint   mag;			/* magnification specified in preamble      */
+Xint   ndone = 0;                /* number of pages converted */
+Xint   nopen;			/* number of open PXL files                 */
+Xint   num;			/* numerator specified in preamble          */
+X#ifdef CREOPT
+Xchar  outfname[256];            /* name of output file                      */
+X#endif CREOPT
+XFILE  *outfp = NULL;            /* output file                              */
+Xstruct font_entry *pfontptr = NULL; /* previous font_entry pointer          */
+Xstruct pixel_list pixel_files[MAXOPEN+1];
+X                                /* list of open PXL file identifiers        */
+Xlong  postambleptr;		/* Pointer to the postamble                 */
+XFILE *pxlfp;			/* PXL file pointer                         */
+Xchar *PXLpath;			/* PXL path name for search		    */
+Xchar *PXLvec[MAXnPXLvec];	/* " split into components at : */
+Xint   nPXLvec;			/* number of components in " */
+Xlong  ppagep;	                /* previous page pointer		     */
+Xchar  rootname[STRSIZE];      /* DVI filename without extension */
+X#ifdef STATS
+Xint   Stats = FALSE;          /* are we reporting stats ?                 */
+Xint   Snbpxl = 0;             /* # of bytes of pixel data                 */
+Xint   Sonbpx = 0;             /* "optimal" number of bytes of pixel data  */
+Xint   Sndc = 0;               /* # of different characters typeset        */
+Xint   Stnc = 0;               /* total # of chars typeset                 */
+Xint   Snbpx0, Sndc0, Stnc0;   /* used for printing incremental changes per dvi page */
+X#endif
+X
+Xint usermag = 0;              /* user specified magnification */
+Xint	loadpass;		/* in nth font load */
+Xint	Complex = FALSE;	/* section too complex - print it */
+Xint	Emitting = FALSE;	/* outputting typsetting instructions? */
+Xint	SkipMode = FALSE;	/* in skip mode flag                     */
+Xstruct xfont *curxfont = NULL;	/* current font on 2700 */
+Xstruct xfont *headxfont = NULL;	/* list of 2700 fonts */
+Xint	nxfonts = 0;		/* number of 2700 fonts so far */
+Xlong	total_font_data;	/* total bytes of font data */
+Xstruct xheader	xheader;	/* header for 2700 font */
+Xchar	qual_tab[256] = { 0 };	/* qualification table (unused) */
+Xstruct xchardesc lut_tab [256];	/* character lookup table in current font */
+Xstruct xchardesc space_glyph = { /* single pixel space */
+X    htoxs(2), 0, 0, 61, -5, 0
+X};
+Xchar	patt_tab[MAX_PAT];	/* patterns for 2700 characters */
+Xint	next_free;		/* next free slot in patt_tab */
+Xstruct xfont *assigned_font[MAXFONTID];	/* fonts with assigned ID's */
+X
+X/**********************************************************************/
+X/*******************************  main  *******************************/
+X/**********************************************************************/
+X
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X
+X{
+X    struct stack_entry {  /* stack entry */
+X	int h, v, w, x, y, z;  /* what's on stack */
+X    };
+X
+X
+X    int command;	    /* current command			     */
+X    int count[10];          /* the 10 counters at begining of each page */
+X    long cpagep;	    /* current page pointer		     */
+X    long spagep, tpagep;	/* extent of this section */
+X    register int i;	    /* command parameter; loop index	     */
+X    int k;		    /* temporary parameter		     */
+X    char n[STRSIZE];	    /* command parameter		     */
+X    int PassNo = 0;         /* which pass over the DVI page are we on?  */
+X    int sp;		    /* stack pointer			     */
+X    struct stack_entry stack[STACKSIZE];   /* stack		     */
+X    char SpecialStr[STRSIZE]; /* "\special" strings                  */
+X    int val, val2;          /* temporarys to hold command information*/
+X    int w;		    /* current horizontal spacing	     */
+X    int x;		    /* current horizontal spacing	     */
+X    int y;		    /* current vertical spacing		     */
+X    int z;		    /* current vertical spacing		     */
+X
+X    nopen = 0;
+X    (void) strcpy(G_progname, argv[0]);
+X
+X    PXLpath = FONTAREA;       /* default font area */
+X
+X    DecodeArgs( argc, argv );
+X
+X    {				/* split PXLpath into vec */
+X	char *p;
+X
+X	nPXLvec = 1;
+X	PXLvec[0] = PXLpath;
+X
+X	while ((p = index(PXLpath, ':')) != 0 && nPXLvec < MAXnPXLvec) {
+X	    *p++ = '\0';
+X	    PXLvec[nPXLvec++] = p;
+X	}
+X    }
+X
+X#ifdef apollo
+X    set_sbrk_size( 2048*1024 );
+X#endif
+X
+X    if ((i = NoSignExtend(dvifp, 1)) != PRE)  {
+X	(void) fprintf(stderr,"\n");
+X	Fatal("%s: PRE doesn't occur first--are you sure this is a DVI file?\n\n",
+X	G_progname);
+X    }
+X
+X    i = SignExtend(dvifp, 1);
+X    if (i != DVIFORMAT)  {
+X	(void) fprintf(stderr,"\n");
+X	Fatal("%s: DVI format = %d, can only process DVI format %d files\n\n",
+X	G_progname, i, DVIFORMAT);
+X    }
+X
+X#ifdef CREOPT
+X    if( G_create )
+X        outfp = OpenOutput();
+X    else
+X#endif CREOPT
+X        outfp = stdout;
+X
+X    /* it is important that these be the very first things output !!! */
+X    EMIT(outfp,"%c+X\n",ESC);
+X    /* set margins for A4 */
+X    EMIT(outfp,"%cm700,0,0,0,495\n",ESC);
+X
+X    if (PreLoad) {
+X	ReadPostAmble(TRUE);
+X	(void) fseek(dvifp, (long) 14, 0);
+X    }
+X    else {
+X	num = NoSignExtend(dvifp, 4);
+X	den = NoSignExtend(dvifp, 4);
+X	mag = NoSignExtend(dvifp, 4);
+X#ifdef USEGLOBALMAG
+X	if( usermag > 0 && usermag != mag )
+X	    (void) fprintf(stderr, "DVI magnification of %d over-ridden by user mag of %d\n", mag, usermag );
+X#endif
+X	if( usermag > 0 ) mag = usermag;
+X#ifndef USEGLOBALMAG
+X	if( mag != 1000 )
+X	    (void) fprintf(stderr, "Magnification of %d ignored.\n", mag);
+X#endif
+X	hconv = DoConv(num, den, hconvRESOLUTION);
+X	vconv = DoConv(num, den, vconvRESOLUTION);
+X    }
+X    k = NoSignExtend(dvifp, 1);
+X    GetBytes(dvifp, n, k);
+X
+X    PassNo = 0;
+X    spagep = ftell(dvifp);
+X    tpagep = 0;
+X    total_font_data = 0;
+X    nxfonts = 0;
+X    curxfont = 0;
+X    loadpass = 1;
+X    EMIT(outfp,"%c+F\n",ESC);
+X    
+X    while (TRUE)
+X
+X	switch (command=NoSignExtend(dvifp, 1))  {
+X
+X	case SET1:case SET2:case SET3:case SET4:
+X	    val = NoSignExtend(dvifp, command-SET1+1);
+X	    if (!SkipMode) SetChar(val, command, PassNo);
+X	    break;
+X
+X	case SET_RULE:
+X	    val = NoSignExtend(dvifp, 4);
+X	    val2 = NoSignExtend(dvifp, 4);
+X            if (Emitting) SetRule(val, val2, 1);
+X	    break;
+X
+X	case PUT1:case PUT2:case PUT3:case PUT4:
+X	    val = NoSignExtend(dvifp,command-PUT1+1);
+X	    if (!SkipMode) SetChar(val, command, PassNo);
+X	    break;
+X
+X	case PUT_RULE:
+X	    val = NoSignExtend(dvifp, 4);
+X	    val2 = NoSignExtend(dvifp, 4);
+X            if (Emitting) SetRule(val, val2, 0);
+X	    break;
+X
+X	case NOP:
+X	    break;
+X
+X	case BOP:
+X	    cpagep = ftell(dvifp) - 1;
+X	    for (i=0; i<=9; i++)
+X		count[i] = NoSignExtend(dvifp, 4);
+X	    ppagep = NoSignExtend(dvifp, 4);
+X
+X	    h = v = w = x = y = z = 0;
+X            hh = vv = -9999;
+X	    sp = 0;
+X	    fontptr = NULL;
+X            prevfont = NULL;
+X
+X            if( count[0] < FirstPage || count[0] > LastPage )
+X                SkipMode = TRUE;
+X            else
+X                SkipMode = FALSE;
+X
+X            if( !SkipMode ) {
+X                if( PassNo == 0) {
+X#ifdef STATS
+X		    if( Stats ) {
+X			Sndc0 = Sndc;
+X			Stnc0 = Stnc;
+X			Snbpx0 = Snbpxl;
+X		    }
+X#endif
+X		    if( !G_quiet ) {
+X			(void) fprintf(stderr, "[%d", count[0] );
+X			(void) fflush(stderr);
+X		    }
+X		}
+X                else if (cpagep == tpagep) { /* end of section */
+X		    PassNo = 0;
+X		    spagep = cpagep; /* start of next section */
+X		    for (i = 0; i < MAXFONTID; i++)
+X			assigned_font[i] = NULL;
+X		    total_font_data = 0;
+X		    nxfonts = 0;
+X		    curxfont = 0;
+X		    loadpass++;
+X		    EMIT(outfp,"%c+F\n",ESC);
+X		}
+X	    }
+X
+X            Emitting = (PassNo != 0) && !SkipMode;
+X
+X	    break;
+X
+X	case EOP:
+X	    if (Complex) {	/* we've had to abandon font processing */
+X		if (spagep == cpagep) {	/* start of section is this page ! */
+X		    Fatal("Page too complex");
+X		}
+X		Complex = 0;
+X		tpagep = cpagep;
+X		(void) fseek(dvifp, spagep, 0);
+X		SkipMode = 0;
+X		PassNo = 1;
+X		FlushXFont(curxfont);
+X		curxfont = NULL;
+X		EMIT(outfp,"%c+P\n", ESC);
+X		/* set up font now, in case first command isn't a char */
+X		SetXFont(headxfont);
+X	    }
+X            if( !SkipMode ) {
+X                if (PassNo == 1) { /* end of page processing in second pass */
+X                    EMIT(outfp,"%c",FF);
+X		    hh = vv = -9999;
+X#ifdef STATS
+X                    if( Stats )
+X                        (void) fprintf(stderr," - %d total ch,  %d diff ch,  %d pxl bytes]\n",
+X				       Stnc-Stnc0, Sndc-Sndc0, Snbpxl-Snbpx0);   
+X                    else
+X#endif
+X                        if( !G_quiet ) {
+X			    (void) fprintf(stderr,"] ");
+X			    if( (++ndone % 10) == 0 )
+X				(void) fprintf(stderr,"\n");
+X			    (void) fflush(stderr);
+X			}
+X		}
+X	    }
+X	    break;
+X
+X	case PUSH:
+X	    if (sp >= STACKSIZE)
+X		Fatal("stack overflow");
+X	    stack[sp].h = h;
+X	    stack[sp].v = v;
+X	    stack[sp].w = w;
+X	    stack[sp].x = x;
+X	    stack[sp].y = y;
+X	    stack[sp].z = z;
+X	    sp++;
+X	    break;
+X
+X	case POP:
+X	    --sp;
+X	    if (sp < 0)
+X		Fatal("stack underflow");
+X	    h = stack[sp].h;
+X	    v = stack[sp].v;
+X	    w = stack[sp].w;
+X	    x = stack[sp].x;
+X	    y = stack[sp].y;
+X	    z = stack[sp].z;
+X	    break;
+X
+X	case RIGHT1:case RIGHT2:case RIGHT3:case RIGHT4:
+X            val = SignExtend(dvifp,command-RIGHT1+1);
+X	    if (Emitting) MoveOver(val);
+X	    break;
+X
+X	case W0:
+X            if (Emitting) MoveOver(w);
+X	    break;
+X
+X	case W1:case W2:case W3:case W4:
+X	    w = SignExtend(dvifp,command-W1+1);
+X            if (Emitting) MoveOver(w);
+X	    break;
+X
+X	case X0:
+X            if (Emitting) MoveOver(x);
+X	    break;
+X
+X	case X1:case X2:case X3:case X4:
+X	    x = SignExtend(dvifp,command-X1+1);
+X	    if (Emitting) MoveOver(x);
+X	    break;
+X
+X	case DOWN1:case DOWN2:case DOWN3:case DOWN4:
+X            val = SignExtend(dvifp,command-DOWN1+1);
+X	    if (Emitting) MoveDown(val);
+X	    break;
+X
+X	case Y0:
+X            if (Emitting) MoveDown(y);
+X	    break;
+X
+X	case Y1:case Y2:case Y3:case Y4:
+X	    y = SignExtend(dvifp,command-Y1+1);
+X            if (Emitting) MoveDown(y);
+X	    break;
+X
+X	case Z0:
+X            if (Emitting) MoveDown(z);
+X	    break;
+X
+X	case Z1:case Z2:case Z3:case Z4:
+X	    z = SignExtend(dvifp,command-Z1+1);
+X	    if (Emitting) MoveDown(z);
+X	    break;
+X
+X	case FNT1:case FNT2:case FNT3:case FNT4:
+X            if (!SkipMode) {
+X                SetFntNum(NoSignExtend(dvifp,command-FNT1+1));
+X                }
+X	    break;
+X
+X	case XXX1:case XXX2:case XXX3:case XXX4:
+X	    k = NoSignExtend(dvifp,command-XXX1+1);
+X            GetBytes(dvifp, SpecialStr, k);
+X            if(Emitting) DoSpecial(SpecialStr, k);
+X	    break;
+X
+X	case FNT_DEF1:case FNT_DEF2:case FNT_DEF3:case FNT_DEF4:
+X            k = NoSignExtend(dvifp, command-FNT_DEF1+1);
+X	    if (PreLoad || HasBeenRead(k) )
+X	    {
+X		SkipFontDef (k);
+X	    }
+X	    else
+X	    {
+X		ReadFontDef (k);
+X	    }
+X	    break;
+X
+X	case PRE:
+X	    Fatal("PRE occurs within file");
+X	    break;
+X
+X	case POST:
+X	    if (PassNo == 0) {
+X		tpagep = 0;
+X		(void) fseek(dvifp, spagep, 0);
+X		PassNo = 1;
+X		FlushXFont(curxfont);
+X		curxfont = NULL;
+X		EMIT(outfp,"%c+P\n", ESC);
+X		/* set up font now, in case first command isn't a char */
+X		SetXFont(headxfont);
+X	    }
+X	    else
+X		AllDone();
+X	    break;
+X
+X	case POST_POST:
+X 	    Fatal("POST_POST with no preceding POST");
+X	    break;
+X
+X	default:
+X	    if (command >= FONT_00 && command <= FONT_63)
+X		{if (!SkipMode)
+X                     SetFntNum(command - FONT_00);}
+X	    else if (command >= SETC_000 && command <= SETC_127)
+X		{if (!SkipMode) SetChar(command, command, PassNo);}
+X	    else
+X		Fatal("%d is an undefined command", command);
+X	    break;
+X
+X	}
+X
+X}
+X
+X/*-->AbortRun*/
+X/**********************************************************************/
+X/***************************  AbortRun  *******************************/
+X/**********************************************************************/
+X
+Xvoid
+XAbortRun(code)
+Xint code;
+X{
+X    exit(code);
+X}
+X
+X
+X/*-->ActualFactor*/
+X/**********************************************************************/
+X/**************************  ActualFactor  ****************************/
+X/**********************************************************************/
+X
+Xfloat		/* compute the actual size factor given the approximation */
+XActualFactor(unmodsize)
+Xint unmodsize;  /* actually factor * 1000 */
+X{
+X    float realsize;	/* the actual magnification factor */
+X
+X    realsize = (float)unmodsize / 1000.0;
+X    /* a real hack to correct for rounding in some cases--rkf */
+X    if(unmodsize==1095) realsize = 1.095445;	/*stephalf*/
+X    else if(unmodsize==1315) realsize=1.314534;	/*stepihalf*/
+X    else if(unmodsize==1577) realsize=1.577441;	/*stepiihalf*/
+X    else if(unmodsize==1893) realsize=1.892929;	/*stepiiihalf*/
+X    else if(unmodsize==2074) realsize=2.0736;	/*stepiv*/
+X    else if(unmodsize==2488) realsize=2.48832;  /*stepv*/
+X    else if(unmodsize==2986) realsize=2.985984;	/*stepiv*/
+X    /* the remaining magnification steps are represented with sufficient
+X	   accuracy already */
+X    return(realsize);
+X}
+X
+X
+X/*-->AllDone*/
+X/**********************************************************************/
+X/****************************** AllDone  ******************************/
+X/**********************************************************************/
+X
+Xvoid
+XAllDone()
+X{
+X    int t;
+X    struct font_entry *p;
+X
+X    EMIT(outfp,"%c+X\n",ESC);
+X    /* just in case the exit code wants to open a file (profiling) ... */
+X    (void) fclose(dvifp);
+X    if( !G_quiet )
+X	(void) fprintf(stderr,"\n");
+X
+X#ifdef CREOPT
+X    if( G_create ) {
+X        (void) fclose(outfp);
+X        if( !G_quiet )
+X	    (void) fprintf(stderr, "Output written on \"%s\"\n", outfname );
+X        }
+X#endif CREOPT
+X
+X    if (G_errenc && G_logging == 1 && G_logfile)  {
+X	(void) fseek(G_logfp, (long)0, 0);
+X	while ((t=getc(G_logfp)) != EOF)
+X	    (void) putchar(t);
+X    }
+X    if (G_logging == 1 && G_logfile)
+X	(void) printf("Log file created\n");
+X
+X#ifdef STATS
+X    if (Stats) {
+X        (void) fprintf( stderr, "Total chars   diff chars   pxl bytes\n" );
+X        (void) fprintf( stderr, "      #   %%        #   %%       #   %%\n" );
+X        (void) fprintf( stderr, "------- ---   ------ ---   ----- ---\n" );
+X        for( p=hfontptr; p!=NULL; p=p->next ) {
+X                (void) fprintf( stderr, "%7d%4d", p->ncts, (100*p->ncts + Stnc/2)/Stnc );
+X                (void) fprintf( stderr, "%9d%4d", p->ncdl, (100*p->ncdl + Sndc/2)/Sndc );
+X                (void) fprintf( stderr, "%8d%4d", p->nbpxl, (100*p->nbpxl + Snbpxl/2)/Snbpxl );
+X                }
+X        (void) fprintf(stderr, "\nTotal number of characters typeset: %d\n", Stnc);
+X        (void) fprintf(stderr, "Number of different characters downloaded: %d\n", Sndc);
+X        (void) fprintf(stderr, "Number of bytes of pxl data downloaded: %d\n", Snbpxl);
+X        (void) fprintf(stderr, "Optimal # of bytes of pxl data: %d\n", Sonbpx);
+X        }
+X#endif
+X
+X    AbortRun(G_errenc);
+X}
+X
+X
+X/*-->CopyFile*/   /* copy a file straight through to output */
+X/*********************************************************************/
+X/***************************** CopyFile ******************************/
+X/*********************************************************************/
+X
+X#ifdef	notdef
+Xvoid
+XCopyFile( str )
+Xchar    *str;
+X{
+X        FILE    *spfp;
+X        int	t;
+X
+X        if( (spfp=fopen(str,"r")) == NULL ) {
+X                (void) fprintf(stderr,"Unable to open file %s\n", str );
+X                return;
+X                }
+X        if( !G_quiet )
+X	    (void) fprintf(stderr," [%s", str);
+X        while( (t = getc(spfp)) != EOF ) {
+X                EMITC(t);
+X                }              
+X        (void) fclose(spfp);
+X        if( !G_quiet )
+X	    (void) fprintf(stderr,"]");
+X}
+X#endif
+X
+X/*-->DecodeArgs*/
+X/*********************************************************************/
+X/***************************** DecodeArgs ****************************/
+X/*********************************************************************/
+X
+Xvoid
+XDecodeArgs( argc, argv )
+Xint argc;
+Xchar *argv[];
+X{
+X    int argind;             /* argument index for flags              */
+X    char curarea[STRSIZE];  /* current file area		     */
+X    char curname[STRSIZE];  /* current file name		     */
+X    char *tcp, *tcp1;	    /* temporary character pointers	     */
+X
+X    argind = 1;
+X    while (argind < argc) {
+X	tcp = argv[argind];
+X        if (*tcp == '-')
+X	    switch(isupper(*++tcp) ? (*tcp-'A')+'a' : *tcp) {
+X
+X                case 'a':       /* a selects different pxl font area */
+X                    PXLpath = argv[++argind];
+X                    break;
+X#ifdef CREOPT
+X                case 'c':       /* create an output file in spool area */
+X                    G_create = TRUE;
+X                    break;
+X#endif CREOPT
+X#ifdef DEBUG
+X		case 'd':	/* d selects Debug output */
+X		    Debug = TRUE;
+X		    break;
+X#endif
+X                case 'f':       /* next arg is starting pagenumber */
+X                    if( ++argind >= argc || sscanf(argv[argind], "%d", &FirstPage) != 1 )
+X                        Fatal("Argument is not a valid integer\n", 0);
+X                    break;
+X
+X		case 'l':	/* l prohibits logging of errors */
+X		    G_logging = -1;
+X		    break;
+X#ifdef USEGLOBALMAG
+X                case 'm':       /* specify magnification to use */
+X                    switch( tolower(*++tcp) ) {
+X
+X                    case '\0':       /* next arg is a magnification to use */
+X                        if( ++argind >= argc || sscanf(argv[argind], "%d", &usermag) != 1 )
+X                            Fatal("Argument is not a valid integer\n", 0);
+X                        break; 
+X                    case '0': usermag = 1000; break;
+X                    case 'h': usermag = 1095; break;
+X                    case '1': usermag = 1200; break;
+X                    case '2': usermag = 1440; break;
+X                    case '3': usermag = 1728; break;
+X                    case '4': usermag = 2074; break;
+X                    case '5': usermag = 2488; break;
+X                    default: Fatal("%c is a bad mag step\n", *tcp);
+X                    }
+X                    break;
+X#endif
+X
+X		case 'p':	/* p prohibits pre-font loading */
+X		    PreLoad = 0;
+X		    break;
+X
+X                case 'q':       /* quiet operation */
+X                    G_quiet = TRUE;
+X                    break;
+X#ifdef STATS                   
+X                case 's':       /* print some statistics */
+X                    Stats = TRUE;
+X                    break;
+X#endif
+X                case 't':       /* next arg is ending pagenumber */
+X                    if( ++argind >= argc || sscanf(argv[argind], "%d", &LastPage) != 1 )
+X                        Fatal("Argument is not a valid integer\n", 0);
+X                    break;
+X
+X                case 'w':       /* don't print out warnings */
+X                    G_nowarn = TRUE;
+X                    break;
+X
+X		default:
+X		    (void) printf("%c is not a legal flag\n", *tcp);
+X		}
+X
+X        else {
+X
+X            tcp = rindex(argv[argind], '/');    /* split into directory + file name */
+X            if (tcp == NULL)  {
+X        	curarea[0] = '\0';
+X        	tcp = argv[argind];
+X                }
+X            else  {
+X        	(void) strcpy(curarea, argv[argind]);
+X                curarea[tcp-argv[argind]+1] = '\0';
+X        	tcp += 1;
+X                }
+X        
+X            (void) strcpy(curname, tcp);
+X            tcp1 = rindex(tcp, '.');   /* split into file name + extension */
+X            if (tcp1 == NULL) {
+X                (void) strcpy(rootname, curname);
+X                (void) strcat(curname, ".dvi");
+X                }
+X            else {
+X                *tcp1 = '\0';
+X                (void) strcpy(rootname, curname);
+X                *tcp1 = '.';
+X                }
+X        
+X            (void) strcpy(filename, curarea);
+X            (void) strcat(filename, curname);
+X        
+X            if ((dvifp=BINARYOPEN(filename,"r")) == NULL)  {
+X        	(void) fprintf(stderr,"\n");
+X        	(void) fprintf(stderr,"%s: can't find DVI file \"%s\"\n\n", G_progname, filename);
+X        	AbortRun(1);
+X                }
+X        
+X            (void) strcpy(G_Logname, curname);
+X            (void) strcat(G_Logname, ".log");
+X	    }
+X	argind++;
+X        }
+X
+X    if (dvifp == NULL)  {
+X	(void) fprintf(stderr, 
+X                "\nusage: %s [-a area] [-c] [-h] [-o option] [-p] [-s] [-r] [-f n] [-t n] [-m{0|h|1|2|3|4|  mag] [-a fontarea] dvifile\n\n", 
+X                G_progname);
+X	AbortRun(1);
+X        }
+X}
+X
+X
+X/*-->DoConv*/
+X/*********************************************************************/
+X/********************************  DoConv  ***************************/
+X/*********************************************************************/
+X
+Xint DoConv(num, den, convResolution)
+X{
+X    register float conv;
+X    conv = ((float)num/(float)den) * 
+X#ifdef USEGLOBALMAG
+X/*	ActualFactor(mag) * why was this in as Actual Factor?  jls */
+X	((float) mag/1000.0) *
+X#endif
+X	((float)convResolution/254000.0);
+X    return((int) (1.0 / conv + 0.5));
+X}
+X
+X
+X/*-->DoSpecial*/
+X/*********************************************************************/
+X/*****************************  DoSpecial  ***************************/
+X/*********************************************************************/
+X#ifdef	notdef
+Xtypedef enum {None, String, Integer, Number, Dimension} ValTyp;
+X
+Xtypedef struct {
+X        char    *Key;           /* the keyword string */
+X        char    *Val;           /* the value string */
+X        ValTyp  vt;             /* the value type */
+X        union {                 /* the decoded value */
+X            int  i;
+X            float n;
+X            } v;
+X        } KeyWord;
+X
+Xtypedef struct {
+X        char    *Entry;
+X        ValTyp  Type;
+X        } KeyDesc;
+X
+X#define PSFILE 0
+XKeyDesc KeyTab[] = {{"psfile", String},
+X                    {"hsize", Dimension},
+X                    {"vsize", Dimension},
+X                    {"hoffset", Dimension},
+X                    {"voffset", Dimension},
+X                    {"hscale", Number},
+X                    {"vscale", Number}};
+X
+X#define NKEYS (sizeof(KeyTab)/sizeof(KeyTab[0]))
+X#endif
+Xvoid
+XDoSpecial( str, n )          /* interpret a \special command, made up of keyword=value pairs */
+Xchar    *str;
+Xint n;
+X{
+X#ifdef	notdef			/* don't do anything for now */
+X        char spbuf[STRSIZE]; 
+X        char *sf = NULL;
+X        KeyWord k;
+X        int i;
+X
+X        str[n] = '\0';
+X        spbuf[0] = '\0';
+X
+X        SetPosn(h, v, 0);
+X        EMITS("@beginspecial\n");
+X
+X        while( (str=GetKeyStr(str,&k)) != NULL ) {      /* get all keyword-value pairs */
+X                              /* for compatibility, single words are taken as file names */
+X                if( k.vt == None && access(k.Key,0) == 0) {
+X                        if( sf ) Warning("  More than one \\special file name given. %s ignored", sf );
+X                        (void) strcpy(spbuf, k.Key);
+X                        sf = spbuf;
+X                        }
+X                else if( GetKeyVal( &k, KeyTab, NKEYS, &i ) && i != -1 ) {
+X                        if( i == PSFILE ) {
+X                                if( sf ) Warning("  More than one \\special file name given. %s ignored", sf );
+X                                (void) strcpy(spbuf, k.Val);
+X                                sf = spbuf;
+X                                }
+X                        else            /* the keywords are simply output as PS procedure calls */
+X                                EMIT(outfp, "%f @%s\n", k.v.n, KeyTab[i].Entry);
+X                        }
+X                else Warning("  Invalid keyword or value in \\special - \"%s\" ignored", k.Key );
+X                }
+X
+X        EMITS("@setspecial\n");
+X
+X        if( sf )
+X                CopyFile( sf );
+X        else
+X                Warning("  No special file name provided.");
+X
+X        EMITS("@endspecial\n");
+X#endif	notdef
+X}
+X
+X
+X/*-->EmitChar*/
+X/**********************************************************************/
+X/****************************  EmitChar  ******************************/
+X/**********************************************************************/
+X/* The 2700 doesn't seem to have much idea about x-offsets, so for negative
+X * offsets pad out the bit map with space, and for positive offsets supply
+X * the offset to SetPosn as an extra parameter.
+X */
+X
+X
+Xvoid
+XEmitChar(ce)			/* output a character bitmap */
+X    struct char_entry *ce;
+X{
+X    int nbpl, nwpl;
+X    int xbytes_per_row;
+X    int bytes_needed;
+X    unsigned char *pattern;
+X    register int i, j, bit_n;
+X    register char *sl;
+X    struct xchardesc *cur_lut;
+X
+X    /* check there's room in the pattern table */
+X    xbytes_per_row = (ce->height + 7) / 8;
+X    if (xbytes_per_row < 2) xbytes_per_row = 2;
+X    bytes_needed = xbytes_per_row * ce->width;
+X    if (ce->xOffset < 0)
+X	bytes_needed += - xbytes_per_row * ce->xOffset;
+X    if (bytes_needed + next_free > MAX_PAT) {
+X	FlushXFont(curxfont);
+X	curxfont = 0;
+X    }
+X
+X    if (curxfont == 0) {
+X	if (nxfonts > MAX_LDFONTS) {
+X	    /* too many fonts in this section */
+X	    Complex++;
+X	    SkipMode++;
+X	    Emitting = 0;
+X	    return;
+X	}
+X	curxfont = (struct xfont *) malloc(sizeof(struct xfont));
+X	/* 
+X	 * initialize first characters in every font to be spaces
+X	 * to use for quick, small moves.  It seems character 32 is not
+X	 * usable, and ought to be a standard space.
+X	 */
+X	cur_lut = &lut_tab[MINCH];
+X	*cur_lut = space_glyph;
+X	cur_lut->width = 18;
+X	*++cur_lut = space_glyph;
+X	cur_lut->width = 1;
+X	*++cur_lut = space_glyph;
+X	cur_lut->width = 2;
+X	bzero(&patt_tab[0], 2);
+X	next_free = 2;
+X	curxfont->glyph = MINCH+3;
+X	/* make sure the 2700 name is unique, in case this is a clever version
+X	 * that only loads fonts it doesn't already have (3700?) */
+X	(void) sprintf(curxfont->xname, "dvi%u-%d-%d",
+X		       getpid(), loadpass, nxfonts++);
+X	curxfont->next = headxfont;
+X	headxfont = curxfont;
+X	/* header, qual table, lut entry for 3 spaces, 2 byte pattern */
+X	total_font_data += sizeof(struct xheader)
+X	    + 256*sizeof(qual_tab[0])
+X	    + 3*sizeof(lut_tab[0])
+X	    + 2;
+X    }
+X
+X    total_font_data += sizeof(lut_tab[0]) + bytes_needed;
+X    if (total_font_data > MAX_FONT_DATA) {
+X	/* too much font data in this section */
+X	Complex++;
+X	SkipMode++;
+X	Emitting = 0;
+X	return;
+X    }
+X
+X    /* set up lookup table entry - loc will be adjusted later */
+X    cur_lut = &lut_tab[curxfont->glyph];
+X    cur_lut->lo_loc = htoxs(next_free & 0xffff);
+X    cur_lut->hi_loc = next_free >> 16;
+X    /* don't use PixRound for this - we'd rather adjust to the right */
+X    cur_lut->width = ce->tfmw / hconv;
+X    cur_lut->orgy = (ce->yOffset - ((int)ce->height) - 1) / 2;
+X    cur_lut->blocking = 63 - xbytes_per_row;
+X    cur_lut->nbyte = htoxs(bytes_needed);
+X
+X    pattern = (unsigned char *) &patt_tab[next_free];
+X    bzero((char *)pattern, bytes_needed);
+X    /* for negative xOffset, add white space to pattern */
+X    if (ce->xOffset < 0)
+X	pattern += - xbytes_per_row * ce->xOffset;
+X#ifdef	notdef
+X    if (ce->xOffset > 0) fprintf(stderr, "xOffset: %d\n", ce->xOffset);
+X#endif
+X    /* for positive xOffset, adjust position before setting position, and
+X     * compensate by increasing width of character */
+X    if (ce->xOffset > 0) {
+X	ce->kern = ce->xOffset;
+X	cur_lut->width += ce->xOffset;
+X    }
+X    ce->realw = cur_lut->width * hconv;
+X#ifdef	notdef
+X    if (ce->xOffset > 0) {
+X	fprintf(stderr, "Incoming map: \n");
+X	printpixelmap((char *)ce->where.address.pixptr, nwpl*4, ce->height);
+X    }
+X#endif
+X    /* convert raster from PK or PXL to 2700 (rows and columns reversed) */
+X    /* this is all a bit cryptic I'm afraid */
+X    if (fontptr->type == FONT_PXL) {
+X	/* this is a PXL font, just reverse rows and columns */
+X	nbpl = (ce->width + 7) >> 3;
+X	nwpl = (ce->width + 31) >> 5;
+X	for (i = 0; i < ce->height; i++) {
+X	    sl = (char *)(ce->where.address.pixptr + (ce->height-1-i)*nwpl);
+X	    for (j = 0; j < nbpl; j++, sl++) {
+X		for (bit_n = 7; bit_n >= 0; bit_n--) {
+X		    if ((*sl >> bit_n) & 1)
+X			pattern[xbytes_per_row * ((j << 3) + (7 - bit_n))
+X				+ (i >> 3)] |= 1 << (7 - (i & 07));
+X		}
+X	    }
+X	}
+X    }
+X    else {			/* PK font */
+X	/* this code is basically from PKTOPXL, modified to swap rows & cols */
+X	if (ce->flag.dyn_f == 14) { /* bitwise raster image */
+X	    bit_n = 0;
+X	    for (i = ce->height-1; i >= 0; i--) {
+X		for (j = 0; j < ce->width; j++) {
+X		    if (((char *)ce->where.address.pixptr)[bit_n >> 3] &
+X			(1 << (7 - (bit_n & 07))))
+X			pattern[xbytes_per_row * j + (i >> 3)] |=
+X			    1 << (7 - (i & 07));
+X		    bit_n++;
+X		}
+X	    }
+X	}
+X	else {			/* compressed raster */
+X	    unsigned char *pp;
+X	    int nybble = 0, repeat = 0;
+X	    int turning_on = ce->flag.turn_on;
+X	    int row, count;
+X	    bit_n = 0;
+X
+X	    pp = (unsigned char *)ce->where.address.pixptr;
+X	    for (row = ce->height - 1; row >= 0; ) {
+X		count = PKPackedNum(&pp, &nybble, ce->flag.dyn_f, &repeat);
+X#ifdef	notdef
+X		fprintf(stderr,
+X			"(row %d) turn_on = %d, count = %d, repeat = %d\n",
+X			row, turning_on, count, repeat);
+X#endif
+X		while (count > 0) {
+X		    while (bit_n < ce->width && count > 0) {
+X			if (turning_on)
+X			    pattern[xbytes_per_row * bit_n + (row >> 3)] |=
+X				1 << (7 - (row & 07));
+X			count--;
+X			bit_n++;
+X		    }
+X		    if (bit_n == ce->width) {
+X			for (bit_n = 0; bit_n < ce->width; bit_n++) {
+X			    if (pattern[xbytes_per_row * bit_n + (row >> 3)] &
+X				(1 << (7 - (row & 07)))) {
+X				    for (i = 1; i <= repeat; i++) {
+X					pattern[xbytes_per_row * bit_n +
+X						((row-i) >> 3)] |=
+X						    1 << (7 - ((row-i) & 07));
+X				    }
+X				}
+X			}
+X			row -= repeat + 1;
+X			bit_n = 0;
+X			repeat = 0;
+X		    }
+X		}
+X		turning_on = !turning_on;
+X	    }
+X	}
+X    }
+X#ifdef	notdef
+X    if (ce->xOffset > 0) {
+X	fprintf(stderr, "Outgoing map: \n");
+X	printpixelmap(&patt_tab[next_free], xbytes_per_row,
+X		      bytes_needed/xbytes_per_row);
+X    }
+X#endif
+X    next_free += (bytes_needed + 1) & ~1; /* start on 16-bit boundary */
+X
+X    ce->where.xfont = curxfont;
+X    ce->where.glyph = curxfont->glyph;
+X
+X    if (++curxfont->glyph == DEL) { /* DEL ignored by printer */
+X	curxfont->glyph++;
+X    }
+X    if (curxfont->glyph > MAXCH) {
+X	FlushXFont(curxfont);
+X	curxfont = 0;
+X    }
+X    
+X#ifdef STATS
+X    Snbpxl += nbpl*ce->height;
+X    fontptr->nbpxl += nbpl*ce->height;
+X    Sonbpx += (ce->width*ce->height + 7) >> 3;
+X    Sndc += 1;
+X#endif
+X}
+X
+X#ifdef	notdef
+Xprintpixelmap(map, row, lines)
+X    unsigned char *map;
+X    int row, lines;
+X{
+X    register int i, j, k;
+X    int c;
+X    
+X    for (i = 0; i < lines; i++) {
+X	for (j = 0; j < row; j++) {
+X	    c = map[i * row + j];
+X	    for (k = 7; k >= 0; k--) {
+X		if (c & (1 << k))
+X		    putc('*', stderr);
+X		else
+X		    putc(' ', stderr);
+X	    }
+X	}
+X	putc('\n', stderr);
+X    }
+X}
+X#endif
+X
+Xstatic long encode_buf = 0;
+Xstatic int encode_count = 0;
+X
+Xvoid
+XFlushXFont(xfont)
+X    struct xfont *xfont;
+X{
+X    long patt_offset, remainder, patt_length, font_length, new_loc;
+X    int trail_length, i, cid;
+X
+X    if (xfont == 0)
+X	return;
+X    /* first construct header */
+X    xheader.magic = 0xaaaa;
+X    xheader.rev = 1;
+X    xheader.flags = PORTRAIT|PROP_SP;
+X    /* don't want font name null terminated */
+X    for (i = 0; i < 20; i++)
+X	xheader.fname[i] = ' ';
+X    (void) strncpy(xheader.fname, xfont->xname, strlen(xfont->xname));
+X    xheader.lowchar = MINCH;
+X    xheader.highchar = xfont->glyph - 1;
+X    /* offset into font of pattern table */
+X    patt_offset = sizeof(struct xheader) + 256 +
+X	sizeof(struct xchardesc) * (xfont->glyph - MINCH);
+X    /* this is a rather empirical calculation of how many trailing 0x55
+X     * bytes are needed, found by looking through several fonts */
+X    remainder = (next_free + patt_offset) % 6;
+X    trail_length = 3*((remainder + 3)/4) + 9 - remainder;
+X    for (i = 0; i < trail_length; i++)
+X	patt_tab[next_free++] = 0x55;
+X    patt_length = next_free;
+X    font_length = patt_length + patt_offset;
+X    xheader.lo_length = htoxs(font_length & 0xffff);
+X    xheader.hi_length = font_length >> 16;
+X    if (xheader.hi_length)
+X	xheader.flags |= LONG_FONT;
+X    /* initialize encoding routine, and output header and (unused) qual tab */
+X    encode_buf = 0;
+X    encode_count = 0;
+X    Encode((unsigned char *)&xheader, sizeof(struct xheader));
+X    Encode((unsigned char *)qual_tab, 256*sizeof(qual_tab[0]));
+X    /* update offsets into font */
+X    for (cid = xheader.lowchar; cid <= xheader.highchar; cid++) {
+X	new_loc = xtohs(lut_tab[cid].lo_loc) +
+X	    (lut_tab[cid].hi_loc << 16) + patt_offset;
+X	lut_tab[cid].lo_loc = htoxs(new_loc & 0xffff);
+X	lut_tab[cid].hi_loc = new_loc >> 16;
+X    }
+X    /* output lookup table and pattern area */
+X    Encode((unsigned char *)&lut_tab[xheader.lowchar],
+X	   sizeof(struct xchardesc)*(xheader.highchar-xheader.lowchar+1));
+X    Encode((unsigned char *)patt_tab, patt_length);
+X    /* flush encode_buf */
+X    new_loc = 0;
+X    Encode((unsigned char *)&new_loc, 2);
+X}
+X
+X/*
+X * encode font data for the 2700.  Each 6 bits of font data is converted into
+X * an ASCII character from '?' to '~'.  Three bytes of input form 4 bytes of
+X * output.
+X */
+Xvoid
+XEncode(p, len)
+X    register unsigned char *p;
+X    int len;
+X{
+X    register int i;
+X
+X    while (1) {
+X	for ( ; len > 0 && encode_count < 3; len--, encode_count++)
+X	    encode_buf = (encode_buf << 8) + *p++;
+X	if (len <= 0)
+X	    return;
+X	for (i = 18; i >= 0; i -= 6) {
+X	    EMITC(((encode_buf >> i) & 077) + '?');
+X	}
+X	encode_count = 0;
+X	encode_buf = 0;
+X    }
+X}
+X
+Xint
+XPKPackedNum(p, b, dynf, repeat_count)
+X    unsigned char **p;
+X    int *b;
+X    int dynf;
+X    int *repeat_count;
+X{
+X    int i, j;
+X    
+X    i = GetNyb(p, b);
+X    if (i == 0) {
+X	do {
+X	    i++;
+X	} while ((j = GetNyb(p, b)) == 0);
+X	for ( ; i > 0; i--)
+X	    j = (j << 4) + GetNyb(p, b);
+X	return (j - 15 + (13 - dynf)*16 + dynf);
+X    }
+X    else if (i <= dynf)
+X	return i;
+X    else if (i < 14)
+X	return (i - dynf - 1)*16 + GetNyb(p, b) + dynf + 1;
+X    else {
+X	*repeat_count = (i == 14) ? PKPackedNum(p, b, dynf, repeat_count) : 1;
+X	return PKPackedNum(p, b, dynf, repeat_count);
+X    }
+X}
+X
+Xint
+XGetNyb(p, b)
+X    unsigned char **p;
+X    int *b;
+X{
+X    if (*b) {
+X	*b = 0;
+X	return (*(*p)++ & 0xf);
+X    }
+X    else {
+X	*b = 1;
+X	return (**p >> 4);
+X    }
+X}
+X
+X/*-->Fatal*/
+X/**********************************************************************/
+X/******************************  Fatal  *******************************/
+X/**********************************************************************/
+X/*VARARGS1*/
+X
+Xvoid
+XFatal(fmt, a, b, c)/* issue a fatal error message */
+Xchar *fmt;	/* format */
+Xchar *a, *b, *c;	/* arguments */
+X
+X{
+X    if (G_logging == 1 && G_logfile)
+X    {
+X	(void) fprintf(G_logfp, "%s: FATAL--", G_progname);
+X	(void) fprintf(G_logfp, fmt, a, b, c);
+X	(void) fprintf(G_logfp, "\n");
+X    }
+X
+X    (void) fprintf(stderr,"\n");
+X    (void) fprintf(stderr, "%s: FATAL--", G_progname);
+X    (void) fprintf(stderr, fmt, a, b, c);
+X    (void) fprintf(stderr, "\n\n");
+X    if (G_logging == 1)
+X	(void) printf("Log file created\n");
+X#ifdef CREOPT
+X    if (G_create && outfp != NULL) {
+X        (void) fclose(outfp);
+X        unlink(outfname);
+X        }
+X#endif CREOPT
+X    AbortRun(1);
+X}
+X
+X
+X/*-->FindPostAmblePtr*/
+X/**********************************************************************/
+X/************************  FindPostAmblePtr  **************************/
+X/**********************************************************************/
+X
+Xvoid
+XFindPostAmblePtr(postambleptr)
+Xlong	*postambleptr;
+X
+X/* this routine will move to the end of the file and find the start
+X    of the postamble */
+X
+X{
+X    int     i;
+X
+X    (void) fseek (dvifp, (long) 0, 2);   /* goto end of file */
+X    *postambleptr = ftell (dvifp) - 4;
+X    (void) fseek (dvifp, *postambleptr, 0);
+X
+X    while (TRUE) {
+X	(void) fseek (dvifp, --(*postambleptr), 0);
+X	if (((i = NoSignExtend(dvifp, 1)) != 223) &&
+X	    (i != DVIFORMAT))
+X	    Fatal ("Bad end of DVI file");
+X	if (i == DVIFORMAT)
+X	    break;
+X    }
+X    (void) fseek (dvifp, (long) ((*postambleptr) - 4), 0);
+X    (*postambleptr) = NoSignExtend(dvifp, 4);
+X    (void) fseek (dvifp, *postambleptr, 0);
+X}
+X
+X
+X/*-->GetBytes*/
+X/**********************************************************************/
+X/*****************************  GetBytes  *****************************/
+X/**********************************************************************/
+X
+Xvoid
+XGetBytes(fp, cp, n)	/* get n bytes from file fp */
+Xregister FILE *fp;	/* file pointer	 */
+Xregister char *cp;	/* character pointer */
+Xregister int n;		/* number of bytes  */
+X
+X{
+X    while (n--)
+X	*cp++ = NoSignExtend(fp, 1);
+X}
+X
+X
+X/*-->GetFontDef*/
+X/**********************************************************************/
+X/**************************** GetFontDef  *****************************/
+X/**********************************************************************/
+X
+Xvoid
+XGetFontDef()
+X
+X/***********************************************************************
+X   Read the font  definitions as they  are in the  postamble of the  DVI
+X   file.
+X***********************************************************************/
+X
+X{
+X    unsigned char   byte;
+X
+X    while (((byte = NoSignExtend(dvifp, 1)) >= FNT_DEF1) &&
+X	(byte <= FNT_DEF4)) {
+X	switch (byte) {
+X	case FNT_DEF1:
+X	    ReadFontDef (NoSignExtend(dvifp, 1));
+X	    break;
+X	case FNT_DEF2:
+X	    ReadFontDef (NoSignExtend(dvifp, 2));
+X	    break;
+X	case FNT_DEF3:
+X	    ReadFontDef (NoSignExtend(dvifp, 3));
+X	    break;
+X	case FNT_DEF4:
+X	    ReadFontDef (NoSignExtend(dvifp, 4));
+X	    break;
+X	default:
+X	    Fatal ("Bad byte value in font defs");
+X	    break;
+X	}
+X    }
+X    if (byte != POST_POST)
+X	Fatal ("POST_POST missing after fontdefs");
+X}
+X
+X
+X/*-->GetKeyStr*/
+X/**********************************************************************/
+X/*****************************  GetKeyStr  ****************************/
+X/**********************************************************************/
+X
+X        /* extract first keyword-value pair from string (value part may be null)
+X         * return pointer to remainder of string
+X         * return NULL if none found
+X         */
+X#ifdef	notdef
+Xchar    KeyStr[STRSIZE];
+Xchar    ValStr[STRSIZE];
+X
+Xchar *GetKeyStr( str, kw )
+Xchar    *str;
+XKeyWord *kw;
+X{
+X        char *s, *k, *v, t;
+X
+X        if( !str ) return( NULL );
+X
+X        for( s=str; *s == ' '; s++ ) ;                  /* skip over blanks */
+X        if( *s == '\0' ) return( NULL );
+X
+X        for( k=KeyStr;                          /* extract keyword portion */
+X             *s != ' ' && *s != '\0' && *s != '='; 
+X             *k++ = *s++ ) ;
+X        *k = '\0';
+X        kw->Key = KeyStr;
+X        kw->Val = v = NULL;
+X        kw->vt = None;
+X
+X        for( ; *s == ' '; s++ ) ;                       /* skip over blanks */
+X        if( *s != '=' )                         /* look for "=" */
+X                return( s );
+X
+X        for( s++ ; *s == ' '; s++ ) ;                   /* skip over blanks */
+X        if( *s == '\'' || *s == '\"' )          /* get string delimiter */
+X                t = *s++;
+X        else
+X                t = ' ';
+X        for( v=ValStr;                          /* copy value portion up to delim */
+X             *s != t && *s != '\0';
+X             *v++ = *s++ ) ;
+X        if( t != ' ' && *s == t ) s++;
+X        *v = '\0';
+X        kw->Val = ValStr;
+X        kw->vt = String;
+X
+X        return( s );
+X}
+X
+X
+X/*-->GetKeyVal*/
+X/**********************************************************************/
+X/*****************************  GetKeyVal  ****************************/
+X/**********************************************************************/
+X
+X        /* get next keyword-value pair
+X         * decode value according to table entry
+X         */
+X
+Xint GetKeyVal( kw, tab, nt, tno)
+XKeyWord *kw; 
+XKeyDesc tab[];
+Xint     nt;
+Xint     *tno;
+X{
+X        int i;
+X        char c = '\0';
+X
+X        *tno = -1;
+X
+X        for(i=0; i<nt; i++)
+X                if( IsSame(kw->Key, tab[i].Entry) ) {
+X                        *tno = i;
+X                        switch( tab[i].Type ) {
+X                                case None: 
+X                                        if( kw->vt != None ) return( FALSE );
+X                                        break;
+X                                case String:
+X                                        if( kw->vt != String ) return( FALSE );
+X                                        break;
+X                                case Integer:
+X                                        if( kw->vt != String ) return( FALSE );
+X                                        if( sscanf(kw->Val,"%d%c", &(kw->v.i), &c) != 1
+X                                            || c != '\0' ) return( FALSE );
+X                                        break;
+X                                case Number:
+X                                case Dimension:
+X                                        if( kw->vt != String ) return( FALSE );
+X                                        if( sscanf(kw->Val,"%f%c", &(kw->v.n), &c) != 1
+X                                            || c != '\0' ) return( FALSE );
+X                                        break;
+X                                }
+X                        kw->vt = tab[i].Type;
+X                        return( TRUE );
+X                        }
+X
+X        return( TRUE );
+X}
+X#endif
+X
+X/*-->HasBeenRead*/
+X/**********************************************************************/
+X/***************************  HasBeenRead  ****************************/
+X/**********************************************************************/
+X
+Xint
+XHasBeenRead(k)
+Xint k;
+X{
+X    struct font_entry *ptr;
+X
+X    ptr = hfontptr;
+X    while ((ptr!=NULL) && (ptr->k!=k))
+X	ptr = ptr->next;
+X    return( ptr != NULL );
+X}
+X
+X
+X/*-->IsSame*/
+X/**********************************************************************/
+X/*******************************  IsSame  *****************************/
+X/**********************************************************************/
+X
+Xint IsSame(a, b)        /* compare strings, ignore case */
+Xchar *a, *b;
+X{
+X        for( ; *a != '\0'; )
+X                if( tolower(*a++) != tolower(*b++) ) return( FALSE );
+X        return( *a == *b ? TRUE : FALSE );
+X}
+X
+X
+X/*-->lcase*/
+X/**********************************************************************/
+X/****************************  lcase  *********************************/
+X/**********************************************************************/
+X
+Xvoid lcase(s)
+Xchar *s;
+X{
+X        char *t;
+X        for(t=s; *t != '\0'; t++)
+X	  *t = tolower(*t);
+X        return;
+X}
+X
+X
+X/*-->MoveDown*/
+X/**********************************************************************/
+X/****************************  MoveDown  ******************************/
+X/**********************************************************************/
+X
+Xvoid
+XMoveDown(a)
+Xint a;
+X{
+X    v += a;
+X}
+X
+X
+X/*-->MoveOver*/
+X/**********************************************************************/
+X/****************************  MoveOver  ******************************/
+X/**********************************************************************/
+X
+Xvoid
+XMoveOver(b)
+Xint b;
+X{
+X    h += b;
+X}
+X
+X
+X/*-->NoSignExtend*/
+X/**********************************************************************/
+X/***************************  NoSignExtend  ***************************/
+X/**********************************************************************/
+X
+Xint
+XNoSignExtend(fp, n)	/* return n byte quantity from file fd */
+Xregister FILE *fp;	/* file pointer    */
+Xregister int n;		/* number of bytes */
+X
+X{
+X    register int x;	/* number being constructed */
+X
+X    x = getc(fp);
+X    while (--n)  {
+X	x <<= 8;
+X	x |= getc(fp);
+X    }
+X    return(x);
+X}
+X
+X
+X/*-->OpenFontFile*/
+X/**********************************************************************/
+X/************************** OpenFontFile  *****************************/
+X/**********************************************************************/
+X
+Xvoid
+XOpenFontFile()
+X/***********************************************************************
+X    The original version of this dvi driver reopened the font file  each
+X    time the font changed, resulting in an enormous number of relatively
+X    expensive file  openings.   This version  keeps  a cache  of  up  to
+X    MAXOPEN open files,  so that when  a font change  is made, the  file
+X    pointer, pxlfp, can  usually be  updated from the  cache.  When  the
+X    file is not found in  the cache, it must  be opened.  In this  case,
+X    the next empty slot  in the cache  is assigned, or  if the cache  is
+X    full, the least used font file is closed and its slot reassigned for
+X    the new file.  Identification of the least used file is based on the
+X    counts of the number  of times each file  has been "opened" by  this
+X    routine.  On return, the file pointer is always repositioned to  the
+X    beginning of the file.
+X
+X***********************************************************************/
+X{
+X    register int i,least_used,current;
+X    int firsttime = 1;
+X
+X#ifdef DEBUG
+X    if (Debug)
+X	(void) printf("Open Font file\n");
+X#endif
+X    if (pfontptr == fontptr)
+X        return;                 /* we need not have been called */
+X
+X    for (current = 1;
+X	(current <= nopen) &&
+X	    (pixel_files[current].font_entry != fontptr);
+X	++current)
+X	;                       /* try to find file in open list */
+X
+X    if (current <= nopen)       /* file already open */
+X    {
+X	if( (pxlfp = pixel_files[current].pixel_file_id) != NO_FILE )
+X	        (void) fseek(pxlfp,(long)0,0);	/* reposition to start of file */
+X    }
+X    else while (1) {		/* file not in open list */
+X        if (firsttime && nopen < MAXOPEN) /* just add it to list */
+X            current = ++nopen;
+X	else {			/* list full -- find least used file, */
+X				/* close it, and reuse slot for new file */
+X	    FILE *fid;
+X	    
+X	    least_used = 1;
+X            for (i = 2; i <= nopen; ++i)
+X	        if (pixel_files[least_used].use_count >
+X                    pixel_files[i].use_count)
+X		    least_used = i;
+X	    fid = pixel_files[least_used].pixel_file_id;
+X            if (fid != NO_FILE) {
+X                struct font_entry *fp = pixel_files[least_used].font_entry;
+X
+X		fp->font_file_id = NULL;
+X#ifdef STATS
+X		if (Stats)
+X		    (void) fprintf(stderr, "PXL file %s closed.\n", fp->name);
+X#endif
+X 	        (void) fclose( fid );
+X	    }
+X	    current = least_used;
+X        }
+X	firsttime = 0;
+X	/* it seems we have to use open/fdopen on Suns to get the errno */
+X	if ((i = open(fontptr->name, O_RDONLY)) < 0) {
+X	    if (errno == EMFILE) {
+X		--nopen;
+X		continue;
+X	    }
+X	    else {
+X		perror("");
+X		Warning("PXL file %s could not be opened",fontptr->name);
+X		pxlfp = NO_FILE;
+X            }
+X	}
+X	else if ((pxlfp = fdopen(i, "r")) == NULL) {
+X	    Warning("Could not fdopen PXL file %s", fontptr->name);
+X	    pxlfp = NO_FILE;
+X	}
+X        else {
+X#ifdef STATS
+X            if (Stats) 
+X                (void) fprintf(stderr, "PXL file %s opened.\n", fontptr->name);
+X#endif
+X            }
+X	pixel_files[current].pixel_file_id = pxlfp;
+X	pixel_files[current].font_entry = fontptr;
+X	pixel_files[current].use_count = 0;
+X	break;
+X    }
+X    pfontptr = fontptr;			/* make previous = current font */
+X    fontptr->font_file_id = pxlfp;	/* set file identifier */
+X    pixel_files[current].use_count++;	/* update reference count */
+X}
+X
+X#ifdef CREOPT
+X/*-->OpenOutput*/   /* generate a unique file name and open it */
+X/**********************************************************************/
+X/*************************** OpenOutput *******************************/
+X/**********************************************************************/
+X
+X
+XFILE*
+XOpenOutput()
+X{
+X        FILE*   fp;
+X        long t;
+X        int  n = 0;
+X        char *p, *pp, b[256];
+X        int nd;
+X
+X        time( &t );
+X        t = t % 100000;
+X        (void) strcpy( outfname, SPOOLFILE );
+X        (void) sprintf( b, "%s.%s.%x", logname(), rootname, t );
+X        if( (nd=strlen(b)-MAXFLEN) > 0 ) {
+X               for(pp=(p=rindex(b,'.')); p && *p != '\0'; *(pp-nd) = *p++, pp++) ;
+X               *(pp-nd) = '\0';
+X               }
+X        (void) strcat( outfname, b );
+X
+X        while( access(outfname,0) == 0 ) {
+X                n += 1;
+X                if( n > 10 ) 
+X                        Fatal( "Unable to create a unique output file name: %s\n", outfname );
+X                (void) strcpy( outfname, SPOOLFILE );
+X                (void) sprintf( b, "%s.%s.%x.%d", logname(), rootname, t, n );
+X                if( (nd=strlen(b)-MAXFLEN) > 0 ) {
+X                        for(pp=(p=rindex(b,'.')); p && *p != '\0'; *(pp-nd) = *p++, pp++) ;
+X                        *(pp-nd) = '\0';
+X                        }
+X                (void) strcat( outfname, b );
+X                }
+X
+X        if( (fp=fopen(outfname,"w")) == NULL )
+X                Fatal("Unable to create output file: %s\n", outfname);
+X
+X        return( fp );
+X}
+X#endif CREOPT
+X
+X/*-->PixRound*/
+X/**********************************************************************/
+X/*****************************  PixRound  *****************************/
+X/**********************************************************************/
+X
+Xint
+XPixRound(x, conv)	/* return rounded number of pixels */
+X    register int x;		/* in DVI units     */
+X    int conv;			/* conversion factor */
+X{
+X    int sign = 0;
+X    if (x < 0) {
+X	sign++;
+X	x = -x;
+X    }
+X    x = (int)((x + (conv >> 1)) / conv);
+X    if (sign)
+X	x = -x;
+X    return x;
+X}
+X
+X
+X/*-->PutInt*/
+X/**********************************************************************/
+X/*****************************  PutInt  *******************************/
+X/**********************************************************************/
+X
+Xvoid
+XPutInt(n)               /* output an integer followed by a space */
+Xregister int n;
+X{
+X    char buf[10];
+X    register char *b;
+X
+X    if( n == 0 )
+X        EMITC('0'); 
+X    else {
+X        if( n < 0 ) {
+X            EMITC('-');
+X            n = -n;
+X            }
+X    
+X        for(b=buf;  n>0;  ) {
+X            *b++ = digit[n%10];
+X            n /= 10;
+X            }
+X    
+X        for( ; b>buf; )
+X            EMITC(*--b);
+X        }
+X
+X    EMITC(' ');
+X}
+X
+X
+X/*-->PutOct*/
+X/**********************************************************************/
+X/*****************************  PutOct  *******************************/
+X/**********************************************************************/
+X
+Xvoid
+XPutOct(n)               /* output an 3 digit octal number preceded by a "\" */
+Xregister int n;
+X{                  
+X    EMITC( '\\' ); 
+X    EMITC( digit[(n&0300)>>6] );
+X    EMITC( digit[(n&0070)>>3] ); 
+X    EMITC( digit[n&0007] );
+X}
+X
+X
+X/*-->ReadFontDef*/
+X/**********************************************************************/
+X/****************************  ReadFontDef  ***************************/
+X/**********************************************************************/
+X
+Xint
+XReadFontDef(k)
+Xint k;
+X{
+X    int t, i;
+X    register struct font_entry *tfontptr;/* temporary font_entry pointer   */
+X    register struct char_entry *tcharptr;/* temporary char_entry pointer  */
+X    int nmag;
+X    char nname[128];
+X
+X    if ((tfontptr = NEW(struct font_entry)) == NULL)
+X	Fatal("can't malloc space for font_entry");
+X    tfontptr->next = hfontptr;
+X    tfontptr->font_file_id = NULL;
+X    fontptr = hfontptr = tfontptr;
+X
+X    tfontptr->ncdl = 0;
+X#ifdef STATS
+X    tfontptr->nbpxl = 0;
+X    tfontptr->ncts = 0;
+X#endif
+X
+X    tfontptr->k = k;
+X    tfontptr->c = NoSignExtend(dvifp, 4); /* checksum */
+X    tfontptr->s = NoSignExtend(dvifp, 4); /* space size */
+X    tfontptr->d = NoSignExtend(dvifp, 4); /* design size */
+X    tfontptr->a = NoSignExtend(dvifp, 1); /* area length for font name */
+X    tfontptr->l = NoSignExtend(dvifp, 1); /* device length */
+X    GetBytes(dvifp, tfontptr->n, tfontptr->a+tfontptr->l);
+X    tfontptr->n[tfontptr->a+tfontptr->l] = '\0';
+X    tfontptr->font_space = tfontptr->s/6; /* never used */
+X    tfontptr->font_mag = (int)((ActualFactor((int)(((float)tfontptr->s/
+X    			(float)tfontptr->d)*1000.0 + 0.5)) * 
+X#ifdef USEGLOBALMAG
+X			ActualFactor(mag) *
+X#endif
+X			(float)RESOLUTION * 5.0) + 0.5);
+X
+X    if ((t = findfile(PXLvec,nPXLvec,"",
+X			 tfontptr->n,tfontptr->font_mag,tfontptr->name,
+X			 nname, &nmag)) == 0)
+X	Fatal("no font %s.%d",tfontptr->n,mag);
+X      
+X    if (tfontptr != pfontptr)
+X	OpenFontFile();
+X    if ( pxlfp == NO_FILE ) {                /* allow missing pxl files */
+X        tfontptr->magnification = 0;
+X        tfontptr->designsize = 0;
+X        for (i = FIRSTPXLCHAR; i <= LASTPXLCHAR; i++) {
+X	    tcharptr = &(tfontptr->ch[i]);
+X	    tcharptr->width = 0;
+X	    tcharptr->height = 0;
+X	    tcharptr->xOffset= 0;
+X	    tcharptr->yOffset = 0;
+X	    tcharptr->where.isloaded = 0;
+X	    tcharptr->where.address.fileOffset = NONEXISTANT;
+X	    tcharptr->tfmw = 0;
+X            }
+X        return;
+X        }
+X
+X    tfontptr->type = (t == -1) ? FONT_PXL : FONT_PK;
+X    
+X    if (tfontptr->type == FONT_PXL) { /* PXL file */
+X	if ((t = NoSignExtend(pxlfp, 4)) != PXLID)
+X	    Fatal("PXL ID = %d, can only process PXL ID = %d files",
+X		  t, PXLID);
+X	(void) fseek(pxlfp, (long)-20, 2);
+X	t = NoSignExtend(pxlfp, 4);
+X	if ((tfontptr->c != 0) && (t != 0) && (tfontptr->c != t))
+X	    Warning("font = \"%s\",\n\
+X-->font checksum = %d,\n\
+X-->dvi checksum = %d",
+X		    tfontptr->name, tfontptr->c, t);
+X	tfontptr->magnification = NoSignExtend(pxlfp, 4);
+X	tfontptr->designsize = NoSignExtend(pxlfp, 4);
+X
+X	(void) fseek(pxlfp, (long) (NoSignExtend(pxlfp, 4) * 4), 0);
+X
+X	for (i = FIRSTPXLCHAR; i <= LASTPXLCHAR; i++) {
+X	    tcharptr = &(tfontptr->ch[i]);
+X	    tcharptr->width = NoSignExtend(pxlfp, 2);
+X	    tcharptr->height = NoSignExtend(pxlfp, 2);
+X	    tcharptr->xOffset= SignExtend(pxlfp, 2);
+X	    tcharptr->yOffset = SignExtend(pxlfp, 2);
+X	    tcharptr->where.isloaded = 0;
+X	    tcharptr->where.address.fileOffset = NoSignExtend(pxlfp, 4) * 4;
+X	    tcharptr->tfmw = ((float)NoSignExtend(pxlfp, 4) *
+X			      (float)tfontptr->s) /
+X				  (float)(1<<20);
+X	    tcharptr->kern = 0;
+X	}
+X    }
+X    else {			/* PK file */
+X	int hppp, vppp;
+X
+X	if (NoSignExtend(pxlfp, 1) != PK_PRE)
+X	    Fatal("Pre command missing from PK file");
+X	if ((t = NoSignExtend(pxlfp, 1)) != PK_ID)
+X	    Fatal("PK ID = %d, can only process PK ID = %d files",
+X		  t, PK_ID);
+X	/* throw away comment */
+X	for (i = NoSignExtend(pxlfp, 1); i > 0; i--)
+X	    (void) NoSignExtend(pxlfp, 1);
+X	tfontptr->designsize = NoSignExtend(pxlfp, 4);
+X	t = NoSignExtend(pxlfp, 4);
+X	if ((tfontptr->c != 0) && (t != 0) && (tfontptr->c != t))
+X	    Warning("font = \"%s\",\n\
+X-->font checksum = %d,\n\
+X-->dvi checksum = %d",
+X		    tfontptr->name, tfontptr->c, t);
+X	hppp = NoSignExtend(pxlfp, 4);
+X	vppp = NoSignExtend(pxlfp, 4);
+X	if (hppp != vppp)
+X	    Warning("font = \"%s\" - aspect ratio not 1:1", tfontptr->name);
+X	tfontptr->magnification = hppp * 72.27 * (float)5/65536 + 0.5;
+X	/* don't read all character info now - just mark them as pk data */
+X	for (i = FIRSTPXLCHAR; i < LASTPXLCHAR; i++) {
+X	    tcharptr = &(tfontptr->ch[i]);
+X	    tcharptr->where.isloaded = 0;
+X	    tcharptr->where.address.fileOffset = 0;
+X	}
+X	tfontptr->offset = ftell(pxlfp);
+X    }
+X}
+X
+X
+X/*-->ReadPostAmble*/
+X/**********************************************************************/
+X/**************************  ReadPostAmble  ***************************/
+X/**********************************************************************/
+X
+Xvoid
+XReadPostAmble(load)
+Xint     load;
+X/***********************************************************************
+X    This  routine  is  used  to  read  in  the  postamble  values.    It
+X    initializes the magnification and checks  the stack height prior  to
+X    starting printing the document.
+X***********************************************************************/
+X{
+X    FindPostAmblePtr (&postambleptr);
+X    if (NoSignExtend(dvifp, 1) != POST)
+X	Fatal ("POST missing at head of postamble");
+X#ifdef DEBUG
+X    if (Debug)
+X	(void) fprintf (stderr, "got POST command\n");
+X#endif
+X    ppagep = NoSignExtend(dvifp, 4);
+X    num = NoSignExtend(dvifp, 4);
+X    den = NoSignExtend(dvifp, 4);
+X    mag = NoSignExtend(dvifp, 4);
+X#ifdef USEGLOBALMAG
+X    if( usermag > 0 && usermag != mag )
+X        (void) fprintf(stderr, "DVI magnification of %d over-ridden by user mag of %d\n", mag, usermag );
+X#endif
+X    if( usermag > 0 ) mag = usermag;
+X#ifndef USEGLOBALMAG
+X    if( mag != 1000 )
+X	(void) fprintf(stderr, "Magnification of %d ignored.\n", mag);
+X#endif
+X    hconv = DoConv(num, den, hconvRESOLUTION);
+X    vconv = DoConv(num, den, vconvRESOLUTION);
+X
+X    (void) NoSignExtend(dvifp, 4);	/* height-plus-depth of tallest page */
+X    (void) NoSignExtend(dvifp, 4);	/* width of widest page */
+X    if (NoSignExtend(dvifp, 2) >= STACKSIZE)
+X	Fatal ("Stack size is too small");
+X    (void) NoSignExtend(dvifp, 2);	/* this reads the number of pages in */
+X    /* the DVI file */
+X#ifdef DEBUG
+X    if (Debug)
+X	(void) fprintf (stderr, "now reading font defs");
+X#endif
+X    if (load) GetFontDef ();
+X}
+X
+X
+X/*-->SetChar*/
+X/**********************************************************************/
+X/*****************************  SetChar  ******************************/
+X/**********************************************************************/
+X
+XLoadAChar(ptr)
+Xregister struct char_entry *ptr;
+X{
+X    long *pr;
+X    register int nints;
+X
+X    if (ptr->where.address.fileOffset == NONEXISTANT) {
+X	ptr->where.address.pixptr = NULL;
+X        ptr->where.isloaded = loadpass;
+X	return;
+X        }
+X
+X    if (ptr->where.isloaded == 0) {
+X	/* haven't had this character before */
+X	OpenFontFile();
+X	if (fontptr->type == FONT_PXL) { /* this is a PXL file */
+X	    (void) fseek(pxlfp, ptr->where.address.fileOffset, 0);
+X	    nints = ((ptr->width + 31) >> 5) * ptr->height;
+X	    pr = (long *)malloc((unsigned)(nints*sizeof(long)) );
+X	    if (pr == NULL)
+X		Fatal("Unable to allocate memory for char\n");
+X	    (void) fread((char *)pr, 4, nints, pxlfp);
+X	    ptr->where.address.pixptr = pr;
+X	}
+X	else {			/* this is a PK file */
+X	    int packet_length, raster_length;
+X
+X	    if (ptr->where.address.fileOffset == 0) {
+X		int car;
+X		FlagByte flag;
+X
+X		/* look for char in PK file */
+X		(void) fseek(pxlfp, fontptr->offset, 0);
+X		flag = SkipSpecials();
+X		while (flag.code != PK_POST &&
+X		       ptr->where.address.fileOffset == 0) {
+X		    fontptr->offset = ftell(pxlfp) - 1;
+X		    if (flag.extended) {
+X			if (flag.length_prefix == 3) {
+X			    /* long character preamble */
+X			    packet_length = NoSignExtend(pxlfp, 4);
+X			    car = NoSignExtend(pxlfp, 4);
+X			}
+X			else {
+X			    /* extended short character preamble */
+X			    packet_length = (flag.length_prefix << 16) +
+X				NoSignExtend(pxlfp, 2);
+X			    car = NoSignExtend(pxlfp, 1);
+X			}
+X		    }
+X		    else {
+X			/* short character preamble */
+X			packet_length = (flag.length_prefix << 8) +
+X			    NoSignExtend(pxlfp, 1);
+X			car = NoSignExtend(pxlfp, 1);
+X		    }
+X		    if (car > 127 || car < 0)
+X			Warning("Character %d in font %s out of range",
+X				car, fontptr->name);
+X		    else
+X			fontptr->ch[car].where.address.fileOffset =
+X			    fontptr->offset;
+X#ifdef	notdef
+X		    fprintf(stderr, "font %s: flag %d car %d pl %d dyn_f %d\n",
+X			    fontptr->name, flag.code, car, packet_length,
+X			    flag.dyn_f);
+X#endif	notdef
+X		    /* just make a note of where this character is, and then
+X		       skip past it */
+X		    if (packet_length <= 0)
+X			Fatal("Bad packet length %d in %s",
+X			      packet_length, fontptr->name);
+X		    (void) fseek(pxlfp, (long)packet_length, 1);
+X		    flag = SkipSpecials();
+X		}
+X	    }
+X	    if (ptr->where.address.fileOffset == 0)
+X		Fatal("Character missing from font");
+X	    (void) fseek(pxlfp, ptr->where.address.fileOffset, 0);
+X	    ptr->flag.code = NoSignExtend(pxlfp, 1);
+X	    if (ptr->flag.extended) {
+X		if (ptr->flag.length_prefix == 3) {
+X		    /* read long preamble */
+X		    packet_length = NoSignExtend(pxlfp, 4);
+X		    (void) NoSignExtend(pxlfp, 4); /* car */
+X		    ptr->tfmw = ((float)NoSignExtend(pxlfp, 4) *
+X				 (float)fontptr->s) /
+X				     (float)(1<<20);
+X		    (void) NoSignExtend(pxlfp, 4); /* hor_esc */
+X		    (void) NoSignExtend(pxlfp, 4); /* ver_esc */
+X		    ptr->width = NoSignExtend(pxlfp, 4);
+X		    ptr->height = NoSignExtend(pxlfp, 4);
+X		    ptr->xOffset = SignExtend(pxlfp, 4);
+X		    ptr->yOffset = SignExtend(pxlfp, 4);
+X		    raster_length = packet_length - 24;
+X		}
+X		else {
+X		    /* read extended short preamble */
+X		    packet_length = ((ptr->flag.length_prefix) << 16) +
+X			NoSignExtend(pxlfp, 2);
+X		    (void) NoSignExtend(pxlfp, 1); /* car */
+X		    ptr->tfmw = (NoSignExtend(pxlfp, 1) << 16);
+X		    ptr->tfmw += NoSignExtend(pxlfp, 2);
+X		    ptr->tfmw = ((float)ptr->tfmw * (float)fontptr->s) /
+X			(float)(1<<20);
+X		    (void) NoSignExtend(pxlfp, 2); /* hor_esc */
+X		    ptr->width = NoSignExtend(pxlfp, 2);
+X		    ptr->height = NoSignExtend(pxlfp, 2);
+X		    ptr->xOffset = SignExtend(pxlfp, 2);
+X		    ptr->yOffset = SignExtend(pxlfp, 2);
+X		    raster_length = packet_length - 13;
+X		}
+X	    }
+X	    else {
+X		/* read short preamble */
+X		packet_length = ((ptr->flag.length_prefix) << 8) 
+X		  + NoSignExtend(pxlfp, 1);
+X		(void) NoSignExtend(pxlfp, 1); /* car */
+X		ptr->tfmw = (NoSignExtend(pxlfp, 1) << 16);
+X		ptr->tfmw += NoSignExtend(pxlfp, 2);
+X		ptr->tfmw = ((float)ptr->tfmw * (float)fontptr->s) /
+X		    (float)(1<<20);
+X		(void) NoSignExtend(pxlfp, 1); /* hor_esc */
+X		ptr->width = NoSignExtend(pxlfp, 1);
+X		ptr->height = NoSignExtend(pxlfp, 1);
+X		ptr->xOffset = SignExtend(pxlfp, 1);
+X		ptr->yOffset = SignExtend(pxlfp, 1);
+X		raster_length = packet_length - 8;
+X	    }
+X	    pr = (long *)malloc((unsigned)raster_length);
+X	    if (pr == NULL)
+X		Fatal("Unable to allocate memory for char\n");
+X	    (void) fread((char *)pr, raster_length, 1, pxlfp);
+X	    ptr->where.address.pixptr = pr;
+X#ifdef	notdef
+X	    fprintf(stderr, "PK Char: t=%d, w=%d, h=%d, x=%d, y=%d\n",
+X		    ptr->tfmw, ptr->width, ptr->height,
+X		    ptr->xOffset, ptr->yOffset);
+X#endif
+X	}
+X    }
+X    ptr->where.isloaded = loadpass;
+X
+X    EmitChar(ptr);
+X        /* we should really free the space used by the PXL data after this
+X           point, but it is not large, and besides, we may want to be
+X           more clever in the future, about sending bitmaps.  So keep
+X           the data around */
+X}
+X
+XFlagByte
+XSkipSpecials()
+X{
+X    int i;
+X    FlagByte flag;
+X
+X    do {
+X	flag.code = NoSignExtend(pxlfp, 1);
+X	if (flag.code >= 240) {
+X	    switch (flag.code) {
+X	    case 240: case 241: case 242: case 243:
+X		for (i = NoSignExtend(pxlfp, flag.code-240+1); i > 0; i--)
+X		    NoSignExtend(pxlfp, 1);
+X		break;
+X	    case 244:
+X		(void) NoSignExtend(pxlfp, 4);
+X		break;
+X	    case 245: case 246:
+X		break;
+X	    default:
+X		Fatal("Unexpected %d !", flag);
+X	    }
+X	}
+X    } while (flag.code >= 240 && flag.code != PK_POST);
+X    return flag;
+X}
+X
+Xvoid
+XSetChar(c, command, PassNo)
+Xint c, command, PassNo;
+X{
+X    register struct char_entry *ptr;  /* temporary char_entry pointer */
+X
+X    ptr = &(fontptr->ch[c]);
+X
+X    if (PassNo == 0) {
+X	if (ptr->where.isloaded != loadpass)
+X	    LoadAChar(ptr);
+X	return;
+X    }
+X
+X    SetPosn(h,v,ptr->kern);
+X    SetXFont(ptr->where.xfont);
+X    if (fontptr->font_file_id != NO_FILE) {      /* ignore missing fonts */
+X	EMITC(ptr->where.glyph);
+X        hh += ptr->realw;
+X    }
+X
+X    if (command <= SET4)
+X        h += ptr->tfmw;
+X
+X#ifdef STATS
+X    Stnc += 1;
+X    fontptr->ncts += 1;
+X#endif
+X}
+X
+X
+X/*-->SetFntNum*/
+X/**********************************************************************/
+X/****************************  SetFntNum  *****************************/
+X/**********************************************************************/
+X
+Xvoid
+XSetFntNum(k)
+Xint k;
+X
+X/*  this routine is used to specify the font to be used in printing future
+X    characters */
+X
+X{
+X    fontptr = hfontptr;
+X    while ((fontptr!=NULL) && (fontptr->k!=k))
+X	fontptr = fontptr->next;
+X    if (fontptr == NULL)
+X	Fatal("font %d undefined", k);
+X}
+X
+Xvoid
+XSetXFont(xfont)
+X    struct xfont *xfont;
+X{
+X    register int i;
+X    int minused = 0;
+X
+X    if (xfont == 0)
+X	return;
+X    if (curxfont == xfont) {
+X	curxfont->usage++;
+X	return;
+X    }
+X    for (i = 0; i < MAXFONTID && assigned_font[i]; i++) {
+X	if (assigned_font[i] == xfont) {
+X	    EMIT(outfp,"%c%d",ESC,i);
+X	    curxfont = xfont;
+X	    curxfont->usage++;
+X	    return;
+X	}
+X	if (assigned_font[i]->usage < assigned_font[minused]->usage)
+X	    minused = i;
+X    }
+X    if (i >= MAXFONTID)
+X	i = minused;
+X    EMIT(outfp,"%c+%d%s\n%c%d",ESC,i,xfont->xname,ESC,i);
+X    assigned_font[i] = curxfont = xfont;
+X    xfont->usage = 1;
+X}
+X
+X/*-->SetPosn*/
+X/**********************************************************************/
+X/*****************************  SetPosn  ******************************/
+X/**********************************************************************/
+X
+Xvoid
+XSetPosn(x, y, kern)		/* output a positioning command */
+Xint x, y;
+X{
+X    int rx,ry;
+X    rx = PixRound(x-hh, hconv) - kern;
+X    ry = PixRound(y-vv, vconv);
+X#ifdef USERELPOS
+X    if (ry == 0) { /* use relative movement if just moving horizontally */
+X	if (rx != 0) {
+X	    if (rx > 0) {
+X		if (rx < 4) {
+X		    if (rx & 2)
+X			EMITC(MINCH+2);
+X		    if (rx & 1)
+X			EMITC(MINCH+1);
+X		}
+X		else
+X		    EMIT(outfp, "%crr%d ", ESC, rx);
+X	    }
+X	    else
+X		EMIT(outfp, "%crl%d ", ESC, -rx);
+X	    hh += rx*hconv;
+X	}
+X    }
+X    else if (rx == 0) {
+X	if (ry > 0)
+X	    EMIT(outfp, "%crd%d ", ESC, ry);
+X	else
+X	    EMIT(outfp, "%cru%d ", ESC, -ry);
+X	vv += ry*vconv;
+X    }
+X    else {
+X#endif
+X	EMIT(outfp, "%ca%d,%d\n", ESC,
+X	     (LEFT+(rx=PixRound(x,hconv))),
+X	     (TOP-(ry=PixRound(y,vconv))));
+X	/* must know "real" position on device for relative positioning */
+X	hh = rx*hconv;
+X	vv = ry*vconv;
+X#ifdef USERELPOS
+X    }
+X#endif
+X}
+X
+X
+X/*-->SetRule*/
+X/**********************************************************************/
+X/*****************************  SetRule  ******************************/
+X/**********************************************************************/
+X
+Xvoid
+XSetRule(a, b, Set)
+Xint a, b;
+XBOOLEAN Set;
+X
+X{	    /*	 this routine will draw a rule */
+X
+X    if( a > 0 && b > 0 ) {
+X	if (a > b)
+X	    EMIT(outfp,"%cy%d,%d,%d,%d\n",ESC,
+X		 LEFT+PixRound(h,hconv),TOP-PixRound(v,vconv),
+X		 PixRound(a,vconv),PixRound(b,hconv));
+X	else
+X	    EMIT(outfp,"%cx%d,%d,%d,%d\n",ESC,
+X		 LEFT+PixRound(h,hconv),TOP-PixRound(v,vconv),
+X		 PixRound(b,hconv),PixRound(a,vconv));
+X    }
+X    if (Set)
+X	h += b;
+X}
+X
+X
+X/*-->SetString*/
+X/**********************************************************************/
+X/*****************************  SetString  ****************************/
+X/**********************************************************************/
+X#ifdef	notdef
+Xvoid
+XSetString(firstch, PassNo)              /* read and set a consecutive string of chars */
+Xint firstch, PassNo;
+X{
+X    char s[256];
+X    register char *sp;
+X    register int  c;
+X    register struct char_entry *ptr;
+X    int len;
+X
+X    /* read entire string of chars */
+X
+X    for(c = firstch, sp = s;  c >= SETC_000 && c <= SETC_127; ) {
+X        *sp++ = c;
+X        c = NoSignExtend(dvifp, 1);
+X        }
+X    (void) fseek(dvifp, (long) -1, 1);	/* backup one character */
+X
+X    len = sp - s;               /* NULL's are valid chars, so cant use for string termination */
+X
+X    /* ensure that all characters are loaded, */
+X
+X    for(sp = s; sp < s+len; sp++) {
+X        ptr = &(fontptr->ch[*sp]);
+X        if(ptr->where.isloaded != loadpass)
+X	    LoadAChar(ptr);
+X    }
+X
+X    /* emit the instructions */
+X
+X    if( PassNo == 0 ) return;
+X    SetPosn(h, v, 0);
+X    for( sp=s;  sp < s+len;  sp++) {
+X	ptr = &(fontptr->ch[*sp]);
+X	if( fontptr->font_file_id != NO_FILE ) {     /* ignore missing fonts */
+X	    SetXFont(ptr->where.xfont);
+X	    EMITC(ptr->where.glyph);
+X	    hh += ptr->realw;
+X	}
+X	h += ptr->tfmw;
+X    }
+X
+X#ifdef STATS
+X    Stnc += len;
+X    fontptr->ncts += len;
+X#endif
+X}
+X#endif
+X
+X/*-->SignExtend*/
+X/**********************************************************************/
+X/****************************  SignExtend  ****************************/
+X/**********************************************************************/
+X
+Xint
+XSignExtend(fp, n)   /* return n byte quantity from file fd */
+Xregister FILE *fp;  /* file pointer    */
+Xregister int n;     /* number of bytes */
+X
+X{
+X    int n1;         /* number of bytes	    */
+X    register int x; /* number being constructed */
+X
+X    x = getc(fp);   /* get first (high-order) byte */
+X    n1 = n--;
+X    while (n--)  {
+X	x <<= 8;
+X	x |= getc(fp);
+X    }
+X
+X    /* NOTE: This code assumes that the right-shift is an arithmetic, rather
+X    than logical, shift which will propagate the sign bit right.   According
+X    to Kernighan and Ritchie, this is compiler dependent! */
+X
+X    x<<=32-8*n1;
+X    x>>=32-8*n1;  /* sign extend */
+X
+X#ifdef DEBUG
+X    if (Debug)
+X    {
+X	(void) fprintf(stderr,"\tSignExtend(fp,%d)=%X\n",n1,x);
+X    }
+X#endif
+X    return(x);
+X}
+X
+X
+X/*-->SkipFontDef*/
+X/**********************************************************************/
+X/****************************  SkipFontDef  ***************************/
+X/**********************************************************************/
+X
+Xvoid
+XSkipFontDef(k)
+Xint k;
+X{
+X    int a, l;
+X    char n[STRSIZE];
+X
+X    (void) NoSignExtend(dvifp, 4);
+X    (void) NoSignExtend(dvifp, 4);
+X    (void) NoSignExtend(dvifp, 4);
+X    a = NoSignExtend(dvifp, 1);
+X    l = NoSignExtend(dvifp, 1);
+X    GetBytes(dvifp, n, a+l);
+X}
+X
+X
+X/*-->Warning*/
+X/**********************************************************************/
+X/*****************************  Warning  ******************************/
+X/**********************************************************************/
+X/*VARARGS1*/
+X
+Xvoid
+XWarning(fmt, a, b, c)  /* issue a warning */
+Xchar *fmt;	/* format   */
+Xchar *a, *b, *c;	/* arguments */
+X{
+X    if (G_logging == 0)
+X    {
+X        if (G_logfile)
+X	        G_logfp=fopen(G_Logname,"w+");
+X        else {
+X                G_logfp=stderr;
+X                if( G_nowarn ) return;
+X                }
+X	G_logging = 1;
+X	if (G_logfp == NULL) G_logging = -1;
+X    }
+X
+X    G_errenc = TRUE;
+X    if (G_logging == 1)
+X    {
+X	(void) fprintf(G_logfp, fmt, a, b, c);
+X	(void) fprintf(G_logfp,"\n");
+X    }
+X}
+X
+X
+/
+echo 'Part 01 of DVI -> 2700 driver complete.'
+exit
+-- 
+UUCP:   ...!mcvax!ukc!warwick!cudcv	PHONE:  +44 203 523037
+JANET:  cudcv@uk.ac.warwick.daisy       ARPA:   cudcv@daisy.warwick.ac.uk
+Rob McMahon, Computing Services, Warwick University, Coventry CV4 7AL, England
+
+

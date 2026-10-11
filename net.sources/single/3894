@@ -1,0 +1,762 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,406e00d7f84d0142,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-01-19 19:39:44 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site down.FUN
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!princeton!down!honey
+From: honey@down.FUN (Peter Honeyman)
+Newsgroups: net.sources
+Subject: pathalias input from arpa hosts.txt table
+Message-ID: <651@down.FUN>
+Date: Sun, 19-Jan-86 22:39:44 EST
+Article-I.D.: down.651
+Posted: Sun Jan 19 22:39:44 1986
+Date-Received: Tue, 21-Jan-86 01:01:33 EST
+Organization: CS Dept., Princeton University
+Lines: 742
+
+# this is for the new pathalias.  see mod.sources and net.mail for
+# details (albeit scant (an oxymoron)).
+#	peter
+
+# To unbundle, sh this file as root
+echo mkarpatxt 1>&2
+sed 's/^-//' >mkarpatxt <<'//GO.SYSIN DD mkarpatxt'
+#!/bin/sh
+# sun and ames are too important to be treated as private hosts
+mkdir paths.internet
+cd paths.internet
+egrep '^HOST.*SMTP' ${1-../hosts.txt}|
+	awk -F: '{print $3}'|
+	sed -e '/SUN\.CSS\.GOV/d' -e '/ AMES\.ARPA/d' -e 's/ //g' -e 's/,/	/g'|
+	../arpatxt -i -g seismo -g ucbvax -p ../arpa-privates
+
+//GO.SYSIN DD mkarpatxt
+echo arpatxt.c 1>&2
+sed 's/^-//' >arpatxt.c <<'//GO.SYSIN DD arpatxt.c'
+/*
+ * convert hosts.txt into pathalias format.
+ * preprocess hosts.txt with
+ *	egrep '^HOST.*SMTP' hosts.txt
+ *		| awk -F: '{print $3}'
+ *		| sed -e 's/ //g' -e 's/,/	/g'
+ *
+ * alias rules:
+ *	host.dom.ain nickname.arpa	-> host = nickname
+ *	host.arpa dom.ain.name		-> host = dom.ain.name
+ * the latter is not yet implemented.
+ */
+
+#ifndef lint
+static char *sccsid = "@(#)arpatxt.c	1.3 (down!honey) 86/01/10";
+#endif
+
+/* remove the next line for standard or research unix */
+#define strchr index
+
+#include <stdio.h>
+#include <ctype.h>
+
+typedef struct node node;
+
+struct node {
+	node *child;	/* subdomain or member host */
+	node *parent;	/* parent domain */
+	node *next;	/* sibling in domain tree or host list */
+	char *name;
+	node *alias;
+	node *bucket;
+	node *gateway;
+	int  flag;
+};
+
+node *Top, *Gateway;
+int Atflag;
+int Iflag;
+char *Arpa = "ARPA";
+
+node *newnode(), *find();
+char *strsave(), *lowercase();
+
+extern char *malloc(), *strchr(), *calloc(), *gets(), *strcpy(), *fgets();
+extern FILE *fopen();
+
+#define ISADOMAIN(n) ((n) && *((n)->name) == '.')
+
+/* for node.flag */
+#define COLLISION 1
+
+/* for formatprint() */
+#define PRIVATE	0
+#define HOST	1
+#define DOMAIN	2
+
+/* for usage() */
+#define USAGE "usage: %s [-i@] [-g gateway] [-p privatefile] [file]\n"
+
+main(argc, argv)
+	char **argv;
+{	int c;
+	char buf[BUFSIZ], *privatefile = 0, *progname;
+	extern char *optarg;
+	extern int optind;
+
+	if ((progname = strchr(argv[0], '/')) != 0)
+		progname++;
+	else
+		progname = argv[0];
+
+	while ((c = getopt(argc, argv, "g:ip:@")) != EOF)
+		switch(c) {
+		case 'g':
+			gateway(optarg);
+			break;
+		case 'i':
+			Iflag++;
+			break;
+		case 'p':
+			privatefile = optarg;
+			if (access(privatefile, 0) != 0) {
+				perror(privatefile);
+				exit(1);
+			}
+			break;
+		case '@':
+			Atflag++;
+			break;
+		default:
+			usage(progname);
+		}
+
+	if (Iflag)
+		(void) lowercase(Arpa);
+	if (Gateway == 0)
+		fprintf(stderr, "%s: warning: no gateways\n", progname);
+
+	Top = newnode();
+	Top->name = "internet";
+	if (optind < argc) {
+		if (freopen(argv[optind], "r", stdin) == 0) {
+			perror(argv[optind]);
+			exit(1);
+		}
+	}
+	while (gets(buf) != 0) {
+		if (Iflag)
+			(void) lowercase(buf);
+		insert(buf);
+	}
+	insertgateways();
+	if (privatefile)
+		readprivates(privatefile);
+	merge();
+	dump(Top);
+	exit(0);
+}
+/*
+ * format of private file:
+ *	one per line, optionally followed by white space and comments
+ *	line starting with # is comment
+ */
+readprivates(pfile)
+	char *pfile;
+{	FILE *f;
+	node *n;
+	char buf[BUFSIZ], *bptr;
+
+	if ((f = fopen(pfile, "r")) == 0)
+		abort();
+	while (fgets(buf, BUFSIZ, f) != 0) {
+		if (*buf == '#')
+			continue;
+		if ((bptr = strchr(buf, ' ')) != 0)
+			*bptr = 0;
+		if ((bptr = strchr(buf, '\t')) != 0)
+			*bptr = 0;
+		if (*buf == 0)
+			continue;
+		n = newnode();
+		n->name = strsave(buf);
+		hash(n);
+	}
+	(void) fclose(f);
+}
+usage(progname)
+	char *progname;
+{
+	fprintf(stderr, USAGE, progname);
+	exit(1);
+}
+dumpgateways(ndom, f)
+	node *ndom;
+	FILE *f;
+{	node *n;
+	char *cost;
+
+	for (n = ndom->gateway; n; n = n->next) {
+		if (ndom == Top)
+			cost = "ARPA";
+		else
+			cost = "0";
+		if (Atflag)
+			fprintf(f, "%s @%s(%s)\n", n->name, ndom->name, cost);
+		else
+			fprintf(f, "%s %s(%s)\n", n->name, ndom->name, cost);
+	}
+}
+
+gateway(buf)
+	char *buf;
+{	node *n;
+
+	n = newnode();
+	n->name = strsave(buf);
+	n->next = Gateway;
+	Gateway = n;
+}
+	
+insert(buf)
+	char *buf;
+{	char host[128], *hptr, *dot;
+	node *n;
+
+	for (hptr = host; *hptr = *buf++; hptr++)
+		if (*hptr == '\t')
+			break;
+
+	if (*hptr == '\t')
+		*hptr = 0;
+	else
+		buf = 0;	/* no aliases */
+
+	if ((dot = strchr(host, '.')) == 0)
+		abort();	/* shouldn't happen */
+	
+	if (strcmp(dot+1, Arpa) == 0)
+		buf = 0;		/* no aliases */
+
+	n = find(dot);
+	*dot = 0;
+
+	addchild(n, host, buf);
+}
+
+node *
+find(domain)
+	char *domain;
+{	char *dot;
+	node *parent, *child;
+
+	if (domain == 0)
+		return(Top);
+	if ((dot = strchr(domain+1, '.')) != 0) {
+		parent = find(dot);
+		*dot = 0;
+	} else
+		parent = Top;
+
+	for (child = parent->child; child; child = child->next)
+		if (strcmp(domain, child->name) == 0)
+			break;
+	if (child == 0) {
+		child = newnode();
+		child->next = parent->child;
+		parent->child = child;
+		child->parent = parent;
+		child->name = strsave(domain);
+	}
+	return(child);
+}
+
+node *
+newnode()
+{
+	node *n;
+
+	if ((n = (node *) calloc(1, sizeof(node))) == 0)
+		abort();
+	return(n);
+}
+
+char *
+strsave(buf)
+	char *buf;
+{	char *mstr;
+
+	if ((mstr = malloc(strlen(buf)+1)) == 0)
+		abort();
+	strcpy(mstr, buf);
+	return(mstr);
+}
+
+addchild(n, host, aliases)
+	node *n;
+	char *host, *aliases;
+{	node *child;
+
+	/* check for dups?  nah! */
+	child = newnode();
+	child->name = strsave(host);
+	child->parent = n;
+	child->next = n->child;
+	makealiases(child, aliases);
+	n->child = child;
+}
+
+dump(n)
+	node *n;
+{	node *child;
+	char buf[32];
+	FILE *f;
+
+	if (!ISADOMAIN(n) && n != Top)
+		abort();
+
+	mkfile(n, buf);
+	if ((f = fopen(buf, "w")) == 0)
+		abort();
+	domprint(n, f);
+	dumpgateways(n, f);
+	(void) fclose(f);
+	for (child = n->child; child; child = child->next)
+		if (child->child)
+			dump(child);
+}
+
+qcmp(a, b)
+	node **a, **b;
+{
+	return(strcmp((*a)->name, (*b)->name));
+}
+
+domprint(n, f)
+	node *n;
+	FILE *f;
+{	node *table[10240], *child, *alias;
+	char leader[128], *cost = 0;
+	int nelem, i;
+
+	/* dump private definitions */
+	/* sort hosts and aliases in table */
+	i = 0;
+	for (child = n->child; child; child = child->next) {
+		table[i++] = child;
+		for (alias = child->alias; alias; alias = alias->next)
+			table[i++] = alias;
+	}
+	qsort((char *) table, i, sizeof(table[0]), qcmp);
+
+	formatprint(f, table, i, PRIVATE, "private {", cost);	/*}*/
+
+	/* dump domains and aliases */
+	/* sort hosts only in table */
+	i = 0;
+	for (child = n->child; child; child = child->next)
+		table[i++] = child;
+	qsort((char *) table, i, sizeof(table[0]), qcmp);
+	if (Atflag)
+		sprintf(leader, "%s = @{", n->name);	/*}*/
+	else
+		sprintf(leader, "%s = {", n->name);	/*}*/
+	/* cost is ARPA for hosts in top-level domains, LOCAL o.w. */
+	if (n->parent == Top)
+		cost = "ARPA";
+	else
+		cost = "LOCAL";
+	formatprint(f, table, i, HOST, leader, cost);
+	if (Atflag)
+		sprintf(leader, "%s = @{", n->name);	/*}*/
+	else
+		sprintf(leader, "%s = {", n->name);	/*}*/
+	formatprint(f, table, i, DOMAIN, leader, "0");
+
+	/* dump aliases */
+	nelem = i;
+	for (i = 0; i < nelem; i++) {
+		if ((alias = table[i]->alias) == 0)
+			continue;
+		fprintf(f, "%s = %s", table[i]->name, alias->name);
+		for (alias = alias->next; alias; alias = alias->next)
+			fprintf(f, ", %s", alias->name);
+		fputc('\n', f);
+	}
+
+}
+
+dtable(comment, table, nelem)
+	char *comment;
+	node **table;
+{	int	i;
+
+	fprintf(stderr, "\n%s\n", comment);
+	for (i = 0; i < nelem; i++)
+		fprintf(stderr, "%3d\t%s\n", i, table[i]->name);
+}
+
+formatprint(f, table, nelem, flag, leader, cost)
+	FILE *f;
+	node **table;
+	char *leader, *cost;
+{	int i, noprint = 1;
+	char buf[128], *bptr;
+
+	strcpy(buf, leader);
+	bptr = buf + strlen(buf);
+	for (i = 0; i < nelem; i++) {
+		switch(flag) {
+		case PRIVATE:
+			if ((table[i]->flag & COLLISION) == 0)
+				continue;
+			break;
+		case HOST:
+			if (ISADOMAIN(table[i]))
+				continue;
+			break;
+		case DOMAIN:
+			if (!ISADOMAIN(table[i]))
+				continue;
+			break;
+		}
+
+		noprint = 0;
+		if ((bptr - buf) + strlen(table[i]->name) + 2 > 71) {
+			*bptr = 0;
+			fprintf(f, "%s\n ", buf);
+			bptr = buf;
+		}
+		sprintf(bptr, "%s, ", table[i]->name);
+		bptr += strlen(bptr);
+	}
+	*bptr = 0;
+	if (!noprint) {
+		fprintf(f, "%s}", buf);
+		switch(flag) {
+		case HOST:
+		case DOMAIN:
+			fprintf(f, "(%s)", cost);
+			break;
+		}
+		fputc('\n', f);
+	}
+}
+				
+mkfile(n, buf)
+	node *n;
+	char *buf;
+{	node *parent;
+	char *bptr;
+
+	if (n == Top)
+		strcpy(buf, n->name);
+	else {
+		strcpy(buf, n->name + 1);	/* skip leading dot */
+		bptr = buf + strlen(buf);
+		parent = n->parent;
+		while (bptr - buf < 14 && ISADOMAIN(parent)) {
+			strcpy(bptr, parent->name);
+			bptr += strlen(bptr);
+			parent = parent->parent;
+		}
+		*bptr = 0;
+		buf[14] = 0;
+	}
+#if 0
+	if (access(buf, 0) == 0)
+		abort();
+#endif
+}
+
+/* map to lower case in place.  return parameter for convenience */
+char *
+lowercase(buf)
+	char *buf;
+{	char *str;
+
+	for (str = buf ; *str; str++)
+		if (isupper(*str))
+			*str -= 'A' - 'a';
+	return(buf);
+}
+
+/* get the interesting aliases, attach to n->alias */
+makealiases(n, line)
+	node *n;
+	char *line;
+{	char *next, *lptr;
+	node *a;
+
+	if (line == 0 || *line == 0)
+		return;
+
+	for ( ; line; line = next) {
+		next = strchr(line, '\t');
+		if (next)
+			*next++ = 0;
+		if ((lptr = strchr(line, '.')) == 0)
+			continue;
+		*lptr++ = 0;
+		if (strcmp(lptr, Arpa) != 0)
+			continue;
+
+		if (strcmp(n->name, line) == 0)
+			continue;
+
+		a = newnode();
+		a->name = strsave(line);
+		a->next = n->alias;
+		n->alias = a;
+	}
+}
+
+#define NHASH 13309
+node *htable[NHASH];
+
+merge()
+{	node *parent;
+
+	setuniqflag(Top);
+	for (parent = Top->child; parent; parent = parent->next) {
+		if (parent->flag & COLLISION) {
+			fprintf(stderr, "illegal subdomain: %s\n", parent->name);
+			abort();
+		}
+		promote(parent);
+	}
+}
+
+promote(parent)
+	node *parent;
+{	node *prev, *child, *next;
+	char buf[BUFSIZ];
+
+	prev = 0;
+	for (child = parent->child; child; child = next) {
+		next = child->next;
+		if (!ISADOMAIN(child)) {
+			prev = child;
+			continue;
+		}
+		if (child->flag & COLLISION) {
+			/*
+			 * reach here on dup domain name.  don't bump
+			 * prev: this node is moving up the tree.
+			 */
+
+			/* lengthen child domain name */
+			sprintf(buf, "%s%s", child->name, parent->name);
+			cfree(child->name);
+			child->name = strsave(buf);
+
+			/* unlink child out of sibling chain */
+			if (prev)
+				prev->next = child->next;
+			else
+				parent->child = child->next;
+
+			/* link child in as peer of parent */
+			child->next = parent->next;
+			parent->next = child;
+			child->parent = parent->parent;
+
+			/*
+			 * reset collision flag; may promote again on
+			 * return to caller.
+			 */
+			child->flag &= ~COLLISION;
+			hash(child);
+		} else {
+			promote(child);
+			prev = child;
+		}
+	}
+	
+}
+
+setuniqflag(n)
+	node *n;
+{	node *child, *alias;
+
+	/* mark this node in the hash table */
+	hash(n);
+	/* mark the aliases of this node */
+	for (alias = n->alias; alias; alias = alias->next)
+		hash(alias);
+	/* recursively mark this node's children */
+	for (child = n->child; child; child = child->next)
+		setuniqflag(child);
+}
+
+hash(n)
+	node *n;
+{	node **bucket, *b;
+
+	bucket = &htable[fold(n->name) % NHASH];
+	for (b = *bucket; b; b = b->bucket) {
+		if (strcmp(n->name, b->name) == 0) {
+			b->flag |= COLLISION;
+			n->flag |= COLLISION;
+			return;
+		}
+	}
+	n->bucket = *bucket;
+	*bucket = n;
+}
+
+fold(str)
+char *str;
+{
+	int sum = 0;
+
+	for (;;) {
+		if (*str == 0)
+			break;
+		sum ^= *str++;
+		if (*str == 0)
+			break;
+		sum ^= *str++ << 8;
+		if (*str == 0)
+			break;
+		sum ^= *str++ << 16;
+		if (*str == 0)
+			break;
+		sum ^= *str++ << 24;
+	}
+	if (sum < 0)
+		sum = -sum;
+	return(sum);
+}
+
+insertgateways()
+{
+	node *n, *ndom, *next;
+
+	for (n = Gateway; n; n = next) {
+		next = n->next;
+		ndom = find(strchr(n->name, '.'));
+		n->next = ndom->gateway;
+		ndom->gateway = n;
+	}
+}
+//GO.SYSIN DD arpatxt.c
+echo arpa-privates 1>&2
+sed 's/^-//' >arpa-privates <<'//GO.SYSIN DD arpa-privates'
+###
+#host		map file	alternate route
+#
+ai		eur.gb		edcaad
+athena		usa.or
+boojum		att.nj.1
+brahms		asia.japan
+dewey		att.nj.1	mhuxi
+escher		usa.ca.s
+felix		usa.ca.s	trwrb
+gandalf		can.on
+godot		usa.nc
+garfield	can.nf		allegra
+green		usa.md		aplvax
+hudson		att.nj.1
+huey		att.nj.1
+icsd		att.fl		mhuxi
+jason		usa.ny		rochester!srs
+lafite		usa.nj.bcr	bellcore
+louie		att.nj.1	mhuxi
+max		att.nj.2	mhuxi
+merlin	unidentified att host
+orion		att.nj.2	mhuxi
+physics		att.nj.2
+polaris		usa.ny		seismo
+psyche		usa.nc		unc
+rocky
+rover
+sphinx		usa.il		gargoyle
+stc	check route to princeton!seismo!mcvax!ukc!stc!%s
+tl-vaxa	check route to princeton!seismo!riacs!sequent!tl-vaxa!%s
+trillian	att.nj.2
+unh		usa.nh		unh.csnet
+usadhq2	check route to princeton!allegra!pyramid!pyrcorp!usadhq2!%s
+###
+###
+### arpa nicknames aren't supported, so these are safe
+# ace		eur.nl		mcvax
+# achilles	att.nj.1	achilles
+# alpha		usa.in		cmcl2
+# anubis	usa.il		gargoyle
+# apollo	usa.ma		linus
+# ariadne	eur.gr		mcvax
+# atlas		att.oh		mhuxi
+# bedford	usa.nh
+# beta	check route to princeton!whuxlb!ptsfa!beta!%s
+# bishop	check route to princeton!seismo!mcvax!ukc!sdlvax!minster!bishop!%s
+# bobo	check route to princeton!allegra!decvax!bobo!%s
+# bunny		usa.ma
+# clark	check route to princeton!mhuxi!clark!%s
+# copernicus	check route to princeton!bellcore!glacier!navajo!copernicus!%s
+# crvax	check route to princeton!seismo!sri-iu!crvax!%s
+# dallas	check route to princeton!ihnp4!sys1!dallas!%s
+# darwin	check route to princeton!ihnp4!darwin!%s
+# dbvax	check route to princeton!seismo!uwvax!dbvax!%s
+# diomedes	check route to princeton!allegra!diomedes!%s
+# eddie	check route to princeton!seismo!prlb2!lln-cs!hrc63!gecsw!eddie!%s
+# eel	check route to princeton!mhuxi!flounder!haddock!eel!%s
+# ems	check route to princeton!seismo!riacs!sequent!ems!%s
+# euclid	check route to princeton!seismo!mcvax!ukc!warwick!euclid!%s
+# fred	check route to princeton!allegra!nbires!fred!%s
+# frog	check route to princeton!seismo!mit-bug!mit-eddie!mitccc!frog!%s
+# fuji	check route to princeton!bellcore!glacier!fuji!%s
+# gizmo	check route to princeton!allegra!sun!gizmo!%s
+# hal	check route to princeton!siemens!cwruecmp!hal!%s
+# hector	check route to princeton!allegra!hector!%s
+# helios	check route to princeton!allegra!sun!helios!%s
+# hermes	check route to princeton!allegra!decvax!sii!dmcnh!hermes!%s
+# hilbert	check route to princeton!allegra!uw-beaver!hilbert!%s
+# hopkins	check route to princeton!allegra!hopkins!%s
+# icarus	check route to princeton!research!icarus!%s
+# indra		usa.nj.bcr, princeton!ihnp4!indra!%s
+# iris	check route to princeton!allegra!brunix!iris!%s
+# isi	check route to princeton!allegra!scgvaxd!isi!%s
+# isl	check route to princeton!seismo!umcp-cs!aplvax!isl!%s
+# jason		usa.ny, princeton!seismo!rochester!srs!jason!%s
+# jove	check route to princeton!seismo!rochester!srs!jove!%s
+# kepler	check route to princeton!whuxlb!ptsfa!well!micropro!kepler!%s
+# labrea	check route to princeton!bellcore!glacier!labrea!%s
+# larry	check route to princeton!seismo!rlgvax!curly!larry!%s
+# marvin	check route to princeton!vax135!qusavx!qtlon!marvin!%s
+# milo	check route to princeton!seismo!umcp-cs!aplvax!milo!%s
+# nexus	check route to princeton!seismo!mcvax!vmucnam!nexus!%s
+# noc	check route to princeton!cbosgd!noc!%s
+# odin	check route to princeton!mhuxi!odin!%s
+# orca	check route to princeton!ihnp4!tektronix!orca!%s
+# pallas	check route to princeton!ihnp4!pallas!%s
+# peewee	check route to princeton!allegra!scgvaxd!engvax!cit-vax!peewee!%s
+# pegasus	check route to princeton!mhuxi!pegasus!%s
+# phobos	check route to princeton!mhuxi!phobos!%s
+# phoenix	check route to princeton!mhuxi!phoenix!%s
+# pioneer	check route to princeton!mhuxi!pioneer!%s
+# poseidon	check route to princeton!mhuxi!poseidon!%s
+# prism	check route to princeton!topaz!prism!%s
+# prometheus	check route to princeton!seismo!prometheus!%s
+# quark	check route to princeton!cmcl2!lanl!dspo!quark!%s
+# ra	check route to princeton!seismo!rochester!srs!ra!%s
+# ranger	check route to princeton!mhuxi!ranger!%s
+# rigel	check route to princeton!ihnp4!oddjob!rigel:%s
+# saturn	check route to princeton!ihnp4!inmet!saturn!%s
+# shark	check route to princeton!ihnp4!tektronix!shark!%s
+# sol	check route to princeton!vax135!qusavx!qtlon!logica!sol!%s
+# spark	check route to princeton!allegra!ima!vaxine!spark!%s
+# sst	check route to princeton!seismo!kaist!kiet!sst!%s
+# star	check route to princeton!ihnp4!star!%s
+# styx	check route to princeton!allegra!idi!styx!%s
+# terra	check route to princeton!seismo!mit-erl!terra!%s
+# tsca	check route to princeton!cmcl2!sri-tsc!tsca!%s
+# tundra	check route to princeton!ihnp4!mmm!tundra!%s
+# turing		eur.nl, princeton!seismo!mcvax!turing!%s
+# tut	check route to princeton!seismo!mcvax!penet!tut!%s
+# vax1	check route to princeton!seismo!mcvax!ukc!ox-prg!vax1!%s
+# voyager	check route to princeton!mhuxi!voyager!%s
+# zeta	check route to princeton!allegra!zeta!%s
+# zeus		att.nj.2	mhuxi
+//GO.SYSIN DD arpa-privates
+exit
+
+

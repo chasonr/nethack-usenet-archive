@@ -1,0 +1,525 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,ef671f4f4e0297a4,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-02-09 03:16:34 PST
+Message-ID: <bnews.mprvaxa.143>
+Newsgroups: net.sources
+Path: utzoo!decvax!microsof!uw-beave!ubc-visi!mprvaxa!cornish
+X-Path: utzoo!decvax!microsof!uw-beave!ubc-visi!mprvaxa!cornish
+From: mprvaxa!cornish
+Date: Wed Feb  9 06:16:32 1983
+Subject: cpmff.c - read/write cpm floppy on 4.1BSD 11/780
+X-Google-Info: Converted from the original B-News header
+Posted: Sun Feb  6 01:22:47 1983
+Received: Wed Feb  9 06:16:32 1983
+
+#include <stdio.h>
+#include <ctype.h>
+#include <sys/types.h>
+#include <stat.h>
+
+/*   ####   #####   #    #        ######  #        ####   #####   #####    #   #
+*   #    #  #    #  ##  ##        #       #       #    #  #    #  #    #    # #
+*   #       #####   # ## #        #####   #       #    #  #####   #####      #
+*   #    #  #       #    #        #       #       #    #  #       #          #
+*    ####   #       #    #        #       ######   ####   #       #          #
+*
+*	This program supports access to a image of a cpm floppy disk.
+*	The image is assumed to have been created by flcopy(1), which
+*	uses track squeing of 6 sectors, and sector squeing of 2.
+*	Unfortunately, the cpm floppy uses track squeing of 0, sector of 6.
+*	To utilize this program without flcopy(1), trans() must be changed.
+*
+*	Copyright 1982 - Allan Cornish - Microtel Pacific Research
+*/
+
+#define DISKSZ	 ( 77)	/* tracks/floppy (including 2 boot tracks)	*/
+#define TRACKSZ	 ( 26)	/* sectors/track */
+#define GROUPSZ  (  8)	/* sectors/group */
+#define SECTORSZ (128)	/* bytes/sector  */
+#define MAXSECTR ((DISKSZ-2)*TRACKSZ)
+#define MAXGROUP (MAXSECTR / GROUPSZ)
+#define DIRSZ	 ( 64)	/* max number of directory entries per floppy	*/
+#define VAXTRSQ	 (  6)	/* phys offset to logicl start of next track	*/
+#define DELETED	  0xe5	/* uid for deleted/non-existent  files		*/
+#define PADCHAR	 (032)	/* pad character for text sectors (NOT DIR NAME)*/
+#define V_SIZE      1	/* Verbose flag to obtain file size information	*/
+#define V_NAME	    2	/* Verbose flag to obtain file name information	*/
+
+#define u_char	unsigned char
+
+struct cpm_dir {
+	u_char	uid;		/* user id, or 0xef if deleted entry	*/
+	u_char	name[8];	/* file name is nnnnnnnn.xxx		*/
+	u_char	namx[3];
+	u_char	extent;
+	u_char	fill[2];
+	u_char	sectors;	/* # of sectors utilized in this extent */
+	u_char	group[16];	/* group#'s for utilized sectors	*/
+} dir[DIRSZ];
+
+char *	flopname = "floppy";
+int	cpm_fno;
+int	txt_fno;
+char	fname[16];
+int	Quick = 0;		/* set for quick copying	    */
+int	Verbose = 0;		/* set for detailed info/tracking   */
+int	Special = 0;		/* set if floppy isn't regular file */
+int	Textmode= 1;		/* set to discard sector filler	    */
+struct stat sb;
+
+main(argc,argv)
+register int argc;
+register char **argv;
+{
+	register int  cmd;
+	register char *cp;
+	extern void usage();
+
+	argv[argc] = 0;
+	if (argc < 2)
+		usage("bad arg count");
+
+	cmd = **++argv; --argc;
+	cp  = ++*argv;
+	while (*cp)
+	{
+		switch (*cp++)
+		{
+		case 'q':
+			Quick++;
+			break;
+		case 'v':
+			Verbose |= V_NAME;
+			break;
+		case 's':
+			Verbose |= V_SIZE;
+			break;
+		case 'r':
+			Textmode=0;
+			break;
+		case 'f':
+			if (! *++argv)
+				usage("missing device");
+			flopname = *argv;
+			break;
+		default :
+			usage("bad flag");
+		}
+	}
+
+	++argv;
+	switch (cmd)
+	{
+	case 'x':
+		cpm_xtract(argv);
+		break;
+	case 'c':
+		cpm_create(argv);
+		break;
+	case 't':
+		cpm_list(argv);
+		break;
+	default :
+		usage("command");
+	}
+}
+
+
+cpm_list(argv)			/* list cpm files in current directory */
+register char **argv;
+{
+	register int d;
+	extern void  cpm_info();
+	extern char *cpm_name(), *sname();
+
+	if ((cpm_fno = open(flopname, 0)) < 0 || fstat(cpm_fno, &sb) < 0)
+		perror(flopname), exit(1);
+	if ((sb.st_mode & S_IFMT) != S_IFREG)
+		Special++;
+	g_read(0, &dir[ 0]);
+	g_read(1, &dir[32]);
+	if (! Verbose)
+		Verbose = V_NAME;
+	if (*argv)
+	{
+		while (*argv)
+		{
+			for (d=0; d < DIRSZ; d++)
+			{
+				if (dir[d].uid == DELETED)
+					continue;
+				if (dir[d].extent != 0)
+					continue;
+				if (strcmp(cpm_name(d), sname(*argv)) == 0)
+					cpm_info(d);
+			}
+			++argv;
+		}
+	}
+	else
+	{
+		for (d=0; d < DIRSZ; d++)
+		{
+			if ((dir[d].uid != DELETED) && (dir[d].extent == 0))
+				cpm_info(d);
+		}
+	}
+}
+
+cpm_create(argv)			/* create a cpm floppy from files */
+register char **argv;
+{
+	register int f, d, g=2, extent, dg, n, i;
+	char buf[GROUPSZ*SECTORSZ];
+	if (! *argv)
+		usage("missing files");
+	if ((cpm_fno = creat(flopname, 0644)) < 0 || fstat(cpm_fno, &sb) < 0)
+		perror(flopname), exit(1);
+	if ((sb.st_mode & S_IFMT) != S_IFREG)
+		Special++;
+	for (d=0; d < DIRSZ; d++)
+		dir[d].uid = DELETED;
+	d=0;
+	while (*argv) {
+		if ((txt_fno = open(*argv, 0)) < 0)
+			perror(*argv), exit(1);
+		for (f=d,extent=0; d < DIRSZ; d++) {
+			for (dg=0; dg < sizeof dir[d].group; dg++) {
+				if ((n = read(txt_fno, buf, sizeof buf)) < 0)
+					perror(*argv), exit(1);
+				if (g >= MAXGROUP) {
+					fprintf(stderr,"floppy full\n");
+					g_write(0, &dir[0]);
+					g_write(1, &dir[32]);
+					exit(1);
+				}
+				for (i=n; i < sizeof buf; i++)
+					buf[i] = PADCHAR;
+				dir[d].group[dg] = g;
+				g_write(g++, buf);
+				if (n < sizeof buf)
+					break;
+			}
+			dir[d].uid	= 0;
+			dir[d].extent	= extent++;
+			dir[d].fill[0]	= dir[d].fill[1] = 0;
+			dir[d].sectors	= dg * GROUPSZ;
+			if (dg < sizeof dir[d].group)
+				dir[d].sectors += (n+(SECTORSZ-1)) / SECTORSZ;
+			buildnam(d,*argv);
+			if (n == 0) break;
+		}
+		close(txt_fno);
+		cpm_info(f);
+		++argv;
+	}
+	g_write(0, &dir[ 0]);
+	g_write(1, &dir[32]);
+	if (! Quick) {
+		for (i=0; i < sizeof buf; i++)
+			buf[i] = DELETED;
+		for (i = g*GROUPSZ; i < MAXSECTR; i++)
+			s_write(i, buf);
+	}
+}
+
+
+buildnam(d, name)		/* convert string into cpm directory entry */
+register int d;
+register char *name;
+{
+	register int i;
+	extern char *sname();
+
+	/* extract simple file name (no directories) */
+	name = sname(name);
+
+	/* take leading chars up to (not including) a '.' as file name */
+	for(i=0; (i<sizeof dir[d].name) && (*name!='\0') && (*name!='.'); i++)
+	{
+		if (islower(*name))
+			dir[d].name[i] = toupper(*name++);
+		else
+			dir[d].name[i] = *name++;
+	}
+
+	/* pad cpm file name with blanks */
+	for (; i < sizeof dir[d].name; i++)
+		dir[d].name[i] = ' ';
+
+	/* skip to a '.' */
+	while ((*name != '\0') && (*name != '.'))
+		++name;
+
+	/* take following chars as cpm file extension */
+	i=0;
+	if (*name == '.')
+	{
+		for (; (i < sizeof dir[d].namx) && (*++name != '\0'); i++)
+		{
+			if (islower(*name))
+				dir[d].namx[i] = toupper(*name);
+			else
+				dir[d].namx[i] = *name;
+		}
+	}
+
+	/* pad cpm file extension with blanks */
+	for (; i < sizeof dir[d].namx; i++) /* pad with blanks */
+		dir[d].namx[i] = ' ';
+}
+
+cpm_xtract(argv)
+register char **argv;
+{
+	register int d;
+	if ((cpm_fno = open(flopname,0)) < 0 || fstat(cpm_fno, &sb) < 0)
+		perror(flopname), exit(1);
+	if ((sb.st_mode & S_IFMT) != S_IFREG)
+		Special++;
+	g_read(0, &dir[ 0]);
+	g_read(1, &dir[32]);
+	if (*argv)
+	{
+		while (*argv)
+		{
+			for (d=0; d < DIRSZ; d++)
+			{
+				if (dir[d].uid == DELETED)
+					continue;
+				if (dir[d].extent != 0)
+					continue;
+				if (strcmp(cpm_name(d), sname(*argv)) == 0)
+				{
+					cpm_info(d);
+					if ((txt_fno = creat(*argv, 0644)) < 0)
+						perror(*argv), exit(1);
+					f_xtract(d);
+					close(txt_fno);
+					break;
+				}
+			}
+			if (d == DIRSZ)
+				fprintf(stderr, "%s: not found\n",
+					sname(*argv));
+			++argv;
+		}
+	}
+	else
+	{
+		for (d=0; d < DIRSZ; d++)
+		{
+			if (dir[d].uid != DELETED && dir[d].extent == 0)
+			{
+				cpm_info(d);
+				if ((txt_fno = creat(fname, 0644)) < 0)
+					perror(fname), exit(1);
+				f_xtract(d);
+				close(txt_fno);
+			}
+		}
+	}
+}
+
+
+f_xtract(f)			/* extract file from cpm floppy */
+{
+	register int d;
+	for (d=f; d < DIRSZ; d++)
+	{
+		if (dir[d].uid != DELETED &&
+			strcmp(fname, cpm_name(d)) == 0)
+				d_xtract(d);
+	}
+}
+
+d_xtract(d)			/* extract dir entry from floppy */
+register int d;
+{
+	register int i=0, cnt;
+	char buf[SECTORSZ];
+	extern long trans();
+	for (i=0; i < dir[d].sectors; i++)
+	{
+		s_read((int) dir[d].group[i/GROUPSZ]*GROUPSZ + i%GROUPSZ, buf);
+		cnt = SECTORSZ;
+		if (Textmode)
+		{
+			for (; cnt > 0; --cnt)
+			{
+				if (buf[cnt-1] != PADCHAR)
+					break;
+			}
+		}
+		if (write(txt_fno, buf, cnt) != cnt)
+			perror(fname), exit(1);
+	}
+}
+
+void
+cpm_info(f)			/* report information on file */
+register int f;
+{
+	register int d, groups;
+	extern char *cpm_name(), *strcpy();
+
+	strcpy(fname, cpm_name(f));	/* always set global file name */
+
+	if ((Verbose & V_SIZE) == V_SIZE)
+	{
+		groups = 0;
+		for (d=f; d < DIRSZ; d++)
+		{
+			if ( (dir[d].uid != DELETED) && 
+				(strcmp(fname, cpm_name(d)) == 0) )
+					groups += (dir[d].sectors + GROUPSZ-1) /
+							GROUPSZ;
+		}
+		printf("%2dk ", groups);
+	}
+	if ((Verbose & V_NAME) == V_NAME)
+		printf("%s", fname);
+	printf("\n");
+	fflush(stdout);
+}
+
+char *				/* return file name for directory entry */
+cpm_name(d)
+register int d;
+{
+	register int i,j;
+	static char name[16];
+
+	for (i = 0; i < sizeof dir[d].name && dir[d].name[i] != ' '; i++)
+	{
+		if (isupper(dir[d].name[i]))
+			name[i] = tolower(dir[d].name[i]);
+		else if (isprint(dir[d].name[i]))
+			name[i] = dir[d].name[i];
+		else
+			name[i] = '?';
+	}
+	if (isprint(dir[d].namx[0]))
+		name[i++] = '.';
+	for (j = 0; j < sizeof dir[d].namx && dir[d].namx[j] != ' '; j++)
+	{
+		if (isupper(dir[d].namx[j]))
+			name[i++] = tolower(dir[d].namx[j]);
+		else if (isprint(dir[d].namx[j]))
+			name[i++] = dir[d].namx[j];
+		else
+			name[i++] = '?';
+	}
+	name[i] = '\0';
+	return name;
+}
+g_read(g,buf)			/* read group (8 sectors) from pseudo floppy */
+char buf[GROUPSZ][SECTORSZ];
+{
+	register int s,i;
+	s = g * GROUPSZ;
+	for (i=0; i < GROUPSZ; ++i)
+		s_read(s+i, buf[i]);
+}
+
+s_read(s, buf)			/* read sector (128 bytes) from pseudo-floppy */
+register int s;
+char buf[SECTORSZ];
+{
+	extern long lseek(), trans();
+	if ((s < 0) || (s >= MAXSECTR))
+		return;
+	if ((lseek(cpm_fno, trans(s), 0) < 0) ||
+		(read(cpm_fno, buf, SECTORSZ) != SECTORSZ))
+			perror(flopname), exit(1);
+}
+
+g_write(g, buf)			/* write group (8 sectors) to pseudo floppy */
+char buf[GROUPSZ][SECTORSZ];
+{
+	register int s,i;
+	s = g * GROUPSZ;
+	for (i=0; i < GROUPSZ; ++i)
+		s_write(s+i, buf[i]);
+}
+
+s_write(s, buf)			/* write sector (128 bytes) to pseudo-floppy */
+register int s;
+char buf[SECTORSZ];
+{
+	extern long lseek(), trans();
+	if ((s < 0) || (s >= MAXSECTR))
+		return;
+	if ((lseek(cpm_fno,trans(s),0) < 0) ||
+		(write(cpm_fno,buf,SECTORSZ) != SECTORSZ))
+			perror(flopname), exit(1);
+}
+
+void
+usage(msg)
+char *msg;
+{
+	fprintf(stderr,"usage error: %s\n", msg);
+	fprintf(stderr,"\tcpm t[v][s][r][f floppy] [files] - list directory\n");
+	fprintf(stderr,"\tcpm c[v][s][r][f floppy] [files] - create  floppy\n");
+	fprintf(stderr,"\tcpm x[v][s][r][f floppy] [files] - extract floppy\n");
+	fprintf(stderr,"options:\n");
+	fprintf(stderr,"\t[v]erbose [s]ize [r]aw [f]loppy image\n");
+	exit(1);
+}
+
+
+/*
+* long trans(sector)
+* accepts a cpm logical sector number, which is translated into a physical
+* sector number, then back into a vax logical sector number, whose address 
+* is then returned.   These translations are necessary  because the flcopy
+* command reads floppys using a different interleave pattern than cpm uses.
+* If the cpm file is a special device, the physical sector number is used.
+*/
+
+long
+trans(sector)
+register int sector;
+{
+	register int track;
+	static char cpmphys[TRACKSZ] = { /* cpm logical to physical sector # */
+		 0,  6, 12, 18, 24,  4, 10, 16, 22,  2,  8, 14, 20,
+		 1,  7, 13, 19, 25,  5, 11, 17, 23,  3,  9, 15, 21 };
+	static char physvax[TRACKSZ] = { /* vax physical to logical sector # */
+		 0, 13,  1, 14,  2, 15,  3, 16,  4, 17,  5, 18,  6,
+		19,  7, 20,  8, 21,  9, 22, 10, 23, 11, 24, 12, 25 };
+
+	/* extract true track # from cpm logical sector # */
+	track  = (sector/TRACKSZ) + 2; /* sector # ignored 2 boot tracks */ 
+
+	/* convert sector # from cpm logical into physical */
+	sector = cpmphys[sector % TRACKSZ];
+
+	/* convert sector # from physical into vax logical */
+	if (! Special) {
+		sector += (DISKSZ * TRACKSZ) - ((track-1) * VAXTRSQ);
+		sector = physvax[sector % TRACKSZ];
+	}
+
+	/* calculate true sector address */
+	return ((long) (track * TRACKSZ) + sector) * SECTORSZ;
+}
+
+/* sname(fname) returns the simple name (no directories) of a file */
+/* BUG: a trailing '/' gives a null file name */
+
+static
+char *
+sname(fname)
+register char *fname;
+{
+	register char *cp;
+	char *rindex();
+	if (cp = rindex(fname, '/'))
+		return cp+1;
+	return fname;
+}
+
+

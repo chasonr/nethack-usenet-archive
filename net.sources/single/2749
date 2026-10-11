@@ -1,0 +1,1880 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,2f28a694a9538192,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-05-07 20:52:00 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site utah-cs.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!genrad!panda!talcott!harvard!seismo!utah-cs!brownc
+From: brownc@utah-cs.UUCP (Eric C. Brown)
+Newsgroups: net.sources
+Subject: A new version of MAKE for the IBM PC  (part 1 of 2)
+Message-ID: <3331@utah-cs.UUCP>
+Date: Tue, 7-May-85 23:52:00 EDT
+Article-I.D.: utah-cs.3331
+Posted: Tue May  7 23:52:00 1985
+Date-Received: Fri, 10-May-85 02:21:30 EDT
+Organization: Univ of Utah CS Dept
+Lines: 1860
+
+About a year ago, Landon Dyer posted a version of MAKE for the IBM PC.
+This had some problems, most notably that it would not directly execute
+programs.  Therefore, I hacked it up and added direct execution of programs
+and some features that I needed in a make, most notably, extraction 
+of files from archives.  This posting contains the MAKE sources and the
+sources for an archiver called LAR, which is similar to LU except that
+the date and time are preserved in the archive.  MAKE can examine LAR 
+format files and conditionally extract files from the archive.
+
+Both MAKE and LAR were written in Wizard C.  They depend on a number
+of include files being present, and on a number of library functions. 
+Most of the dependencies are localized to LWTOL.C, execute.c, parsedir.c,
+and getdir.c.  Some functions such as _open, _close, _read, and _write
+are binary versions of the standard unix open, close, etc.
+
+No guarantees are made about the portability of these programs.
+
+Eric C. Brown
+brownc@utah-cs
+..!seismo!utah-cs!brownc
+
+#------------Cut Here ------------------------------------------------
+# This is a shell archive.  Remove anything before this line, then
+# unpack it by saving it in a file and typing "sh file".  (Files
+# unpacked will be owned by you and have default permissions.)
+#
+# This archive contains:
+# execute.c file.c getdir.c macro.c make.c make.h osdate.c parsedir.c token.c
+
+echo x - execute.c
+cat > "execute.c" << '//E*O*F execute.c//'
+#include <errno.h>
+#include <bdos.h>
+#include <stdio.h>
+#include <ctype.h>
+#include "make.h"
+
+
+#define FALSE 0
+#define TRUE 1
+#define BUFFSIZ 256
+
+char *searchpath(), *getenv();
+extern	int	_envseg;
+static char cmd[128], param[128];
+static char *cmds[] = {
+	"break",
+	"chdir",
+	"cd",
+	"cls",
+	"copy",
+	"ctty",
+	"date",
+	"del",
+	"erase",
+	"dir",
+	"echo",
+	"exit",
+	"for",
+	"goto",
+	"if",
+	"mkdir",
+	"md",
+	"path",
+	"pause",
+	"prompt",
+	"rem",
+	"ren",
+	"rename",
+	"rmdir",
+	"rd",
+	"set",
+	"shift",
+	"time",
+	"type",
+	"ver",
+	"verify",
+	"vol",
+	0 };
+
+execute (str, noexecflag)
+char *str;
+int noexecflag;
+{
+    char tmp[BUFFSIZ], buf[10];
+    int index = 0, rval;
+    extern int ignore_errors;
+    
+    if (noexecflag) {
+        fputs(str, stdout);
+	return 0;
+    };
+    while (*str != '\0') {
+        if (*str == '\n') {
+	    tmp[index] = '\0';
+	    index = 0;
+	    str++;
+	    if ((rval = run(tmp)) != 0 && !ignore_errors) {
+	        fputs("***Error Code ", stderr);
+		itoa(rval, buf);
+		fputs(buf, stderr);
+		fputc('\n', stderr);
+	        return rval;
+	    }
+	}
+	else if (index == (BUFFSIZ - 1)) {
+	    fputs("Command Too Long: ", stderr);
+	    fputs(str, stderr);
+	    fputs("\nShorten.\n", stderr);
+	    return -1;
+	} 
+	else {
+	    tmp[index++] = *str++;
+	}    
+    }
+    return 0;
+}
+    
+    
+
+#ifdef TESTING
+main()
+{
+        char temp[128];
+
+	for (;;) {
+		printf("Command: ");
+		gets(temp);
+	if (temp[0] == '\0') break;
+		printf("        Execute: %d\n",run(temp));
+	}
+}
+#endif
+
+/* run(str)
+ * char *str;
+ *		returns the value of the executed command.  If the command is
+ *		an MS-DOS resident command the command.com is executed else
+ *		the program is invoked (looking down the PATH).
+ *
+ *		Written: Bradley N. Davis  University of Utah VCIS group
+ *		Date: 4-Jan-84
+ *
+ */
+
+static
+run(str)
+char *str;
+{
+	struct	execp	ep;
+	struct	SREGS	segs;
+
+	puts(str);
+#ifdef NOREALEXECUTE
+	return 0;
+#else
+	if (str[0] == '\0') {		/* Blank Line? push to subshell */
+		strcpy(cmd, getenv("COMSPEC"));
+		param[0] = '\0';
+		segread(&segs);
+		ep.ex_envseg = _envseg;
+		ep.ex_cmdadd = (unsigned)param;
+		ep.ex_cmdseg = segs.ss;
+		ep.ex_fcb1ad = 0;
+		ep.ex_fcb1sg = 0;
+		ep.ex_fcb2ad = 0;
+		ep.ex_fcb2sg = 0;
+		return (exec(cmd, 0, &ep));
+	}
+	if (resident(str))
+		return(system(str));
+	return(program(cmd,param));
+#endif
+}
+
+/*
+ * resident(str)
+ * char *str;
+ *		returns true if the command in str is an MS-DOS resident
+ *		command.
+ *
+ *		Written: Bradley N. Davis  University of Utah VCIS group
+ *		Date: 4-Jan-84
+ *
+ */
+#define iswhite(ch) ( ch == ' ' || ch == '\t' )
+static
+resident(str)
+char *str;
+{
+	char **t, *strpbrk();
+	int i, j;
+
+	while (iswhite(*str)) str++;		/* trim blanks */
+	if (str[1] == ':' && isalpha(str[0]))		/* look for x: */
+	    return TRUE;
+	if (strpbrk(str, "<>|") != NULL)	/* redirection? use system */
+	    return TRUE;
+	i = 0;
+	while ( isalnum(*str))
+		if (isupper(*str))
+			cmd[i++] = *str++ - 'A' + 'a';
+		else
+			cmd[i++] = *str++;
+	cmd[i] = '\0';
+	for (t = cmds; *t; t++) {
+		if (strcmp(*t,cmd) == 0) return TRUE;
+	}
+	strcat(cmd, ".bat");			/* Batch file? use system */
+	if (searchpath(cmd) != 0) {
+		cmd[i] = '\0';
+		return TRUE;
+	}
+	cmd[i] = '\0';
+	j = strlen(str);
+	i = 1;
+	while ((param[i++] = *str++) != 0);
+	param[0] = j;
+	param[j+1] = '\r';
+	return FALSE;
+}
+
+static
+program(cmd,param)
+char	*cmd, *param;
+{
+	struct	execp	ep;
+	struct	SREGS	segs;
+	char	*pathp;
+	int	len;
+
+	len = strlen(cmd);
+	strcat(cmd, ".com");
+	pathp = searchpath(cmd);
+	if (pathp == 0) {
+		cmd[len] = '\0';
+		strcat(cmd, ".exe");
+		pathp = searchpath(cmd);
+		if (pathp == 0) {
+			cmd[len] = '\0';
+			errno = ENOENT;
+			return(-1);
+		}
+	}
+	segread(&segs);
+	ep.ex_envseg = _envseg;
+	ep.ex_cmdadd = (unsigned)param;
+	ep.ex_cmdseg = segs.ss;
+	ep.ex_fcb1ad = 0;
+	ep.ex_fcb1sg = 0;
+	ep.ex_fcb2ad = 0;
+	ep.ex_fcb2sg = 0;
+	return (exec(pathp, 0, &ep));
+}
+//E*O*F execute.c//
+
+echo x - file.c
+cat > "file.c" << '//E*O*F file.c//'
+#include <stdio.h>
+#include "make.h"
+
+
+/*
+ * Return file-node for 'fname'.
+ * If it doesn't exist, then create one.
+ */
+FILENODE *filenode(fname)
+char *fname;
+{
+	FILENODE *f, *afnode(), *gfile();
+
+	if ((f = gfile(fname)) == (FILENODE *) NULL)
+		f = afnode(fname);
+	return f;
+}
+
+
+/*
+ * Add a dependency to the node 'fnd'.
+ * 'fnd' will depend on 'fname'.
+ */
+FILENODE *addfile(fnd, fname)
+FILENODE *fnd;
+char *fname;
+{
+	NODE *n;
+	FILENODE *f;
+
+    if (fnd == (FILENODE *) NULL) {		/* punt if no root file */
+        fputs("No current root, can't add dependency '", stderr);
+	fputs(fname, stderr);
+	fputs("%s'\n", stderr);
+	return (FILENODE *) NULL;
+    }
+
+    f = filenode(fname);
+    if ((n = (NODE *)calloc(1, sizeof(NODE))) == (NODE *) NULL) allerr();
+    n->nnext = fnd->fnode;
+    fnd->fnode = n;
+    n->nfile = f;
+    return f;
+}
+
+
+/*
+ * Add a line of method-text to the node 'fnode'.
+ */
+addmeth(fnode, methtext)
+FILENODE *fnode;
+char *methtext;
+{
+	int len;
+	char *new;
+
+	if (fnode == (FILENODE *) NULL || methtext == NULL) return;
+
+	len = strlen(methtext) + 2;
+	if (fnode->fmake == NULL) {
+	    if ((fnode->fmake = (char *)calloc(1, 1)) == NULL) allerr();
+	    *(fnode->fmake) = '\0';
+	}
+	len += strlen(fnode->fmake);
+
+/* Lattice C doesn't have 'realloc()', so this kludges around it: */
+	if ((new = (char *)calloc(1, len)) == NULL) allerr();
+	strcpy(new, fnode->fmake);
+	free(fnode->fmake);
+	fnode->fmake = new;
+
+	strcat(fnode->fmake, methtext);
+	len = strlen(fnode->fmake);
+	if (len && fnode->fmake[len - 1] != '\n')
+		strcat(fnode->fmake, "\n");
+}
+
+/*
+ * Add token to the parent list.  Return the pointer to the new parent.
+ * If token is already on the parent list, simply return the pointer found.
+ */
+FILENODE *addtolist(token, list)
+char *token;
+NODE **list;
+{
+    NODE *search, *newnode;
+    
+    for (search = *list; search != (NODE *) NULL; search = search->nnext) {
+        if (!strcmp (search->nfile->fname, token)) 
+        return search->nfile;
+    };
+    /* token not found so far... add it to list */
+    if ((newnode=(NODE *)calloc(1,sizeof(NODE))) == (NODE *)NULL) allerr();
+    search = *list;
+    *list = newnode;
+    newnode->nnext = search;
+    if ((newnode->nfile = (FILENODE *)calloc(1, sizeof(FILENODE))) == (FILENODE *) NULL) allerr();
+
+    if ((newnode->nfile->fname = (char *)calloc(1, strlen(token)+1)) == NULL) allerr();
+    strcpy(newnode->nfile->fname, token);
+    newnode->nfile->parent = (FILENODE *) NULL;
+    return newnode->nfile;
+}
+
+static NODE *parentlist = (NODE *) NULL;
+
+FILENODE *addparent(token)
+char *token;
+{
+    FILENODE *addtolist();
+
+    return addtolist(token, &parentlist);
+}
+
+#ifdef FUNNYLIBS
+isonlibrary(f)				/* return SUCCEED if f is a library. */
+FILENODE *f;				/* set f->fdate to parent's date */
+{
+    if (f->fflag & LIBRARY) {
+        getdate(f->parent);
+        f->fdate = f->parent->fdate;
+	return(SUCCEED);
+    }
+    return FAILURE;
+}
+#else
+/*
+ * Add file node fnd to library list.
+ */
+static FILENODE *librarylist = (FILENODE *) NULL;
+
+addtolibrary(fnd)
+FILENODE *fnd;
+{
+    NODE *n;
+
+    if (librarylist == (FILENODE *) NULL)  {
+        if ((librarylist = (FILENODE *) calloc(1, sizeof(FILENODE))) == (FILENODE *) NULL)
+            allerr();
+        librarylist->fnode = (NODE *) NULL;
+    }
+    if ((n = (NODE *)calloc(1, sizeof(NODE))) == (NODE *) NULL) allerr();
+    n->nnext = librarylist->fnode;
+    librarylist->fnode = n;
+    n->nfile = fnd;
+}
+
+/*
+ * Return SUCCEED if filenode f is a direct descendant of a library;
+ * set f->fdate to parent's time.
+ */
+
+isonlibrary(f)
+FILENODE *f;
+{
+    NODE *lib, *dep;
+
+#if DEBUG
+printf("Searching for: %s\n", f->fname);
+#endif
+    if (librarylist == (FILENODE *)  NULL) return FAILURE;
+    for (lib = librarylist->fnode; lib != (NODE *) NULL; lib = lib->nnext) {
+        for (dep = lib->nfile->fnode; dep != (NODE *) NULL; dep = dep->nnext) {
+#if DEBUG
+printf("Examining: %s\n", dep->nfile->fname);
+#endif
+            if (f == dep->nfile) {                /* found it!! */
+#if DEBUG
+printf("Found %s depend on %s\n", dep->nfile->fname, lib->nfile->fname);
+#endif
+                f->fdate = lib->nfile->fdate;        /* update time */
+                return SUCCEED;
+            }
+        }
+    }
+    return FAILURE;
+}
+#endif
+
+isanarchive(f)				/* return SUCCEED if f is an archive */
+FILENODE *f;				/* set f->fdate to date in parent's */
+{					/* archive directory */
+	DATE getarchdate();
+
+    if (f->fflag & ARCHIVE) {
+        f->fdate = getarchdate(f->parent->fname, f->fname);
+	return(SUCCEED);
+    }
+    return FAILURE;
+}
+
+NODE  *deletelist = (NODE *) NULL;
+
+extract(f)
+FILENODE *f;
+{
+	FILENODE *addtolist();
+#if DEBUG
+printf("Extracting %s for archivehood.\n", f->fname);
+#endif
+    if (f->fflag & ARCHIVE) {
+#if DEBUG
+printf("Copying %s for archivehood.\n", f->fname);
+#endif
+#ifndef NOREALEXTRACT
+        copyfile(f->parent->fname, f->fname);
+#endif
+	(void) addtolist(f->fname, &deletelist);  /* delete f->fname at end of run */
+	return(SUCCEED);
+    }
+    return FAILURE;
+}
+
+cleanuparchives()
+{
+    NODE *search;
+
+#if DEBUG
+printf("Inside cleanuparchives.\n");
+#endif
+
+    for (search = deletelist; search != (NODE *)NULL; search = search->nnext) {
+        fputs("Purging ", stdout);
+	puts(search->nfile->fname);
+#ifndef NOREALDELETE
+        unlink (search->nfile->fname);
+#endif
+    };
+}
+
+
+/*
+ * Get a filenode for the file called 'fn'.
+ * Returns (FILENODE *) NULL if the node doesn't exist.
+ */
+FILENODE *gfile(fn)
+char *fn;
+{
+	FILENODE *f;
+
+	for (f = froot; f != (FILENODE *) NULL; f = f->fnext)
+		if (!strcmp(fn, f->fname)) return f;
+	return (FILENODE *) NULL;
+}
+
+
+/*
+ * Alloc space for a new file node.
+ */
+FILENODE *afnode(name)
+char *name;
+{
+	FILENODE *f;
+
+	for (f=froot; f; f=f->fnext)
+		if (!strcmp(name, f->fname)) return f;
+
+	if ((f = (FILENODE *)calloc(1, sizeof(FILENODE))) == (FILENODE *) NULL) allerr();
+
+	if ((f->fname = (char *)calloc(1, strlen(name)+1)) == NULL) allerr();
+	strcpy(f->fname, name);
+
+	if ((f->fmake = (char *)calloc(1, 1)) == NULL) allerr();
+	*(f->fmake) = '\0';
+
+	f->fdate = (DATE) NULL;
+
+	f->fnode = (NODE *) NULL;
+	
+	f->parent = (FILENODE *) NULL;
+
+	f->fflag = 0;
+
+	f->fnext = froot;
+	froot = f;
+	return f;
+}
+
+
+/*
+ * Print dependency tree.
+ */
+prtree()
+{
+	FILENODE *f;
+	NODE *n;
+
+	for (f = froot; f != (FILENODE *) NULL; f = f->fnext)
+	{
+	    fputs(f->fname, stdout);
+	    fputs((f->fflag & ROOTP) ? " (root)" : "", stdout);
+	    fputs((f->fflag & REBUILT) ? " (rebuilt)" : "", stdout);
+	    fputs((f->fflag & LIBRARY) ? " (library)" : "", stdout);
+	    fputs((f->fflag & EXTRACT) ? " (extracted)" : "", stdout);
+	    fputs((f->fflag & ARCHIVE) ? " (archive)" : "", stdout);
+	    printdate(f->fdate);
+	    if (f->parent != (FILENODE *) NULL) {
+	        fputs("Parent is: ", stdout);
+		fputs(f->parent->fname, stdout);
+		fputc('\n', stdout);
+		fputs("Parental Date:", stdout);
+	        printdate(f->parent->fdate);
+	    }
+		if (f->fmake != NULL)
+		    puts(f->fmake);
+		puts("Dependents: ");
+		for (n = f->fnode; n != (NODE *) NULL; n = n->nnext) {
+		    fputc('\t', stdout);
+		    puts((n->nfile)->fname);
+		}
+		fputc('\n', stdout);
+	}
+}
+//E*O*F file.c//
+
+echo x - getdir.c
+cat > "getdir.c" << '//E*O*F getdir.c//'
+#include "lar.h"
+getdir (f)
+fildesc f;
+{
+    extern int nslots;
+    extern struct ludir ldir[MAXFILES];
+    char *getname();
+
+    lseek(f, 0L, 0);		/* rewind f */
+
+    if (_read(f, (char *) &ldir[0], DSIZE) != DSIZE)
+	error ("No directory\n");
+
+    if ( !equal(getname(ldir[0].l_name, ldir[0].l_ext), "larformt.arc") ) {
+        error("This is not a LAR format archive!!");
+    }
+
+    if (lwtol(ldir[0].l_datetime) != -1L)
+        error("This is not a LAR format archive!!");
+
+    nslots = (int) (lwtol (ldir[0].l_len)/DSIZE);
+
+    if (_read (f, (char *) & ldir[1], DSIZE * nslots) != DSIZE * nslots)
+	error ("Can't read directory - is it a library?");
+}
+
+/* convert nm.ex to a Unix style string */
+char   *getname (nm, ex)
+char   *nm, *ex;
+{
+    static char namebuf[14];
+    register char  *cp, *dp, *ocp;
+
+    for (cp = namebuf, dp = nm; *dp != ' ' && dp != nm+8;)
+	*cp++ = isupper (*dp) ? tolower (*dp++) : *dp++;
+    *cp++ = '.';
+    ocp = cp;
+
+    for (dp = ex; *dp != ' ' && dp != ex+3;)
+	*cp++ = isupper (*dp) ? tolower (*dp++) : *dp++;
+
+    if (cp == ocp)		/* no extension */
+        --cp;			/* eliminate dot */
+
+    *cp = '\0';
+    return namebuf;
+}
+
+cant (name)
+char   *name;
+{
+extern int  errno;
+extern char *sys_errlist[];
+
+fputs(name, stderr);
+fputs(": ", stderr);
+fputs(sys_errlist[errno], stderr);
+fputs("\n", stderr);
+fflush(stderr);
+exit (1);
+}
+
+error (str)
+char   *str;
+{
+fputs("lar: ", stderr);
+fputs(str, stderr);
+fputs("\n", stderr);
+fflush(stderr);
+exit (1);
+}
+
+
+/*
+ * This itoa doesn't call in the floating point library:
+ *   CI C86 does an sprintf!
+ */
+itoa(val, buf)
+int val;
+char *buf;
+{
+	register int i;
+	int j;
+	register char tbuf[10];
+
+	if (val == 0) {
+		buf[0] = '0';
+		buf[1] = '\0';
+		return;
+	}
+
+	i = 9;
+
+	while (val != 0) {
+		tbuf[i--] = (val % 10) + '0';
+		val /= 10;
+	}
+
+	i++;
+
+	for (j = 0; i <= 9; i++, j++)
+		buf[j] = tbuf[i];
+
+	buf[j] = '\0';
+}
+//E*O*F getdir.c//
+
+echo x - macro.c
+cat > "macro.c" << '//E*O*F macro.c//'
+#include <stdio.h>
+#include "make.h"
+
+/*
+ * Macro processing
+ */
+
+
+/*
+ * Perform macro substitution from 'orig' to 'dest'.
+ * Return number of macro substitutions made.
+ * A macro reference is in one of two forms:
+ *		<MACCHAR>(macro-name)
+ *  	or	<MACCHAR><single-character>
+ *
+ * "<MACCHAR><MACCHAR>" expands to a single '<MACCHAR>'
+ */
+mexpand(orig, dest, destsiz, macchar)
+char *orig, *dest;
+int destsiz;
+char macchar;
+{
+	char *s, *d, mname[STRSIZ];
+	int di, count;
+/*	MACRO *m; */
+
+	di = count = 0;
+	for(s=orig; *s;)
+		if(*s == macchar)
+		{
+			if(*++s == macchar)
+			{
+				if(di < destsiz-1) dest[di++] = *s++;
+				continue;
+			}
+
+			if(!*s) break;
+			d = mname;
+			if(*s != '(') *d++ = *s++;
+			else
+			{
+				for(++s; *s && *s!=')';) *d++ = *s++;
+				if(*s != ')') puts("Missed matching ')'");
+				else ++s;
+			}
+			*d = 0;
+			if((d = gmacro(mname)) == NULL) {
+				fputs("Undefined macro: ", stderr);
+				fputs(mname, stderr);
+				fputc('\n', stderr);
+			}
+			else {
+				while(*d && di < (destsiz - 1))
+					dest[di++] = *d++;
+				++count;
+			}
+		} else if(di < destsiz-1)
+			dest[di++] = *s++;
+
+	dest[di]=0;
+	return count;
+}
+
+
+/*
+ * Define a macro.
+ * Give the macro called 'name' the string expansion 'def'.
+ * Old macro-names are superseded, NOT replaced.
+ * Return ERROR if can't define the macro.
+ */
+defmac(name, def)
+char *name, *def;
+{
+	MACRO *m;
+
+	if((m = (MACRO *)malloc(sizeof(MACRO))) == (MACRO *) NULL) allerr();
+	if((m->mname = (char *)malloc(strlen(name)+1)) == NULL) allerr();
+	if((m->mvalue = (char *)malloc(strlen(def)+1)) == NULL) allerr();
+
+	strcpy(m->mname, name);
+	strcpy(m->mvalue, def);
+	m->mnext = mroot;
+	mroot = m;
+}
+
+
+/*
+ * undefmac - undefine a macro.
+ * Return 0 if macro was succesfully undefined, -1 if not found.
+ */
+undefmac(name)
+char *name;
+{
+	MACRO *m = mroot;
+	MACRO *prev = (MACRO *)NULL;
+
+	while(m != (MACRO *) NULL && strcmp(name, m->mname))
+	{
+		prev = m;
+		m = m->mnext;
+	}
+
+	if(m == (MACRO *) NULL) return -1;
+	if(prev == (MACRO *) NULL) mroot = m->mnext;
+	    else prev->mnext = m->mnext;
+
+	free(m->mname);
+	free(m->mvalue);
+	free(m);
+	return 0;
+}
+
+
+/*
+ * Lookup a macro called 'name'.
+ * Return a pointer to its definition,
+ * or NULL if it does not exist.
+ */
+char *gmacro(name)
+char *name;
+{
+	MACRO *m;
+
+	for(m=mroot; m != (MACRO *) NULL; m=m->mnext)
+		if(!strcmp(name, m->mname)) return m->mvalue;
+	return NULL;
+}
+ //E*O*F macro.c//
+
+echo x - make.c
+cat > "make.c" << '//E*O*F make.c//'
+#include <stdio.h>
+#include <ctype.h>
+#include "make.h"
+
+/*
+ *    MAKE - Maintain separate source files
+ *
+ *    SYNOPSIS
+ *        MK [-f file] [-a] [-n] [-d] [-i] [-k] [name] ...
+ *           f: use 'file' instead of default makefile
+ *           a: assume all modules are obsolete (recompile everything)
+ *           n: don't recompile, just list steps to recompile
+ *           d: debugging (print tree, file info)
+ *	     i: ignore return statuses from execution
+ *	     k: if errors occur, propagate error status up tree; continue.
+ *           name: module name to recompile
+ *
+ *    AUTHOR
+ *        Landon M. Dyer, Atari Inc.
+ *
+ *    INCREDIBLY HACKED OVER BY
+ *        Eric C. Brown University of Utah.
+ *
+ *    HACKS
+ *        Added object library support (dummy names that inherit dates)
+ *	  Added source library support (real parents)
+ *	  Added direct execution capability.
+ *	  Removed script file.
+ */
+
+#define INIT    "~INIT"              /* initialization macro */
+#define DEINIT    "~DEINIT"          /* de-init macro */
+#define BEFORE    "~BEFORE"          /* the per-root 'startup' method */
+#define AFTER    "~AFTER"            /* the per-root 'wrapup' method */
+
+
+char *mfiles[] = {            /* default makefiles */
+    "makefile",
+
+#ifdef VAXVMS
+    "[-]makefile",
+    "sys$login:makefile",
+#endif
+
+#ifdef MSDOS
+    "..\makefile",
+#endif
+    ""
+};
+
+
+MACRO *mroot = (MACRO *) NULL;          /* root of macro-list */
+FILENODE *froot = (FILENODE *) NULL;    /* root of filenode-list */
+FILENODE *firstf =(FILENODE *) NULL;    /* the very first filenode */
+char *modnames[MAXMODS];    /* module-names mentioned in commandline */
+int execstat = 0;	    /* nonzero if started executing */
+int modcount = 0;           /* #of module-names */
+int debug = 0;              /* nonzero: turn on debugging */
+int obsolete = 0;           /* nonzero: every file should be recompiled */
+int noscript = 0;           /* nonzero: print methods on standard output */
+int ignore_errors = 0;       /* nonzero: ignore error return codes */
+int prop_errors = 0;         /* nonzero: propagate error status up tree */
+DATE bigbang;               /* a date, the very earliest possible */
+DATE endoftime;             /* a date, the very last possible */
+
+
+main(argc, argv)
+int argc;
+char **argv;
+{
+    int arg, i;
+    char *mfile = NULL;
+    DATE adate();
+
+    initrootdates();
+
+    for (arg = 1; arg < argc; ++arg)
+    if (*argv[arg] == '-') 
+        switch (tolower(argv[arg][1])) {
+            case 'f':
+                if (++arg >= argc) {
+                    fputs("-f needs filename argument.\n", stderr);
+                    return;
+                }
+                mfile = argv[arg];
+                break;
+           case 'a':
+               obsolete = 1;
+               break;
+           case 'n':
+               noscript = 1;
+               break;
+           case 'd':
+               debug = 1;
+               break;
+           case 'i':
+               ignore_errors = 1;
+               break;
+           case 'k':
+               prop_errors = 1;
+               break;
+           default:
+               fputs("Unknown switch: ", stderr);
+	       fputc(argv[arg][1], stderr);
+	       fputc('\n', stderr);
+               break;
+        } 
+    else if (modcount < MAXMODS)
+         modnames[modcount++] = argv[arg];
+    else {
+        fputs("Too many module names.\n", stderr);
+        return;
+    }
+
+     if (mfile != NULL)  {
+         if (fmake(mfile) == -1) {
+             fputs("Cannot open makefile '", stderr);
+	     fputs(mfile, stderr);
+	     fputs("'.\n", stderr);
+	 }
+     } else {
+         for (i = 0; *mfiles[i]; ++i)
+             if (fmake(mfiles[i]) != -1) 
+	         break;
+         if (!*mfiles[i])
+             fputs("Cannot open makefile.\n", stderr);
+    }
+    if (debug) 
+        prtree();
+}
+
+
+/*
+ * Construct dependency tree from the makefile 'fn'.
+ * Figure out what has to be recompiled, and write a script file to do that.
+ */
+fmake(fn)
+char *fn;
+{
+    FILE *fp;
+
+    if ((fp = fopen(fn, "r")) == (FILE *) NULL) 
+        return -1;
+
+    fparse(fp);
+    determ();
+    fclose(fp);
+    return 0;
+}
+
+
+/*
+ * Parse the input file, defining macros and building the dependency tree.
+ */
+fparse(fp)
+FILE *fp;
+{
+    char ibuf[STRSIZ], ebuf[STRSIZ];
+    char *strp, *tok1, *tok2, *s, *fgets();
+    FILENODE *lastf = (FILENODE *) NULL, *addfile();
+
+    for (;;)
+    {
+        if (fgets(ibuf, STRSIZ, fp) == NULL) break;
+        mexpand(ibuf, ebuf, STRSIZ, MACCHAR);
+        escape(ebuf, COMCHAR);
+        s = ebuf + strlen(ebuf) - 1;       /* clobber last newline in string */
+        if (s >= ebuf && *s == '\n') 
+	    *s = '\0';
+        if (*ebuf == '\t') {
+            addmeth(lastf, ebuf+1);
+            continue;
+        }
+        strp = ebuf;
+        if ((tok1 = token(&strp)) == NULL) 
+	    continue;
+        if ((tok2 = token(&strp)) != NULL)
+            if (!strcmp(tok2, DEFMAC)) {
+                if (*strp) 
+		    defmac(tok1, strp);
+                else 
+		    if (undefmac(tok1) < 0) {
+             		fputs("Can't undefine macro '", stderr);
+			fputs(tok1, stderr);
+	   	        fputs("'.\n", stderr);
+		    }
+                continue;
+            }
+            else if (!strcmp(tok2, DEPEND)) {
+                addmeth(lastf, gmacro(AFTER));	/* terminate last method */
+
+                lastf = filenode(tok1);		/* init lastf */
+                if (firstf == (FILENODE *)NULL) 
+		    firstf = lastf;
+                lastf->fmake = NULL;
+                addmeth(lastf, gmacro(BEFORE));
+                lastf->fflag |= ROOTP;
+
+                addmanydepend(strp, lastf);
+                continue;
+            }
+#ifndef FUNNYLIBS
+            else if (!strcmp(tok2, ISLIB))
+            {
+                addmeth(lastf, gmacro(AFTER));
+
+                lastf = filenode(tok1);
+                if (firstf == (FILENODE *) NULL) firstf = lastf;
+                lastf->fmake = NULL;
+                addmeth(lastf, gmacro(BEFORE));
+                lastf->fflag |= LIBRARY;
+                lastf->fflag |= ROOTP;
+
+                addtolibrary(lastf);
+/* no archives here -- archives and libraries are mutually exclusive */
+                while((tok1 = token(&strp)) != NULL)
+                    (void) addfile(lastf, tok1);
+                continue;
+            }
+#endif
+            else addmanydepend(strp, lastf);
+    }
+    addmeth(lastf, gmacro(AFTER));
+}
+
+/*
+ * scan tokens from strbuf and search for libraries and archives.
+ * libraries look like foo [ bar baz mumble ]
+ * archives look like foo ( bar baz mumble )
+ * in either case, bar, baz, and mumble have parents of foo.
+ * foo is added to the parentlist, if not already on the list.
+ * bar, baz, and mumble are added to the dependency list of depend.
+ * the command *cannot* be split across newlines without causing errors.
+ * if you don't like that, well, life's a bitch and then you die.
+ */
+addmanydepend(strbuf, depend)
+char *strbuf;
+FILENODE *depend;
+{
+    char *tok1, *tok2;
+    FILENODE *parent, *child, *addfile(), *addparent();
+    
+    tok1 = token(&strbuf);
+    if (tok1 == NULL)
+        return;
+    tok2 = token(&strbuf);
+    while (tok2 != NULL) {
+#ifdef FUNNYLIBS
+        if (!strcmp(tok2, BGNLIB)) {
+             parent = addparent(tok1);	/* add tok1 to parent list */
+    	     for (tok1 = token(&strbuf); /* skip over token in tok2 */
+                  tok1 != NULL && strcmp(tok1, ENDLIB); /* go eol or end */
+                  tok1 = token(&strbuf)) {	/* get next token */
+                 if (tok1 == NULL) {
+                     fputs("MAKE: Error in library defn.\n", stderr);
+                     exit(2);
+                 };
+                 child = addfile(depend, tok1);
+                 child -> fflag = LIBRARY;
+                 child -> parent = parent;
+             }					/* for */
+	     tok1 = token(&strbuf);
+	     tok2 = token(&strbuf);
+	     continue;	/* the while */
+	 }					/* if islib */
+#endif
+        if (!strcmp(tok2, BGNARC)) {
+             parent = addparent(tok1);	/* add tok1 to parent list */
+    	     for (tok1 = token(&strbuf); /* skip over token in tok2 */
+                  tok1 != NULL && strcmp(tok1, ENDARC); /* go eol or end */
+                  tok1 = token(&strbuf)) {	/* get next token */
+                 if (tok1 == NULL) {
+                     fputs("MAKE: Error in archive defn.\n", stderr);
+                     exit(2);
+                 };
+                 child = addfile(depend, tok1);
+                 child -> fflag = ARCHIVE;
+                 child -> parent = parent;
+             }					/* for */
+	     tok1 = token(&strbuf);		/* get current token */
+	     tok2 = token(&strbuf);		/* get lookahead token */
+	     continue;	/* the while */
+	 }					/* if isarc */
+	 else {				/* nothing special -- */
+	     (void) addfile(depend, tok1);	/* add dependency */
+	     tok1 = tok2;		/* shift token */
+	     tok2 = token(&strbuf);
+	}
+    }						/* while */
+    if (tok2 == NULL && tok1 != NULL)	/* last token = not special */
+        (void) addfile(depend, tok1);
+}
+
+/*
+ * Determine sequence of recompiles from the creation dates.
+ * If have anything to recompile, then create a script file full of commands.
+ */
+determ()
+{
+    FILENODE *f;
+    int i;
+    char *m;
+
+    if (firstf ==(FILENODE *) NULL)            /* empty tree */
+    {
+        puts("No changes.");
+        return;
+    }
+
+    if (modcount == 0) {
+    examine(firstf, endoftime);
+    }
+    else {
+        for (i = 0; i < modcount; ++i) {
+            if ((f = gfile(modnames[i])) == (FILENODE *) NULL) {
+           	fputs("Don't know how to make ", stderr);
+		fputs(modnames[i], stderr);
+	   	fputs(".\n", stderr);
+                continue;
+            }
+            if ((f->fflag & ROOTP) == 0) {
+             	fputc('\'', stderr);
+		fputs(f->fname, stderr);
+	   	fputs("' is not a root!\n", stderr);
+                continue;
+            }
+            examine(f, endoftime);
+        }
+    }
+    if (execstat) {
+        if ((m = gmacro(DEINIT)) != NULL) {
+            execute (m, noscript);
+        }
+	cleanuparchives();
+    } else puts("No changes.");
+}
+
+
+/*
+ * Examine filenode 'fnd' and see if it has to be recompiled.
+ * 'date' is the last-touched date of the node's father
+ * (or 'endoftime' if its a root file.)
+ * Root files with NO dependencies are assumed not to be up to date.
+ */
+examine(fnd, date)
+FILENODE *fnd;
+DATE date;
+{
+    int rebuildp = 0, rval, errcode = 0;
+    NODE *n;
+
+#if DEBUG
+    printf("Examining %s\n", fnd->fname);
+#endif
+    getdate(fnd);
+    if (fnd->fnode == (NODE *) NULL && fnd->fflag & ROOTP)
+        rebuildp = 1;        /* always rebuild root with no dependents */
+    else             /* see if dependents need to be recompiled */
+    for (n = fnd->fnode; n != (NODE *) NULL; n = n->nnext) {
+        if ((rval = examine(n->nfile, fnd->fdate)) != 0) {
+	    if (rval == ERROR) {
+	        errcode = ERROR;	/* if error occurred, propagate up */
+		fnd->fflag |= ERROR;
+		fputs("Couldn't compile ", stderr);
+		fputs(fnd->fname, stderr);
+		fputs(" because of errors.\n", stderr);
+	    }
+            rebuildp = 1;
+        }
+    }
+
+/* if ancestor recompiled or root, recompile, but not if error in ancestor */
+    if (rebuildp && (fnd->fflag & ERROR) == 0) {
+        recomp(fnd);
+	if (fnd->fflag & ERROR) {
+#if DEBUG
+printf("Golly.  I got an error compiling %s.\n", fnd->fname);
+#endif
+	    return (ERROR);
+        }
+    }
+
+    if (obsolete || laterdt(fnd->fdate, date) >= 0) {
+        rebuildp = 1;
+    }
+    if (errcode)
+        return errcode;
+    else 
+        return rebuildp;
+}
+
+/*
+ * Make sure a filenode gets recompiled.
+ */
+recomp(f)
+FILENODE *f;
+{
+    char *m;
+
+    if (!execstat) {
+	execstat = 1;
+        if ((m = gmacro(INIT)) != NULL) {
+            execute(m, noscript);
+        }
+    }
+
+    if (f->fflag & REBUILT) return;
+    if (!noscript) {			/* don't extract if printing steps */
+        yankdependents(f);
+    };
+    if (f->fmake != NULL) {
+        if (execute(f->fmake, noscript) != 0) {
+	    if (!ignore_errors && !prop_errors)
+	        exit(2);
+	    else if (prop_errors) 
+	        f->fflag |= ERROR;
+	}
+    }
+    f->fflag |= REBUILT;
+}
+
+yankdependents(fnd)
+FILENODE *fnd;
+{
+    NODE *n;
+
+    for (n = fnd->fnode; n != (NODE *) NULL; n = n->nnext) {
+#ifdef YANKDESCENDANTS
+        yankdependents(n->nfile);
+#endif
+
+#if DEBUG
+printf("yanking %s, flags are %d\n", n->nfile->fname, n->nfile->fflag);
+#endif
+        if ((n->nfile->fflag & ARCHIVE) && ((n->nfile->fflag & EXTRACT) == 0)){
+                    /* if archived and not extracted */
+            fputs("Extracting ", stdout);
+            puts(n->nfile->fname);
+            if (!noscript) {
+                if (extract(n->nfile) == FAILURE) {
+                    fputs("Extract failed -- I think I'll die now.\n", stderr);
+                    exit(1);
+                }
+            };
+            n->nfile->fflag |= EXTRACT;
+        }
+    }
+}
+
+/*
+ * Complain about being out of memory, and then die.
+ */
+allerr() {
+    fputs("Can't alloc -- no space left (I give up!)\n", stderr);
+    exit(1);
+}
+//E*O*F make.c//
+
+echo x - make.h
+cat > "make.h" << '//E*O*F make.h//'
+/* #define	VAXVMS	1 */		/* uncomment for VAX/VMS */
+#define	MSDOS	1			/* uncomment for MSDOS */
+
+#ifdef VAXVMS
+#define ESCCHAR	`\\`		/* ok to use backslash on VMS */
+#endif
+
+#ifdef MSDOS
+#define	ESCCHAR	'`'		/* since pathname char is backslash (yech) */
+#endif
+
+#define	MACCHAR '$'		/* macro-definition char */
+#define	COMCHAR	'#'		/* comment char */
+#define	DEFMAC	"="		/* macro-definition token */
+#define	DEPEND	":"		/* dependency-definition token */
+#ifdef FUNNYLIBS
+#define BGNLIB  "["		/* start library token */
+#define ENDLIB  "]"		/* end library token */
+#else
+#define ISLIB   "|"		/* Library definition token */
+#endif
+#define BGNARC  "("		/* start archive token */
+#define ENDARC  ")"		/* end archive token */
+
+#define	DEBUG	0
+#define	STRSIZ	1024
+#define	MAXMODS	50
+
+#if DEBUG
+#define NOREALEXECUTE		/* if set, don't really execute commands */
+#define NOREALEXTRACT		/* if set, don't really extract files */
+#define NOREALDELETE		/* if set, don't really delete files */
+#endif
+
+#define SUCCEED 0
+#define FAILURE -1
+
+/* file attributes */
+#define	REBUILT	0x01		/* file has been reconstructed */
+#define	ROOTP	0x02		/* file was named on left side of DEPEND */
+#define LIBRARY 0x04		/* file is library; inherit parent's time */
+#define ARCHIVE 0x08		/* file is archive; search through parent */
+				/* archive directory for time */
+#define EXTRACT 0x10		/* extract from archive when rebuilding */
+#define ERROR   0x20		/* error occurred while rebuilding */
+
+#ifdef VAXVMS
+struct date_str {
+	unsigned ds_low, ds_high;
+};
+
+typedef struct date_str *DATE;
+#endif
+#ifdef MSDOS
+#ifndef FA_ARCH
+#include <bdos.h>
+#endif
+typedef struct ftime *DATE;
+#endif
+
+struct node {
+	struct filenode *nfile;	/* this node's file */
+	struct node *nnext;	/* the next node */
+};
+typedef struct node NODE;
+
+
+struct filenode {
+	char *fname;		/* the filename */
+	char *fmake;		/* remake string for file */
+	DATE fdate;		/* 32 bit last-modification date */
+	NODE *fnode;		/* files this file depends on */
+	char fflag;		/* magic flag bits */
+	struct filenode *parent;/* pointer to parent for archives, libraries */
+	struct filenode *fnext;	/* the next file */
+};
+typedef struct filenode FILENODE;
+
+
+struct macro {
+	char *mname;		/* the macro's name */
+	char *mvalue;		/* the macro's definition */
+	struct macro *mnext;	/* the next macro */
+};
+typedef struct macro MACRO;
+
+
+extern MACRO *mroot;
+extern FILENODE *froot;
+extern DATE bigbang;		/* Far, far in the past */
+extern DATE endoftime;		/* Far, far in the future */
+char *gmacro();
+FILENODE *filenode(), *gfile();
+char *token();
+//E*O*F make.h//
+
+echo x - osdate.c
+cat > "osdate.c" << '//E*O*F osdate.c//'
+/*
+; OSDATE - return file's creation-date (called from Lattice), or -1
+;	   if can't find the file.
+; Synopsis:
+;		int osdate(filename, time1, time2)
+;			char *filename;
+;			int *time1, *time2;
+;
+*/
+
+#include "lar.h"
+#undef ERROR
+#define FILERR -1
+#include "make.h"
+
+DATE osdate(filename, success)
+char *filename;
+int *success;
+{
+	DATE adate(), newdate;
+	register int handle;
+	if ((handle = _open(filename, O_RDONLY)) == FILERR) {
+		*success = FAILURE;
+		return (DATE) NULL;
+	}
+ 	newdate = adate();
+	getftime(handle, newdate);
+	_close(handle);
+	*success = SUCCEED;
+	return newdate;
+}
+
+struct ludir ldir[MAXFILES];
+int nslots;
+char *malloc(), *getname();
+
+DATE getarchdate(archname, filename)
+char *archname, *filename;
+{
+    fildesc lfd;
+    register int    i;
+    register struct ludir *lptr;
+    union timing {
+    	DATE ftimeptr;
+	long *longptr;
+	} unionptr;
+    DATE adate(), newdate;
+    char   *realname;
+
+#if DEBUG
+printf("Inside getarchdate; looking for %s inside %s.\n", filename, archname);
+#endif
+    if ((lfd = _open (archname, O_RDONLY)) == FILERR)
+	cant (archname);
+    getdir (lfd);
+
+    for (i = 1, lptr = ldir+1; i < nslots; i++, lptr++) {
+	if(lptr->l_stat != ACTIVE)
+		continue;
+	realname = getname (lptr->l_name, lptr->l_ext);
+	if (strcmp (realname, filename) != 0)
+	    continue;
+#if DEBUG
+printf("Found file.. name %s time %lx\n", realname, lwtol(lptr->l_datetime));
+#endif
+	newdate = adate();
+	unionptr.ftimeptr = newdate;
+	*(unionptr.longptr) = lwtol(lptr->l_datetime);
+	break;
+    }
+    VOID _close (lfd);
+#if DEBUG
+printf("About to return; date is ");
+printdate(newdate);
+#endif
+    return newdate;
+}
+
+copyfile(archname, filename)
+char   *archname, *filename;
+{
+    fildesc lfd, ofd;
+    register int    i;
+    register struct ludir *lptr;
+    union timer timeunion;
+    extern int errno;
+    char   *realname, outname[64], *tmpptr, *strrchr();
+
+#if DEBUG
+printf("Inside copyfile; looking for %s inside %s.\n", filename, archname);
+#endif
+    if ((lfd = _open (archname, O_RDWR)) == FILERR)
+	cant (archname);
+
+    getdir (lfd);
+
+    for (i = 1, lptr = &ldir[1]; i < nslots; i++, lptr++) {
+	if(lptr->l_stat != ACTIVE)
+		continue;
+	realname = getname (lptr->l_name, lptr->l_ext);
+	if (strcmp (realname, filename) != 0)
+	    continue;
+/* generate real filename */
+	tmpptr = strrchr(archname, '/');	/* should be path chr */
+	if (tmpptr != NULL)  {
+            i = (int) (tmpptr - archname);
+	    i++;
+#if DEBUG
+printf("tmpptr was not NULL; i is %d.\n",i);
+#endif
+            strncpy(outname, archname, i);
+	} 
+	else {
+#if DEBUG
+printf("tmpptr was NULL.\n");
+#endif
+	    i = 0;
+	    *outname = '\0';
+	}
+	strcat(outname, realname);
+#if DEBUG
+printf("Got it; about to extract %s.\n", outname);
+#endif
+	ofd = _creat(outname, 0);
+	if (ofd == FILERR) {
+	    fputs(outname, stderr);
+	    fputs ("  - can't create\n", stderr);
+	    return;
+	}
+	else {
+	    VOID lseek (lfd, (long) lwtol (lptr->l_off), 0);
+	    acopy (lfd, ofd, lwtol (lptr->l_len));
+	    timeunion.realtime = lwtol(lptr->l_datetime);
+	    if (ofd != fileno(stdout)) {
+                VOID setftime(ofd, &(timeunion.ftimep));
+		VOID _close (ofd);
+	    }
+	    break;			/* exit after copy */
+	}
+    }
+    VOID _close (lfd);
+}
+
+static acopy (fdi, fdo, nbytes)		/* copy nbytes from fdi to fdo */
+fildesc fdi, fdo;
+long nbytes;
+{
+    register int btr, retval;
+    char blockbuf[BLOCK];
+    
+    for (btr = (nbytes > BLOCK) ? BLOCK : (int) nbytes; btr > 0; 
+    	 nbytes -= BLOCK, btr = (nbytes > BLOCK) ? BLOCK : (int) nbytes)  {
+        if ((retval = _read(fdi, blockbuf, btr)) != btr) {
+	    if( retval == 0 ) {
+		error("Premature EOF\n");
+	     }
+	     if( retval == FILERR)
+	        error ("Can't read");
+	}
+	if ((retval = _write(fdo, blockbuf, btr)) != btr) {
+	     if( retval == FILERR )
+	        error ("Write Error");
+	}
+    }
+}
+
+//E*O*F osdate.c//
+
+echo x - parsedir.c
+cat > "parsedir.c" << '//E*O*F parsedir.c//'
+#include <stdio.h>
+#include "make.h"
+#ifdef VAXVMS
+#include <rms.h>
+#endif
+
+extern DATE bigbang, endoftime;
+
+/*
+ * Get a file's creation date.
+ */
+int getdate(f)
+FILENODE *f;
+{
+	/* return if already got date or if filedate succeeds. */
+	if (f->fdate != (DATE) NULL || filedate(f) == SUCCEED) {
+		return;
+	}
+ 	if (isonlibrary(f) == SUCCEED)	/* isonlibrary will set time */
+		return;
+ 	if (isanarchive(f) == SUCCEED)	/* isanarchive will set time */
+		return;
+	else if ((f->fflag & ROOTP) == 0)
+	{
+		fputs("Can't get date for file '", stderr);
+		fputs(f->fname, stderr);
+		fputc('\n', stderr);
+		f->fdate = endoftime;
+	} 
+	else f->fdate = bigbang;
+	return;
+}
+
+
+#ifdef VAXVMS
+/*
+ * filedate - return file's creation date (VAX/VMS only.)
+ * Returns -1 if file cannot be found, 0 if succesful.
+ */
+filedate(fnd)
+FILENODE *fnd;
+{
+	unsigned *datetime;
+	DATE adate();
+	struct FAB *fptr;
+	struct XABDAT *dptr;
+
+	fptr = malloc(sizeof(struct FAB));	/* allocate FAB and XABDAT */
+	dptr = malloc(sizeof(struct XABDAT));
+	if (fptr == NULL || dptr == NULL) allerr();
+	*fptr = cc$rms_fab;			/* initialize FAB and XABDAT */
+	*dptr = cc$rms_xabdat;
+	fptr->fab$l_xab = (char *) dptr;	/* FAB -> XABDAT */
+
+	fptr->fab$l_fna = fnd->fname;		/* setup filename */
+	fptr->fab$b_fns = strlen(fnd->fname);
+
+	if (sys$open(fptr) != RMS$_NORMAL ||	/* open the file */
+	   sys$display(fptr) != RMS$_NORMAL)	/* get XABDAT info */
+		return -1;
+
+	datetime = &(dptr->xab$q_cdt);		/* record 64-bit date */
+	fnd->fdate = adate(datetime[0], datetime[1]);
+
+	sys$close(fptr);			/* close the file */
+
+	free(dptr);				/* clean up and return */
+	free(fptr);
+	return 0;
+}
+
+/*
+ * laterdt - compare two dates.
+ * Return -1, 0 or 1 if date1 < date2, date1 == date2, or date1 > date2
+ */
+laterdt(date1, date2)
+DATE date1, date2;
+{
+	if (date1->ds_high > date2->ds_high ||
+	   (date1->ds_high >= date2->ds_high &&
+	    date1->ds_low > date2->ds_low)) return 1;
+	else if (date1->ds_high == date2->ds_high &&
+	   date1->ds_low == date2->ds_low) return 0;
+	else return -1;
+}
+
+
+/*
+ * adate - allocate a date with the given time
+ */
+DATE adate(time1, time2)
+unsigned time1, time2;
+{
+	DATE d;
+
+	if ((d = (DATE)malloc(sizeof(struct date_str))) == NULL) allerr();
+	d->ds_low = time1;
+	d->ds_high = time2;
+	return d;
+
+}
+
+initrootdates()
+{
+	bigbang = adate(0, 0);		/* init root dates */
+	endoftime = adate(~0, ~0);
+}
+
+printdate(fdate)
+DATE fdate;
+{
+	printf("( %u, %u )\n",
+		(f->fdate != NULL) ? (f->fdate)->ds_high : 0,
+		(f->fdate != NULL) ? (f->fdate)->ds_low : 0);
+}
+#endif
+
+
+#ifdef MSDOS
+/*
+ * filedate - return file's creation date (MSDOS only.)
+ * Returns -1 if file cannot be found, 0 if successful
+ */
+filedate(fnd)
+FILENODE *fnd;
+{
+	DATE osdate(), newdate;
+	int success;
+
+	success = FAILURE;
+	newdate = osdate(fnd->fname, &success);
+	if (success == FAILURE) return FAILURE;
+	fnd->fdate = newdate;
+        fnd->fflag |= EXTRACT;		/* don't extract this file again */
+	return SUCCEED;
+}
+
+/*
+ * laterdt - compare two dates.
+ * Return -1, 0 or 1 if date1 < date2, date1 == date2, or date1 > date2
+ */
+laterdt(date1, date2)
+DATE date1, date2;
+{
+	if (date1->ft_year > date2->ft_year) return 1;
+
+	if (date1->ft_year < date2->ft_year) return -1;
+/* years are equal */
+	if (date1->ft_month > date2->ft_month) return 1;
+
+	if (date1->ft_month < date2->ft_month) return -1;
+/* months are equal */
+	if (date1->ft_day > date2->ft_day) return 1;
+
+	if (date1->ft_day < date2->ft_day) return -1;
+/* days are equal */
+	if (date1->ft_hour > date2->ft_hour) return 1;
+
+	if (date1->ft_hour < date2->ft_hour) return -1;
+/* hours are equal */
+	if (date1->ft_min > date2->ft_min) return 1;
+
+	if (date1->ft_min < date2->ft_min) return -1;
+/* minutes are equal */
+	if (date1->ft_tsec > date2->ft_tsec) return 1;
+
+	if (date1->ft_tsec < date2->ft_tsec) return -1;
+/* everything is equal */
+	return 0;
+}
+
+/*
+ * adate - allocate a date struct to be filled out later.
+ */
+DATE adate()
+{
+	DATE d;
+
+	if ((d = (DATE) calloc(1, sizeof(struct ftime))) == (DATE) NULL) allerr();
+	return d;
+}
+
+initrootdates()		/* init root dates */
+{
+	bigbang = adate();
+	bigbang->ft_tsec = 0;
+	bigbang->ft_min = 0;
+	bigbang->ft_hour = 0;
+	bigbang->ft_day = 1;
+	bigbang->ft_month = 1;
+	bigbang->ft_year = 0;
+	endoftime = adate();
+	endoftime->ft_tsec = 29;
+	endoftime->ft_min = 59;
+	endoftime->ft_hour = 23;
+	endoftime->ft_day = 31;
+	endoftime->ft_month = 11;
+	endoftime->ft_year = 127;
+}
+
+printdate(fdate)
+DATE fdate;
+{
+	char buf[10];
+	
+	fputs("( ", stdout);
+	itoa(fdate->ft_hour, buf);
+	fputs(buf, stdout);
+	fputc(':', stdout);
+	itoa(fdate->ft_min, buf);
+	fputs(buf, stdout);
+	fputc(':', stdout);
+	itoa(fdate->ft_tsec, buf);
+	fputs(buf, stdout);
+
+	fputs(", ", stdout);
+	itoa(fdate->ft_month, buf);
+	fputs(buf, stdout);
+	fputc('-', stdout);
+	itoa(fdate->ft_day, buf);
+	fputs(buf, stdout);
+	fputc('-', stdout);
+	itoa(fdate->ft_year + 80, buf);
+	fputs(buf, stdout);
+	puts(" )");
+}
+#endif
+//E*O*F parsedir.c//
+
+echo x - token.c
+cat > "token.c" << '//E*O*F token.c//'
+#include <stdio.h>
+#include <ctype.h>
+#include "make.h"
+
+/*
+ * Get next token from the string.  Return a pointer to it, or NULL.
+ * Adjust pointer to point to next part of string.
+ * The string is modified.
+ * A token consists of any number of non-white characters.
+ */
+char *token(strpp)
+char **strpp;
+{
+	char *s, *beg, *stripwh();
+
+	(void) stripwh(strpp);
+	if(!**strpp) return NULL;
+
+	beg = s = *strpp;
+	while(*s && !isspace(*s)) ++s;
+	if(*s) *s++ = '\0';
+	*strpp = s;
+	return beg;
+}
+
+
+/*
+ * Parse character escape-sequences in a line of text.
+ *	<EscChar><EscChar> = <EscChar>
+ *	<EscChar>n = newline, and so on
+ *	<EscChar><char> = <char>
+ * The string is truncated at the first non-escaped occurance of 'comchar'.
+ */
+escape(str, comchar)
+char *str, comchar;
+{
+	char *d, c;
+
+	for(d = str; *str && *str != comchar; ++str)
+	    if(*str == ESCCHAR && *(str + 1)) switch((c = *++str))
+		{
+		   case ESCCHAR:
+			*d++ = ESCCHAR;
+			break;
+
+		   case 'n':
+			*d++ = '\n';
+			break;
+
+		   case 'r':
+			*d++ = '\r';
+			break;
+
+		   case 't':
+			*d++ = '\t';
+			break;
+
+		   case 'b':
+			*d++ = '\b';
+			break;
+
+		   case 'f':
+			*d++ = '\f';
+			break;
+
+		   default:
+			*d++ = c;
+			break;
+		} else *d++ = *str;
+
+	*d++ = 0;
+}
+
+static 
+char *stripwh(strpp)
+char **strpp;
+{
+	char *s;
+
+	s = *strpp;
+	while(isspace(*s)) ++s;
+	return (*strpp = s);
+}
+//E*O*F token.c//
+
+exit 0
+
+

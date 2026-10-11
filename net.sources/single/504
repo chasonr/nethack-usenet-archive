@@ -1,0 +1,619 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,756fae3404b3b45c,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-08-14 20:58:54 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site utcsstat.UUCP
+Path: utzoo!utcsrgv!utcsstat!ian
+From: ian@utcsstat.UUCP
+Newsgroups: net.sources
+Subject: TMODEM: UNIX-compatible Christensen MODEM
+Message-ID: <872@utcsstat.UUCP>
+Date: Sun, 14-Aug-83 23:58:54 EDT
+Article-I.D.: utcsstat.872
+Posted: Sun Aug 14 23:58:54 1983
+Date-Received: Mon, 15-Aug-83 00:29:15 EDT
+Organization: U. of Toronto, Canada
+Lines: 599
+
+# /bin/sh
+echo x - tmodem.README
+cat > tmodem.README << "//SYSIN DD SYSOUT=BD"
+TMODEM -- a UNIX-style implementation of Christensen's MODEM
+
+The recent comment on USENET about huge assembly-language MODEM
+programs prompts this posting:
+
+This MODEM program was written by Andrew Scott Beals at MIT.
+I liked it, so I'm posting it to the net (with Beals' permission).
+Called TMODEM, it is in the UNIX/software tools style of programming, that is,
+it doesn't log on to remote systems, have 365 different options,
+or scratch your nose for you. It has just two modes (send and receive)
+and concentrates on sending and receiving files. Normal usage would
+be to sign on from a CP/M system (using the TO option of CP/M 
+MODEM, and login to UNIX, then invoke TMODEM to transmit
+or receive a file. Note that `transmit' and `receive' are locally
+defined, so the CP/M side should be instructed to transmit when the TMODEM
+side is in receive, or vice versa.
+
+There are two source files, the one distributed by Beals and one I cleaned up
+a little. They both work; mine has one bug fix (clearing to the
+end of the buffer at end of file on receive). Use whichever you like,
+for whatever you like. This software is not to be sold; it may be
+freely distributed provided the author is credited.
+
+program written by Andrew Scott Beals (SJOBRG.ANDY%MIT-OZ@MIT-MC)
+distributed to USENET by Ian Darwin (utcsstat!ian).
+//SYSIN DD SYSOUT=BD
+echo x - tmodem.1
+cat > tmodem.1 << "//SYSIN DD SYSOUT=BD"
+.TH TMODEM 1
+.SH NAME
+tmodem \- Christensen modem protocol (MODEM7, MODEM9, XMODEM, etc) under UNIX.
+.SH SYNOPSIS
+.I tmodem
+[
+.B \-s
+] / [
+.B \-t
+] file ...
+.SH DESCRIPTION
+.I Tmodem
+implements Ward Christensen's MODEM protocol.
+This protocol is normally associated with CP/M systems,
+and is provided under UNIX to provide for bidirectional
+file transfer between CP/M and UNIX.
+.PP
+It is assumed that the user knows how to use MODEM on his/her
+CP/M system.
+For use of
+.I tmodem
+you must have a version of the Christensen MODEM program
+on your CP/M system.
+To transfer a file, you must have one program in
+.I send
+mode and one in 
+.I receive 
+mode.
+You use `s' for MODEM and `-s' for 
+.I tmodem
+to send a file;
+`r' and `-r' to receive a file.
+.SH EXAMPLE
+This example shows use of MODEM and 
+.I tmodem
+to load a file from the CP/M micro to the UNIX system.
+.nf
+A>modem to.300		; dial in to UNIX, login
+login: joeuser		; in terminal mode
+password: censored
+Last login Wed Aug  3 11:30:43 EDT 1983 on tty513
+You have mail.
+There is news.
+$ tmodem -r sample.data	; start UNIX copy of tmodem to receive file
+^E			; switch CP/M MODEM to command mode
+COMMAND? so.300 sample.dat ; start cp/m copy of MODEM to send file
+SENDING # 01		; message appears for each sector.
+----			; and so on.
+COMMAND? to.300		; reconnect to UNIX
+<nl>			; send null line
+Transmission complete	; final message from tmodem.
+$			; can now log off UNIX or do other work.
+.SH SEE ALSO
+cu(1), uucp(1), stty(1), cat(1), tounix(1), tocpm(1).
+.SH AUTHOR
+Andrew Scott Beals, M.I.T.
+.sp
+This document mostly by Ian Darwin, Toronto.
+.SH BUGS
+CP/M is a trademark of Digital Research, Inc.
+.PP
+I should write in more intelligent time-out, but I don't think it's
+really necessary.
+//SYSIN DD SYSOUT=BD
+echo x - tmodem.c
+cat > tmodem.c << "//SYSIN DD SYSOUT=BD"
+/*
+ * a version of Ward Christensen's MODEM program for
+ * UNIX v7, 4.1bsd
+ *
+ * by Andrew Scott Beals
+ * sjobrg.andy%mit-oz@mit-mc
+ * last update->4 june 1982
+ * code reorganized, cleaned up - ian darwin, utcsstat!ian, 83-05-02
+ *
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+#include <signal.h>
+#include <sgtty.h>
+
+#define uchar	unsigned char
+
+#define CPMEOF	26		/* control/z */
+#define OVERWRITE 1		/* define for normal overwrite */
+#define MAXERRORS 10		/* max number of times to retry one block */
+#define OVRWRITIM 10		/* time to pause (none if OVERWRITE defined) */
+#define SECSIZE	128		/* cpm sector, transmission block */
+#define SENTIMOUT 80		/* timeout time in send */
+#define	SLEEP	30		/* timeout time in recv */
+
+/* Protocol characters used */
+
+#define	SOH	1	/* Start Of Header */
+#define	EOT	4	/* End Of Transmission */
+#define	ACK	6	/* ACKnowlege */
+#define	NAK	0x15	/* Negative AcKnowlege */
+
+short ttyhold;
+struct sgttyb ttymode;
+
+main(argc, argv)
+int argc;
+char **argv;
+{
+
+	if (argc != 3) 
+		usage();
+	gtty(0, &ttymode);
+	ttyhold = ttymode.sg_flags;
+	ttymode.sg_flags |= RAW;
+	ttymode.sg_flags &= ~ECHO;
+
+	if (argv[1][0] != '-')
+		usage();
+	switch (argv[1][1]){
+	case 'r': 
+		rec(argv[2]); 
+		break;
+	case 's': 
+		sen(argv[2]); 
+		break;
+	default: 
+		usage();
+	}
+	die(0);
+}
+
+/********** send a file to the remote **********/
+sen(tfile)
+char	*tfile;
+{
+
+	register uchar checksum, index, blocknumber, errorcount;
+	uchar sector[SECSIZE];
+	int foo, nbytes, timeout();
+
+	stty(0, &ttymode);
+	if ((foo = open(tfile, 0)) == -1) {
+		fprintf(stderr, "can't open %s for send!\r\n", tfile);
+		die(1);
+	}
+	fprintf(stderr, "file open, ready to send\r\n");
+	fflush(stderr);
+	fflush(stdout);
+	errorcount = 0;
+	blocknumber = 1;
+	signal(SIGALRM, timeout);
+	alarm(SENTIMOUT);
+
+	while ((getchar() != NAK) && (errorcount < MAXERRORS))
+		++errorcount;
+	alarm(0);
+#ifdef DEBUG
+	fprintf(stderr, "transmission beginning\r\n");
+	fflush(stderr);
+#endif
+	if (errorcount == MAXERRORS) {
+		error();
+	}
+	while (nbytes=read(foo, sector, sizeof sector)) {
+		if (nbytes<SECSIZE)
+			sector[nbytes]=CPMEOF;
+		errorcount = 0;
+		while (errorcount < MAXERRORS) {
+#ifdef DEBUG
+			fprintf(stderr, "{%d} ", blocknumber);
+			fflush(stderr);
+#endif
+			putchar(SOH);	/* here is our header */
+			putchar(blocknumber);	/* the block number */
+			putchar(~blocknumber);	/* & its complement */
+			checksum = 0;
+			for (index = 0; index < SECSIZE; index++) {
+				putchar(sector[index]);
+				checksum += sector[index];
+			}
+			putchar(checksum);	/* tell our checksum */
+			fflush(stdout);
+			if (getchar() != ACK)
+				++errorcount;
+			else
+				break;
+		}
+		if (errorcount == MAXERRORS)
+			error();
+		++blocknumber;
+	}
+	index = 1;
+	while (index) {
+		putchar(EOT);
+		fflush(stdout);
+		index = getchar() == ACK;
+	}
+	fprintf(stderr, "Transmission complete.\r\n");
+	fflush(stderr);
+}
+
+/********** receive a file **********/
+rec(tfile)
+char	*tfile;
+{
+	register uchar checksum, index, blocknumber, errorcount, character;
+	uchar sector[SECSIZE];
+	int foo;
+
+#ifndef OVERWRITE
+	if ((foo = open(tfile, 0)) != -1) {
+		close(foo);
+		fprintf(stderr, "%s exists; you have %d seconds to abort\r\n",
+		OVRWRITIM,tfile);
+		fflush(stderr);
+		sleep(OVRWRITIM);
+		fprintf(stderr, "Too late!\r\n");
+		fflush(stderr);
+	}
+#endif
+
+	stty(0, &ttymode);
+
+	if ((foo = creat(tfile, 0666)) == -1) {
+		perror(tfile);
+		die(1);
+	}
+	printf("you have %d seconds...",SLEEP);
+	fflush(stdout);
+	sleep(SLEEP);	/* wait for the user to get his act together */
+#ifdef DEBUG
+	fprintf(stderr, "Starting...\r\n");
+	fflush(stderr);
+#endif
+	putchar(NAK);
+	fflush(stdout);
+	errorcount = 0;
+	blocknumber = 1;
+	while ((character = getchar()) != EOT) {
+		register uchar not_ch;
+		if (character != SOH) {
+#ifdef DEBUG
+			fprintf(stderr, "Not SOH\r\n");
+			fflush(stderr);
+#endif
+			if (++errorcount < MAXERRORS)
+				goto nakit;
+			else
+				error();
+		}
+		character = getchar();
+		not_ch = ~getchar();
+#ifdef DEBUG
+		fprintf(stderr, "[%d] ", character);
+		fflush(stderr);
+#endif
+		if (character != not_ch) {
+#ifdef DEBUG
+			fprintf(stderr, "Blockcounts not ~\r\n");
+			fflush(stderr);
+#endif
+			++errorcount;
+			goto nakit;
+		}
+		if (character != blocknumber) {
+#ifdef DEBUG
+			fprintf(stderr, "Wrong blocknumber\r\n");
+			fflush(stderr);
+#endif
+			++errorcount;
+			goto nakit;
+		}
+		checksum = 0;
+		for (index = 0; index < SECSIZE; index++) {
+			sector[index] = getchar();
+			checksum += sector[index];
+		}
+		if (checksum != getchar()) {
+#ifdef DEBUG
+			fprintf(stderr, "Bad checksum\r\n");
+			fflush(stderr);
+#endif
+			errorcount++;
+			goto nakit;
+		}
+		putchar(ACK);
+		fflush(stdout);
+		blocknumber++;
+		write(foo, sector, sizeof sector);
+		if (!errorcount)
+			continue;
+nakit:
+		putchar(NAK);
+		fflush(stdout);
+	}
+	close(foo);
+
+	putchar(ACK);	/* tell the other end we accepted his EOT 	*/
+	putchar(ACK);
+	putchar(ACK);
+	fflush(stdout);
+
+	fprintf(stderr, "Completed.\r\n");
+	fflush(stderr);
+}
+
+
+/* give message that we timed out, and then die */
+timeout()
+{
+	fprintf(stderr, "Timed out waiting for NAK from remote system\r\n");
+	die(1);
+}
+
+/* give user minimal usage message */
+usage()
+{
+	fprintf(stderr,"usage: modem option file\n");
+	fprintf(stderr,"       option is `-s' for send, or `-r' for recieve''\n");
+	exit(1);
+}
+
+error()
+{
+	fprintf(stderr, "too many errors...aborting\r\n");
+	die(1);
+}
+
+die(how)
+register int how;
+{
+	ttymode.sg_flags = ttyhold;
+	stty(0, &ttymode);
+	exit(how);
+}
+//SYSIN DD SYSOUT=BD
+echo x - tmodem.dist.c
+cat > tmodem.dist.c << "//SYSIN DD SYSOUT=BD"
+/*
+ * a version of Ward Christensen's MODEM program for
+ * UNIX v7, 4.1bsd
+ *
+ * by Andrew Scott Beals
+ * sjobrg.andy%mit-oz@mit-mc
+ * last update->4 june 1982
+ *
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+#include <signal.h>
+#include <sgtty.h>
+
+#define uchar	unsigned char
+
+#define	SLEEP	30
+
+	/* Protocol characters used */
+
+#define	SOH	1	/* Start Of Header */
+#define	EOT	4	/* End Of Transmission */
+#define	ACK	6	/* ACKnowlege */
+#define	NAK	0x15	/* Negative AcKnowlege */
+
+short		ttyhold;
+struct sgttyb	ttymode;
+
+main(argc,argv)
+int	argc;
+char	**argv;
+{
+	register uchar	checksum,index,blocknumber,errorcount,
+			character;
+	uchar		sector[128];
+	int		foo,timeout();
+
+	if(argc!=3)
+	{
+usage:		fprintf(stderr,"usage:\tmodem -<option> <file>\n");
+		fprintf(stderr,"\twhere <option> is ``s'' for send, or ``r'' for recieve''\n");
+		exit(1);
+	}
+	gtty(0,&ttymode);
+	ttyhold=ttymode.sg_flags;
+	ttymode.sg_flags|=RAW;
+	ttymode.sg_flags&=~ECHO;
+
+	if(argv[1][0]!='-')goto usage;
+	if(argv[1][1]=='r')goto rec;
+	if(argv[1][1]!='s')goto usage;
+
+	/* send a file to the remote */
+
+	stty(0,&ttymode);
+	if((foo=open(argv[2],0))==-1)
+	{
+		fprintf(stderr,"can't open %s for send!\7\n",argv[2]);
+		die(1);
+	}
+	fprintf(stderr,"file open, ready to send\r\n");
+	fflush(stderr);
+	fflush(stdout);
+	errorcount=0;
+	blocknumber=1;
+	signal(SIGALRM,timeout);
+	alarm(80);
+
+	while((getchar()!=NAK)&&(errorcount<10))++errorcount;
+	alarm(0);
+#ifdef DEBUG
+	fprintf(stderr,"transmission beginning\r\n");
+	fflush(stderr);
+#endif
+	if(errorcount==10)
+	{
+error:		fprintf(stderr,"too many errors...aborting\7\7\7\r\n");
+		die(1);
+	}
+	while(read(foo,sector,sizeof sector))
+	{
+		errorcount=0;
+		while(errorcount<10)
+		{
+#ifdef DEBUG
+			fprintf(stderr,"{%d} ",blocknumber);
+			fflush(stderr);
+#endif
+			putchar(SOH); /* here is our header */
+			putchar(blocknumber);	/* the block number */
+			putchar(~blocknumber);	/* & its complement */
+			checksum=0;
+			for(index=0;index<128;index++)
+			{
+				putchar(sector[index]);
+				checksum+=sector[index];
+			}
+			putchar(checksum); /* tell our checksum */
+			fflush(stdout);
+			if(getchar()!=ACK)++errorcount;
+			else break;
+		}
+		if(errorcount==10)goto error;
+		++blocknumber;
+	}
+	index=1;
+	while(index)
+	{
+		putchar(EOT);
+		fflush(stdout);
+		index=getchar()==ACK;
+	}
+	fprintf(stderr,"Transmission complete.\r\n");
+	fflush(stderr);
+	die(0);
+
+rec:	/* recieve a file */
+
+	if((foo=open(argv[2],0))!=-1) {
+		close(foo);
+		fprintf(stderr,"%s exists; you have 10 seconds to abort\r\n",argv[2]);
+		fflush(stderr);
+		sleep(10);
+		fprintf(stderr,"Too late!\r\n");
+		fflush(stderr);
+	}
+
+	stty(0,&ttymode);
+
+	if((foo=creat(argv[2],0666))==-1) {
+		perror(argv[2]);
+		die(1);
+	}
+	printf("you have 30 seconds...");
+	fflush(stdout);
+	sleep(SLEEP);	/* wait for the user to get his act together */
+#ifdef DEBUG
+	fprintf(stderr,"Starting...\r\n");
+	fflush(stderr);
+#endif
+	putchar(NAK);
+	fflush(stdout);
+	errorcount=0;
+	blocknumber=1;
+	while((character=getchar())!=EOT)
+	{
+		register uchar not_ch;
+		if(character!=SOH)
+		{
+#ifdef DEBUG
+			fprintf(stderr,"Not SOH\r\n");
+			fflush(stderr);
+#endif
+			if(++errorcount<10)goto nakit;
+			else goto error;
+		}
+		character=getchar();
+		not_ch=~getchar();
+#ifdef DEBUG
+		fprintf(stderr,"[%d] ",character);
+		fflush(stderr);
+#endif
+		if(character!=not_ch)
+		{
+#ifdef DEBUG
+			fprintf(stderr,"Blockcounts not ~\r\n");
+			fflush(stderr);
+#endif
+			++errorcount;
+			goto nakit;
+		}
+		if(character!=blocknumber)
+		{
+#ifdef DEBUG
+			fprintf(stderr,"Wrong blocknumber\r\n");
+			fflush(stderr);
+#endif
+			++errorcount;
+			goto nakit;
+		}
+		checksum=0;
+		for(index=0;index<128;index++)
+		{
+			sector[index]=getchar();
+			checksum+=sector[index];
+		}
+		if(checksum!=getchar())
+		{
+#ifdef DEBUG
+			fprintf(stderr,"Bad checksum\r\n");
+			fflush(stderr);
+#endif
+			errorcount++;
+			goto nakit;
+		}
+		putchar(ACK);
+		fflush(stdout);
+		blocknumber++;
+		write(foo,sector,sizeof sector);
+		if(!errorcount)continue;
+nakit:
+		putchar(NAK);
+		fflush(stdout);
+	}
+	close(foo);
+
+	putchar(ACK); /* tell the modem on the other end we accepted his EOT */
+	putchar(ACK);
+	putchar(ACK);
+	fflush(stdout);
+
+	fprintf(stderr,"Completed.\r\n");
+	fflush(stderr);
+	die(0);
+}
+
+timeout()
+{
+	fprintf(stderr,
+	"Timed out waiting for NAK from remote system\7\7\7\r\n");
+	die(1);
+}
+
+die(how)
+register int how;
+{
+	ttymode.sg_flags=ttyhold;
+	stty(0,&ttymode);
+	exit(how);
+}
+//SYSIN DD SYSOUT=BD
+
+

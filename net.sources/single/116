@@ -1,0 +1,203 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,fd41ace7ef137922,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1982-11-04 02:16:46 PST
+Message-ID: <bnews.ima.246>
+Newsgroups: net.sources
+Path: utzoo!decvax!cca!ima!johnl
+X-Path: utzoo!decvax!cca!ima!johnl
+From: ima!johnl
+Date: Thu Nov  4 05:16:44 1982
+Subject: News batching programs
+X-Google-Info: Converted from the original B-News header
+Posted: Wed Nov  3 14:05:00 1982
+Received: Thu Nov  4 05:16:44 1982
+
+cat > README << 'EOFEOF'
+These small programs provide a rudimentary news batching scheme.  They are
+designed for the situation where most of the news comes in from one site
+and is then redistributed to one or more other sites.  Batching the news
+saves spool disk space and uucp transfer time, since one job of 100 items
+is transferred much faster than 100 jobs of 1 item.  I observe that the
+uucp time per system appears to have dropped from 1 hour/day to about 15
+minutes at 1200 baud.
+
+The scheme is this.  When news is "sent" to another system, net news passes
+the item to "batchnews", which appends it to a spool file.  Every now and
+then, a daemon named "unbatch" is run which takes the existing batched
+spool files and makes uux commands to transfer them to the other sites.
+It runs "bnproc" at the other sites which separate the articles and pass
+them to rnews for posting.
+
+Note that the regular news passing scheme still works.  We use batched
+news from ima to three other sites, but those other sites pass the few
+articles they originate back the regular way.
+
+Rough installation instructions:
+
+1 - Compile batchnews and unbatch and install them in /usr/lib/news
+	at the sending site.
+2 - Compile bnproc and install it in /usr/bin at the receiving
+	site.  It has to be in /usr/bin or uux can't find it. Sorry.
+
+3 - At the sending site, add a line like this to the news sys file:
+
+	batched:net.all,fa.all:B:/usr/lib/news/batchnews
+
+This sets up a fake news site that gets the batched news.  If you just
+send to one site, you can use that site's name.  Adjust the entries for
+the receiving sites so that they do not get news the old way (e.g., make
+them just receive to.xxx but not net.all or anything else.)
+
+4 - At the sending site, add a line like this to /usr/lib/crontab
+
+45 0,6,12,18 * * * cd /usr/tmp;/usr/lib/news/unbnews -s1 -s2 news.*
+
+where s1 and s2 are the sites that actually are to get the news.
+If the sender polls the receiver, run this program when news is to
+go out.  If the receiver polls the sender, run this program shortly
+before the poll is expected.
+
+Notes:  The default name for the spool files is /usr/lib/news.*, but you
+can pass arguments to change it if you want to make separate batches for
+separate machines.  In another news article, I post changes to uux so that
+it links rather than copying the spool files.  You might want to install
+that.
+
+Finally, you might want to add some sort of locking to batchnews if
+you often have several items posted at once.  If you get all of your
+news over the phone, uux serializes calls to rnews automatically.
+
+John Levine, IECC, PO Box 349, Cambridge MA 02238; (617) 491-5450
+decvax!cca!ima!johnl, harpo!esquire!ima!johnl, ucbvax!cbosgd!ima!johnl,
+yale-co!jrl (all uucp), Levine@YALE (Arpa).
+EOFEOF
+cat > batchnews.c << 'EOFEOF'
+/*****************************************************************************
+* batchnews:      take many news articles and batch them into one big        *
+*                 group                                                      *
+*****************************************************************************/
+
+# include <stdio.h>
+# include <sys/types.h>
+# include <sys/stat.h>
+
+int debug = 1;
+# define INTERVAL       3600    /* one spool file per hour */
+
+/* write out a line with the file length, then the file itself */
+
+main(ac, av)
+char **av;
+{
+	long now;
+	char fnbuf[100];
+	register FILE *fo;
+	register c;
+	struct stat statbuf;
+
+	time(&now);
+	sprintf(fnbuf, "/usr/tmp/%s.%ld", ac>1? av[1]: "news", now/INTERVAL);
+	fo = fopen(fnbuf, "a");
+	fstat(0, &statbuf);
+	fprintf(fo, "%ld\n", statbuf.st_size);
+	while(--statbuf.st_size >= 0 && (c = getchar()) != EOF)
+		putc(c, fo);
+	fclose(fo);
+}
+EOFEOF
+cat > unbatch.c << 'EOFEOF'
+/*****************************************************************************
+* unbatch: unbatch news items and hand them to uucp                          *
+*****************************************************************************/
+
+# include <stdio.h>
+
+/*
+ *      Syntax: unbnews -host -host file file
+ */
+
+main(ac, av)
+char **av;
+{
+	int i;
+	register char *hn;
+
+	for(i = 1; i < ac; i++) {
+		if(av[i][0] == '-')
+			douux(av[i]+1, ac, av);
+	}
+
+	/* get rid of the files */
+	for(i = 1; i < ac; i++)
+		if(av[i][0] != '-')
+			unlink(av[i]);
+	return 0;
+}
+
+douux(host, ac, av)
+char *host;
+char **av;
+{
+	char uxbuf[100];
+	register i;
+
+	/* note: make this uux -l -z ... if your uux supports it */
+	sprintf(uxbuf, "uux -z '%s!bnproc", host);
+	for(i = 1; i < ac; i++) {
+		if(av[i][0] != '-')
+			strcat(uxbuf, " !");
+			strcat(uxbuf, av[i]);
+	}
+	strcat(uxbuf, "'");
+	/* following for debugging only */
+	printf("%s\n", uxbuf);
+	system(uxbuf);
+}
+EOFEOF
+cat > bnproc.c << 'EOFEOF'
+/*****************************************************************************
+* bnproc: break up and process the batched news files                        *
+*****************************************************************************/
+
+# include <stdio.h>
+
+char buf[40];
+FILE *popen();
+
+main(ac, av)
+char **av;
+{
+	while(--ac >= 0)
+		process(*++av);
+	return 0;
+}
+
+process(fn)
+char *fn;
+{
+	long size;
+	register FILE *ifn, *pfn;
+
+	ifn = fopen(fn, "r");
+	if(ifn == NULL)
+		return;
+	while(fgets(buf, sizeof(buf), ifn) != NULL) {
+		long atol();
+		register c;
+
+		size = atol(buf);
+		if(size <= 0)
+			break;
+		pfn = popen("rnews", "w");
+		while(--size >= 0 && (c = getc(ifn)) != EOF)
+			putc(c, pfn);
+		pclose(pfn);
+	}
+	fclose(ifn);
+}
+EOFEOF
+
+--------
+
+

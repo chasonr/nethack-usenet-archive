@@ -1,0 +1,367 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,1ffc3108c023582b,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-08-17 10:43:17 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 exptools 1/6/84; site ihuxq.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxl!ihnp4!ihuxq!ken
+From: ken@ihuxq.UUCP (ken perlow)
+Newsgroups: net.sources
+Subject: Yet another random password generator (better!)
+Message-ID: <1145@ihuxq.UUCP>
+Date: Fri, 17-Aug-84 13:43:17 EDT
+Article-I.D.: ihuxq.1145
+Posted: Fri Aug 17 13:43:17 1984
+Date-Received: Sat, 18-Aug-84 01:32:27 EDT
+Organization: AT&T Bell Labs, Naperville, IL
+Lines: 347
+
+/*
+To make this work, just cc -O -o<whatever> <this_program>.c
+There's no fancy-shmancy archive or makefiles--all the documentation
+is in this see-here comment.  If you run BSD, read the "portability
+considerations" to see what to rehack (essential, but should be trivial).
+
+Author:
+
+Ken Perlow
+AT&T Bell Laboratories @ Naperville, IL
+..ihnp4!ihuxq!ken
+
+Synopsis:
+
+This program generates random pseudo- (and occasionally real!)
+words from 5 to 8 characters in length from a table of pairwise
+letter frequencies it generates by scanning through an input
+text file.  A warning message is printed if the text file does
+not contain successors to all letters, and those missing successors
+are listed.  The program picks a random start letter.  Each
+successive letter is generated from random access into the
+frequency row for the letter just generated.  If there is no
+successor in the table, it stops generating that particular word
+and prints what it has so far (maybe only the 1st letter).
+Otherwise it stops when the word has grown to the (random) length
+generated for that particular word.
+
+This so-called "order-2" word generation strategy is modified
+for readability of output by the following rules:
+
+(1) A "u" which follows a "q" will have a successor chosen (randomly)
+    from among the vowels [aeio] only.
+(2) If the first two letters are identical consonants, the
+    second will be changed to a random vowel [aeiouy].
+(3) If there are 4 consonants in a row, the last will be changed
+    to a random vowel [aeiouy].
+(4) After 2 vowels in a row, the table will be entered for the
+    2nd vowel until a (random) consonant is selected to succeed
+    it.  This could result in an infinite loop, though it would
+    require unusual text input in which some vowel has only vowel
+    successors.
+
+Options:
+
+-f file     Text file for table generation.
+
+-i file     Binary 26x27 file of integers for fast table generation
+	    (table is read directly in).  The 27th column contains
+	    row totals.
+
+-o file     Binary 26x27 file of integers to be produced for subsequent
+	    use of "-i" option.  Can be invoked irrespective of input
+	    file type, including default.
+
+Default:    If neither f, i, nor o invoked, program will prompt for a
+	    text file.
+
+-n nwdsout  Number of words to generate.  If not specified, program
+	    will loop indefinitely.
+
+-s slpintvl Number of seconds to sleep between successive word
+	    generations.  If not specified, no wait will occur.
+	    The random number generator reseeds at random intervals
+	    using the time-of-day in seconds, so this option may
+	    aid in randomization as well as adding drama.
+
+-t          If specified, the 26x26 frequency table will be printed,
+	    with each cell's tally scaled from 0 to 9 for ease of
+	    reading.  Note that 0 is printed for cell frequencies of
+	    0 only, 1 for frequencies of 1 to (1/9)*max_tally, etc.
+	    After printing the table, the program requests a <CR> to
+	    continue.
+
+-v          If specified, perusal of text file will be verbose.
+	    This includes printing  "." for every 100 character
+	    pairs scanned (so you know it hasn't died), and giving
+	    summary statistics.  Without this option, there will
+	    be no output during the reading of the text file.
+            This option will be ignored for "-i" binary files.
+
+Portability considerations:
+
+This program is fully portable to any Unix environment except for
+the "getrandom" function.  The SV_R2 functions "rand", "srand",
+and "time" are not standard in all Unix implementations.  Any
+procedure that returns a random number mod its argument may be
+substituted, however.  Unix is a trademark of AT&T Bell Laboratories.
+
+Bugs:
+
+None found so far, as the possibility of an infinite loop mentioned
+above is now, by definition, a feature.  On the other hand, this
+algorithm is the acme of non-deterministic programming.  So, to
+paraphrase Clint Eastwood:
+
+You're probably asking yourself, did it generate 5 characters or
+6?  Well, in all the excitement, it kinda forgot.  But seeing as
+it's written in C, the most powerful high-level language in the
+world and capable of blowing your kernel clean off, ask yourself
+this question, punk: "Do I feel lucky?"
+*/
+
+
+#include <stdio.h>
+#include <ctype.h>
+#define TRUE      1
+#define FALSE     0
+#define PROMPT    0
+#define TEXTIN    1
+#define BININ     2
+#define NLETTERS 26
+#define NLETPLS1 27
+#define MAXWDSIZ 80
+
+FILE *list;
+int calls, nvow, ncns, table[NLETTERS][NLETPLS1];
+char *letter = {"abcdefghijklmnopqrstuvwxyz"};
+char fname[MAXWDSIZ], oname[MAXWDSIZ];
+int vowel[6] = {0,4,8,14,20,24};
+int binout, fflg, sflg, tflg, vflg, bytes, loops = 0;
+
+extern char *optarg;
+extern int optind, opterr;
+
+mktable() {
+
+int i, j, len, ctr, bin, last;
+int longest = 0;
+double avg = 0.0;
+char word[MAXWDSIZ], *ptr;
+
+switch(fflg) {
+
+case PROMPT:
+    printf("Word file: ");
+    scanf("%s", fname);
+case TEXTIN:
+    list = fopen(fname, "r");
+    if (list==NULL) nosoap(fname);
+    ctr = 0;
+    while(fscanf(list, "%s", word) != EOF) {
+        len = strlen(word);
+        if (notword(word, &len)) continue;
+        if (longest < len) longest = len;
+        if (vflg && (++ctr % 100 == 1)) write(1,".",1);
+        avg += len;
+        for (i=0;i<len-1;i++) {
+    	    table[(int)(word[i]-'a')][(int)(word[i+1]-'a')]++;
+    	    table[(int)(word[i]-'a')][NLETTERS]++;
+	    }
+    	}
+    if (vflg) printf("\n%d words; mean length = %.1f; longest = %d.\n", ctr, avg/ctr, longest);
+    break;
+case BININ:
+    if (vflg) fprintf(stderr, "Binary input: 'v' option ignored.\n");
+    if ((bin = open(fname, 0)) == -1) nosoap(fname);
+    for(i=0;i<NLETTERS;i++) for(j=0;j<NLETPLS1;j++) read(bin,&table[i][j],sizeof(int));
+    close(bin);
+    break;
+    }
+
+if (binout) {
+    if ((bin = creat(oname, 0644)) != -1)
+        printf("Binary table file '%s' created.\n", oname);
+    for(i=0;i<NLETTERS;i++) for(j=0;j<NLETPLS1;j++)
+	bytes += write(bin,&table[i][j],sizeof(int));
+    printf("%d bytes written.\n", bytes);
+    close(bin);
+    }
+
+word[0] = '\0';
+ptr = word;
+for(i=0;i<NLETTERS;i++) if(!table[i][NLETTERS]) *ptr++ = *(letter+i);
+*ptr = '\0';
+if (strlen(word)) fprintf(stderr, "WARNING--no successors found for: %s\n",word);
+fclose(list);
+}
+
+
+nosoap(filename) char *filename; {
+
+fprintf(stderr, "Can't open '%s'.\n", filename);
+exit(2);
+}
+
+
+notword(string, length)  char *string; int *length; {
+
+char *ptr;
+
+if (ispunct(*(string+(*length)-1))) (*length)--;
+for (ptr=string; ptr<string+(*length); ptr++) {
+    if (!isalpha(*ptr)) return(TRUE);
+    if (isupper(*ptr)) *ptr += 040;
+    }
+return(FALSE);
+}
+
+
+getnext(i,pick) int i,pick; {
+
+int sum,j;
+
+if (i >= 0) {
+    if (table[i][NLETTERS]==0) return(-1);
+    sum=j=0;
+    while (sum<pick) sum += table[i][j++];
+    }
+else
+    j = getrandom(pick)+1;
+switch (--j) {
+    case 0 :
+    case 4 :
+    case 8 :
+    case 14:
+    case 20:
+    case 24: nvow++; ncns=0; break;
+    default: ncns++; nvow=0; break;
+    }
+return(j);
+}
+
+
+getvowel(set) int set; {
+
+nvow++;
+ncns = 0;
+return(vowel[getrandom(set)]);
+}
+
+
+getrandom(modulus) int modulus; {
+
+long time();
+
+if (!modulus) return(0);
+if (!(calls++ % ((rand() & 0x1f)+1)))
+    srand((unsigned)time((long *)0) % ((rand() & 0xfff)+1));
+return(rand() % modulus);
+}
+
+
+main(argc,argv) int argc; char **argv; {
+
+int i, j, length, pos, opt, snooze;
+int iters = 0;
+char word[10];
+
+while((opt=getopt(argc,argv,"i:o:f:s:n:tv"))!=EOF)
+    switch(opt) {
+    case 'i':
+	    fflg++; 
+    case 'f':
+	    fflg++; 
+	    strcpy(fname,optarg);
+	    break;
+    case 'o':
+	    binout++; 
+	    strcpy(oname,optarg);
+	    break;
+    case 's':
+	    sflg++;
+	    snooze=atoi(optarg);
+	    break;
+    case 'n':
+	    loops=atoi(optarg);
+	    break;
+    case 't':
+	    tflg++;
+	    break;
+    case 'v':
+	    vflg++;
+	    break;
+    case '?':
+	    fprintf(stderr, "Usage: %s [-f filein][-n nwdsout][-s slpintvl][-t][-v]\n", argv[0]);
+	    exit(2);
+	    break;
+    }
+mktable();
+if (tflg) prttbl();
+for(;;) {
+    nvow=ncns=0;
+    length = getrandom(4) + 5;
+    i = getnext(-1,NLETTERS);
+    for (pos=0;pos<length;pos++) {
+        word[pos] = *(letter+i);
+        if(pos && (word[pos-1]=='q')) {
+    	    j = getvowel(4);
+	    }
+        else if (nvow <= 2)
+    	    j = getnext(i,(getrandom(table[i][NLETTERS])+1));
+        while (nvow > 2 && j >= 0)
+    	    j = getnext(i,(getrandom(table[i][NLETTERS])+1));
+        if ((j==i && ncns && (ncns>2 || pos<2)) || ncns>3) {
+	    j = getvowel(6);
+	    }
+	else if (j == -1) {
+	    word[pos] = *(letter+i);
+	    word[pos+1] = '\0';
+	    break;
+	    }
+        i = j;
+        }
+    if (loops) {
+	iters++;
+	if (iters > loops) break;
+	}
+    word[length] = '\0';
+    printf("%s\n", word);
+    if (sflg) sleep(snooze);
+    }
+}
+
+
+prttbl() {
+
+int i,j,max,floor;
+char ch, display[NLETTERS][NLETPLS1];
+double agsiz, freq, flpnt;
+
+max=0;
+for(i=0;i<NLETTERS;i++) {
+    display[i][NLETTERS] = '\0';
+    for(j=0;j<NLETTERS;j++) if (max < table[i][j]) max = table[i][j];
+    }
+agsiz = max/9.0;
+printf("Pairwise letter frequencies (scale 1:%.1f) in file '%s'\n\n", agsiz, fname);
+for(i=0;i<NLETTERS;i++)
+    for(j=0;j<NLETTERS;j++) {
+	freq=table[i][j]/agsiz + 1.0;
+	flpnt = floor = freq;
+	if (freq == flpnt) floor--;
+        display[i][j] = (char)(floor + '0');
+        }
+printf("   abcdefghijklmnopqrstuvwxyz    abcdefghijklmnopqrstuvwxyz\n");
+for(i=0;i<13;i++)
+    printf("  %c%s   %c%s\n",*(letter+i),display[i],*(letter+13+i),display[13+i]);
+printf("\nHit <return> to continue.\n");
+read(0,&ch,1);
+}
+-- 
+                    *** ***
+JE MAINTIENDRAI   ***** *****
+                 ****** ******    17 Aug 84 [30 Thermidor An CXCII]
+ken perlow       *****   *****
+(312)979-7261     ** ** ** **
+..ihnp4!ihuxq!ken   *** ***
+
+

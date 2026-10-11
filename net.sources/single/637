@@ -1,0 +1,513 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,3d63f11452152f01,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-09-20 20:35:18 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!decvax!harpo!eagle!mhuxi!houxm!ihnp4!ixn5c!inuxc!pur-ee!uiucdcs!acheng
+From: acheng@uiucdcs.UUCP
+Newsgroups: net.sources
+Subject: vmstat - (nf)
+Message-ID: <2897@uiucdcs.UUCP>
+Date: Tue, 20-Sep-83 23:35:18 EDT
+Article-I.D.: uiucdcs.2897
+Posted: Tue Sep 20 23:35:18 1983
+Date-Received: Thu, 22-Sep-83 04:20:09 EDT
+Lines: 495
+
+#N:uiucdcs:12600015:000:15356
+uiucdcs!acheng    Sep 20 09:04:00 1983
+
+		*************FORWARDED NOTE******************
+I didn't realize there might be a demand for screen-oriented versions
+of vmstat(1).  I just looked at chris@umcp (hope I got that right)
+program vmpic; unfortunately I can't use it yet, because I haven't
+done anything about the window library.  I have been using my own
+hacked-up version of vmstat, which uses plain old curses and runs
+on 4.1bsd.  The source follows.  Hack it as you wish.  All I ask
+is you not sell it.  
+
+Cheers,
+Vahe Sarkissian
+UUCP  : {ihnss!ihnp4}!inuxc!iuvax!vahe
+CSnet : Vahe @ Indiana
+
+The source is bracketed between the two lines of all percent marks.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+#include <curses.h>
+#include <signal.h>
+#include <sys/param.h>
+#include <sys/vm.h>
+#include <sys/dk.h>
+#include <nlist.h>
+#include <sys/buf.h>
+#include <sys/ubavar.h>
+#include <sys/mbavar.h>
+
+/*  vmshow  -  show vm statistics with screen-oriented output.
+ *  This program is a hacked up version of vmstat(1).  It uses
+ *  the "curses" package.
+ *  To compile:
+ *
+ *	cc -O -s -n vmshow.c -o vmshow -ljobs -lcurses -ltermlib   
+ *
+ *  The defined string MYNAME should be the name of the machine
+ *  the program is running on.  It can be set to anything you like.
+ *  Vahe Sarkissian, IUCS, July 29, 1983.
+ */
+  
+#define MYNAME " I U V A X "
+
+struct nlist mynl[] = {
+#define	X_CPTIME	0
+	{ "_cp_time" },
+#define	X_RATE		1
+	{ "_rate" },
+#define X_TOTAL		2
+	{ "_total" },
+#define	X_DEFICIT	3
+	{ "_deficit" },
+#define	X_FORKSTAT	4
+	{ "_forkstat" },
+#define X_SUM		5
+	{ "_sum" },
+#define	X_FIRSTFREE	6
+	{ "_firstfree" },
+#define	X_MAXFREE	7
+	{ "_maxfree" },
+#define	X_BOOTIME	8
+	{ "_bootime" },
+#define	X_DKXFER	9
+	{ "_dk_xfer" },
+#define X_MBDINIT	10
+	{ "_mbdinit" },
+#define X_UBDINIT	11
+	{ "_ubdinit" },
+#define X_REC		12
+	{ "_rectime" },
+#define X_PGIN		13
+	{ "_pgintime" },
+#define X_HZ		14
+	{ "_hz" },
+	{ 0 },
+};
+
+char dr_name[DK_NDRIVE][10];
+char dr_unit[DK_NDRIVE];
+double	stat1();
+/* save these for later....
+int	firstfree, maxfree;
+*/
+int	hz;
+struct
+{
+	long	time[CPUSTATES];
+	long	xfer[DK_NDRIVE];
+	struct	vmmeter Rate;
+	struct	vmtotal	Total;
+	struct	vmmeter Sum;
+} s, s1;
+#define	rate		s.Rate
+#define	total		s.Total
+#define	sum		s.Sum
+
+int	deficit;
+double	etime;
+int 	mf;
+
+main(argc, argv)
+char **argv;
+{
+	time_t 		now;
+	extern char 	*ctime();
+	char 		timestr[26];
+	register 	i;
+	int 		iter = 1;
+	int 		nintv;
+	time_t 		bootime;
+	long 		t;
+	int 		cleanup();
+
+        sigset(SIGINT,cleanup);
+	sigset(SIGHUP,cleanup);
+	sigset(SIGQUIT,cleanup);
+	nlist("/vmunix", mynl);
+	if(mynl[0].n_type == 0) {
+		printf("no /vmunix namelist\n");
+		exit(1);
+	}
+	mf = open("/dev/kmem", 0);
+	if(mf < 0) {
+		printf("cannot open /dev/kmem\n");
+		exit(1);
+	}
+	if(argc > 1)
+		iter = atoi(argv[1]);
+	/* These may come in handy in the future....
+	lseek(mf, (long)mynl[X_FIRSTFREE].n_value, 0);
+	read(mf, &firstfree, sizeof firstfree);
+	lseek(mf, (long)mynl[X_MAXFREE].n_value, 0);
+	read(mf, &maxfree, sizeof maxfree);
+	*/
+	lseek(mf, (long)mynl[X_BOOTIME].n_value, 0);
+	read(mf, &bootime, sizeof bootime);
+	lseek(mf, (long)mynl[X_HZ].n_value, 0);
+	read(mf, &hz, sizeof hz);
+	for (i = 0; i < DK_NDRIVE; i++) {
+		strcpy(dr_name[i], "xx");
+		dr_unit[i] = i;
+	}
+	read_names();
+	time(&now);
+	nintv = now - bootime;
+	if (nintv <= 0 || nintv > 60*60*24*365*10) {
+		printf("Time makes no sense... namelist must be wrong.\n");
+		exit(1);
+	}
+	set_display();
+loop:   /* This begins an infinite loop.  It's not written in
+	   the form for(;;) because you run out of crt if you indent...*/
+	lseek(mf, (long)mynl[X_CPTIME].n_value, 0);
+ 	read(mf, s.time, sizeof s.time);
+	lseek(mf, (long)mynl[X_DKXFER].n_value, 0);
+	read(mf, s.xfer, sizeof s.xfer);
+	if (nintv != 1) {
+		lseek(mf, (long)mynl[X_SUM].n_value, 0);
+		read(mf, &rate, sizeof rate);
+	} else {
+		lseek(mf, (long)mynl[X_RATE].n_value, 0);
+		read(mf, &rate, sizeof rate);
+	}
+	lseek(mf, (long)mynl[X_TOTAL].n_value, 0);
+	read(mf, &total, sizeof total);
+	lseek(mf, (long)mynl[X_DEFICIT].n_value, 0);
+	read(mf, &deficit, sizeof deficit);
+	lseek(mf, (long)mynl[X_SUM].n_value, 0);
+	read(mf, &sum, sizeof sum);
+	etime = 0;
+	for (i=0; i < DK_NDRIVE; i++) {
+		t = s.xfer[i];
+		s.xfer[i] -= s1.xfer[i];
+		s1.xfer[i] = t;
+	}
+	for (i=0; i < CPUSTATES; i++) {
+		t = s.time[i];
+		s.time[i] -= s1.time[i];
+		s1.time[i] = t;
+		etime += s.time[i];
+	}
+	if(etime == 0.)
+	        etime = 1.;
+	time(&now);
+	strncpy(timestr,ctime(&now),sizeof timestr);
+	timestr[19] = '\0'; 
+	mvaddstr(1,11,&timestr[11]);
+	mvprintw(1,73,"%3d",sum.v_rev);
+	mvprintw(4,14,"%3d",total.t_rq);
+	mvprintw(5,14,"%3d",total.t_dw+total.t_pw);
+	mvprintw(6,14,"%3d",total.t_sw);
+	mvprintw(4,42,"%6d",total.t_avm/2);
+	mvprintw(5,42,"%6d",total.t_free/2);
+	mvprintw(10,21,"%3d",(rate.v_pgrec - (rate.v_xsfrec+rate.v_xifrec))/nintv);
+	mvprintw(11,21,"%3d",(rate.v_xsfrec+rate.v_xifrec)/nintv);
+	mvprintw(10,35,"%3d",rate.v_pgpgin/2/nintv);
+	mvprintw(11,35,"%3d",rate.v_pgpgout/2/nintv);
+	mvprintw(10,50,"%3d",rate.v_scan/nintv);
+	mvprintw(11,50,"%3d",rate.v_dfree/2/nintv);
+	mvprintw(10,68,"%3d",deficit/2);
+	etime /= 60.;
+	for(i=0; i<DK_NDRIVE; i++)
+		mvprintw(15,(9*i+21),"%3.0f",s.xfer[i]/etime);
+	mvprintw(17,30,"%3d",(rate.v_intr/nintv)-hz);
+	mvprintw(17,68,"%3d",rate.v_pdma/nintv);
+	mvprintw(18,30,"%3d",rate.v_syscall/nintv);
+	mvprintw(18,68,"%3d",rate.v_trap/nintv);
+	mvprintw(4,68,"%3d",rate.v_swtch/nintv);
+	for(i=0; i<CPUSTATES; i++) {
+		float f = stat1(i);
+		if (i == 0) {		/* US+NI */
+		        i++;
+		        f += stat1(i);
+		} 
+		mvprintw(4+i,68,"%3.0f",f);
+	}
+	mvprintw(21,30,"%4d",rate.v_pswpin/nintv);
+	mvprintw(22,30,"%4d",rate.v_pswpout/nintv);
+	mvprintw(21,68,"%4d",rate.v_swpin/nintv);
+	mvprintw(22,68,"%4d",rate.v_swpout/nintv);
+	move(0,0);
+	refresh();
+	nintv = 1;
+	sleep(iter);
+	goto loop;
+	/*NOTREACHED*/
+}
+
+double
+stat1(row)
+{
+	double t;
+	register i;
+
+	t = 0;
+	for(i=0; i<CPUSTATES; i++)
+		t += s.time[i];
+	if(t == 0.)
+		t = 1.;
+	return(s.time[row]*100./t);
+}
+
+set_display()
+{   
+    int column,i;
+    
+    initscr();
+    nonl();
+    clear();
+    mvaddstr(1,5,"Time:");
+    standout(); 
+    mvaddstr(0,(40-strlen(MYNAME)/2),MYNAME); 
+    standend();
+    mvaddstr(1,60,"Clock Revs:");
+    mvaddstr(3,5,"Procs:"); mvaddstr(3,34,"Virtual Mem:"); mvaddstr(3,60,"CPU:");
+    mvaddstr(4,5,"running:"); mvaddstr(4,34,"active:"); mvaddstr(4,60,"ctxsw :");
+    mvaddstr(5,5,"blocked:"); mvaddstr(5,34,"free  :"); mvaddstr(5,60,"user  :");
+    mvaddstr(6,5,"waiting:"); mvaddstr(6,60,"system:"); mvaddstr(7,60,"idle  :");
+    mvaddstr(9,5,"Paging:"); mvaddstr(9,41,"(daemon)");
+    mvaddstr(10,10,"reclaims :"); mvaddstr(10,27,"pgins :");
+    mvaddstr(10,41,"scanned:");  mvaddstr(10,57,"deficit  :");
+    mvaddstr(11,10,"free list:"); mvaddstr(11,27,"pgouts:");
+    mvaddstr(11,41,"freed  :");              
+    mvaddstr(13,5,"Faults:");                
+    mvaddstr(14,10,"disk:");                 
+    column = 21;                             
+    for(i = 0; i < DK_NDRIVE; i++) {         
+        mvprintw(14,column,"%2s%d",dr_name[i],dr_unit[i]);
+        column += 9;
+    }              
+    mvaddstr(17,10,"device interrupts :");
+    mvaddstr(17,39,"pseudo-dma dz interrupts   :");
+    mvaddstr(18,10,"system calls      :");
+    mvaddstr(18,39,"traps                      :");
+    mvaddstr(20,5,"Swap:");
+    mvaddstr(21,10,"pages swapped in  :");
+    mvaddstr(21,39,"number of swapins          :");
+    mvaddstr(22,10,"pages swapped out :");
+    mvaddstr(22,39,"number of swapouts         :");
+    refresh();
+}
+    
+/*
+ * Read the drive names out of kmem.
+ * ARGH ARGH ARGH ARGH !!!!!!!!!!!!
+ */
+
+#define steal(where, var) lseek(mf, where, 0); read(mf, &var, sizeof var);
+read_names()
+{
+	struct mba_device mdev;
+	register struct mba_device *mp;
+	struct mba_driver mdrv;
+	short two_char;
+	char *cp = (char *) &two_char;
+	struct uba_device udev, *up;
+	struct uba_driver udrv;
+
+	mp = (struct mba_device *) mynl[X_MBDINIT].n_value;
+	up = (struct uba_device *) mynl[X_UBDINIT].n_value;
+	if (up == 0) {
+		fprintf(stderr, "iostat: Disk init info not in namelist\n");
+		exit(1);
+	}
+	if (mp) for (;;) {
+		steal(mp++, mdev);
+		if (mdev.mi_driver == 0)
+			break;
+		if (mdev.mi_dk < 0 || mdev.mi_alive == 0)
+			continue;
+		steal(mdev.mi_driver, mdrv);
+		steal(mdrv.md_dname, two_char);
+		sprintf(dr_name[mdev.mi_dk], "%c%c", cp[0], cp[1]);
+		dr_unit[mdev.mi_dk] = mdev.mi_unit;
+	}
+	for (;;) {
+		steal(up++, udev);
+		if (udev.ui_driver == 0)
+			break;
+		if (udev.ui_dk < 0 || udev.ui_alive == 0)
+			continue;
+		steal(udev.ui_driver, udrv);
+		steal(udrv.ud_dname, two_char);
+		sprintf(dr_name[udev.ui_dk], "%c%c", cp[0], cp[1]);
+		dr_unit[udev.ui_dk] = udev.ui_unit;
+	}
+}
+ 
+cleanup()
+{    
+    sigignore(SIGINT);
+    sigignore(SIGHUP);
+    sigignore(SIGQUIT);
+    mvcur(0,COLS-1,LINES-1,0);
+    endwin();
+    exit(0);
+}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+N:sri-unix:-9900:0
+Prolog library: helper.pl           
+pereira:0
+1983:8:15:0:52
+001:9978
+%   File: Mec:Helper.Pl         Author: R.A.O'Keefe      Updated: 12 October 82
+%				Modified for TOPS-20	Fernando Pereira
+
+%   This file contains two utilities:
+%       try_hard_to_see(FileName, DeviceDefaults, ExtensionDefaults)
+%           -- tries all the Extension and Device defaults (varying the
+%           -- extensions first) until it succeeds in 'see'ing the file,
+%           -- and fails if the file cannot be found.
+%       give_help(Area, Topic)
+%           -- looks for an assertion help_file(Area, FileName, Delimiter)
+%           -- which you must supply.  It then tries hard to open the file
+%           -- with default extensions "", "HLP", and "PL" and with device
+%           -- defaults "DSK", "MEC", "UTIL", and "PLL".  If the file can't
+%           -- be found, or if there is no help_file assertion, it gives an
+%           -- apology.  Otherwise it searches the file for the sequence
+%           -- Delimiter Topic ".", e.g. #help.
+
+%   It defines append, but its definition is the same as that in UTIL.
+
+
+%----------------------------------------------------------------------%
+
+:- public try_hard_to_see/3.
+:- public append/3.
+
+:- mode
+    try_hard_to_see(+, +, +),
+        expand_file(+, +, +, -),
+            parse_file(-, -, -, -, ?, ?),
+                file_component(-, ?, ?),
+                    letter_or_digit(+, -),
+            normalise_file_component(+, +, -),
+            supply_file_default(+, +, +, -),
+                supply_file_default(+, +, -),
+            pack_file_title(+, +, +, +, -),
+                append(+, +, -).
+
+
+try_hard_to_see(Title, DeviceDefaults, ExtensionDefaults) :-
+        nofileerrors,
+        expand_file(Title, DeviceDefaults, ExtensionDefaults, FullTitle),
+        see(FullTitle), !,
+        fileerrors.
+try_hard_to_see(Title, _, _) :-
+        fileerrors,
+        write('** Can''t see '), writeq(Title), nl, fail.
+
+
+expand_file(Title, DeviceDefaults, ExtensionDefaults, FullTitle) :-
+        atomic(Title),
+        name(Title, TitleName), !,
+        expand_file(TitleName, DeviceDefaults, ExtensionDefaults, FullTitle).
+expand_file(Title, DeviceDefaults, ExtensionDefaults, FullTitle) :-
+        parse_file(Device, Directory, FileName, Extension, Title, []),
+	normalise_file_component(Directory, 99999, TryDirectory),
+        normalise_file_component(FileName, 99999, TryFileName), !,
+        supply_file_default(Device, DeviceDefaults, 99999, TryDevice),
+        supply_file_default(Extension, ExtensionDefaults, 99999, TryExtension),
+        pack_file_title(TryDevice, TryDirectory, TryFileName,
+                        TryExtension, TryTitle),
+        name(FullTitle, TryTitle).
+
+
+        parse_file(Device, Directory, FileName, Extension) -->
+                (   file_component(Device), ":"
+                |   {   Device = ""   }
+                ),  !,
+		(   "<", file_component(Directory), ">"
+		|    {	Directory = ""	}
+		),  !,
+                file_component(FileName),
+                (   ".", file_component(Extension)
+                |   {   Extension = ""   }
+                ),  !.
+
+
+                file_component([LetDig|Rest]) -->
+                        [Char], {   letter_or_digit(Char, LetDig)
+				|   [Char] = "-", LetDig = Char  }, !,
+                        file_component(Rest).
+                file_component([]) --> [].
+
+                        letter_or_digit(C, C) :-
+                                C >= "0", C =< "9", !.
+                        letter_or_digit(C, C) :-
+                                C >= "a", C =< "z", !.
+                        letter_or_digit(C, D) :-
+                                C >= "A", C =< "Z",
+                                D is C+("a"-"A").
+
+
+        normalise_file_component([], _, []) :- !.
+        normalise_file_component(Default, Length, TryThis) :-
+                atomic(Default),
+                name(Default, DefaultName), !,
+                normalise_file_component(DefaultName, Length, TryThis).
+        normalise_file_component(_, 0, []) :- !.
+        normalise_file_component([C|Rest], Length, [LetDig|More]) :-
+                letter_or_digit(C, LetDig), !,
+                Left is Length-1,
+                normalise_file_component(Rest, Left, More).
+        normalise_file_component([_|Rest], Length, TryThis) :-
+                normalise_file_component(Rest, Length, TryThis).
+
+
+        supply_file_default(Given, _, Length, TryThis) :-
+                normalise_file_component(Given, Length, TryThis).
+        supply_file_default([], Defaults, Length, TryThis) :-
+                supply_file_default(Defaults, Length, TryThis).
+
+                supply_file_default([Default|_], Length, TryThis) :-
+                        normalise_file_component(Default, Length, TryThis).
+                supply_file_default([_|Defaults], Length, TryThis) :- !,
+                        supply_file_default(Defaults, Length, TryThis).
+
+
+        pack_file_title([], [], FileName, Extension, Title) :- !,
+                append(FileName, [46|Extension], Title).        % 46 is "."
+        pack_file_title([], Directory, FileName, Extension, Title) :- !,
+                pack_file_title([], [], FileName, Extension, Tail),
+		append([60|Directory],[62|Tail],Title). 	% 60 is "<"
+								% 62 is ">"
+        pack_file_title(Device, Directory, FileName, Extension, Title) :-
+                pack_file_title([], Directory, FileName, Extension, Tail),
+                append(Device, [58|Tail], Title).               % 58 is ":"
+
+
+                append([Head|Tail], List, [Head|More]) :-
+                        append(Tail, List, More).
+                append([], List, List).
+
+
+%----------------------------------------------------------------------%
+
+:- public give_help/0, give_help/1, give_help/2.
+
+:- mode
+    give_help,                          %  list of areas.
+    give_help(+),                       %  list of topics in an area.
+    give_help(+, +),                    %  help on a specific topic.
+        find_help(+, +),                %  find and type a topic of list
+            read_after_delimiter(+),    %  find "#" or return end_of_file
+            find_help(+, +, +),         %  check a list of topics
+                among(+, +),            %  member on commas instead of dots
+                type_until_delimiter(+). %  display body of a Note.
+
+
+
+give_help :-
+        write('Help is available in the following areas:'), nl,
+        help_file(Area, _, _),
+        <aeera au  in   b- ,ptt'en2  L)i
+
+

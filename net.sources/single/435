@@ -1,0 +1,948 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,9c76961544e22309,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-07-20 00:47:24 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site uw-june
+Path: utzoo!linus!decvax!microsoft!uw-beaver!uw-june!fredf
+From: fredf@uw-june (Fred Finster)
+Newsgroups: net.sources
+Subject: Small C operating system typed in
+Message-ID: <508@uw-june>
+Date: Wed, 20-Jul-83 03:47:24 EDT
+Article-I.D.: uw-june.508
+Posted: Wed Jul 20 03:47:24 1983
+Date-Received: Wed, 20-Jul-83 20:40:12 EDT
+Organization: U. Washington, Computer Sci
+Lines: 928
+
+
+This was typed in but never run. So good luck and be thankful
+you didnt type it in by hand. 
+	I would like anyone who puts this on a micro to report back
+their opinions of its operation to the net.  I might play with it on a 
+home built 6809 micro to see how well it runs.  Cheers and Tears for the hackers
+who make it run and escape the control program for microcomputers curse 
+ala CP/M
+Small C operating system as typed in from Dr. Dobb's Journal March 1983
+
+puterr(str)             Put a string to the console (cannot
+                        be redirected, used for error
+                        messages).
+
+getc(unit)              Get a character from "unit,"
+                        unit=0 standart input, unit=1 the
+                        communication port, returns
+                        character or 0 on end of file.
+
+putc(c,unit)            Put a character to "unit" (see getc),
+                        returns "c".
+
+readf(unit)             Read the next sequential group on
+                        opened file, returns 0 on end of
+                        file.
+
+writef(unit)            Write the next sequential group.
+
+openf(name,buffer,fn)   Open "name" for read(fn=1)
+                        write(fn=2) or append (fn=3) with
+                        "buffer" as the buffer address,
+                        returns a unit number or 0 if not
+                        found.
+
+create(name,buffer)     As for openf, write assumed, any
+                        old file by that name is lost.
+
+closf(unit)             Close the given unit number,
+                        flushes write buffer if required.
+
+readr(unit,N)           Read n~th group from opened unit
+                        number, returns 0 if out of file
+                        group range.
+
+writer(unit,N)          Write n~th group to open unit
+                        number, returns 0 if out of range.
+
+scndir(name)            Scan the working directory for
+                        "name," returns number of entry in
+                        directory, 1 to n or 0 if not there.
+
+chdir(name)             Look for "name" in the current
+                        directory and if it is a directory,
+                        change operations to it, if name==0
+                        changes back to root directory of
+                        user.
+
+mkdir(name)             Create a new directory "name,"
+                        returns a 0 if name in use.
+
+rmfil(name,i)           Remove directory entry "name," if
+                        not found, returns 0. Won't allow
+                        rmfil(".". If "i" is 0, won't allow
+                        directory entry removal. If "i" is
+                        1, a recursive remove of the entry
+                        is undertaken, directory or file.
+
+alloc()                 Return the address of the next free
+                        top 512 byte block of memory.
+                        Addr will lie on a 512 byte
+                        boundary.
+
+dalloc(addr)            Give back a 512 byte block of
+                        memory for future use.
+
+dirfn(i)                For directory information: i=0 re-
+                        turns ptr to glinks[], i=1 returns ptr
+                        to loptr[], i=2, returns ptr to hiptr.
+
+dirio(rw)               Refresh of save the directory
+                        pointer arrays: rw=1 (write) gives a
+                        save to disk, rw=2 (read) gives a
+                        refresh from disk.
+/** operating system written in Small-C         **/
+/** Brian McKeon 5/5/82                 **/
+#define eol 10          /* end of line char */
+#define bufsiz  512     /* disk buffer size */
+/** some memory control         **/
+#define usrprg 256 /* start and entry point of user program */
+int memmap[8];          /* bitmap of 512 byte blocks of memory */
+/** and directory structure     **/
+#define dirone 22  /* ptr to 1st grp of glinks-loptr-hiptr  */
+#define lnksiz 500 /* one link per 'bufsiz' bytes */
+int glinks[lnksiz];
+#define ptrsiz 50  /* seems to be enough */
+int loptr[ptrsiz];
+int hiptr[ptrsiz];
+/** First few pointer pairs have special functions **/
+/** zero ptrs are set to to 0 as traps                  **/
+#define rsvptrs 4  /* reserved system pointer pairs */
+#define sysdir loptr[1] /* ptr to system dir struct */
+#define userdir loptr[2] /* ptr to root dir of user */
+#define workdir loptr[3] /* ptr to -current- user dir structure */
+#define freptr hiptr[1] /* ptr to free dotted pair list */
+#define grpfree hiptr[2] /* ptr to first free disk group */
+/** i/o structures              **/
+int stdout;     /* and for standard output */
+#define maxunits 10     /* max no. simul open files */
+#define minunit 2  /* 0, 1 reserved for console and communication port */
+int grw[maxunits]; /* 0 if free, 'rdfn' for read and 'wrfn', write */
+#define rdfn 1
+#define wrfn 2
+#define apfn 3  /* append, used for openf call only */
+/** structures to keep track of file i/o **/
+int firgrp[maxunits];   /* first group of a file group list */
+int lnkgrp[maxunits];   /* link group for sequential i/o */
+int gbuffs[maxunits];   /* addr of the buffers assoc with a unit */
+int gptrs[maxunits];    /* pointers into these buffers */
+char sysinp[bufsiz];    /* system input buffer */
+char sysout[bufsiz];    /* and output buffer */
+/** command line argument passing to user programs **/
+int argc;               /* argument count */
+int argv[10];           /* array of ptrs to argument strings */
+/** line input buffer - argv[] strings **/
+#define maxlin 128 /* max line input size */
+char linbuf[maxlin];    /* line input buffer */
+/** main entry point for system **/
+/* call the system with the desired i/o parameters */
+/* with arg0 the number of the system call  */
+/*                              */
+#asm
+    org 0a000h
+#endasm
+                /* 0a000 gives blocks 1 to 79 spare */
+#define maxblk 77 /* leave a couple of blocks for stack */
+system(arg0,arg1,arg2,arg3)
+    int arg0,arg1,arg2,arg3;
+{
+int munit,savedir;
+if(arg0==0)return (puts(arg1));         /* put str to std err */
+if(arg0==1)return (getc(arg1));         /* char fetch */
+if(arg0==2)return (putc(arg1,arg2));    /* char put */
+if(arg0==3)return (readf(arg1));        /* sequential read */
+if(arg0==4)return (writef(arg1));       /* sequential write */
+if(arg0==5)return (openf(arg1,arg2,arg3)); /* open a file */
+if(arg0==6)return (creatf(arg1,arg2));  /* create a file */
+if(arg0==7)return (closf(arg1));        /* close a unit */
+if(arg0==8)return (readr(arg1,arg2));   /* read random grp */
+if(arg0==9)return (writer(arg1,arg2));  /* write random */
+if(arg0==10)return (scndir(arg1));      /* scan dir for file name */
+if(arg0==11)return (chdir(arg1));       /* change directory */
+if(arg0==12)return (mkdir(arg1));       /* make new dir */
+if(arg0==13)return (rmfil(arg1,arg2));  /* remove file-directory */
+if(arg0==14)return (alloc());   /* get addr of free blk */
+if(arg0==15)return (dalloc(arg1));      /* de-alloc a mem blk */
+if(arg0==16)return (dirfn(arg1));       /* give addr of dir in mem */
+if(arg0==17)dirio(wrfn); /* go system, save the dir */
+else {inits();dirio(rdfn);
+        puts("illegal system call >17: directory restored/n");
+        }
+while(1)        /* command interpreter loop */
+        {
+        inits();        /* re-initialize stk, i/o, hardware */
+        puts("$ ");             /* prompt to user */
+        if((munit=getlin(linbuf))==0)continue; /* get command */
+        if(parslin(linbuf,munit)==0     /* parse into argc, argv */
+                continue;       /* on parse error */
+        if((munit=openf(argv[0],sysinp,rdfn))==0)
+                {
+                if(workdir==svsdir){puts("open error/n");continue;}
+                else
+                        {
+                        savedir=workdir; /* save the working dir */
+                        workdir=sysdir; /* and look in the sys dir */
+                        munit=openf(argv[0],sysinp,rdfn);
+                        workdir=savedir;
+                        if(munit==0){puts("open error/n");continue;}
+                        }
+                }
+        if(loadf(munit)==0)continue; /* and load the file */
+        closf(munit);   /* close the loader unit */
+        usrprg(argc,argv);      /* call the loaded user program */
+        closf(stdout);          /* flush the output if any */
+        dirio(wrfn);            /* and save the dir */
+        }
+    }
+/* get the next line of input from the console */
+/* all white space is replaced by nulls (0) for parsing */
+#define backsp 8
+getlin(buffa)
+    char buffa[];
+    {
+    int k;
+    char c;
+    k=0;
+    while(k<maxlin)
+        {
+        c=inchar();
+        if(c==eol)break;
+        if(c==backsp)
+                {
+                if(k){--k;outchar(c);}
+                continue;
+                }
+        if(c<=' ')c=0;
+        buffa[k++]=c;
+        }
+    buffa[k]=0;
+    return k;
+    }
+/* parse a line into argc, argv and also re-direct i/o */
+parslin(str,nchar)
+    char str[];
+    int nchar;
+    {
+    int pt,endarg;
+    char lastc;
+    pt=argc=0;
+    argv[0]=&str[0];
+    while(1)
+        {
+        while(str[pt])++pt;     /* move over argument */
+        while(str[pt]==0)++pt;  /* and nulls */
+        if(pt>nchar)break;      /* finished? */
+        if(str[pt]=='>')        /* check for re-direction */
+                {
+                if((stdout=creatf(&str[pt+1],sysout))==0)
+                        {puts("i/o redirecteion error/n");return 0;}
+                }
+        else if(str[pt]=='<')
+                {
+                if((stdin=openf(&str[pt+1],sysinp,rdfn))==0)
+                        {puts("i/o redirection error/n");return 0;}
+                }
+        else argv[++argc]=&str[pt];
+        ;
+    return ++argc;
+    }
+/* open a given file name for file i/o */
+/* from the current directory           */
+/* rw is 'rdfn' for input, 'wrfn' for output and 'apfn' for append */
+openf(name,buffer,rw)
+    char name[],buffer[];
+    int rw;
+    {
+    int filno;
+    if((filno=scndir(name))==0)return 0;        /* find file name */
+    return (openit(filno,buffer,rw));
+    }
+/* lower level open operates from number entry of file in dir */
+/* for example 1 would open the dir file itself         */
+/* the append function should only be used with null terminated */
+/* files as it searches for this null char.     */
+openit(filno,buffer,rw)
+    int filno;
+    char buffer[];
+    int rw;
+    {
+    int i,k,grp;
+    i=workdir;
+    while(--filno)i=loptr[i]; /* down the dir list */
+    if(hiptr[i]<0)return 0;     /* attempting to open dir? */
+    if((filno=findio())==0)return 0; /* any i/o units left? */
+    firgrp[filno]=hiptr[i];     /* pointer to first grp of file */
+    gbuffs[filno]=buffer;       /* setup buffer location */
+    if(rw==rdfn)        /* read? */
+        {
+        grw[filno]=rdfn;
+        lnkgrp[filno]=hiptr[i];/* read from this first group */
+        gptrs[filno]=bufsiz;    /* initialize the pointer */
+        }                                                    /* DDJ page 44 */
+    else if(rw==wrfn)           /* write ? */
+        {
+        frefil(fiptr[i]);       /* free up the old groups */
+        hiptr[i]=0;             /* initially append null */
+        grw[filno]=wrfn;        /* write */
+        lnkgrp[filno]=-i;       /* by -, indicate a link to the dir! */
+        gptrs[filno]=0;         /* initialize the pointer */
+        }
+    else if(rw==apfn)           /* append ? */
+        {
+
+        /* get to the last group */
+        grp=hiptr[i];
+        if(glinks[grp]==0)lnkgrp[filno]=-i;
+        else
+                {
+                while(glinks[glinks[grp]]!=0)grp=glinks[grp];
+                lnkgrp[filno]=grp; /* 2nd last grp */
+                grp=glinks[grp];        /* last grp */
+                }
+        if(grpio(grp,buffer,rdfn)==0)return 0; /* read last grp */
+        frefil(grp);    /* and give it up */
+        grw[filno]=wrfn;
+        k=0;                                               /* DDJ page 45 */
+        while(buffer[k]!=0)++k; /* go to the old eof */
+        gptrs[filno]=k;         /* pointer now ready for append */
+        }
+    return filno;
+    }
+/* create a file */
+creatf(name,buffa)
+        char name[],buffa[];
+        {
+        int unit,k,1,newfree;
+        if((grpfree==0)|(freptr==0)|(name[0]==0))return 0;
+        if(unit=openf(name,buffa,wrfn))return unit; /* in the dir? */
+        if((unit=openit(1,buffa,apfn))==0)return 0; /* no, open the dir */
+        k=workdir;              /* and append the file */
+        while(loptr[k])k=loptr[k];      /* go down the dir list */
+        newfree=loptr[freptr];          /* get a new free pointer */
+        loptr[k]=freptr;        /* and add to the directory */
+        loptr[freptr]=0;        /* append a null */
+        hiptr[freptr]=0;        /* and no groups */
+        freptr=newfree;         /* up-date free pointer */
+        1=0;    /* errors after this point are fatal */
+        while(name[1]) /* append the name */
+                if(putc(name[1++],unit)==0)     /* to the dir file */
+                        createrr(k);
+        if(putc(eol,unit)==0)
+                createrr(k);
+        closf(unit);    /* and close the directory */
+        return (openf(name,buffa,wrfn)); /* openf should now work */
+        }
+/* fatal error routine from create function */
+/* dont flush the dir buffer as there is an error somewhere */
+createrr(k)
+        int k;
+        {
+        int oldfree;
+        oldfree=freptr;
+        freptr=loptr[k];
+        loptr[k]=0;     /* re-terminate the dir */
+        loptr[freptr]=oldfree;
+        puts("fatal failure on file create/n");
+        system(17,0,0,0);       /* and try to recover */
+        }
+/* close a given unit number */
+closf(unit)
+        int unit;
+        {
+        int k;
+        k=1; /* default return value */
+        if(unit<minunit)return 0;       /* trap illegal close */
+        if((grw[unit]==wrfn)&(gptrs[unit]!=0))  /* write required? */
+                k=writef(unit);
+        grw[unit]=0;    /* now free up this unit */
+        return k;
+        }                                               /* DDJ page 46 */
+/* look for a spare unit number else return 0 */
+findio()
+        {
+        int k;
+        k=minunit;
+        while(k<maxunits)
+                {if(grw[k]==0)return k;++k;}
+        return 0;
+        }
+/* scan a directory for a matching line to the given one */
+/* and return a number 1 to n, else zero if not found */
+scndir(name)
+        char name[];
+        {
+        int linnum,munit,k,flg;
+        char c;
+        if(name[0]==0)return 0;
+        if((munit=openit(1,sysinp,rdfn))==0)return 0; /* open dir for read */
+        linnum=0;
+        while(1)
+                {
+                flg=1;
+                k=0;
+                ++linnum;
+                while(1)
+                        {
+                        if((c=getc(munit))==0){closf(munit);return 0;}
+                        if(c==eol)break;
+                        if(c!=name[k++])flg=0;
+                        }
+                if((name[k]==0)&flg){closf(munit);return linnum;}
+                }
+        }
+
+/* put an error message to the console */
+puts(str)
+        char str[];
+        {
+        int j;
+        j=0;
+        while((outchar(str[j++]))!=0;
+        }
+
+/* get a character from a given unit number */
+getc(unit)
+        int unit;
+        {
+        char c;
+        if(unit==0)unit=stdin;  /* standard in? - re-firect */
+        if(unit==0)return (inchar());   /* console port */
+        if(unit==1)return (incom());    /* communication port */
+        if(grw[unit]!=rdfn)return 0;    /* open for read? */
+        if(gptrs{unit}==bufsiz)         /* get pointer - empty? */
+                if(readf(unit)==0)return 0;
+        c=*(gbuffs[unit]+gptrs[unit]);
+        ++gptrs[unit];
+        return c;
+        }                                               /* DDJ page 47 */
+
+/* sequential read of file */
+readf(unit)
+        int unit;
+        {
+        int nxtgrp;
+        if(grw[unit]!=rdfn)return 0;
+        gptrs[unit]=0;
+        nxtgrp=lnkgrp[unit];
+        lnkgrp[unit]=glinks[nxtgrp];    /* update grp no. */
+        return (grupio(nxtgrp,gbuffs[unit],rdfn));      /* refill buffer */
+        }
+/* random read of file group, range 0 to N */
+readr(unit,grpno)
+        int unit,grpno;
+        {
+        int rdgrp;
+        if(grw[unit]!=rdfn)return 0;
+        rdgrp=firgrp[unit];
+        while(grpno--)rdgrp=glinks[rdgrp];      /* down the file grp list */
+        return (grupio(rdgrp,gbuffs[unit],rdfn));
+        }
+/* put a character to a given i/o unit */
+putc(c,unit)
+        char c;
+        int unit;
+        {
+        if(unit==0)unit=stdout;         /* standard out? - redirect */
+        if(unit==0)return (outchar(c));         /* console port */
+        if(unit==1)return (outcom(c));  /* communication port */
+        if(grw[unit]!=wrfn)return 0;    /* write unit? */
+        if(gptrs[unit]==bufsiz)         /* full buffer? */
+                if(writef(unit)==0)return 0;
+        *(gbuffs[unit]+gptrs[unit])=c;
+        ++gptrs[unit];
+        return c;
+        }
+/* write sequential to given unit */
+writef(unit)
+        int unit;
+        {
+        int newgrp;
+        if(grw[unit]!=wrfn)return 0;
+        gptrs[unit]=0;
+        newgrp=fregrp();        /* get a new group */
+        if(lnkgrp[unit]>0)glinks[lnkgrp[unit]]=newgrp;  /* link */
+        else hiptr[-lnkgrp[unit]]=newgrp;       /* special case: link to dir */
+        lnkgrp[unit]=newgrp;    /* and ready for next call */
+        return (grupio(newgrp,gbuffs[unit],wrfn));
+        }
+/* random write of file group, range 0 to N */
+writer(unit,grpno)
+        int unit,grpno;
+        {
+        int wrgrp;
+        if(grw[unit]!=wrfn)return 0;
+        wrgrp=firgrp[unit];
+        while(grpno--)wrgrp=glinks[wrgrp];      /* down the file grp list */
+        return (grupio(wrgrp,gbuffs[unit],wrfn));
+        }
+/* free up a list of groups */
+frefil(grp)
+        int grp;
+        {
+        int fgrp; /* a pointer to the first free group */
+        if(grp==0)return 0;     /* dont lose the free list */
+        fgrp=grpfree;   /* a pointer to the first free group */
+        grpfree=grp;    /* a point free list at the file */
+        while(glinks[grp])grp=glinks[grp];      /* go to end of file */
+        glinks[grp]=fgrp;       /* and link on the old free list */
+        }
+/* get a free group */
+/* null terminate */
+fregrp()
+        {
+        int grp;
+        grp=grpfree;    /* find the next free group */
+        grpfree=glinks[grp];    /* update the free pointer */
+        glinks[grp]=0; /* and null terminate the returned group link */
+        return grp;
+        }
+/* load a program, checking for oversize and for jump at start */
+loadf(unit)
+        int unit;
+        {
+        int grp,addr,blk;
+        char ujump;
+        grp=lnkgrp[unit];       /* get the first group */
+        addr=usrprg;            /* load into the user area */
+        blk=addr>>9;            /* and allocate mem as you go */
+        while(grp)
+                {
+                if(blk==maxblk){puts("program too large\n");return 0;}
+                if(grupio(grp,addr,rdfn)==0){puts("load error\n");return 0;}
+                addr=addr+bufsiz;
+                fixblk(++blk);          /* allocate the mem */
+                grp=glinks[grp];
+                }
+        ujump=*usrprg;  /* should be the jump byte if a program */
+        if(ujump!=-61){puts("not a program\n");return 0;}
+        return 1;
+        }                                       /* DDJ page 51 */
+/* save/restore the directory structure to/from disk */
+dirio(rdwr)
+        int rdwr;
+        {
+        int grp,addr;
+        grp=dirone;
+        addr=glinks;
+        while(grp)
+                {
+                if(grupio(grp,addr,rdwr)==0)return 0;
+                grp=glinks[grp];
+                addr=addr+bufsiz;
+                }
+        }
+/* change work directory */
+chdir(name)
+        char name[];
+        {
+        int pt,n;
+        if(name==0){workdir=userdir;return;}
+        if((n=scndir(name))==0)return 0;
+        pt=workdir;
+        while(--n)pt=loptr[pt];         /* down the dir list */
+        if(hiptr[pt]>0)return 0;        /* not a directory */
+        workdir=-hiptr[pt];     /* it is a dir, change */
+        }
+/* make a new directory */
+mkdir(name)
+        char name[];
+        {
+        int pt,n,newfree;
+        if(n=openf(name,sysinp,rdfn))
+                {closf(n);return 0;}    /* name is in use ! */
+        if((n=creatf(name,sysinp))==0)return 0;         /* cannot create */
+        closf(n);       /* got the name entry, close it */
+        pt=workdir;
+        while(loptr[pt])=loptr[pt];     /* name must be last on dir-list */
+        newfree=loptr[freptr];          /* get the new free pointer */
+        hiptr[pt]=-freptr;      /* link on a call (- to indic dir) */
+        pt=freptr;
+        freptr=newfree;         /* update the freptr */
+        loptr[pt]=0;    /* empty dir */
+        hiptr[pt]=fregrp();     /* qnd the directory file grp itself */
+        return (grupio(hiptr[pt],".\n",wrfn));  /* dir contains '.' only */
+        }       /* i.e. itself */
+/* remove a directory-file structure */
+rmfil(name,flg)
+        char name[];
+        int flg;
+        {
+        int n,i,preptr,pt,postptr;
+        if((n=scndir(name))==0)return 0;        /* in the dir? */
+        i=n;
+        --i;
+        if(i==0)return 0;       /* dont allow rmfil(".",x) */
+        preptr=workdir;         /* and go to the link before the entry */
+        while(--i)preptr=loptr[preptr];
+        pt=loptr[preptr];       /* the entry */
+        postptr=loptr[pt];      /* and the one after */
+        if((hiptr[pt]<0)&(flg!=1))return 0;     /* remove dir? */
+        if(rmname(n)==0)return 0;       /* now remove the n th. name */
+        loptr[preptr]=postptr;          /* link around */
+        loptr[pt]=0;    /* and terminate to restrain 'remove' */
+        remove(pt);
+        return 1;
+        }
+/* remove the n th. name from the work directory *.
+rmname(n)
+        int n;
+        {
+        int obuf,ibuf,ounit,iunit,1,wrtflg;
+        char c;
+        wrtflg=obuf=iunit=ounit=0;
+        while(1)        /* but only used for one-pass flow control */
+                {
+                if((ibuf=alloc())==0)return 0;
+                if((obuf=alloc())==0)break;
+                if((iunit=openit(1,ibuf,rdfn))==0)break;
+                if((ounit=openit(1,obuf,wrfn))==0)break;
+                l=1
+                wrtflg=1        /* writing flag */
+                while(c=getc(iunit))                    /* DDJ page 53 */
+                        {
+                        if(n==l)wrtflg=0; /* suppress this entry? */
+                        if(wrtflg)putc(c,ounit);
+                        if(c==eol){++l;wrtflg=1;}
+                        }
+                putc(0,ounit);
+                wrtflg=1;break;
+                }
+        closf(iunit);closf(ounit);dalloc(ibuf);dalloc(obuf);
+        return wrtflg; /* will be 0 on an error */
+        }
+/* recursive remove of dir-file structure */
+remove(pt)
+        int pt;
+        {
+        int newfree;
+        while(pt) /* down the dir list */
+                {
+                if(hiptr[pt]<0)remove((-hiptr[pt]));    /* if a dir */
+                else frefil(hiptr[pt]);         /* or if a file */
+                newfree=pt;     /* now add this loptr.hiptr to free list */
+                pt=loptr[pt];   /* pt onto next in list */
+                loptr[newfree]=freptr;  /* link on the old free list */
+                freptr=newfree; /* and update the free pointer */
+                }
+        }
+/* return the addr of the next free top blk of mem */
+alloc()
+        {
+        int blk;
+        blk=maxblk;
+        while(blk)
+                if(blkfree(--blk))break;
+        fixblk(blk);    /* fix this block */
+        return (blk<<9);        /* and return the addr */
+        }
+/* fix a block of mem for use, given the block no */
+fixblk(blk)
+        int blk;
+        {
+        int bits,words;
+        words=blk>>4;
+        bits=blk-(words<<4);
+        bits=-(1+(1<<bits));    /* complement for mask */
+        memmap[words]=bits&memmap[words];
+        }
+/* is the given block number free ?: returns 1 if true, else 0 */
+blkfree(blk)
+        int blk;
+        {
+        int bits,words;
+        words=blk>>4;
+        bits=blk-(words<<4);
+        return ((1<<bits)&(memmap[words]));
+        }
+/* free up the given block corresponding to the given addr */
+dalloc(addr)
+        int addr;
+        {
+        int bits,words,blk;
+        addr=32767&(addr>>1);   /* take care to mask */
+        blk=addr>>8;    /* and then calc the blk no. */
+        if(blk==0)return;       /* trap */
+        words=blk>>4;
+        bits=blk-(words<<4);
+        memmap[words]=memmap[words]|(1<<bits);
+        }
+/* return the location of a directory structure */
+dirfn(arg)
+        int arg;
+        {
+        if(arg==0)return glinks;
+        if(arg==1)return loptr;
+        if(arg==2)return hiptr;
+        }
+inchar()
+        {
+        char c;
+        c=conin();      /*the machine code char input */
+        if(c>=' ')outchar(c);   /*if not a control char */
+        if(c==13)return outchar(eol);   /* carr-ret to eol */
+        if(c==4)return 0;  /* control-d ret null */
+        return c;
+        }
+outchar(c)
+        char c;
+        {
+        if(c==eol)conout(13);   /* insert a carraige return if eol */
+        return (conout(c));
+        }
+#include shlibr.c                       /* end listing one DDJ page 56 */
+/* this library is simply the routines ccgchar-cmpbcde from DDJ 48 */
+                                /* initialize stack, i/o and hardware etc. */
+inits()
+        {
+        int i;
+        #asm
+        mvi     a,0c3h  ;fix up the system call location at zero
+        sta     0
+        lxi     h,system
+        shld    1
+        lxi     h,system_4
+        pop     b       ;the local variable 'i'
+        pop     b       ;and the return addr
+        sphl
+        push    b       ;the return addr
+        push    b       ;and 'i'
+        #endasm
+        stdin=stdout=0; /* std in, out via console */
+        i=8;    /* now book up all memory */
+        while(i)memmap[--i]=0;  /* and free up user area */
+        i=maxblk;
+        while(--i)dalloc(i<<9); /* leaves zero block not free */
+        i=0;
+        while(++i<maxunits)grw[i]=0;
+        loptr[0]=hiptr[0]=glinks[0]=0;  /* trap errors */
+        }
+/* get/put a group to disk      /*
+/* to/from a given dma address          /*
+/* returns 1 if o.k., 0 if error */
+#define sectrk 26       /* 26 by 128 byte sectors per track */
+                /* conversions in the next section */
+                /* assume a 512 byte bufsiz !!!         /*
+grupio(group,addr,io)
+        int group,addr,io;
+        {
+        int track,sector,memad;
+        if(group==0)return 0;
+        track=(group<<1)/13;
+        sector=(group<<2)-track*26;     /* 0 to 25 range not 1 to 26! */
+/***** insert routines to read/write 4 sequential sectors *****/
+        }
+/* Save a specified number of blocks of memory into a specified file */
+/* The blocks of memory are assumed to start at 2560 (0A00H)    /*
+#define bufsiz 512
+char buff[bufsiz];
+main(argc,argv)
+        int argc,argv[];
+        {
+        int unit,ngrp,grp,addr;
+        if(argc!=3){puterr("\nWrong no. of args");return;}
+        if((unit=creatf(argv[1],buff))==0)
+                {puterr("\nCannot open file");return;}
+        if((ngrp=todec(argv[2]))==0){puterr("\nHow many blocks?");return;}
+        addr=2560;      /* first location saved */
+        while(ngrp--)
+                {
+                move(addr,buff);
+                if(writef(unit)==0){puterr("n\Write error");return;}
+                addr=addr+bufsiz;
+                }
+        closf(unit);
+        puterr("n\Successful save");
+        }
+/* move a buffer in memory */
+move(from,to)
+        char from[],to[];
+        {
+        int k;
+        k=0;
+        while(k<bufsiz)
+                to[k]=from[k++];
+        }
+/* convert a string to an integer: return 0 on error */
+/* routine straight from small-c compiler       */
+todec(str)
+        char str[];
+        {
+        int k,n,c;
+        n=k=0;
+        while(c=str[k++])
+                {
+                c=c-'0';
+                if((c<0)|(c>9))return 0;
+                n=10*n+c;
+                }
+        return n;
+        }
+#include syslib.c
+End of program.
+This program 'rm' enables the removal of files.
+It is set up so as to be not able to remove directories.
+
+
+#include syslib.c
+main(argc,argv)
+        int argc,argv[];
+        {while(--argc)rmfil(argv[argc],0);}
+End of program.
+/* Gives statistics of number of free dotted pairs and groups left */
+/* If any arguments are given it will give the size of these files */
+#include syslib.c
+main(argc,argv)
+        int argc,argv[];
+        {
+        int pt,n,i,glinks[],loptr[],hiptr[];
+        glinks=dirfn(0);
+        loptr=dirfn(1);
+        hiptr=dirfn(2);
+        i=1;
+        while(i<argc)           /* for any given file names */
+                {
+                if((n=scndir(argv[i]))==0)continue;
+                pt=loptr[3];    /* the working dir ptr */
+                while(--n)pt=loptr[pt]; /* go to the files dotted pair */
+                pt=hiptr[pt];   /* a pointer to the file */
+                if(pt>0)
+                        {
+                        n=size(pt,glinks);
+                        if(n<0)puts(" corrupted file structure in ");
+                        else {outdec(n);puts(" groups in");}
+                        puts(argv[i++];puts("\n");
+                        }
+                }
+        pt=hiptr[1];
+        n=size(pt,loptr);       /* find the no. of free nodes */
+        if(n<0)puts(" free node list is corrupted\n");
+        else outdec(n);puts(" free nodes left\n");
+        pt=hiptr[2];
+        n=size(pt,glinks);      /* find the no of free grps left */
+        if(n<0)puts("\n free group list is corrupted\n");
+        else outdec(n);puts(" free groups left\n");
+        }
+size(pt,array)
+        int pt,array[];
+        {
+        int n;
+        n=0;
+        while(pt)
+                {
+                pt=array[pt];
+                if(++n>32000){n=-1;break;}
+                }
+        return n;
+        }
+puts(str)
+        char str[];
+        {
+        int k;
+        k=0;
+        while(putchar(str[k++1]));
+        }
+outdec(num)
+        int num;
+        {
+        int k,zs;
+        char c;
+        zs=0;
+        k=10000;
+        if(num<0){num=(-num);putchar('-');}
+        while(k>=1)
+                {
+                c=num/k+'0';
+                if((c!='0')|(k==1)|(zs))
+                        {zs=1;putchar(c);}
+                num=num%k;
+                k=k/10;
+                }
+        }
+/* library for small-c system programs */
+#asm
+sys equ 0
+#endasm
+
+/* some definitions */
+#define rdfn 1  /* file read function */
+#define wrfn 2  /* write function */
+#define apfn 3  /* and append */
+#define bufsiz 512
+#define eol 10
+puterr(str)
+        char str[];
+        {sys(0,str,0,0);}
+getchar()
+        {sys(1,0,0,0);}
+putchar(c)
+        char c;
+        {sys(2,c,0,0);}
+getc(unit)
+        int unit;
+        {sys(1,unit,0,0);}
+putc(c,unit)
+        char c;
+        int unit;
+        {sys(2,c,unit,0);}
+readf(unit)
+        int unit;
+        {sys(3,unit,0,0);}
+writef(unit)
+        int unit;
+        {sys(4,unit,0,0);}
+openf(name,buff,fn)
+        char name[],buff[];
+        int fn;
+        {sys(5,name,buff,fn);}
+creatf(name,buff)
+        char name[],buff[];
+        {sys(6,name,buff,0);}
+closf(unit)
+        int unit;
+        {sys(7,unit,0,0);}
+readr(unit,n)
+        int unit,n;
+        {sys(8,unit,n,0);}
+writer(unit,n)
+        int unit,n;
+        {sys(9,unit,n,0);}
+scndir(name)
+        char name[];
+        {sys(10,name,0,0);}
+chdir(name)
+        char name[];
+        {sys(11,name,0,0);}
+mkdir(name)
+        char name[];
+        {sys(12,name,0,0);}
+rmfil(name,flg)
+        char name[];
+        int flg;
+        {sys(13,name,flg,0);}
+alloc()
+        {sys(14,0,0,0);}
+dalloc(addr)
+        int addr;
+        {sys(15,addr,0,0);}
+dirfn(arg)
+        int arg;
+        {sys(16,arg,0,0);}
+gosys()
+        {sys(17,0,0,0);}
+#asm
+;fetch a single byte from the address in hl into hl
+The routines are as in DDJ 48 but only the routines
+'ccgchar' to 'cmpbcde'
+#endasm
+%
+ls -l
+
+

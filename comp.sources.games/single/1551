@@ -1,0 +1,1999 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,b3090c3a2f6a4224,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1993-01-29 12:45:33 PST
+Path: sparky!uunet!news.tek.com!master!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v16i028:  nethack31 - display oriented dungeons & dragons (Ver. 3.1), Part28/108
+Message-ID: <4316@master.CNA.TEK.COM>
+Date: 29 Jan 93 20:45:33 GMT
+Sender: news@master.CNA.TEK.COM
+Lines: 1983
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: izchak@linc.cis.upenn.edu (Izchak Miller)
+Posting-number: Volume 16, Issue 28
+Archive-name: nethack31/Part28
+Supersedes: nethack3p9: Volume 10, Issue 46-102
+Environment: Amiga, Atari, Mac, MS-DOS, OS2, Unix, VMS, X11
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 28 (of 108)."
+# Contents:  src/pray.c sys/amiga/amiwbench.c
+# Wrapped by billr@saab on Wed Jan 27 16:08:57 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'src/pray.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'src/pray.c'\"
+else
+echo shar: Extracting \"'src/pray.c'\" \(41023 characters\)
+sed "s/^X//" >'src/pray.c' <<'END_OF_FILE'
+X/*	SCCS Id: @(#)pray.c	3.1	92/12/10	*/
+X/* Copyright (c) Benson I. Margulies, Mike Stephenson, Steve Linhart, 1989. */
+X/* NetHack may be freely redistributed.  See license for details. */
+X
+X#include "hack.h"
+X#include "epri.h"
+X
+XSTATIC_PTR int NDECL(prayer_done);
+Xstatic int NDECL(in_trouble);
+Xstatic void FDECL(fix_worst_trouble,(int));
+Xstatic void FDECL(angrygods,(ALIGNTYP_P));
+Xstatic void FDECL(pleased,(ALIGNTYP_P));
+Xstatic void FDECL(godvoice,(ALIGNTYP_P,const char*));
+Xstatic void FDECL(gods_angry,(ALIGNTYP_P));
+Xstatic void FDECL(gods_upset,(ALIGNTYP_P));
+Xstatic void FDECL(consume_offering,(struct obj *));
+Xstatic boolean FDECL(water_prayer,(BOOLEAN_P));
+X
+X/*
+X * Logic behind deities and altars and such:
+X * + prayers are made to your god if not on an altar, and to the altar's god
+X *   if you are on an altar
+X * + If possible, your god answers all prayers, which is why bad things happen
+X *   if you try to pray on another god's altar
+X * + sacrifices work basically the same way, but the other god may decide to
+X *   accept your allegiance, after which they are your god.  If rejected,
+X *   your god takes over with your punishment.
+X * + if you're in Gehennom, all messages come from the chaotic god
+X */
+Xstatic
+Xstruct ghods {
+X	char	classlet;
+X	const char *law, *balance, *chaos;
+X}  gods[] = {
+X{'A', /* Central American */	"Quetzalcoatl", "Camaxtli", "Huhetotl"},
+X{'B', /* Hyborian */		"Mitra", "Crom", "Set"},
+X{'C', /* Babylonian */		"Anu", "Ishtar", "Anshar"},
+X{'E', /* Elven */		"Solonor Thelandira",
+X					"Aerdrie Faenya", "Erevan Ilesere"},
+X{'H', /* Greek */		"Athena", "Hermes", "Poseidon"},
+X{'K', /* Celtic */		"Lugh", "Brigit", "Macannan Mac Lir"},
+X{'P', /* Chinese */		"Shan Lai Ching", "Chih Sung-tzu", "Huan Ti"},
+X{'R', /* Nehwon */		"Issek", "Mog", "Kos"},
+X{'S', /* Japanese */		"Amaterasu Omikami", "Raiden", "Susanowo"},
+X#ifdef TOURIST
+X{'T', /* Discworld */		"Blind Io", "The Lady", "Offler"},
+X#endif
+X{'V', /* Norse */		"Tyr", "Odin", "Loki"},
+X{'W', /* Egyptian */		"Ptah", "Thoth", "Anhur"},
+X{0,0,0,0}
+X};
+X
+X/*
+X *	Moloch, who dwells in Gehennom, is the "renegade" cruel god
+X *	responsible for the theft of the Amulet from Marduk, the Creator.
+X *	Moloch is unaligned.
+X */
+Xstatic const char	*Moloch = "Moloch";
+X
+Xstatic const char *godvoices[] = {
+X    "booms out",
+X    "thunders",
+X    "rings out",
+X    "booms",
+X};
+X
+X/* values calculated when prayer starts, and used when completed */
+Xstatic aligntyp p_aligntyp;
+Xstatic int p_trouble;
+Xstatic int p_type; /* (-1)-3: (-1)=really naughty, 3=really good */
+X
+X#define PIOUS 20
+X#define DEVOUT 14
+X#define FERVENT 9
+X#define STRIDENT 4
+X
+X#define TROUBLE_STONED 10
+X#define TROUBLE_STRANGLED 9
+X#define TROUBLE_LAVA 8
+X#define TROUBLE_SICK 7
+X#define TROUBLE_STARVING 6
+X#define TROUBLE_HIT 5
+X#define TROUBLE_LYCANTHROPE 4
+X#define TROUBLE_STUCK_IN_WALL 3
+X#define TROUBLE_CURSED_BLINDFOLD 2
+X#define TROUBLE_CURSED_LEVITATION 1
+X
+X#define TROUBLE_PUNISHED (-1)
+X#define TROUBLE_CURSED_ITEMS (-2)
+X#define TROUBLE_BLIND (-3)
+X#define TROUBLE_HUNGRY (-4)
+X#define TROUBLE_POISONED (-5)
+X#define TROUBLE_WOUNDED_LEGS (-6)
+X#define TROUBLE_STUNNED (-7)
+X#define TROUBLE_CONFUSED (-8)
+X#define TROUBLE_HALLUCINATION (-9)
+X
+X/* We could force rehumanize of polyselfed people, but we can't tell
+X   unintentional shape changes from the other kind. Oh well. */
+X
+X/* Return 0 if nothing particular seems wrong, positive numbers for
+X   serious trouble, and negative numbers for comparative annoyances. This
+X   returns the worst problem. There may be others, and the gods may fix
+X   more than one.
+X
+XThis could get as bizarre as noting surrounding opponents, (or hostile dogs),
+Xbut that's really hard.
+X */
+X
+X#define ugod_is_angry() (u.ualign.record < 0)
+X#define on_altar()	IS_ALTAR(levl[u.ux][u.uy].typ)
+X#define on_shrine()	((levl[u.ux][u.uy].altarmask & AM_SHRINE) != 0)
+X#define a_align(x,y)	((aligntyp)Amask2align(levl[x][y].altarmask & ~AM_SHRINE))
+X
+Xstatic int
+Xin_trouble()
+X{
+X	register struct obj *otmp;
+X	int i, j, count=0;
+X
+X/* Borrowed from eat.c */
+X
+X#define	SATIATED	0
+X#define NOT_HUNGRY	1
+X#define	HUNGRY		2
+X#define	WEAK		3
+X#define	FAINTING	4
+X#define FAINTED		5
+X#define STARVED		6
+X
+X	if(Stoned) return(TROUBLE_STONED);
+X	if(Strangled) return(TROUBLE_STRANGLED);
+X	if(u.utrap && u.utraptype == TT_LAVA) return(TROUBLE_LAVA);
+X	if(Sick) return(TROUBLE_SICK);
+X	if(u.uhs >= WEAK) return(TROUBLE_STARVING);
+X	if(u.uhp < 5 || (u.uhp*7 < u.uhpmax)) return(TROUBLE_HIT);
+X#ifdef POLYSELF
+X	if(u.ulycn >= 0) return(TROUBLE_LYCANTHROPE);
+X#endif
+X	for (i= -1; i<=1; i++) for(j= -1; j<=1; j++) {
+X		if (!i && !j) continue;
+X		if (!isok(u.ux+i, u.uy+j) || IS_ROCK(levl[u.ux+i][u.uy+j].typ))
+X			count++;
+X	}
+X	if(count==8
+X#ifdef POLYSELF
+X	    && !passes_walls(uasmon)
+X#endif
+X	    ) return(TROUBLE_STUCK_IN_WALL);
+X	if((uarmf && uarmf->otyp==LEVITATION_BOOTS && uarmf->cursed) ||
+X		(uleft && uleft->otyp==RIN_LEVITATION && uleft->cursed) ||
+X		(uright && uright->otyp==RIN_LEVITATION && uright->cursed))
+X		return(TROUBLE_CURSED_LEVITATION);
+X	if(ublindf && ublindf->cursed) return(TROUBLE_CURSED_BLINDFOLD);
+X
+X	if(Punished) return(TROUBLE_PUNISHED);
+X	for(otmp=invent; otmp; otmp=otmp->nobj)
+X		if((otmp->otyp==LOADSTONE || otmp->otyp==LUCKSTONE) &&
+X			otmp->cursed)
+X		    return(TROUBLE_CURSED_ITEMS);
+X	if((uarmh && uarmh->cursed) ||	/* helmet */
+X	   (uarms && uarms->cursed) ||	/* shield */
+X	   (uarmg && uarmg->cursed) ||	/* gloves */
+X	   (uarm && uarm->cursed) ||	/* armor */
+X	   (uarmc && uarmc->cursed) ||	/* cloak */
+X	   (uarmf && uarmf->cursed && uarmf->otyp != LEVITATION_BOOTS) ||
+X					/* boots */
+X#ifdef TOURIST
+X	   (uarmu && uarmu->cursed) ||  /* shirt */
+X#endif
+X	   (welded(uwep)) ||
+X	   (uleft && uleft->cursed && uleft->otyp != RIN_LEVITATION) ||
+X	   (uright && uright->cursed && uright->otyp != RIN_LEVITATION) ||
+X	   (uamul && uamul->cursed))
+X
+X	   return(TROUBLE_CURSED_ITEMS);
+X
+X	if(Blinded > 1) return(TROUBLE_BLIND);
+X	if(u.uhs >= HUNGRY) return(TROUBLE_HUNGRY);
+X	for(i=0; i<A_MAX; i++)
+X	    if(ABASE(i) < AMAX(i)) return(TROUBLE_POISONED);
+X	if(Wounded_legs) return (TROUBLE_WOUNDED_LEGS);
+X	if(HStun) return (TROUBLE_STUNNED);
+X	if(HConfusion) return (TROUBLE_CONFUSED);
+X	if(Hallucination) return(TROUBLE_HALLUCINATION);
+X
+X	return(0);
+X}
+X
+Xconst char leftglow[] = "left ring softly glows";
+Xconst char rightglow[] = "right ring softly glows";
+X
+Xstatic void
+Xfix_worst_trouble(trouble)
+Xregister int trouble;
+X{
+X	int i;
+X	struct obj *otmp;
+X	const char *what = NULL;
+X
+X	u.ublesscnt += rnz(100);
+X	switch (trouble) {
+X	    case TROUBLE_STONED:
+X		    You("feel more limber.");
+X		    Stoned = 0;
+X		    break;
+X	    case TROUBLE_STRANGLED:
+X		    You("can breathe again.");
+X		    Strangled = 0;
+X		    break;
+X	    case TROUBLE_LAVA:
+X		    You("are back on solid ground.");
+X		    /* teleport should always succeed, but if not,
+X		     * just untrap them.
+X		     */
+X		    if(!safe_teleds())
+X			u.utrap = 0;
+X		    break;
+X	    case TROUBLE_STARVING:
+X		    losestr(-1);
+X		    /* fall into... */
+X	    case TROUBLE_HUNGRY:
+X		    Your("stomach feels content.");
+X		    init_uhunger ();
+X		    flags.botl = 1;
+X		    break;
+X	    case TROUBLE_SICK:
+X		    You("feel better.");
+X		    make_sick(0L,FALSE);
+X		    break;
+X	    case TROUBLE_HIT:
+X		    You("feel much better.");
+X		    if (u.uhpmax < u.ulevel * 5 + 11)
+X			u.uhp = u.uhpmax += rnd(5);
+X		    else
+X			u.uhp = u.uhpmax;
+X		    flags.botl = 1;
+X		    break;
+X	    case TROUBLE_STUCK_IN_WALL:
+X		    Your("surroundings change.");
+X		    tele();
+X		    break;
+X	    case TROUBLE_CURSED_LEVITATION:
+X		    if (uarmf && uarmf->otyp==LEVITATION_BOOTS
+X						&& uarmf->cursed)
+X			otmp = uarmf;
+X		    else if (uleft && uleft->otyp==RIN_LEVITATION
+X						&& uleft->cursed) {
+X			otmp = uleft;
+X			what = leftglow;
+X		    } else {
+X			otmp = uright;
+X			what = rightglow;
+X		    }
+X		    goto decurse;
+X	    case TROUBLE_CURSED_BLINDFOLD:
+X		    otmp = ublindf;
+X		    goto decurse;
+X	    case TROUBLE_PUNISHED:
+X		    Your("chain disappears.");
+X		    unpunish();
+X		    break;
+X#ifdef POLYSELF
+X	    case TROUBLE_LYCANTHROPE:
+X		    You("feel purified.");
+X		    if(uasmon == &mons[u.ulycn] && !Polymorph_control)
+X			rehumanize();
+X		    u.ulycn = -1;       /* now remove the curse */
+X		    break;
+X#endif
+X	    case TROUBLE_CURSED_ITEMS:
+X		    if (uarmh && uarmh->cursed)		/* helmet */
+X			    otmp = uarmh;
+X		    else if (uarms && uarms->cursed)	/* shield */
+X			    otmp = uarms;
+X		    else if (uarmg && uarmg->cursed)	/* gloves */
+X			    otmp = uarmg;
+X		    else if (uarm && uarm->cursed)	/* armor */
+X			    otmp = uarm;
+X		    else if (uarmc && uarmc->cursed)	/* cloak */
+X			    otmp = uarmc;
+X		    else if (uarmf && uarmf->cursed)	/* boots */
+X			    otmp = uarmf;
+X#ifdef TOURIST
+X		    else if (uarmu && uarmu->cursed)	/* shirt */
+X			    otmp = uarmu;
+X#endif
+X		    else if (uleft && uleft->cursed) {
+X			    otmp = uleft;
+X			    what = leftglow;
+X		    } else if (uright && uright->cursed) {
+X			    otmp = uright;
+X			    what = rightglow;
+X		    } else if (uamul && uamul->cursed) /* amulet */
+X			    otmp = uamul;
+X		    else if (welded(uwep)) otmp = uwep;
+X		    else {
+X			    for(otmp=invent; otmp; otmp=otmp->nobj)
+X				if ((otmp->otyp==LOADSTONE ||
+X				     otmp->otyp==LUCKSTONE) && otmp->cursed)
+X					break;
+X		    }
+Xdecurse:
+X		    uncurse(otmp);
+X		    otmp->bknown = TRUE;
+X		    if (!Blind)
+X			    Your("%s %s.",
+X				 what ? what :
+X				 (const char *)aobjnam (otmp, "softly glow"),
+X				 Hallucination ? hcolor() : amber);
+X		    break;
+X	    case TROUBLE_HALLUCINATION:
+X		    pline ("Looks like you are back in Kansas.");
+X		    make_hallucinated(0L,FALSE,0L);
+X		    break;
+X	    case TROUBLE_BLIND:
+X		    Your("%s feel better.", makeplural(body_part(EYE)));
+X		    make_blinded(0L,FALSE);
+X		    break;
+X	    case TROUBLE_POISONED:
+X		    if (Hallucination)
+X			pline("There's a tiger in your tank.");
+X		    else
+X			You("feel in good health again.");
+X		    for(i=0; i<A_MAX; i++) {
+X			if(ABASE(i) < AMAX(i)) {
+X				ABASE(i) = AMAX(i);
+X				flags.botl = 1;
+X			}
+X		    }
+X		    break;
+X	    case TROUBLE_WOUNDED_LEGS:
+X		    heal_legs();
+X		    break;
+X	    case TROUBLE_STUNNED:
+X		    make_stunned(0L,TRUE);
+X		    break;
+X	    case TROUBLE_CONFUSED:
+X		    make_confused(0L,TRUE);
+X		    break;
+X	}
+X}
+X
+Xstatic void
+Xangrygods(resp_god)
+Xaligntyp resp_god;
+X{
+X	register int	maxanger;
+X
+X	if(Inhell) resp_god = A_NONE;
+X	u.ublessed = 0;
+X
+X	/* changed from tmp = u.ugangr + abs (u.uluck) -- rph */
+X	/* added test for alignment diff -dlc */
+X	if(resp_god != u.ualign.type)
+X	    maxanger =  u.ualign.record/2 + (Luck > 0 ? -Luck/3 : -Luck);
+X	else
+X	    maxanger =  3*u.ugangr +
+X		((Luck > 0 || u.ualign.record >= STRIDENT) ? -Luck/3 : -Luck);
+X	if (maxanger < 0) maxanger = 0; /* possible if bad align & good luck */
+X	maxanger =  (maxanger > 15 ? 15 : maxanger);  /* be reasonable */
+X	switch (maxanger ? rn2(maxanger): 0) {
+X
+X	    case 0:
+X	    case 1:	You("feel that %s is %s.", align_gname(resp_god),
+X			    Hallucination ? "bummed" : "displeased");
+X			break;
+X	    case 2:
+X	    case 3:
+X			godvoice(resp_god,NULL);
+X# ifdef POLYSELF
+X			pline("\"Thou %s, %s.\"",
+X			      ugod_is_angry() ? "hast strayed from the path" :
+X						"art arrogant",
+X			      u.usym == S_HUMAN ? "mortal" : "creature");
+X# else
+X			pline("\"Thou %s, mortal.\"",
+X			      ugod_is_angry() ? "hast strayed from the path" :
+X						"art arrogant");
+X# endif
+X			verbalize("Thou must relearn thy lessons!");
+X			(void) adjattrib(A_WIS, -1, FALSE);
+X			if (u.ulevel > 1) {
+X			    losexp();
+X			    if(u.uhp < 1) u.uhp = 1;
+X			    if(u.uhpmax < 1) u.uhpmax = 1;
+X			} else  {
+X			    u.uexp = 0;
+X			    flags.botl = 1;
+X			}
+X			break;
+X	    case 6:	if (!Punished) {
+X			    gods_angry(resp_god);
+X			    punish((struct obj *)0);
+X			    break;
+X			} /* else fall thru */
+X	    case 4:
+X	    case 5:	gods_angry(resp_god);
+X			if (!Blind && !Antimagic)
+X			    pline("%s glow surrounds you.",
+X				  An(Hallucination ? hcolor() : Black));
+X			rndcurse();
+X			break;
+X	    case 7:
+X	    case 8:	godvoice(resp_god,NULL);
+X			verbalize("Thou durst %s me?",
+X				  (on_altar() &&
+X				   (a_align(u.ux,u.uy) != resp_god)) ?
+X				  "scorn":"call upon");
+X# ifdef POLYSELF
+X			pline("\"Then die, %s!\"",
+X			      u.usym == S_HUMAN ? "mortal" : "creature");
+X# else
+X			verbalize("Then die, mortal!");
+X# endif
+X
+X			summon_minion(resp_god, FALSE);
+X			break;
+X
+X	    default:	gods_angry(resp_god);
+X			pline("Suddenly, a bolt of lightning strikes you!");
+X			if (Reflecting) {
+X			    shieldeff(u.ux, u.uy);
+X			    if (Blind)
+X				pline("For some reason you're unaffected.");
+X			    else {
+X				if (Reflecting & W_AMUL) {
+X				    pline("It reflects from your medallion.");
+X				    makeknown(AMULET_OF_REFLECTION);
+X				} else {
+X				    pline("It reflects from your shield.");
+X				    makeknown(SHIELD_OF_REFLECTION);
+X				}
+X			    }
+X			    goto ohno;
+X			} else if (Shock_resistance) {
+X			    shieldeff(u.ux, u.uy);
+X			    pline("It seems not to affect you.");
+Xohno:
+X			    pline("%s is not deterred...",
+X				  align_gname(resp_god));
+X			    pline("A wide-angle disintegration beam hits you!");
+X			    if (Disint_resistance) {
+X				You("bask in its %s glow for a minute...",
+X				    Black);
+X				godvoice(resp_god, "I believe it not!");
+X				break;
+X			    }
+X			}
+X			{
+X			    char killerbuf[64];
+X			    You("fry to a crisp.");
+X			    killer_format = KILLED_BY;
+X			    Sprintf(killerbuf, "the wrath of %s",
+X				    align_gname(resp_god));
+X			    killer = killerbuf;
+X			    done(DIED);
+X			}
+X			break;
+X	}
+X	u.ublesscnt = rnz(300);
+X	return;
+X}
+X
+Xstatic void
+Xpleased(g_align)
+X	aligntyp g_align;
+X{
+X	int trouble = p_trouble;	/* what's your worst difficulty? */
+X	int pat_on_head = 0;
+X
+X	You("feel that %s is %s.", align_gname(g_align),
+X	    u.ualign.record >= DEVOUT ?
+X	    Hallucination ? "pleased as punch" : "well-pleased" :
+X	    u.ualign.record >= STRIDENT ?
+X	    Hallucination ? "ticklish" : "pleased" :
+X	    Hallucination ? "full" : "satisfied");
+X
+X	/* not your deity */
+X	if (on_altar() && p_aligntyp != u.ualign.type) {
+X		adjalign(-1);
+X		return;
+X	} else if (u.ualign.record < 2) adjalign(1);
+X
+X	/* depending on your luck & align level, the god you prayed to will:
+X	   - fix your worst problem if it's major.
+X	   - fix all your major problems.
+X	   - fix your worst problem if it's minor.
+X	   - fix all of your problems.
+X	   - do you a gratuitous favor.
+X
+X	   if you make it to the the last category, you roll randomly again
+X	   to see what they do for you.
+X
+X	   If your luck is at least 0, then you are guaranteed rescued
+X	   from your worst major problem. */
+X
+X	if (!trouble && u.ualign.record >= DEVOUT) pat_on_head = 1;
+X	else {
+X	    int action = rn1(on_altar() ? 3 + on_shrine() : 2, Luck+1);
+X
+X	    if (!on_altar()) action = max(action,2);
+X	    if (u.ualign.record < STRIDENT)
+X		action = (u.ualign.record > 0 || !rnl(2)) ? 1 : 0;
+X
+X	    switch(min(action,5)) {
+X	    case 5: pat_on_head = 1;
+X	    case 4: do fix_worst_trouble(trouble);
+X		    while ((trouble = in_trouble()) != 0);
+X		    break;
+X
+X	    case 3: fix_worst_trouble(trouble);
+X	    case 2: while ((trouble = in_trouble()) > 0)
+X		    fix_worst_trouble(trouble);
+X		    break;
+X
+X	    case 1: if (trouble > 0) fix_worst_trouble(trouble);
+X	    case 0: break; /* your god blows you off, too bad */
+X	    }
+X	}
+X
+X    if(pat_on_head)
+X	switch(rn2((Luck + 6)>>1)) {
+X	case 0:	break;
+X	case 1:
+X	    if (uwep && (welded(uwep) || uwep->oclass == WEAPON_CLASS ||
+X			 uwep->otyp == PICK_AXE) && (!uwep->blessed)) {
+X		if (uwep->cursed) {
+X		    uwep->cursed = FALSE;
+X		    uwep->bknown = TRUE;
+X		    if (!Blind)
+X			Your("%s %s.", aobjnam(uwep, "softly glow"),
+X			     Hallucination ? hcolor() : amber);
+X		    else You("feel the power of %s over your %s.",
+X			u_gname(), xname(uwep));
+X		} else if(uwep->otyp < BOW) {
+X		    uwep->blessed = uwep->bknown = TRUE;
+X		    if (!Blind)
+X			Your("%s with %s aura.",
+X			     aobjnam(uwep, "softly glow"),
+X			     an(Hallucination ? hcolor() : light_blue));
+X		    else You("feel the blessing of %s over your %s.",
+X			u_gname(), xname(uwep));
+X		}
+X	    }
+X	    break;
+X	case 3:
+X	    /* takes 2 hints to get the music to enter the stronghold */
+X	    if (flags.soundok && !u.uevent.uopened_dbridge) {
+X		if(u.uevent.uheard_tune < 1) {
+X		    godvoice(g_align,NULL);
+X#ifdef POLYSELF
+X		    verbalize("Hark, %s!",
+X			  u.usym == S_HUMAN ? "mortal" : "creature");
+X#else
+X		    verbalize("Hark, mortal!");
+X#endif
+X		    verbalize(
+X			"To enter the castle, thou must play the right tune!");
+X		    u.uevent.uheard_tune++;
+X		    break;
+X		} else if (u.uevent.uheard_tune < 2) {
+X		    You(Hallucination ? "hear a funeral march..." : "hear a divine music...");
+X		    pline("It sounds like:  \"%s\".", tune);
+X		    u.uevent.uheard_tune++;
+X		    break;
+X		}
+X	    }
+X	    /* Otherwise, falls into next case */
+X	case 2:
+X	    if (!Blind)
+X		You("are surrounded by %s glow.",
+X		    an(Hallucination ? hcolor() : golden));
+X	    u.uhp = u.uhpmax += 5;
+X	    ABASE(A_STR) = AMAX(A_STR);
+X	    if (u.uhunger < 900)	init_uhunger();
+X	    if (u.uluck < 0)	u.uluck = 0;
+X	    make_blinded(0L,TRUE);
+X	    flags.botl = 1;
+X	    break;
+X	case 4: {
+X	    register struct obj *otmp;
+X
+X	    if (Blind)
+X		You("feel the power of %s.", u_gname());
+X	    else You("are surrounded by %s aura.",
+X		     an(Hallucination ? hcolor() : light_blue));
+X	    for(otmp=invent; otmp; otmp=otmp->nobj) {
+X		if (otmp->cursed) {
+X		    uncurse(otmp);
+X		    if (!Blind) {
+X			Your("%s %s.", aobjnam(otmp, "softly glow"),
+X			     Hallucination ? hcolor() : amber);
+X			otmp->bknown = TRUE;
+X		    }
+X		}
+X	    }
+X	    break;
+X	}
+X	case 5: {
+X	    const char *msg="\"and thus I grant thee the gift of %s!\"";
+X	    godvoice(u.ualign.type, "Thou hast pleased me with thy progress,");
+X	    if (!(HTelepat & INTRINSIC))  {
+X		HTelepat |= FROMOUTSIDE;
+X		pline(msg, "Telepathy");
+X		if (Blind) see_monsters();
+X	    } else if (!(Fast & INTRINSIC))  {
+X		Fast |= FROMOUTSIDE;
+X		pline(msg, "Speed");
+X	    } else if (!(Stealth & INTRINSIC))  {
+X		Stealth |= FROMOUTSIDE;
+X		pline(msg, "Stealth");
+X	    } else {
+X		if (!(Protection & INTRINSIC))  {
+X		    Protection |= FROMOUTSIDE;
+X		    if (!u.ublessed)  u.ublessed = rn1(3, 2);
+X		} else u.ublessed++;
+X		pline(msg, "my protection");
+X	    }
+X	    verbalize("Use it wisely in my name!");
+X	    break;
+X	}
+X	case 7:
+X	case 8:
+X#ifdef ELBERETH
+X	    if (u.ualign.record >= PIOUS && !u.uevent.uhand_of_elbereth) {
+X		register struct obj *obj = uwep;	/* to be blessed */
+X		boolean already_exists, in_hand;
+X
+X		u.uevent.uhand_of_elbereth = TRUE;
+X		HSee_invisible |= FROMOUTSIDE;
+X		HFire_resistance |= FROMOUTSIDE;
+X		HCold_resistance |= FROMOUTSIDE;
+X		HPoison_resistance |= FROMOUTSIDE;
+X		godvoice(u.ualign.type,NULL);
+X
+X		switch(u.ualign.type) {
+X		case A_LAWFUL:
+X		    verbalize("I crown thee...      The Hand of Elbereth!");
+X		    if (obj && (obj->otyp == LONG_SWORD) && !obj->oartifact)
+X			obj = oname(obj, artiname(ART_EXCALIBUR), 1);
+X		    break;
+X		case A_NEUTRAL:
+X		    verbalize("Thou shalt be my Envoy of Balance!");
+X		    if (uwep && uwep->oartifact == ART_VORPAL_BLADE) {
+X			obj = uwep;	/* to be blessed and rustproofed */
+X			Your("%s goes snicker-snack!", xname(obj));
+X			obj->dknown = TRUE;
+X		    } else if (!exist_artifact(LONG_SWORD,
+X						artiname(ART_VORPAL_BLADE))) {
+X		        obj = mksobj(LONG_SWORD, FALSE, FALSE);
+X			obj = oname(obj, artiname(ART_VORPAL_BLADE), 0);
+X		        pline("%s %s %s your %s!", Blind ? "Something" : "A",
+X			      Blind ? "lands" : "sword appears",
+X			      Levitation ? "beneath" : "at",
+X			      makeplural(body_part(FOOT)));
+X			obj->spe = 1;
+X			dropy(obj);
+X		    }
+X		    break;
+X		case A_CHAOTIC:
+X		    /* This does the same damage as Excalibur.
+X		     * Disadvantages: doesn't do bonuses to undead;
+X		     *   doesn't aid searching.
+X		     * Advantage: part of that bonus is a level drain.
+X		     * Disadvantage: player cannot start with a +5 weapon and
+X		     * turn it into a Stormbringer.
+X		     * Advantage: they don't need to already have a sword of
+X		     *   the right type to get it...
+X		     * However, if Stormbringer already exists in the game, an
+X		     * ordinary good broadsword is given and the messages are
+X		     * a bit different.
+X		     */
+X		    in_hand = (uwep && uwep->oartifact == ART_STORMBRINGER);
+X		    already_exists = exist_artifact(RUNESWORD,
+X						artiname(ART_STORMBRINGER));
+X		    verbalize("Thou art chosen to %s for My Glory!",
+X			      already_exists && !in_hand ?
+X			      "take lives" : "steal souls");
+X		    if (in_hand) {
+X			obj = uwep;	/* to be blessed and rustproofed */
+X		    } else if (!already_exists) {
+X		        obj = mksobj(RUNESWORD, FALSE, FALSE);
+X			obj = oname(obj, artiname(ART_STORMBRINGER), 0);
+X		        pline("%s %s %s your %s!", Blind ? "Something" :
+X			      An(Hallucination ? hcolor() : Black),
+X			      Blind ? "lands" : "sword appears",
+X			      Levitation ? "beneath" : "at",
+X			      makeplural(body_part(FOOT)));
+X			obj->spe = 1;
+X			dropy(obj);
+X		    }
+X		    break;
+X		default:
+X		    obj = 0;	/* lint */
+X		    break;
+X		}
+X		/* enhance weapon regardless of alignment or artifact status */
+X		if (obj && (obj->oclass == WEAPON_CLASS)) {
+X		    bless(obj);
+X		    obj->oeroded = 0;
+X		    obj->oerodeproof = TRUE;
+X		    obj->bknown = obj->rknown = TRUE;
+X		    if (obj->spe < 1) obj->spe = 1;
+X		} else	/* opportunity knocked, but there was nobody home... */
+X		    You("feel unworthy.");
+X		break;
+X	    }
+X#endif
+X
+X	case 6:	pline ("An object appears at your %s!",
+X		       makeplural(body_part(FOOT)));
+X	    bless(mkobj_at(SPBOOK_CLASS, u.ux, u.uy, TRUE));
+X	    break;
+X
+X	default:	impossible("Confused deity!");
+X	    break;
+X	}
+X	u.ublesscnt = rnz(350);
+X#ifndef ELBERETH
+X	u.ublesscnt += (u.uevent.udemigod * rnz(1000));
+X#else
+X	u.ublesscnt += ((u.uevent.udemigod + u.uevent.uhand_of_elbereth)
+X							* rnz(1000));
+X#endif
+X	return;
+X}
+X
+X/* either blesses or curses water on the altar,
+X * returns true if it found any water here.
+X */
+Xstatic boolean
+Xwater_prayer(bless_water)
+X    boolean bless_water;
+X{
+X    register struct obj* otmp;
+X    register long changed = 0;
+X    boolean other = FALSE;
+X
+X    for(otmp = level.objects[u.ux][u.uy]; otmp; otmp = otmp->nexthere) {
+X	/* turn water into (un)holy water */
+X	if (otmp->otyp == POT_WATER) {
+X	    otmp->blessed = bless_water;
+X	    otmp->cursed = !bless_water;
+X	    otmp->bknown = !Blind;
+X	    changed += otmp->quan;
+X	} else if(otmp->oclass == POTION_CLASS)
+X	    other = TRUE;
+X    }
+X    if(!Blind && changed) {
+X	pline("%s potion%s on the altar glow%s %s for a moment.",
+X	      ((other && changed > 1L) ? "Some of the" : (other ? "A" : "The")),
+X	      (changed > 1L ? "s" : ""), (changed > 1L ? "" : "s"),
+X	      (bless_water ? amber : Black));
+X    }
+X    return (changed > 0L);
+X}
+X
+Xstatic void
+Xgodvoice(g_align, words)
+X    aligntyp g_align;
+X    const char *words;
+X{
+X    const char *quot = "";
+X    if(words)
+X	quot = "\"";
+X    else
+X	words = "";
+X
+X    pline("The voice of %s %s: %s%s%s", align_gname(g_align),
+X	  godvoices[rn2(SIZE(godvoices))], quot, words, quot);
+X}
+X
+Xstatic void
+Xgods_angry(g_align)
+X    aligntyp g_align;
+X{
+X    godvoice(g_align, "Thou hast angered me.");
+X}
+X
+X/* The g_align god is upset with you. */
+Xstatic void
+Xgods_upset(g_align)
+X	aligntyp g_align;
+X{
+X	if(g_align == u.ualign.type) u.ugangr++;
+X	else if(u.ugangr) u.ugangr--;
+X	angrygods(g_align);
+X}
+X
+Xstatic const char NEARDATA sacrifice_types[] = { FOOD_CLASS, AMULET_CLASS, 0 };
+X
+Xstatic void
+Xconsume_offering(otmp)
+Xregister struct obj *otmp;
+X{
+X    if (Hallucination)
+X	switch (rn2(3)) {
+X	    case 0:
+X		Your("sacrifice sprouts wings and a propeller and roars away!");
+X		break;
+X	    case 1:
+X		Your("sacrifice puffs up, swelling bigger and bigger, and pops!");
+X		break;
+X	    case 2:
+X		Your("sacrifice collapses into a cloud of dancing particles and fades away!");
+X		break;
+X	}
+X    else if (Blind && u.ualign.type == A_LAWFUL)
+X	Your("sacrifice disappears!");
+X    else Your("sacrifice is consumed in a %s!",
+X	      u.ualign.type == A_LAWFUL ? "flash of light" : "burst of flame");
+X    if (carried(otmp)) useup(otmp);
+X    else useupf(otmp);
+X    exercise(A_WIS, TRUE);
+X}
+X
+Xint
+Xdosacrifice()
+X{
+X    register struct obj *otmp;
+X    int value = 0;
+X    aligntyp altaralign = a_align(u.ux,u.uy);
+X
+X    if (!on_altar()) {
+X	You("are not standing on an altar.");
+X	return 0;
+X    }
+X
+X    if (In_endgame(&u.uz)) {
+X	if (!(otmp = getobj(sacrifice_types, "sacrifice"))) return 0;
+X    } else
+X	if (!(otmp = floorfood("sacrifice", 0))) return 0;
+X
+X    /*
+X      Was based on nutritional value and aging behavior (< 50 moves).
+X      Sacrificing a food ration got you max luck instantly, making the
+X      gods as easy to please as an angry dog!
+X
+X      Now only accepts corpses, based on the games evaluation of their
+X      toughness.  Human sacrifice, as well as sacrificing unicorns of
+X      your alignment, is strongly discouraged.  (We can't tell whether
+X      a pet corpse was tame, so you can still sacrifice it.)
+X     */
+X
+X#define MAXVALUE 24 /* Highest corpse value (besides Wiz) */
+X
+X    if (otmp->otyp == CORPSE) {
+X	register struct permonst *ptr = &mons[otmp->corpsenm];
+X	extern int monstr[];
+X
+X	if (otmp->corpsenm == PM_ACID_BLOB || (monstermoves <= otmp->age + 50))
+X	    value = monstr[otmp->corpsenm] + 1;
+X	if (otmp->oeaten)
+X	    value = eaten_stat(value, otmp);
+X
+X	if ((pl_character[0]=='E') ? is_elf(ptr) : is_human(ptr)) {
+X#ifdef POLYSELF
+X	    if (is_demon(uasmon)) {
+X		You("find the idea very satisfying.");
+X		exercise(A_WIS, TRUE);
+X	    } else
+X#endif
+X		if (u.ualign.type != A_CHAOTIC) {
+X		    pline("You'll regret this infamous offense!");
+X		    exercise(A_WIS, FALSE);
+X		}
+X
+X	    if (altaralign != A_CHAOTIC) {
+X		/* curse the lawful/neutral altar */
+X		pline("The altar is stained with %sn blood.",
+X		      (pl_character[0]=='E') ? "elve" : "huma");
+X		levl[u.ux][u.uy].altarmask = AM_CHAOTIC;
+X		angry_priest();
+X	    } else {
+X		register struct monst *dmon;
+X		/* Human sacrifice on a chaotic altar is equivalent */
+X		/* to demon summoning */
+X		if(u.ualign.type != A_CHAOTIC) {
+X		pline("The blood floods the altar, which vanishes in %s cloud!",
+X			  an(Hallucination ? hcolor() : Black));
+X		    levl[u.ux][u.uy].typ = ROOM;
+X		    levl[u.ux][u.uy].altarmask = 0;
+X		    if(Invisible) newsym(u.ux, u.uy);
+X		} else {
+X		    pline("The blood covers the altar!");
+X		    change_luck(2);
+X		}
+X		if ((dmon = makemon(&mons[dlord()], u.ux, u.uy)) != 0) {
+X		    You("have summoned %s!", a_monnam(dmon));
+X		    if (u.ualign.type == A_CHAOTIC)
+X			dmon->mpeaceful = TRUE;
+X		    You("are terrified, and unable to move.");
+X		    nomul(-3);
+X		} else pline("The cloud dissipates.");
+X	    }
+X
+X	    if (u.ualign.type != A_CHAOTIC) {
+X		adjalign(-5);
+X		u.ugangr += 3;
+X		(void) adjattrib(A_WIS, -1, TRUE);
+X		if (!Inhell) angrygods(u.ualign.type);
+X		change_luck(-5);
+X	    } else adjalign(5);
+X	    if (carried(otmp)) useup(otmp);
+X	    else useupf(otmp);
+X	    return(1);
+X	} else if (is_undead(ptr)) { /* Not demons--no demon corpses */
+X	    if (u.ualign.type != A_CHAOTIC)
+X		value += 1;
+X	} else if (ptr->mlet == S_UNICORN) {
+X	    int unicalign = sgn(ptr->maligntyp);
+X
+X	    /* If same as altar, always a very bad action. */
+X	    if (unicalign == altaralign) {
+X		pline("Such an action is an insult to %s!",
+X		      (unicalign == A_CHAOTIC)
+X		      ? "chaos" : unicalign ? "law" : "balance");
+X		(void) adjattrib(A_WIS, -1, TRUE);
+X		value = -5;
+X	    } else if (u.ualign.type == altaralign) {
+X		/* If different from altar, and altar is same as yours, */
+X		/* it's a very good action */
+X		if (u.ualign.record < ALIGNLIM)
+X		    You("feel appropriately %s.", align_str(u.ualign.type));
+X		else You("feel you are thoroughly on the right path.");
+X		adjalign(5);
+X		value += 3;
+X	    } else
+X		/* If sacrificing unicorn of your alignment to altar not of */
+X		/* your alignment, your god gets angry and it's a conversion */
+X		if (unicalign == u.ualign.type) {
+X		    u.ualign.record = -1;
+X		    value = 1;
+X		} else value += 3;
+X	}
+X    }
+X
+X    if (otmp->otyp == AMULET_OF_YENDOR) {
+X	if (!In_endgame(&u.uz)) {
+X	    if (Hallucination)
+X		    You("feel homesick.");
+X	    else
+X		    You("feel an urge to return to the surface.");
+X	    return 1;
+X	} else {
+X	    /* The final Test.	Did you win? */
+X	    if(uamul == otmp) Amulet_off();
+X	    if(carried(otmp)) useup(otmp); /* well, it's gone now */
+X	    else useupf(otmp);
+X	    You("offer the Amulet of Yendor to %s...", a_gname());
+X	    if (u.ualign.type != altaralign) {
+X		/* And the opposing team picks you up and
+X		   carries you off on their shoulders */
+X		adjalign(-99);
+X		pline("%s accepts your gift, and gains dominion over %s...",
+X		      a_gname(), u_gname());
+X		pline("%s is enraged...", u_gname());
+X		pline("Fortunately, %s permits you to live...", a_gname());
+X		pline("A cloud of %s smoke surrounds you...",
+X		      Hallucination ? hcolor() : (const char *)"orange");
+X		done(ESCAPED);
+X	    } else { /* super big win */
+X		adjalign(10);
+Xpline("An invisible choir sings, and you are bathed in radiance...");
+X		godvoice(altaralign, "Congratulations, mortal!");
+X		display_nhwindow(WIN_MESSAGE, FALSE);
+Xverbalize("In return for thy service, I grant thee the gift of Immortality!");
+X		You("ascend to the status of Demigod%s...",
+X		    flags.female ? "dess" : "");
+X		done(ASCENDED);
+X	    }
+X	}
+X    }
+X
+X    if (otmp->otyp == FAKE_AMULET_OF_YENDOR) {
+X	    if (flags.soundok)
+X		You("hear a nearby thunderclap.");
+X	    if (!otmp->known) {
+X		You("realize you have made a %s.",
+X		    Hallucination ? "boo-boo" : "mistake");
+X		otmp->known = TRUE;
+X		change_luck(-1);
+X		return 1;
+X	    } else {
+X		/* don't you dare try to fool the gods */
+X		change_luck(-3);
+X		adjalign(-1);
+X		u.ugangr += 3;
+X		value = -3;
+X	    }
+X    }
+X
+X    if (value == 0) {
+X	pline(nothing_happens);
+X	return (1);
+X    }
+X
+X    if (value < 0) /* I don't think the gods are gonna like this... */
+X	gods_upset(altaralign);
+X    else {
+X	int saved_anger = u.ugangr;
+X	int saved_cnt = u.ublesscnt;
+X	int saved_luck = u.uluck;
+X
+X	/* Sacrificing at an altar of a different alignment */
+X	if (u.ualign.type != altaralign) {
+X	    /* Is this a conversion ? */
+X	    if(ugod_is_angry()) {
+X		if(u.ualignbase[0] == u.ualignbase[1] &&
+X		   altaralign != A_NONE) {
+X		    You("have a strong feeling that %s is angry...", u_gname());
+X		    consume_offering(otmp);
+X		    pline("%s accepts your allegiance.", a_gname());
+X		    You("have a sudden sense of a new direction.");
+X
+X		    /* The player wears a helm of opposite alignment? */
+X		    if (uarmh && uarmh->otyp == HELM_OF_OPPOSITE_ALIGNMENT)
+X			u.ualignbase[0] = altaralign;
+X		    else
+X			u.ualign.type = u.ualignbase[0] = altaralign;
+X		    flags.botl = 1;
+X		    /* Beware, Conversion is costly */
+X		    change_luck(-3);
+X		    u.ublesscnt += 300;
+X		    adjalign((int)(u.ualignbase[1] * (ALIGNLIM / 2)));
+X		} else {
+X		    pline("%s rejects your sacrifice!", a_gname());
+X		    godvoice(altaralign, "Suffer, infidel!");
+X		    adjalign(-5);
+X		    u.ugangr += 3;
+X		    (void) adjattrib(A_WIS, -2, TRUE);
+X		    if (!Inhell) angrygods(u.ualign.type);
+X		    change_luck(-5);
+X		}
+X		return(1);
+X	    } else {
+X		consume_offering(otmp);
+X		You("sense a conflict between %s and %s.",
+X		    u_gname(), a_gname());
+X		if (rn2(8 + (int)u.ulevel) > 5) {
+X		    struct monst *pri;
+X		    You("feel the power of %s increase.", u_gname());
+X		    exercise(A_WIS, TRUE);
+X		    change_luck(1);
+X		    /* Yes, this is supposed to be &=, not |= */
+X		    levl[u.ux][u.uy].altarmask &= AM_SHRINE;
+X		    /* the following accommodates stupid compilers */
+X		    levl[u.ux][u.uy].altarmask =
+X			levl[u.ux][u.uy].altarmask | (Align2amask(u.ualign.type));
+X		    if (!Blind)
+X			pline("The altar glows %s.",
+X			      Hallucination ? hcolor() :
+X			      u.ualign.type == A_LAWFUL ? White :
+X			      u.ualign.type ? Black : (const char *)"gray");
+X
+X		    if(rnl((int)u.ulevel) > 6 && u.ualign.record > 0 &&
+X		       rnd(u.ualign.record) > (3*ALIGNLIM)/4)
+X			summon_minion(altaralign, TRUE);
+X		    /* anger priest; test handles bones files */
+X		    if((pri = findpriest(temple_occupied(u.urooms))) &&
+X		       !p_coaligned(pri))
+X			angry_priest();
+X		} else {
+X		    pline("Unluckily, you feel the power of %s decrease.",
+X			  u_gname());
+X		    change_luck(-1);
+X		    exercise(A_WIS, FALSE);
+X		    if(rnl((int)u.ulevel) > 6 && u.ualign.record > 0 &&
+X		       rnd(u.ualign.record) > (7*ALIGNLIM)/8)
+X			summon_minion(altaralign, TRUE);
+X		}
+X		return(1);
+X	    }
+X	}
+X
+X	consume_offering(otmp);
+X	/* OK, you get brownie points. */
+X	if(u.ugangr) {
+X	    u.ugangr -=
+X		((value * (u.ualign.type == A_CHAOTIC ? 2 : 3)) / MAXVALUE);
+X	    if(u.ugangr < 0) u.ugangr = 0;
+X	    if(u.ugangr != saved_anger) {
+X		if (u.ugangr) {
+X		    pline("%s seems %s.", u_gname(),
+X			  Hallucination ? "groovy" : "slightly mollified");
+X
+X		    if ((int)u.uluck < 0) change_luck(1);
+X		} else {
+X		    pline("%s seems %s.", u_gname(), Hallucination ?
+X			  "cosmic (not a new fact)" : "mollified");
+X
+X		    if ((int)u.uluck < 0) u.uluck = 0;
+X		}
+X	    } else { /* not satisfied yet */
+X		if (Hallucination)
+X		    pline("The gods seem tall.");
+X		else You("have a feeling of inadequacy.");
+X	    }
+X	} else if(ugod_is_angry()) {
+X	    if(value > MAXVALUE) value = MAXVALUE;
+X	    if(value > -u.ualign.record) value = -u.ualign.record;
+X	    adjalign(value);
+X	    You("feel partially absolved.");
+X	} else if (u.ublesscnt > 0) {
+X	    u.ublesscnt -=
+X		((value * (u.ualign.type == A_CHAOTIC ? 500 : 300)) / MAXVALUE);
+X	    if(u.ublesscnt < 0) u.ublesscnt = 0;
+X	    if(u.ublesscnt != saved_cnt) {
+X		if (u.ublesscnt) {
+X		    if (Hallucination)
+X			You("realize that the gods are not like you and I.");
+X		    else
+X			You("have a hopeful feeling.");
+X		    if ((int)u.uluck < 0) change_luck(1);
+X		} else {
+X		    if (Hallucination)
+X			pline("Overall, there is a smell of fried onions.");
+X		    else
+X			You("have a feeling of reconciliation.");
+X		    if ((int)u.uluck < 0) u.uluck = 0;
+X		}
+X	    }
+X	} else {
+X	    int nartifacts = nartifact_exist();
+X
+X	    /* you were already in pretty good standing */
+X	    /* The player can gain an artifact */
+X	    /* The chance goes down as the number of artifacts goes up */
+X	    if (u.ulevel > 2 && !rn2(10 + (2 * nartifacts * nartifacts))) {
+X		otmp = mk_artifact((struct obj *)0, a_align(u.ux,u.uy));
+X		if (otmp) {
+X		    if (otmp->spe < 0) otmp->spe = 0;
+X		    if (otmp->cursed) uncurse(otmp);
+X		    dropy(otmp);
+X		    pline("An object appears at your %s!",
+X			  makeplural(body_part(FOOT)));
+X		    godvoice(u.ualign.type, "Use my gift wisely!");
+X		    u.ublesscnt = rnz(300 + (50 * nartifacts));
+X		    exercise(A_WIS, TRUE);
+X		    return(1);
+X		}
+X	    }
+X	    change_luck((value * LUCKMAX) / (MAXVALUE * 2));
+X	    if (u.uluck != saved_luck) {
+X		if (Blind)
+X		    You("think something brushed your %s.", body_part(FOOT));
+X		else You(Hallucination ?
+X		    "see crabgrass at your %s.  A funny thing in a dungeon." :
+X		    "glimpse a four-leaf clover at your %s.",
+X		    makeplural(body_part(FOOT)));
+X	    }
+X	}
+X    }
+X    return(1);
+X}
+X
+Xint
+Xdopray()
+X{
+X    int alignment;
+X
+X    p_aligntyp = on_altar() ? a_align(u.ux,u.uy) : u.ualign.type;
+X    p_trouble = in_trouble();
+X
+X#ifdef POLYSELF
+X    if (is_demon(uasmon) && (p_aligntyp != A_CHAOTIC)) {
+X	pline("The very idea of praying to a %s god is repugnant to you.",
+X	      p_aligntyp ? "lawful" : "neutral");
+X	return(0);
+X    }
+X#endif
+X
+X    if (u.ualign.type && u.ualign.type == -p_aligntyp)
+X	alignment = -u.ualign.record;
+X	/* Opposite alignment altar */
+X    else if (u.ualign.type != p_aligntyp) alignment = u.ualign.record / 2;
+X	/* Different (but non-opposite) alignment altar */
+X    else alignment = u.ualign.record;
+X
+X    You("begin praying to %s.", align_gname(p_aligntyp));
+X    if ((!p_trouble && (u.ublesscnt > 0)) ||
+X	((p_trouble < 0) && (u.ublesscnt > 100)) || /* minor difficulties */
+X	((p_trouble > 0) && (u.ublesscnt > 200))) /* big trouble */
+X	p_type = 0;
+X    else if ((int)Luck < 0 || u.ugangr || alignment < 0)
+X	p_type = 1;
+X    else /* alignment >= 0 */ {
+X	if(on_altar() && u.ualign.type != p_aligntyp)
+X	    p_type = 2;
+X	else
+X	    p_type = 3;
+X    }
+X
+X#ifdef POLYSELF
+X    if (is_undead(uasmon) && !Inhell &&
+X	(p_aligntyp == A_LAWFUL || (p_aligntyp == A_NEUTRAL && !rn2(10))))
+X	p_type = -1;
+X#endif
+X
+X#ifdef WIZARD
+X    if (wizard && p_type >= 0) {
+X	if (yn("Force the gods to be pleased?") == 'y') {
+X	    u.ublesscnt = 0;
+X	    if (u.uluck < 0) u.uluck = 0;
+X	    u.ugangr = 0;
+X	    if(p_type < 2) p_type = 3;
+X	}
+X    }
+X#endif
+X    nomul(-3);
+X    nomovemsg = "You finish your prayer.";
+X    afternmv = prayer_done;
+X
+X    if(p_type == 3 && !Inhell) {
+X	/* if you've been true to your god you can't die while you pray */
+X	if (!Blind)
+X	    You("are surrounded by a shimmering light.");
+X	u.uinvulnerable = TRUE;
+X    }
+X
+X    return(1);
+X}
+X
+XSTATIC_PTR int
+Xprayer_done()		/* M. Stephenson (1.0.3b) */
+X{
+X    aligntyp alignment = p_aligntyp;
+X
+X#ifdef POLYSELF
+X    if(p_type == -1) {
+X	godvoice(alignment,
+X		 alignment == A_LAWFUL ?
+X		 "Vile creature, thou durst call upon me?" :
+X		 "Walk no more, perversion of nature!");
+X	You("feel like you are falling apart.");
+X	rehumanize();
+X	losehp(rnd(20), "residual undead turning effect", KILLED_BY_AN);
+X	exercise(A_CON, FALSE);
+X	return(1);
+X    }
+X#endif
+X    if (Inhell) {
+X	pline("Since you are in Gehennom, %s won't help you.",
+X	      align_gname(alignment));
+X	if(rnl(u.ualign.record)) /* yes, this is the right sense */
+X	    angrygods(u.ualign.type);
+X	return(0);
+X    }
+X
+X    if (p_type == 0) {
+X	if(on_altar() && u.ualign.type != alignment)
+X	    (void) water_prayer(FALSE);
+X	u.ublesscnt += rnz(250);
+X	change_luck(-3);
+X	gods_upset(u.ualign.type);
+X    } else if(p_type == 1) {
+X	if(on_altar() && u.ualign.type != alignment)
+X	    (void) water_prayer(FALSE);
+X	angrygods(u.ualign.type);	/* naughty */
+X    } else if(p_type == 2) {
+X	if(water_prayer(FALSE)) {
+X	    /* attempted water prayer on a non-coaligned altar */
+X	    u.ublesscnt += rnz(250);
+X	    change_luck(-3);
+X	    gods_upset(u.ualign.type);
+X	} else pleased(alignment);
+X    } else {
+X	u.uinvulnerable = FALSE;
+X	/* coaligned */
+X	if(on_altar())
+X	    (void) water_prayer(TRUE);
+X	pleased(alignment); /* nice */
+X    }
+X    return(1);
+X}
+X
+Xint
+Xdoturn()
+X{	/* Knights & Priest(esse)s only please */
+X
+X	register struct monst *mtmp;
+X	register int	xlev = 6;
+X
+X	if((pl_character[0] != 'P') &&
+X	   (pl_character[0] != 'K')) {
+X		/* Try to use turn undead spell. */
+X		if (objects[SPE_TURN_UNDEAD].oc_name_known) {
+X		    register int sp_no;
+X		    for (sp_no = 0; sp_no < MAXSPELL &&
+X			 spl_book[sp_no].sp_id != NO_SPELL &&
+X			 spl_book[sp_no].sp_id != SPE_TURN_UNDEAD; sp_no++);
+X
+X		    if (sp_no < MAXSPELL &&
+X			spl_book[sp_no].sp_id == SPE_TURN_UNDEAD)
+X			    return spelleffects(++sp_no, TRUE);
+X		}
+X
+X		You("don't know how to turn undead!");
+X		return(0);
+X	}
+X	if (
+X#  ifdef POLYSELF
+X	    (u.ualign.type != A_CHAOTIC &&
+X		    (is_demon(uasmon) || is_undead(uasmon))) ||
+X#  endif
+X	    u.ugangr > 6 /* "Die, mortal!" */) {
+X
+X		pline("For some reason, %s seems to ignore you.", u_gname());
+X		aggravate();
+X		exercise(A_WIS, FALSE);
+X		return(0);
+X	}
+X
+X	if (Inhell) {
+X	    pline("Since you are in Gehennom, %s won't help you.", u_gname());
+X	    aggravate();
+X	    return(0);
+X	}
+X	pline("Calling upon %s, you chant an arcane formula.", u_gname());
+X	exercise(A_WIS, TRUE);
+X	for(mtmp = fmon; mtmp; mtmp = mtmp->nmon)
+X	    if(cansee(mtmp->mx,mtmp->my)) {
+X		if(!mtmp->mpeaceful && (is_undead(mtmp->data) ||
+X		   (is_demon(mtmp->data) && (u.ulevel > (MAXULEV/2))))) {
+X
+X		    if(Confusion) {
+X			pline("Unfortunately, your voice falters.");
+X			mtmp->mflee = mtmp->mfrozen = mtmp->msleep = FALSE;
+X			mtmp->mcanmove = TRUE;
+X		    } else if (! resist(mtmp, '\0', 0, TELL))
+X			switch (mtmp->data->mlet) {
+X			    /* this is intentional, lichs are tougher
+X			       than zombies. */
+X			case S_LICH:    xlev += 2;
+X			case S_GHOST:   xlev += 2;
+X			case S_VAMPIRE: xlev += 2;
+X			case S_WRAITH:  xlev += 2;
+X			case S_MUMMY:   xlev += 2;
+X			case S_ZOMBIE:
+X			    mtmp->mflee = TRUE; /* at least */
+X			    if(u.ulevel >= xlev &&
+X			       !resist(mtmp, '\0', 0, NOTELL)) {
+X				if(u.ualign.type == A_CHAOTIC) {
+X				    mtmp->mpeaceful = TRUE;
+X				} else { /* damn them */
+X				    You("destroy %s!", mon_nam(mtmp));
+X				    mondied(mtmp);
+X				}
+X			    }
+X			    break;
+X			default:    mtmp->mflee = TRUE;
+X			    break;
+X			}
+X		   }
+X	    }
+X	nomul(-5);
+X	return(1);
+X}
+X
+Xconst char *
+Xa_gname()
+X{
+X    return(a_gname_at(u.ux, u.uy));
+X}
+X
+Xconst char *
+Xa_gname_at(x,y)     /* returns the name of an altar's deity */
+Xxchar x, y;
+X{
+X    if(!IS_ALTAR(levl[x][y].typ)) return((char *)0);
+X
+X    return align_gname(a_align(x,y));
+X}
+X
+Xconst char *
+Xu_gname()  /* returns the name of the player's deity */
+X{
+X    return align_gname(u.ualign.type);
+X}
+X
+Xconst char *
+Xalign_gname(alignment)
+X	register aligntyp alignment;
+X{
+X	register struct ghods *aghod;
+X
+X	if(alignment == A_NONE) return(Moloch);
+X
+X	for(aghod=gods; aghod->classlet; aghod++)
+X	    if(aghod->classlet == pl_character[0])
+X		switch(alignment) {
+X		case A_CHAOTIC:	return(aghod->chaos);
+X		case A_NEUTRAL:	return(aghod->balance);
+X		case A_LAWFUL:	return(aghod->law);
+X		default: impossible("unknown alignment.");
+X			 return("Balance");
+X		}
+X	impossible("unknown character's god?");
+X	return("someone");
+X}
+X
+Xvoid
+Xaltar_wrath(x, y)
+Xregister int x, y;
+X{
+X    aligntyp altaralign = a_align(x,y);
+X
+X    if(!strcmp(align_gname(altaralign), u_gname())) {
+X	godvoice(altaralign, "How darest thou desecrate my altar!");
+X	(void) adjattrib(A_WIS, -1, FALSE);
+X    } else {
+X	pline("A voice (could it be %s?) whispers:",
+X	      align_gname(altaralign));
+X	verbalize("Thou shalt pay, infidel!");
+X	change_luck(-1);
+X    }
+X}
+X
+X/*pray.c*/
+END_OF_FILE
+if test 41023 -ne `wc -c <'src/pray.c'`; then
+    echo shar: \"'src/pray.c'\" unpacked with wrong size!
+fi
+# end of 'src/pray.c'
+fi
+if test -f 'sys/amiga/amiwbench.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'sys/amiga/amiwbench.c'\"
+else
+echo shar: Extracting \"'sys/amiga/amiwbench.c'\" \(12565 characters\)
+sed "s/^X//" >'sys/amiga/amiwbench.c' <<'END_OF_FILE'
+X/*    SCCS Id: @(#)amiwbench.c      3.1   93/01/08
+X/*    Copyright (c) Kenneth Lorber, Bethesda, Maryland, 1990, 1992, 1993 */
+X/* NetHack may be freely redistributed.  See license for details. */
+X
+X/*  Amiga Workbench interface  */
+X
+X#include "hack.h"
+X
+X/* Have to #undef CLOSE, because it's used in display.h and intuition.h */
+X#undef CLOSE
+X
+X#ifdef __SASC
+X# undef COUNT
+X# include <proto/exec.h>
+X# include <proto/dos.h>
+X# include <proto/icon.h>
+X#endif
+X
+X#include <workbench/startup.h>
+X#include <workbench/workbench.h>
+X#include <exec/memory.h>
+X#include <ctype.h>
+X
+X#ifdef __SASC
+X# include <string.h>
+X# undef strlen          /* grrr */
+X#endif
+X
+X#define ALLOC_SIZE      ((long)sizeof(struct FileInfoBlock))
+X
+X#ifdef AZTEC_C
+X# include <functions.h>
+Xextern struct Library *IconBase;
+X#endif
+X
+Xextern int FDECL(parse_config_line, (FILE *, char *, char *, char *));
+X
+Xint ami_argc;           /* global argc */
+Xchar **ami_argv;        /* global argv */
+Xboolean FromWBench=0;       /* how did we get started? */
+Xboolean FromCLI=0;      /* via frontend and INTERNALCLI */
+Xstatic BOOL FromTool=0;     /* or from Project (ergo nothing to restore) */
+Xstatic char argline[80];    /* fake command line from ToolTypes */
+Xstatic BOOL TTparse=0;      /* parsing tooltypes? */
+Xstatic BOOL KillIcon=FALSE; /* delayed expunge of user's icon */
+Xstatic char iconname[PATHLEN+5];
+Xstatic char origicon[PATHLEN+5];
+Xstatic char savefname[PL_NSIZ];     /* name from name of save file */
+X
+Xextern int bigscreen;
+Xextern const char *classes; /* liberated from pcmain */
+Xextern char PATH[];
+X
+X/* Called after NetHack.cnf (and maybe NETHACKOPTIONS) are read.
+X * If this is a request to show the score file, do it here and quit.
+X */
+Xvoid ami_wbench_init()
+X{
+X    struct WBStartup *wbs=(struct WBStartup *)ami_argv;
+X    struct WBArg *wa;
+X    int ia;         /* arg of active icon */
+X    int x,doscore=0;
+X    char    *p,*lp;
+X    BPTR    olddir;         /* starting directory */
+X    struct DiskObject *dobj;
+X    char    *scorearg, *t;
+X    char    tmp_levels[PATHLEN];
+X
+X    FromWBench=(ami_argc==0);
+X    if(!FromWBench)return;          /* nothing if from CLI */
+X
+X    /*
+X     * "NULL" out arrays
+X     */
+X    tmp_levels[0]  = '\0';
+X
+X    IconBase=OpenLibrary("icon.library",33L);
+X    if(!IconBase)error("icon.library missing!");
+X
+X    wa=wbs->sm_ArgList;
+X    if(wbs->sm_NumArgs>2)error("You can only play one game at a time!");
+X    ia=wbs->sm_NumArgs-1;
+X
+X    if(strcmp("NewGame",wa[ia].wa_Name)){
+X	strcpy(savefname,wa[ia].wa_Name);
+X	strcpy(plname,wa[ia].wa_Name);
+X    }
+X
+X    if( ( t = strrchr( plname, '.' ) ) && strcmp( t, ".sav" ) == 0 )
+X	*t = 0;
+X
+X    olddir=CurrentDir(wa[ia].wa_Lock);   /* where the icon is */
+X
+X    dobj=GetDiskObject(wa[ia].wa_Name);
+X    (void)CurrentDir(olddir);       /* and back */
+X    if(!dobj){
+X	error("Sorry, I can't find your icon!");
+X    }
+X
+X    FromTool=(dobj->do_Type==WBTOOL)?1:
+X	(dobj->do_Type==WBPROJECT)?0:
+X	(error("Sorry, I don't recognize this icon type!"),1);
+X
+X    if(index(savefname,'.') && !strncmp(index(savefname,'.'),".sav",4)){
+X	*index(savefname,'.')='\0';
+X    } else {
+X	savefname[0]='\0';  /* don't override if not save file */
+X	FromTool = 1;
+X    }
+X
+X    argline[0]='\0';
+X    if( p = FindToolType( dobj->do_ToolTypes, "SCREEN" ) )
+X    {
+X	extern int bigscreen;
+X	if( MatchToolValue( p, "NOLACE" ) )
+X	    bigscreen = -1;
+X	else if( MatchToolValue( p, "LACE" ) )
+X	    bigscreen = 1;
+X    }
+X    if(dobj->do_ToolTypes)for(x=0;p=dobj->do_ToolTypes[x];x++){
+X	lp=index(p,'=');
+X	if( !lp++ || strncmp(p, "SCORE", 5 ) == 0 ){
+X	    if((strncmp(p,"SCORES",6)==0) || (strncmp(p,"SCORE",5)==0)){
+X		if( !lp ) lp = "";
+X		doscore=1;
+X		scorearg=(char *)alloc(strlen(lp)+1);
+X		strcpy(scorearg,lp);
+X	    } else {
+X		TTparse=TRUE;
+X		parseoptions(p,(boolean)TRUE,(boolean)FALSE);
+X		TTparse=FALSE;
+X	    }
+X	} else {
+X	    TTparse=TRUE;
+X		/* new things */
+X	    if((strncmp(p,"CMDLINE",7)==0)||
+X	      (strncmp(p,"COMMANDLINE",11)==0)||
+X	      (strncmp(p,"INTERNALCLI",11)==0)){
+X	    	strncpy(argline,lp,79);
+X		if(*p=='I'){
+X		    FromTool=0; /* ugly hack bugfix */
+X		    FromCLI=1;  /* frontend ICLI only */
+X		}
+X	    }
+X	    else if( strncmp( p, "SCREEN",6 ) )
+X	    {
+X		if (!parse_config_line((FILE *)0, p, 0, tmp_levels)){
+X		    raw_printf("Bad ToolTypes line: '%s'\n",p);
+X		    getreturn("to continue");
+X		}
+X	    }
+X	TTparse=FALSE;
+X	}
+X    }
+X	/* cleanup - from files.c, except we only change things
+X	 * that are explicitly changed, since we already
+X	 * did this once to get the defaults (in amidos.c)  */
+X    if(plname[0]){
+X	plnamesuffix(); /* from files.c */
+X	set_savefile_name();
+X    }
+X    if(tmp_levels[0])strcpy(permbones,tmp_levels);
+X    if(tmp_levels[0]){
+X	strcpy(levels,tmp_levels);
+X	strcpy(bones,levels);
+X    }
+X    FreeDiskObject(dobj);   /* we'll get it again later if we need it */
+X
+X    if(doscore){
+X	long ac;
+X	char *p;
+X	char **av=calloc(1,50*sizeof(char *));
+X#ifdef CHDIR
+X	chdirx(hackdir,0);
+X#endif
+X	av[0]="NetHack";            /* why not? */
+X	av[1]="-s";             /* why not? */
+X	for(ac=2,p=scorearg;*p;ac++){
+X	    av[ac]=p;
+X	    while(*p && !isspace(*p))p++;
+X	    if(!*p)break;
+X	    *p++='\0';
+X	    while(*p && isspace(*p))p++;
+X	}
+X	prscore(ac+1,av);
+X	free( av );
+X	exit(0);        /* overloaded */
+X    }
+X
+X	    /* if the user started us from the tool icon,
+X	     * we can't save the game in the same place
+X	     * we started from, so pick up the plname
+X	     * and hope for the best.
+X	     */
+X    if(FromTool){
+X	set_savefile_name();
+X    }
+X}
+X
+X/* Simulate the command line (-s is already done, although this is
+X * not exactly the way it should be). Note that we do not handle the
+X * entire range of standard NetHack flags.
+X */
+Xvoid ami_wbench_args(){
+X    char *p=argline;
+X
+X    if(!FromWBench) return;
+X
+X    while(*p){
+X	switch(*p++){
+X	case ' ':
+X	case '-':   break;
+X#ifdef NEWS
+X	case 'n':   flags.news = FALSE;
+X#endif
+X#if defined(WIZARD) || defined(EXPLORE_MODE)
+X# ifndef EXPLORE_MODE
+X	case 'X':
+X# endif
+X	case 'D':
+X# ifdef WIZARD
+X#  ifdef KR1ED
+X	    if(!strcmp(plname,WIZARD_NAME))
+X#  else
+X	    if(!strcmp(plname,WIZARD))
+X#  endif
+X	    {
+X		wizard=TRUE;break;
+X	    }
+X	    /* else fall through */
+X# endif
+X# ifdef EXPLORE_MODE
+X	case 'X':   discover=TRUE;
+X# endif
+X	    break;
+X#endif
+X	case 'L':   /* interlaced screen */
+X	    bigscreen = 1;
+X	    break;
+X	case 'l':   /* No interlaced screen */
+X	    bigscreen = -1;
+X	    break;
+X	case 'u':
+X	    {
+X	    char *c,*dest;
+X	    while(*p && isascii(*p) && isspace(*p))p++;
+X	    c=p;
+X	    dest=plname;
+X	    for(;*p && isascii(*p) && !isspace(*p);){
+X		if(dest-plname>=(sizeof(plname)-1))break;
+X		*dest++=*p++;
+X	    }
+X	    *dest='\0';
+X	    if(c==dest)
+X		raw_print("Player name expected after -u");
+X	    }
+X	    strcpy(savefname,plname);
+X	    set_savefile_name();
+X	    break;
+X	default:
+X	    p--;
+X	    if(index(classes,toupper(*p))){
+X		char *t=pl_character;
+X		int cnt=sizeof(pl_character)-1;
+X		while(cnt && *p && !isspace(*p))*t++=*p++,cnt--;
+X		*t=0;
+X		break;
+X	    }
+X	    raw_printf("Unknown switch: %s\n",p);
+X	    /* FALL THROUGH */
+X	case '?':
+X	    {
+X	    char buf[77];
+X
+X	    raw_printf("Usage: %s -s [-[%s]] [maxrank] [name]...",
+X	      hname, classes);
+X	    raw_print("       or");
+X	    sprintf(buf,"       %s [-u name] [-[%s]]", hname, classes);
+X#if defined(WIZARD) || defined(EXPLORE_MODE)
+X	    strcat(buf," [-[DX]]");
+X#endif
+X#ifdef NEWS
+X	    strcat(buf," [-n]");
+X#endif
+X#ifdef MFLOPPY
+X# ifndef AMIGA
+X	    strcat(" [-r]");
+X# endif
+X#endif
+X	    raw_print(buf);
+X	    exit(0);
+X	    }
+X	}
+X    }
+X}
+X
+X
+X/* IF (from workbench) && (currently parsing ToolTypes)
+X * THEN print error message and return 0
+X * ELSE return 1
+X */
+Xami_wbench_badopt(oopsline)
+Xconst char *oopsline;
+X{
+X    if(!FromWBench)return 1;
+X    if(!TTparse)return 1;
+X
+X    raw_printf("Bad Syntax in OPTIONS in ToolTypes: %s.",oopsline);
+X    return 0;
+X}
+X
+X/* Construct (if necessary) and fill in icon for given save file */
+Xvoid ami_wbench_iconwrite(base)
+Xchar *base;
+X{
+X    BPTR lock;
+X    char tmp[PATHLEN+5];
+X    struct DiskObject *dobj;
+X    char **savtp, *ourtools[ 21 ];
+X#define CHARACTER   0
+X#define PENS        1
+X    char types[ 4 ][ 80 ];  /* Buffer space for tooltypes until written */
+X    int i, j;
+X
+X    if(!FromWBench)return;
+X    if(FromCLI)return;
+X
+X    strcpy(tmp,base);
+X    strcat(tmp,".info");
+X    if(FromTool){               /* user clicked on main icon */
+X	(void)CopyFile(DEFAULT_ICON,tmp);
+X    } else {                /* from project */
+X	lock=Lock(tmp,ACCESS_READ);
+X	if(lock==0){    /* maybe our name changed - try to get
+X		 * original icon */
+X	    if(!Rename(origicon,tmp)){
+X		/* nope, build a new icon */
+X	    lock=Lock(DEFAULT_ICON,ACCESS_READ);
+X	    if(lock==0)return;      /* no icon today */
+X	    UnLock(lock);
+X	    (void)CopyFile(DEFAULT_ICON,tmp);
+X	    }
+X	} else UnLock(lock);
+X    }
+X    KillIcon=FALSE;
+X
+X    dobj=GetDiskObject(base);
+X
+X    /* Save the current pointer */
+X
+X    savtp = (char **)dobj->do_ToolTypes;
+X
+X    /* Copy the old and set new entries for the WorkBench. */
+X
+X    for( i = 0; savtp[i]; ++i )
+X    {
+X	/* Ignore any current settings of these values */
+X
+X	if( strncmpi( savtp[ i ], "CHARACTER=", 10 ) == 0 ||
+X	    strncmpi( savtp[ i ], "PENS=", 5 ) == 0 )
+X	{
+X	    continue;
+X	}
+X
+X	ourtools[ i ] = savtp[ i ];
+X    }
+X
+X    /* Fill in the needed values. */
+X
+X    ourtools[ i++ ] = types[ CHARACTER ];
+X    sprintf( types[ CHARACTER ], "CHARACTER=%c", *pl_character );
+X
+X    ourtools[ i++ ] = types[ PENS ];
+X    strcpy( types[ PENS ], "PENS=" );
+X
+X    /* Put in the pen colors... */
+X    for( j = 0; j < (1L << DEPTH); ++j )
+X    {
+X	extern unsigned short amii_curmap[];
+X	sprintf( types[ PENS ] + strlen( types[ PENS ] ),
+X	  "%03x,", amii_curmap[ j ] );
+X    }
+X
+X    /* Remove trailing comma */
+X    types[ PENS ][ strlen( types[ PENS ] ) - 1 ] = 0;
+X
+X    ourtools[ i ] = NULL;
+X
+X    /* Set the tools pointer to the temporary copy */
+X
+X    dobj->do_ToolTypes = (void *)ourtools;
+X    PutDiskObject(base,dobj);
+X
+X    /* Restore the pointer and free the structures */
+X
+X    dobj->do_ToolTypes = (void *)savtp;
+X    FreeDiskObject(dobj);
+X}
+X
+X/* How much disk space will we need for the icon? */
+Xint ami_wbench_iconsize(base)
+Xchar *base;
+X{
+X    struct FileInfoBlock *fib;
+X    BPTR lock;
+X    int rv;
+X    char tmp[PATHLEN+5];
+X
+X    if(!FromWBench)return(0);
+X    if(FromCLI)return(0);
+X
+X    strcpy(tmp,base);
+X    strcat(tmp,".info");
+X    lock=Lock(tmp,ACCESS_READ);
+X    if(lock==0){    /* check the default */
+X	lock=Lock(DEFAULT_ICON,ACCESS_READ);
+X	if(lock==0)return(0);
+X    }
+X    fib = (struct FileInfoBlock *)AllocMem(ALLOC_SIZE, MEMF_CLEAR);
+X    if(!Examine(lock,fib)){
+X	UnLock(lock);
+X	FreeMem(fib, ALLOC_SIZE);
+X	return(0);          /* if no icon, there never will be one */
+X    }
+X    rv=fib->fib_Size+strlen(plname);    /* guessing */
+X    UnLock(lock);
+X    FreeMem(fib, ALLOC_SIZE);
+X    return(rv);
+X}
+X
+X/* Delete the icon associated with the given file (NOT the file itself! */
+X/* (Don't worry if the icon doesn't exist */
+Xvoid ami_wbench_unlink(base)
+Xchar *base;
+X{
+X    if(!FromWBench)return;
+X    if(FromCLI)return;
+X
+X    strcpy(iconname,base);
+X    strcat(iconname,".info");
+X    KillIcon=TRUE;          /* don't do it now - this way the user
+X			     * gets back whatever picture we had
+X			     * when we started if the game is
+X			     * saved again           */
+X}
+X
+Xstatic int preserved=0;		/* wizard mode && saved save file */
+X
+Xpreserve_icon(){
+X    preserved=1;
+X}
+Xclear_icon(){
+X    if(!FromWBench)return;
+X    if(FromCLI)return;
+X    if(preserved)return;
+X    if(!KillIcon)return;
+X
+X    DeleteFile(iconname);
+X}
+X
+X/* Check for a saved game.
+XIF not a saved game -> -1
+XIF can't open SAVEF -> -1
+XELSE -> fd for reading SAVEF */
+Xint ami_wbench_getsave(mode)
+Xint mode;
+X{
+X    BPTR lock;
+X    struct FileInfoBlock *fib;
+X
+X    if(!FromWBench)return(open(SAVEF,mode));
+X	    /* if the file will be created anyway, skip the
+X	     * checks and just do it            */
+X    if(mode & O_CREAT)return(open(SAVEF,mode));
+X    if(FromTool)return(-1);	/* otherwise, by definition, there
+X				 * isn't a save file (even if a
+X				 * file of the right name exists) */
+X    if(savefname[0])
+X	strncpy(plname,savefname,PL_NSIZ-1); /* restore poly'd name */
+X    lock=Lock(SAVEF,ACCESS_READ);
+X    fib = (struct FileInfoBlock *)AllocMem(ALLOC_SIZE, MEMF_CLEAR);
+X    if(lock && Examine(lock,fib)){
+X	if(fib->fib_Size>100){  /* random number << save file size */
+X	    UnLock(lock);
+X	    FreeMem(fib,ALLOC_SIZE);
+X	    return(open(SAVEF,mode));
+X	} else {
+X		/* this is a dummy file we need because
+X		 * workbench won't duplicate an icon with no
+X		 * "real" data attached - try to get rid of it.
+X		 */
+X	    UnLock(lock);
+X	    unlink(SAVEF);
+X	    FreeMem(fib,ALLOC_SIZE);
+X	    return(-1);
+X	}
+X    }
+X    FreeMem(fib,ALLOC_SIZE);
+X    return(-1);     /* give up */
+X}
+END_OF_FILE
+if test 12565 -ne `wc -c <'sys/amiga/amiwbench.c'`; then
+    echo shar: \"'sys/amiga/amiwbench.c'\" unpacked with wrong size!
+fi
+# end of 'sys/amiga/amiwbench.c'
+fi
+echo shar: End of archive 28 \(of 108\).
+cp /dev/null ark28isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
+41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 \
+61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 \
+81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 \
+101 102 103 104 105 106 107 108 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 108 archives.
+    echo "Now execute 'rebuild.sh'"
+    rm -f ark10[0-8]isdone ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

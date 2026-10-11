@@ -1,0 +1,2235 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,3445369a5cdfd3c0,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-07-09 21:10:20 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site nsc-pdc.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!genrad!decvax!tektronix!reed!nsc-pdc!mark
+From: mark@nsc-pdc.UUCP (Mark Nudelman)
+Newsgroups: net.sources
+Subject: less, part 2 of 2
+Message-ID: <229@nsc-pdc.UUCP>
+Date: Wed, 10-Jul-85 00:10:20 EDT
+Article-I.D.: nsc-pdc.229
+Posted: Wed Jul 10 00:10:20 1985
+Date-Received: Fri, 12-Jul-85 03:31:46 EDT
+Reply-To: mark@nsc-pdc.UUCP (Mark Nudelman)
+Organization: NSC Portland Development Center, Portland Oregon
+Lines: 2214
+
+This is part 2 of 2 of the less distribution.
+To install, delete everything down to the cut line below, 
+put the file in an empty directory, and run sh on the file.
+
+	Mark Nudelman		nsc!nsc-pdc!mark
+	National Semiconductor	tektronix!reed!nsc-pdc!mark
+
+
+#!/bin/sh-----cut here-----cut here-----cut here-----cut here-----
+# shar:	Shell Archiver
+#	Run the following text with /bin/sh to create:
+#	main.c 
+#	output.c 
+#	position.c 
+#	prim.c 
+#	screen.c 
+#	signal.c 
+#	ttyin.c 
+#	version.c 
+#	funcs.h 
+#	less.h 
+#	position.h 
+#	mkfuncs.awk 
+cat - << \SHAR_EOF > main.c
+/*
+ * Entry point, initialization, miscellaneous routines.
+ */
+
+#include "less.h"
+#include "position.h"
+#include <setjmp.h>
+
+public int	pipe;
+public jmp_buf	main_loop;
+public char *	first_cmd;
+public int	new_file;
+
+/*
+ * Command line options.
+ */
+public int p_nbufs, f_nbufs;	/* Number of buffers.  There are two values,
+				   one used for input from a pipe and 
+				   the other for input from a file. */
+public int clean_data;		/* Can we assume the data is "clean"? 
+				   (That is, free of nulls, etc) */
+public int quiet;		/* Should we suppress the audible bell? */
+public int top_search;		/* Should forward searches start at the top 
+				   of the screen? (alternative is bottom) */
+public int pr_type;		/* Type of prompt (short, medium, long) */
+public int bs_mode;		/* How to process backspaces */
+public int know_dumb;		/* Don't complain about dumb terminals */
+
+/*
+ * Defaults for command line options.
+ */
+#define	NBUFS_PIPED		12	/* # buffers if input is a pipe */
+#define	NBUFS_NON_PIPED		5	/* # buffers if input is a file */
+#define	CLEAN_DATA		0	/* Don't assume data is clean */
+#define	TOP_SEARCH		1	/* Start forw search from top of screen */
+#define	KNOW_DUMB		0	/* Warn me if I have a dumb terminal */
+#define	PR_TYPE			PR_SHORT
+#define	BS_MODE			BS_UNDERLINE
+
+extern int file;
+extern int nbufs;
+extern int sigs;
+
+static char current_file[128];
+
+static int ac;
+static char **av;
+static int curr_ac;
+
+/*
+ * Edit a new file.
+ * Filename "-" means standard input.
+ * No filename means the "current" file, from the command line.
+ */
+	public void
+edit(filename)
+	char *filename;
+{
+	register int f;
+	char message[100];
+
+	if (filename == NULL || *filename == '\0')
+	{
+		if (curr_ac >= ac)
+		{
+			error("No current file");
+			return;
+		}
+		filename = av[curr_ac];
+	}
+	if (strcmp(filename, "-") == 0)
+		f = 0;	/* Standard input */
+	else if ((f = open(filename, 0)) < 0)
+	{
+		sprintf(message, "Cannot open %.60s", filename);
+		error(message);
+		return;
+	}
+
+	if (isatty(f))
+	{
+		/*
+		 * Not really necessary to call this an error,
+		 * but if the control terminal (for commands)
+		 * and the input file (for data) are the same,
+		 * we get weird results at best.
+		 */
+		error("Can't take input from a terminal");
+		if (f > 0)
+			close(f);
+		return;
+	}
+
+	/*
+	 * Close the current input file and set up to use the new one.
+	 */
+	if (file > 0)
+		close(file);
+	new_file = 1;
+	file = f;
+	strcpy(current_file, filename);
+	pipe = (f == 0);
+	ch_init( (pipe) ? p_nbufs : f_nbufs );
+	if (first_cmd == NULL)
+		/* Display the first screen. */
+		jump_back(1);
+	else
+		/* Indicate there is nothing yet on the screen. */
+		pos_clear();
+}
+
+/*
+ * Construct a message suitable for printing by the "=" command.
+ * Also used by verbose prompting (-m) 
+ * and as the first prompt of a new file.
+ * The second argument is a bit mask describing 
+ * what to include in the message.
+ * Truncate the file name if it is too long to print.
+ */
+	public char *
+eq_message(width, what)
+	int width;
+	int what;
+{
+	POSITION pos, len;
+	int namelen, tlen;
+	int i;
+	char buf2[200];
+	static char buffer[200];
+
+	if (pipe)
+	{
+		/*
+		 * To avoid ending up with an empty message,
+		 * we force inclusion of the byte offset.
+		 */
+		what |= MBYTE;
+	}
+
+	pos = position(BOTTOM_PLUS_ONE);
+	len = ch_length();
+
+	/*
+	 * Build the message in "buffer", 
+	 * temporarily ignoring the width limit.
+	 * {{ buffer is supposed to be big enough that it won't overflow }}
+	 */
+	if ((what & MNAME) && !pipe)
+	{
+		strcpy(buffer, current_file);
+		namelen = strlen(buffer);
+	} else
+	{
+		buffer[0] = '\0';
+		namelen = 0;
+	}
+	
+	if ((what & MOF) && (ac > 1))
+	{
+		sprintf(buf2, " (file %d of %d)", curr_ac+1, ac);
+		strcat(buffer, buf2);
+	}
+
+
+	if (what & MBYTE)
+	{
+		if (pos == NULL_POSITION)
+			sprintf(buf2, " at bottom");
+		else
+			sprintf(buf2, " at byte %d", pos);
+		strcat(buffer, buf2);
+
+		if (len > 0)
+		{
+			sprintf(buf2, "/%d", len);
+			strcat(buffer, buf2);
+		}
+	}
+
+	if ((what & MPCT) && (len > 0) && (pos != NULL_POSITION))
+	{
+		sprintf(buf2, " (%d%%)", (100 * pos) / len);
+		strcat(buffer, buf2);
+	}
+
+	/*
+	 * If we have exceeded the width limit,
+	 * shift the last part of the message to the left,
+	 * overwriting the tail of the filename,
+	 * and append ".." to the end of the filename.
+	 */
+	if ((tlen = strlen(buffer)) > width)
+	{
+		int shift = tlen - width;
+		for (i = namelen+1;  i <= tlen;  i++)
+			buffer[i-shift] = buffer[i];
+		buffer[namelen-shift] = buffer[namelen-shift-1] = '.';
+	}
+
+	return (buffer);
+}
+
+/*
+ * Edit the next file in the command line list.
+ */
+	public void
+next_file(n)
+	int n;
+{
+	if (curr_ac + n >= ac)
+		error("No (N-th) next file");
+	else
+		edit(av[curr_ac += n]);
+}
+
+/*
+ * Edit the previous file in the command line list.
+ */
+	public void
+prev_file(n)
+	int n;
+{
+	if (curr_ac - n < 0)
+		error("No (N-th) previous file");
+	else
+		edit(av[curr_ac -= n]);
+}
+
+/*
+ * Toggle command line flags from within the program.
+ * Used by the "-" command.
+ */
+	public void
+toggle_flag(c)
+	int c;
+{
+	register char *s;
+	char message[100];
+
+	switch (c)
+	{
+	case 'c':
+		if (clean_data = !clean_data)
+			s = "Assume data is clean";
+		else
+			s = "Don't assume data is clean";
+		break;
+	case 'q':
+		quiet = (quiet == LITTLE_QUIET) ? NOT_QUIET : LITTLE_QUIET;
+		goto qflag;
+	case 'Q':
+		quiet = (quiet == VERY_QUIET) ? NOT_QUIET : VERY_QUIET;
+	qflag:
+		switch (quiet)
+		{
+		case NOT_QUIET:
+			s = "Ring the bell for errors AND at eof/bof";
+			break;
+		case LITTLE_QUIET:
+			s = "Ring the bell for errors but not at eof/bof";
+			break;
+		case VERY_QUIET:
+			s = "Never ring the bell";
+			break;
+		}
+		break;
+	case 'm':
+		pr_type = (pr_type == PR_MEDIUM) ? PR_SHORT : PR_MEDIUM;
+		goto mflag;
+	case 'M':
+		pr_type = (pr_type == PR_LONG) ? PR_SHORT : PR_LONG;
+	mflag:
+		switch (pr_type)
+		{
+		case PR_SHORT:
+			s = "Prompt with a colon";
+			break;
+		case PR_MEDIUM:
+			s = "Prompt with a message";
+			break;
+		case PR_LONG:
+			s = "Prompt with a verbose message";
+			break;
+		}
+		break;
+	case 't':
+		if (top_search = !top_search)
+			s = "Forward search starts from top of screen";
+		else
+			s = "Forward search starts from bottom of screen";
+		break;
+	case 'u':
+		bs_mode = (bs_mode == BS_NORMAL) ? BS_UNDERLINE : BS_NORMAL;
+		goto uflag;
+	case 'U':
+		bs_mode = (bs_mode == BS_CONTROL) ? BS_UNDERLINE : BS_CONTROL;
+	uflag:
+		switch (bs_mode)
+		{
+		case BS_UNDERLINE:
+			s = "Underlined text displayed in underline mode";
+			break;
+		case BS_NORMAL:
+			s = "All backspaces cause overstrike";
+			break;
+		case BS_CONTROL:
+			s = "Backspaces print as ^H";
+			break;
+		}
+		break;
+	case 'b':
+		sprintf(message, "Currently using %d buffers", nbufs);
+		s = message;
+		break;
+	default:
+		if (control_char(c))
+			sprintf(message, "\"-^%c\"", carat_char(c));
+		else
+			sprintf(message, "\"-%c\"", c);
+		strcat(message, ": no such flag.  Use one of \"bctmMuUqQ\"");
+		s = message;
+		break;
+	}
+	error(s);
+}
+
+/*
+ * Scan an argument (either from command line or from LESS environment 
+ * variable) and process it.
+ */
+	static void
+arg_scan(s)
+	register char *s;
+{
+	register int n;
+	char bflag;
+
+	if (s == NULL)
+		return;
+
+	while (*s != '\0') switch (*s++)
+	{
+	case 'b':
+		bflag = '\0';
+		if (*s == 'f' || *s == 'p')
+		{
+			bflag = *s;
+			++s;
+		}
+
+		if (*s < '0' || *s > '9')
+		{
+			printf("-b requires number: \"-b<n>\"\n");
+			exit(1);
+			/*NOTREACHED*/
+		}
+
+		n = 0;
+		while (*s >= '0' && *s <= '9')
+			n = 10 * n + *s++ - '0';
+		if (n <= 0 || n > 200)
+		{
+			printf("invalid number (%d) for -b\n", n);
+			exit(1);
+			/*NOTREACHED*/
+		}
+
+		switch (bflag)
+		{
+		case 'p':
+			p_nbufs = n;
+			break;
+		case 'f':
+			f_nbufs = n;
+			break;
+		case '\0':
+			p_nbufs = f_nbufs = n;
+			break;
+		}
+		break;
+	case 'c':
+		clean_data = !CLEAN_DATA;
+		break;
+	case 'd':
+		know_dumb = !KNOW_DUMB;
+		break;
+	case 'q':
+		quiet = LITTLE_QUIET;
+		break;
+	case 'Q':
+		quiet = VERY_QUIET;
+		break;
+	case 'm':
+		pr_type = PR_MEDIUM;
+		break;
+	case 'M':
+		pr_type = PR_LONG;
+		break;
+	case 't':
+		top_search = !TOP_SEARCH;
+		break;
+	case 'u':
+		bs_mode = BS_NORMAL;
+		break;
+	case 'U':
+		bs_mode = BS_CONTROL;
+		break;
+	case '+':
+		first_cmd = s;
+		return;
+	case '-':
+	case ' ':
+	case '\t':
+		break;
+	default:
+		printf("\"-%c\": invalid flag\n", *--s);
+		exit(1);
+		/*NOTREACHED*/
+	}
+}
+
+/*
+ * Entry point.
+ */
+main(argc, argv)
+	int argc;
+	char *argv[];
+{
+	char *getenv();
+
+	/*
+	 * Initialize command line flags to their defaults.
+	 */
+	p_nbufs = NBUFS_PIPED;
+	f_nbufs = NBUFS_NON_PIPED;
+	clean_data = CLEAN_DATA;
+	quiet = NOT_QUIET;
+	top_search = TOP_SEARCH;
+	pr_type = PR_TYPE;
+	bs_mode = BS_MODE;
+	first_cmd = NULL;
+	know_dumb = KNOW_DUMB;
+
+	/*
+	 * Process command line arguments and LESS environment arguments.
+	 * Command line arguments override environment arguments.
+	 */
+	arg_scan(getenv("LESS"));
+	argv++;
+	while ((--argc > 0) && (**argv == '-' || **argv == '+'))
+		arg_scan(*argv++);
+
+	/*
+	 * Set up list of files to be examined.
+	 */
+	ac = argc;
+	av = argv;
+	curr_ac = 0;
+
+	/*
+	 * Set up terminal, etc.
+	 */
+	raw_mode(1);
+	get_term();
+	open_getc();
+	init();
+
+	if (setjmp(main_loop) == 0)
+	{
+		init_signals();
+
+		/*
+		 * Select the first file to examine.
+		 */
+		if (ac < 1)
+			edit("-");	/* Standard input */
+		else 
+		{
+			/*
+			 * Try all the files named as command arguments.
+			 * We are simply looking for one which can be
+			 * opened without error.
+			 */
+			do
+			{
+				edit((char *)NULL);
+				if (file >= 0)
+					/* We can open this file. */
+					break;
+				putc('\n');  flush();
+			} while (++curr_ac < ac);
+		}
+	}
+	if (file >= 0)
+		commands();
+	quit();
+}
+
+/*
+ * Exit the program.
+ */
+	public void
+quit()
+{
+	/*
+	 * Put cursor at bottom left corner, clear the line,
+	 * reset the terminal modes, and exit.
+	 */
+	lower_left();
+	clear_eol();
+	deinit();
+	flush();
+	raw_mode(0);
+	exit(0);
+}
+SHAR_EOF
+cat - << \SHAR_EOF > output.c
+/*
+ * High level routines dealing with the output to the screen.
+ */
+
+#include "less.h"
+
+extern int sigs;
+extern int sc_width, sc_height;
+extern int ul_width, ue_width;
+extern char *line;
+	
+/*
+ * Display the line which is in the line buffer.
+ */
+	public void
+put_line()
+{
+	register char *p;
+	register int c;
+	register int column;
+	extern int auto_wrap, ignaw;
+
+	if (sigs)
+		/*
+		 * Don't output if a signal is pending.
+		 */
+		return;
+
+	if (line == NULL)
+		line = "~";
+
+	column = 0;
+	for (p = line;  *p != '\0';  p++)
+	{
+		c = *p;
+		if (c == UL_CHAR)
+		{
+			ul_enter();
+			column += ul_width;
+		} else if (c == UE_CHAR)
+		{
+			ul_exit();
+			column += ue_width;
+		} else if (c & 0200)
+		{
+			putc('^');
+			putc(c & 0177);
+			column += 2;
+		} else if (c == '\b')
+		{
+			putbs();
+			column--;
+		} else
+		{
+			putc(c);
+			column++;
+		}
+	}
+	if (column < sc_width || !auto_wrap || ignaw)
+		putc('\n');
+}
+
+/*
+ * Is a given character a "control" character?
+ * {{ ASCII DEPENDENT }}
+ */
+	public int
+control_char(c)
+	int c;
+{
+	return (c < ' ' || c == '\177');
+}
+
+/*
+ * Return the printable character used to identify a control character
+ * (printed after a carat; e.g. '\3' => "^C").
+ * {{ ASCII DEPENDENT }}
+ */
+	public int
+carat_char(c)
+	int c;
+{
+	return ((c == '\177') ? '?' : (c | 0100));
+}
+
+
+static char obuf[1024];
+static char *ob = obuf;
+
+/*
+ * Flush buffered output.
+ */
+	public void
+flush()
+{
+	write(1, obuf, ob-obuf);
+	ob = obuf;
+}
+
+/*
+ * Discard buffered output.
+ */
+	public void
+dropout()
+{
+	ob = obuf;
+}
+
+/*
+ * Output a character.
+ */
+	public void
+putc(c)
+	int c;
+{
+	if (ob >= &obuf[sizeof(obuf)])
+		flush();
+	*ob++ = c;
+}
+
+/*
+ * Output a string.
+ */
+	public void
+puts(s)
+	register char *s;
+{
+	while (*s != '\0')
+		putc(*s++);
+}
+
+/*
+ * Output a message in the lower left corner of the screen
+ * and wait for carriage return.
+ */
+
+static char return_to_continue[] = "  (press RETURN)";
+
+	public void
+error(s)
+	char *s;
+{
+	register int c;
+
+	lower_left();
+	clear_eol();
+	so_enter();
+	puts(s);
+	puts(return_to_continue);
+	so_exit();
+
+	while ((c = getc()) != '\n' && c != '\r')
+		bell();
+}
+
+	public int
+error_width()
+{
+	/*
+	 * Allow 2 extra spaces at each end for terminals that eat spaces 
+	 * to enter/exit standout mode.
+	 * Also don't use the last position, because some terminals
+	 * will scroll if you write in the last char of the last line.
+	 *
+	 * {{ Could use termcap "sg" to determine how many spaces
+	 *    the terminal eats for enter/exit standout.
+	 *    Maybe something in termcap also tells whether terminal
+	 *    scrolls if you write in lower right corner?
+	 *    Probably not worth it to gain the (max) 5 extra spaces. }}
+	 */
+	return (sc_width - sizeof(return_to_continue) - 5);
+}
+SHAR_EOF
+cat - << \SHAR_EOF > position.c
+/*
+ * Routines dealing with the "position" table.
+ * This is a table which tells the position (in the input file) of the
+ * first char on each currently displayed line.
+ *
+ * {{ The position table is scrolled by moving all the entries.
+ *    Would be better to have a circular table 
+ *    and just change a couple of pointers. }}
+ */
+
+#include "less.h"
+#include "position.h"
+
+#define	NPOS	100		/* {{ sc_height must be less than NPOS }} */
+static POSITION table[NPOS];	/* The position table */
+
+extern int sc_width, sc_height;
+
+/*
+ * Return the position of one of:
+ *	the top (first) line on the screen
+ *	the second line on the screen
+ *	the bottom line on the screen
+ *	the line after the bottom line on the screen
+ */
+	public POSITION
+position(where)
+	int where;
+{
+	register int n;
+
+	switch (where)
+	{
+	case TOP:
+		n = 0;
+		break;
+	case TOP_PLUS_ONE:
+		n = 1;
+		break;
+	case BOTTOM:
+		n = sc_height - 2;
+		break;
+	case BOTTOM_PLUS_ONE:
+		n = sc_height - 1;
+		break;
+	}
+	return (table[n]);
+}
+
+/*
+ * Add a new file position to the bottom of the position table.
+ */
+	public void
+add_forw_pos(pos)
+	POSITION pos;
+{
+	register int i;
+
+	/*
+	 * Scroll the position table up.
+	 */
+	for (i = 1;  i < sc_height;  i++)
+		table[i-1] = table[i];
+	table[sc_height - 1] = pos;
+}
+
+/*
+ * Add a new file position to the top of the position table.
+ */
+	public void
+add_back_pos(pos)
+	POSITION pos;
+{
+	register int i;
+
+	/*
+	 * Scroll the position table down.
+	 */
+	for (i = sc_height - 1;  i > 0;  i--)
+		table[i] = table[i-1];
+	table[0] = pos;
+}
+
+/*
+ * Initialize the position table, done whenever we clear the screen.
+ */
+	public void
+pos_clear()
+{
+	register int i;
+
+	for (i = 0;  i < sc_height;  i++)
+		table[i] = NULL_POSITION;
+}
+SHAR_EOF
+cat - << \SHAR_EOF > prim.c
+/*
+ * Primitives for displaying the file on the screen.
+ */
+
+#include "less.h"
+#include "position.h"
+
+extern int quiet;
+extern int top_search;
+extern int sc_width, sc_height;
+extern int sigs;
+extern char *line;
+
+/*
+ * Display n lines, scrolling forward, 
+ * starting at position pos in the input file.
+ */
+	static void
+forw(n, pos, force)
+	register int n;
+	POSITION pos;
+	int force;
+{
+	while (--n >= 0)
+	{
+		/*
+		 * Read the next line of input.
+		 */
+		pos = forw_line(pos);
+		if (line == NULL)
+		{
+			/*
+			 * End of file: stop here unless the top line 
+			 * is still empty, or "force" is true.
+			 */
+			if (!force && position(TOP) != NULL_POSITION)
+			{
+				if (quiet == NOT_QUIET)
+					bell();
+				else
+					vbell();
+				break;
+			}
+			pos = NULL_POSITION;
+		}
+		/*
+		 * Add the position of the next line to the position table.
+		 * Display the current line on the screen.
+		 */
+		add_forw_pos(pos);
+		lower_left();
+		put_line();
+	}
+}
+
+/*
+ * Display n lines, scrolling backward.
+ */
+	static void
+back(n, pos, force)
+	register int n;
+	POSITION pos;
+	int force;
+{
+	while (--n >= 0)
+	{
+		/*
+		 * Get the previous line of input.
+		 */
+		pos = back_line(pos);
+		if (line == NULL)
+		{
+			/*
+			 * Beginning of file: stop here unless "force" is true.
+			 */
+			if (!force)
+			{
+				if (quiet == NOT_QUIET)
+					bell();
+				else
+					vbell();
+				break;
+			}
+			pos = NULL_POSITION;
+		}
+		/*
+		 * Add the position of the previous line to the position table.
+		 * Display the line on the screen.
+		 */
+		add_back_pos(pos);
+		home();
+		add_line();
+		put_line();
+	}
+}
+
+/*
+ * Display n more lines, forward.
+ * Start just after the line currently displayed at the bottom of the screen.
+ */
+	public void
+forward(n)
+	int n;
+{
+	POSITION pos;
+
+	pos = position(BOTTOM_PLUS_ONE);
+	if (pos == NULL_POSITION)
+		return;
+	forw(n, pos, 0);
+}
+
+/*
+ * Display n more lines, backward.
+ * Start just before the line currently displayed at the top of the screen.
+ */
+	public void
+backward(n)
+	int n;
+{
+	POSITION pos;
+
+	pos = position(TOP);
+	if (pos == NULL_POSITION)
+		/* 
+		 * This will almost never happen,
+		 * because the top line is almost never empty. 
+		 */
+		return;   
+	back(n, pos, 0);
+}
+
+/*
+ * Repaint the screen.
+ */
+	public void
+repaint()
+{
+	POSITION pos;
+
+	/*
+	 * Start at the line currently at the top of the screen
+	 * and redisplay the screen.
+	 */
+	pos = position(TOP);
+	clear();
+	pos_clear();
+	add_forw_pos(pos);
+	forw(sc_height - 1, pos, 0);
+}
+
+/*
+ * Jump to the end of the file.
+ * It is more convenient to paint the screen backward,
+ * from the end of the file toward the beginning.
+ */
+	public void
+jump_forw()
+{
+	POSITION pos;
+
+	if (ch_end_seek())
+	{
+		error("Cannot seek to end of file");
+		return;
+	}
+	pos = ch_tell();
+	clear();
+	pos_clear();
+	add_back_pos(pos);
+	back(sc_height - 1, pos, 0);
+}
+
+/*
+ * Jump to line n in the file.
+ */
+	public void
+jump_back(n)
+	register int n;
+{
+	register int c;
+	POSITION pos;
+
+	/*
+	 * This is done the slow way, by starting at the beginning
+	 * of the file and counting newlines.
+	 */
+	if (ch_seek((POSITION)0))
+	{
+		/* 
+		 * Probably a pipe with beginning of file no longer buffered. 
+		 */
+		error("Cannot get to beginning of file");
+		return;
+	}
+
+	/*
+	 * Start counting lines.
+	 */
+	while (--n > 0)
+	{
+		while ((c = ch_forw_get()) != '\n')
+			if (c == EOF)
+			{
+				error("File is not that long");
+				/* {{ Maybe tell him how long it is? }} */
+				return;
+			}
+	}
+
+	/*
+	 * Finally found the place to start.
+	 * Clear and redisplay the screen from there.
+	 *
+	 * {{ We *could* figure out if the new position is 
+	 *    close enough to just scroll there without clearing
+	 *    the screen, but it's not worth it. }}
+	 */
+	pos = ch_tell();
+	clear();
+	pos_clear();
+	add_forw_pos(pos);
+	forw(sc_height - 1, pos, 0);
+}
+
+/*
+ * Jump to a specified percentage into the file.
+ * This is a poor compensation for not being able to
+ * quickly jump to a specific line number.
+ */
+	public void
+jump_percent(percent)
+	int percent;
+{
+	POSITION pos, len;
+	int c;
+
+	/*
+	 * Determine the position in the file
+	 * (the specified percentage of the file's length).
+	 */
+	if ((len = ch_length()) == NULL_POSITION)
+	{
+		error("Don't know length of file");
+		return;
+	}
+	pos = (percent * len) / 100;
+
+	/*
+	 * Seek to the specified percentage into the file.
+	 */
+	if (ch_seek(pos))
+	{
+		error("Cannot seek to that position");
+		return;
+	}
+
+	/*
+	 * Back up to the beginning of the current line.
+	 */
+	while ((c = ch_back_get()) != '\n' && c != EOF)
+		;
+	if (c == '\n')
+		(void) ch_forw_get();
+	pos = ch_tell();
+
+	/*
+	 * Clear and paint the screen.
+	 */
+	clear();
+	pos_clear();
+	add_forw_pos(pos);
+	forw(sc_height - 1, pos, 0);
+}
+
+/*
+ * Search for the n-th occurence of a specified pattern, 
+ * either forward (direction == '/'), or backwards (direction == '?').
+ */
+	public void
+search(direction, pattern, n)
+	int direction;
+	char *pattern;
+	register int n;
+{
+	register int search_forward = (direction == '/');
+	POSITION pos, new_pos;
+	register int lines_from_top;
+
+#if RECOMP
+	char *re_comp();
+	char *errmsg;
+
+	/*
+	 * (re_comp handles a null pattern internally, 
+	 *  so there is no need to check for a null pattern here.)
+	 */
+	if ((errmsg = re_comp(pattern)) != NULL)
+	{
+		error(errmsg);
+		return;
+	}
+#else
+#if REGCMP
+	char *regcmp();
+	static char *cpattern = NULL;
+
+	if (pattern == NULL || *pattern == '\0')
+	{
+		/*
+		 * A null pattern means use the previous pattern.
+		 * The compiled previous pattern is in cpattern, so just use it.
+		 */
+		if (cpattern == NULL)
+		{
+			error("No previous regular expression");
+			return;
+		}
+	} else
+	{
+		/*
+		 * Otherwise compile the given pattern.
+		 */
+		char *s;
+		if ((s = regcmp(pattern, 0)) == NULL)
+		{
+			error("Invalid pattern");
+			return;
+		}
+		if (cpattern != NULL)
+			free(cpattern);
+		cpattern = s;
+	}
+#else
+	static char lpbuf[100];
+	static char *last_pattern = NULL;
+
+	if (pattern == NULL || *pattern == '\0')
+	{
+		/*
+		 * Null pattern means use the previous pattern.
+		 */
+		if (last_pattern == NULL)
+		{
+			error("No previous regular expression");
+			return;
+		}
+		pattern = last_pattern;
+	} else
+	{
+		strcpy(lpbuf, pattern);
+		last_pattern = lpbuf;
+	}
+#endif
+#endif
+
+	/*
+	 * Figure out where to start the search.
+	 */
+
+	if (position(TOP) == NULL_POSITION)
+	{
+		/*
+		 * Nothing is currently displayed.
+		 * Start at the beginning of the file.
+		 * (This case is mainly for first_cmd searches,
+		 * for example, "+/xyz" on the command line.)
+		 */
+		pos = (POSITION)0;
+		lines_from_top = sc_height + 1;
+	} else if (!search_forward)
+	{
+		/*
+		 * Backward search: start just before the top line
+		 * displayed on the screen.
+		 */
+		pos = position(TOP);
+		lines_from_top = 0;
+	} else if (top_search)
+	{
+		/*
+		 * Forward search and "start from top".
+		 * Start at the second line displayed on the screen.
+		 */
+		pos = position(TOP_PLUS_ONE);
+		lines_from_top = 1;
+	} else
+	{
+		/*
+		 * Forward search but don't "start from top".
+		 * Start just after the bottom line displayed on the screen.
+		 */
+		pos = position(BOTTOM_PLUS_ONE);
+		lines_from_top = sc_height + 1;
+	}
+
+	if (pos == NULL_POSITION)
+	{
+		/*
+		 * Can't find anyplace to start searching from.
+		 */
+		error("Nothing to search");
+		return;
+	}
+	new_pos = pos;
+
+	for (;;)
+	{
+		/*
+		 * Get lines until we find a matching one or 
+		 * until we hit end-of-file (or beginning-of-file 
+		 * if we're going backwards).
+		 */
+		if (sigs)
+			/*
+			 * A signal aborts the search.
+			 */
+			return;
+
+		if (search_forward)
+		{
+			/*
+			 * Read the next line, and remember the 
+			 * starting position of the line after that.
+			 */
+			pos = new_pos;
+			new_pos = forw_line(pos);
+			lines_from_top++;
+		} else
+		{
+			/*
+			 * Read the previous line.
+			 */
+			pos = back_line(pos);
+			lines_from_top--;
+		}
+
+		if (line == NULL)
+		{
+			/*
+			 * We hit EOF/BOF without a match.
+			 */
+			error("Pattern not found");
+			return;
+		}
+
+		/*
+		 * Test the next line to see if we have a match.
+		 * This is done in a variety of ways, depending
+		 * on what pattern matching functions are available.
+		 */
+#if REGCMP
+		if ( (regex(cpattern, line) != NULL)
+#else
+#if RECOMP
+		if ( (re_exec(line) == 1)
+#else
+		if ( (match(pattern, line))
+#endif
+#endif
+				&& (--n <= 0) )
+			/*
+			 * Found the matching line.
+			 */
+			break;
+	}
+
+	if (lines_from_top > 0 && lines_from_top < sc_height)
+	{
+		/*
+		 * Scroll forward.
+		 */
+		clear_eol();
+		forw(lines_from_top-1, position(BOTTOM_PLUS_ONE), 1);
+	} else if (lines_from_top < 0 && -lines_from_top < sc_height)
+	{
+		/*
+		 * Scroll backwards.
+		 */
+		clear_eol();
+		back(-lines_from_top, position(TOP), 1);
+	} else
+	{
+		/*
+		 * Clear and paint screen.
+		 */
+		clear();
+		pos_clear();
+		add_forw_pos(pos);
+		forw(sc_height - 1, pos, 1);
+	}
+}
+
+#if (!REGCMP) && (!RECOMP)
+/*
+ * We have neither regcmp() nor re_comp().
+ * We use this function to do simple pattern matching.
+ * It supports no metacharacters like *, etc.
+ */
+	static int
+match(pattern, buf)
+	char *pattern, *buf;
+{
+	register char *pp, *lp;
+
+	for ( ;  *buf != '\0';  buf++)
+	{
+		for (pp = pattern, lp = buf;  *pp == *lp;  pp++, lp++)
+			if (*pp == '\0' || *lp == '\0')
+				break;
+		if (*pp == '\0')
+			return (1);
+	}
+	return (0);
+}
+#endif
+SHAR_EOF
+cat - << \SHAR_EOF > screen.c
+/*
+ * Routines which deal with the characteristics of the terminal.
+ * Uses termcap to be as terminal-independent as possible.
+ *
+ * {{ Someday this should be rewritten to use curses. }}
+ */
+
+#include "less.h"
+#if XENIX
+#include <sys/types.h>
+#include <sys/ioctl.h>
+#endif
+
+#if TERMIO
+#include <termio.h>
+#else
+#include <sgtty.h>
+#endif
+
+/*
+ * Strings passed to tputs() to do various terminal functions.
+ */
+static char
+	*sc_pad,		/* Pad string */
+	*sc_home,		/* Cursor home */
+	*sc_addline,		/* Add line, scroll down following lines */
+	*sc_lower_left,		/* Cursor to last line, first column */
+	*sc_move,		/* General cursor positioning */
+	*sc_clear,		/* Clear screen */
+	*sc_eol_clear,		/* Clear to end of line */
+	*sc_s_in,		/* Enter standout (highlighted) mode */
+	*sc_s_out,		/* Exit standout mode */
+	*sc_u_in,		/* Enter underline mode */
+	*sc_u_out,		/* Exit underline mode */
+	*sc_visual_bell,	/* Visual bell (flash screen) sequence */
+	*sc_backspace,		/* Backspace cursor */
+	*sc_init,		/* Startup terminal initialization */
+	*sc_deinit;		/* Exit terminal de-intialization */
+static int dumb;
+static int hard;
+
+public int auto_wrap;		/* Terminal does \r\n when write past margin */
+public int ignaw;		/* Terminal ignores \n immediately after wrap */
+public int erase_char, kill_char; /* The user's erase and line-kill chars */
+public int sc_width, sc_height;	/* Height & width of screen */
+public int ul_width, ue_width;	/* Printing width of underline sequences */
+
+/*
+ * These two variables are sometimes defined in,
+ * and needed by, the termcap library.
+ * It may be necessary on some systems to declare them extern here.
+ */
+/*extern*/ short ospeed;	/* Terminal output baud rate */
+/*extern*/ char PC;		/* Pad character */
+
+extern int quiet;		/* If VERY_QUIET, use visual bell for bell */
+extern int know_dumb;		/* Don't complain about a dumb terminal */
+char *tgetstr();
+char *tgoto();
+
+/*
+ * Change terminal to "raw mode", or restore to "normal" mode.
+ * "Raw mode" means 
+ *	1. An outstanding read will complete on receipt of a single keystroke.
+ *	2. Input is not echoed.  
+ *	3. On output, \n is mapped to \r\n.
+ *	4. \t is NOT be expanded into spaces.
+ *	5. Signal-causing characters such as ctrl-C (interrupt),
+ *	   etc. are NOT disabled.
+ * It doesn't matter whether an input \n is mapped to \r, or vice versa.
+ */
+	public void
+raw_mode(on)
+	int on;
+{
+#if TERMIO
+	struct termio s;
+	static struct termio save_term;
+
+	if (on)
+	{
+		/*
+		 * Get terminal modes.
+		 */
+		ioctl(2, TCGETA, &s);
+
+		/*
+		 * Save modes and set certain variables dependent on modes.
+		 */
+		save_term = s;
+		ospeed = s.c_cflag & CBAUD;
+		erase_char = s.c_cc[VERASE];
+		kill_char = s.c_cc[VKILL];
+
+		/*
+		 * Set the modes to the way we want them.
+		 */
+		s.c_lflag &= ~(ICANON|ECHO|ECHOE|ECHOK|ECHONL);
+		s.c_oflag |=  (OPOST|ONLCR|TAB3);
+		s.c_oflag &= ~(OCRNL|ONOCR|ONLRET);
+		s.c_cc[VMIN] = 1;
+		s.c_cc[VTIME] = 0;
+	} else
+	{
+		/*
+		 * Restore saved modes.
+		 */
+		s = save_term;
+	}
+	ioctl(2, TCSETAW, &s);
+#else
+	struct sgttyb s;
+	static struct sgttyb save_term;
+
+	if (on)
+	{
+		/*
+		 * Get terminal modes.
+		 */
+		ioctl(2, TIOCGETP, &s);
+
+		/*
+		 * Save modes and set certain variables dependent on modes.
+		 */
+		save_term = s;
+		ospeed = s.sg_ospeed;
+		erase_char = s.sg_erase;
+		kill_char = s.sg_kill;
+
+		/*
+		 * Set the modes to the way we want them.
+		 */
+		s.sg_flags |= CBREAK;
+		s.sg_flags &= ~(ECHO|XTABS);
+	} else
+	{
+		/*
+		 * Restore saved modes.
+		 */
+		s = save_term;
+	}
+	ioctl(2, TIOCSETP, &s);
+#endif
+}
+
+static int couldnt = 0;
+
+	static void
+cannot(s)
+	char *s;
+{
+	if (know_dumb)
+		/* 
+		 * He knows he has a dumb terminal, so don't tell him. 
+		 */
+		return;
+
+	printf("WARNING: terminal cannot \"%s\"\n", s);
+	couldnt = 1;
+}
+
+/*
+ * Get terminal capabilities via termcap.
+ */
+	public void
+get_term()
+{
+	char termbuf[1024];
+	char *sp;
+	static char sbuf[150];
+
+	char *getenv();
+
+	/*
+	 * Find out what kind of terminal this is.
+	 */
+	if (tgetent(termbuf, getenv("TERM")) <= 0)
+		dumb = 1;
+
+	/*
+	 * Get size of the screen.
+	 */
+	if (dumb || (sc_height = tgetnum("li")) < 0 || tgetflag("hc"))
+	{
+		/* Oh no, this is a hardcopy terminal. */
+		hard = 1;
+		sc_height = 24;
+	}
+	if (dumb || (sc_width = tgetnum("co")) < 0)
+		sc_width = 80;
+
+	auto_wrap = tgetflag("am");
+	ignaw = tgetflag("xn");
+
+	/*
+	 * Assumes termcap variable "sg" is the printing width of
+	 * the standout sequence, the end standout sequence,
+	 * the underline sequence, and the end underline sequence.
+	 */
+	if ((ul_width = tgetnum("sg")) < 0)
+		ul_width = 0;
+	ue_width = ul_width;
+
+	/*
+	 * Get various string-valued capabilities.
+	 */
+	sp = sbuf;
+
+	sc_pad = (dumb) ? NULL : tgetstr("pc", &sp);
+	if (sc_pad != NULL)
+		PC = *sc_pad;
+
+	sc_init = (dumb) ? NULL : tgetstr("ti", &sp);
+	if (sc_init == NULL)
+		sc_init = "";
+
+	sc_deinit= (dumb) ? NULL : tgetstr("te", &sp);
+	if (sc_deinit == NULL)
+		sc_deinit = "";
+
+	sc_eol_clear = (dumb) ? NULL : tgetstr("ce", &sp);
+	if (hard || sc_eol_clear == NULL || *sc_eol_clear == '\0')
+	{
+		cannot("clear to end of line");
+		sc_eol_clear = "";
+	}
+
+	sc_clear = (dumb) ? NULL : tgetstr("cl", &sp);
+	if (hard || sc_clear == NULL || *sc_clear == '\0')
+	{
+		cannot("clear screen");
+		sc_clear = "\n\n";
+	}
+
+	sc_move = (dumb) ? NULL : tgetstr("cm", &sp);
+	if (hard || sc_move == NULL || *sc_move == '\0')
+	{
+		/*
+		 * This is not an error here, because we don't 
+		 * always need sc_move.
+		 * We need it only if we don't have home or lower-left.
+		 */
+		sc_move = "";
+	}
+
+	sc_s_in = (dumb) ? NULL : tgetstr("so", &sp);
+	if (hard || sc_s_in == NULL)
+		sc_s_in = "";
+
+	sc_s_out = (dumb) ? NULL : tgetstr("se", &sp);
+	if (hard || sc_s_out == NULL)
+		sc_s_out = "";
+
+	sc_u_in = (dumb) ? NULL : tgetstr("us", &sp);
+	if (hard || sc_u_in == NULL)
+		sc_u_in = sc_s_in;
+
+	sc_u_out = (dumb) ? NULL : tgetstr("ue", &sp);
+	if (hard || sc_u_out == NULL)
+		sc_u_out = sc_s_out;
+
+	sc_visual_bell = (dumb) ? NULL : tgetstr("vb", &sp);
+	if (hard || sc_visual_bell == NULL)
+		sc_visual_bell = "";
+
+	sc_home = (dumb) ? NULL : tgetstr("ho", &sp);
+	if (hard || sc_home == NULL || *sc_home == '\0')
+	{
+		if (*sc_move == '\0')
+		{
+			cannot("home cursor");
+			/*
+			 * This last resort for sc_home is supposed to
+			 * be an up-arrow suggesting moving to the 
+			 * top of the "virtual screen". (The one in
+			 * your imagination as you try to use this on
+			 * a hard copy terminal.)
+			 */
+			sc_home = "|\b^";		
+		} else
+		{
+			/* 
+			 * No "home" string,
+			 * but we can use "move(0,0)".
+			 */
+			strcpy(sp, tgoto(sc_move, 0, 0));
+			sc_home = sp;
+			sp += strlen(sp) + 1;
+		}
+	}
+
+	sc_lower_left = (dumb) ? NULL : tgetstr("ll", &sp);
+	if (hard || sc_lower_left == NULL || *sc_lower_left == '\0')
+	{
+		if (*sc_move == '\0')
+		{
+			cannot("move cursor to lower left of screen");
+			sc_lower_left = "\r";
+		} else
+		{
+			/*
+			 * No "lower-left" string, 
+			 * but we can use "move(0,last-line)".
+			 */
+			strcpy(sp, tgoto(sc_move, 0, sc_height-1));
+			sc_lower_left = sp;
+			sp += strlen(sp) + 1;
+		}
+	}
+
+	/*
+	 * To add a line at top of screen and scroll the display down,
+	 * we use "al" (add line) or "sr" (scroll reverse).
+	 */
+	if (dumb)
+		sc_addline = NULL;
+	else if ((sc_addline = tgetstr("al", &sp)) == NULL || 
+		 *sc_addline == '\0')
+		sc_addline = tgetstr("sr", &sp);
+
+	if (hard || sc_addline == NULL || *sc_addline == '\0')
+	{
+		cannot("scroll backwards");
+		sc_addline = "";
+	}
+
+	if (dumb || tgetflag("bs"))
+		sc_backspace = "\b";
+	else
+	{
+		sc_backspace = tgetstr("bc", &sp);
+		if (sc_backspace == NULL || *sc_backspace == '\0')
+			sc_backspace = "\b";
+	}
+
+	if (couldnt)
+		/* Give him time to read all the "cannot" messages. */
+		error("");
+}
+
+
+/*
+ * Below are the functions which perform all the 
+ * terminal-specific screen manipulation.
+ */
+
+
+/*
+ * Initialize terminal
+ */
+	public void
+init()
+{
+	tputs(sc_init, sc_height, putc);
+}
+
+/*
+ * Deinitialize terminal
+ */
+	public void
+deinit()
+{
+	tputs(sc_deinit, sc_height, putc);
+}
+
+/*
+ * Home cursor (move to upper left corner of screen).
+ */
+	public void
+home()
+{
+	tputs(sc_home, 1, putc);
+}
+
+/*
+ * Add a blank line (called with cursor at home).
+ * Should scroll the display down.
+ */
+	public void
+add_line()
+{
+	tputs(sc_addline, sc_height, putc);
+}
+
+/*
+ * Move cursor to lower left corner of screen.
+ */
+	public void
+lower_left()
+{
+	tputs(sc_lower_left, 1, putc);
+}
+
+/*
+ * Ring the terminal bell.
+ */
+	public void
+bell()
+{
+	if (quiet == VERY_QUIET)
+		vbell();
+	else
+		putc('\7');
+}
+
+/*
+ * Output the "visual bell", if there is one.
+ */
+	public void
+vbell()
+{
+	if (*sc_visual_bell == '\0')
+		return;
+	tputs(sc_visual_bell, sc_height, putc);
+}
+
+/*
+ * Clear the screen.
+ */
+	public void
+clear()
+{
+	tputs(sc_clear, sc_height, putc);
+}
+
+/*
+ * Clear from the cursor to the end of the cursor's line.
+ * {{ This must not move the cursor. }}
+ */
+	public void
+clear_eol()
+{
+	tputs(sc_eol_clear, 1, putc);
+}
+
+/*
+ * Begin "standout" (bold, underline, or whatever).
+ */
+	public void
+so_enter()
+{
+	tputs(sc_s_in, 1, putc);
+}
+
+/*
+ * End "standout".
+ */
+	public void
+so_exit()
+{
+	tputs(sc_s_out, 1, putc);
+}
+
+/*
+ * Begin "underline" (hopefully real underlining, 
+ * otherwise whatever the terminal provides).
+ */
+	public void
+ul_enter()
+{
+	tputs(sc_u_in, 1, putc);
+}
+
+/*
+ * End "underline".
+ */
+	public void
+ul_exit()
+{
+	tputs(sc_u_out, 1, putc);
+}
+
+/*
+ * Erase the character to the left of the cursor 
+ * and move the cursor left.
+ */
+	public void
+backspace()
+{
+	/* 
+	 * Try to erase the previous character by overstriking with a space.
+	 */
+	tputs(sc_backspace, 1, putc);
+	putc(' ');
+	tputs(sc_backspace, 1, putc);
+}
+
+/*
+ * Output a plain backspace, without erasing the previous char.
+ */
+	public void
+putbs()
+{
+	tputs(sc_backspace, 1, putc);
+}
+SHAR_EOF
+cat - << \SHAR_EOF > signal.c
+/*
+ * Routines dealing with signals.
+ *
+ * A signal usually merely causes a bit to be set in the "signals" word.
+ * At some convenient time, the mainline code checks to see if any
+ * signals need processing by calling psignal().
+ * An exception is made if we are reading from the keyboard when the
+ * signal is received.  Some operating systems will simply call the
+ * signal handler and NOT return from the read (with EINTR).
+ * To handle this case, we service the interrupt directly from
+ * the handler if we are reading from the keyboard.
+ */
+
+#include "less.h"
+#include <signal.h>
+#include <setjmp.h>
+
+/*
+ * The type of signal handler functions.
+ * Usually int, although it should be void.
+ */
+typedef	int		HANDLER;
+
+/*
+ * "sigs" contains bits indicating signals which need to be processed.
+ */
+public int sigs;
+#define	S_INTERRUPT	01
+#ifdef SIGTSTP
+#define	S_STOP		02
+#endif
+
+extern int reading;
+extern char *first_cmd;
+extern jmp_buf main_loop;
+
+/*
+ * Interrupt signal handler.
+ */
+	static HANDLER
+interrupt()
+{
+	SIGNAL(SIGINT, interrupt);
+	sigs |= S_INTERRUPT;
+	if (reading)
+		psignals();
+}
+
+#ifdef SIGTSTP
+/*
+ * "Stop" (^Z) signal handler.
+ */
+	static HANDLER
+stop()
+{
+	SIGNAL(SIGTSTP, stop);
+	sigs |= S_STOP;
+	if (reading)
+		psignals();
+}
+#endif
+
+/*
+ * Set up the signal handlers.
+ */
+	public void
+init_signals()
+{
+	(void) SIGNAL(SIGINT, interrupt);
+#ifdef SIGTSTP
+	(void) SIGNAL(SIGTSTP, stop);
+#endif
+}
+
+/*
+ * Process any signals we have recieved.
+ * A received signal cause a bit to be set in "sigs".
+ */
+	public void 
+psignals()
+{
+	register int tsignals;
+
+	tsignals = sigs;
+	sigs = 0;
+	if (tsignals == 0)
+		return;
+
+	dropout();		/* Discard any buffered output */
+
+#ifdef SIGTSTP
+	if (tsignals & S_STOP)
+	{
+		/*
+		 * Clean up the terminal.
+		 */
+		lower_left();
+		clear_eol();
+		flush();
+		raw_mode(0);
+		SIGNAL(SIGTSTP, SIG_DFL);
+#if SIGSETMASK
+		/*
+		 * This system will not allow us to send a 
+		 * stop signal (SIGTSTP) to ourself
+		 * while we are in the signal handler, like maybe now.
+		 * (This can be the case if we are reading; see comment above.)
+		 * So we ask the silly system for permission to do so.
+		 */
+		sigsetmask(0);
+#endif
+		kill(getpid(), SIGTSTP);
+		/*
+		 * ... Bye bye. ...
+		 * Hopefully we'll be back later and resume here...
+		 * Reset the terminal and arrange to repaint the
+		 * screen when we get back to the main command loop.
+		 */
+		SIGNAL(SIGTSTP, stop);
+		raw_mode(1);
+		first_cmd = "r";
+		longjmp(main_loop, 1);
+	}
+#endif
+	if (tsignals & S_INTERRUPT)
+	{
+		bell();
+		/*
+		 * {{ You may wish to replace the bell() with 
+		 *    error("Interrupt"); }}
+		 */
+	}
+
+	longjmp(main_loop, 1);
+}
+SHAR_EOF
+cat - << \SHAR_EOF > ttyin.c
+/*
+ * Routines dealing with getting input from the keyboard (i.e. from the user).
+ */
+
+#include "less.h"
+
+/*
+ * The boolean "reading" is set true or false according to whether
+ * we are currently reading from the keyboard.
+ * This information is used by the signal handling stuff in signal.c.
+ * {{ There are probably some race conditions here
+ *    involving the variable "reading". }}
+ */
+public int reading;
+
+static int tty;
+
+/*
+ * Open keyboard for input.
+ * (Just use file descriptor 2.)
+ */
+	public void
+open_getc()
+{
+	tty = 2;
+}
+
+/*
+ * Get a character from the keyboard.
+ */
+	public int
+getc()
+{
+	char c;
+	int result;
+
+	reading = 1;
+	do
+	{
+		flush();
+		result = read(tty, &c, 1);
+	} while (result != 1);
+	reading = 0;
+	return (c & 0177);
+}
+SHAR_EOF
+cat - << \SHAR_EOF > version.c
+/*
+ *		less
+ *	Copyright (c) 1984,1985  Mark Nudelman
+ *
+ *	This program may be freely used and/or modified, 
+ *	with the following provisions:
+ *	1. This notice and the above copyright notice must remain intact.
+ *	2. Neither this program, nor any modification of it,
+ *	   may not be sold for profit without written consent of the author.
+ *
+ *	-----------------------------------------------------------------
+ *
+ *	usage:  less [-cdtmMqQuU] [-b[fp]<n>] [+<cmd>] [file-name] ...
+ *
+ *	This program is a paginator similar to "more", 
+ *	but allows you to move both forward and backward in the file.  
+ *	Commands are based on "more" and "vi".
+ *
+ *	----------------------- CHANGES ---------------------------------
+ *
+ *	    Allowed use on standard input		1/29/84   markn
+ *	    Added E, N, P commands			2/1/84    markn
+ *	    Added '=' command, 'stop' signal handling	4/17/84   markn
+ *	    Added line folding				4/20/84   markn
+ *	v2: Fixed '=' command to use BOTTOM_PLUS_ONE, 
+ *	    instead of TOP, added 'p' & 'v' commands	4/27/84   markn
+ *	v3: Added -m and -t options, '-' command	5/3/84    markn
+ *	v4: Added LESS environment variable		5/3/84    markn
+ *	v5: New comments, fixed '-' command slightly	5/3/84    markn
+ *	v6: Added -Q, visual bell			5/15/84   markn
+ *	v7: Fixed jump_back(n) bug: n should count real
+ *	    lines, not folded lines.  Also allow number
+ *	    on G command.				5/24/84   markn
+ *	v8: Re-do -q and -Q commands			5/30/84   markn
+ *	v9: Added "+<cmd>" argument			9/25/84   markn
+ *	v10: Fixed bug in -b<n> argument processing	10/10/84  markn
+ *	v11: Made error() ring bell if \n not entered.	10/18/84  markn
+ *	-----------------------------------------------------------------
+ *	v12: Reorganized signal handling and made
+ *	     portable to 4.2bsd.			2/13/85   mark
+ *	v13: Reword error message for '-' command.	2/16/85   mark
+ *	v14: Added -bf and -bp variants of -b.		2/22/85   mark
+ *	v15: Miscellaneous changes.			2/25/85   mark
+ *	v16: Added -u flag for backspace processing.	3/13/85   mark
+ *	v17: Added j and k commands, 
+ *		changed -t default.			4/13/85   mark
+ *	v18: Rewrote signal handling code.		4/20/85   mark
+ *	v19: Got rid of "verbose" eq_message().		5/2/85    mark
+ *	     Made search() scroll in some cases.
+ *	v20: Fixed screen.c ioctls for System V.	5/21/85   mark
+ *	v21: Fixed some first_cmd bugs.			5/23/85   mark
+ *	v22: Added support for no RECOMP nor REGCMP.	5/24/85   mark
+ *	v23: Miscellanous changes and prettying up.	5/25/85   mark
+ *      v24: Added ti,te terminal init & de-init       6/3/85 Mike Kersenbrock
+ *	v25: Added -U flag, standout mode underlining.	6/8/85    mark
+ *	v26: Added -M flag.				6/9/85    mark
+ *	     Use underline termcap (us) if it exists.
+ *	v27: Renamed some variables to make unique in	6/15/85   mark
+ *	     6 chars.  Minor fix to -m.
+ *	v28: Fixed right margin bug.			6/28/85   mark
+ *	v29: Incorporated M.Rose's changes to signal.c	6/28/85   mark
+ *	v30: Fixed stupid bug in argument processing.	6/29/85   mark
+ *	-----------------------------------------------------------------
+ */
+
+char version[] = "@(#) less  version 30";
+SHAR_EOF
+cat - << \SHAR_EOF > funcs.h
+	public void edit ();
+	public char * eq_message ();
+	public void next_file ();
+	public void prev_file ();
+	public void toggle_flag ();
+	public void quit ();
+	public void forward ();
+	public void backward ();
+	public void repaint ();
+	public void jump_forw ();
+	public void jump_back ();
+	public void jump_percent ();
+	public void search ();
+	public int ch_seek ();
+	public int ch_end_seek ();
+	public POSITION ch_length ();
+	public POSITION ch_tell ();
+	public int ch_forw_get ();
+	public int ch_back_get ();
+	public void ch_init ();
+	public POSITION position ();
+	public void add_forw_pos ();
+	public void add_back_pos ();
+	public void pos_clear ();
+	public POSITION forw_line ();
+	public POSITION back_line ();
+	public void put_line ();
+	public int control_char ();
+	public int carat_char ();
+	public void flush ();
+	public void dropout ();
+	public void putc ();
+	public void puts ();
+	public void error ();
+	public int error_width ();
+	public void raw_mode ();
+	public void get_term ();
+	public void init ();
+	public void deinit ();
+	public void home ();
+	public void add_line ();
+	public void lower_left ();
+	public void bell ();
+	public void vbell ();
+	public void clear ();
+	public void clear_eol ();
+	public void so_enter ();
+	public void so_exit ();
+	public void ul_enter ();
+	public void ul_exit ();
+	public void backspace ();
+	public void putbs ();
+	public void prewind ();
+	public int pappend ();
+	public void init_signals ();
+	public void  psignals ();
+	public void help ();
+	public void open_getc ();
+	public int getc ();
+	public void commands ();
+SHAR_EOF
+cat - << \SHAR_EOF > less.h
+/*
+ * Standard include file for "less".
+ */
+
+/*
+ * Language details.
+ */
+#if !VOID
+#define	void  int
+#endif
+#define	public		/* PUBLIC FUNCTION */
+
+/*
+ * Special types and constants.
+ */
+typedef long		POSITION;
+
+#define	END_POSITION	((POSITION)(-2))
+#define	NULL_POSITION	((POSITION)(-1))
+
+#define	EOF		(0)
+#define	NULL		(0)
+
+/* How quiet should we be? */
+#define	NOT_QUIET	0	/* Ring bell at eof and for errors */
+#define	LITTLE_QUIET	1	/* Ring bell only for errors */
+#define	VERY_QUIET	2	/* Never ring bell */
+
+/* How should we prompt? */
+#define	PR_SHORT	0	/* Prompt with colon */
+#define	PR_MEDIUM	1	/* Prompt with message */
+#define	PR_LONG		2	/* Prompt with longer message */
+
+/* How should we handle backspaces? */
+#define	BS_UNDERLINE	0	/* Underlining converted to underline mode */
+#define	BS_NORMAL	1	/* \b treated as normal char; actually output */
+#define	BS_CONTROL	2	/* \b treated as control char; prints as ^H */
+
+/* Flag to eq_message() telling what to put in the message */
+#define	MNAME		001	/* File name */
+#define	MOF		002	/* "file x of y" */
+#define	MBYTE		004	/* "byte x/y" */
+#define	MPCT		010	/* Percentage into the file */
+
+/* Special chars used to tell put_line() to do something special */
+#define	UL_CHAR		'\201'	/* Enter underline mode */
+#define	UE_CHAR		'\202'	/* Exit underline mode */
+
+#define	SIGNAL(sig,func)	signal(sig,func)
+
+off_t lseek();
+
+#include "funcs.h"
+SHAR_EOF
+cat - << \SHAR_EOF > position.h
+/*
+ * Include file for interfacing to position.c modules.
+ */
+#define	TOP		0
+#define	BOTTOM		1
+#define	BOTTOM_PLUS_ONE	2
+#define	TOP_PLUS_ONE	3
+SHAR_EOF
+cat - << \SHAR_EOF > mkfuncs.awk
+BEGIN { FS="("; state = 0 }
+
+/^	public/ { ftype = $0; state = 1 }
+
+{ if (state == 1)
+	state = 2
+  else if (state == 2)
+	{ print ftype,$1,"();"; state = 0 }
+}
+SHAR_EOF
+
+

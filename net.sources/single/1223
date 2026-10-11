@@ -1,0 +1,906 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,58b29266b9616bfd,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-06-06 20:42:24 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site t4test.UUCP
+Path: utzoo!linus!philabs!cmcl2!floyd!whuxle!mit-eddie!genrad!decvax!ittvax!dcdwest!sdcsvax!sdcrdcf!hplabs!intelca!t4test!news
+From: news@t4test.UUCP
+Newsgroups: net.sources
+Subject: Re: smarter postnews
+Message-ID: <646@t4test.UUCP>
+Date: Wed, 6-Jun-84 23:42:24 EDT
+Article-I.D.: t4test.646
+Posted: Wed Jun  6 23:42:24 1984
+Date-Received: Sat, 9-Jun-84 08:23:05 EDT
+References: <1422@cbosgd.UUCP>
+Organization: Intel, Santa Clara, Ca.
+Lines: 886
+
+=== REFERENCED ARTICLE ===================================
+From: mark@cbosgd.UUCP (Mark Horton)
+
+/*
+ * Postnews: post a news message to Usenet.  This C version replaces a shell
+ * script, and does more intelligent prompting and filtering than possible
+ * in a shell script.
+ *
+ * Checklist:
+ * x	Smart prompt for distribution
+ *	Newsgroup by interest group
+ * x	Mail to moderators of proper groups.
+ *	Handle followups.
+ *	Check for multiple postings.
+ *	Recordings.
+ *	Group dependent checks/messages/questions:
+ *		all.wanted:	distribution
+ *		net.jokes:	rot13
+ *		net.general:	important
+ */
+==========================================================
+
+Well...I just finished a bunch of hacks to Mark's postnews to get most
+of the unimplemented features working.  I also added a few, new
+features.  For example, it barfs if you try to post to net.gunneral
+(s.i.c.), it warns about the Eunice multiple posting bug (from which we
+suffer), and more.  The program is attached below.  It is upwardly
+compatible with Mark's with one exception.  Instead of saving a copy of
+the posted article in $HOME/author_copy, it appends it to
+$NEWSARCHIVE/CC in a format which can be read with mail (e.g.  mail -f
+$NEWSARCHIVE/CC).  This makes things sort of nice if you use the
+archive program which I posted a week or so back.
+
+Be forwarned--the program you are about to see represents one night of
+hacking.  I can't guarantee that all bugs are out and it is as pretty
+as it should be.  However, I can guarantee that I will be doing a bit
+more to it, so I could post a "final" version whenever that happens.
+
+Use the same "makefile" commands as Mark posted.  Below the tear point
+there is only a single file, so I didn't use shar.  Save it as
+"postnews.c".  Watch for the signature at bottom.
+
+I'd be happy to hear about any bugs or suggestions.  I'll mention
+one bug now so you don't have to report it.  Postnews does some smart
+stuff based upon the posting newsgroups and distribution.  However,
+you can change these things while editing the article, but postnews
+will not recognize the change.  It's on the agenda for next week's
+hacking.....
+
+=== TEAR HERE ======================================================
+/*
+ * Postnews: post a news message to Usenet.  This C version replaces a shell
+ * script, and does more intelligent prompting and filtering than possible
+ * in a shell script.
+ *
+ * Checklist:
+ * -->  Smart prompt for distribution
+ *      Newsgroup by interest group
+ * -->  Mail to moderators of proper groups.
+ * -->  Handle followups.
+ * -->  Check for multiple postings (only in net.general though).
+ *      Recordings.
+ * -->  Group dependent checks/messages/questions:
+ * -->    all.wanted:   distribution
+ * -->    net.jokes:    rot13
+ * -->    net.general:  important
+ * -->  Verifies that selected newsgroups are valid.
+ * -->  Requires a subject for posting.
+ * -->  Saves copy of article in news archive in 'mail' format.
+ *
+ */
+
+static char *sccsid = "@(#)postnews.c   1.3     5/06/84";
+#include <stdio.h>
+#include <ctype.h>
+#include "defs.h"
+#define ARCHIVES_DEF "NEWSARCHIVE"
+#define HELL 1
+#define FROZEN_OVER 0
+
+                                /**********************************************/
+char tempfname[50];             /*  file name used for making article         */
+char original[BUFLEN];          /*  file name of original, used in followup   */
+char homedir[BUFLEN];           /*  HOME environment setting                  */
+char ccname[BUFLEN];            /*  file name for article copy                */
+char group[BUFLEN];             /*  to whom this article offends              */
+                                /**********************************************/
+
+/* article header information */
+char subject[BUFLEN];
+char distribution[BUFLEN];
+char references[BUFLEN];
+char newsgroups[BUFLEN];
+char moderator[BUFLEN];
+
+int ismod = 0;
+extern char LIB[];
+extern char SPOOL[];
+
+struct distr {
+  char abbr[8];
+  char descr[80];
+} 
+distrib[16];
+
+main(argc, argv)
+char **argv;
+{
+  init();
+
+  if (yes("Is this message in response to some other message? ","no"))
+    followup();
+  else {
+    if (!get_subject()) 
+      byebye("If it ain't worth giving a subject, it ain't worth posting.");
+    if (!get_newsgroup()) 
+      byebye("You didn't give me a newsgroup");
+    get_distribution();
+  }
+
+  pre_checks();
+  edit_article();
+  post_checks();
+
+  save_article();
+  post_article();
+}
+
+/*
+ * Get the subject for the message.
+ */
+get_subject()
+{
+  getpr("Subject: ", subject);
+  if (*subject)
+    return TRUE;
+  else
+    return FALSE;
+}
+
+/*
+ * Find out the topic of interest.
+ */
+get_newsgroup()
+{
+  char buf[BUFLEN];
+  int n,i;
+
+  printf("Newsgroups (enter one at a time, end with a blank line):\n");
+  n=0;
+  strcpy(newsgroups,"");
+
+  while ( HELL != FROZEN_OVER ) {
+    getpr("> ", buf);
+    if (buf[0]=='\0') 
+      switch (n) {
+      case 0:
+        return FALSE;
+      case 1:
+        return TRUE;
+      default:
+        /*  this following is a warning for a Eunice bug  */
+#ifdef VMS
+        printf(" ** Be Forwarned **\n");
+        printf("Due to a bug in the Eunice-based USENET software, on most\n");
+        printf("Eunice machines this article will show up only under the\n");
+        printf("last newsgroup you entered.  However, it will be posted\n");
+        printf("to all of the newsgroups you specified on other machines.\n\n");
+#endif
+        return TRUE;
+      }
+    if (valid_ng(buf,&i)) {
+      if (n++ != 0) strcat(newsgroups,",");
+      strcat(newsgroups,buf);
+    }
+    else
+      printf("There is no such newsgroup as %s, so I'll ignore that.\n",buf);
+  }
+}
+
+/*
+ * Find out how widely the author wants the message distributed.
+ */
+get_distribution()
+{
+  int i;
+  char buf[BUFLEN];
+  char def[BUFLEN],*r;
+
+  strcpy(def,newsgroups);
+  for ( i=0 ; def[i]!='.' && def[i]!='\0' ; ++i ) ;
+  def[i]='\0';
+
+  while ( HELL != FROZEN_OVER ) {
+    sprintf(buf, "Distribution ( default='%s' , '?' for help) : ",def);
+    getpr(buf, distribution);
+    if (distribution[0]=='\0') strcpy(distribution,def);
+
+    /* Did the user ask for help? */
+    if (distribution[0] == '?') {
+      printf("How widely should your article be distributed?\n");
+      for (i=0; distrib[i].abbr[0]; i++)
+        printf("%s\t%s\n", distrib[i].abbr, distrib[i].descr);
+      continue;
+    }
+
+    /* Check that it's a proper distribution */
+    for (i=0; distrib[i].abbr[0]; i++) {
+      if (strcmp(distrib[i].abbr, distribution) == 0) {
+        /* Found a match.  Do any special rewriting. */
+        if (strcmp(distribution, "world") == 0) strcpy(distribution, "net");
+        return;
+      }
+    }
+
+    printf("Type ? for help.\n");
+  }
+}
+
+/*
+ * Do sanity checks before the author types in the message.
+ */
+pre_checks()
+{
+  check_mod();
+}
+
+/*
+ * Check to see if the newsgroup is moderated.
+ */
+check_mod()
+{
+  FILE *fd;
+  char buf[BUFLEN];
+  char ng[64], mod[BUFLEN];
+
+  sprintf(buf, "%s/%s", LIB, "moderators");
+  fd = fopen(buf, "r");
+  if (fd == NULL) {
+    fprintf(stderr, "No %s file - get your guru to fix it\n", buf);
+    exit(1);
+  }
+
+  while (!feof(fd)) {
+    if (fgets(buf, sizeof buf, fd) == NULL) {
+      fclose(fd);
+      return;
+    }
+    twosplit(buf, ng, mod);
+    if (sameng(newsgroups, ng)) {
+      strcpy(moderator, mod);
+      ismod = 1;
+      return;
+    }
+  }
+}
+
+/*
+ * Set up the temp file with headers.
+ */
+edit_article()
+{
+  FILE *tf,*of;
+  char buf[BUFLEN];
+  char *editor;
+  char *endflag = "";
+  char *p,c;
+  char *getenv();
+
+  editor=getenv("EDITOR");
+  strcpy(tempfname, "/tmp/postXXXXXX");
+  mktemp(tempfname);
+
+  /* insert a header */
+  tf = fopen(tempfname, "w");
+  if (tf == NULL) {
+    perror(tempfname);
+    exit(2);
+  }
+  fprintf(tf, "Subject: %s\n", subject);
+  fprintf(tf, "Newsgroups: %s\n", newsgroups);
+  if (distribution[1]!='\0') fprintf(tf, "Distribution: %s\n", distribution);
+  if (ismod) fprintf(tf, "To: %s\n", moderator);
+
+  if (references[0]!='\0') {
+    fprintf(tf, "References: %s\n\n", references);
+    fprintf(tf, "=== REFERENCED ARTICLE ===================================\n");
+    if ( (of = fopen(original,"r")) == NULL ) {
+      perror(original);
+      exit(2);
+    }
+    while ((c=getc(of)) != EOF)
+      putc(c, tf);
+    fclose(of);
+    fprintf(tf, "==========================================================\n");
+  }
+
+  fprintf(tf, "\n*** REPLACE THIS LINE WITH YOUR MESSAGE ***\n");
+  fclose(tf);
+
+  /* edit the file */
+  if (editor == NULL) editor = DFTEDITOR;
+
+  p = editor+strlen(editor) - 2;
+  if ( strcmp(p, "vi")==0 && references[0]=='\0' ) endflag = "+";
+
+  sprintf(buf, "%s %s %s", editor, endflag, tempfname);
+  system(buf);
+}
+
+/*
+ * Do sanity checks after the author has typed in the message.
+ */
+post_checks()
+{
+  int changed = 0;
+  char group[64];
+  char buf[BUFLEN];
+  char *c;
+
+  if (!exists(tempfname)) {
+    printf("File deleted - no message posted.\n");
+    unlink(tempfname);
+    exit(1);
+  }
+
+  /* Sanity checks for certain newsgroups */
+  if (sameng(newsgroups, "all.wanted") && sameng(distribution,"net,na,usa,att,btl")) {
+    printf("Is your message something that might go in your local\n");
+    printf("newspaper, for example a used car ad, or an apartment\n");
+    printf("for rent? ");
+    if (yes("","")) {
+      printf("It's pointless to distribute your article widely, since\n");
+      printf("people more than a hundred miles away won't be interested.\n");
+      printf("Please use a more restricted distribution.\n");
+      get_distribution();
+      modify_article(tempfname,"Distribution: ",distribution,"replace");
+    }
+  }
+
+  if (sameng(newsgroups, "net.jokes")) {
+    if (yes("Could this be offensive to anyone? ","")) {
+      getpr("Whom might it offend? ", group);
+      sprintf(buf," - offensive to %s (ROT13)",group);
+      modify_article(tempfname,"Subject: ",buf,"append");
+      encode(tempfname);
+    }
+  }
+
+  if (sameng(newsgroups, "net.general")) {
+    c=newsgroups;
+    while ( *c!=',' && *c ) ++c;
+    if ( *c == ',' ) {
+      printf("Everybody reads net.general, so it doesn't make sense to\n");
+      printf("post to newsgroups in addition to net.general.  If your\n");
+      printf("article belongs in one of these other newsgroups, then you\n");
+      printf("should not post to net.general.  If it is important enough\n");
+      printf("for net.general, then you shouldn't post it in other places\n");
+      printf("as well.  Please reenter the newsgroups.\n");
+      get_newsgroup();
+      modify_article(tempfname,"Newsgroups: ",newsgroups,"replace");
+    }
+    else {
+      printf("net.general is for important announcements.\n");
+      printf("It is not for items for which you couldn't think\n");
+      printf("of a better place - those belong in net.misc.\n");
+      if (!yes("Are you sure your message belongs in net.general? ","")) {
+        get_newsgroup();
+        modify_article(tempfname,"Newsgroups: ",newsgroups,"replace");
+      }
+    }
+  }
+}
+
+/*
+ * Save a copy of the article in the users NEWSARCHIVE directory.
+ */
+save_article()
+{
+  FILE *in, *out;
+  int c;
+  long timenow,time();
+  char *today,*ctime();
+
+  if ( !*ccname ) {
+    printf("You know, if you defined a %s environment\n",ARCHIVES_DEF);
+    printf("parameter I could save you a copy of your articles.\n");
+    ccname[0] = 0;
+    return;
+  }
+
+  in = fopen(tempfname, "r");
+  out = fopen(ccname, "a");
+  if (in == NULL) {
+    perror(tempfname);
+    ccname[0] = 0;
+    return;
+  }
+  if (out == NULL) {
+    perror(ccname);
+    ccname[0] = 0;
+    return;
+  }
+
+  timenow=time(0);
+  today=ctime(&timenow);
+  fprintf(out,"From postnews %s",today);
+  while ((c=getc(in)) != EOF)
+    putc(c, out);
+  fclose(in);
+  fclose(out);
+
+}
+
+/*
+ * Post the article to the net.
+ */
+post_article()
+{
+  char buf[BUFLEN];
+  int status;
+
+  printf("%s article -- please stand by\n", ismod ? "Mailing" : "Posting" );
+  if (ismod)
+    sprintf(buf, "%s/recmail < %s", LIB, tempfname);
+  else
+    sprintf(buf, "inews -h < %s", tempfname);
+  status=system(buf);
+
+  if (status)
+    printf("Article not %s - exit status %d\n", ismod ? "mailed" : "posted", status);
+  else 
+      printf("Article %s successfully.\n", ismod ? "mailed" : "posted" );
+
+  if (ccname[0]) printf("A copy has been saved in %s\n", ccname);
+
+  unlink(tempfname);
+}
+
+/*
+ * Initialization.
+ */
+init()
+{
+  FILE *fd;
+  int i;
+  char buf[BUFLEN];
+  char *p;
+  char *getenv();
+
+  strcpy(references,"");
+  strcpy(distribution,"");
+
+  strcpy(homedir, getenv("HOME"));
+
+  strcpy(ccname,getenv(ARCHIVES_DEF));
+  if ( *ccname) strcat(ccname,"/CC");
+
+  pathinit();
+  sprintf(buf, "%s/%s", LIB, "distributions");
+  fd = fopen(buf, "r");
+  if (fd == NULL) {
+    printf("Cannot open %s.  Have a guru fix the distributions file.\n", buf);
+    exit(1);
+  }
+  for (i=0; !feof(fd); i++) {
+    if (fgets(buf, sizeof buf, fd) == NULL) break;
+    twosplit(buf, distrib[i].abbr,distrib[i].descr);
+  }
+}
+
+/*
+ * Split a line of the form
+ *    text whitespace text
+ * into two strings.  Also trim off any trailing newline.
+ * This is destructive on src.
+ */
+twosplit(src, dest1, dest2)
+char *src, *dest1, *dest2;
+{
+  register char *p;
+
+  nstrip(src);
+  for (p=src; isalnum(*p) || ispunct(*p); p++)
+    ;
+  *p++ = 0;
+  for ( ; isspace(*p); p++)
+    ;
+  strcpy(dest1, src);
+  strcpy(dest2, p);
+}
+
+/*
+ * Get a yes or no answer to a question.  A default may be used.
+ */
+yes(msg,def)
+char *msg,*def;
+{
+  char buf[BUFLEN];
+
+  printf("%s", msg);
+  buf[0] = 0;
+  gets(buf);
+  switch(buf[0]) {
+  case 'y':
+  case 'Y':
+    return TRUE;
+  case 'n':
+  case 'N':
+    return FALSE;
+  case '\0':
+    switch(*def) {
+    case 'y':
+    case 'Y':
+      return TRUE;
+    case 'n':
+    case 'N':
+      return FALSE;
+    }
+  default:
+    printf("Please answer yes or no.\n");
+    return yes(msg,def);
+  }
+}
+
+/*
+ * Get a character string into buf, using prompt msg.
+ */
+getpr(msg, buf)
+char *msg, *buf;
+{
+  printf("%s", msg);
+  gets(buf);
+  nstrip(buf);
+}
+
+/*
+ * Strip a newline from the end of buf.
+ */
+nstrip(buf)
+char *buf;
+{
+  register char *p;
+
+  for (p=buf; *p; p++)
+    if (*p == '\n') {
+      *p = 0;
+      return;
+    }
+}
+
+/*
+ * Append NGDELIM to string.
+ */
+ngcat(s)
+register char *s;
+{
+  if (*s) {
+    while (*s++);
+    s -= 2;
+    if (*s++ == NGDELIM) return;
+  }
+  *s++ = NGDELIM;
+  *s = '\0';
+}
+
+/*
+ * Return TRUE if the file exists and has something in it.
+ */
+exists(file)
+char *file;
+{
+  FILE *fp;
+  int c;
+
+  fp = fopen(file, "r");
+  if (fp == NULL) return FALSE;
+  c = getc(fp);
+  while (c == '\n')
+    c = getc(fp);
+  fclose(fp);
+  if (c == EOF) return FALSE;
+  return TRUE;
+}
+
+/* Return TRUE if these newsgroups match. */
+sameng(ng1, ng2)
+char *ng1, *ng2;
+{
+  char n1[BUFLEN], n2[BUFLEN];
+
+  strcpy(n1, ng1);
+  strcpy(n2, ng2);
+  ngcat(n1);
+  ngcat(n2);
+  return ngmatch(n1, n2);
+}
+
+/*
+ * News group matching.
+ *
+ * nglist is a list of newsgroups.
+ * sublist is a list of subscriptions.
+ * sublist may have "meta newsgroups" in it.
+ * All fields are NGDELIM separated,
+ * and there is an NGDELIM at the end of each argument.
+ *
+ * Currently implemented glitches:
+ * sublist uses 'all' like shell uses '*', and '.' like shell '/'.
+ * If subscription X matches Y, it also matches Y.anything.
+ */
+ngmatch(nglist, sublist)
+register char *nglist, *sublist;
+{
+  register char *n, *s;
+  register int rc;
+
+  rc = FALSE;
+  for (n = nglist; *n != '\0' && rc == FALSE;) {
+    for (s = sublist; *s != '\0';) {
+      if (*s != NEGCHAR)
+        rc |= ptrncmp(s, n);
+      else
+        rc &= ~ptrncmp(s+1, n);
+      while (*s++ != NGDELIM);
+    }
+    while (*n++ != NGDELIM);
+  }
+  return(rc);
+}
+
+/*
+ * Compare two newsgroups for equality.
+ * The first one may be a "meta" newsgroup.
+ */
+ptrncmp(ng1, ng2)
+register char *ng1, *ng2;
+{
+  while (*ng1 != NGDELIM) {
+    if (ng1[0]=='a' && ng1[1]=='l' && ng1[2]=='l') {
+      ng1 += 3;
+      while (*ng2 != NGDELIM && *ng2 != '.')
+        if (ptrncmp(ng1, ng2++)) return(TRUE);
+      return (ptrncmp(ng1, ng2));
+    } 
+    else if (*ng1++ != *ng2++) return(FALSE);
+  }
+  return (*ng2 == '.' || *ng2 == NGDELIM);
+}
+
+
+byebye(mesg)
+char *mesg;
+{
+  printf("%s\n",mesg);
+  exit(1);
+}
+
+/*
+ * make a modification to the header of an article
+ *
+ *   fname -- name of article
+ *   field -- header field to modify
+ *   line  -- modification line
+ *   how   -- 'a' or 'A' to append line to existing header line
+ *            anything else to replace existing line
+ *
+ * example:  
+ *   modify_article("/tmp/article" , "Subject: " , "new subject" , "replace");
+ *  
+ *  
+ */
+modify_article(fname,field,line,how)
+char *fname,*field,*line,*how;
+{
+  FILE *fpart,*fptmp,*fopen();
+  char buf[BUFLEN];
+  char *c,*fgets();
+  char *temp2fname = "/tmp/postXXXXXX";
+  int i;
+  mktemp(temp2fname);
+
+
+  if ( (fptmp=fopen(temp2fname, "w")) == NULL ) {
+    perror(temp2fname);
+    exit(2);
+  }
+  if ( (fpart=fopen(fname, "r")) == NULL ) {
+    perror(fname);
+    exit(2);
+  }
+
+  i=strlen(field);
+  while ( fgets(buf,BUFLEN,fpart) != NULL ) {
+    if (strncmp(field,buf,i)==0) {
+      nstrip(buf);
+      if (*how=='a' || *how=='A')
+        /* append to current field */
+        sprintf(buf,"%s%s\n",buf,line);
+      else
+        /* replace current field */
+        sprintf(buf,"%s%s\n",field,line);
+    }
+    fputs(buf,fptmp);
+  }
+
+  fclose(fpart);
+  fclose(fptmp);
+
+  if ( (fptmp=fopen(temp2fname, "r")) == NULL ) {
+    perror(temp2fname);
+    exit(2);
+  }
+  if ( (fpart=fopen(fname, "w")) == NULL ) {
+    perror(fname);
+    exit(2);
+  }
+
+  i=strlen(field);
+  while ( fgets(buf,BUFLEN,fptmp) != NULL ) 
+    fputs(buf,fpart);
+
+  fclose(fpart);
+  fclose(fptmp);
+  unlink(fptmp);
+}
+
+
+/* verify that newsgroup exists, and get number of entries */
+valid_ng(ng,num)
+char *ng;
+int *num;
+{
+  char ng_check[BUFLEN],ng_read[BUFLEN];
+  char active[BUFLEN];
+  int i;
+  FILE *fp,*fopen();
+  char *fgets();
+  char *c;
+
+  sprintf(active,"%s/active",LIB);
+  sprintf(ng_check,"%s ",ng);
+  i=strlen(ng_check);
+
+  if ( (fp=fopen(active,"r")) == NULL ) {
+    perror(active);
+    exit(2);
+  }
+  while ((c=fgets(ng_read,BUFLEN,fp))!=NULL && strncmp(ng_check,ng_read,i)!=0) ;
+  if (c==NULL)
+    return FALSE;
+  else {
+    sscanf(ng_read,"%s %n",ng_check,num);
+    return TRUE;
+  }
+}
+
+/* get the line specified by field from an article */
+article_line(article,field,line)
+char *article,*field,*line;
+{
+  FILE *fp,*fopen();
+  char *c,*fgets();
+  int i=strlen(field);
+
+  if ( (fp=fopen(article,"r")) == NULL ) {
+    perror(article);
+    exit(2);
+  }
+  while ( (c=fgets(line,BUFLEN,fp))!=NULL && strncmp(field,line,i)!=0 ) ;
+  fclose(fp);
+  if (*c) {
+    nstrip(line);
+    return TRUE;
+  }
+  else {
+    strcpy(line,"");
+    return FALSE;
+  }
+}
+
+
+/* get the header information for a followup article */
+followup()
+{
+  char ng[BUFLEN], num[BUFLEN], buf[BUFLEN];
+  int i;
+  char *c;
+
+  getpr("In what newsgroup was the article posted? ",ng);
+  if ( !valid_ng(ng,&i) ) byebye("There isn't any newsgroup called that.");
+
+  printf("There are %d articles in %s\n",i,ng);
+
+  while ( HELL != FROZEN_OVER ) {
+
+    getpr("\nWhat was the article number? ",num);
+    sprintf(original,"%s/%s",SPOOL,ng);
+    for ( c=original+strlen(SPOOL)+1 ; *c ; ++c ) if ( *c == '.' ) *c='/';
+    strcat(original,"/");
+    strcat(original,num);
+
+    if (exists(original)) {
+      printf("\narticle %s\n",original);
+      if (article_line(original,"From: ",buf)) printf("%s\n",buf);
+      if (article_line(original,"Subject: ",buf)) printf("%s\n",buf);
+      if (yes("Is this the one you want? ","")) break;
+    }
+    else
+      printf("I can't find that article.\n");
+  }
+
+  /* subject */
+  if (article_line(original,"Subject: ",buf))
+    sprintf(subject,"Re: %s",buf+9);
+  else
+    strcpy(subject,"Re: orphan response");
+
+  /* newsgroup */
+  article_line(original,"Newsgroups: ",buf);
+  strcpy(newsgroups,buf+12);
+  if (sameng(newsgroups, "net.general")) strcpy(newsgroups,"net.followup");
+
+  /* distribution */
+  if (article_line(original,"Distribution: ",buf)) strcpy(distribution,buf+14);
+
+  /* references */
+  if (article_line(original,"References: ",buf)) {
+    strcpy(references,buf+12);
+    strcat(references," ");
+  }
+  article_line(original,"Message-ID: ",buf);
+  strcat(references,buf+12);
+}
+
+encode(article)
+char *article;
+{
+  FILE *fpart,*fphead,*fpcoded,*fopen();
+  char *headerfile = "/tmp/pheadXXXXXX";
+  char *codedfile = "/tmp/pcodeXXXXXX";
+  char *fgets();
+  char buf[BUFLEN];
+
+  mktemp(headerfile);
+  mktemp(codedfile);
+
+  if ( (fpart=fopen(article,"r")) == NULL ) {
+    perror(article);
+    exit(2);
+  }
+
+  /* place article header in "headerfile" file */
+  if ( (fphead=fopen(headerfile,"w")) == NULL ) {
+    perror(headerfile);
+    exit(2);
+  }
+  while (fgets(buf,BUFLEN,fpart) != NULL) {
+    fputs(buf,fphead);
+    if (buf[0]=='\n') break;
+  }
+  fclose(fphead);
+
+  /* place article body in "codedfile" file */
+  if ( (fpcoded=fopen(codedfile,"w")) == NULL ) {
+    perror(codedfile);
+    exit(2);
+  }
+  while (fgets(buf,BUFLEN,fpart)!=NULL) fputs(buf,fpcoded);
+  fclose(fpcoded);
+  fclose(fpart);
+
+  /* encode body and put back together with header */
+  sprintf(buf,"mv %s %s ; caesar 13 < %s >> %s ; rm %s\n",
+    headerfile,article, codedfile,article, codedfile);
+  printf("Encoding article -- please stand by\n");
+  if (system(buf)) {
+    printf("encoding failed");
+    exit(2);
+  }
+}
+
+-- 
+Chip Rosenthal, Intel/Santa Clara
+{idi|intelca|icalqa|imcgpe|kremvax|qubix|ucscc}!t4test!{chip|news}
+
+

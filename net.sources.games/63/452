@@ -1,0 +1,2023 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 162299,8ca5e408e46afda7,start
+X-Google-Attributes: gid162299,public
+X-Google-ArrivalTime: 1986-03-12 21:52:21 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!think!harvard!seismo!mcvax!enea!chalmers!myab!lars
+From: lars@myab.UUCP (lars)
+Newsgroups: net.sources.games
+Subject: search for SVR2 part 4 (4)
+Message-ID: <136@myab.UUCP>
+Date: Thu, 13-Mar-86 00:52:21 EST
+Article-I.D.: myab.136
+Posted: Thu Mar 13 00:52:21 1986
+Date-Received: Sun, 16-Mar-86 09:41:08 EST
+Reply-To: lars@myab.UUCP (lars)
+Organization: Myab Gothenburg, Sweden
+Lines: 2002
+
+
+
+#--------CUT---------CUT---------CUT---------CUT--------#
+#########################################################
+#                                                       #
+# This is a shell archive file.  To extract files:      #
+#                                                       #
+#    1)	Make a directory for the files.                 #
+#    2) Write a file, such as "file.shar", containing   #
+#       this archive file into the directory.           #
+#    3) Type "sh file.shar".  Do not use csh.           #
+#                                                       #
+#########################################################
+#
+#
+echo x - main.c
+sed 's/^Z//' >main.c <<\STUNKYFLUFF
+Z#ifndef lint
+Zstatic char rcsid[] = "$Header: main.c,v 2.2 85/08/06 22:26:37 matt Exp $";
+Z#endif
+Z/*
+Z *
+Z * search
+Z *
+Z * multi-player and multi-system search and destroy.
+Z *
+Z * Original by Greg Ordy	1979
+Z * Rewrite by Sam Leffler	1981
+Z * Socket code by Dave Pare	1983
+Z * Ported & improved
+Z *      by Matt Crawford	1985
+Z *
+Z * main game iteration loop
+Z *
+Z * Copyright (c) 1979
+Z */
+Z
+Z#include <stdio.h>
+Z#include <sys/types.h>
+Z#include <sys/ioctl.h>
+Z#include <errno.h>
+Z#include <sys/file.h>
+Z#include <time.h>
+Z#include <sys/ipc.h>
+Z#include <sys/msg.h>
+Z
+Z#include "defines.h"
+Z#include "structs.h"
+Z
+Zextern int sock;
+Zstatic struct message message;
+Z
+Z/*
+Z * Major data bases
+Z */
+Zt_torps		torps[NTORP];		/* torpedoes data base */
+Zt_sbase		sbase[NBASE];		/* star bases data base */
+Zt_planet	planet;			/* planet data base */
+Zt_alien		alien[NALIEN];		/* aliens data base */
+Zt_burst		bursts[NBURST];		/* shrapnel data base */
+Zt_player	player[NPLAYER];	/* players */
+Z
+Zint		dtabsiz;		/* descriptor table size */
+Zint		pfd;			/* playerfile fd */
+Zint		errfile;		/* error log file */
+Zint		nplayer;		/* # of players currently in game */
+Zint		nobody;			/* is anybody playing? */
+Z
+Zt_player	*whoscab;		/* identity of current scab */
+Zint		TDIST;			/* max distance a torpedo can go */
+Zchar		xxi;
+Zchar		yyi;
+Zchar		ppx;			/* planet x-coord */
+Zchar		ppy;			/* planet y-coord */
+Zchar		dx;
+Zchar		dy;
+Zlong		ptime;			/* search playing time counter */
+Z
+Zint		NALIENS = NALIEN;
+Zextern		int errno;
+Z/*
+Z * Solar flare stuff
+Z */
+Zint		sfcount;		/* solar flare timer */
+Zint		sfflag;			/* solar flare in progress */
+Z
+Zint		gutsflag;		/* playing in guts mode */
+Z
+Zint		numbnode;
+Zstruct plist	*avl;
+Zt_player	*wholist;
+Zchar		visual[NPLAYER][NPLAYER];/* group visibility matrix */
+Zint		tim_inp;
+Z
+Z
+Zmain(argc, argv)
+Zint argc;
+Zchar  *argv[];
+Z{
+Z    int cost;
+Z    extern	t_player *newplayer();
+Z    extern	void	apilot(), autopi(), bcast(), bflush(), cput(),
+Z		    dock(), done(), enteritem(), facts(), fnode(),
+Z		    gathermsg(), groupm(), home(), init(), initplayer(),
+Z		    invisible(), joing(), launch(), lookg(), magnif(),
+Z		    makeburst(), makeflare(), makescab(), movealien(),
+Z		    moveburst(), nuke(), orbit(), orbmove(), outgame(),
+Z		    phaser(), pmesg(), prompt(), pstatus(), quitg(),
+Z		    rmsg(), seeall(), seescab(), sethome(), set_delay(),
+Z		    uplst(), xploit();
+Z		    
+Z    register t_player *p;
+Z    register t_player *pl;
+Z    register t_alien *pa;
+Z    register t_burst *pb;
+Z    register t_sbase *ps;
+Z    register t_torps *pt;
+Z    t_player *np;
+Z    char	x, y;
+Z    int	mf;
+Z    int	gutsvote;
+Z    char	buf[255];
+Z    char	xx, yy, c;
+Z    int	port_num = DEFAULT_IN_PORT;
+Z    int	nfds;
+Z    int	mask;
+Z    int	save_mask;
+Z
+Z    /*
+Z     * set up data bases
+Z     */
+Z    setuid(geteuid());
+Z    init();
+Z    if (fork())
+Z	    exit(0);
+Z    /*
+Z     * set up sockets: port number doesn't matter
+Z     * if INET isn't defined
+Z     */
+Z    if (!initsocks())
+Z	    exit(1);
+Z    /*
+Z     * block indefinitely until the first player enters the game
+Z     * then start the player loop
+Z     */
+Z    nobody = 1;
+Z    /*
+Z     * Main loop -- works in a hard run polling the input socket
+Z     * of each player.  Each turn around the loop defines a time
+Z     * unit in search.
+Z     */
+Z    for (;;) {
+Z	ptime++;		/* time marches on ... */
+Z	if (--sfcount == 0) {	/* ring a ding, time for a flare */
+Z		makeflare();
+Z		NALIENS = NALIEN-nplayer;
+Z	}
+Z	/*
+Z	 * if nobody's playing, wait until someone generates
+Z	 * some sort of request
+Z	 */
+Z	if ((ptime % 16) == 0) {
+Z		np = newplayer(nobody);
+Z		if (np != NULL) {
+Z			nplayer++;
+Z			initplayer(np);
+Z			errlog("new player %s uid %d\n",
+Z			    np->plname, np->uid);
+Z			for (p = player; p < &player[NPLAYER]; p++)
+Z				if (p->status.alive == TRUE && p != np)
+Z					pmesg(p, "From scanners-- NEW PLAYER");
+Z			if (gutsflag)
+Z				pmesg(np, "This game is in GUTS mode");
+Z		}
+Z	} else
+Z	    set_delay();
+Z	/*
+Z	 * Command scanning loop...
+Z	 */
+Z	nobody = 0;
+Z	gutsvote = !gutsflag;
+Z	for (p = player; p < &player[NPLAYER]; p++) {
+Z		if (p->status.alive == FALSE) {
+Z			nobody++;
+Z			continue;
+Z		}
+Z		gutsvote = gutsflag ? gutsvote || p->status.guts
+Z				    : gutsvote && p->status.guts;
+Z		if (p->status.ap == TRUE)	/* update autopilot */
+Z			apilot(p);
+Z		if (p->status.orb == TRUE)	/* update orbiting */
+Z			orbmove(p);
+Z		x = p->offx;
+Z		y = p->offy;
+Z		if (!p->ninput)
+Z			if (pinput(p) < 0)
+Z				continue;
+Z		if (p->ninput <= 0)
+Z			goto constvel;
+Z		c = (*p->pinputq++)&0177;
+Z		p->ninput--;
+Z		/*
+Z		 * Two letter commands (e.g. launch torpedo) are
+Z		 *  marked as a command pending, so that when the
+Z		 *  second char comes in it can be processed entirely.
+Z		 */
+Z		if (p->cmdpend > 0) {
+Z			switch (p->cmd) {
+Z			case 'h': 
+Z				home(p, c);
+Z				break;
+Z			case '5':
+Z			case 't': 
+Z				p->status.ap = FALSE;
+Z				launch((thing *)p, c, PLAYER, x, y,
+Z					1, p->curx, p->cury, 0);
+Z				break;
+Z			case 'g':
+Z				groupm(p, c);
+Z				break;
+Z			case 'q':
+Z				quitg(p, c);
+Z				break;
+Z			case 'n':
+Z				nuke(p, c);
+Z				break;
+Z			case 'j':
+Z				joing(p, c);
+Z				break;
+Z			case 's': 
+Z				sethome(p, c);
+Z				break;
+Z			case 'b': 
+Z				bcast(p, c);
+Z				break;
+Z			case 'a': 
+Z				autopi(p, c);
+Z				break;
+Z			case 'r': 
+Z				rmsg(p, c);
+Z				break;
+Z			case 'm': 
+Z				magnif(p, c);
+Z				break;
+Z			case 'Q':
+Z			    if (c == 'P' && geteuid() == OWNERID &&
+Z				fork() == 0) {
+Z				execl("/usr/src/local/search/search",
+Z				    "search", 0);
+Z			    }
+Z			    if (c == 'P')
+Z				pmesg(p, "Starting player search\n");
+Z			    if (c != 'Y' && c != 'y') {
+Z				    p->cmd = p->cmdpend = 0;
+Z				    prompt(p, "");
+Z				    goto constvel;
+Z			    }
+Z			    done(p);
+Z			    break;
+Z			}
+Z			goto constvel;
+Z		}
+Z		switch (c) {
+Z		case 'e': 
+Z			if (p->energy != p->preve) {
+Z				cput(EGYDATA, p, "%d", p->energy);
+Z				p->preve = p->energy;
+Z			}
+Z			break;
+Z		case 'p': 
+Z			if (p->points != p->prevp) {
+Z				cput(PTDATA, p, "%d", p->points);
+Z				p->prevp = p->points;
+Z			}
+Z			break;
+Z		case 'f': 
+Z			facts(p);
+Z			break;
+Z		case 'l':
+Z			lookg(p);
+Z			break;
+Z		case 'x': 
+Z			xploit(p);
+Z			break;
+Z		case '0': 
+Z			if (p->whocent == 0)
+Z				break;
+Z			if (isalien(p->whocent)) {
+Z				pa = (t_alien *)p->whocent;
+Z				/*
+Z				 * Register a hit on an alien
+Z				 */
+Z				pa->hit++; p->maxmaxe++;
+Z				if (pa->hit > 5) {
+Z				    pa->stats = DEAD;
+Z				    p->maxmaxe++;
+Z				}
+Z				pa->cix = -1;
+Z				pa->ciy = (rand()%3)-1;
+Z				p->points += 4;
+Z				message.mtype = p->uid+1;
+Z				message.text[0] = '\007';
+Z				message.text[1] = 0;
+Z				msgsnd(sock, &message, 2+8, 0);
+Z			}
+Z			break;
+Z		case 'i': 
+Z			invisible(p);
+Z			break;
+Z		case 'c': 
+Z			cput(TMDATA, p, "%d", (int)ptime);
+Z			break;
+Z		case 'o': 
+Z			orbit(p);
+Z			x = p->offx;
+Z			y = p->offy;
+Z			break;
+Z		case 'z': 
+Z			seescab(p);
+Z			break;
+Z		case 'd': 
+Z			dock(p);
+Z			break;
+Z		case 'v': 
+Z			cput(VLDATA, p, "%d %d", p->offx, -p->offy);
+Z			break;
+Z		case 'G':
+Z			p->status.guts = TRUE;
+Z			break;
+Z		case 'W':
+Z			p->status.guts = FALSE;
+Z			break;
+Z		case '\014':	/* ^L */
+Z		case '@': 
+Z			fnode(p->plstp);
+Z			initplayer(p);
+Z			break;
+Z		case 'Q':
+Z			prompt(p, "Really quit?");
+Z			goto savecmd;
+Z		case 'q':
+Z		case 'j':
+Z			prompt(p, "enter group members");
+Z			goto savecmd;
+Z		case 'b':
+Z		case 'g':
+Z			gathermsg(p);
+Z			/*FALL THRU*/
+Z		case 'r':
+Z		case 'h':
+Z		case 't':
+Z		case 'a':
+Z		case 'm':
+Z		case 's':
+Z		case 'n':
+Z		case '5':
+Z		savecmd:
+Z			p->cmdpend++;
+Z			p->cmd = c;
+Z			break;
+Z		default: 
+Z			goto vel;
+Z		}
+Z		goto constvel;
+Z	vel: 
+Z		/*
+Z		 * Velocity changes handled here...
+Z		 */
+Z		p->status.ap = p->status.orb = FALSE;
+Z		switch (c) {
+Z		case NO: y--; break;
+Z		case NE: x++; y--; break;
+Z		case EA: x++; break;
+Z		case SE: x++; y++; break;
+Z		case SO: y++; break;
+Z		case SW: x--; y++; break;
+Z		case WE: x--; break;
+Z		case NW: x--; y--; break;
+Z		default: goto constvel;
+Z		}
+Z		cost = max(energycost(p->offx,p->offy),
+Z			   energycost(x,y));
+Z		if (cost > p->energy) {
+Z		    pmesg(p, "Out of energy\n");
+Z		    x = p->offx; y = p->offy;
+Z		} else {
+Z		    p->offx = x;
+Z		    p->offy = y;
+Z		    p->energy -= cost + 1; /* consvel will add one */
+Z		    cput(VLDATA, p, "%d %d", p->offx, -p->offy);
+Z		}
+Zconstvel:
+Z		/*
+Z		 * Update energy total for player:
+Z		 *  Non accelerating adds one unit/iteration
+Z		 *  magnification costs energy proportional to M-factor
+Z		 *  invisibility costs INCOST/iteration
+Z		 */
+Z		p->curx = p->curx+x;
+Z		p->cury = p->cury+y;
+Z		p->energy++;
+Z		if (p->mflg > 1) p->energy -= p->mflg;
+Z		if (p->status.invis == TRUE)
+Z			p->energy = p->energy-INCOST;
+Z		if (p->maxe > p->maxmaxe) p->maxe = p->maxmaxe;
+Z		if (p->energy > p->maxe) p->energy = p->maxe;
+Z		if (p->energy < 0) outgame(p);
+Z		if (p->status.crash == TRUE) {
+Z			pstatus(p, "Crash into planet--all is lost!!");
+Z			if (p->points >= 50)
+Z				p->points -= 50;
+Z			p->status.killed = TRUE;
+Z			done(p);
+Z		}
+Z		/*
+Z		 * Update energy display only every 16 iterations --
+Z		 *  otherwise, it would be constantly updated at
+Z		 *  great expense
+Z		 */
+Z		if (p->energy != p->preve && (ptime&017) == 0) {
+Z			cput(EGYDATA, p, "%d", p->energy);
+Z			p->preve = p->energy;
+Z		}
+Z		/*
+Z		 * Friction for high speeds.
+Z		 */
+Z		if ((ptime&017) == 0) {
+Z			p->offx = friction(p->offx);
+Z			p->offy = friction(p->offy);
+Z			cput(VLDATA, p, "%d %d", p->offx, -p->offy);
+Z		}
+Z		if (p->points != p->prevp) {
+Z			cput(PTDATA, p, "%d", p->points);
+Z			p->prevp = p->points;
+Z		}
+Z	}
+Z	if (nobody < NPLAYER)
+Z		nobody = 0;
+Z	if (gutsvote && !gutsflag)
+Z		seeall("\07Entering GUTS mode-- beware!");
+Z	else if (gutsflag && !gutsvote)
+Z		for (p = player; p < &player[NPLAYER]; p++)
+Z			if (p->status.alive == TRUE)
+Z				pmesg(p, "Entering WIMP mode");
+Z	gutsflag = gutsvote;
+Z	moveburst();
+Z	/*
+Z	 * Update the state of the aliens...
+Z	 */
+Z	for (pa = alien; pa < &alien[NALIEN]; pa++) {
+Z		if (pa->stats == DEAD)
+Z			continue;
+Z		if (pa->type == WANDER) {
+Z			pa->count--;
+Z			/* time to change direction */
+Z			if (pa->count == 0) {
+Z				pa->cix = (rand()%3)-1;
+Z				pa->ciy = (rand()%3)-1;
+Z				pa->count = (rand()%50)+30;
+Z			}
+Z		}
+Z		/* shankers "dance" */
+Z		if (pa->type == SHANK && pa->aname == NAMESH)
+Z			movealien(pa);
+Z		else {
+Z			pa->cx = pa->cx + pa->cix;
+Z			pa->cy = pa->cy + pa->ciy;
+Z		}
+Z	}
+Z	/*
+Z	 * Update motion of torpedoes.
+Z	 * When looking for hits, try every point of movement.
+Z	 */
+Z	for (pt = torps; pt < &torps[NTORP]; pt++) {
+Z	    int fromx, fromy;
+Z	    int tdx, tdy, apa;
+Z	    int tdiffx, tdiffy;
+Z
+Z	    if (pt->owner == 0)
+Z		continue;
+Z	    tdx = sign(pt->xinc); tdy = sign(pt->yinc);
+Z	    tdiffx = pt->xinc*sign(tdx);
+Z	    tdiffy = pt->yinc*sign(tdy);
+Z	    pt->torx += pt->xinc;
+Z	    pt->tory += pt->yinc;
+Z	    pt->tcount--;
+Z	    /*
+Z	     * Check for alien hits
+Z	     */
+Z	    for (pa = alien; pa < &alien[NALIEN]; pa++) {
+Z		int numit;
+Z		if (pa->stats == DEAD)
+Z		    continue;
+Z		fromx = pt->torx - pt->xinc;
+Z		fromy = pt->tory - pt->yinc;
+Z		apa = tdiffy - tdiffx; numit = 30;
+Z		do {
+Z		    if (numit-- == 0) {
+Z			exit(1);
+Z			break;
+Z		    }
+Z		    if (apa < 0) {
+Z			fromx += tdx; apa += tdiffy;
+Z		    } else if (apa > 0) {
+Z			fromy += tdy; apa -= tdiffx;
+Z		    } else {
+Z			fromy += tdy; fromx += tdx;
+Z			apa = tdiffy-tdiffx;
+Z		    }
+Z		    if (pa->cx == fromx && pa->cy == fromy) {
+Z			pa->hit++;
+Z			if (pa->hit > 5) {
+Z			    makeburst(pa->cx, pa->cy);
+Z			    pa->stats = DEAD;
+Z			}
+Z			/* shot by a shanker */
+Z			if(isalien(pt->owner)) break;
+Z			pl = (t_player *)pt->owner;
+Z			/* 6 points for any hit on an alien */
+Z			pl->points += 6; pl->ahits++;
+Z			pl->maxmaxe += 1 + (pa->stats == DEAD);
+Z			/* X-aliens are worth 20 points */
+Z			if (pa->type == WANDER) pl->points += 20;
+Z			/*
+Z			 * move off in a random direction
+Z			 *  after a hit
+Z			 */
+Z			pa->cix = (rand()%3)-1;
+Z			pa->ciy = (rand()%3)-1;
+Z			if (pa->cix == 0 && pa->ciy == 0)
+Z			    pa->cix = pa->ciy = 1;
+Z			/*
+Z			 * Hit a shanker -- they fight back
+Z			 */
+Z			if (pa->type == SHANK) {
+Z			    pa->aname = NAMESH;
+Z			    pa->whotoget = pt->owner;
+Z			    pl->points += 20; pa->count = 0;
+Z			    pmesg(pl, "From a shanker-- bonzai!");
+Z			}
+Z			pstatus(pl, "\007Torpedo hit on alien!");
+Z			pt->owner = 0; break;
+Z		    }
+Z		} while (fromx != pt->torx && fromy != pt->tory);
+Z	    }
+Z	    if (pt->tcount == 0) pt->owner = 0;
+Z	}
+Z	/*
+Z	 * Main screen update loop...
+Z	 */
+Z	for (p = player; p < &player[NPLAYER]; p++) {
+Z	    if (p->status.alive == FALSE)
+Z		    continue;
+Z	    wholist = p;
+Z	    x = p->curx;
+Z	    y = p->cury;
+Z	    mf = p->mflg;
+Z	    p->whocent = 0;
+Z	    dx = x-ppx;
+Z	    dy = y-ppy;
+Z	    /*
+Z	     * Display any portion of Quartone visible
+Z	     */
+Z	    if (dx > -18 && dx < 18 && dy > -10 && dy < 10) {
+Z		    register int pp;
+Z
+Z		    for (pp = 0; pp != 17; pp++) {
+Z			    dx = planet.places[pp][0];
+Z			    dy = planet.places[pp][1];
+Z			    if (!onscreen (dx, dy, x, y))
+Z				    continue;
+Z			    if (dx == x && dy == y)
+Z				    p->status.crash = TRUE;
+Z			    xx = (dx-x)/mf+XWIND;
+Z			    yy = (dy-y)/mf+YWIND;
+Z			    enteritem(xx, yy, NAMEP);
+Z		    }
+Z	    }
+Z	    /*
+Z	     * Shrapnel around?
+Z	     */
+Z	    for (pb = bursts; pb < &bursts[NBURST]; pb++) {
+Z		    if (pb->cbactive == 0)
+Z			    continue;
+Z		    dx = x-pb->cbx;
+Z		    dy = y-pb->cby;
+Z		    if (dx > -21 && dx < 21 && dy > -13 && dy < 13) {
+Z			    register int is;
+Z
+Z			    for (is = 0; is != 9; is++) {
+Z				    dx = pb->shrap[is][0];
+Z				    dy = pb->shrap[is][1];
+Z				    if (dx == 0 && dy == 0)
+Z					    continue;
+Z				    if (!onscreen (dx, dy, x, y))
+Z					    continue;
+Z				    /* a piece hit -- mark it */
+Z				    if (dx == x && dy == y)
+Z					    p->status.bur = TRUE;
+Z				    xx = (dx-x)/mf+XWIND;
+Z				    yy = (dy-y)/mf+YWIND;
+Z				    enteritem(xx, yy, '.');
+Z			    }
+Z		    }
+Z	    }
+Z	    /*
+Z	     * Any star bases visible?
+Z	     */
+Z	    for (ps = sbase; ps < &sbase[NBASE]; ps++) {
+Z		    if (!onscreen (ps->xpos, ps->ypos, x, y))
+Z			    continue;
+Z		    if (ps->xpos == x && ps->ypos == y)
+Z			    p->whocent = (thing *)ps;
+Z		    xx = (ps->xpos-x)/mf+XWIND;
+Z		    yy = (ps->ypos-y)/mf+YWIND;
+Z		    enteritem(xx, yy, '*');
+Z	    }
+Z	    /*
+Z	     * Show other players -- take care of groups
+Z	     */
+Z	    for (pl = player; pl < &player[NPLAYER]; pl++) {
+Z		    register int shift;
+Z
+Z		    if (pl == p)
+Z			    continue;
+Z		    if (pl->status.alive == FALSE)
+Z			    continue;
+Z		    if (!onscreen (pl->curx, pl->cury, x, y))
+Z			    continue;
+Z		    if (pl->status.invis == TRUE) {
+Z			    if (!visual[pl-player][p-player])
+Z				    continue;
+Z			    shift = 'a'-'A';
+Z		    } else
+Z			    shift = 0;
+Z		    if (pl->curx == x && pl->cury == y) {
+Z			    p->whocent = (thing *)pl;
+Z			    pl->whocent = (thing *)p;
+Z		    }
+Z		    xx = (pl->curx-x)/mf+XWIND;
+Z		    yy = (pl->cury-y)/mf+YWIND;
+Z		    c = (pl-player)+'A'+shift;
+Z		    enteritem(xx, yy, c);
+Z	    }
+Z	    /*
+Z	     * Show visible aliens...
+Z	     */
+Z	    for (pa = alien; pa < &alien[NALIEN]; pa++) {
+Z		    if (pa->stats == DEAD)
+Z			    continue;
+Z		    if (!onscreen (pa->cx, pa->cy, x, y))
+Z			    continue;
+Z		    if (pa->cx == x && pa->cy == y)
+Z			    p->whocent = (thing *)pa;
+Z		    xx = (pa->cx-x)/mf+XWIND;
+Z		    yy = (pa->cy-y)/mf+YWIND;
+Z		    enteritem(xx, yy, pa->aname);
+Z		    if (pa->type == SHANK && (t_player *)(pa->whotoget) == p)
+Z			    pa->onscr = ON;
+Z	    }
+Z	    /*
+Z	     * Track torpedoes...
+Z	     */
+Z	    for (pt = torps; pt < &torps[NTORP]; pt++) {
+Z		    if (pt->owner == 0)
+Z			    continue;
+Z		    if (!onscreen (pt->torx, pt->tory, x, y))
+Z			    continue;
+Z		    if (pt->torx == x && pt->tory == y)
+Z			    p->whocent = (thing *)pt;
+Z		    xx = (pt->torx-x)/mf+XWIND;
+Z		    yy = (pt->tory-y)/mf+YWIND;
+Z		    enteritem(xx, yy, '+');
+Z	    }
+Z	    /*
+Z	     * Update the display -- attempts minimal changes
+Z	     */
+Z	    uplst();
+Z	    if (p->offx != 0)
+Z		    cput(POS1DATA, p, "%d", p->curx); 
+Z	    if (p->offy != 0)
+Z		    cput(POS2DATA, p, "%d", -p->cury);
+Z	    if (p->status.bur == TRUE) {	/* shrapnel damage */
+Z		    pmesg(p, "From damage control-- Shrapnel!!");
+Z		    cput(INDATA, p, "off");
+Z		    p->status.bur = FALSE;
+Z		    p->status.invis = FALSE;
+Z		    p->energy -= SHRAPCOST;
+Z		    if (p->energy < 0)
+Z			    p->energy = 0;
+Z		    p->maxe -= SHRAPCOST;
+Z	    }
+Z	    /*
+Z	     * Check for damage
+Z	     */
+Z	    if (isalien(p->whocent) && ((t_alien *)p->whocent)->type == WANDER) {
+Z		    /*
+Z		     * X-alien collision
+Z		     */
+Z		    p->maxe = p->maxe-15;
+Z		    if (p->energy > p->maxe)
+Z			    p->energy = p->maxe;
+Z		    pmesg(p, "From engine room-- Collision!!");
+Z	    }
+Z	    /*
+Z	     * Torpedo hit, and not in orbit
+Z	     */
+Z	    if (istorp(p->whocent) &&
+Z		(gutsflag || p->status.orb == FALSE)) {
+Z		pt = (t_torps *)p->whocent;
+Z		/*
+Z		 * If it's a shanker, let it get back to
+Z		 *  wandering -- it's done its job
+Z		 */
+Z		if (isalien(pt->owner)) {
+Z		    phaser((t_alien *)pt->owner, p);
+Z		    pt->owner = 0;
+Z		    continue;
+Z		}
+Z		/*
+Z		 * Torpedo hit by a player
+Z		 */
+Z		pl = (t_player *)pt->owner;
+Z		if (pl == p) {
+Z		    pt->owner = 0;
+Z		    pmesg(p, "From damage control-- SELF HIT!!!");
+Z		    p->points -= 75;
+Z		    p->maxmaxe--;
+Z		    if (p->points < 0)
+Z			p->points = 0;
+Z		    continue;
+Z		}
+Z		pt->owner = 0;
+Z		pstatus(pl, "\007Hit on %c", (p-player)+'A');
+Z		pstatus(p, "\007Torpedo damage suffered!");
+Z		pl->points += 50; pl->phits++; pl->maxmaxe++;
+Z		p->maxe -= 50;
+Z		if (p->energy > p->maxe) p->energy = p->maxe;
+Z		if (p->maxe <= 0) {
+Z		    int	booty = p->points / 5;
+Z		    pmesg(p, "From damage control-- FATAL HIT!");
+Z		    pmesg(pl, "From navigation-- TOTAL DESTRUCTION!");
+Z		    pl->points += 5 + booty;
+Z		    p->points -= booty;
+Z		    pl->maxmaxe++; pl->pkills++;
+Z		    /*
+Z		     * Time for a new scab??
+Z		     */
+Z		    if ((pl->pkills%4) == 0)
+Z			    makescab(pl);
+Z		    makeburst(p->curx, p->cury);
+Z		    p->status.killed = TRUE;
+Z		    done(p);
+Z		}
+Z	    }
+Z	}
+Z	/*
+Z	 * trying to minimize the number of writes to the sockets.
+Z	 */
+Z	for (p = player; p < &player[NPLAYER]; p++) {
+Z	    if (p->status.alive == TRUE)
+Z		    bflush(p);
+Z	}
+Z    }
+Z}
+Z
+Zenergycost(dx, dy)
+Zregister dx, dy;
+Z{
+Z    dx <<= 1; dy <<= 1;
+Z    if (dx<0) dx = -dx;
+Z    if (dy<0) dy = -dy;
+Z
+Z    if (dx>dy) return dx+dy/2;
+Z    else return dy+dx/2;
+Z}
+Z
+Zfriction(n)
+Z{
+Z    return n - n/4;
+Z}
+Z
+Zmax(a,b)
+Z{
+Z    return a>b ? a : b;
+Z}
+Z
+Zsign(n)
+Zint n;
+Z{
+Z    if (n<0) return -1;
+Z    else return n ? 1 : 0;
+Z}
+STUNKYFLUFF
+set `sum < main.c`
+if test 2482 != $1
+then
+echo main.c: Error. number of characters is: $1, should be: 2482.
+fi
+#
+#
+echo x - planet.c
+sed 's/^Z//' >planet.c <<\STUNKYFLUFF
+Z#ifndef lint
+Zstatic char rcsid[] = "$Header: planet.c,v 1.3 85/07/08 17:22:52 matt Exp $";
+Z#endif
+Z/*
+Z *
+Z * search
+Z *
+Z * multi-player and multi-system search and destroy.
+Z *
+Z * Original by Greg Ordy	1979
+Z * Rewrite by Sam Leffler	1981
+Z * Socket code by Dave Pare	1983
+Z * Ported & improved
+Z *      by Matt Crawford	1985
+Z *
+Z * routines to manipulate orbiting of the planet
+Z *
+Z * Copyright (c) 1979
+Z *
+Z * $Log:	planet.c,v $
+Z * Revision 1.3  85/07/08  17:22:52  matt
+Z * prepare for preliminary distribution
+Z * 
+Z * Revision 1.2  85/02/10  19:19:24  matt
+Z * Added more realistic orbiting.
+Z * 
+Z */
+Z
+Z#include "defines.h"
+Z#include "structs.h"
+Z
+Z/* orbit increments, indexed by the 0070 (CW) */
+Z/* or 0007 (CCW) bits of an oentry[] element  */
+Z
+Zstatic char omods[8][2] = {
+Z	{ 1, 0}, { 1, 1}, { 0, 1}, {-1, 1},	/* E, SE, S, SW */
+Z	{-1, 0}, {-1,-1}, { 0,-1}, { 1,-1}	/* W, NW, N, NE */
+Z};
+Z
+Z/* p->ocnt will be set odd for CCW orbits and always incremented by 2 */
+Z
+Z#define ORB_INCR(N)	omods[( (p->ocnt&1) ? (N) : (N)>>3 )&0007]
+Z
+Z#define CAN_ENTER_HERE	0200
+Z#define CAN_ORBIT_HERE  0100
+Z
+Z#define ORB_DATA(DX,DY)	(oentry[22-(DX)-9*(DY)])
+Z
+Z/* the strange subscript formula above makes */
+Z/* the following array correspond to the map */
+Z
+Zstatic char oentry[45]	= {	/* orbital entry calculations */
+Z	0000, 0202, 0303, 0304, 0304, 0304, 0314, 0224, 0000,
+Z	0202, 0373, 0000, 0000, 0000, 0000, 0000, 0315, 0224,
+Z	0371, 0000, 0000, 0000, 0000, 0000, 0000, 0000, 0335,
+Z	0260, 0351, 0000, 0000, 0000, 0000, 0000, 0337, 0246,
+Z	0000, 0260, 0350, 0340, 0340, 0340, 0347, 0246, 0000
+Z};
+Z
+Zvoid orbmove(p)
+Zregister t_player *p;
+Z{
+Z	extern	void pmesg();
+Z	extern	t_planet planet;
+Z	register char dx, dy, c;
+Z
+Z	if((p->ocnt&06) == 4) {
+Z		dx = planet.places[8][0] - p->curx;
+Z		dy = planet.places[8][1] - p->cury;
+Z		if (dx < -4 || dx > 4 || dy < -2 || dy > 2
+Z				|| !((c = ORB_DATA(dx,dy))&CAN_ORBIT_HERE)) {
+Z			/* should "never" happen */
+Z			pmesg(p, "Orbit unstable!\007");
+Z			p->status.orb = FALSE;
+Z			return;
+Z		}
+Z		p->offx = ORB_INCR(c)[0];
+Z		p->offy = ORB_INCR(c)[1];
+Z	} else {
+Z		p->offx = 0;
+Z		p->offy = 0;
+Z	}
+Z	p->ocnt += 2;
+Z}
+Z
+Zvoid orbit(p)
+Zregister t_player *p;
+Z{
+Z	extern	void pmesg();
+Z	extern	int  rand();
+Z	extern	t_planet planet;
+Z	register char dx, dy, c;
+Z	int	sense;	/* CW or CCW ? */
+Z
+Z	move(STDATAX, STDATAY, p);
+Z	if (p->offx < -1 || p->offx > 1 || p->offy < -1 || p->offy > 1) {
+Z		pmesg(p, "Velocity too great!!");
+Z		return;
+Z	}
+Z	dx = planet.places[8][0] - p->curx;
+Z	dy = planet.places[8][1] - p->cury;
+Z	if (dx < -4 || dx > 4 || dy < -2 || dy > 2
+Z			|| !((c = ORB_DATA(dx,dy))&CAN_ENTER_HERE)) {
+Z		pmesg(p, "Too far from planet to orbit!");
+Z		return;
+Z	}
+Z	if ( ! p->status.orb ) {
+Z		p->status.orb = TRUE;
+Z		p->ocnt = 0;
+Z		sense = dx * p->offy - dy * p->offx;	/* cross product */
+Z		if ( sense > 0 || (sense == 0 && rand()&01) )
+Z			p->ocnt = 1;
+Z		p->offx = p->offy = 0;
+Z		if ( !(c&CAN_ORBIT_HERE) ) {
+Z			/* jump to proper orbit location */
+Z			p->curx += ORB_INCR(c)[0];
+Z			p->cury += ORB_INCR(c)[1];
+Z		}
+Z	}
+Z	pmesg(p, "In orbit around: %s", planet.planetname);
+Z}
+STUNKYFLUFF
+set `sum < planet.c`
+if test 19515 != $1
+then
+echo planet.c: Error. number of characters is: $1, should be: 19515.
+fi
+#
+#
+echo x - playmap.c
+sed 's/^Z//' >playmap.c <<\STUNKYFLUFF
+Z#ifndef lint
+Zstatic char rcsid[] = "$Header: playmap.c,v 2.2 85/04/10 22:53:20 matt Exp $";
+Z#endif
+Z/*
+Z *
+Z * search
+Z *
+Z * multi-player and multi-system search and destroy.
+Z *
+Z * Original by Sam Leffler	1981
+Z * Socket code by Dave Pare	1983
+Z * Ported & improved
+Z *      by Matt Crawford	1985
+Z *
+Z * routines to manipulate the player map
+Z *
+Z * Copyright (c) 1981
+Z *
+Z */
+Z
+Z#include "defines.h"
+Z#include "structs.h"
+Z
+Z/*
+Z * Screen locations for the players map fields -- if you make
+Z *  NPLAYER > 16, you'd better change this.
+Z */
+Zstatic struct statcoords {
+Z	char	s_x;
+Z	char	s_y;
+Z} scoord[] = {
+Z	{0, 20}, {20, 20}, {40, 20}, {60, 20},
+Z	{0, 21}, {20, 21}, {40, 21}, {60, 21},
+Z	{0, 22}, {20, 22}, {40, 22}, {60, 22},
+Z	{0, 23}, {20, 23}, {40, 23}, {60, 23},
+Z};
+Z
+Z/*
+Z * Update the status of a player on everyone else's screen.
+Z */
+Zvoid pldisplay(pl, status)
+Zregister t_player *pl;
+Zchar *status;
+Z{
+Z	extern	void cput();
+Z	extern	t_player player[NPLAYER];
+Z	register t_player *p;
+Z	register struct statcoords *pcoord = &scoord[pl-player];
+Z
+Z	for (p = player; p < &player[NPLAYER]; p++) {
+Z		if (p->status.alive == FALSE || p == pl)
+Z			continue;
+Z		if (pl->status.begin == TRUE) {
+Z			cput(pcoord->s_x, pcoord->s_y, p, "%c[%s]%s ",
+Z				(pl-player)+'A', status, pl->plname);
+Z		} else
+Z			cput(pcoord->s_x+2, pcoord->s_y, p, status);
+Z	}
+Z	pl->status.begin = FALSE;
+Z}
+Z
+Z/*
+Z * Set up the player map for an entering player
+Z */
+Zvoid initpdisplay(pl)
+Zregister t_player *pl;
+Z{
+Z	extern	void cput();
+Z	extern	t_player player[NPLAYER];
+Z	char	what;
+Z	register t_player *p;
+Z	register struct statcoords *pcoord;
+Z
+Z	for (p = player; p < &player[NPLAYER]; p++) {
+Z		if (*p->plname == NULL || p->status.alive == FALSE)
+Z			continue;
+Z		pcoord = &scoord[p-player];
+Z		if (p->status.alive == FALSE) {
+Z			if (p->status.killed == TRUE)
+Z				what = 'd';
+Z			else
+Z				what = 'q';
+Z		}
+Z		else
+Z			what = 'a';
+Z		cput(pcoord->s_x, pcoord->s_y, pl, "%c[%c]: %s",
+Z			(p-player)+'A', what, p->plname);
+Z	}
+Z}
+STUNKYFLUFF
+set `sum < playmap.c`
+if test 18968 != $1
+then
+echo playmap.c: Error. number of characters is: $1, should be: 18968.
+fi
+#
+#
+echo x - tgoto.c
+sed 's/^Z//' >tgoto.c <<\STUNKYFLUFF
+Z#define	CTRL(c)	('c' & 037)
+Z
+Z#include "defines.h"
+Z#include "structs.h"
+Zchar *_branchto();
+Z
+Z/*
+Z * Routine to perform parameter substitution.
+Z * p->CM is a string containing printf type escapes.
+Z * The whole thing uses a stack, much like an HP 35.
+Z * The following escapes are defined for substituting row/column:
+Z *
+Z *	%d	print pop() as in printf
+Z *	%[0]2d	print pop() like %[0]2d
+Z *	%[0]3d	print pop() like %[0]3d
+Z *	%c	print pop() like %c
+Z *	%s	print pop() like %s
+Z *	%l	pop() a string and push its length.
+Z *
+Z *	%p[1-0]	push ith parm
+Z *	%P[a-z] set variable
+Z *	%g[a-z] get variable
+Z *	%'c'	char constant c
+Z *	%{nn}	integer constant nn
+Z *
+Z *	%+ %- %* %/ %m		arithmetic (%m is mod): push(pop() op pop())
+Z *	%& %| %^		bit operations:		push(pop() op pop())
+Z *	%= %> %<		logical operations:	push(pop() op pop())
+Z *	%! %~			unary operations	push(op pop())
+Z *	%b			unary BCD conversion
+Z *	%d			unary Delta Data conversion
+Z *
+Z *	%? expr %t thenpart %e elsepart %;
+Z *				if-then-else, %e elsepart is optional.
+Z *				else-if's are possible ala Algol 68:
+Z *				%? c1 %t %e c2 %t %e c3 %t %e c4 %t %e %;
+Z *
+Z * all other characters are ``self-inserting''.  %% gets % output.
+Z */
+Z
+Z#define push(i) (stack[++top] = (i))
+Z#define pop()	(stack[top--])
+Z
+Zchar *
+Ztgoto (p, p2, p1)
+Z	t_player *p;
+Z	int p2, p1;
+Z{
+Z	static char result[32];
+Z	static char added[10];
+Z	int vars[26];
+Z	int stack[10], top = 0;
+Z	register char *cp = p->CM;
+Z	register char *outp = result;
+Z	register int c;
+Z	register int op;
+Z	int sign;
+Z	int onrow = 0;
+Z	int leadzero = 0;	/* not having leading zero is unimplemented */
+Z	char *xp;
+Z
+Z	if (cp == 0)
+Z		return ("OOPS: NULL ARG");
+Z	added[0] = 0;
+Z
+Z	while (c = *cp++) {
+Z		if (c != '%') {
+Z			*outp++ = c;
+Z			continue;
+Z		}
+Z		op = stack[top];
+Z		if (*cp == '0') {
+Z			leadzero = 1;
+Z			cp++;
+Z		}
+Z		switch (c = *cp++) {
+Z
+Z		/* PRINTING CASES */
+Z		case 'd':
+Z			if (op < 10)
+Z				goto one;
+Z			if (op < 100)
+Z				goto two;
+Z			/* fall into... */
+Z
+Z		case '3':
+Zthree:
+Z			if (c == '3' && *cp++ != 'd')
+Z				return ("OOPS: BAD CHAR AFTER %3");
+Z			*outp++ = (op / 100) | '0';
+Z			op %= 100;
+Z			/* fall into... */
+Z
+Z		case '2':
+Z			if (op >= 100)
+Z				goto three;
+Z			if (c == '2' && *cp++ != 'd')
+Z				return ("OOPS: BAD CHAR AFTER %2");
+Ztwo:	
+Z			*outp++ = op / 10 | '0';
+Zone:
+Z			*outp++ = op % 10 | '0';
+Z			(void) pop();
+Z			continue;
+Z
+Z		case 'c':
+Z			/*
+Z			 * Weird things can happen to nulls, EOT's, tabs, and
+Z			 * newlines by the tty driver, arpanet, etc.
+Z			 * So we instead we used to alter the place being
+Z			 * addessed and then move the cursor locally using UP
+Z			 * or RIGHT, before Tore made som changes.
+Z			 */
+Z			switch (op) {
+Z			case 0:
+Z				op = 0200;
+Z				break;
+Z			}
+Z
+Z			*outp++ = op;
+Z			(void) pop();
+Z			break;
+Z
+Z		case 'l':
+Z			xp = (char *) pop();
+Z			push(strlen(xp));
+Z			break;
+Z
+Z		case 's':
+Z			xp = (char *) pop();
+Z			while (*xp)
+Z				*outp++ = *xp++;
+Z			break;
+Z
+Z		case '%':
+Z			*outp++ = c;
+Z			break;
+Z
+Z		/*
+Z		 * %i: shorthand for increment first two parms.
+Z		 * Useful for terminals that start numbering from
+Z		 * one instead of zero (like ANSI terminals).
+Z		 */
+Z		case 'i':
+Z			p1++; p2++;
+Z			break;
+Z
+Z		/* %pi: push the ith parameter */
+Z		case 'p':
+Z			switch (c = *cp++) {
+Z			case '1': push(p1); break;
+Z			case '2': push(p2); break;
+Z			default: return ("OOPS: BAD PARM NUMBER");
+Z			}
+Z			onrow = (c == '1');
+Z			break;
+Z		
+Z		/* %Pi: pop from stack into variable i (a-z) */
+Z		case 'P':
+Z			vars[*cp++ - 'a'] = pop();
+Z			break;
+Z		
+Z		/* %gi: push variable i (a-z) */
+Z		case 'g':
+Z			push(vars[*cp++ - 'a']);
+Z			break;
+Z		
+Z		/* %'c' : character constant */
+Z		case '\'':
+Z			push(*cp++);
+Z			if (*cp++ != '\'')
+Z				return ("OOPS: MISSING CLOSING QUOTE");
+Z			break;
+Z		
+Z		/* %{nn} : integer constant.  */
+Z		case '{':
+Z			op = 0; sign = 1;
+Z			if (*cp == '-') {
+Z				sign = -1;
+Z				cp++;
+Z			} else if (*cp == '+')
+Z				cp++;
+Z			while ((c = *cp++) >= '0' && c <= '9') {
+Z				op = 10*op + c - '0';
+Z			}
+Z			if (c != '}')
+Z				return ("OOPS: MISSING CLOSING BRACE");
+Z			push(sign * op);
+Z			break;
+Z		
+Z		/* binary operators */
+Z		case '+': c=pop(); op=pop(); push(op + c); break;
+Z		case '-': c=pop(); op=pop(); push(op - c); break;
+Z		case '*': c=pop(); op=pop(); push(op * c); break;
+Z		case '/': c=pop(); op=pop(); push(op / c); break;
+Z		case 'm': c=pop(); op=pop(); push(op % c); break; /* %m: mod */
+Z		case '&': c=pop(); op=pop(); push(op & c); break;
+Z		case '|': c=pop(); op=pop(); push(op | c); break;
+Z		case '^': c=pop(); op=pop(); push(op ^ c); break;
+Z		case '=': c=pop(); op=pop(); push(op = c); break;
+Z		case '>': c=pop(); op=pop(); push(op > c); break;
+Z		case '<': c=pop(); op=pop(); push(op < c); break;
+Z
+Z		/* Unary operators. */
+Z		case '!': stack[top] = !stack[top]; break;
+Z		case '~': stack[top] = ~stack[top]; break;
+Z		/* Sorry, no unary minus, because minus is binary. */
+Z
+Z		/*
+Z		 * If-then-else.  Implemented by a low level hack of
+Z		 * skipping forward until the match is found, counting
+Z		 * nested if-then-elses.
+Z		 */
+Z		case '?':	/* IF - just a marker */
+Z			break;
+Z
+Z		case 't':	/* THEN - branch if false */
+Z			if (!pop())
+Z				cp = _branchto(cp, 'e');
+Z			break;
+Z
+Z		case 'e':	/* ELSE - branch to ENDIF */
+Z			cp = _branchto(cp, ';');
+Z			break;
+Z
+Z		case ';':	/* ENDIF - just a marker */
+Z			break;
+Z
+Z		default:
+Z			return ("OOPS: BAD % SEQUENCE");
+Z		}
+Z	}
+Z	strcpy(outp, added);
+Z	return (result);
+Z}
+Z
+Z
+Zchar *
+Z_branchto(cp, to)
+Zregister char *cp;
+Zchar to;
+Z{
+Z	register int level = 0;
+Z	register char c;
+Z
+Z	while (c = *cp++) {
+Z		if (c == '%') {
+Z			if ((c = *cp++) == to || c == ';') {
+Z				if (level == 0) {
+Z					return cp;
+Z				}
+Z			}
+Z			if (c == '?')
+Z				level++;
+Z			if (c == ';')
+Z				level--;
+Z		}
+Z	}
+Z	return ("OOPS: NO MATCHING ENDIF");
+Z}
+STUNKYFLUFF
+set `sum < tgoto.c`
+if test 62044 != $1
+then
+echo tgoto.c: Error. number of characters is: $1, should be: 62044.
+fi
+#
+#
+echo x - util.c
+sed 's/^Z//' >util.c <<\STUNKYFLUFF
+Z#ifndef lint
+Zstatic char rcsid[] = "$Header: util.c,v 2.2 85/08/06 22:29:53 matt Exp $";
+Z#endif
+Z/*
+Z *
+Z * search
+Z *
+Z * multi-player and multi-system search and destroy.
+Z *
+Z * Original by Greg Ordy	1979
+Z * Rewrite by Sam Leffler	1981
+Z * Socket code by Dave Pare	1983
+Z * Ported & improved
+Z *      by Matt Crawford	1985
+Z *
+Z * utility routines
+Z *
+Z * Copyright (c) 1979
+Z *
+Z * $Log:	util.c,v $
+Z * Revision 2.2  85/08/06  22:29:53  matt
+Z * Change handling of "r", "b", "g", "j", "q" commands to
+Z * provide better feedback, using per-player message buffer.
+Z * 
+Z * Revision 2.1  85/04/10  17:32:11  matt
+Z * Major de-linting and minor restructuring.
+Z * 
+Z * Revision 1.4  85/02/24  22:52:07  matt
+Z * Make the select() polls into real polls by setting the timeouts
+Z * to zero.  This cuts down on context switches and speeds the game
+Z * up IMMENSELY!
+Z * 
+Z * Revision 1.3  85/02/11  12:44:13  matt
+Z * added GUTS mode
+Z * 
+Z * Revision 1.2  85/02/09  23:50:55  matt
+Z * Eliminated the dependence on the value of the mask after
+Z * select() times out.  Use the return value to distinguish
+Z * a timeout!!
+Z * 
+Z */
+Z
+Z#include <stdio.h>
+Z#include <time.h>
+Z#include <sys/types.h>
+Z#include <signal.h>
+Z#include <sys/ipc.h>
+Z#include <sys/msg.h>
+Z
+Z#include "defines.h"
+Z#include "structs.h"
+Z
+Zstruct message message;
+Z
+Zvoid pmesg();
+Zint sock;
+Z
+Z/*
+Z * Out of energy, out of game...
+Z */
+Zvoid
+Zoutgame(p)
+Zregister t_player *p;
+Z{
+Z	extern	void pstatus();
+Z	void	done();
+Z
+Z	p->status.alive = FALSE;
+Z	pstatus(p, "Out of energy, out of game!");
+Z	p->status.killed = TRUE;
+Z	done(p);
+Z}
+Z
+Z
+Z/*
+Z * Cleanup after player leaves...
+Z */
+Zvoid
+Zdone(p)
+Zregister t_player *p;
+Z{
+Z	extern	void	bflush(),
+Z			cput(),
+Z			fnode(),
+Z			pldisplay(),
+Z			putplayer();
+Z	extern	t_player	player[NPLAYER];
+Z	extern	char	visual[NPLAYER][NPLAYER];
+Z	extern	t_player	*whoscab;
+Z	extern	int	dtabsiz,	nplayer;
+Z	register	t_player	*pl;
+Z	register	int	i,	j;
+Z	int		delay;
+Z	char	junkbuf[4096];
+Z	int	mask,	y;
+Z
+Z	nplayer--;
+Z	p->status.alive = FALSE;
+Z	cput(PTDATA, p, "%d", p->points);
+Z	move(0, 23, p);		/* lower left hand corner? */
+Z	bflush(p);
+Z	delay = 0;
+Z	/*
+Z	 * close down the socket:
+Z	 * send an out-of-band message to the player,
+Z	 * stop any more writes to the socket,
+Z	 * read all the muck that's accumulated,
+Z	 * then shut it down for good.
+Z	 */
+Z	message.mtype = p->uid+1;
+Z	message.text[0] = '\0';
+Z	msgsnd(sock, &message, 8+1, 0);
+Z	j = p-player;
+Z	for (i=0,pl=player; i<NPLAYER; i++,pl++) {
+Z		visual[i][j] = visual[j][i] = 0;
+Z		if (pl->status.alive == FALSE)
+Z			continue;
+Z		for (y = 0; y != 3; y++)
+Z			if (pl->home[y] == (thing *)p)
+Z				pl->home[y] = NOTHING;
+Z	}
+Z	if (whoscab == p)
+Z		whoscab = NOBODY;
+Z	(void) putplayer(p);
+Z	(void) fnode(p->plstp);
+Z	(void) pldisplay(p, p->status.killed ? "d" : "q");
+Z}
+Z
+Z/*
+Z * Time for a solar flare...
+Z */
+Zvoid makeflare() {
+Z	extern	t_player player[NPLAYER];
+Z	extern	int sfflag,
+Z		gutsflag,
+Z		sfcount,
+Z		nplayer,
+Z		TDIST;
+Z	extern	int rand();
+Z	extern	void seeall();
+Z
+Z	if (sfflag == ON) {
+Z		sfcount = 500+(rand()%128);
+Z		sfflag = OFF;
+Z		TDIST = TSIZE-(2*nplayer);
+Z		return;
+Z	}
+Z	sfcount = 30+(rand()%100);
+Z	sfflag = ON;
+Z	if (!gutsflag)
+Z		seeall("\07From radar-- Solar flare starting!!!");
+Z}
+Z
+Z/*
+Z * Autopilot update routine
+Z */
+Zvoid apilot(p)
+Zregister t_player *p;
+Z{
+Z	extern	void cput();
+Z	register char dx, dy;
+Z	int	xplus, yplus, cost;
+Z
+Z	dx = *(p->apx) - p->curx;
+Z	dy = *(p->apy) - p->cury;
+Z	if (dx == 0 && dy == 0) {
+Z		cput(VLDATAX, VLDATAY, p, "%d %d\07", 0, 0);
+Z		p->status.ap = FALSE;
+Z	}
+Z	xplus = dx < 3 && dx > -3 ? 1 : 2;
+Z	yplus = dy < 3 && dy > -3 ? 1 : 2;
+Z	dx = dx < 0 ? -xplus : dx > 0 ? xplus : 0;
+Z	dy = dy < 0 ? -yplus : dy > 0 ? yplus : 0;
+Z	if (abs(dx - p->offx) > 1) dx = p->offx + sign(dx - p->offx);
+Z	if (abs(dy - p->offy) > 1) dy = p->offy + sign(dy - p->offy);
+Z	cost = 0;
+Z	if (dx != p->offx && dy != p->offy) {
+Z	    cost = energycost(dx, dy);
+Z	    if (cost > p->energy) {
+Z		pmesg(p, "Low on energy\n"); return;
+Z	    }
+Z	} else cost = 0;
+Z	p->energy = p->energy+1-cost;
+Z	p->offx = dx; p->offy = dy;
+Z	if (cost) cput(VLDATA, p, "%d %d", p->offx, p->offy);
+Z}
+Z
+Z/*
+Z * errlog logs the errors found by other routines.
+Z * this is needed since the main program closes stdout
+Z * so we need to print out what's wrong into a file.
+Z *
+Z * Of course, if errlog isn't opened, then we'll never see
+Z * anything bad (except a core-dump of searchd).
+Z */
+Z
+Zerrlog(msg, x0, x1, x2, x3, x4, x5, x6, x7, x8, x9)
+Zchar *msg;
+Z{
+Z	extern	int	errfile;
+Z	extern	long	lseek();
+Z	char buff[200];
+Z
+Z	if (errfile < 0) {
+Z		signal(SIGQUIT, SIG_DFL);
+Z		kill(getpid(), SIGQUIT);
+Z	}
+Z	sprintf(buff, msg, x0, x1, x2, x3, x4, x5, x6, x7, x8, x9);
+Z	(void)lseek(errfile, 0L, 2);
+Z	write(errfile, buff, strlen(buff));
+Z}
+Z
+Z/*
+Z * seeall makes everyone visible and sends them all the argument
+Z * string as a message.  This is used by makeflare and when
+Z * entering guts mode.
+Z */
+Zvoid seeall(msg)
+Zchar	*msg;
+Z{
+Z	extern	t_player player[NPLAYER];
+Z	extern	void cput();
+Z	register t_player *p;
+Z
+Z	for (p = player; p < &player[NPLAYER]; p++) {
+Z		if (p->status.alive == FALSE)
+Z			continue;
+Z		cput(INDATA, p, "off");
+Z		pmesg(p, msg);
+Z		p->status.invis = FALSE;
+Z	}
+Z}
+Z
+Zabs(x)
+Z{
+Z    return x<0 ? -x : x;
+Z}
+STUNKYFLUFF
+set `sum < util.c`
+if test 62810 != $1
+then
+echo util.c: Error. number of characters is: $1, should be: 62810.
+fi
+#
+#
+echo x - defines.h
+sed 's/^Z//' >defines.h <<\STUNKYFLUFF
+Z/*
+Z *
+Z * search
+Z *
+Z * multi-player and multi-system search and destroy.
+Z *
+Z * Original by Greg Ordy	1979
+Z * Rewrite by Sam Leffler	1981
+Z * Socket code by Dave Pare	1983
+Z * Ported & improved
+Z *      by Matt Crawford	1985
+Z *
+Z * defines and macros used by search code.
+Z *
+Z * Copyright (c) 1979
+Z *
+Z * $Header: defines.h,v 2.2 85/08/06 22:25:30 matt Exp $
+Z * $Log:	defines.h,v $
+Z * Revision 2.2  85/08/06  22:25:30  matt
+Z * Change definition of score and error log files for flexibility.
+Z * 
+Z * Revision 2.1  85/04/10  17:30:57  matt
+Z * Major de-linting and minor restructuring.
+Z * 
+Z * Revision 1.2  85/02/11  14:59:08  matt
+Z * raised NPLAYER to 15
+Z */
+Z
+Z#define DEFAULT_IN_PORT 525	/* default internet port number */
+Z
+Z/*
+Z * Configuration definitions
+Z */
+Z#define	NPLAYER 16		/* # players supported */
+Z#define	MAXMAG	'3'		/* upper bound on magnification */
+Z#define	NBURST  2		/* # concurrent visible shrapnel */
+Z#define	NALIEN  20		/* # of aliens in game */
+Z#define	NBASE	3		/* # of starbases */
+Z#define	NSHANK  12		/* # of shanker aliens */
+Z#define	NWAND	4		/* # of X-aliens */
+Z#define	NTORP	26		/* # of available torpedoes (recycled) */
+Z#define ITCHECK	128		/* # of iterations between new player check */
+Z#define QSIZE	8		/* size of input q for buffering tty reads */
+Z/*
+Z * Energy costs for various items
+Z */
+Z#define	SHRAPCOST  20		/* cost of being hit by a piece of shrapnel */
+Z#define	TPCOST  10		/* energy cost to shoot a torpedo */
+Z#define	INCOST  1		/* cost for staying invisible */
+Z
+Z#define	SCABLETTER  27
+Z#define	TSIZE	37		/* lifetime of a torpedo */
+Z/*
+Z * State bits
+Z */
+Z#define	ALIVE	0		/* player/alien/torpedo alive */
+Z#define	DEAD	7		/* player/alien/torpedo dead */
+Z
+Z#define OFF	17
+Z#define ON	23
+Z/*
+Z * Alien types -- normal, shankers, X-aliens
+Z */
+Z#define	NORM	11
+Z#define	SHANK	13
+Z#define	WANDER	17
+Z/*
+Z * Alien monikers -- shown on screen
+Z */
+Z#define	NAMEAL	'#'		/* normal type */
+Z#define	NAMESH	'@'		/* shanker */
+Z#define	NAMEWD	'X'		/* X-alien */
+Z#define	NAMEP	'%'		/* planet component */
+Z/*
+Z * Input directional keyboard definitions
+Z */
+Z#define	NO	'8'
+Z#define	NE	'9'
+Z#define	EA	'6'
+Z#define	SE	'3'
+Z#define	SO	'2'
+Z#define	SW	'1'
+Z#define	WE	'4'
+Z#define	NW	'7'
+Z/*
+Z * Other sundry commands
+Z */
+Z#define	FIRE	'0'
+Z/*
+Z * Union type qualifiers -- used with varargs
+Z */
+Z#define PLAYER	1
+Z#define ALIEN	2
+Z#define PLANET	3
+Z#define SBASE	4
+Z#define TORPEDO	5
+Z
+Z#define		onscreen(ox,oy,x,y)     (ox >= (x - XWIND*mf) && \
+Zox <= (x + XWIND * mf) && \
+Zoy >= (y - YWIND * mf) && \
+Zoy <= (y + YWIND * mf))
+Z
+Z#define NULL	0
+Z#define NULLCH	((char *)0)
+Z#define NULLINT	((int *)0)
+Z#define NOTHING	((thing *)0)
+Z#define NOBODY	((t_player *)0)
+Z
+Z#define	TRUE	1
+Z#define FALSE	0
+Z
+Z#define isbase(p)	((p) < (thing *)&sbase[NBASE] && \
+Z			 (p) >= (thing *)sbase)
+Z#define isplayer(p)	((p) < (thing *)&player[NPLAYER] && \
+Z			 (p) >= (thing *)player)
+Z#define isalien(p)	((p) < (thing *)&alien[NALIEN] && \
+Z			 (p) >= (thing *)alien)
+Z#define istorp(p)	((p) < (thing *)&torps[NTORP] && \
+Z			 (p) >= (thing *)torps)
+Z
+Z/*#define clear(p)	((void) strcat(p->outputq, p->CL))*/
+Z/*#define move(x, y, p)	((void) strcat(p->outputq, tgoto((p),(x),(y)) ))*/
+Z
+Z
+Z#define POINTFILE	LIBDIR/points"
+Z#define ERRLOG		LIBDIR/errlog"
+Z
+Z/*
+Z * Coordinate definitions for the titles of screen fields --
+Z *   probably should be defined relative to the screen dimensions.
+Z */
+Z#define	POSTITLE	55,1
+Z#define	EGYTITLE	56,4
+Z#define	HRTITLE		53,7
+Z#define	H1TITLE		53,8
+Z#define	H2TITLE		53,9
+Z#define	H3TITLE		53,10
+Z#define	PTTITLE		56,12
+Z#define	STTITLE		11,16
+Z#define	INTITLE		4,1
+Z#define	VLTITLE		5,4
+Z#define	TMTITLE		7,7
+Z#define	MFTITLE		5,10
+Z#define	MSTITLE		11,18
+Z#define PLTITLE		23,19
+Z#define XAXISTITLE	CENTX,7
+Z#define YAXISTITLE	34
+Z
+Z
+Z/*
+Z * Positions of data fields on screen
+Z */
+Z#define POS1DX	55
+Z#define POS1DY	2
+Z#define	POS1DATA	POS1DX,POS1DY
+Z#define POS2DX	60
+Z#define POS2DY	2
+Z#define	POS2DATA	POS2DX,POS2DY
+Z#define EGYDATAX	56
+Z#define EGYDATAY	5
+Z#define	EGYDATA		EGYDATAX,EGYDATAY
+Z#define H1DATAX		55
+Z#define H1DATAY		8
+Z#define	H1DATA		H1DATAX,H1DATAY
+Z#define H2DATAX		55
+Z#define H2DATAY		9
+Z#define	H2DATA		H2DATAX,H2DATAY
+Z#define H3DATAX		55
+Z#define H3DATAY		10
+Z#define	H3DATA		H3DATAX,H3DATAY
+Z#define PTDATAX		57
+Z#define PTDATAY		13
+Z#define	PTDATA		PTDATAX,PTDATAY
+Z#define STDATAX		19
+Z#define STDATAY		16
+Z#define	STDATA		STDATAX,STDATAY
+Z#define INDATAX		7
+Z#define INDATAY		2
+Z#define	INDATA		INDATAX,INDATAY
+Z#define VLDATAX		5
+Z#define VLDATAY		5
+Z#define	VLDATA		VLDATAX,VLDATAY
+Z#define TMDATAX		6
+Z#define TMDATAY		8
+Z#define	TMDATA		TMDATAX,TMDATAY
+Z#define MFDATAX		8
+Z#define MFDATAY		11
+Z#define	MFDATA		MFDATAX,MFDATAY
+Z#define MSDATAX		21
+Z#define MSDATAY		18
+Z#define	MSDATA		MSDATAX,MSDATAY
+Z#define PROMPTX		11
+Z#define PROMPTY		19
+Z
+Z/*
+Z * Definition of screen origin of viewport -- objects are located
+Z *  relative when displayed in lists.c
+Z */
+Z#define	CENTX	19
+Z#define	CENTY	0
+Z
+Z/*
+Z * Dimensions of viewport
+Z */
+Z#define	XWIND	15
+Z#define	YWIND	7
+STUNKYFLUFF
+set `sum < defines.h`
+if test 27931 != $1
+then
+echo defines.h: Error. number of characters is: $1, should be: 27931.
+fi
+#
+#
+echo x - structs.h
+sed 's/^Z//' >structs.h <<\STUNKYFLUFF
+Z/*
+Z *
+Z * search
+Z *
+Z * multi-player and multi-system search and destroy.
+Z *
+Z * Original by Greg Ordy	1979
+Z * Rewrite by Sam Leffler	1981
+Z * Socket code by Dave Pare	1983
+Z * Ported & improved
+Z *      by Matt Crawford	1985
+Z *
+Z * file contains data structure declarations used in search.
+Z * originally these were spread across several .h files.
+Z *
+Z * Copyright (c) 1979
+Z *
+Z * $Header: structs.h,v 2.2 85/08/06 22:29:49 matt Exp $
+Z * $Log:	structs.h,v $
+Z * Revision 2.2  85/08/06  22:29:49  matt
+Z * Change handling of "r", "b", "g", "j", "q" commands to
+Z * provide better feedback, using per-player message buffer.
+Z * 
+Z * Revision 2.1  85/04/10  17:32:03  matt
+Z * Major de-linting and minor restructuring.
+Z * 
+Z * Revision 1.4  85/02/11  12:44:06  matt
+Z * added GUTS mode
+Z * 
+Z * Revision 1.3  84/07/08  13:40:29  matt
+Z * Added two bytes of padding to the t_file structure.  Vax compiler
+Z * added them implicitly but Sun compiler did not, giving "bad new
+Z * player read".
+Z * 
+Z * Revision 1.2  84/07/07  18:11:31  matt
+Z * Rearranged structure t_file because it gets sent across the
+Z * net and may be padded differently by different compilers.
+Z * 
+Z */
+Z
+Zstruct plist {
+Z	char	zx;
+Z	char	zy;
+Z	char	zchar;
+Z	char	zflg;
+Z	struct plist *zpnt;
+Z};
+Z
+Z/*
+Z * Shrapnel description data base
+Z */
+Ztypedef struct {
+Z	char    cbx;		/* x coord of center */
+Z	char    cby;		/* y coord of center */
+Z	char    cbactive;	/* any pieces still visible */
+Z	char    cbcnt;		/* time left to stay active */
+Z	char    shrap[9][2];	/* offsets from center of pieces */
+Z	char    shrapd[9];	/* offset from center of each piece */
+Z} t_burst;
+Z
+Z/*
+Z * Player structure -- contains everything you'd ever
+Z *  want to know about a player in the game
+Z */
+Ztypedef struct {
+Z	char	plname[20];	/* player's name */
+Z	int	uid;		/* Uniq identifier of player */
+Z	short	energy;		/* current energy level */
+Z	short	maxmaxe;	/* max max energy */
+Z	short	maxe;		/* max energy to accumulate */
+Z	char	curx;		/* current x coord */
+Z	char	cury;		/* current y coord */
+Z	char	gmess[40];	/* group message buffer */
+Z/* status stuff */
+Z	struct {
+Z		unsigned orb : 1;	/* in orbit? */
+Z		unsigned bur : 1;	/* pending shrapnel damage */
+Z		unsigned ap : 1;	/* in the middle of an autopilot */
+Z		unsigned crash : 1;	/* crash into quartone? */
+Z		unsigned alive : 1;	/* player alive? */
+Z		unsigned killed : 1;	/* was the player killed? */
+Z		unsigned invis : 1;	/* are we invisible */
+Z		unsigned begin : 1;	/* new player? */
+Z		unsigned guts : 1;	/* wants to play "guts" */
+Z	} status;
+Z/* points */
+Z	int	points;		/* current point total for this round */
+Z	long	pltime;		/* playing time accumulated */
+Z	int	pkills;		/* kills of other players accumulated */
+Z	int	phits;		/* hits of other players accumulated */
+Z	int	ahits;		/* alien hits accumulated */
+Z/* i/o */
+Z	char	cmdpend;	/* pending command */
+Z	char	cmd;		/* current command */
+Z	char	inputq[QSIZE];	/* for buffering input from terminal */
+Z	char	*pinputq;	/* next char to read */
+Z	char	ninput;		/* # of chars in input q -- must fit QSIZE */
+Z	char	outputq[2048];	/* characters to output - null terminated */
+Z	char	*eoq;		/* pointer to the current end-of-queue */
+Z/* autopilot */
+Z	union	thing_u	*home[3];	/* autopilot channels */
+Z	char	*apx;		/* autopilot pointer - x coord */
+Z	char	*apy;		/* autopilot pointer - y coord */
+Z	union	thing_u	*whocent;	/* center over who? */
+Z/* screen stuff */
+Z	struct	plist *plstp;	/* head of screen list */
+Z	int	preve;		/* last energy value displayed */
+Z	int	prevp;		/* last point total displayed */
+Z	int	mflg;		/* magnification factor */
+Z	char	offx;		/* x offset from center */
+Z	char	offy;		/* y offset from center */
+Z/* quartone stuff */
+Z	int	ocnt;		/* orbit count */
+Z	int	qkill;		/* quartonites killed during current xploit */
+Z	int	nkcnt;		/* nuke count */
+Z	int	xcount;		/* xploitation count */
+Z	int	scabcount;	/* scab threshold */
+Z/* Termcap additions */
+Z	int	ttyspeed;	/* baud rate for padding */
+Z	char	PC;		/* pad char */
+Z	char	*BC;		/* backspace one char */
+Z	char	*UP;		/* move up one line */
+Z	char	*CM;		/* cursor motion string */
+Z	char	*CL;		/* clear screen */
+Z	char	*CE;		/* clear to end of line */
+Z/* radio and broadcast message stuff */
+Z	char	mesgbuf[40];	/* message buffer */
+Z	int	mesglen;	/* characters in buffer */
+Z	int	mesgdst;	/* radio message destination */
+Z} t_player;
+Z
+Z/*
+Z * Definition of an alien being
+Z */
+Ztypedef struct {
+Z	char	type;		/* shanker, X-alien, etc. */
+Z	char	onscr;		/* on screen? */
+Z	char	cx;		/* current x coord */
+Z	char	cy;		/* current y coord */
+Z	char	cix;		/* current increment in x direction */
+Z	char	ciy; 		/* current increment in y direction */
+Z	char	fx;		/* x firing direction */
+Z	char	fy;		/* y firing direction */
+Z	char	stats;		/* state bits */
+Z	char	hit;		/* # of hits taken */
+Z	char	count;		/* # in existence */
+Z	char	aname;		/* alien moniker */
+Z	union	thing_u	*whotoget;	/* player to attack -- shanker */
+Z} t_alien;
+Z
+Z/*
+Z * Planet definitions
+Z */
+Ztypedef struct {
+Z	char	*planetname;	/* planet's name */
+Z	char	places[17][2];	/* offsets from center of pieces */
+Z} t_planet;
+Z
+Z/*
+Z * Location of starbases
+Z */
+Ztypedef struct {
+Z	char	xpos;		/* x coord of center */
+Z	char	ypos;		/* y coord of center */
+Z} t_sbase;
+Z
+Z/*
+Z * Info regarding torpedoes
+Z */
+Ztypedef struct {
+Z	char	torx;		/* current x coord */
+Z	char	tory;		/* current y coord */
+Z	union	thing_u	*owner;		/* who shot it? */
+Z	union	thing_u	*target;	/* destination */
+Z	char	xinc;		/* velocity increment in x direction */
+Z	char	yinc;		/* velocity increment in y direction */
+Z	char	tcount;		/* time to live counter */
+Z} t_torps;
+Z
+Ztypedef union thing_u {		/* need a tag for recursive structs */
+Z	t_player	u_player;
+Z	t_alien		u_alien;
+Z	t_sbase		u_sbase;
+Z	t_torps		u_torps;
+Z} thing;
+Z
+Z/*
+Z * User point totals data base
+Z */
+Ztypedef struct {
+Z	char	ptname[20];	/* player name */
+Z	int	ptpoints;	/* total points */
+Z	int	pthits;		/* total player hits */
+Z	int	ptahits;	/* total alien hits */
+Z	int	ptkills;	/* total player kills */
+Z	int	ptkilled;	/* total times killed */
+Z	int	ptlast;		/* last game's score */
+Z	int	ptbest;		/* best score */
+Z	int	ptgames;	/* # games played */
+Z} t_totals ;
+Z
+Z/*
+Z * One file structure is read in for each player
+Z *   that gets into a game
+Z */
+Z
+Ztypedef struct {
+Z	int	uid;		/* Uniq id for the player */
+Z	char	p_name[20];	/* player's chosen moniker */
+Z	char	p_BC[20];	/* backspace one character */
+Z	char	p_UP[20];	/* move up one line */
+Z	char	p_CM[40];	/* cursor motion string */
+Z	char	p_CL[20];	/* clear screen */
+Z	char	p_CE[20];	/* clear to end of line */
+Z	int	p_speed;	/* terminal's ioctl speed */
+Z	char	p_PC;		/* pad character */
+Z	char	p_flags;	/* status bits of player */
+Z	char	p_xxx[2];	/* padding for portability */
+Z} t_file;
+Z
+Zstruct message {
+Z    long mtype;
+Z    int ident;
+Z    char text[10000];
+Z};
+STUNKYFLUFF
+set `sum < structs.h`
+if test 9923 != $1
+then
+echo structs.h: Error. number of characters is: $1, should be: 9923.
+fi
+echo All done
+exit 0
+-- 
+    ______________________________________________________
+	Lars Pensjo
+	{decvax,philabs}!mcvax!enea!chalmers!myab!lars
+
+

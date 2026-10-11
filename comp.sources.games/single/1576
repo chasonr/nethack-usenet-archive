@@ -1,0 +1,2047 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,e7aaf92833a9b11b,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1993-02-01 11:43:02 PST
+Path: sparky!uunet!news.tek.com!master!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v16i060:  nethack31 - display oriented dungeons & dragons (Ver. 3.1), Part52/108
+Message-ID: <4363@master.CNA.TEK.COM>
+Date: 1 Feb 93 19:43:02 GMT
+Sender: news@master.CNA.TEK.COM
+Lines: 2031
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: izchak@linc.cis.upenn.edu (Izchak Miller)
+Posting-number: Volume 16, Issue 60
+Archive-name: nethack31/Part52
+Supersedes: nethack3p9: Volume 10, Issue 46-102
+Environment: Amiga, Atari, Mac, MS-DOS, OS2, Unix, VMS, X11
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 52 (of 108)."
+# Contents:  src/display.c sys/vms/gnutermcap.c
+# Wrapped by billr@saab on Wed Jan 27 16:09:07 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'src/display.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'src/display.c'\"
+else
+echo shar: Extracting \"'src/display.c'\" \(35153 characters\)
+sed "s/^X//" >'src/display.c' <<'END_OF_FILE'
+X/*	SCCS Id: @(#)display.c	3.1	92/10/25	*/
+X/* Copyright (c) Dean Luick, with acknowledgements to Kevin Darcy */
+X/* and Dave Cohrs, 1990.					  */
+X/* NetHack may be freely redistributed.  See license for details. */
+X
+X/*
+X *			THE NEW DISPLAY CODE
+X *
+X * The old display code has been broken up into three parts: vision, display,
+X * and drawing.  Vision decides what locations can and cannot be physically
+X * seen by the hero.  Display decides _what_ is displayed at a given location.
+X * Drawing decides _how_ to draw a monster, fountain, sword, etc.
+X *
+X * The display system uses information from the vision system to decide
+X * what to draw at a given location.  The routines for the vision system
+X * can be found in vision.c and vision.h.  The routines for display can
+X * be found in this file (display.c) and display.h.  The drawing routines
+X * are part of the window port.  See doc/window.doc for the drawing
+X * interface.
+X *
+X * The display system deals with an abstraction called a glyph.  Anything
+X * that could possibly be displayed has a unique glyph identifier.
+X *
+X * What is seen on the screen is a combination of what the hero remembers
+X * and what the hero currently sees.  Objects and dungeon features (walls
+X * doors, etc) are remembered when out of sight.  Monsters and temporary
+X * effects are not remembered.  Each location on the level has an
+X * associated glyph.  This is the hero's _memory_ of what he or she has
+X * seen there before.
+X *
+X * Display rules:
+X *
+X *	If the location is in sight, display in order:
+X *		visible monsters
+X *		visible objects
+X *		known traps
+X *		background
+X *
+X *	If the location is out of sight, display in order:
+X *		sensed monsters (telepathy)
+X *		memory
+X *
+X *
+X *
+X * Here is a list of the major routines in this file to be used externally:
+X *
+X * newsym
+X *
+X * Possibly update the screen location (x,y).  This is the workhorse routine.
+X * It is always correct --- where correct means following the in-sight/out-
+X * of-sight rules.  **Most of the code should use this routine.**  This
+X * routine updates the map and displays monsters.
+X *
+X *
+X * map_background
+X * map_object
+X * map_trap
+X * unmap_object
+X *
+X * If you absolutely must override the in-sight/out-of-sight rules, there
+X * are two possibilities.  First, you can mess with vision to force the
+X * location in sight then use newsym(), or you can  use the map_* routines.
+X * The first has not been tried [no need] and the second is used in the
+X * detect routines --- detect object, magic mapping, etc.  The map_*
+X * routines *change* what the hero remembers.  All changes made by these
+X * routines will be sticky --- they will survive screen redraws.  Do *not*
+X * use these for things that only temporarily change the screen.  These
+X * routines are also used directly by newsym().  unmap_object is used to
+X * clear a remembered object when/if detection reveals it isn't there.
+X *
+X *
+X * show_glyph
+X *
+X * This is direct (no processing in between) buffered access to the screen.
+X * Temporary screen effects are run through this and its companion,
+X * flush_screen().  There is yet a lower level routine, print_glyph(),
+X * but this is unbuffered and graphic dependent (i.e. it must be surrounded
+X * by graphic set-up and tear-down routines).  Do not use print_glyph().
+X *
+X *
+X * see_monsters
+X * see_objects
+X *
+X * These are only used when something affects all of the monsters or
+X * objects.  For objects, the only thing is hallucination.  For monsters,
+X * there are hallucination and changing from/to blindness, etc.
+X *
+X *
+X * tmp_at
+X *
+X * This is a useful interface for displaying temporary items on the screen.
+X * Its interface is different than previously, so look at it carefully.
+X *
+X *
+X *
+X * Parts of the rm structure that are used:
+X *
+X *	typ	- What is really there.
+X *	glyph	- What the hero remembers.  This will never be a monster.
+X *		  Monsters "float" above this.
+X *	lit	- True if the position is lit.  An optimization for
+X *		  lit/unlit rooms.
+X *	waslit	- True if the position was *remembered* as lit.
+X *	seen	- Set to true when the location is seen or felt as it really
+X *		  is.  This is used primarily for walls, which look like stone
+X *		  if seen from the outside of a room.  However, this is
+X *		  also used as a guide for blind heros.  If the hero has
+X *		  seen or felt a room feature underneath a boulder, when the
+X *		  boulder is moved, the hero should see it again.  This is
+X *		  also used as an indicator for unmapping detected objects.
+X *
+X *	doormask   - Additional information for the typ field.
+X *	horizontal - Indicates whether the wall or door is horizontal or
+X *		     vertical.
+X */
+X#include "hack.h"
+X
+Xstatic void FDECL(display_monster,(XCHAR_P,XCHAR_P,struct monst *,int,XCHAR_P));
+Xstatic int FDECL(swallow_to_glyph, (int, int));
+X
+X#ifdef INVISIBLE_OBJECTS
+X/*
+X * vobj_at()
+X *
+X * Returns a pointer to an object if the hero can see an object at the
+X * given location.  This takes care of invisible objects.  NOTE, this
+X * assumes that the hero is not blind and on top of the object pile.
+X * It does NOT take into account that the location is out of sight, or,
+X * say, one can see blessed, etc.
+X */
+Xstruct obj *
+Xvobj_at(x,y)
+X    xchar x,y;
+X{
+X    register struct obj *obj = level.objects[x][y];
+X
+X    while (obj) {
+X	if (!obj->oinvis || See_invisible) return obj;
+X	obj = obj->nexthere;
+X    }
+X    return ((struct obj *) 0);
+X}
+X#endif	/* else vobj_at() is defined in display.h */
+X
+X/*
+X * The routines map_background(), map_object(), and map_trap() could just
+X * as easily be:
+X *
+X *	map_glyph(x,y,glyph,show)
+X *
+X * Which is called with the xx_to_glyph() in the call.  Then I can get
+X * rid of 3 routines that don't do very much anyway.  And then stop
+X * having to create fake objects and traps.  However, I am reluctant to
+X * make this change.
+X */
+X
+X/*
+X * map_background()
+X *
+X * Make the real background part of our map.  This routine assumes that
+X * the hero can physically see the location.  Update the screen if directed.
+X */
+Xvoid
+Xmap_background(x, y, show)
+X    register xchar x,y;
+X    register int  show;
+X{
+X    register int glyph = back_to_glyph(x,y);
+X
+X    if (level.flags.hero_memory)
+X	levl[x][y].glyph = glyph;
+X    if (show) show_glyph(x,y, glyph);
+X}
+X
+X/*
+X * map_trap()
+X *
+X * Map the trap and print it out if directed.  This routine assumes that the
+X * hero can physically see the location.
+X */
+Xvoid
+Xmap_trap(trap, show)
+X    register struct trap *trap;
+X    register int	 show;
+X{
+X    register int x = trap->tx, y = trap->ty;
+X    register int glyph = trap_to_glyph(trap);
+X
+X    if (level.flags.hero_memory)
+X	levl[x][y].glyph = glyph;
+X    if (show) show_glyph(x, y, glyph);
+X}
+X
+X/*
+X * map_object()
+X *
+X * Map the given object.  This routine assumes that the hero can physically
+X * see the location of the object.  Update the screen if directed.
+X */
+Xvoid
+Xmap_object(obj, show)
+X    register struct obj *obj;
+X    register int	show;
+X{
+X    register int x = obj->ox, y = obj->oy;
+X    register int glyph = obj_to_glyph(obj);
+X
+X    if (level.flags.hero_memory)
+X	levl[x][y].glyph = glyph;
+X    if (show) show_glyph(x, y, glyph);
+X}
+X
+X/*
+X * unmap_object()
+X *
+X * Remove something from the map when detection reveals that it isn't
+X * there any more.  Replace it with background or known trap, but not
+X * with any other remembered object.  No need to update the display;
+X * a full update is imminent.
+X *
+X * This isn't quite correct due to overloading of the seen bit.  But
+X * it works well enough for now.
+X */
+Xvoid
+Xunmap_object(x, y)
+X    register int x, y;
+X{
+X    register struct trap *trap;
+X
+X    if (!level.flags.hero_memory) return;
+X
+X    if ((trap = t_at(x,y)) != 0 && trap->tseen && !covers_traps(x,y))
+X	map_trap(trap, 0);
+X    else if (levl[x][y].seen) {
+X	struct rm *lev = &levl[x][y];
+X
+X	map_background(x, y, 0);
+X
+X	/* turn remembered dark room squares dark */
+X	if (!lev->waslit && lev->glyph == cmap_to_glyph(S_room) &&
+X							    lev->typ == ROOM)
+X	    lev->glyph = cmap_to_glyph(S_stone);
+X    } else 
+X	levl[x][y].glyph = cmap_to_glyph(S_stone);	/* default val */
+X}
+X
+X
+X/*
+X * map_location()
+X *
+X * Make whatever at this location show up.  This is only for non-living
+X * things.  This will not handle feeling invisible objects correctly.
+X */
+X#define map_location(x,y,show)						\
+X{									\
+X    register struct obj   *obj;						\
+X    register struct trap  *trap;					\
+X									\
+X    if ((obj = vobj_at(x,y)) && !covers_objects(x,y))			\
+X	map_object(obj,show);						\
+X    else if ((trap = t_at(x,y)) && trap->tseen && !covers_traps(x,y))	\
+X	map_trap(trap,show);						\
+X    else								\
+X	map_background(x,y,show);					\
+X}
+X
+X
+X/*
+X * display_monster()
+X *
+X * Note that this is *not* a map_XXXX() function!  Monsters sort of float
+X * above everything.
+X *
+X * Yuck.  Display body parts by recognizing that the display position is
+X * not the same as the monster position.  Currently the only body part is
+X * a worm tail.
+X *  
+X */
+Xstatic void
+Xdisplay_monster(x, y, mon, in_sight, worm_tail)
+X    register xchar x, y;	/* display position */
+X    register struct monst *mon;	/* monster to display */
+X    int in_sight;		/* TRUE if the monster is physically seen */
+X    register xchar worm_tail;	/* mon is actually a worm tail */
+X{
+X    register boolean mon_mimic = (mon->m_ap_type != M_AP_NOTHING);
+X    register int sensed = mon_mimic &&
+X	(Protection_from_shape_changers || sensemon(mon));
+X
+X    /*
+X     * We must do the mimic check first.  If the mimic is mimicing something,
+X     * and the location is in sight, we have to change the hero's memory
+X     * so that when the position is out of sight, the hero remembers what
+X     * the mimic was mimicing.
+X     */
+X
+X    if (mon_mimic && in_sight) {
+X	switch (mon->m_ap_type) {
+X	    default:
+X		impossible("display_monster:  bad m_ap_type value [ = %d ]",
+X							(int) mon->m_ap_type);
+X	    case M_AP_NOTHING:
+X		show_glyph(x, y, mon_to_glyph(mon));
+X		break;
+X
+X	    case M_AP_FURNITURE: {
+X		/*
+X		 * This is a poor man's version of map_background().  I can't
+X		 * use map_background() because we are overriding what is in
+X		 * the 'typ' field.  Maybe have map_background()'s parameters
+X		 * be (x,y,glyph) instead of just (x,y).
+X		 *
+X		 * mappearance is currently set to an S_ index value in
+X		 * makemon.c.
+X		 */
+X		register int glyph = cmap_to_glyph(mon->mappearance);
+X		levl[x][y].glyph = glyph;
+X		if (!sensed) show_glyph(x,y, glyph);
+X		break;
+X	    }
+X
+X	    case M_AP_OBJECT: {
+X		struct obj obj;	/* Make a fake object to send	*/
+X				/* to map_object().		*/
+X		obj.ox = x;
+X		obj.oy = y;
+X		obj.otyp = mon->mappearance;
+X		obj.corpsenm = PM_TENGU;	/* if mimicing a corpse */
+X		map_object(&obj,!sensed);
+X		break;
+X	    }
+X
+X	    case M_AP_MONSTER:
+X		show_glyph(x,y, monnum_to_glyph(what_mon(mon->mappearance)));
+X		break;
+X	}
+X	
+X    }
+X
+X    /* If the mimic is unsucessfully mimicing something, display the monster */
+X    if (!mon_mimic || sensed) {
+X	if (mon->mtame) {
+X	    if (worm_tail)
+X		show_glyph(x,y, petnum_to_glyph(what_mon(PM_LONG_WORM_TAIL)));
+X	    else    
+X		show_glyph(x,y, pet_to_glyph(mon));
+X	} else {
+X	    if (worm_tail)
+X		show_glyph(x,y, monnum_to_glyph(what_mon(PM_LONG_WORM_TAIL)));
+X	    else    
+X		show_glyph(x,y, mon_to_glyph(mon));
+X	}
+X    }
+X}
+X
+X/*
+X * feel_location()
+X *
+X * Feel the given location.  This assumes that the hero is blind and that
+X * the given position is either the hero's or one of the eight squares
+X * adjacent to the hero (except for a boulder push).
+X */
+Xvoid
+Xfeel_location(x, y)
+X    xchar x, y;
+X{
+X    struct rm *lev = &(levl[x][y]);
+X    struct obj *boulder;
+X    register struct monst *mon;
+X
+X    /* The hero can't feel non pool locations while under water. */
+X    if (Underwater && !Is_waterlevel(&u.uz) && ! is_pool(x,y))
+X	return;
+X
+X    /* If the hero is not in a corridor, then she will feel the wall as a */
+X    /* wall.  It doesn't matter if the hero is levitating or not.	  */
+X    if ((IS_WALL(lev->typ) || lev->typ == SDOOR) &&
+X						levl[u.ux][u.uy].typ != CORR)
+X	lev->seen = 1;
+X
+X    if (Levitation && !Is_airlevel(&u.uz) && !Is_waterlevel(&u.uz)) {
+X	/*
+X	 * Levitation Rules.  It is assumed that the hero can feel the state
+X	 * of the walls around herself and can tell if she is in a corridor,
+X	 * room, or doorway.  Boulders are felt because they are large enough.
+X	 * Anything else is unknown because the hero can't reach the ground.
+X	 * This makes things difficult.
+X	 *
+X	 * Check (and display) in order:
+X	 *
+X	 *	+ Stone, walls, and closed doors.
+X	 *	+ Boulders.  [see a boulder before a doorway]
+X	 *	+ Doors.
+X	 *	+ Room/water positions
+X	 *	+ Everything else (hallways!)
+X	 */
+X	if (IS_ROCK(lev->typ) || (IS_DOOR(lev->typ) &&
+X				(lev->doormask & (D_LOCKED | D_CLOSED)))) {
+X	    map_background(x, y, 1);
+X	} else if (boulder = sobj_at(BOULDER,x,y)) {
+X	    map_object(boulder, 1);
+X	} else if (IS_DOOR(lev->typ)) {
+X	    map_background(x, y, 1);
+X	} else if (IS_ROOM(lev->typ) || IS_POOL(lev->typ)) {
+X	    /*
+X	     * An open room or water location.  Normally we wouldn't touch
+X	     * this, but we have to get rid of remembered boulder symbols.
+X	     * This will only occur in rare occations when the hero goes
+X	     * blind and doesn't find a boulder where expected (something
+X	     * came along and picked it up).  We know that there is not a
+X	     * boulder at this location.  Show fountains, pools, etc.
+X	     * underneath if already seen.  Otherwise, show the appropriate
+X	     * floor symbol.
+X	     *
+X	     * This isn't quite correct.  If the boulder was on top of some
+X	     * other objects they should be seen once the boulder is removed.
+X	     * However, we have no way of knowing that what is there now
+X	     * was there then.  So we let the hero have a lapse of memory.
+X	     * We could also just display what is currently on the top of the
+X	     * object stack (if anything).
+X	     */
+X	    if (lev->glyph == objnum_to_glyph(BOULDER)) {
+X		if (lev->typ != ROOM && lev->seen) {
+X		    map_background(x, y, 1);
+X		} else {
+X		    lev->glyph = lev->waslit ? cmap_to_glyph(S_room) :
+X					       cmap_to_glyph(S_stone);
+X		    show_glyph(x,y,lev->glyph);
+X		}
+X	    }
+X	} else {
+X	    /* We feel it (I think hallways are the only things left). */
+X	    map_background(x, y, 1);
+X	    /* Corridors are never felt as lit (unless remembered that way) */
+X	    /* (lit_corridor only).					    */
+X	    if (lev->typ == CORR &&
+X		    lev->glyph == cmap_to_glyph(S_litcorr) && !lev->waslit)
+X		show_glyph(x, y, lev->glyph = cmap_to_glyph(S_corr));
+X	}
+X    } else {
+X	map_location(x, y, 1);
+X
+X	if (Punished) {
+X	    /*
+X	     * A ball or chain is only felt if it is first on the object
+X	     * location list.  Otherwise, we need to clear the felt bit ---
+X	     * something has been dropped on the ball/chain.  If the bit is
+X	     * not cleared, then when the ball/chain is moved it will drop
+X	     * the wrong glyph.
+X	     */
+X	    if (uchain->ox == x && uchain->oy == y) {
+X		if (level.objects[x][y] == uchain)
+X		    u.bc_felt |= BC_CHAIN;
+X		else
+X		    u.bc_felt &= ~BC_CHAIN;	/* do not feel the chain */
+X	    }
+X	    if (!carried(uball) && uball->ox == x && uball->oy == y) {
+X		if (level.objects[x][y] == uball)
+X		    u.bc_felt |= BC_BALL;
+X		else
+X		    u.bc_felt &= ~BC_BALL;	/* do not feel the ball */
+X	    }
+X	}
+X
+X	/* Floor spaces are dark if unlit.  Corridors are dark if unlit. */
+X	if (lev->typ == ROOM &&
+X		    lev->glyph == cmap_to_glyph(S_room) && !lev->waslit)
+X	    show_glyph(x,y, lev->glyph = cmap_to_glyph(S_stone));
+X	else if (lev->typ == CORR &&
+X		    lev->glyph == cmap_to_glyph(S_litcorr) && !lev->waslit)
+X	    show_glyph(x,y, lev->glyph = cmap_to_glyph(S_corr));
+X    }
+X    /* draw monster on top if we can sense it */
+X    if ((x != u.ux || y != u.uy) && (mon = m_at(x,y)) && sensemon(mon))
+X	display_monster(x,y,mon,1,((x != mon->mx)  || (y != mon->my)));
+X}
+X
+X/*
+X * newsym()
+X *
+X * Possibly put a new glyph at the given location.
+X */
+Xvoid
+Xnewsym(x,y)
+X    register xchar x,y;
+X{
+X    register struct monst *mon;
+X    register struct rm *lev = &(levl[x][y]);
+X    register int see_it;
+X    register xchar worm_tail;
+X
+X    /* only permit updating the hero when swallowed */
+X    if (u.uswallow) {
+X	if (x == u.ux && y == u.uy) display_self();
+X	return;
+X    }
+X    if (Underwater && !Is_waterlevel(&u.uz)) {
+X	/* don't do anything unless (x,y) is an adjacent underwater position */
+X	int dx, dy;
+X	if (!is_pool(x,y)) return;
+X	dx = x - u.ux;	if (dx < 0) dx = -dx;
+X	dy = y - u.uy;	if (dy < 0) dy = -dy;
+X	if (dx > 1 || dy > 1) return;
+X    }
+X
+X    /* Can physically see the location. */
+X    if (cansee(x,y)) {
+X	lev->waslit = (lev->lit!=0);	/* remember lit condition */
+X
+X	if (x == u.ux && y == u.uy) {
+X	    if (canseeself()) {
+X		map_location(x,y,0);	/* map *under* self */
+X		display_self();
+X	    } else
+X		/* we can see what is there */
+X		map_location(x,y,1);
+X	}
+X	else if ((mon = m_at(x,y)) &&
+X		 ((see_it = mon_visible(mon)) || sensemon(mon))) {
+X	    map_location(x,y,0); 	/* map under the monster */
+X    	    worm_tail = ((x != mon->mx)  || (y != mon->my));
+X	    display_monster(x,y,mon,see_it,worm_tail);
+X	}
+X	else
+X	    map_location(x,y,1);	/* map the location */
+X    }
+X
+X    /* Can't see the location. */
+X    else {
+X	if (x == u.ux && y == u.uy) {
+X	    feel_location(u.ux, u.uy);		/* forces an update */
+X
+X	    if (canseeself()) display_self();
+X	}
+X	else if ((mon = m_at(x,y)) && sensemon(mon) &&
+X    		 		!((x != mon->mx)  || (y != mon->my))) {
+X	    /* Monsters are printed every time. */
+X	    display_monster(x,y,mon,0,0);
+X	}
+X	/*
+X	 * If the location is remembered as being both dark (waslit is false)
+X	 * and lit (glyph is a lit room or lit corridor) then it was either:
+X	 *
+X	 *	(1) A dark location that the hero could see through night
+X	 *	    vision.
+X	 *
+X	 *	(2) Darkened while out of the hero's sight.  This can happen
+X	 *	    when cursed scroll of light is read.
+X	 *
+X	 * In either case, we have to manually correct the hero's memory to
+X	 * match waslit.  Deciding when to change waslit is non-trivial.
+X	 *
+X	 *  Note:  If flags.lit_corridor is set, then corridors act like room
+X	 *	   squares.  That is, they light up if in night vision range.
+X	 *	   If flags.lit_corridor is not set, then corridors will
+X	 *	   remain dark unless lit by a light spell.
+X	 *
+X	 * These checks and changes must be here and not in back_to_glyph().
+X	 * They are dependent on the position being out of sight.
+X	 */
+X	else if (!lev->waslit) {
+X	    if (flags.lit_corridor && lev->glyph == cmap_to_glyph(S_litcorr) &&
+X							    lev->typ == CORR)
+X		show_glyph(x, y, lev->glyph = cmap_to_glyph(S_corr));
+X	    else if (lev->glyph == cmap_to_glyph(S_room) && lev->typ == ROOM)
+X		show_glyph(x, y, lev->glyph = cmap_to_glyph(S_stone));
+X	    else
+X		goto show_mem;
+X	} else {
+Xshow_mem:
+X	    show_glyph(x, y, lev->glyph);
+X	}
+X    }
+X}
+X
+X
+X/*
+X * shieldeff()
+X *
+X * Put magic shield pyrotechnics at the given location.  This *could* be
+X * pulled into a platform dependent routine for fancier graphics if desired.
+X */
+Xvoid
+Xshieldeff(x,y)
+X    xchar x,y;
+X{
+X    register int i;
+X
+X    if (cansee(x,y)) {	/* Don't see anything if can't see the location */
+X	for (i = 0; i < SHIELD_COUNT; i++) {
+X	    show_glyph(x, y, cmap_to_glyph(shield_static[i]));
+X	    flush_screen(1);	/* make sure the glyph shows up */
+X	    delay_output();
+X	}
+X	newsym(x,y);		/* restore the old information */
+X    }
+X}
+X
+X
+X/*
+X * tmp_at()
+X *
+X * Temporarily place glyphs on the screen.  Do not call delay_output().  It
+X * is up to the caller to decide if it wants to wait [presently, everyone
+X * but explode() wants to delay].
+X *
+X * Call:
+X *	(DISP_BEAM,   glyph)	open, initialize glyph
+X *	(DISP_FLASH,  glyph)	open, initialize glyph
+X *	(DISP_CHANGE, glyph)	change glyph
+X *	(DISP_END,    0)	close & clean up (second argument doesn't
+X *				matter)
+X *	(x, y)			display the glyph at the location
+X *
+X * DISP_BEAM  - Display the given glyph at each location, but do not erase
+X *		any until the close call.
+X * DISP_FLASH - Display the given glyph at each location, but erase the
+X *		previous location's glyph.
+X */
+Xvoid
+Xtmp_at(x, y)
+X    int x, y;
+X{
+X    static coord saved[COLNO];	/* prev positions, only for DISP_BEAM */
+X    static int sidx = 0;	/* index of saved previous positions */
+X    static int sx = -1, sy;	/* previous position, only for DISP_FLASH */
+X    static int status;		/* either DISP_BEAM or DISP_FLASH */
+X    static int glyph;		/* glyph to use when printing */
+X
+X    switch (x) {
+X	case DISP_BEAM:
+X	case DISP_FLASH:
+X	    status = x;
+X	    glyph  = y;
+X	    flush_screen(0);	/* flush buffered glyphs */
+X	    break;
+X
+X	case DISP_CHANGE:
+X	    glyph = y;
+X	    break;
+X
+X	case DISP_END:
+X	    if (status == DISP_BEAM) {
+X		register int i;
+X
+X		/* Erase (reset) from source to end */
+X		for (i = 0; i < sidx; i++)
+X		    newsym(saved[i].x,saved[i].y);
+X		sidx = 0;
+X		
+X	    } else if (sx >= 0) {	/* DISP_FLASH (called at least once) */
+X		newsym(sx,sy);	/* reset the location */
+X		sx = -1;	/* reset sx to an illegal pos for next time */
+X	    }
+X	    break;
+X
+X	default:	/* do it */
+X	    if (!cansee(x,y)) break;
+X
+X	    if (status == DISP_BEAM) {
+X		saved[sidx  ].x = x;	/* save pos for later erasing */
+X		saved[sidx++].y = y;
+X	    }
+X
+X	    else {	/* DISP_FLASH */
+X		if (sx >= 0)		/* not first call */
+X		    newsym(sx,sy);	/* update the old position */
+X
+X		sx = x;		/* save previous pos for next call */
+X		sy = y;
+X	    }
+X
+X	    show_glyph(x,y,glyph);	/* show it */
+X	    flush_screen(0);		/* make sure it shows up */
+X	    break;
+X    } /* end case */
+X}
+X
+X
+X/*
+X * swallowed()
+X *
+X * The hero is swallowed.  Show a special graphics sequence for this.  This
+X * bypasses all of the display routines and messes with buffered screen
+X * directly.  This method works because both vision and display check for
+X * being swallowed.
+X */
+Xvoid
+Xswallowed(first)
+X    int first;
+X{
+X    static xchar lastx, lasty;	/* last swallowed position */
+X    int swallower;
+X
+X    if (first)
+X	cls();
+X    else {
+X	register int x, y;
+X
+X	/* Clear old location */
+X	for (y = lasty-1; y <= lasty+1; y++)
+X	    if(isok(lastx,y)) {
+X		for (x = lastx-1; x <= lastx+1; x++)
+X		    show_glyph(x,y,cmap_to_glyph(S_stone));
+X	    }
+X    }
+X
+X    swallower = monsndx(u.ustuck->data);
+X    /*
+X     *  Display the hero surrounded by the monster's stomach.
+X     */
+X    if(isok(u.ux, u.uy-1)) {
+X	show_glyph(u.ux-1, u.uy-1, swallow_to_glyph(swallower, S_sw_tl));
+X	show_glyph(u.ux  , u.uy-1, swallow_to_glyph(swallower, S_sw_tc));
+X	show_glyph(u.ux+1, u.uy-1, swallow_to_glyph(swallower, S_sw_tr));
+X    }
+X
+X    show_glyph(u.ux-1, u.uy  , swallow_to_glyph(swallower, S_sw_ml));
+X    display_self();
+X    show_glyph(u.ux+1, u.uy  , swallow_to_glyph(swallower, S_sw_mr));
+X
+X    if(isok(u.ux, u.uy+1)) {
+X	show_glyph(u.ux-1, u.uy+1, swallow_to_glyph(swallower, S_sw_bl));
+X	show_glyph(u.ux  , u.uy+1, swallow_to_glyph(swallower, S_sw_bc));
+X	show_glyph(u.ux+1, u.uy+1, swallow_to_glyph(swallower, S_sw_br));
+X    }
+X
+X    /* Update the swallowed position. */
+X    lastx = u.ux;
+X    lasty = u.uy;
+X}
+X
+X/*
+X * under_water()
+X *
+X * Similar to swallowed() in operation.  Shows hero when underwater
+X * except when in water level.  Special routines exist for that.
+X */
+Xvoid
+Xunder_water(mode)
+X    int mode;
+X{
+X    static xchar lastx, lasty;
+X    static boolean dela;
+X    register int x, y;
+X
+X    /* swallowing has a higher precedence than under water */
+X    if (Is_waterlevel(&u.uz) || u.uswallow) return;
+X
+X    /* full update */
+X    if (mode == 1 || dela) {
+X	cls();
+X	dela = FALSE;
+X    }   
+X    /* delayed full update */
+X    else if (mode == 2) {
+X	dela = TRUE;
+X	return;
+X    }
+X    /* limited update */
+X    else {
+X	for (y = lasty-1; y <= lasty+1; y++)
+X	    for (x = lastx-1; x <= lastx+1; x++)
+X		if (isok(x,y)) 
+X		    show_glyph(x,y,cmap_to_glyph(S_stone));
+X    }
+X    for (x = u.ux-1; x <= u.ux+1; x++)
+X	for (y = u.uy-1; y <= u.uy+1; y++)
+X	    if (isok(x,y) && is_pool(x,y)) {
+X		if (Blind && !(x == u.ux && y == u.uy))
+X		    show_glyph(x,y,cmap_to_glyph(S_stone));
+X		else	
+X		    newsym(x,y);
+X	    }
+X    lastx = u.ux;
+X    lasty = u.uy;
+X}
+X
+X
+X/* ========================================================================= */
+X
+X/*
+X * Loop through all of the monsters and update them.  Called when:
+X *	+ going blind & telepathic
+X *	+ regaining sight & telepathic
+X *	+ hallucinating
+X *	+ doing a full screen redraw
+X *	+ see invisible times out or a ring of see invisible is taken off
+X *	+ when a potion of see invisible is quaffed or a ring of see
+X *	  invisible is put on
+X *	+ gaining telepathy when blind [givit() in eat.c, pleased() in pray.c]
+X *	+ losing telepathy while blind [xkilled() in mon.c, attrcurse() in
+X *	  sit.c]
+X */
+Xvoid
+Xsee_monsters()
+X{
+X    register struct monst *mon;
+X    for (mon = fmon; mon; mon = mon->nmon) {
+X	newsym(mon->mx,mon->my);
+X	if (mon->wormno) see_wsegs(mon);
+X    }
+X}
+X
+X/*
+X * Block/unblock light depending on what a mimic is mimicing and if it's
+X * invisible or not.  Should be called only when the state of See_invisible
+X * changes.
+X */
+Xvoid
+Xset_mimic_blocking()
+X{
+X    register struct monst *mon;
+X    for (mon = fmon; mon; mon = mon->nmon)
+X	if(mon->minvis &&
+X	   ((mon->m_ap_type == M_AP_FURNITURE &&
+X	      (mon->mappearance == S_vcdoor || mon->mappearance == S_hcdoor))||
+X	    (mon->m_ap_type == M_AP_OBJECT && mon->mappearance == BOULDER))) {
+X	    if(See_invisible)
+X		block_point(mon->mx, mon->my);
+X	    else
+X		unblock_point(mon->mx, mon->my);
+X	}
+X}
+X
+X/*
+X * Loop through all of the object *locations* and update them.  Called when
+X *	+ hallucinating.
+X */
+Xvoid
+Xsee_objects()
+X{
+X    register struct obj *obj;
+X    for(obj = fobj; obj; obj = obj->nobj)
+X	if (vobj_at(obj->ox,obj->oy) == obj) newsym(obj->ox, obj->oy);
+X}
+X
+X/*
+X * Put the cursor on the hero.  Flush all accumulated glyphs before doing it.
+X */
+Xvoid
+Xcurs_on_u()
+X{
+X    flush_screen(1);	/* Flush waiting glyphs & put cursor on hero */
+X}
+X
+Xint
+Xdoredraw()
+X{
+X    docrt();
+X    return 0;
+X}
+X
+Xvoid
+Xdocrt()
+X{
+X    register int x,y;
+X    register struct rm *lev;
+X
+X    if (!u.ux) return; /* display isn't ready yet */
+X
+X    if (u.uswallow) {
+X	swallowed(1);
+X	return;
+X    }
+X    if (Underwater && !Is_waterlevel(&u.uz)) {
+X	under_water(1);
+X	return;
+X    }
+X
+X    /* shut down vision */
+X    vision_recalc(2);
+X
+X    /*
+X     * This routine assumes that cls() does the following:
+X     *      + fills the physical screen with the symbol for rock
+X     *      + clears the glyph buffer
+X     */
+X    cls();
+X
+X    /* display memory */
+X    for (x = 1; x < COLNO; x++) {
+X	lev = &levl[x][0];
+X	for (y = 0; y < ROWNO; y++, lev++)
+X	    if (lev->glyph != cmap_to_glyph(S_stone))
+X		show_glyph(x,y,lev->glyph);
+X    }
+X
+X    /* see what is to be seen */
+X    vision_recalc(0);
+X
+X    /* overlay with monsters */
+X    see_monsters();
+X
+X    flags.botlx = 1;	/* force a redraw of the bottom line */
+X}
+X
+X
+X/* ========================================================================= */
+X/* Glyph Buffering (3rd screen) ============================================ */
+X
+Xtypedef struct {
+X    xchar new;		/* perhaps move this bit into the rm strucure. */
+X    int   glyph;
+X} gbuf_entry;
+X
+Xstatic gbuf_entry gbuf[ROWNO][COLNO];
+Xstatic char gbuf_start[ROWNO];
+Xstatic char gbuf_stop[ROWNO];
+X
+X/*
+X * Store the glyph in the 3rd screen for later flushing.
+X */
+Xvoid
+Xshow_glyph(x,y,glyph)
+X    xchar x,y;
+X    int   glyph;
+X{
+X    /*
+X     * Check for bad positions and glyphs.
+X     */
+X    if (x <= 0 || x >= COLNO || y < 0 || y >= ROWNO) {
+X	const char *text;
+X	int  offset;
+X
+X	/* column 0 is invalid, but it's often used as a flag, so ignore it */
+X	if (x == 0) return;
+X
+X	/*
+X	 *  This assumes an ordering of the offsets.  See display.h for
+X	 *  the definition.
+X	 */
+X	if (glyph >= GLYPH_SWALLOW_OFF) {		/* swallow border */
+X	    text = "swallow border";	offset = glyph - GLYPH_SWALLOW_OFF;
+X	}else if (glyph >= GLYPH_ZAP_OFF) {		/* zap beam */
+X	    text = "zap beam";		offset = glyph - GLYPH_ZAP_OFF;
+X	} else if (glyph >= GLYPH_CMAP_OFF) {		/* cmap */
+X	    text = "cmap_index";	offset = glyph - GLYPH_CMAP_OFF;
+X	} else if (glyph >= GLYPH_TRAP_OFF) {		/* trap */
+X	    text = "trap";		offset = glyph - GLYPH_TRAP_OFF;
+X	} else if (glyph >= GLYPH_OBJ_OFF) {		/* object */
+X	    text = "object";		offset = glyph - GLYPH_OBJ_OFF;
+X	} else if (glyph >= GLYPH_BODY_OFF) {		/* a corpse */
+X	    text = "corpse";		offset = glyph - GLYPH_BODY_OFF;
+X	} else {					/* a monster */
+X	    text = "monster";		offset = glyph;
+X	}
+X
+X	impossible("show_glyph:  bad pos %d %d with glyph %d [%s %d].",
+X						x, y, glyph, text, offset);
+X	return;
+X    }
+X
+X    if (glyph >= MAX_GLYPH) {
+X	impossible("show_glyph:  bad glyph %d [max %d] at (%d,%d).",
+X					glyph, MAX_GLYPH, x, y);
+X	return;
+X    }
+X
+X    if (gbuf[y][x].glyph != glyph) {
+X	gbuf[y][x].glyph = glyph;
+X	gbuf[y][x].new   = 1;
+X	if (gbuf_start[y] > x) gbuf_start[y] = x;
+X	if (gbuf_stop[y]  < x) gbuf_stop[y]  = x;
+X    }
+X}
+X
+X
+X/*
+X * Reset the changed glyph borders so that none of the 3rd screen has
+X * changed.
+X */
+X#define reset_glyph_bbox()			\
+X    {						\
+X	int i;					\
+X						\
+X	for (i = 0; i < ROWNO; i++) {		\
+X	    gbuf_start[i] = COLNO-1;		\
+X	    gbuf_stop[i]  = 0;			\
+X	}					\
+X    }
+X
+X
+Xstatic gbuf_entry nul_gbuf = { 0, cmap_to_glyph(S_stone) };
+X/*
+X * Turn the 3rd screen into stone.
+X */
+Xvoid
+Xclear_glyph_buffer()
+X{
+X    register int x, y;
+X    register gbuf_entry *gptr;
+X
+X    for (y = 0; y < ROWNO; y++) {
+X	gptr = &gbuf[y][0];
+X	for (x = COLNO; x; x--) {
+X	    *gptr++ = nul_gbuf;
+X	}
+X    }
+X    reset_glyph_bbox();
+X}
+X
+X/*
+X * Assumes that the indicated positions are filled with S_stone glyphs.
+X */
+Xvoid
+Xrow_refresh(start,stop,y)
+X    int start,stop,y;
+X{
+X    register int x;
+X
+X    for (x = start; x <= stop; x++)
+X	if (gbuf[y][x].glyph != cmap_to_glyph(S_stone))
+X	    print_glyph(WIN_MAP,x,y,gbuf[y][x].glyph);
+X}
+X
+Xvoid
+Xcls()
+X{
+X    display_nhwindow(WIN_MESSAGE, FALSE); /* flush messages */
+X    flags.botlx = 1;		/* force update of botl window */
+X    clear_nhwindow(WIN_MAP);	/* clear physical screen */
+X
+X    clear_glyph_buffer();	/* this is sort of an extra effort, but OK */
+X}
+X
+X/*
+X * Synch the third screen with the display.
+X */
+Xvoid
+Xflush_screen(cursor_on_u)
+X    int cursor_on_u;
+X{
+X    /* Prevent infinite loops on errors:
+X     *	    flush_screen->print_glyph->impossible->pline->flush_screen
+X     */
+X    static   boolean flushing = 0;
+X    register int x,y;
+X
+X    if (flushing) return;	/* if already flushing then return */
+X    flushing = 1;
+X
+X    for (y = 0; y < ROWNO; y++) {
+X	register gbuf_entry *gptr = &gbuf[y][x = gbuf_start[y]];
+X	for (; x <= gbuf_stop[y]; gptr++, x++)
+X	    if (gptr->new) {
+X		print_glyph(WIN_MAP,x,y,gptr->glyph);
+X		gptr->new = 0;
+X	    }
+X    }
+X
+X    if (cursor_on_u) curs(WIN_MAP, u.ux,u.uy); /* move cursor to the hero */
+X    display_nhwindow(WIN_MAP, FALSE);
+X    reset_glyph_bbox();
+X    flushing = 0;
+X    if(flags.botl || flags.botlx) bot();
+X}
+X
+X/* ========================================================================= */
+X
+X/*
+X * back_to_glyph()
+X *
+X * Use the information in the rm structure at the given position to create
+X * a glyph of a background.
+X *
+X * I had to add a field in the rm structure (horizontal) so that we knew
+X * if open doors and secret doors were horizontal or vertical.  Previously,
+X * the screen symbol had the horizontal/vertical information set at
+X * level generation time.
+X *
+X * I used the 'ladder' field (really doormask) for deciding if stairwells
+X * were up or down.  I didn't want to check the upstairs and dnstairs
+X * variables.
+X */
+Xint
+Xback_to_glyph(x,y)
+X    xchar x,y;
+X{
+X    int idx;
+X    struct rm *ptr = &(levl[x][y]);
+X
+X    switch (ptr->typ) {
+X	case SCORR:
+X	case STONE:		idx = S_stone;	  break;
+X	case ROOM:		idx = S_room;	  break;
+X	case CORR:
+X	    idx = (ptr->waslit || flags.lit_corridor) ? S_litcorr : S_corr;
+X	    break;
+X	case HWALL:	idx = ptr->seen ? S_hwall  : S_stone;   break;
+X	case VWALL:	idx = ptr->seen ? S_vwall  : S_stone;   break;
+X	case TLCORNER:	idx = ptr->seen ? S_tlcorn : S_stone;	break;
+X	case TRCORNER:	idx = ptr->seen ? S_trcorn : S_stone;	break;
+X	case BLCORNER:	idx = ptr->seen ? S_blcorn : S_stone;	break;
+X	case BRCORNER:	idx = ptr->seen ? S_brcorn : S_stone;	break;
+X	case CROSSWALL:	idx = ptr->seen ? S_crwall : S_stone;	break;
+X	case TUWALL:	idx = ptr->seen ? S_tuwall : S_stone;	break;
+X	case TDWALL:	idx = ptr->seen ? S_tdwall : S_stone;	break;
+X	case TLWALL:	idx = ptr->seen ? S_tlwall : S_stone;	break;
+X	case TRWALL:	idx = ptr->seen ? S_trwall : S_stone;	break;
+X	case SDOOR:
+X	    if (ptr->seen)
+X		idx = (ptr->horizontal) ? S_hwall : S_vwall;
+X	    else
+X		idx = S_stone;
+X	    break;
+X	case DOOR:
+X	    if (ptr->doormask) {
+X		if (ptr->doormask & D_BROKEN)
+X		    idx = S_ndoor;
+X		else if (ptr->doormask & D_ISOPEN)
+X		    idx = (ptr->horizontal) ? S_hodoor : S_vodoor;
+X		else			/* else is closed */
+X		    idx = (ptr->horizontal) ? S_hcdoor : S_vcdoor;
+X	    } else
+X		idx = S_ndoor;
+X	    break;
+X	case POOL:
+X	case MOAT:		idx = S_pool;	  break;
+X	case STAIRS:
+X	    idx = (ptr->ladder & LA_DOWN) ? S_dnstair : S_upstair;
+X	    break;
+X	case LADDER:
+X	    idx = (ptr->ladder & LA_DOWN) ? S_dnladder : S_upladder;
+X	    break;
+X	case FOUNTAIN:		idx = S_fountain; break;
+X	case SINK:		idx = S_sink;     break;
+X	case ALTAR:		idx = S_altar;    break;
+X	case THRONE:		idx = S_throne;   break;
+X	case LAVAPOOL:		idx = S_lava;	  break;
+X	case ICE:		idx = S_ice;      break;
+X	case AIR:		idx = S_air;	  break;
+X	case CLOUD:		idx = S_cloud;	  break;
+X	case WATER:		idx = S_water;	  break;
+X	case DBWALL:
+X	    idx = (ptr->horizontal) ? S_hcdbridge : S_vcdbridge;
+X	    break;
+X	case DRAWBRIDGE_UP:
+X	    switch(ptr->drawbridgemask & DB_UNDER) {
+X	    case DB_MOAT:  idx = S_pool; break;
+X	    case DB_LAVA:  idx = S_lava; break;
+X	    case DB_ICE:   idx = S_ice;  break;
+X	    case DB_FLOOR: idx = S_room; break;
+X	    default:
+X		impossible("Strange db-under: %d",
+X			   ptr->drawbridgemask & DB_UNDER);
+X		idx = S_room; /* something is better than nothing */
+X		break;
+X	    }
+X	    break;
+X	case DRAWBRIDGE_DOWN:
+X	    idx = (ptr->horizontal) ? S_hodbridge : S_vodbridge;
+X	    break;
+X	default:
+X	    impossible("back_to_glyph:  unknown level type [ = %d ]",ptr->typ);
+X	    idx = S_room;
+X	    break;
+X    }
+X
+X    return cmap_to_glyph(idx);
+X}
+X
+X
+X/*
+X * swallow_to_glyph()
+X *
+X * Convert a monster number and a swallow location into the correct glyph.
+X * If you don't want a patchwork monster while hallucinating, decide on
+X * a random monster in swallowed() and don't use what_mon() here.
+X */
+Xstatic int
+Xswallow_to_glyph(mnum, loc)
+X    int mnum;
+X    int loc;
+X{
+X    if (loc < S_sw_tl || S_sw_br < loc) {
+X	impossible("swallow_to_glyph: bad swallow location");
+X	loc = S_sw_br;
+X    }
+X    return ((int) (what_mon(mnum)<<3) | (loc - S_sw_tl)) + GLYPH_SWALLOW_OFF;
+X}
+X
+X
+X
+X/*
+X * zapdir_to_glyph()
+X *
+X * Change the given zap direction and beam type into a glyph.  Each beam
+X * type has four glyphs, one for each of the symbols below.  The order of
+X * the zap symbols [0-3] as defined in rm.h are:
+X *
+X *	|  S_vbeam	( 0, 1) or ( 0,-1)
+X *	-  S_hbeam	( 1, 0) or (-1,	0)
+X *	\  S_lslant	( 1, 1) or (-1,-1)
+X *	/  S_rslant	(-1, 1) or ( 1,-1)
+X */
+Xint
+Xzapdir_to_glyph(dx, dy, beam_type)
+X    register int dx, dy;
+X    int beam_type;
+X{
+X    if (beam_type >= NUM_ZAP) {
+X	impossible("zapdir_to_glyph:  illegal beam type");
+X	beam_type = 0;
+X    }
+X    dx = (dx == dy) ? 2 : (dx && dy) ? 3 : dx ? 1 : 0;
+X
+X    return ((int) ((beam_type << 2) | dx)) + GLYPH_ZAP_OFF;
+X}
+X
+X
+X/*
+X * Utility routine for dowhatis() used to find out the glyph displayed at
+X * the location.  This isn't necessarily the same as the glyph in the levl
+X * structure, so we must check the "third screen".
+X */
+Xint
+Xglyph_at(x, y)
+X    xchar x,y;
+X{
+X    if(x < 0 || y < 0 || x >= COLNO || y >= ROWNO)
+X	return cmap_to_glyph(S_room);			/* XXX */
+X    return gbuf[y][x].glyph;
+X}
+X
+X/*display.c*/
+END_OF_FILE
+if test 35153 -ne `wc -c <'src/display.c'`; then
+    echo shar: \"'src/display.c'\" unpacked with wrong size!
+fi
+# end of 'src/display.c'
+fi
+if test -f 'sys/vms/gnutermcap.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'sys/vms/gnutermcap.c'\"
+else
+echo shar: Extracting \"'sys/vms/gnutermcap.c'\" \(18405 characters\)
+sed "s/^X//" >'sys/vms/gnutermcap.c' <<'END_OF_FILE'
+X/* Work-alike for termcap, plus extra features.
+X   Copyright (C) 1985, 1986 Free Software Foundation, Inc.
+X
+X		       NO WARRANTY
+X
+X  BECAUSE THIS PROGRAM IS LICENSED FREE OF CHARGE, WE PROVIDE ABSOLUTELY
+XNO WARRANTY, TO THE EXTENT PERMITTED BY APPLICABLE STATE LAW.  EXCEPT
+XWHEN OTHERWISE STATED IN WRITING, FREE SOFTWARE FOUNDATION, INC,
+XRICHARD M. STALLMAN AND/OR OTHER PARTIES PROVIDE THIS PROGRAM "AS IS"
+XWITHOUT WARRANTY OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING,
+XBUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+XFITNESS FOR A PARTICULAR PURPOSE.  THE ENTIRE RISK AS TO THE QUALITY
+XAND PERFORMANCE OF THE PROGRAM IS WITH YOU.  SHOULD THE PROGRAM PROVE
+XDEFECTIVE, YOU ASSUME THE COST OF ALL NECESSARY SERVICING, REPAIR OR
+XCORRECTION.
+X
+X IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW WILL RICHARD M.
+XSTALLMAN, THE FREE SOFTWARE FOUNDATION, INC., AND/OR ANY OTHER PARTY
+XWHO MAY MODIFY AND REDISTRIBUTE THIS PROGRAM AS PERMITTED BELOW, BE
+XLIABLE TO YOU FOR DAMAGES, INCLUDING ANY LOST PROFITS, LOST MONIES, OR
+XOTHER SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+XUSE OR INABILITY TO USE (INCLUDING BUT NOT LIMITED TO LOSS OF DATA OR
+XDATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY THIRD PARTIES OR
+XA FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS) THIS
+XPROGRAM, EVEN IF YOU HAVE BEEN ADVISED OF THE POSSIBILITY OF SUCH
+XDAMAGES, OR FOR ANY CLAIM BY ANY OTHER PARTY.
+X
+X		GENERAL PUBLIC LICENSE TO COPY
+X
+X  1. You may copy and distribute verbatim copies of this source file
+Xas you receive it, in any medium, provided that you conspicuously and
+Xappropriately publish on each copy a valid copyright notice "Copyright
+X(C) 1986 Free Software Foundation, Inc."; and include following the
+Xcopyright notice a verbatim copy of the above disclaimer of warranty
+Xand of this License.  You may charge a distribution fee for the
+Xphysical act of transferring a copy.
+X
+X  2. You may modify your copy or copies of this source file or
+Xany portion of it, and copy and distribute such modifications under
+Xthe terms of Paragraph 1 above, provided that you also do the following:
+X
+X    a) cause the modified files to carry prominent notices stating
+X    that you changed the files and the date of any change; and
+X
+X    b) cause the whole of any work that you distribute or publish,
+X    that in whole or in part contains or is a derivative of this
+X    program or any part thereof, to be licensed at no charge to all
+X    third parties on terms identical to those contained in this
+X    License Agreement (except that you may choose to grant more extensive
+X    warranty protection to some or all third parties, at your option).
+X
+X    c) You may charge a distribution fee for the physical act of
+X    transferring a copy, and you may at your option offer warranty
+X    protection in exchange for a fee.
+X
+XMere aggregation of another unrelated program with this program (or its
+Xderivative) on a volume of a storage or distribution medium does not bring
+Xthe other program under the scope of these terms.
+X
+X  3. You may copy and distribute this program (or a portion or derivative
+Xof it, under Paragraph 2) in object code or executable form under the terms
+Xof Paragraphs 1 and 2 above provided that you also do one of the following:
+X
+X    a) accompany it with the complete corresponding machine-readable
+X    source code, which must be distributed under the terms of
+X    Paragraphs 1 and 2 above; or,
+X
+X    b) accompany it with a written offer, valid for at least three
+X    years, to give any third party free (except for a nominal
+X    shipping charge) a complete machine-readable copy of the
+X    corresponding source code, to be distributed under the terms of
+X    Paragraphs 1 and 2 above; or,
+X
+X    c) accompany it with the information you received as to where the
+X    corresponding source code may be obtained.  (This alternative is
+X    allowed only for noncommercial distribution and only if you
+X    received the program in object code or executable form alone.)
+X
+XFor an executable file, complete source code means all the source code for
+Xall modules it contains; but, as a special exception, it need not include
+Xsource code for modules which are standard libraries that accompany the
+Xoperating system on which the executable file runs.
+X
+X  4. You may not copy, sublicense, distribute or transfer this program
+Xexcept as expressly provided under this License Agreement.  Any attempt
+Xotherwise to copy, sublicense, distribute or transfer this program is void and
+Xyour rights to use the program under this License agreement shall be
+Xautomatically terminated.  However, parties who have received computer
+Xsoftware programs from you with this License Agreement will not have
+Xtheir licenses terminated so long as such parties remain in full compliance.
+X
+X  5. If you wish to incorporate parts of this program into other free
+Xprograms whose distribution conditions are different, write to the Free
+XSoftware Foundation at 675 Mass Ave, Cambridge, MA 02139.  We have not yet
+Xworked out a simple rule that can be stated here, but we will often permit
+Xthis.  We will be guided by the two goals of preserving the free status of
+Xall derivatives of our free software and of promoting the sharing and reuse of
+Xsoftware.
+X
+X
+XIn other words, you are welcome to use, share and improve this program.
+XYou are forbidden to forbid anyone else to use, share and improve
+Xwhat you give them.   Help stamp out software-hoarding!  */
+X
+X
+X
+X/* BUFSIZE is the initial size allocated for the buffer
+X   for reading the termcap file.
+X   It is not a limit.
+X   Make it large normally for speed.
+X   Make it variable when debugging, so can exercise
+X   increasing the space dynamically.  */
+X
+X#ifdef emacs
+X#include "config.h"
+X#endif
+X
+X#ifndef BUFSIZE
+X#ifdef DEBUG
+X#define BUFSIZE bufsize
+X
+Xint bufsize = 128;
+X#else
+X#define BUFSIZE 2048
+X#endif
+X#endif
+X
+X#ifndef emacs
+Xstatic
+Xmemory_out ()
+X{
+X  write (2, "Virtual memory exhausted\n", 25);
+X  exit (1);
+X}
+X
+Xstatic int
+Xxmalloc (size)
+X     int size;
+X{
+X  register tem = malloc (size);
+X  if (!tem)
+X    memory_out ();
+X  return tem;
+X}
+X
+Xstatic int
+Xxrealloc (ptr, size)
+X     int ptr;
+X     int size;
+X{
+X  register tem = realloc (ptr, size);
+X  if (!tem)
+X    memory_out ();
+X  return tem;
+X}
+X#endif /* not emacs */
+X
+X/* Looking up capabilities in the entry already found */
+X
+X/* The pointer to the data made by tgetent is left here
+X   for tgetnum, tgetflag and tgetstr to find.  */
+X
+Xstatic char *term_entry;
+X
+Xstatic char *tgetst1 ();
+X
+X/* This is the main subroutine that is used to search
+X   an entry for a particular capability */
+X
+Xstatic char *
+Xfind_capability (bp, cap)
+X     register char *bp, *cap;
+X{
+X  for (; *bp; bp++)
+X    if (bp[0] == ':'
+X	&& bp[1] == cap[0]
+X	&& bp[2] == cap[1])
+X      return &bp[4];
+X  return 0;
+X}
+X
+Xint
+Xtgetnum (cap)
+X     char *cap;
+X{
+X  register char *ptr = find_capability (term_entry, cap);
+X  if (!ptr || ptr[-1] != '#')
+X    return -1;
+X  return atoi (ptr);
+X}
+X
+Xint
+Xtgetflag (cap)
+X     char *cap;
+X{
+X  register char *ptr = find_capability (term_entry, cap);
+X  return 0 != ptr && ptr[-1] == ':';
+X}
+X
+X/* Look up a string-valued capability `cap'.
+X   If `area' is nonzero, it points to a pointer to a block in which
+X   to store the string.  That pointer is advanced over the space used.
+X   If `area' is zero, space is allocated with `malloc'.  */
+X
+Xchar *
+Xtgetstr (cap, area)
+X     char *cap;
+X     char **area;
+X{
+X  register char *ptr = find_capability (term_entry, cap);
+X  if (!ptr || (ptr[-1] != '=' && ptr[-1] != '~'))
+X    return 0;
+X  return tgetst1 (ptr, area);
+X}
+X
+X/* Table, indexed by a character in range 0100 to 0140 with 0100 subtracted,
+X   gives meaning of character following \, or a space if no special meaning.
+X   Eight characters per line within the string.  */
+X
+Xstatic char esctab[]
+X  = " \007\010  \033\014 \
+X      \012 \
+X  \015 \011 \013 \
+X        ";
+X
+X/* Given a pointer to a string value inside a termcap entry (`ptr'),
+X   copy the value and process \ and ^ abbreviations.
+X   Copy into block that *area points to,
+X   or to newly allocated storage if area is 0.  */
+X
+Xstatic char *
+Xtgetst1 (ptr, area)
+X     char *ptr;
+X     char **area;
+X{
+X  register char *p, *r;
+X  register int c;
+X  register int size;
+X  char *ret;
+X  register int c1;
+X
+X  if (!ptr)
+X    return 0;
+X
+X  /* `ret' gets address of where to store the string */
+X  if (!area)
+X    {
+X      /* Compute size of block needed (may overestimate) */
+X      p = ptr;
+X      while ((c = *p++) && c != ':' && c != '\n');
+X      ret = (char *) xmalloc (p - ptr + 1);
+X    }
+X  else
+X    ret = *area;
+X
+X  /* Copy the string value, stopping at null or colon.  */
+X  /* Also process ^ and \ abbreviations.  */
+X  p = ptr;
+X  r = ret;
+X  while ((c = *p++) && c != ':' && c != '\n')
+X    {
+X      if (c == '^')
+X	c = *p++ & 037;
+X      else if (c == '\\')
+X	{
+X	  c = *p++;
+X	  if (c >= '0' && c <= '7')
+X	    {
+X	      c -= '0';
+X	      size = 0;
+X
+X	      while (++size < 3 && (c1 = *p) >= '0' && c1 <= '7')
+X		{
+X		  c *= 8;
+X		  c += c1 - '0';
+X		  p++;
+X		}
+X	    }
+X	  else if (c >= 0100 && c < 0200)
+X	    {
+X	      c1 = esctab[(c & ~040) - 0100];
+X	      if (c1 != ' ')
+X		c = c1;
+X	    }
+X	}
+X      *r++ = c;
+X    }
+X  *r = 0;
+X  /* Update *area */
+X  if (area)
+X    *area = r + 1;
+X  return ret;
+X}
+X
+X/* Outputting a string with padding */
+X
+Xshort ospeed;
+Xchar PC;
+X
+X/* Actual baud rate if positive;
+X   - baud rate / 100 if negative.  */
+X
+Xstatic short speeds[] =
+X  {
+X#ifdef VMS
+X    0, 50, 75, 110, 134, 150, -3, -6, -12, -18,
+X    -20, -24, -36, -48, -72, -96, -192
+X#else /* not VMS */
+X    0, 50, 75, 110, 135, 150, -2, -3, -6, -12,
+X    -18, -24, -48, -96, -192, -384
+X#endif /* not VMS */
+X  };
+X
+Xtputs (string, nlines, outfun)
+X     register char *string;
+X     int nlines;
+X     register int (*outfun) ();
+X{
+X  register int padcount = 0;
+X
+X  if (string == (char *) 0)
+X    return;
+X  while (*string >= '0' && *string <= '9')
+X    {
+X      padcount += *string++ - '0';
+X      padcount *= 10;
+X    }
+X  if (*string == '.')
+X    {
+X      string++;
+X      padcount += *string++ - '0';
+X    }
+X  if (*string == '*')
+X    {
+X      string++;
+X      padcount *= nlines;
+X    }
+X  while (*string)
+X    (*outfun) (*string++);
+X
+X  /* padcount is now in units of tenths of msec.  */
+X  padcount *= speeds[ospeed];
+X  padcount += 500;
+X  padcount /= 1000;
+X  if (speeds[ospeed] < 0)
+X    padcount = -padcount;
+X  else
+X    {
+X      padcount += 50;
+X      padcount /= 100;
+X    }
+X
+X  while (padcount-- > 0)
+X    (*outfun) (PC);
+X}
+X
+X/* Finding the termcap entry in the termcap data base */
+X
+Xstruct buffer
+X  {
+X    char *beg;
+X    int size;
+X    char *ptr;
+X    int ateof;
+X    int full;
+X  };
+X
+X/* Forward declarations of static functions */
+X
+Xstatic int scan_file ();
+Xstatic char *gobble_line ();
+Xstatic int compare_contin ();
+Xstatic int name_match ();
+X
+X#ifdef VMS
+X
+X#include <rmsdef.h>
+X#include <fab.h>
+X#include <nam.h>
+X
+Xstatic int
+Xlegal_filename_p (fn)
+X     char *fn;
+X{
+X  struct FAB fab = cc$rms_fab;
+X  struct NAM nam = cc$rms_nam;
+X  char esa[NAM$C_MAXRSS];
+X
+X  fab.fab$l_fna = fn;
+X  fab.fab$b_fns = strlen(fn);
+X  fab.fab$l_nam = &nam;
+X  fab.fab$l_fop = FAB$M_NAM;
+X
+X  nam.nam$l_esa = esa;
+X  nam.nam$b_ess = sizeof esa;
+X
+X  return SYS$PARSE(&fab, 0, 0) == RMS$_NORMAL;
+X}
+X
+X#endif /* VMS */
+X
+X/* Find the termcap entry data for terminal type `name'
+X   and store it in the block that `bp' points to.
+X   Record its address for future use.
+X
+X   If `bp' is zero, space is dynamically allocated.  */
+X
+Xint
+Xtgetent (bp, name)
+X     char *bp, *name;
+X{
+X  register char *tem;
+X  register int fd;
+X  struct buffer buf;
+X  register char *bp1;
+X  char *bp2;
+X  char *term;
+X  int malloc_size = 0;
+X  register int c;
+X  char *tcenv;			/* TERMCAP value, if it contais :tc=.  */
+X  char *indirect = 0;		/* Terminal type in :tc= in TERMCAP value.  */
+X  int filep;
+X
+X  tem = (char *) getenv ("TERMCAP");
+X  if (tem && *tem == 0) tem = 0;
+X
+X#ifdef VMS
+X  filep = tem && legal_filename_p (tem);
+X#else
+X  filep = tem && (*tem == '/');
+X#endif /* VMS */
+X
+X  /* If tem is non-null and starts with / (in the un*x case, that is),
+X     it is a file name to use instead of /etc/termcap.
+X     If it is non-null and does not start with /,
+X     it is the entry itself, but only if
+X     the name the caller requested matches the TERM variable.  */
+X
+X  if (tem && !filep && !strcmp (name, getenv ("TERM")))
+X    {
+X      indirect = tgetst1 (find_capability (tem, "tc"), 0);
+X      if (!indirect)
+X	{
+X	  if (!bp)
+X	    bp = tem;
+X	  else
+X	    strcpy (bp, tem);
+X	  goto ret;
+X	}
+X      else
+X	{			/* we will need to read /etc/termcap */
+X	  tcenv = tem;
+X 	  tem = 0;
+X	}
+X    }
+X  else
+X    indirect = (char *) 0;
+X
+X  if (!tem)
+X#ifdef VMS
+X    tem = "emacs_library:[etc]termcap.dat";
+X#else
+X    tem = "/etc/termcap";
+X#endif
+X
+X  /* Here we know we must search a file and tem has its name.  */
+X
+X  fd = open (tem, 0, 0);
+X  if (fd < 0)
+X    return -1;
+X
+X  buf.size = BUFSIZE;
+X  buf.beg = (char *) xmalloc (buf.size);
+X  term = indirect ? indirect : name;
+X
+X  if (!bp)
+X    {
+X      malloc_size = indirect ? strlen (tcenv) + 1 : buf.size;
+X      bp = (char *) xmalloc (malloc_size);
+X    }
+X  bp1 = bp;
+X
+X  if (indirect)			/* copy the data from the environment variable */
+X    {
+X      strcpy (bp, tcenv);
+X      bp1 += strlen (tcenv);
+X    }
+X
+X  while (term)
+X    {
+X      /* Scan file, reading it via buf, till find start of main entry */
+X      if (scan_file (term, fd, &buf) == 0)
+X	return 0;
+X
+X      /* Free old `term' if appropriate.  */
+X      if (term != name)
+X	free (term);
+X
+X      /* If `bp' is malloc'd by us, make sure it is big enough.  */
+X      if (malloc_size)
+X	{
+X	  malloc_size = bp1 - bp + buf.size;
+X	  tem = (char *) xrealloc (bp, malloc_size);
+X	  bp1 += tem - bp;
+X	  bp = tem;
+X	}
+X
+X      bp2 = bp1;
+X
+X      /* Copy the line of the entry from buf into bp.  */
+X      tem = buf.ptr;
+X      while ((*bp1++ = c = *tem++) && c != '\n')
+X	/* Drop out any \ newline sequence. */
+X	if (c == '\\' && *tem == '\n')
+X	  {
+X	    bp1--;
+X	    tem++;
+X	  }
+X      *bp1 = 0;
+X
+X      /* Does this entry refer to another terminal type's entry?  */
+X      /* If something is found, copy it into heap and null-terminate it */
+X      term = tgetst1 (find_capability (bp2, "tc"), 0);
+X    }
+X
+X  close (fd);
+X  free (buf.beg);
+X
+X  if (malloc_size)
+X    {
+X      bp = (char *) xrealloc (bp, bp1 - bp + 1);
+X    }
+X
+X ret:
+X  term_entry = bp;
+X  if (malloc_size)
+X    return (int) bp;
+X  return 1;
+X}
+X
+X/* Given file open on `fd' and buffer `bufp',
+X   scan the file from the beginning until a line is found
+X   that starts the entry for terminal type `string'.
+X   Returns 1 if successful, with that line in `bufp',
+X   or returns 0 if no entry found in the file.  */
+X
+Xstatic int
+Xscan_file (string, fd, bufp)
+X     char *string;
+X     int fd;
+X     register struct buffer *bufp;
+X{
+X  register char *tem;
+X  register char *end;
+X
+X  bufp->ptr = bufp->beg;
+X  bufp->full = 0;
+X  bufp->ateof = 0;
+X  *bufp->ptr = 0;
+X
+X  lseek (fd, 0L, 0);
+X
+X  while (!bufp->ateof)
+X    {
+X      /* Read a line into the buffer */
+X      end = 0;
+X      do
+X	{
+X	  /* if it is continued, append another line to it,
+X	     until a non-continued line ends */
+X	  end = gobble_line (fd, bufp, end);
+X	}
+X      while (!bufp->ateof && end[-2] == '\\');
+X
+X      if (*bufp->ptr != '#'
+X	  && name_match (bufp->ptr, string))
+X	return 1;
+X
+X      /* Discard the line just processed */
+X      bufp->ptr = end;
+X    }
+X  return 0;
+X}
+X
+X/* Return nonzero if NAME is one of the names specified
+X   by termcap entry LINE.  */
+X
+Xstatic int
+Xname_match (line, name)
+X     char *line, *name;
+X{
+X  register char *tem;
+X
+X  if (!compare_contin (line, name))
+X    return 1;
+X  /* This line starts an entry.  Is it the right one?  */
+X  for (tem = line; *tem && *tem != '\n' && *tem != ':'; tem++)
+X    if (*tem == '|' && !compare_contin (tem + 1, name))
+X      return 1;
+X
+X  return 0;
+X}
+X
+Xstatic int
+Xcompare_contin (str1, str2)
+X     register char *str1, *str2;
+X{
+X  register int c1, c2;
+X  while (1)
+X    {
+X      c1 = *str1++;
+X      c2 = *str2++;
+X      while (c1 == '\\' && *str1 == '\n')
+X	{
+X	  str1++;
+X	  while ((c1 = *str1++) == ' ' || c1 == '\t');
+X	}
+X      if (c2 == '\0')		/* end of type being looked up */
+X	{
+X	  if (c1 == '|' || c1 == ':') /* If end of name in data base, */
+X	    return 0;		/* we win. */
+X	  else
+X	    return 1;
+X        }
+X      else if (c1 != c2)
+X	return 1;
+X    }
+X}
+X
+X/* Make sure that the buffer <- `bufp' contains a full line
+X   of the file open on `fd', starting at the place `bufp->ptr'
+X   points to.  Can read more of the file, discard stuff before
+X   `bufp->ptr', or make the buffer bigger.
+X
+X   Returns the pointer to after the newline ending the line,
+X   or to the end of the file, if there is no newline to end it.
+X
+X   Can also merge on continuation lines.  If `append_end' is
+X   nonzero, it points past the newline of a line that is
+X   continued; we add another line onto it and regard the whole
+X   thing as one line.  The caller decides when a line is continued.  */
+X
+Xstatic char *
+Xgobble_line (fd, bufp, append_end)
+X     int fd;
+X     register struct buffer *bufp;
+X     char *append_end;
+X{
+X  register char *end;
+X  register int nread;
+X  register char *buf = bufp->beg;
+X  register char *tem;
+X
+X  if (append_end == 0)
+X    append_end = bufp->ptr;
+X
+X  while (1)
+X    {
+X      end = append_end;
+X      while (*end && *end != '\n') end++;
+X      if (*end)
+X        break;
+X      if (bufp->ateof)
+X	return buf + bufp->full;
+X      if (bufp->ptr == buf)
+X	{
+X	  if (bufp->full == bufp->size)
+X	    {
+X	      bufp->size *= 2;
+X	      tem = (char *) xrealloc (buf, bufp->size);
+X	      bufp->ptr += tem - buf;
+X	      append_end += tem - buf;
+X	      bufp->beg = buf = tem;
+X	    }
+X	}
+X      else
+X	{
+X	  append_end -= bufp->ptr - buf;
+X	  bcopy (bufp->ptr, buf, bufp->full -= bufp->ptr - buf);
+X	  bufp->ptr = buf;
+X	}
+X      if (!(nread = read (fd, buf + bufp->full, bufp->size - bufp->full)))
+X	bufp->ateof = 1;
+X      bufp->full += nread;
+X      if (bufp->full != bufp->size)
+X	buf[bufp->full] = 0;
+X    }
+X  return end + 1;
+X}
+X
+X#ifdef TEST
+X
+X#include <stdio.h>
+X
+Xmain (argc, argv)
+X     int argc;
+X     char **argv;
+X{
+X  char *term;
+X  char *buf;
+X
+X  term = argv[1];
+X  printf ("TERM: %s\n", term);
+X
+X  buf = (char *) tgetent (0, term);
+X  if ((int) buf <= 0)
+X    {
+X      printf ("No entry.\n");
+X      return 0;
+X    }
+X
+X  printf ("Entry: %s\n", buf);
+X
+X  tprint ("cm");
+X  tprint ("AL");
+X
+X  printf ("co: %d\n", tgetnum ("co"));
+X  printf ("am: %d\n", tgetflag ("am"));
+X}
+X
+Xtprint (cap)
+X     char *cap;
+X{
+X  char *x = tgetstr (cap, 0);
+X  register char *y;
+X
+X  printf ("%s: ", cap);
+X  if (x)
+X    {
+X      for (y = x; *y; y++)
+X	if (*y <= ' ' || *y == 0177)
+X	  printf ("\\%0o", *y);
+X	else
+X	  putchar (*y);
+X      free (x);
+X    }
+X  else
+X    printf ("none");
+X  putchar ('\n');
+X}
+X
+X#endif /* TEST */
+END_OF_FILE
+if test 18405 -ne `wc -c <'sys/vms/gnutermcap.c'`; then
+    echo shar: \"'sys/vms/gnutermcap.c'\" unpacked with wrong size!
+fi
+# end of 'sys/vms/gnutermcap.c'
+fi
+echo shar: End of archive 52 \(of 108\).
+cp /dev/null ark52isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
+41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 \
+61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 \
+81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 \
+101 102 103 104 105 106 107 108 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 108 archives.
+    echo "Now execute 'rebuild.sh'"
+    rm -f ark10[0-8]isdone ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

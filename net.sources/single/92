@@ -1,0 +1,341 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,8d77b71a18d069fe,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1982-09-27 17:04:34 PST
+Message-ID: <bnews.tpdcvax.167>
+Newsgroups: net.sources
+Path: utzoo!decvax!ittvax!tpdcvax!bobvan
+X-Path: utzoo!decvax!ittvax!tpdcvax!bobvan
+From: tpdcvax!bobvan
+Date: Mon Sep 27 20:04:32 1982
+Subject: Mods to dz.c for line turn around
+X-Google-Info: Converted from the original B-News header
+Posted: Thu Sep 23 08:23:56 1982
+Received: Mon Sep 27 20:04:32 1982
+
+The line turn around scheme I described recently in net.unix-wizards has
+generated enough interest that I feel justified in posting diffs to
+net.sources.  First, I'll give a brief English description of the changes
+and then a diff -c.  Don't let the size of the diff -c scare you, the changes
+really are trivial.
+
+In my original note, I expressed some nervousness about having the 128 bit
+set in t_dev.  Since then, several sites have said that they have been
+using the same or similar schemes for many months without problems.
+
+Changes to dz.c for line turn around:
+
+1) Strip the 128 bit from existing references to minor(dev)
+
+2) In dzopen(dev, flag)
+	a) Copy dev into t_dev
+	b) Sleep if in use outgoing and incoming open
+	c) Fail open if in use incoming and outgoing open
+	d) Sleep on t_state instead of t_rawq
+
+3) In dzclose()
+	a) Turn off carrier if was open outgoing
+	b) Wakeup processes sleeping on t_state
+	c) Knock bit off of t_dev (paranoia)
+
+4) In dzscan()
+	a) Wakeup on t_state, not t_rawq as before
+	b) Wakeup when carrier drops, as well as when it comes up
+
+----------------------------------------
+*** dz.old.c	Mon Aug 31 03:53:36 1981
+--- dz.c	Thu Sep 16 07:51:33 1982
+***************
+*** 6,11
+   *  DZ-11 Driver
+   *
+   * This driver mimics dh.c; see it for explanation of common code.
+   */
+  #include "bk.h"
+  #include "../h/param.h"
+
+--- 6,16 -----
+   *  DZ-11 Driver
+   *
+   * This driver mimics dh.c; see it for explanation of common code.
++  *
++  * Line turnaround added 9/1/82, RAV, based on work by dove@mit-mc.
++  * In a nutshell, outgoing inodes (/dev/cul?) have 128 bit set in
++  * the minor number.  Minor number is copied into t_dev to record
++  * the "direction" the line is open in.
+   */
+  #include "bk.h"
+  #include "../h/param.h"
+***************
+*** 62,67
+  /* Flags for modem-control */
+  #define	DZ_ON	1
+  #define	DZ_OFF	0
+   
+  int	dzstart(), dzxint(), dzdma();
+  int	ttrstrt();
+
+--- 67,74 -----
+  /* Flags for modem-control */
+  #define	DZ_ON	1
+  #define	DZ_OFF	0
++ 
++ #define	OUTGOING(dev) ((dev&0200)!=0)
+   
+  int	dzstart(), dzxint(), dzdma();
+  int	ttrstrt();
+***************
+*** 145,151
+  	register struct tty *tp;
+  	register int unit;
+   
+! 	unit = minor(dev);
+  	if (unit >= dz_cnt || dzpdma[unit].p_addr == 0) {
+  		u.u_error = ENXIO;
+  		return;
+
+--- 152,158 -----
+  	register struct tty *tp;
+  	register int unit;
+   
+! 	unit = minor(dev)&0177;
+  	if (unit >= dz_cnt || dzpdma[unit].p_addr == 0) {
+  		u.u_error = ENXIO;
+  		return;
+***************
+*** 165,171
+  		u.u_error = EBUSY;
+  		return;
+  	}
+- 	dzmodem(unit, DZ_ON);
+  	(void) spl5();
+  	while ((tp->t_state & CARR_ON) == 0) {
+  		tp->t_state |= WOPEN;
+
+--- 172,177 -----
+  		u.u_error = EBUSY;
+  		return;
+  	}
+  	(void) spl5();
+  	if ((tp->t_state&ISOPEN)==0 && OUTGOING(dev))
+  		tp->t_dev = dev;
+***************
+*** 167,175
+  	}
+  	dzmodem(unit, DZ_ON);
+  	(void) spl5();
+! 	while ((tp->t_state & CARR_ON) == 0) {
+! 		tp->t_state |= WOPEN;
+! 		sleep((caddr_t)&tp->t_rawq, TTIPRI);
+  	}
+  	(void) spl0();
+  	(*linesw[tp->t_line].l_open)(dev, tp);
+
+--- 173,188 -----
+  		return;
+  	}
+  	(void) spl5();
+! 	if ((tp->t_state&ISOPEN)==0 && OUTGOING(dev))
+! 		tp->t_dev = dev;
+! 	dzmodem(unit, DZ_ON);
+! 	while ((tp->t_state & CARR_ON) == 0
+! 	||	(OUTGOING(tp->t_dev) && !OUTGOING(dev))) {
+! 		if ((tp->t_state&ISOPEN) == 0) {
+! 			tp->t_state |= WOPEN;
+! 			dzmodem(unit, DZ_ON);
+! 		}
+! 		sleep((caddr_t)&tp->t_state, TTIPRI);
+  	}
+  	if (!OUTGOING(tp->t_dev) && OUTGOING(dev)) {
+  		u.u_error = EBUSY;
+***************
+*** 171,176
+  		tp->t_state |= WOPEN;
+  		sleep((caddr_t)&tp->t_rawq, TTIPRI);
+  	}
+  	(void) spl0();
+  	(*linesw[tp->t_line].l_open)(dev, tp);
+  }
+
+--- 184,193 -----
+  		}
+  		sleep((caddr_t)&tp->t_state, TTIPRI);
+  	}
++ 	if (!OUTGOING(tp->t_dev) && OUTGOING(dev)) {
++ 		u.u_error = EBUSY;
++ 		return;
++ 	}
+  	(void) spl0();
+  	(*linesw[tp->t_line].l_open)(dev, tp);
+  }
+***************
+*** 181,186
+  {
+  	register struct tty *tp;
+  	register int unit;
+  	int dz;
+   
+  	unit = minor(dev);
+
+--- 198,204 -----
+  {
+  	register struct tty *tp;
+  	register int unit;
++ 	int s;
+  	int dz;
+   
+  	unit = minor(dev)&0177;
+***************
+*** 183,189
+  	register int unit;
+  	int dz;
+   
+! 	unit = minor(dev);
+  	dz = unit >> 3;
+  	tp = &dz_tty[unit];
+  	(*linesw[tp->t_line].l_close)(tp);
+
+--- 201,207 -----
+  	int s;
+  	int dz;
+   
+! 	unit = minor(dev)&0177;
+  	dz = unit >> 3;
+  	tp = &dz_tty[unit];
+  	(*linesw[tp->t_line].l_close)(tp);
+***************
+*** 189,195
+  	(*linesw[tp->t_line].l_close)(tp);
+  	((struct pdma *)(tp->t_addr))->p_addr->dzbrk =
+  	    (dz_brk[dz] &= ~(1 << (unit&07)));
+! 	if (tp->t_state & HUPCLS)
+  		dzmodem(unit, DZ_OFF);
+  	ttyclose(tp);
+  }
+
+--- 207,213 -----
+  	(*linesw[tp->t_line].l_close)(tp);
+  	((struct pdma *)(tp->t_addr))->p_addr->dzbrk =
+  	    (dz_brk[dz] &= ~(1 << (unit&07)));
+! 	if (tp->t_state & HUPCLS || OUTGOING(dev))
+  		dzmodem(unit, DZ_OFF);
+  	ttyclose(tp);
+  	s = spl5();
+***************
+*** 192,197
+  	if (tp->t_state & HUPCLS)
+  		dzmodem(unit, DZ_OFF);
+  	ttyclose(tp);
+  }
+   
+  dzread(dev)
+
+--- 210,221 -----
+  	if (tp->t_state & HUPCLS || OUTGOING(dev))
+  		dzmodem(unit, DZ_OFF);
+  	ttyclose(tp);
++ 	s = spl5();
++ 	if (OUTGOING(tp->t_dev) && OUTGOING(dev)) {
++ 		tp->t_dev &= ~0200;
++ 		wakeup((caddr_t)&tp->t_state);
++ 	}
++ 	splx(s);
+  }
+   
+  dzread(dev)
+***************
+*** 199,205
+  {
+  	register struct tty *tp;
+   
+! 	tp = &dz_tty[minor(dev)];
+  	(*linesw[tp->t_line].l_read)(tp);
+  }
+   
+
+--- 223,229 -----
+  {
+  	register struct tty *tp;
+   
+! 	tp = &dz_tty[minor(dev)&0177];
+  	(*linesw[tp->t_line].l_read)(tp);
+  }
+   
+***************
+*** 208,214
+  {
+  	register struct tty *tp;
+   
+! 	tp = &dz_tty[minor(dev)];
+  	(*linesw[tp->t_line].l_write)(tp);
+  }
+   
+
+--- 232,238 -----
+  {
+  	register struct tty *tp;
+   
+! 	tp = &dz_tty[minor(dev)&0177];
+  	(*linesw[tp->t_line].l_write)(tp);
+  }
+   
+***************
+*** 265,271
+  	caddr_t addr;
+  {
+  	register struct tty *tp;
+! 	register int unit = minor(dev);
+  	register int dz = unit >> 3;
+   
+  	tp = &dz_tty[unit];
+
+--- 289,295 -----
+  	caddr_t addr;
+  {
+  	register struct tty *tp;
+! 	register int unit = minor(dev)&0177;
+  	register int dz = unit >> 3;
+   
+  	tp = &dz_tty[unit];
+***************
+*** 436,442
+  		if ((dzsoftCAR[i>>3]&bit) || (dzaddr->dzmsr&bit)) {
+  			/* carrier present */
+  			if ((tp->t_state & CARR_ON) == 0) {
+! 				wakeup((caddr_t)&tp->t_rawq);
+  				tp->t_state |= CARR_ON;
+  			}
+  		} else {
+
+--- 460,466 -----
+  		if ((dzsoftCAR[i>>3]&bit) || (dzaddr->dzmsr&bit)) {
+  			/* carrier present */
+  			if ((tp->t_state & CARR_ON) == 0) {
+! 				wakeup((caddr_t)&tp->t_state);
+  				tp->t_state |= CARR_ON;
+  			}
+  		} else {
+***************
+*** 443,448
+  			if ((tp->t_state&CARR_ON) &&
+  			    (tp->t_local&LNOHANG)==0) {
+  				/* carrier lost */
+  				if (tp->t_state&ISOPEN) {
+  					gsignal(tp->t_pgrp, SIGHUP);
+  					gsignal(tp->t_pgrp, SIGCONT);
+
+--- 467,473 -----
+  			if ((tp->t_state&CARR_ON) &&
+  			    (tp->t_local&LNOHANG)==0) {
+  				/* carrier lost */
++ 				wakeup((caddr_t)&tp->t_state);
+  				if (tp->t_state&ISOPEN) {
+  					gsignal(tp->t_pgrp, SIGHUP);
+  					gsignal(tp->t_pgrp, SIGCONT);
+
+----------------------------------------
+
+				Bob Van Valzah
+				(...!decvax!ittvax!tpdcvax!bobvan)
+
+

@@ -1,0 +1,350 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,51077c397d9d5342,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-12-15 20:41:27 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!security!genrad!decvax!decwrl!flairvax!turtleva!ken
+From: ken@turtleva.UUCP (Ken Turkowski)
+Newsgroups: net.sources
+Subject: Graphics source in C: hsalgs/poly_drawl.c
+Message-ID: <286@turtleva.UUCP>
+Date: Thu, 15-Dec-83 23:41:27 EST
+Article-I.D.: turtleva.286
+Posted: Thu Dec 15 23:41:27 1983
+Date-Received: Sun, 18-Dec-83 06:22:48 EST
+Lines: 332
+
+echo x - hsalgs/poly_drawl.c
+cat >hsalgs/poly_drawl.c <<'!Funky!Stuff!'
+
+
+
+
+
+
+/* --------------------------------------------------------------
+   Clip, and display, as lines, polygonal objects in the standard
+   binary format.
+
+	input format is defined in "man hsalg_input"
+  ---------------------------------------------------------------
+*/
+
+
+#include <ctype.h>
+#include <stdio.h>
+
+#define TRUE             1
+#define FALSE            0
+#define NULLCHAR	'\0'
+#define DtoR		3.14159 / 180.
+#define DET_CODE	0x20746564
+#define IN               0
+#define OUTLFT           1
+#define OUTRGT           2
+#define OUTTOP           4
+#define OUTBOT           8
+#define OUTHTR          16
+#define POLYSIZE        64
+#define MAXPTS       32768  /* must be <= 32768 indexed by shorts */
+#define MAXPOLYS     32768  /*  "  */
+#define MAXVTCES    131072
+#define sqr(x)    ((x)*(x))
+#define LINE_LENGTH     81
+
+
+static struct {float x,y,z;} pts[MAXPTS];
+static short npts,npolys,nvtces,clipping,backfaces;
+static short cnt[MAXPTS],vtces[MAXVTCES];
+static short bfacing[MAXPOLYS],clp[MAXPOLYS];
+
+static double matrix[16];		/* current object transform matrix */
+static double cot_x,cot_y;
+
+/* +++++++++++++++++++++++++ MAIN +++++++++++++++++++++++++++++++++++++++++ */
+main()
+{
+    char instrg[LINE_LENGTH],keywd[LINE_LENGTH],remainder[LINE_LENGTH],dvc[3];
+    char *eofchk,*gets();
+    short i,first_obj;
+    long ivtx;
+    double atof(),sqrt(),fabs();
+    FILE *popen(),*stream;
+
+    nocore();			   /* prevent dumping core on error */
+
+    clipping = TRUE;	backfaces = FALSE;   first_obj = TRUE;
+
+    /* scan input for keywords */
+    do
+    {   eofchk = gets(instrg);
+	if (eofchk != NULL) get_term(instrg,keywd,remainder);  /* get keyword */
+
+	if ((eofchk == NULL) || ((strcmp(keywd,"object") == 0) && (!first_obj)))
+        {   prepare_obj();  /* transform, etc. last object if end or next obj */
+
+            /* ------ run through polygons, if not rejected,
+                  put out move and draw commands   ------------------  */
+            ivtx = 0;
+            for (i=0; i<npolys; i++)
+            {   short size;
+                size = vtces[ivtx++];
+
+	        if ((clp[i] >= 0) && (!bfacing[i] || backfaces))/*rejected?*/
+                {   struct { double x,y,z; } poly [POLYSIZE],poly2[POLYSIZE];
+                    short k,m,npts;
+		    npts = size;
+                    if (npts > POLYSIZE)
+                        error("(poly_drawl) %d > POLYSIZE\n",npts);
+
+                    for (k=0; k<npts; k++)                  /* copy polygon */
+                    {   m = vtces[ivtx++];
+                        poly[k].x = pts[m].x;
+                        poly[k].y = pts[m].y;
+                        poly[k].z = pts[m].z;
+		    }
+
+                    for (k=0; k<npts; k++)       /* predistort for clipping */
+                    {   poly[k].x *= cot_x;    poly[k].y *= cot_y;   }
+                    if (clp[i] > 0)  polclp(0,&npts,poly,poly2);
+                    if (npts > 2)
+                    {  for (k=0; k<npts; k++)       /* take to screen space */
+                       { poly[k].x /= poly[k].z; poly[k].y /= poly[k].z*4./3.; }
+
+		       fprintf(stream,"m %g %g 1.\n",poly[npts-1].x,poly[npts-1].y);
+		       for (k=0; k<npts; k++)
+		           fprintf(stream,"d %g %g 1.\n",poly[k].x,poly[k].y);
+                    }
+                }
+	        else ivtx += size;
+	    }   /* for each polygon */
+	}
+
+	/* process input line, beginning with keyword */
+	if ((strcmp(keywd,"device") == 0) && (first_obj)) /*get disply dvc*/
+    	{   sscanf(remainder,"%s",dvc);
+	         if (dvc[0] == 'm')  stream = popen("megdrawl","w");
+	    else if (dvc[0] == 'v')  stream = popen("vtdrawl","w");
+	    else if (dvc[0] == 'c')  stream = popen("crtdrawl","w");
+	    else if (dvc[0] == 'h')  stream = popen("h19drawl","w");
+	    else error(" strange line-drawing device - %s",dvc);
+    	}
+
+    	else if ( strcmp(keywd,"object") == 0 ) 	/* get an object file */
+	{   getobject(remainder,&npts,pts,&npolys,&nvtces,vtces);
+	    first_obj = FALSE;   clipping = TRUE;   backfaces = FALSE;
+	}
+	else if ( strcmp(keywd,"transform") == 0 )/*get eyespace transform*/
+	    for (i=0; i<16; i+=4) sscanf(gets(instrg),"%F%F%F%F",&matrix[i],
+			                &matrix[i+1],&matrix[i+2],&matrix[i+3]);
+
+        else if ( strcmp(keywd,"no_clipping") == 0 )   /* need clipping? */
+	    clipping = FALSE;
+
+	else if ( strcmp(keywd,"view_angle") == 0)
+ 	{   double view_angle,cos(),sin();
+	    sscanf(remainder,"%F",&view_angle);
+	    cot_x = cos(DtoR * view_angle/2.) / sin(DtoR * view_angle/2.);
+	    cot_y = cot_x / .75;
+	}
+
+    }   while (eofchk != NULL);		/* continue until input exhausted */
+    pclose(stream);	/* close stream to line drawer, wait for termination */
+}   /* done with main program */
+
+
+
+
+
+/* ++++++++++++++++++++++++ GETOBJECT ++++++++++++++++++++++++++++++++++++ */
+getobject(instrg,npts,pts,npolys,nvtces,vtces)	/* read in object file */
+    char *instrg;  short *npts,*npolys,*nvtces,vtces[];
+    struct { float x,y,z; } pts[];
+{   FILE *input;    short i;    long j,code;
+    char fname[LINE_LENGTH],string[LINE_LENGTH],keywd[LINE_LENGTH];
+
+    get_term(instrg,fname,instrg);     /* strip leading and trailing blanks */
+    input = fopen(fname,"r");
+    if (input == NULL) error("(poly_drawl) can't open .obj file %s\n",fname);
+
+    while (fgets(string,LINE_LENGTH,input) != NULL)   /* read for detail file */
+    {   get_term(string,keywd,string);
+	if      (strcmp(keywd,"detail") == 0)   get_term(string,fname,string);
+
+    	else if (strcmp(keywd,"type") == 0)  /*keep backfacing*/
+	{   while (strlen(string) > 4)
+	    {   get_term(string,keywd,string);
+	        if (strcmp(keywd,"open") == 0)  backfaces = TRUE;
+	    }
+	}
+    }
+    fclose(input);		   /* close ".obj" file and open detail file */
+    input = fopen(fname,"r");
+    if (input == NULL) error("(poly_drawl) can't open .det file %s\n",fname);
+
+    fread(&code,4,1,input);			   /* read file type header */
+    if (code != DET_CODE)
+    {   fprintf(stderr,"poly_drawl:  %s notted tagged detail file\n",fname);
+	close(input);    return;    /* apparently not a detail file, give up */
+    }
+    fread(npts,2,1,input);     fread(npolys,2,1,input);
+    if ((*npts > MAXPTS) || (*npolys > MAXPOLYS))
+        error(" (poly_drawl) object too big!! %d > MAXPTS or %d > MAXPOLYS\n",
+              *npts,*npolys);
+
+    fread(pts,4,(*npts)*3,input);
+
+    j = 0;
+    for (i=0; i<*npolys; i++)
+    {   short  num;    long k;
+        fread(&num,2,1,input);
+        vtces[j++] = num;
+        if (fread(&vtces[j],2,num,input) < num) error(" bad polygon # %d\n",i);
+        for (k=j; k<j+num; k++) vtces[k] -=1;  /* -1  so pointers start at 0 */
+        j += num;
+    }
+    *nvtces = j;
+    fclose(input);
+}
+
+
+
+
+/* +++++++++++++++++++++ GET_TERM +++++++++++++++++++++++++++++++++ */
+get_term(instrg,term,remainder)		/* remove first term from string */
+char *instrg,*term,*remainder;  /* blanks, tabs, nulls, commas are separators */
+{   short i,index1,index2;
+    index1 = 0;				/* find first non-separator */
+    while ((instrg[index1] == ' ') 	|| (instrg[index1] == '\t') ||
+	   (instrg[index1] == NULLCHAR) || (instrg[index1] == ',' )) index1++;
+    index2 = index1;			/* find next separator */
+    while ((instrg[index2] != ' ') 	&& (instrg[index2] != '\t') &&
+	   (instrg[index2] != NULLCHAR) && (instrg[index2] != ',' ) &&
+	   (instrg[index2] != '\n'))				     index2++;
+    for (i=index1; i<index2; i++)  term[i-index1] = instrg[i];
+    term[i-index1] = NULLCHAR;
+    while ((instrg[i] != NULLCHAR) && (instrg[i] != '\n'))
+	{  remainder[i-index2] = instrg[i];  i++;  }
+    remainder[i-index2] = NULLCHAR;
+}
+
+
+
+
+
+/* ++++++++++++++++++++++++ POLCLP +++++++++++++++++++++++++++++++++++++ */
+polclp(pass,npts,pts,pt2)        /* polygon clipper (eyespace) */
+    short *npts,pass;    struct { double x,y,z; } pts[],pt2[];
+{   short i,lk,m;   float dist,last_dist;
+    if ((pass == 4) || (*npts < 3))  return;        /* completion conditions */
+    last_dist = 0.0;    m = 0;    lk = 0;
+    for (i=0; i<=*npts; i++)
+    {   short k;
+        k = (i == *npts) ?  0 : i;
+        switch (pass)
+        {   case 0: { dist = pts[k].z+pts[k].x; break; }  /* left side  */
+            case 1: { dist = pts[k].z-pts[k].x; break; }  /* right side */
+            case 2: { dist = pts[k].z+pts[k].y; break; }  /* bottom  */
+            case 3: { dist = pts[k].z-pts[k].y; break; }  /* top  */
+        }
+        if (i == 0) {  last_dist = dist;  lk = k;  continue;  } /* 1st pnt? */
+
+        if (last_dist * dist < 0.0)  /* put out point if clip plane crossed */
+        {   float t,t1;
+            t = dist / (dist - last_dist);  t1 = 1.0 - t;
+            pt2[m].x = pts[k].x * t1 + pts[lk].x * t;
+            pt2[m].y = pts[k].y * t1 + pts[lk].y * t;
+            pt2[m].z = pts[k].z * t1 + pts[lk].z * t;
+	    m++;
+        }
+        if (dist >= 0.0)                            /* copy point if inside */
+        {   pt2[m].x = pts[k].x;   pt2[m].y = pts[k].y;   pt2[m].z = pts[k].z;
+            m++;
+        }
+        lk = k;    last_dist = dist;
+    }						   /* recurse for next plane */
+    *npts = m;   polclp(++pass,npts,pt2,pts);
+}
+
+
+
+/* ++++++++++++++++++++++ PREPARE_OBJ ++++++++++++++++++++++++++++++++++ */
+prepare_obj()           /* transform vertices, compute normals, etc. */
+{   short i;
+    /* ----- run through points, transform ----- */
+    for (i=0; i<npts; i++)
+    {   transform(&pts[i],matrix,&pts[i]);
+        cnt[i] = IN;                                    /* set clip code */
+    }
+    if (clipping) for (i=0; i<npts; i++)  /* tag if clipping */
+    {   if ( pts[i].z < 0.0)               cnt[i] |= OUTHTR;
+        if ((pts[i].x)*cot_x < -pts[i].z)  cnt[i] |= OUTLFT;
+        if ((pts[i].x)*cot_x >  pts[i].z)  cnt[i] |= OUTRGT;
+        if ((pts[i].y)*cot_y < -pts[i].z)  cnt[i] |= OUTBOT;
+        if ((pts[i].y)*cot_y >  pts[i].z)  cnt[i] |= OUTTOP;
+    }
+
+
+    /* ------------- run through polygons, check backfacing,
+                     do trivial clip tests and tag polys -------------- */
+    {   short in,out;    long ivtx;
+        ivtx = in = out = 0;
+        for (i=0; i<npolys; i++)
+        {   struct { float x,y,z; } vec;   short size;   long j;
+
+            size = vtces[ivtx++];
+            if (clipping)           /* trivial clip test if clipping */
+            {   out = 0;    in = 0;
+                for (j=ivtx; j<ivtx+size; j++)
+                {   out &= cnt[vtces[j]];   in |= cnt[vtces[j]];   }
+            }
+            if (out)   clp[i] = -out;   /* trivial rejection, skip this one */
+            else
+            {   clp[i] = in;     /* store code for trivial acceptance or clip */
+
+                j = ivtx;            /* get normal vector, do backface test */
+                X_prod(&vec,pts[vtces[j]],pts[vtces[j+1]],pts[vtces[j+2]]);
+                j = vtces[ivtx];
+                if ((vec.x*pts[j].x + vec.y*pts[j].y + vec.z*pts[j].z) >= 0.0)
+                     bfacing[i] = TRUE;                        /* backfacing */
+                else bfacing[i] = FALSE;
+            }
+            ivtx += size;                         /* increment to next poly */
+        }
+    }
+}
+
+
+
+/* +++++++++++++++++++++++++ TRANSFORM ++++++++++++++++++++++++++++++++++++ */
+transform(orgpt,mtx,pt)                          /* apply transform to point */
+    struct { float x,y,z; } *orgpt,*pt;    double mtx[16];
+{   float tx,ty,tz;
+    tx = mtx[0]*orgpt->x + mtx[4]*orgpt->y + mtx[8]*orgpt->z   + mtx[12];
+    ty = mtx[1]*orgpt->x + mtx[5]*orgpt->y + mtx[9]*orgpt->z   + mtx[13];
+    tz = mtx[2]*orgpt->x + mtx[6]*orgpt->y + mtx[10]*orgpt->z  + mtx[14];
+    pt->x = tx;    pt->y = ty;    pt->z = tz;
+}
+
+
+
+
+/* ++++++++++++++++++++++++++ X_PROD +++++++++++++++++++++++++++++++++++ */
+X_prod(vec,pt1,pt2,pt3)                        /* vector cross-product */
+    struct { float x,y,z; } *vec,pt1,pt2,pt3;
+{   pt1.x = pt2.x - pt1.x;
+    pt1.y = pt2.y - pt1.y;
+    pt1.z = pt2.z - pt1.z;
+    pt2.x = pt3.x - pt2.x;
+    pt2.y = pt3.y - pt2.y;
+    pt2.z = pt3.z - pt2.z;
+    vec->x = pt1.y*pt2.z - pt1.z*pt2.y;
+    vec->y = pt1.z*pt2.x - pt1.x*pt2.z;
+    vec->z = pt1.x*pt2.y - pt1.y*pt2.x;
+}
+
+
+
+!Funky!Stuff!
+
+

@@ -1,0 +1,673 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,105b62e900744e0d,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-04-07 03:46:16 PST
+Message-ID: <bnews.stolaf.872>
+Newsgroups: net.sources
+Path: utzoo!decvax!harpo!floyd!vax135!ariel!houti!hogpc!houxm!ihnp4!stolaf!borman
+X-Path: utzoo!decvax!harpo!floyd!vax135!ariel!houti!hogpc!houxm!ihnp4!stolaf!borman
+From: stolaf!borman
+Date: Thu Apr  7 06:46:10 1983
+Subject: tree.c
+X-Google-Info: Converted from the original B-News header
+Posted: Wed Apr  6 14:02:51 1983
+Received: Thu Apr  7 06:46:10 1983
+
+/*
+ *	TREE - Print the tree structure of a directory
+ *	Version 2.1
+ *
+ *	Dave Borman, St. Olaf College.
+ *		{ihnp4|harpo|umn-cs}!stolaf!{borman|sys}
+ *	Copyright (c) 1983 by Dave Borman
+ *	All rights reserved
+ *	Permission is hereby given for use by valid UNIX(TM) licencees.
+ *	This program may not be sold, but may be distributed
+ *	provided this header is included.
+ *
+ *	Compile: PDP V7 w/split i&d	cc -O tree.c -i -n -o tree
+ *		 VAX 4.1bsd		cc -O tree.c -n -o tree
+ *
+ *	Usage:	tree -[adfglnpsvx] [-c length] [top]
+ *	Flags:	-a) include non-directory entries in listing
+ *		-d) sort tree with directories at the top
+ *		-f) sort tree with files at the top
+ *		-g) same as l, but use group name instead of user name
+ *		-l) print stats with each listing
+ *		    if both g & l flags are given, both owner and
+ *		    group will be printed
+ *		-n) do not sort the tree
+ *		-p) include files starting with a '.' (except "." & "..")
+ *		-s) use shorter stats. Implies -l if -g isn't given.
+ *		-v) variable length columns
+ *		-x) do not cross mounted file systems.
+ *		-c length) set max column length to "length"
+ */
+
+#define STATS	/* comment out to remove stats, giving more core space	*/
+		/* and thus the ability to tree larger tree structures	*/
+
+
+#include	<stdio.h>
+#include	<sys/types.h>
+#include	<sys/dir.h>
+#include	<sys/stat.h>
+#ifdef	STATS
+#include	<pwd.h>
+#include	<grp.h>
+#endif	STATS
+
+#define	DEPTH	10	/* maximum depth that tree will go */
+#define	MAX	100	/* initial # of elements for list of files */
+#define	PWD	"/bin/pwd"	/* program to get name of current dir */
+
+#define	FFIRST	2	/* sort files first */
+#define DFIRST	1	/* sort directories first */
+#define	FAIL	-1	/* failure return status of sys calls */
+#define	GREATER	1	/* return value of strcmp if arg1 > arg2 */
+#define	LESSTHAN -1	/* return value of strcmp if arg1 < arg2 */
+#define	SAME	0	/* return value of strcmp if arg1 == arg2 */
+
+int	Index = 0;		/* current element of list[]	*/
+int	Length = DIRSIZ;	/* max length of a column	*/
+int	All = 0;		/* all != 0; list non-directory entries */
+int	File_dir = 0;		/* flag for how to sort */
+int	Sort = 1;		/* flag to cause sorting of entries */
+int	Point = 1;		/* skip point files if set	*/
+int	Maxes[DEPTH];		/* array keeps track of max length in columns */
+int	Level = 0;		/* counter for how deep we are	*/
+int	Device;			/* device that we are starting tree on */
+int	Xdev = 1;		/* set to allow crossing of devices */
+int	Varspaces = 0;		/* set to allow compaction of column width */
+#ifdef	STATS
+int	Gflag = 0;		/* set for group stats instead of owner */
+int	Longflg = 0;		/* set for long listing */
+int	Compact = 0;		/* set for shortened long listing */
+#endif	STATS
+struct	stat Status;
+
+struct entry {
+	short unsigned dir : 1;		/* entry is a directory */
+	short unsigned last : 1;	/* last entry in the dir. */
+	short unsigned dev : 1;		/* set if same device as top */
+	short unsigned end : 13;	/* index of last subdir entry*/
+	char	e_name[DIRSIZ];		/* name from directory entry */
+	int next;			/* index to next element in list */
+					/* could be a ptr, but realloc() */
+					/* might screw us then */
+#ifdef	STATS
+	unsigned short	e_mode;		/* file mode */
+	short	e_uid;			/* uid of owner */
+	short	e_gid;			/* gid of owner */
+	off_t	e_size;			/* size in blocks */
+#endif	STATS
+} *List;
+
+unsigned size = sizeof(struct entry)*MAX; /* how big of space we've malloced */
+
+char	Spaces[] = 	"                ";	/* used for output */
+char	Buf1[BUFSIZ];	/* buffers for stdio stuff.  We don't want	*/
+char	Buf2[BUFSIZ];	/* anyone calling malloc, because then		*/
+char	Buf3[BUFSIZ];	/* realloc() will have to move the whole list	*/
+
+main(argc, argv)
+char	**argv;
+int	argc;
+{
+	register int i, j = 0;
+	int	flag = 0;	/* used to jump over 'c' argument */
+	char	top[128];	/* array for treetop name */
+	char	*ptr;
+	char	*malloc();
+	char	*rindex();
+	FILE	*istr, *popen();
+
+	setbuf(stdout, Buf1);
+
+	strcpy(top, ".\0");
+	for (j=1; j<argc; j++) {
+		if (flag) {	/* saw a 'c', so jump over value */
+			flag = 0;
+			continue;
+		}
+		if (argv[j][0] == '-') {
+			for (i = 1; i < strlen(argv[j]); i++) {
+				switch (argv[j][i]) {
+				case 'a':
+					All = 1;
+					break;
+				case 'c':
+					Length = atoi(argv[j+1]);
+					if (Length > DIRSIZ || Length < 1)
+						Length = DIRSIZ;
+					flag = 1;
+					break;
+				case 'd':
+					File_dir = DFIRST;
+					break;
+				case 'f':
+					File_dir = FFIRST;
+					break;
+#ifdef	STATS
+				case 'g':
+					Gflag = 1;
+					break;
+				case 'l':
+					Longflg = 1;
+					break;
+#endif	STATS
+				case 'n':
+					Sort = 0;
+					break;
+				case 'p':
+					Point = 0;
+					break;
+#ifdef	STATS
+				case 's':
+					Compact = 1;
+					break;
+#endif	STATS
+				case 'v':
+					Varspaces = 1;
+					break;
+				case 'x':
+					Xdev = 0;
+					break;
+				default:
+					fprintf(stderr,
+						"Bad flag: %c\n", argv[j][i]);
+					exit(FAIL);
+				}
+			}
+		}
+		else if (j < argc-1) {
+			fprintf(stderr,
+#ifdef	STATS
+			    "Usage: tree -[adfglnpsvx] [-c length] [top]\n");
+#else	STATS
+			    "Usage: tree -[adfnpvx] [-c length] [top]\n");
+#endif	STATS
+			exit(FAIL);
+		}
+		else
+			strcpy(top, argv[j]);
+	}
+	if (Compact && !Gflag)
+		Longflg = 1;
+
+	if (chdir(top) == FAIL) {
+		fprintf(stderr, "Can't chdir to %s\n", top);
+		exit(1);
+	} else if ((istr = popen(PWD, "r")) == NULL) {
+		fprintf(stderr,"tree: pwd failed\n");
+		exit(1);
+	} else if (setbuf(istr,Buf2), fgets(top, 128, istr) == NULL) {
+		fprintf(stderr, "tree: EOF from pwd\n");
+		pclose(istr);
+		exit(1);
+	} else {
+		ptr = top;
+		while (*ptr && (*ptr != '\n'))
+			ptr++;
+		*ptr = '\0';
+		pclose(istr);
+	}
+
+	List = (struct entry *)malloc(size);	/* get initial storage space */
+	ptr = rindex(top, '/');
+	if (ptr)			/* strip off begining of name */
+		strncpy(List[Index].e_name, ++ptr, DIRSIZ);
+	if (stat(top, &Status) == FAIL) {
+		fprintf(stderr, "Can't stat %s\n", top);
+		exit(1);
+	}
+	Device = Status.st_dev;
+	List[0].dir = 1;
+	List[0].last = 1;
+	List[0].next = 1;
+#ifdef	STATS
+	List[0].e_mode = Status.st_mode;
+	List[0].e_uid = Status.st_uid;
+	List[0].e_gid = Status.st_gid;
+	List[0].e_size = Status.st_size;
+#endif	STATS
+	Index = 1;
+	for (i = 1; i < DEPTH; i++)
+		Maxes[i] = 0;
+	Maxes[0] = stln(List[0].e_name);
+	Level = 1;
+
+	List[0].end = t_search(top, &List[0]);		/* search the tree */
+	if (Index == 1)					/* empty tree */
+		List[0].next = 0;
+
+	if (All)
+		printf("Directory structure and contents of %s\n", top);
+	else
+		printf("Directory structure of %s\n", top);
+	printf(Point ? "(excluding entries that begin with '.')\n\n" : "\n");
+	pt_tree();					/* print the tree */
+}
+
+
+t_search(dir, addrs)
+char *dir;
+struct	entry *addrs;
+{
+	int	bsort;		/* index to begin sort */
+	int	stmp;		/* save temporary index value */
+	struct entry *sstep;	/* saved step in list */
+	int	nitems;		/* # of items in this directory */
+	FILE	*dirstr;	/* stream for directory */
+	char	sub[DIRSIZ + 1]; /* used for subdirectory names */
+	int	i;
+	struct direct dirent;
+	int	n_subs = 0;
+	int	tmp = 0;
+	extern	qsort();
+	int	compar();	/* comparison routine for qsort */
+	char	*realloc();
+
+
+	if ((dirstr = fopen(".", "r")) == NULL) {
+		fprintf(stderr, "Cannot open %s\n", dir);
+		return(0);
+	}
+	setbuf(dirstr, Buf3);
+
+	bsort = Index;
+	sstep = &List[bsort];	/* initialize sstep for for loop later on */
+	nitems = Index;
+	/* get the entries of the directory that we are interested in */
+	while (fread((char *)&dirent, sizeof(struct direct), 1, dirstr) == 1) {
+
+		if (!dirent.d_ino
+		    || (strcmp(dirent.d_name, ".") == SAME)
+		    || (strcmp(dirent.d_name, "..") == SAME)
+		    || (Point && dirent.d_name[0] == '.'))
+				continue;
+
+		sprintf(sub, "%.*s", DIRSIZ, dirent.d_name);
+		if ((tmp = stat(sub, &Status)) == FAIL) {
+			fprintf(stderr, "%s:stat can't find\n", sub);
+			continue;
+		}
+		if ((Status.st_mode & S_IFMT) == S_IFDIR)
+			List[Index].dir = 1;
+		else if (All)
+			List[Index].dir = 0;
+		else
+			continue;
+		strncpy(List[Index].e_name, dirent.d_name, DIRSIZ);
+		List[Index].last = 0;
+		List[Index].end = 0;
+		List[Index].dev = (Device == Status.st_dev);
+#ifdef	STATS
+		List[Index].e_mode = Status.st_mode;
+		List[Index].e_uid = Status.st_uid;
+		List[Index].e_gid = Status.st_gid;
+		List[Index].e_size = Status.st_size;
+#endif	STATS
+		if (stln(List[Index].e_name) > Maxes[Level])
+			Maxes[Level] = stln(List[Index].e_name);
+		++Index;
+		if (Index*sizeof(struct entry) >= size) {
+			size += 20*(sizeof(struct entry));
+			if (!(List =
+			    (struct entry *)realloc((char *)List, size))) {
+				fprintf(stderr, "Out of space\n");
+				break;
+			}
+		}
+	}
+	fclose(dirstr);
+
+	nitems = Index - nitems;	/* nitems now contains the # of */
+					/* items in this dir, rather than */
+					/* # total items before this dir */
+
+	if (Sort)
+		qsort(&List[bsort], nitems, sizeof(struct entry), compar);
+
+	List[Index-1].last = 1;	/* mark last item for this dir */
+	n_subs = nitems;
+	stmp = Index;
+
+	/* now walk through, and recurse on directory entries */
+	/* sstep was initialized above */
+
+	for (i = 0; i < nitems; sstep = &List[stmp - nitems+(++i)]) {
+		if (sstep->dir && (Xdev || sstep->dev)) {
+			sstep->next = Index;
+			sprintf(sub, "%.*s", DIRSIZ, sstep->e_name);
+			tmp = n_subs;
+			Level++;
+			if (chdir(sub) == FAIL)
+				fprintf(stderr,
+					"Can't chdir to %s/%s", dir, sub);
+			else {
+				n_subs += t_search(sub, sstep);
+				if (chdir("..") == FAIL) {
+					fprintf(stderr,
+						"No '..' in %s/%s!\n",dir, sub);
+					exit(1);
+				}
+			}
+			--Level;
+			if (n_subs - tmp <= 0)
+				sstep->next = 0;
+			else
+				--n_subs;
+		}
+		else
+			sstep->next = 0;
+	}
+	addrs->end = (unsigned)n_subs;
+	return(n_subs);
+}
+
+/*
+ *	comparison routine for qsort
+ */
+
+compar(a, b)
+struct entry *a, *b;
+{
+	if (!File_dir)		/* straight alphabetical */
+		return(strncmp(a->e_name, b->e_name, DIRSIZ));
+
+	/* sort alphabetically if both dirs or both not dirs */
+
+	if ((a->dir && b->dir) || (!a->dir && !b->dir))
+		return(strncmp(a->e_name, b->e_name, DIRSIZ));
+
+	if (File_dir == FFIRST) {	/* sort by files first */
+		if (a->dir)
+			return(GREATER);
+		else
+			return(LESSTHAN);
+	}
+
+	if (a->dir)			/* sort by dir first */
+		return(LESSTHAN);
+	else
+		return(GREATER);
+}
+
+
+pt_tree()
+{
+	register int	i,j;
+	struct entry *l;
+	struct entry *hdr[DEPTH];
+	int posit[DEPTH];		/* array of positions to print dirs */
+	int con[DEPTH];			/* flags for connecting up tree */
+	char	flag;			/* flag to leave blank line after dir */
+	struct	entry *stack[DEPTH];	/* save positions for changing levels */
+	int	top = 0;		/* index to top of stack */
+	int	count = 1;		/* count of line of output */
+#ifdef	STATS
+	char	*getmode();
+	char	*guid(), *ggid();
+#endif	STATS
+
+	Level = 0;			/* initialize Level */
+
+	/* this loop appends each entry with dashes or spaces, for */
+	/* directories or files respectively */
+
+	for (i = 0; i < Index; i++) {
+		for (j = 0; j < DIRSIZ; j++) {
+			if (!List[i].e_name[j])
+				break;
+		}
+		if (List[i].dir) {
+			for (; j < DIRSIZ; j++)
+				List[i].e_name[j] = '-';
+		} else {
+			for (; j < DIRSIZ; j++)
+				List[i].e_name[j] = ' ';
+		}
+	}
+
+	/* adjust the Maxes array according to the flags */
+
+	for (i = 0; i < DEPTH; i++) {
+		if (Varspaces) {
+			if (Maxes[i] > Length )
+				Maxes[i] = Length;
+		} else
+			Maxes[i] = Length;
+	}
+
+	/* clear the connective and position flags */
+
+	for (i = 0; i < DEPTH; i++)
+		con[i] = posit[i] = 0;
+
+	/* this is the main loop to print the tree structure. */
+	l = List;
+	j = 0;
+	for (;;) {
+		/* directory entry, save it for later printing */
+		if (l->dir != 0 && l->next != 0) {
+			hdr[Level] = l;
+			posit[Level] = count + (l->end + 1)/2 - 1;
+			flag = 1;
+			stack[top++] = l;
+			l = &List[l->next];
+			++Level;
+			continue;
+		}
+
+#ifdef	STATS
+	do_it_again:
+#endif	STATS
+		/* print columns up to our entry */
+		for (j = 0; j < (flag ? Level-1 : Level); j++) {
+			if (!flag && posit[j] && posit[j] <= count) {
+				/* time to print it */
+				printf("|-%.*s",Maxes[j],hdr[j]->e_name);
+				posit[j] = 0;
+				if (hdr[j]->last != 0)
+				    con[j] = 0;
+				else
+				    con[j] = 1;
+#ifdef	STATS
+				if (Gflag || Longflg) {
+				    if ((i = j+1) <= Level)
+					printf("| %.*s", Maxes[i], Spaces);
+				    for (i++; i <= Level; i++) {
+					printf("%c %.*s",
+					    (con[i] ? '|' : ' '),
+					    Maxes[i], Spaces);
+				    }
+				    if (!Compact) {
+					printf("%s ", getmode(hdr[j]->e_mode));
+					if (Longflg)
+					   printf("%8.8s ",guid(hdr[j]->e_uid));
+					if (Gflag)
+					   printf("%8.8s ",ggid(hdr[j]->e_gid));
+					printf("%7ld\n",
+					    (hdr[j]->e_size+511L)/512L);
+				    } else {
+					printf(" %04o ",hdr[j]->e_mode & 07777);
+					if (Longflg)
+					    printf("%5u ", hdr[j]->e_uid);
+					if (Gflag)
+					    printf("%5u ", hdr[j]->e_gid);
+					printf("%7ld\n",
+					    (hdr[j]->e_size+511L)/512L);
+				    }
+				    goto do_it_again;
+				}
+#endif	STATS
+			} else
+				printf("%c %.*s", (con[j] ? '|' : ' '),
+					Maxes[j], Spaces);
+		}
+		if (flag) {	/* start of directory, so leave a blank line */
+			printf(con[j] ? "|\n" : "\n");
+			flag = 0;
+			continue;
+		} else {
+				/* normal file name, print it out */
+			printf("|-%.*s",Maxes[Level],l->e_name);
+			if (l->last) {
+				con[j] = 0;
+			} else {
+				con[j] = 1;
+			}
+#ifdef	STATS
+			if (Gflag || Longflg) {
+				if (Compact) {
+					printf(" %04o ", l->e_mode & 07777);
+					if (Longflg)
+					    printf("%5u ", l->e_uid);
+					if (Gflag)
+					    printf("%5u ", l->e_gid);
+					printf("%7ld",
+					    (l->e_size+511L)/512L);
+				} else {
+					printf("%s ", getmode(l->e_mode));
+					if (Longflg)
+					    printf("%8.8s ",guid(l->e_uid));
+					if (Gflag)
+					    printf("%8.8s ",ggid(l->e_gid));
+					printf("%7ld",
+					    (l->e_size+511L)/512L);
+				}
+			}
+#endif	STATS
+		}
+		printf("\n");
+
+		if (l->last) {
+			/* walk back up */
+			while (l->last) {
+				--Level;
+				if (--top <= 0)
+					return;
+				l = stack[top];
+			}
+		}
+		++l;
+		++count;
+	}
+}
+
+#ifdef	STATS
+
+char *
+guid(uid)
+short uid;
+{
+	static char tb[10];
+	extern struct passwd *getpwuid();
+	struct passwd *pswd;
+
+	pswd = getpwuid(uid);
+	if (pswd == NULL)
+		sprintf(tb,"%u", uid);
+	else
+		strncpy(tb, pswd->pw_name, 8);
+	return(tb);
+}
+
+char *
+ggid(gid)
+short gid;
+{
+	static char tb[10];
+	extern struct group *getgrgid();
+	struct group *grp;
+
+	grp = getgrgid(gid);
+	if (grp == NULL)
+		sprintf(tb,"%u", gid);
+	else
+		strncpy(tb, grp->gr_name, 8);
+	return(tb);
+}
+
+/* take the mode and make it into a nice character string */
+
+char	*
+getmode(p_mode)
+unsigned short p_mode;
+{
+	static char a_mode[16];
+	register int	i = 0, j = 0;
+
+	a_mode[j++] = ' ';
+
+	switch (p_mode & S_IFMT) {
+	case S_IFDIR:
+		a_mode[j++] = 'd';
+		break;
+#ifdef	S_IFMPC		/* defined in stats.h if you have MPX files */
+	case S_IFMPC:
+		a_mode[j-1] = 'm';
+		/* FALL THROUGH */
+#endif	S_IFMPC
+	case S_IFCHR:
+		a_mode[j++] = 'c';
+		break;
+#ifdef	S_IFMPB		/* defined in stats.h if you have MPX files */
+	case S_IFMPB:
+		a_mode[j-1] = 'm';
+		/* FALL THROUGH */
+#endif	S_IFMPB
+	case S_IFBLK:
+		a_mode[j++] = 'b';
+		break;
+	case S_IFREG:
+	default:
+		a_mode[j++] = (p_mode & S_ISVTX) ? 't' : ' ';
+		break;
+	}
+	a_mode[j++] = ' ';
+	for( i = 0;i<3;i++ ) {
+		a_mode[j++] = (p_mode<<(3*i) & S_IREAD) ? 'r' : '-';
+		a_mode[j++] = (p_mode<<(3*i) & S_IWRITE) ? 'w' : '-';
+		a_mode[j++] = (i<2 && (p_mode<<i & S_ISUID)) ? 's' :
+			      ((p_mode<<(3*i) & S_IEXEC ) ? 'x' : '-');
+		a_mode[j++] = ' ';
+	}
+	a_mode[j] = '\0';
+	return(a_mode);
+}
+#endif
+
+/* stln - sortof like strlen, returns length up to DIRSIZE-1 */
+stln(st)
+register char *st;
+{
+	register int t;
+
+	for (t=0; t<DIRSIZ-1; ++t)
+		if (!st[t])
+			return (++t);
+	return (++t);
+}
+
+/*
+ * Return a pointer into str at which the character
+ * c last appears; NULL if not found.
+*/
+
+char *
+rindex(str, c)
+register char *str, c;
+{
+	register char *ptr;
+
+	ptr = NULL;
+	do {
+		if (*str == c)
+			ptr = str;
+	} while (*str++);
+	return(ptr);
+}
+
+

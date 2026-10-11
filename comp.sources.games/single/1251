@@ -1,0 +1,1849 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,ae550d72838f8ad3,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1992-01-10 09:47:24 PST
+Path: sparky!uunet!spool.mu.edu!uwm.edu!ogicse!zephyr.ens.tek.com!master!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v13i021:  okbridge - computer-mediated bridge game, Part06/07
+Message-ID: <2280@masterCNA.TEK.COM>
+Date: 10 Jan 92 16:45:15 GMT
+Article-I.D.: masterCN.2280
+Sender: news@masterCNA.TEK.COM
+Lines: 1832
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: mclegg@cs.UCSD.EDU (Matthew Clegg)
+Posting-number: Volume 13, Issue 21
+Archive-name: okbridge/Part06
+Environment: BSD-derived Unix, curses, sockets
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 6 (of 7)."
+# Contents:  code.c email.h globals.h help.c input.h oktally.c
+#   scoring.c
+# Wrapped by billr@saab on Fri Jan 10 08:31:29 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'code.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'code.c'\"
+else
+echo shar: Extracting \"'code.c'\" \(8947 characters\)
+sed "s/^X//" >'code.c' <<'END_OF_FILE'
+X/* code.c
+X ! 
+X ! Copyright (C) 1990,1991 by Matthew Clegg
+X ! 
+X ! This program may be copied and distributed freely.  Please do not
+X ! charge money for this program or for any program derived from it.
+X ! If you modify this program, then include a notice stating plainly
+X ! that your program is derived from the okbridge program and is not
+X ! the same as the official okbridge program.
+X !
+X ! I welcome any suggestions for improvement to okbridge, and 
+X ! I would be especially happy to receive improved source code.
+X ! If you have comments or suggestions, or if you would like to
+X ! join the okbridge mailing list, then write to
+X !
+X !   mclegg@cs.ucsd.edu
+X !
+X *
+X * This file implements procedures for a very simple cipher which
+X * is used to encode crucial parts of the files which contain
+X * email duplicate hands.
+X *
+X * The intention of this cipher is to make the contents
+X * of an email duplicate file non-obvious.  This cipher is certainly
+X * not intended to be difficult to break -- it is simply intended to
+X * allow email duplicate files to be manipulated (e.g., mailed, copied,
+X * etc.) without having their contents revealed.
+X *
+X * The cipher that we use is based upon the following principles:
+X *    1.  Only the 64 characters a-zA-Z0-9+- are encoded.
+X *        This defines a function h(c) for characters c which is 0
+X *        if c is not coded and which is a unique integer in the
+X *        range [1,64] if c is coded.
+X *    2.  An initial permutation p the integers [1,64] is chosen.
+X *    3.  Given a string s, a permuted string s' is computed according
+X *        to the following formula:
+X *
+X *	  s'[i] =  s[i]  				if h[s[i]] = 0,
+X *		   h^-1 [ p[ (h[s[i]] + i) mod 64 ]]    otherwise.
+X *
+X *  	  In other words, the encoding of a character is determined
+X *        by a fixed permutation and by its index in the string.
+X *
+X * An email duplicate file begins with a header line identifying the
+X * fact that it is an email duplicate file.  The following line contains
+X * the permutation which has been used to encode the file.  The
+X * succeeding lines are a mixture of plain-text and coded lines.
+X * Coded lines begin with an exclamation point '!'.
+X */
+X
+X#include <stdio.h>
+X
+X
+Xextern char *malloc ();
+X
+X/* extern long random (); */
+Xextern int rand ();
+X#define random(n) ((rand () / 64) % n)
+X
+Xint codefile_line_no;
+X	/* The number of lines that have been read from the current
+X           coded file. */
+X
+X#define CIPHER_SIZE	64
+X#define CIPHER_SIZE1	65
+X
+Xstatic  int cipher_mapping [128];	/* the function h above. */
+Xstatic  int cipher_unmapping [128];	/* h^-1, where defined  */
+Xstatic  int mapping_is_initialized = 0;
+X
+Xtypedef int cipher_encoding [128];	/* the function p above. */
+Xtypedef int cipher_decoding [128];	/* p^-1 */
+X
+Xtypedef struct Encoded_File_Struct {
+X	cipher_encoding		encoding;
+X	cipher_decoding		decoding;
+X	FILE			*cf;
+X} Encoded_File;
+X
+Xstatic void Initialize_Cipher_Mapping ()
+X{
+X	int i;
+X
+X	for (i = 0; i < 128; i++)
+X		cipher_mapping[i] = cipher_unmapping[i] = 0;
+X	for (i = 'A'; i <= 'Z'; i++)
+X		cipher_mapping[i] = i - 'A' + 1;
+X	for (i = 'a'; i <= 'z'; i++)
+X		cipher_mapping[i] = i - 'a' + 26 + 1;
+X	for (i = '0'; i <= '9'; i++)
+X		cipher_mapping[i] = i - '0' + 52 + 1;
+X	cipher_mapping['+'] = 63;
+X	cipher_mapping['-'] = 64;
+X
+X	for (i = 0; i < 128; i++)
+X		if (cipher_mapping[i])
+X			cipher_unmapping[cipher_mapping[i]] = i;
+X};
+X
+Xstatic int Read_Line (f, buf, buflen)
+X	FILE *f; char *buf; int buflen;
+X/* Reads a line of up to buflen characters from the file f into
+X   the buffer buf.  Returns the number of characters read, or -1
+X   if EOF reached.
+X*/
+X{
+X	int i, ch;
+X
+X	i = 0;
+X	while ((ch = getc(f)) != '\n') {
+X		if (ch == EOF)
+X			return (-1);
+X		if ((i < buflen - 1) && (ch != '\015'))
+X			buf[i++] = ch;
+X	};
+X	buf[i] = '\0';
+X	codefile_line_no++;
+X	return (i);
+X};
+X
+Xint Reset_Encoded_File (filename, check_string, ef)
+X	char *filename, *check_string; Encoded_File **ef;
+X/* Opens the named file for input.  Returns a pointer to a structure
+X   describing the opened file.  If an error occurs in opening the
+X   file, returns -1, in which case the system error code is stored
+X   in errno.  Reads lines from the file until a line is found which
+X   matches check_string.  If the check_string is not found, then
+X   returns 1.  Else, reads the cipher_encoding from the following line.
+X   Allocates a new Encoded_File structure and stores its location in ef.
+X   Returns 0 on success.
+X*/
+X{
+X	FILE *code_file;
+X	char *check_buffer, code_buffer [CIPHER_SIZE1];
+X	int buflen, read_code, i;
+X
+X	if (!mapping_is_initialized)
+X		Initialize_Cipher_Mapping ();
+X
+X	if (strcmp(filename, "-"))
+X	  code_file = fopen (filename, "r");
+X	else
+X	  code_file = stdin;
+X
+X	if (code_file == NULL)
+X		return (-1);
+X	codefile_line_no = 0;
+X
+X	buflen = strlen (check_string);
+X	check_buffer = malloc (buflen + 1);
+X	do {
+X		read_code = Read_Line (code_file, check_buffer, buflen+1);
+X	} while ((read_code >= 0) && strcmp (check_string, check_buffer));
+X	free (check_buffer);
+X	if (read_code < 0) {
+X		fclose (code_file);
+X		return (1);
+X	};
+X
+X	read_code = Read_Line (code_file, code_buffer, CIPHER_SIZE1);
+X	if (read_code < 0) {
+X		fclose (code_file);
+X		return (1);
+X	};
+X
+X	*ef = (Encoded_File *) malloc(sizeof(Encoded_File));
+X	for (i = 0; i < CIPHER_SIZE; i++)
+X		(*ef)->encoding[i+1] = cipher_mapping[code_buffer[i]];
+X	for (i = 1; i < CIPHER_SIZE1; i++)
+X		(*ef)->decoding[(*ef)->encoding[i]] = i;
+X	(*ef)->cf = code_file;
+X	return (0);
+X};
+X
+Xstatic void Encode_Line (ef, buf)
+X	Encoded_File *ef; char *buf;
+X{
+X	int i, base_code;
+X
+X	for (i = 0; buf[i] != '\0'; i++)
+X		if ((base_code = cipher_mapping[buf[i]]) != 0)
+X			buf[i] = cipher_unmapping [ef->encoding[
+X					(base_code + 3*i) % CIPHER_SIZE + 1]];
+X};
+X
+Xstatic void Decode_Line (ef, buf)
+X	Encoded_File *ef; char *buf;
+X{
+X	int i, p, base_code;
+X
+X	for (i = 0; buf[i] != '\0'; i++)
+X		if ((base_code = cipher_mapping[buf[i]]) != 0) {
+X			p = (ef->decoding[base_code] + 3*CIPHER_SIZE - 3*i)
+X				% CIPHER_SIZE - 1;
+X			if (p == 0) p = CIPHER_SIZE;
+X			buf[i] = cipher_unmapping[p];
+X		};
+X			
+X
+X};
+X
+Xint Read_Encoded_Line (ef, buf, buflen)
+X	Encoded_File *ef; char *buf; int buflen;
+X/* Reads a line of up to buflen characters from the encoded file ef
+X   into buf.  If the first character of the line is '!', then strips
+X   that character and applies the decoding algorithm to the remainder
+X   of the line.  Otherwise, just copies the line from the input file
+X   to the buffer.  Returns the number of characters read or -1 if
+X   the end of file is reached.
+X*/
+X{
+X	int i, read_code, base_mapping;
+X
+X	read_code = Read_Line (ef->cf, buf, buflen);
+X	if ((read_code <= 0) || (buf[0] != '!'))
+X		return (read_code);
+X
+X	for (i = 0; i < read_code; i++)
+X		buf[i] = buf[i+1];
+X	read_code -= 1;
+X
+X	Decode_Line (ef, buf);
+X	return (read_code);
+X	
+X};
+X
+Xint Rewrite_Encoded_File (filename, check_string, ef)
+X	char *filename, *check_string; Encoded_File **ef;
+X/* Opens the named file for output.  Returns a pointer to a structure
+X   describing the opened file.  If an error occurs in opening the file,
+X   then returns -1, in which case the system error code is stored
+X   in errno.  Invents a permutation for the new encoded file.
+X   Writes the check_string as the first line of the new file,
+X   and the permutation as the second line.  Returns 0 to indicate
+X   success.
+X*/
+X{
+X	FILE *code_file;
+X	char code_buffer [CIPHER_SIZE1];
+X	int read_code, i, t, c;
+X
+X	if (!mapping_is_initialized)
+X		Initialize_Cipher_Mapping ();
+X
+X	if (strcmp(filename, "-"))
+X	  code_file = fopen (filename, "w");
+X	else
+X	  code_file = stdout;
+X
+X	if (code_file == NULL)
+X		return (-1);
+X
+X	*ef = (Encoded_File *) malloc(sizeof(Encoded_File));
+X
+X	for (i = 1; i < CIPHER_SIZE1; i++) 
+X		(*ef)->encoding [i] = i;
+X	for (i = 1; i < CIPHER_SIZE; i++) {
+X		c = random (CIPHER_SIZE + 1 - i);
+X		t = (*ef)->encoding[i+c]; 
+X		(*ef)->encoding[i+c] = (*ef)->encoding[i];
+X		(*ef)->encoding[i] = t;
+X	};
+X
+X	for (i = 1; i < CIPHER_SIZE1; i++)
+X		(*ef)->decoding[(*ef)->encoding[i]] = i;
+X
+X	(*ef)->cf = code_file;
+X
+X	fprintf ((*ef)->cf, "%s\n", check_string);
+X	
+X	for (i = 0; i < CIPHER_SIZE; i++)
+X		code_buffer[i] = cipher_unmapping[(*ef)->encoding[i+1]];
+X	code_buffer[CIPHER_SIZE] = '\0';
+X	fprintf ((*ef)->cf, "%s\n", code_buffer);
+X
+X	return (0);
+X		
+X};
+X 
+Xint Write_Encoded_Line (ef, buf)
+X	Encoded_File *ef; char *buf;
+X/* Writes the encoded version of the string from buf to the encoded
+X   file ef.  Returns 0 on success or 1 if the system reports an error.
+X*/
+X{
+X	Encode_Line (ef, buf);
+X	fprintf (ef->cf, "!%s\n", buf);
+X	fflush (ef->cf);
+X	Decode_Line (ef, buf);
+X	return (0);
+X};
+X
+Xint Write_Unencoded_Line (ef, buf)
+X	Encoded_File *ef; char *buf;
+X/* Writes the unencoded line in buf to the file ef. */
+X{
+X	if (buf[0] == '!')
+X		fprintf (ef->cf, " %s\n", buf);
+X	else
+X		fprintf (ef->cf, "%s\n", buf);
+X	return (0);
+X};
+X
+Xvoid Close_Encoded_File (ef)
+X	Encoded_File *ef;
+X/* Closes the file associated to ef and disposes of the memory
+X   associated to ef. */
+X{
+X        if ((ef->cf != stdout) && (ef->cf != stdin)) {
+X	  fflush (ef->cf);
+X	  fclose (ef->cf);
+X	};
+X	free (ef);
+X};
+END_OF_FILE
+if test 8947 -ne `wc -c <'code.c'`; then
+    echo shar: \"'code.c'\" unpacked with wrong size!
+fi
+# end of 'code.c'
+fi
+if test -f 'email.h' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'email.h'\"
+else
+echo shar: Extracting \"'email.h'\" \(5047 characters\)
+sed "s/^X//" >'email.h' <<'END_OF_FILE'
+X/* email.h
+X ! 
+X ! Copyright (C) 1990,1991 by Matthew Clegg
+X ! 
+X ! This program may be copied and distributed freely.  Please do not
+X ! charge money for this program or for any program derived from it.
+X ! If you modify this program, then include a notice stating plainly
+X ! that your program is derived from the okbridge program and is not
+X ! the same as the official okbridge program.
+X !
+X ! I welcome any suggestions for improvement to okbridge, and 
+X ! I would be especially happy to receive improved source code.
+X ! If you have comments or suggestions, or if you would like to
+X ! join the okbridge mailing list, then write to
+X !
+X !   mclegg@cs.ucsd.edu
+X !
+X *
+X * This file defines the data structures associated with reading
+X * and writing email duplicate files.  An email duplicate file
+X * has the following information:
+X *
+X *  1.  Some header information, including the encryption key,
+X *      the number of boards played, and the number of player pairs.
+X *
+X *  2.  A list of player-pairs.
+X *
+X *  3.  A list of boards.  This includes the deal of the cards and
+X *      also a series of scores.
+X *
+X * The email duplicate structure mirrors the contents of an email
+X * duplicate file more or less directly.
+X *
+X */
+X
+Xtypedef struct Email_Comment_struct {
+X	char 	*comment;
+X	struct Email_Comment_struct *next;
+X} Email_Comment;
+X
+Xtypedef struct Email_Pair_struct {
+X	char	*ne;	/* The north/east player's name. */
+X	char	*sw;	/* The south/west player's name. */
+X	int	match_points;
+X} Email_Pair;
+X
+Xtypedef struct Email_Score_struct {
+X	int	ns_pair;	/* The north-south pair number. */
+X	int 	ew_pair;	/* The east-west pair number. */
+X	int	bid;		/* Index of bid in bid_names. */
+X	int	doubled;	/* 0, BID_DOUBLE or BID_REDOUBLE. */
+X	int	contractor;	/* PLAYER_NORTH ... PLAYER_WEST. */
+X	int	result;
+X	int	ns_score;	/* +score for contract made, -score for down.*/
+X	int	ns_match_points;
+X	int	ew_match_points;
+X	struct Email_Score_struct *next;
+X} Email_Score;
+X
+Xtypedef struct Email_Board_struct {
+X	hand	deal;
+X	int     dealer;
+X	int	ns_vulnerable, ew_vulnerable;
+X	Email_Comment *pre_script, *post_script;
+X	Email_Score *score_list;
+X	struct Email_Board_struct *next;
+X} Email_Board;
+X
+Xstruct Email_Duplicate_struct {
+X	int	nboards;	/* The number of boards played. */
+X	int 	npairs;		/* The number of player-pairs. */
+X	Email_Pair  *player_list;
+X	Email_Board *board_list;
+X};
+X
+X
+Xextern int Read_Email_Duplicate_File ();
+X/*
+Xint Read_Email_Duplicate_File (filename, email_struct)
+X	char *filename; struct Email_Duplicate_Struct **email_struct; */
+X/* Reads an email duplicate file.  If successful, then allocates a
+X   structure to represent the file and returns a pointer to that
+X   structure in email_struct.  Returns 0 in this case.  If an error
+X   occurred opening the file, then returns -1 with the system error
+X   code in errno.  If an error is detected in the format of the file,
+X   then returns 1.
+X*/
+X
+Xextern int Write_Email_Duplicate_File ();
+X/*
+Xint Write_Email_Duplicate_File (filename, encode_flag, email_struct)
+X	char *email_file; int encode_flag;
+X	struct Email_Duplicate_Struct *email_struct; 
+X*/
+X/* Writes an email duplicate file to filename.  If encode_flag is true,
+X   then encodes critical parts of the file.  If no errors, returns 0.
+X   Otherwise, returns -1 with the system error code in errno.
+X*/
+X
+Xextern void Free_Email_Duplicate_Struct ();
+X/*
+Xvoid Free_Email_Duplicate_Struct (email_struct)
+X	struct Email_Duplicate_struct *email_struct; */
+X/* Simply de-allocates email_struct and its substructures. */
+X
+Xextern struct Email_Duplicate_struct *New_Email_Duplicate_Struct ();
+X/* Allocates an empty email duplicate structure to be used for
+X   recording email duplicate hands.
+X*/
+X
+Xextern int Add_Email_Pair ();
+X/*
+Xint Add_Email_Pair (email_struct, ne_name, sw_name)
+X	struct Email_Duplicate_struct *email_struct;
+X	char *ne_name, *sw_name;
+X*/
+X/* Appends a new player-pair to the list of players in email_struct.
+X   Returns the pair number assigned to them.
+X*/
+X
+Xextern Email_Board *Add_Email_Board ();
+X/*
+XEmail_Board *Add_Email_Board (email_struct, new_deal)
+X	struct Email_Duplicate_struct *email_struct;
+X	hand new_deal;
+X*/
+X/* Appends the given hand to the list of boards in email_struct. 
+X   Returns a pointer to the newly allocated board.
+X*/
+X
+Xextern void Record_Email_Score ();
+X/*
+Xvoid Record_Email_Score (email_board,
+X	ns_pair, ew_pair, bid, doubled, contractor, result, ns_score)
+X	struct Email_Board *email_board;
+X	int ns_pair, ew_pair, bid, contractor, result, ns_score;
+X*/
+X/* Constructs a new score record containing the information
+X   ns_pair, ew_pair, bid, contractor, result and ns_score.
+X   Links this into the list of score records associated to email_board.
+X   The list is maintained in ascending order according to ns_score.
+X*/
+X
+Xextern void Compute_Board_Match_Points ();
+X/*
+Xvoid Compute_Board_Match_Points (email_board)
+X	struct Email_Board *email_board;
+X*/
+X/* Computes the ns_match_points and ew_match_points fields for each of
+X   the records in the score list of email_board.  The number recorded
+X   is actually twice the number of match points awarded.  
+X*/
+X
+END_OF_FILE
+if test 5047 -ne `wc -c <'email.h'`; then
+    echo shar: \"'email.h'\" unpacked with wrong size!
+fi
+# end of 'email.h'
+fi
+if test -f 'globals.h' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'globals.h'\"
+else
+echo shar: Extracting \"'globals.h'\" \(9551 characters\)
+sed "s/^X//" >'globals.h' <<'END_OF_FILE'
+X/* globals.h -- global data values.
+X ! 
+X ! Copyright (C) 1990,1991 by Matthew Clegg
+X ! 
+X ! This program may be copied and distributed freely.  Please do not
+X ! charge money for this program or for any program derived from it.
+X ! If you modify this program, then include a notice stating plainly
+X ! that your program is derived from the okbridge program and is not
+X ! the same as the official okbridge program.
+X !
+X ! I welcome any suggestions for improvement to okbridge, and 
+X ! I would be especially happy to receive improved source code.
+X ! If you have comments or suggestions, or if you would like to
+X ! join the okbridge mailing list, then write to
+X !
+X !   mclegg@cs.ucsd.edu
+X !
+X * This file contains the definitions of all of the global variables.
+X * These variables represent the state of the current game.  It seems
+X * to be more convenient to make them global variables than to store
+X * them locally and pass them as parameters to various procedures.
+X *
+X * The definition _BRIDGE_ is used to distinguish the external
+X * references to these variables from the actual definitions.  The module
+X * which defines these variables should give a definition to _BRIDGE_
+X * before including this file.
+X */
+X 
+X 
+X/* #define LOOPBACK_MODE */
+X/* #define TWOPLAYER_MODE */
+X 
+X/* The following constants define the possible states which the program
+X * can be in.  The current program state is stored in the variable
+X * game_mode.
+X */
+X 
+X#define STARTUP_MODE	0
+X#define DEALING_MODE	1
+X#define BIDDING_MODE	2
+X#define PLAYING_MODE	3
+X#define REVIEW_MODE     4
+X 
+X/* The following constants define the locations on the screen where
+X * user input may occur.
+X */
+X 
+X#define PLAY_ROW	16
+X#define PLAY_COL	1
+X#define PLAY_LENGTH	30
+X 
+X#define TALK_ROW	17
+X#define TALK_COL	1
+X#define TALK_LENGTH	75
+X 
+X/* The following constants are used to refer to the positions of various
+X * players.  The players are named NORTH, SOUTH, EAST and WEST.
+X * However, the assignment of these positions to the screen display
+X * may vary from game to game.  And the position of the declarer may
+X * vary from hand to hand.
+X */
+X 
+X#define PLAYER_NORTH	0
+X#define PLAYER_EAST	1
+X#define PLAYER_SOUTH	2
+X#define PLAYER_WEST	3
+X 
+X#define POS_TOP		0
+X#define POS_RIGHT	1
+X#define POS_BOTTOM	2
+X#define POS_LEFT	3
+X 
+X#define GAME_DECLARER	0
+X#define GAME_OPPL	1
+X#define GAME_DUMMY	2
+X#define GAME_OPPR	3
+X 
+X#define SUIT_CLUBS	0
+X#define SUIT_DIAMONDS	1
+X#define SUIT_HEARTS	2
+X#define SUIT_SPADES	3
+X#define SUIT_NOTRUMP	4
+X#define MAJOR(suit)     ((suit == SUIT_HEARTS) || (suit == SUIT_SPADES))
+X#define MINOR(suit)     ((suit == SUIT_CLUBS)  || (suit == SUIT_DIAMONDS))
+X
+X#define RANK_TWO	0
+X#define RANK_THREE	1
+X#define RANK_FOUR	2
+X#define RANK_FIVE	3
+X#define RANK_SIX	4
+X#define RANK_SEVEN	5
+X#define RANK_EIGHT	6
+X#define RANK_NINE	7
+X#define RANK_TEN	8
+X#define RANK_JACK	9
+X#define RANK_QUEEN	10
+X#define RANK_KING	11
+X#define RANK_ACE	12
+X 
+X#define BID_PASS	0
+X#define BID_DOUBLE	1
+X#define BID_REDOUBLE	2
+X#define BID_SUIT	3
+X
+X#define SIDE_NS		0
+X#define SIDE_EW		1
+X#define side_of(x) 	(x%2)
+X
+X#define RUBBER_SCORING    0
+X#define CHICAGO_SCORING   1
+X#define DUPLICATE_SCORING 2 
+X#define EMAIL_SCORING	  3
+X#define IMP_SCORING       4
+X
+X/* We represent both a deck of cards and a hand by an array of 52 elements,
+X * where the array is indexed by card indices.  That is, to each card we
+X * associate a unique integer in the range 0-51, and this "card index"
+X * is used to reference an array representing a deal or a hand.  In the
+X * case of a deal, the array contains thirteen elements which are 0,
+X * thirteen which are 1, thirteen which are 2, and thirteen which are 3.
+X * Thus an element of an array refers to the holder of that particular
+X * card.  We represent a hand by an array where thirteen elements are 1
+X * and the rest are 0.  Thus, an element of an array is TRUE exactly when
+X * that particular card is in the hand.
+X */
+X
+Xtypedef char card_type;
+Xtypedef card_type *suit_type;
+Xtypedef card_type deal [52];
+Xtypedef card_type hand [52];
+Xtypedef int  bid_list [10];
+X 
+X#ifdef _BRIDGE_
+X 
+X	/* Character constants: */
+X
+X        char *major_revision_level = "1.5";  /* In theory, all copies of the
+X		 			        program at a given major 
+X						revision level should be 
+X						compatible. */
+X        char *minor_revision_level = "Q";
+X
+X	char *card_names [] =  {"C2", "C3", "C4", "C5", "C6", "C7", "C8",
+X				"C9", "CT", "CJ", "CQ", "CK", "CA",
+X				"D2", "D3", "D4", "D5", "D6", "D7", "D8",
+X				"D9", "DT", "DJ", "DQ", "DK", "DA",
+X				"H2", "H3", "H4", "H5", "H6", "H7", "H8",
+X				"H9", "HT", "HJ", "HQ", "HK", "HA",
+X				"S2", "S3", "S4", "S5", "S6", "S7", "S8",
+X				"S9", "ST", "SJ", "SQ", "SK", "SA"};
+X	char *suit_names [] =  {"C", "D", "H", "S", "NT"};
+X	char *rank_names [] =  {"2", "3", "4", "5", "6", "7", "8", "9",
+X				"T", "J", "Q", "K", "A"};
+X	char *bid_names  [] =  {"P" , "X" , "XX",
+X				"1C", "1D", "1H", "1S", "1NT",
+X				"2C", "2D", "2H", "2S", "2NT",
+X				"3C", "3D", "3H", "3S", "3NT",
+X				"4C", "4D", "4H", "4S", "4NT",
+X				"5C", "5D", "5H", "5S", "5NT",
+X				"6C", "6D", "6H", "6S", "6NT",
+X				"7C", "7D", "7H", "7S", "7NT",
+X				NULL};
+X 
+X	char *player_names [] ={"NORTH", "EAST", "SOUTH", "WEST"};
+X 
+X	/* Information regarding the positions of the players: */
+X	int player_next [] = {1, 2, 3, 0};
+X	int player_prev [] = {3, 0, 1, 2};
+X	int player_partner [] = {2, 3, 0, 1};
+X	int local_player;			/* the local player */
+X        int scoring_mode;            
+X        int prompt_dummy = 1;                   /* true if the dummy should
+X						   be prompted after each 
+X						   play. */
+X        int default_plays=1;                    /* true if default plays
+X						   are allowed. */
+X
+X	/* Information regarding the current hand: */
+X	int  dealer,
+X	     game_mode;		/* whether we are bidding or playing. */
+X	deal current_deal;
+X	hand current_hand [4];  /* indexed by player position. */
+X        int trick;              /* number of tricks played in current hand */
+X 
+X	/* Information regarding the current trick being played: */
+X	int leader;		/* Which player leads the current trick? */
+X	int no_plays;		/* The number of cards played in this trick. */
+X	int plays[4];		/* The cards played so far in this trick,
+X				   indexed by the position of the player. */
+X 
+X	/* Information about the bidding: */
+X	int trump_suit;		/* trump suit for current hand. */
+X	int contract;		/* (rank of) contract in current hand. */
+X	int declarer;		/* declarer in current hand. */
+X        int dummy;              /* dummy in current hand. */
+X	int doubled, redoubled; /* boolean flags. */
+X 
+X	bid_list bids [4];	/* index by player position */
+X	int no_bids;
+X 
+X	/* Scoring information: */
+X	int tricks [2];		/* no. tricks won by each side in this hand. */
+X	int above_line [2];	/* 'above-the-line' points for each side. */
+X	int below_line [2];	/* 'below-the-line' points for each side. */
+X	int vulnerable [2];	/* number of games won by each side in this
+X				   rubber */
+X	int hands_played;	/* the number of hands that have been
+X				   played so far. */
+X 
+X	/* Information used for email duplicate scoring: */
+X	int total_no_deals;	/* the total number of deals to make
+X				   before querying for further action. */
+X	int current_deal_no;	/* the current deal number. */
+X	int replaying_mode;	/* true if we are "replaying" hands that have
+X				   been read from a file. */
+X	int ns_pair_no;		/* the pair number assigned to north-south */
+X	int ew_pair_no;		/* the pair number assigned to east-west */
+X	struct Email_Duplicate_struct *email_record;
+X				/* record of the email duplicate hands. */
+X	struct Email_Board_struct *current_board;	
+X				/* the current board being played. */
+X
+X#else
+X 
+X	/* Character constants: */
+X        extern char *major_revision_level, *minor_revision_level;
+X      	extern char *card_names[],
+X		    *suit_names[],
+X		    *rank_names[],
+X		    *bid_names[],
+X		    *player_names[];
+X
+X	/* Information regarding the positions of the players: */
+X	extern int  player_next [],
+X		    player_prev [],
+X		    player_partner [],
+X		    local_player;
+X        extern int scoring_mode;
+X        extern int prompt_dummy;
+X        extern int default_plays;
+X 
+X	/* Information regarding the current hand: */
+X	extern int  dealer,
+X		    game_mode;
+X	extern deal current_deal;
+X	extern hand current_hand [4];
+X        extern int  trick;
+X 
+X	/* Information about the bidding: */
+X	extern int  trump_suit,
+X		    contract,
+X		    declarer,
+X                    dummy,
+X		    doubled, redoubled;
+X 
+X	extern bid_list bids [4];
+X	extern int  no_bids;
+X 
+X	/* Information regarding the current trick being played: */
+X	extern int  leader,
+X		    no_plays,
+X		    plays [];
+X 
+X	/* Scoring information: */
+X	extern int  tricks[],
+X		    above_line [],
+X		    below_line [],
+X		    vulnerable [],
+X		    hands_played;
+X 
+X	/* Information used for email duplicate scoring: */
+X	extern int total_no_deals,
+X		   current_deal_no,
+X		   replaying_mode,
+X		   ns_pair_no,
+X		   ew_pair_no;
+X	extern struct Email_Duplicate_struct *email_record;
+X	extern struct Email_Board_struct *current_board;	
+X 
+X#endif
+X 
+X 
+X/* int suit_of (int card_code); */
+X/* Returns the suit index associated to the card with the given card_code. */
+X#define suit_of(cc)	(cc/13)
+X 
+X/* int rank_of (int card_code); */
+X/* Returns the rank index associated to the card with the given card_code. */
+X#define rank_of(cc)	(cc % 13)
+X 
+X/* int trumpsuit_of (int bid_code); */
+X/* Returns the trump suit determined by a given bid. */
+X#define trumpsuit_of(bc)	((bc) > 2 ?  ((bc) - 3) % 5: -1)
+X 
+X/* int contract_of (int bid_code); */
+X/* Returns the level of the contract associated to the given bid. */
+X#define contract_of(bc)		((bc) > 2 ?  (((bc) - 3) / 5) + 1: 0)
+X
+END_OF_FILE
+if test 9551 -ne `wc -c <'globals.h'`; then
+    echo shar: \"'globals.h'\" unpacked with wrong size!
+fi
+# end of 'globals.h'
+fi
+if test -f 'help.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'help.c'\"
+else
+echo shar: Extracting \"'help.c'\" \(6323 characters\)
+sed "s/^X//" >'help.c' <<'END_OF_FILE'
+X/* help.c -- help functions for the bridge program.
+X ! 
+X ! Copyright (C) 1990,1991 by Matthew Clegg
+X ! 
+X ! This program may be copied and distributed freely.  Please do not
+X ! charge money for this program or for any program derived from it.
+X ! If you modify this program, then include a notice stating plainly
+X ! that your program is derived from the okbridge program and is not
+X ! the same as the official okbridge program.
+X !
+X ! I welcome any suggestions for improvement to okbridge, and 
+X ! I would be especially happy to receive improved source code.
+X ! If you have comments or suggestions, or if you would like to
+X ! join the okbridge mailing list, then write to
+X !
+X !   mclegg@cs.ucsd.edu
+X !
+X *
+X */
+X 
+X#include <stdio.h>
+X#include <string.h>
+X#include <ctype.h>
+X
+X#ifndef SEEK_SET
+X#define SEEK_SET  0
+X#endif
+X 
+X#include "globals.h"
+X#include "ps.h"
+X#include "input.h"
+X#include "terminal.h"
+X 
+X/* char *help_file_name = "okbridge.help"; */
+X#include "helpfile.h"
+X 
+Xextern int errno;
+Xextern char *sys_errlist[];
+Xextern char *strdup();
+Xextern char *getenv ();
+X
+Xtypedef struct help_entry_struct {
+X	char	*topic;
+X	char	*description;
+X	long int file_offset;
+X	struct help_entry_struct *next;
+X} *help_entry;
+X 
+Xstatic help_entry main_topic = NULL;
+XFILE *help_file = NULL;
+X
+X 
+Xstatic display_topics (message)
+X	char *message;
+X/* Displays the list of topics, with the given message as the top line.
+X . Does not display the main topic.
+X */
+X{
+X	int i;
+X	help_entry e;
+X	char msg_buf[80];
+X 
+X	clear_screen ();
+X	print (1,1,message);
+X	if (main_topic == NULL) {
+X		print (3,1,"The help system is empty.");
+X	} else {
+X		i = 3;
+X		for (e = main_topic->next; e != NULL; e = e->next) {
+X		  if (strcasecmp(e->topic, "slam")) {
+X			sprintf (msg_buf, "%-10s -- %s",e->topic,
+X				e->description);
+X			print (i++, 1, msg_buf);
+X		      };
+X		};
+X	};
+X	input_acknowledgment (24);
+X};
+X 
+Xstatic int read_help_line (buf, buflen)
+X	char *buf;
+X/* Reads a line from the help file.  Returns the number of characters
+X   read of -1 if EOF is encountered.  Skips lines beginning with a '#'. 
+X*/
+X{
+X	int i, ch;
+X 
+X	do {
+X		ch = getc(help_file);
+X		i = 0;
+X		while ((ch != '\n') && (ch != EOF)) {
+X			if (i < buflen-1) buf[i++] = ch;
+X			ch = getc(help_file);
+X		};
+X		buf[i] = '\0';
+X		if (ch == EOF) return (-1);
+X		while ((i > 0) && isspace(buf[i-1])) buf[--i] = '\0';
+X	} while (buf[0] == '#');
+X	return (i);
+X};
+X 
+Xstatic display_help_entry (e)
+X	help_entry e;
+X/* Displays the help_entry e. */
+X{
+X	char line[81];
+X	int lines_on_page, log;
+X
+X	lines_on_page = 0;
+X/*
+X	sprintf (line, "%s -- %s", e->topic, e->description);
+X	print(++lines_on_page, 1, line);
+X	lines_on_page += 1;
+X*/
+X
+X	fseek (help_file, e->file_offset, SEEK_SET);
+X	log = read_help_line (line, 81);
+X	while ((log >= 0) && strcmp(line, "--")) {
+X		if ((lines_on_page > 22) || (line[0] == '^')) {
+X			input_acknowledgment (24);
+X			clear_screen ();
+X			lines_on_page = 0;
+X			if (line[0] == '^') line[0] = ' ';
+X		};
+X		print (++lines_on_page, 1, line);
+X		log = read_help_line (line, 81);
+X	};
+X	input_acknowledgment (24);
+X		
+X};
+X
+Xstatic FILE *open_helpfile ()
+X/* Tries to open the helpfile with given name from the help_directory.
+X * If an error, prints an error message and returns NULL.  Otherwise,
+X * returns a pointer to the opened file.
+X */
+X{
+X	char filename_buf [80], msg_buf[80], *envhelpdir;
+X	FILE *fp;
+X 
+X	if ((envhelpdir = getenv("OKBRIDGE_HELPFILE")) != NULL)
+X		sprintf (filename_buf, "%s", envhelpdir);
+X	else
+X		sprintf (filename_buf, "%s", help_file_name);
+X
+X	fp = fopen (filename_buf, "r");
+X	if (fp == NULL)
+X		fp = fopen ("okbridge.help", "r");
+X
+X	if (fp == NULL) {
+X		sprintf (msg_buf, "Error opening helpfile %s", filename_buf);
+X		print (3, 1, msg_buf);
+X		sprintf (msg_buf, "System reports error: %s",
+X				sys_errlist[errno]);
+X		print (4, 1, msg_buf);
+X		input_acknowledgment (24);
+X	};
+X	return (fp);
+X};
+X 
+X 
+Xstatic help_entry find_help_topic (topic)
+X	char *topic;
+X/* Looks for the help entry with the associated topic.  If it is found,
+X * returns a pointer to the corresponding record.  Otherwise, returns NULL.
+X */
+X{
+X	help_entry e;
+X 
+X	e = main_topic;
+X	while (e != NULL) {
+X		if (!strcasecmp(e->topic, topic))
+X			return (e);
+X		e = e->next;
+X	};
+X	return (e);
+X};
+X 
+Xstatic help_entry read_new_help_entry ()
+X/* Reads a help entry from the help_file.  Allocates a help_entry record
+X . and records the pertinent information in that record.  Returns the
+X . allocated record or NULL if the end of file is reached.
+X */
+X{
+X	char line_buf[81], keyword_buf[80];
+X	help_entry e;
+X	char *curpos, *keypos, *descpos, ch;
+X	int log;
+X
+X	log = read_help_line (line_buf, 81);
+X	if (log < 0)
+X		return (NULL);
+X
+X	for (keypos = line_buf; isspace(*keypos); keypos++);
+X	for (curpos = keypos;(*curpos != '\0') && !isspace(*curpos);curpos++);
+X	for (descpos = curpos; isspace(*descpos); descpos++);
+X
+X	e = (help_entry) malloc(sizeof(struct help_entry_struct));
+X	*curpos = '\0';
+X	e->topic = strdup (keypos);
+X	e->description = strdup (descpos);
+X	e->file_offset = ftell (help_file);
+X	e->next = NULL;
+X
+X	do
+X		log = read_help_line (line_buf, 81);
+X	while 
+X		((log >= 0) && strcmp(line_buf, "--"));
+X
+X	return (e);
+X
+X};
+X
+X 
+Xinitialize_help_system ()
+X/* Called once at the beginning of the program to read the file of help
+X * topics.
+X */
+X{
+X	help_entry e;
+X 
+X	help_file = open_helpfile ();
+X	if (help_file == NULL) return;
+X 
+X	e = main_topic = read_new_help_entry ();
+X	while (e != NULL) {
+X		e->next = read_new_help_entry ();
+X		e = e->next;
+X	};
+X
+X};
+X 
+X 
+Xdisplay_help (topic)
+X	char *topic;
+X/* Displays help on the given topic.  This consists of looking up the
+X * help file associated to this topic and displaying the contents of this
+X * file on the screen.  If the topic string is empty, then displays first
+X * the contents of the main topic file, and then displays a list of the
+X * topics.  If there is no help on the given topic, then displays a list
+X * of topics.
+X */
+X{
+X	help_entry he;
+X	char line_buf[81];
+X 
+X	if (main_topic == NULL)
+X		return;
+X 
+X	Suspend_Comment_Display ();
+X        clear_screen ();
+X	if (strlen(topic) == 0) {
+X		display_help_entry (main_topic);
+X                display_topics ("Here is a list of available topics: ");
+X	} else if ((he = find_help_topic(topic)) != NULL)
+X		display_help_entry (he);
+X	else {
+X	    sprintf (line_buf, "%s  %s",
+X		 "There is no help for this topic.",
+X		 "The available topics are");
+X	    display_topics (line_buf);
+X	};
+X	Continue_Comment_Display ();
+X 
+X};
+END_OF_FILE
+if test 6323 -ne `wc -c <'help.c'`; then
+    echo shar: \"'help.c'\" unpacked with wrong size!
+fi
+# end of 'help.c'
+fi
+if test -f 'input.h' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'input.h'\"
+else
+echo shar: Extracting \"'input.h'\" \(7783 characters\)
+sed "s/^X//" >'input.h' <<'END_OF_FILE'
+X/* input.h -- interface for input module of bridge game.
+X ! 
+X ! Copyright (C) 1990,1991 by Matthew Clegg
+X ! 
+X ! This program may be copied and distributed freely.  Please do not
+X ! charge money for this program or for any program derived from it.
+X ! If you modify this program, then include a notice stating plainly
+X ! that your program is derived from the okbridge program and is not
+X ! the same as the official okbridge program.
+X !
+X ! I welcome any suggestions for improvement to okbridge, and 
+X ! I would be especially happy to receive improved source code.
+X ! If you have comments or suggestions, or if you would like to
+X ! join the okbridge mailing list, then write to
+X !
+X !   mclegg@cs.ucsd.edu
+X !
+X *
+X * This file defines the routines for handling the player-input
+X * in the bridge game.
+X *
+X */
+X 
+X/* The main job of the input module is to return a record indicating
+X . a player's input.  However, the input module also controls 
+X . some of the bookkeeping and communications aspects of the game.  The
+X . commands having index 100 or greater are handled internally to the
+X . input module and are not ever passed back to the calling routines.
+X */
+X 
+X#define CMD_ERROR	000
+X#define CMD_VULN	001
+X#define CMD_RDEAL	002
+X#define CMD_BID		004
+X#define CMD_PLAY	010
+X#define CMD_FINISH	020
+X 
+X#define CMD_HELLO	0000000100
+X#define CMD_ACK		0000000200
+X#define CMD_TALK	0000000400
+X#define CMD_HELP	0000001000
+X#define CMD_QUIT	0000002000
+X#define CMD_BELL	0000004000
+X#define CMD_PING	0000010000
+X#define CMD_ECHO	0000020000
+X#define CMD_PROMPT      0000040000
+X#define CMD_CLAIM	0000100000
+X#define CMD_RESP	0000200000
+X#define CMD_SCORE       0000400000
+X#define CMD_LOG         0001000000
+X#define CMD_DEAL	0002000000
+X#define CMD_LOAD	0004000000
+X#define CMD_SAVE	0010000000
+X#define CMD_REPLAY      0020000000
+X#define CMD_COMMENT	0040000000
+X#define CMD_DEFAULT     0100000000
+X#define CMD_REVIEW      0200000000
+X 
+X/* #define MAX_COMMANDS	25 */
+X
+X#define VERSION_LENGTH	10
+X#define VERSION_NAME_LENGTH 20
+X#define MESSAGE_LENGTH	75
+X#define TOPIC_LENGTH	20
+X#define FILENAME_LENGTH 60
+X 
+Xtypedef struct player_command_struct {
+X	long	command;
+X	int	player_no;
+X	union  {
+X		int 	bid;
+X		int 	card;
+X		char 	deal [52];
+X		char 	version_name [VERSION_NAME_LENGTH];
+X		char	message [MESSAGE_LENGTH];
+X		char	topic [TOPIC_LENGTH];
+X		char    filename [FILENAME_LENGTH];
+X		int	bell;
+X		int	ping_source;
+X		int     prompt;
+X		int 	tricks;
+X		int	response;
+X		int     scoring;
+X		int	nhands;
+X		int	vulnerable;
+X		int     defaalt;
+X	} data;
+X} *player_command;
+X 
+Xtypedef struct input_buffer_struct {
+X	char	buf[91];
+X	int	row, col, length;	/* aspects of the screen display. */
+X	int	pos;			/* cursor position in buffer. */
+X	int     defaulted;              /* true if input buffer contains the
+X					   default input. */
+X} *input_buffer;
+X 
+X 
+X#ifndef _INPUT_
+X 
+Xextern parse_player_command ();
+X/* void parse_player_command (parse_string ps, player_command pc); */
+X/* parse the string ps into a player command, which is stored in pc.
+X * If an error is encountered, then an error message is stored in the
+X * global variable parsing_errmsg.
+X *
+X * The syntax of a player command is as follows:
+X *
+X * 0.  VULN  NONE | EW | NS | BOTH
+X * 1.  RDEAL <cards>
+X * 2.  BID  (<level> (<suit> | <notrump>)) | <pass> | <double> | <redouble>
+X * 3.  PLAY <suit> <card>
+X * 4.  CLAIM <ntricks>
+X * 5.  FINISH YES | NO
+X * 6.  TALK message
+X * 7.  HELLO version name
+X * 8.  ACK   version name
+X * 9.  HELP [topic]
+X * 10. BELL [ON | OFF]
+X * 11. PROMPT [ON | OFF]
+X * 12. PING
+X * 13. ECHO [player]
+X * 14. SCORE mode
+X * 15. LOG <log-file>
+X * 16. DEAL [nhands]
+X * 17. LOAD filename
+X * 18. SAVE filename
+X * 19. REPLAY filename
+X * 20. COMMENT broadcast-message
+X * 21. QUIT
+X *
+X * where:
+X *  <cards> = A string over the alphabet {0,1,2,3} containing exactly
+X *            thirteen occurrences of each symbol.
+X *  <level> = 1 | 2 | 3 | 4 | 5 | 6 | 7
+X *  <suit>  = C | D | H | S | CLUB[S] | DIAMOND[S] | HEART[S] | SPADE[S]
+X *  <notrump> = N | NT | NOTRUMP
+X *  <pass> = P | PASS
+X *  <double> = X | DOUBLE
+X *  <redouble> = XX | REDOUBLE
+X *  <card> = <suit> <rank>
+X *  <rank> = 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | T | J | Q | K
+X *             | JACK | KING | QUEEN
+X *  <tricks>  = an integer in the range 0 - 13.
+X *  <version> = a string indicating the revision level of the program
+X *  <name>    = the name of a player
+X *  <player>  = NORTH | EAST | SOUTH | WEST
+X *  <mode>    = RUBBER | CHICAGO
+X */
+X 
+X 
+Xextern clear_input_buffer ();
+X/* void clear_input_buffer (input_buffer ib); */
+X/* Clears the screen display representing the input buffer, and
+X * resets the cursor position to the beginning of the buffer.
+X */
+X 
+Xextern int update_input_buffer ();
+X/* int update_input_buffer (input_buffer ib, int ch); */
+X/* Adds the character ch to the input buffer, or if it is a control
+X * character, then modifies the cursor position or buffer appropriately.
+X * If the user has indicated he is through entering input, by entering
+X * i.e. <^J> or <^M>, then TRUE is returned.  Otherwise, FALSE is
+X * returned.  The other control characters which are accepted at this
+X * point are:
+X *	<^H>	causes last character in buffer to be erased.
+X * 	<^R>	causes the screen to be refreshed.
+X *	<DEL>	causes last character in buffer to be erased.
+X *	<ESC>	causes entire buffer to be erased.
+X * Printable characters are entered into the buffer if there is room.
+X * All other characters are ignored.
+X */
+X 
+Xextern Initialize_Input ();
+X/* void Initialize_Input (void); */
+X/* This routine should be called once when the program first begins,
+X *  in order to set up the input buffers correctly.
+X */
+X 
+X 
+Xextern input_hand ();
+X/* void input_hand (deal new_deal); */
+X/* Inputs a new deal into the data structure 'new_deal'.  If the dealer
+X * is the local_player, then the deck is shuffled locally and the deal
+X * is messaged to the other players.  Otherwise, we wait for the other
+X * players to send us the new deal.
+X */
+X 
+Xextern int input_bid ();
+X/* int input_bid (int rmt_player, int minimum_bid, int double_ok,
+X     int redouble_ok); */
+X/* Inputs a bid from the player 'rmt_player'.  If rmt_player is the
+X * local player, then we only accept a contract bid which is at least as
+X * high as minimum_bid, and we only accept a double or redouble bid if
+X * respectively double_ok and redouble_ok is true.  However, if rmt_player
+X * is not the local player, then we wait for the bid to come from the
+X * network.  In this case, we assume that the bid we receive is legal.
+X */
+X 
+Xextern int input_play ();
+X/* int input_play (int rmt_player, hand legal_plays); */
+X/* Inputs a play from the player 'rmt_player'.  If rmt_player is the
+X * local player, then we only accept a play which is listed as one of the
+X * cards in 'legal_plays'.  However, if rmt_player is not the local player,
+X * then we wait for the play to come from the network.  In this case, we
+X * assume that the play is legal.  If the return value is non-negative,
+X * then it indicates the card which has been played.  Otherwise,
+X * the return value is of the form -k-1, where k is the number of
+X * additional tricks conceded to the declaring team in this hand.
+X */
+X 
+Xextern input_acknowledgement ();
+X/* void input_acknowledgment (int line); */
+X/* Displays the message "PRESS RETURN TO CONTINUE" on the given screen line,
+X * unless line == -1, in which case the message is displayed on the
+X * status line.  Then waits for the user to press, RETURN.
+X */
+X 
+Xextern send_player_message (); 
+X/* send_player_message (char *message); */
+X/* Transmits the message to the other players through the network. 
+X * Prepends the name of the player to the message before transmitting.
+X */
+X 
+Xextern Broadcast_Comment ();
+X/* Broadcase_Comment (char *message); */
+X/* Transmits the message to the other players as a comment which is
+X * displayed in the talk window.
+X */
+X
+X#endif
+END_OF_FILE
+if test 7783 -ne `wc -c <'input.h'`; then
+    echo shar: \"'input.h'\" unpacked with wrong size!
+fi
+# end of 'input.h'
+fi
+if test -f 'oktally.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'oktally.c'\"
+else
+echo shar: Extracting \"'oktally.c'\" \(6530 characters\)
+sed "s/^X//" >'oktally.c' <<'END_OF_FILE'
+X/* tally.c
+X ! 
+X ! Copyright (C) 1991 by Matthew Clegg
+X ! 
+X ! This program may be copied and distributed freely.  Please do not
+X ! charge money for this program or for any program derived from it.
+X ! If you modify this program, then include a notice stating plainly
+X ! that your program is derived from the okbridge program and is not
+X ! the same as the official okbridge program.
+X !
+X ! I welcome any suggestions for improvement to okbridge, and 
+X ! I would be especially happy to receive improved source code.
+X ! If you have comments or suggestions, or if you would like to
+X ! join the okbridge mailing list, then write to
+X !
+X !   mclegg@cs.ucsd.edu
+X !
+X * This program merges email duplicate files, totaling the match
+X * points for corresponding pairs in each file.
+X *
+X * Usage:
+X *
+X *   tally [-c] [-sn] file_1 file_2 ... file_n
+X *
+X * Reads each of file_1, file_2, ..., file_n.  Merges the boards
+X * from these files and totals the match points for each pair.
+X * Writes the merged set of boards to standard output.  If the
+X * -c flag is given, then the output is written in encoded format.
+X * If the "-sn" parameter is given, then "n" is interpreted to be
+X * some positive integer which determines the number of hands to
+X * skip before writing the first hand to output.  If a filename is
+X * given simply as "-", then the hands are read from standard input.
+X */
+X
+X#include <stdio.h>
+X#include <string.h>
+X
+X#define _BRIDGE_
+X
+X#include "globals.h"
+X#include "email.h"
+X
+Xextern int errno;
+Xextern char *sys_errlist [];
+Xextern char *email_error_message;
+Xextern char *malloc ();
+X
+Xchar **filename;
+X  /* The list of files from which we are to read email duplicate hands. */
+Xint no_files;
+X  /* The number of entries in the filename array. */
+Xint coded_format;
+X  /* A boolean variable which is true if the output should be written
+X     in coded format. */
+X
+Xstruct Email_Duplicate_struct *merged_email_boards;
+X  /* The set of merged email boards. */
+X
+Xstruct Email_Duplicate_struct *current_email_boards;
+X  /* The set of email boards that we are currently merging. */
+X
+Xint *Pair_Translation = NULL;
+X  /* An array mapping pair numbers in the current email board list to
+X     corresponding pair numbers in the merged board list.
+X  */
+X
+Xchar *strdup (s)
+X     char *s;
+X{
+X  char *p, *q;
+X
+X  p = q = malloc (strlen(s) + 1);
+X  while (*s)
+X    *(q++) = *(s++);
+X  *q = '\0';
+X  return (p);
+X};
+X
+Xint Lookup_Pair (e, ne, sw)
+X     struct Email_Duplicate_struct *e; char *ne, *sw;
+X/* Looks for the pair (ne, sw) in the pair list of the email duplicate
+X   struct e.  If found, returns the index of the pair.  Otherwise,
+X   returns -1.
+X*/
+X{
+X  int i;
+X
+X  for (i = 1; i <= e->npairs; i++)
+X    if (!strcmp(e->player_list[i].ne, ne) && !strcmp(e->player_list[i].sw, sw))
+X      return (i);
+X  return (-1);
+X};
+X
+Xvoid Create_Pair_Mapping ()
+X/* Creates a mapping between pair numbers for the current_email_boards and
+X   the pair numbers for the merged_email_boards.  Records new pairs into
+X   merged_email_boards if necessary.
+X*/
+X{
+X  int i, p;
+X  char *ne, *sw;
+X
+X  if (Pair_Translation != NULL)
+X    free (Pair_Translation);
+X  Pair_Translation = (int *) malloc (sizeof(int) * 
+X				     (current_email_boards->npairs + 1));
+X
+X  for (i = 1; i <= current_email_boards->npairs; i++) {
+X    ne = current_email_boards->player_list[i].ne;
+X    sw = current_email_boards->player_list[i].sw;
+X    if ((p = Lookup_Pair(merged_email_boards, ne, sw)) < 0)
+X      p = Add_Email_Pair (merged_email_boards, ne, sw);
+X    Pair_Translation[i] = p;
+X  };
+X};
+X
+Xint Equal_Hand (h1, h2)
+X     hand h1, h2;
+X/* Returns true if the hands h1 and h2 are equal. */
+X{
+X  int i;
+X
+X  for (i = 0; i < 52; i++)
+X    if (h1[i] != h2[i])
+X      return (0);
+X
+X  return (1);
+X};
+X
+Xvoid Tally_Board (b)
+X     Email_Board *b;
+X/* Records the scores from the board b into the list of merged email duplicate
+X   boards. */
+X{
+X  Email_Board *c;
+X  Email_Score *s;
+X  int ns, ew;
+X
+X  c = merged_email_boards->board_list;
+X  while ((c != NULL) && !Equal_Hand (b->deal, c->deal)) c = c->next;
+X  if (c == NULL) {
+X    c = Add_Email_Board (merged_email_boards, b->deal);
+X    c->ns_vulnerable = b->ns_vulnerable;
+X    c->ew_vulnerable = b->ew_vulnerable;
+X    c->pre_script = b->pre_script;
+X    c->post_script = b->post_script;
+X    c->dealer = b->dealer;
+X  };
+X
+X  s = b->score_list;
+X  for (s = b->score_list; s != NULL; s = s->next) {
+X    ns = Pair_Translation [s->ns_pair];
+X    ew = Pair_Translation [s->ew_pair];
+X    Record_Email_Score (c, ns, ew, s->bid, s->doubled, s->contractor, 
+X			s->result, s->ns_score);
+X  };
+X
+X};
+X
+Xvoid Abort (m)
+X     char *m;
+X{
+X  fprintf (stderr, "tally: %s\n", m);
+X  exit (1);
+X};
+X
+Xmain (argc, argv)
+X     int argc; char *argv[];
+X{
+X  int i, status, skip_count;
+X  char error_buf [80];
+X  Email_Board *b;
+X
+X  no_files = 0;
+X  skip_count = 0;
+X  filename = (char **) malloc ((argc - 1) * sizeof(char *));
+X  for (i = 1; i < argc; i++) {
+X    if (*argv[i] == '-') {
+X      if(argv[i][1] == '\0')
+X	filename[no_files++] = argv[i];
+X      else if (argv[i][1] == 's') {
+X	skip_count = atoi (argv[i]+2);
+X	if (skip_count == 0) {
+X	  sprintf (error_buf, "Error in skip count: %s", argv[i]+2);
+X	  Abort (error_buf);
+X	};
+X      } else if (!strcmp(argv[i], "-c"))
+X	coded_format = 1;
+X      else
+X	Abort ("Error in parameters");
+X    } else
+X      filename[no_files++] = argv[i];
+X  };
+X
+X  if (no_files < 1)
+X    Abort ("At least one email file name must be given.");
+X
+X  status = Read_Email_Duplicate_File (filename[0], &merged_email_boards);
+X  if (status < 0) {
+X    sprintf (error_buf, "Error opening file %s: %s", filename[0],
+X	     sys_errlist[errno]);
+X    Abort (error_buf);
+X  } else if (status > 0) {
+X    sprintf (error_buf, "Error in format of file %s: %s", filename[0],
+X	     email_error_message);
+X    Abort (error_buf);
+X  };
+X
+X  for (i = 1; i < no_files; i++) {
+X    status = Read_Email_Duplicate_File (filename[i], &current_email_boards);
+X    if (status < 0) {
+X      sprintf (error_buf, "Error opening file %s: %s", filename[0],
+X	       sys_errlist[errno]);
+X      Abort (error_buf);
+X    } else if (status > 0) {
+X      sprintf (error_buf, "Error in format of file %s: %s", filename[0],
+X	       email_error_message);
+X      Abort (error_buf);
+X    };
+X
+X    Create_Pair_Mapping ();
+X
+X    for (b = current_email_boards->board_list; b != NULL; b = b->next)
+X      Tally_Board (b);
+X  };
+X
+X  for(i=0; (i < skip_count) && (merged_email_boards->board_list != NULL); i++){
+X    merged_email_boards->board_list =
+X      merged_email_boards->board_list->next;
+X    merged_email_boards->nboards--;
+X  };
+X
+X  Write_Email_Duplicate_File ("-", coded_format, merged_email_boards);
+X
+X};
+END_OF_FILE
+if test 6530 -ne `wc -c <'oktally.c'`; then
+    echo shar: \"'oktally.c'\" unpacked with wrong size!
+fi
+# end of 'oktally.c'
+fi
+if test -f 'scoring.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'scoring.c'\"
+else
+echo shar: Extracting \"'scoring.c'\" \(6200 characters\)
+sed "s/^X//" >'scoring.c' <<'END_OF_FILE'
+X/* scoring.c -- scoring functions for the bridge program.
+X ! 
+X ! Copyright (C) 1990,1991 by Matthew Clegg
+X ! 
+X ! This program may be copied and distributed freely.  Please do not
+X ! charge money for this program or for any program derived from it.
+X ! If you modify this program, then include a notice stating plainly
+X ! that your program is derived from the okbridge program and is not
+X ! the same as the official okbridge program.
+X !
+X ! I welcome any suggestions for improvement to okbridge, and 
+X ! I would be especially happy to receive improved source code.
+X ! If you have comments or suggestions, or if you would like to
+X ! join the okbridge mailing list, then write to
+X !
+X !   mclegg@cs.ucsd.edu
+X !
+X *
+X * This file defines the functions used for computing scores.
+X * We provide functions for scoring according to the rules of
+X * rubber bridge as well as according to the rules of Chicago style
+X * bridge.  Instead of being passed parameters, these functions
+X * obtain most of their information from the global variables
+X * defined in globals.h.
+X *
+X * I would like to thank Tom Kronmiller for supplying the code
+X * for scoring according to the Chicago rules.  Thanks Tom!
+X */
+X 
+X#include "globals.h"
+X
+X 
+Xstatic int  first_trick   [] = {20, 20, 30, 30, 40};
+Xstatic int  subseq_tricks [] = {20, 20, 30, 30, 30};
+X
+X
+Xint Rubber_score_above (extra)
+X     int extra;
+X/* int Rubber_score_above (int extra, int vulnerable); */
+X/* Computes the above-the-line score for the current contract assuming
+X * that 'extra' many tricks below the required number were taken.
+X * Returns the computed above-the-line score.
+X */
+X{
+X  int above = 0;  /* computed above-the-line points. */
+X  int vul;        /* true if contracting team is vulnerable. */
+X
+X  vul = vulnerable[side_of(declarer)];
+X  if (doubled || redoubled) {
+X    above = 100 * extra;
+X    if (vul)       above *= 2;
+X    if (redoubled) above *= 2;
+X    above += 50;
+X  } else
+X    above = subseq_tricks[trump_suit] * extra;
+X
+X  if (contract == 6)
+X    above += vul? 750: 500;
+X  else if (contract == 7)
+X    above += vul? 1500: 1000;
+X  return (above);
+X	
+X};
+X
+Xint Rubber_score_below ()
+X/* int Rubber_score_below (void); */
+X/* Computes the below-the-line score for the current contract,
+X * assuming that it was made.
+X */
+X{
+X  int below = 0;  /* computed below-the-line points. */
+X
+X  below  = first_trick[trump_suit] + 
+X    (contract - 1) * subseq_tricks[trump_suit];
+X  if (redoubled)
+X    below *= 4;
+X  else if (doubled)
+X    below *= 2;
+X  return (below);
+X};
+X
+X
+Xint Rubber_score_set (down)
+X     int down;
+X/* int Rubber_score_set (int down); */
+X/* Computes the penalty score for the current contract assuming that
+X * 'down' too few tricks were taken.  Returns the score.
+X */
+X{
+X  int penalty = 0;  /* computed penalty points. */
+X  int vul;          /* true if contracting team is vulnerable. */
+X
+X  vul = vulnerable[side_of(declarer)];
+X  down -= 1;
+X  if (doubled || redoubled) {
+X    if (vul) penalty = 200 + 300 * down;
+X    else     penalty = 100 + 200 * down;
+X    if (redoubled) penalty *= 2;
+X  } else {
+X    if (vul) penalty = 100 + 100 * down;
+X    else     penalty =  50 +  50 * down;
+X  };
+X  return (penalty);
+X};
+X
+X
+Xint Chicago_score_made (extra, vulnerable)
+X     int extra, vulnerable;
+X/* int Chicago_score_made (int extra, int vulnerable); */
+X/* Computes the score for the current contract assuming that it was made
+X * and that an additional 'extra' tricks were taken.  'vulnerable' is a
+X * boolean flag which indicates whether the declaring team was
+X * vulnerable.  Returns the score.
+X */
+X{
+X	int result = 0, perTrick;
+X
+X
+X	/* How much is making the bid worth? */
+X	perTrick = (MINOR(trump_suit))? 20:30;
+X	result = perTrick * contract;
+X	if (trump_suit == SUIT_NOTRUMP)	result += 10;
+X	if (redoubled)                  result *= 4;
+X	else if (doubled)               result *= 2;
+X	  
+X	/* Was it a game we made? */
+X	if (result >= 100)		result += (!vulnerable)? 300:500;
+X/*	else					result += 50; */
+X
+X	/* Was it a slam we made? */
+X	if (contract == 6)		result += (!vulnerable)? 500:750;
+X	if (contract == 7)		result += (!vulnerable)? 1000:1500;
+X
+X	/* Were we insulted by a double? */
+X	if (redoubled)                  result += 100;
+X	else if (doubled)               result += 50;
+X
+X	/* How much do we get for overtricks? */
+X	if (redoubled)
+X	        result += (extra * 100) * (vulnerable? 4: 2);
+X	else if (doubled)
+X	        result += (extra * 100) * (vulnerable? 2: 1);
+X	else
+X		result += extra * perTrick;
+X
+X	return (result);
+X}
+X
+X
+Xint Chicago_score_set (down, vulnerable)
+X     int down, vulnerable;
+X/* int Chicago_score_set (int down, int vulnerable); */
+X/* Computes the score for the current contract assuming that it was
+X * set and that 'down' too few tricks were taken.  'vulnerable' is
+X * a boolean flag which indicates whether the declaring team was
+X * vulnerable.  Returns the score.
+X *
+X * written by Tom Kronmiller
+X */
+X{
+X	int result = 0;
+X
+X	if (!doubled)
+X	{
+X		result = 50 * down;
+X		if (vulnerable) result *= 2;
+X	}
+X	else
+X	{
+X		switch (down)
+X		{
+X			case 1:
+X				result = (!vulnerable)? 100:200;
+X				break;
+X			case 2:
+X				result = (!vulnerable)? 300:500;
+X				break;
+X			case 3:
+X				result = (!vulnerable)? 500:800;
+X				break;
+X			default:
+X				result = 500 + (300*(down-3)) 
+X				  + ((!vulnerable)? 0:300);
+X				break;
+X		}
+X		if (redoubled) result *= 2;
+X	}
+X	return (result);
+X}
+X
+X
+Xint Duplicate_score_made (extra, vulnerable)
+X     int extra, vulnerable;
+X/* int Duplicate_score_made (int extra, int vulnerable); */
+X/* Computes the score for the current contract assuming that it was made
+X * and that an additional 'extra' tricks were taken.  'vulnerable' is a
+X * boolean flag which indicates whether the declaring team was
+X * vulnerable.  Returns the score.
+X */
+X{
+X	int score;
+X
+X	score = Chicago_score_made (extra, vulnerable);
+X	if (score < 300)
+X		score += 50;
+X	return (score);
+X	
+X}
+X
+Xint Duplicate_score_set (down, vulnerable)
+X     int down, vulnerable;
+X/* int Duplicate_score_set (int down, int vulnerable); */
+X/* Computes the score for the current contract assuming that it was
+X * set and that 'down' too few tricks were taken.  'vulnerable' is
+X * a boolean flag which indicates whether the declaring team was
+X * vulnerable.  Returns the score.
+X */
+X{
+X	return (Chicago_score_set(down, vulnerable));
+X};
+X
+END_OF_FILE
+if test 6200 -ne `wc -c <'scoring.c'`; then
+    echo shar: \"'scoring.c'\" unpacked with wrong size!
+fi
+# end of 'scoring.c'
+fi
+echo shar: End of archive 6 \(of 7\).
+cp /dev/null ark6isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 7 archives.
+    rm -f ark[1-9]isdone
+    echo creating input.c from input.c.aa and input.c.ab
+    cat input.c.aa input.c.ab >input.c
+    rm -f input.c.aa input.c.ab
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

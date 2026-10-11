@@ -1,0 +1,920 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,f398de4c52427e68,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-02-27 21:24:37 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site umcp-cs.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!eagle!harpo!seismo!rlgvax!cvl!umcp-cs!petec
+From: petec@umcp-cs.UUCP
+Newsgroups: net.sources
+Subject: dump/file-restor code (2 of 4)
+Message-ID: <5489@umcp-cs.UUCP>
+Date: Tue, 28-Feb-84 00:24:37 EST
+Article-I.D.: umcp-cs.5489
+Posted: Tue Feb 28 00:24:37 1984
+Date-Received: Wed, 29-Feb-84 14:04:30 EST
+Organization: Univ. of Maryland, Computer Science Dept.
+Lines: 900
+
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting filtapmgr.c'
+sed 's/^X//' <<'//go.sysin dd *' >filtapmgr.c
+static	char	*sccsid = "@(#) filtapmgr  (University of Maryland)";
+
+X/* 			File Tape Manager
+*
+* Copyright 1984 - University of Maryland
+*
+*	This program is a file/tape manager.  It's purpose is to maintain
+* a record of every file dumped onto a particular tape.  The record
+* contains the file name, its inode number, a directory flag, and three tape
+* names (one primary & two  secondary).  The information is kept in a compact
+* form in a file called "/etc/filesontapes".  Several file systems can
+* be maintained in this one file.
+*	This program is called using a "file system name", a dumpdir
+* file, and a tape name.  The file system name should be a logical name
+* (ie. the name of a mounted file system.)  The dumpdir file should be
+* the name of a file containing the output from the dumpdir program.
+* The tape name can be any 2-letter name (defined by MAXTAPNAM).
+*	The number of Back-ups for each file can be varied (MAXBACKUPS).
+* For each back-up, the inode number is kept.  This is not necessary, but
+* might prove helpful, if the restor program is changed to accept inode #'s
+* as a "key" to finding & restoring the file.
+*/
+X/* Original design by:  Patrick Steranka (patrick@umcp-cs)  --  Dec. 1982 
+   Appended to and maintained by:  Pete Cottrell (petec@umcp-cs) 
+
+   Please send all comments, bug reports, etc, to Pete Cottrell.
+   Patrick has graduated and is no longer working with this.	
+*/
+#include <stdio.h>
+#include <sys/param.h>
+#include <dir.h>
+#include <ctype.h>
+#include "filtap.h"
+
+PTRNODE marker; /* This marker marks the end of a directory */
+PTRNODE	base_sys; /* Pointer to the base of the in-core file system */
+
+char	*filsys_nam,	/* Logical Name of file system currently working on */
+	*dd_file,	/* Name of current dumpdir for current file system */
+	*tape_name;	/* Tape Name to be used for updating all entries in
+			   dumpdir file */
+char	*filename;
+ino_t	inode;
+FILE	*fp_dd; /* This is used for the dumpdir files */
+FILE	*fp; /* This is used for /etc/filesontapes */
+char	*tapeused;
+X/* Option flags */
+int	topt = 0;	/* tape option */
+int	fopt = 0;	/* file option */
+int	popt = 0;	/* purge-only option */
+int	vopt = 0;	/* verbose option */
+int	dopt = 0;	/* disable tape-check option */
+int	sopt = 0;	/* summary option */
+X/* Summary Information */
+int	s_nofils = 0;	/* Record of # files read per files system */
+int	s_nomkrs = 0;	/* # of markers in filsys_file */
+
+int	s_totent = 0;	/* total number of entries in filsys_file */
+int	s_filent = 0;	/* number of actual file entries in filsys_file */
+int	s_dirent = 0;	/* number of directory entries in filsys_file */
+int	s_dotent = 0;	/* number of dot(.) or dotdot(..) entries */
+                     /* above totals tallied during writing of filsys_file */
+
+int     r_totent = 0;   /* number of entries read from filsys_file */
+int  	d_totent = 0;	/* number of entries deleted from filsys_file during
+                           reading due to outdated info */
+
+
+X/* Global Procedures and Functions used */
+char	**argv; /* this will be used globally */
+int	argc;	/* this will be used globally */
+
+char	*index(),*adjust();
+PTRNODE	talloc(),makdir(),findname(),getnode(),getentry(),getvalentry();
+int	ckfilsys(),getnextfile();
+FILE	*fopen();
+
+
+main(argn,arg)
+int	argn;
+char	**arg;
+{
+
+		/* Initialize the marker variable, do it here vs during 
+		initialization so if MAXBACKUPS changes then this will 
+			still work */
+	marker = getnode("/",0); 
+	argc = argn; /* make argc global */
+	argv = arg;  /* make argv global */
+	if (argv[1][0] == '-') setopts(); 
+	if(!popt) /* make sure we have enough arguments */
+	  if ((argc < 4 && topt == 0) || (argc < 3 && topt == 1)){
+usage:		fprintf(stderr,"Usage: filtapmgr [-f filsys_file] [-sdv] [-t tape_name] filsys_nam dumpdir_fil tape_name\n");
+		fprintf(stderr,"or     filtapmgr [-f filsys_file] [-dvs] -p tape_name\n");
+		exit(1);
+	}
+
+	if (vopt) /* if user want's to know what's going on */
+		printf("Building in core file system using %s.\n",filsys_file);
+	/* let's check the tape name (don't want any small letters) */
+	if (!dopt && (topt || popt)){
+		tapeused = adjust(tapeused);
+	}
+	/* Get a node to be the base of the fil_sys */
+	base_sys = getnode("_root_",0);
+
+	if (Build_Sys(base_sys,filsys_file) != 1){
+		fprintf(stderr,"Fatal Error in Build_Sys after %d entries.\n",
+			r_totent);
+		fprintf(stderr,"%d entries were deleted before the error\n",
+			d_totent);
+		exit(1);
+	}
+	if (popt) /* we are simply purging, no need to add or update */
+		printf("Purge is complete, Comrade Hacker!!!\n");
+	else
+	/* For each file system -- add or update files dumped onto tape */
+		while (nextfilsys(&filsys_nam,&dd_file,&tape_name)){
+			s_nofils = 0; /* count # of files in dumpdir file */
+			if (vopt)
+		    	    printf("Processing file system %s\n",filsys_nam);
+			include_these_files(filsys_nam,dd_file,tape_name);
+			if (sopt)
+				printf("%d files processed (on %s)\n",s_nofils, 
+					filsys_nam);
+		}
+
+	if(vopt)
+		printf("Creating (or Updating) compacted file system file %s.\n",filsys_file);
+
+	Write_Sys(base_sys,filsys_file);
+	if (sopt){
+		/* print out summary information */
+		printf("%d\tTotal entries\n",s_totent);
+		printf("%d\tdirectory entries\n",s_dirent);
+		printf("%d\tfile entries\n",s_filent);
+		printf("%d\tmarker entries\n",s_nomkrs);
+		printf("%d\tdirectory entries (including '.' & '..')\n",
+				s_dirent+s_dotent);
+	}
+	exit(0);
+}
+
+setopts()
+{
+	char *opts;
+
+	while(argv[1][0] == '-'){
+		opts = *++argv;
+		argc--;
+		while(*++opts){
+			switch(*opts){
+			case 'v': /* verbose option */
+				vopt++;
+				break;
+			case 's': /* summary option */
+				sopt++;
+				break;
+			case 'd': /* disable tape check option */
+				dopt++;
+				break;
+			case 'p': /* purge option */
+				popt++;
+				break;
+			case 't': /* tape option */
+				tapeused = *++argv;
+				argc--;
+				topt++;
+				break;
+			case 'f': /* file option */
+				filsys_file = *++argv;
+				argc--;
+				fopt++;
+				break;
+			default:
+				fprintf(stderr,"Invalid option `%c' ignored.\n",*opts);
+				break;
+			} /* end case */
+		} /* end while (opts) */
+	} /* end while */
+}
+
+
+Build_Sys(base,filsys_fil)
+PTRNODE	base;
+char	*filsys_fil;
+{
+	if ((fp = fopen(filsys_fil,"r")) == NULL){
+		fprintf(stderr,"\n\nNo previous `files on tape' information.\n");
+		fprintf(stderr,"File %s will be created.\n",filsys_fil);
+		creat(filsys_fil,0644);
+		return(1); /* File system built OK */
+	}
+	if (Recurse_Read(base) != 1){
+		fclose(fp);
+		return(0);
+	} /* Some Error in creating incore file system */
+	fclose(fp);
+	if (topt){
+		printf("File system data file built. Due to old info,\n");
+		printf("%d\t entries out of %d\t were deleted.\n",d_totent,
+			r_totent);
+	}
+	return(1); /* File system Built OK */
+}
+
+Recurse_Read(st_ptr)
+PTRNODE st_ptr;
+{
+	PTRNODE e,dot,dotdot,trav;
+
+	/* St_ptr should be pointing to a directory name. */
+	/* So "go down" to its "." entry and write all its sub-entries */
+	if ((dot=getvalentry(1)) == NULL) return(1); /* This is the */
+	if ((dotdot=getvalentry(1)) == NULL){	       /*  normal return */
+		/* What missing ".." entry ??? */
+		fprintf(stderr,"Unexpected EOF in file /etc/filesontapes\n");
+		return(ERROR);
+	}
+	if ((dot == (PTRNODE) ERROR) || 
+		(dotdot == (PTRNODE) ERROR)) return(ERROR);
+	/* Link "." to directory name & "." to ".." */
+	st_ptr->down = dot;
+	linknode(dotdot,dot);
+	if(strcmp(".",dot->name) != 0 || strcmp("..",dotdot->name) != 0){
+		fprintf(stderr,". or .. entries missing from directory %s\n",st_ptr->name);
+		fprintf(stderr,". and .. entries are:\n");
+		printnode(dot);
+		printnode(dotdot);
+		fprintf(stderr,"`%s' not found\n",st_ptr->name);
+		return(ERROR);
+	}
+	trav = dotdot;
+	while((e=getvalentry(1)) != NULL && strcmp("/",e->name) != 0){
+		/* Add this entry to the directory list */
+		if (e == (PTRNODE) ERROR) return(ERROR);
+		linknode(e,trav);
+		if (e->dir)
+			if(Recurse_Read(e) == ERROR) return(ERROR);
+		trav = trav->next;
+	}
+	return(1);
+}
+
+
+PTRNODE
+getvalentry(ckflag)
+int ckflag;
+{
+    register int havemarker;
+    register int valid=0;
+    PTRNODE e;
+    while (!valid){
+	e=getentry();
+	if (e==(PTRNODE) NULL || e==(PTRNODE) ERROR) return(e);
+	if (!topt || strcmp("/",e->name)==0 || 
+            strcmp(".",e->name)==0 || strcmp("..",e->name)==0){
+		valid++;
+	}
+	else{			/* topt is set, so let's clean the system */
+        	if (e->dir && ((ckflag)?delete_file_entry(e):1)){
+		  /* we are possibly at a directory with outdated info, or
+		    we are recursively deleting sub-directories */
+		   havemarker=0; /* When we are deleting a sub-directory, we
+				   want to keep going until we hit the file 
+				   entry containing a '/', known as a marker.
+				   Havemarker is a flag that tells us when we
+				   have reached the marker */
+		   while (!havemarker){
+		       e=getvalentry(0);
+                       d_totent++;
+		       if (e==(PTRNODE) NULL || e==(PTRNODE) ERROR) return(e);
+		       if (strcmp("/",e->name)==0) havemarker++;
+		   }
+                }
+		else if (e->dir) valid++;
+		else /* at file node, or at a '.' or '..' node, so lets
+                        get rid of old info */
+		   ckflag?(delete_file_entry(e)?d_totent++:valid++):valid++;
+        }
+    }
+    return(e);
+}
+
+delete_file_entry(e)
+PTRNODE e;
+{
+    int i,ii,j;
+    int delete=1;
+    for (ii=0,i=0; ii<MAXBACKUPS; ii++)
+	if (strcmp(e->tapes[i],tapeused)==0){
+	    for (j=i; j<MAXBACKUPS-1; j++){
+		strcpy(e->tapes[j],e->tapes[j+1]);
+		e->inodes[j] = e->inodes[j+1];
+	    }
+	    e->inodes[MAXBACKUPS-1] = 0;
+	    for (j=0;j<MAXTAPNAM; j++)
+		e->tapes[MAXBACKUPS-1][j] = ' ';
+	    e->tapes[MAXBACKUPS-1][MAXTAPNAM] = '\0';
+	    /* keep the value of i so we can look at this position again */
+	}
+	else i++; /* this position of tapes[] looks OK, go to next */
+    for (i=0; i<MAXBACKUPS; i++)
+	if (strcmp(e->tapes[i],"  ") != 0) delete--;
+    if (delete==1) return(1);
+    return(0);
+}	    
+ 
+	
+nextfilsys(filsys_nam,dumpdir_fil,tape_name)
+char	**filsys_nam,**dumpdir_fil,**tape_name;
+{
+	if (*++argv == 0) return(0); /* Stop processing */
+	*filsys_nam = *argv;
+	*dumpdir_fil = *++argv;
+	if (ckfilsys(*filsys_nam) == 0){
+		fprintf(stderr,"File system %s is not recognized\n",*filsys_nam);
+		return(0); /* Stop processing */
+	}
+	if (!topt)
+		if (dopt) 
+			*tape_name = *++argv;
+		else 
+			*tape_name = adjust(*++argv);
+	else
+			*tape_name = tapeused; 
+	if (strlen(*tape_name) > MAXTAPNAM){
+		(*tape_name)[MAXTAPNAM] = '\0';
+		fprintf(stderr,"Tape name truncated to `%s'\n",*tape_name);
+	}
+	return(1);
+}
+
+
+X/* ckfilsys:  Map logical file system to a device & return(1).  If no
+   mapping can be done, return(0).  (ie. check to make sure a valid
+   file system is given). Amended to handle /u files, PBC 7/83 */
+
+ckfilsys(filsystem)
+char *filsystem;
+{
+	if (strcmp(filsystem,"/usr") == 0 || strcmp(filsystem,"/g") == 0
+       	|| strcmp(filsystem,"/") == 0 || strcmp(filsystem,"/u") == 0)
+		return(1);
+	else
+		return(0);
+}
+
+include_these_files(filsys_nam,dd_file,i_tapnam)
+char *filsys_nam,*dd_file,*i_tapnam;
+{
+	char i_filnam[100];
+	ino_t i_inode,i;
+	char tline[100];
+	
+	if ((fp_dd = fopen(dd_file,"r")) == NULL){
+		fprintf(stderr,"Can't open dumpdir file %s\n",dd_file);
+		return(0);
+	}
+	/* Skip over dates given in dumpdir output */
+	for(i=0;i<2;i++)
+		fgets(tline,100,fp_dd);
+	while (getnextfile(i_filnam,&i_inode,fp_dd) != EOF){
+		addorupdate(i_filnam,i_inode,i_tapnam,base_sys);
+	}
+	fclose(fp_dd);
+	return;
+}
+
+getnextfile(fname,finode,fp)
+char	*fname;
+ino_t	*finode;
+FILE	*fp;
+{
+	static int j;
+	char c,tname[100];
+
+	j = fscanf(fp,"%d",finode);
+	while((c=getc(fp)) == '\t' || c == ' ')
+		;
+	ungetc(c,fp);
+	fgets(tname,100,fp);
+	tname[strlen(tname)-1] = '\0';
+	strcpy(fname,filsys_nam); /* Prefix file name with logical File system name */
+	strcat(fname,tname);
+	if (j != EOF) s_nofils++; /* inc # files processed */
+	return(j); /* Return -1 on EOF */
+}
+
+addorupdate(fnam,finode,tapnam,st_ptr)
+char	*fnam,*tapnam;
+ino_t	finode;
+PTRNODE	st_ptr;
+{
+	char *idxslash,name[100],*restofname;
+	int eoname,found;
+	PTRNODE trav,e;
+
+	if (*fnam == '/'){ /* If leading slashes then */
+		while (*fnam == '/')
+		fnam++; /* Skip over leading slashes */
+		if (st_ptr->down == NULL)
+			/* No way down -- so create a directory */
+			trav = makdir(st_ptr);
+		else	/* Directory exists -- just traverse */
+			trav = st_ptr->down;
+	}
+	else{ 	/* Must be starting in a "current" directory */
+		trav = st_ptr;
+	}
+	/* Get Name & set eoname flag */
+	/* eoname is true if no more slashes in name */
+	eoname = ((idxslash = index(fnam,'/')) == NULL);
+	if (eoname == 0) /* if not end of name */
+		restofname = idxslash; /* whatevers after the slash */
+	strncpy(name,fnam,(eoname == 0)? (idxslash-fnam) : strlen(fnam));
+	name[(eoname == 0)? (idxslash-fnam) : strlen(fnam)] = '\0';
+	/* Look for name -- along list of files */
+	trav = findname(trav,name,eoname==0,&found);
+	if (found){
+		/* Found a directory or a file */
+		if (eoname){ /* A file was found -- just update its info */
+			update(trav,finode,tapnam);
+		}
+		else{	/* This is just a directory on the way to a file */
+			/* So, update its info if we haven't been here before */
+			if(trav->Marked == 'n')
+				update(trav,finode,tapnam);
+			addorupdate(restofname,finode,tapnam,trav);
+		}
+	}
+	else{	/* File or directory not found -- so add it */
+		e = getnode(name,0); /* Could be a directory or a file */
+		linknode(e,trav);
+		if (eoname)
+			/* file just added */
+			update(e,finode,tapnam);
+		else{	/* directory just added - now recurse to add it's
+			   "." and ".." entries */
+			update(e,finode,tapnam);
+			addorupdate(restofname,finode,tapnam,e);
+		}
+	}
+	return;
+}
+
+PTRNODE
+makdir(st_ptr)
+PTRNODE	st_ptr;
+{
+	PTRNODE dot,dotdot;
+
+	st_ptr->dir = 1; /* Make node comming from a directory */
+	/* Create "." and ".." entries for a directory */
+	dot = getnode(".",0);
+	dot->dir = 1;
+	st_ptr->down = dot; /* Link st_ptr to the dot entry */
+	dotdot = getnode("..",0);
+	dotdot->dir = 1;
+	/* Link dot to the dotdot entry */
+	dot->next = dotdot; /* Link dot to the dotdot entry */
+	return(dot); /* Return a pointer to the "." entry */
+}
+
+PTRNODE
+findname(st_ptr,name,dir,found)
+PTRNODE	st_ptr;
+char	*name;
+int	dir,*found;
+{
+	PTRNODE	trav,last;
+
+	if (strcmp(".",st_ptr->name) == 0){
+		/* Handle "." & ".." case, first */
+		if (strcmp(name,".") == 0){
+			/* Looking for ".", so return "."'s entry */
+			(*found) = 1;
+			return(st_ptr);
+		}
+		if (strcmp(name,"..") == 0){
+			/* Looking for "..", so return ".."'s entry */
+			(*found) = 1;
+			return(st_ptr->next);
+		}
+		/* Begin searching a directory */
+		trav = st_ptr->next; /* point to ".." entry */
+		if (trav->next == NULL){
+			/* No files in this directory, except "." & ".." */
+			(*found) = 0;
+			return(trav); /* Insertion would go after .. entry */
+		}
+	}
+	else{	/* Start searching, somewhere in the middle of a directory */
+		trav = st_ptr;
+	}
+	last = trav;
+	trav = trav->next; /* Don't include . or .. for alphabetical order */
+	/* Look for entry "name" in this directory */
+	while (trav != NULL && strcmp(trav->name,name) < 0){
+		/* Look for "name", & know list is in alphabetical order */
+		last = trav;
+		trav = trav->next;
+	}
+	if (trav == NULL){
+		/* easy case, Searched entire directory and didn't find "name",
+		   so it would be added at the end of this directory list */
+		(*found) = 0;
+		return(last); /* last should point to last entry in dir list */
+	}
+	if (strcmp(trav->name,name) > 0){
+		/* "name" was not found in dir list, and to keep the dir
+		   list in alphabetical order, the entry "name" should be
+		   added after the entry last */
+		(*found) = 0; /* "name" was not found in directory */
+		return(last);
+	}
+	/* If this code is reached, then "name" was found in the directory
+	   list.  However, the directory status must also match in order for
+	   the file to be considered "found" */
+	if (trav->dir == dir){
+		/* "name" has been found in the directory list */
+		/* either as a file or as a directory */
+		(*found) = 1;
+		return(trav);
+	}
+	/* If this code is reached, then a peculiar situation has arisen.
+	   Both a file & a directory have the same name.  In this case,
+	   the directory should appear before the file, in the dir list.
+	   There is no "special" purpose for having the directory first.
+	   It was merely a choice of the designer. */
+	printf("Duplicate file & directory of same name (%s)\n",trav->name);
+	if (dir==0){
+		/* "name" is a normal file, so lets check next entry
+		   and maybe it will be there */
+		if (trav->next != NULL){ /* avoid going past end of list */
+			if (strcmp(trav->next->name,name) == 0){
+				/* entry WAS FOUND after directory entry
+				   of same name */
+				(*found) = 1;
+				return(trav->next);
+			}
+		}
+		/* entry "name" was not found, so return a pointer to
+		   where it should be added, if it were going to be added */
+		(*found) = 0;
+		return(trav);
+	}
+	else{	/* Looking for a directory, but entry found was a normal file */
+		if (last==trav){
+			/* This could only happen if searching was not begun
+			   at the begining of a directory (ie. at the entry ".")
+			*/
+			fprintf(stderr,"Directory %s, possibly out of order\n",
+				name);
+		}
+		(*found) = 0;
+		return(last); /* Directory should be inserted before the
+				 file of the same name */
+	}
+}
+
+X/* GetNode:  Returns a newly allocated node & initialize it to contain 
+   the name & inode passed.  The other entries default as follows:
+   Next & Down are NULL. Dir is false(0), Marked is 'n' */
+
+PTRNODE
+getnode(name,inode)
+char	*name;
+ino_t	inode;
+{
+	PTRNODE e;
+	int	i,j;
+
+	e = talloc();
+	strcpy(e->name,name);
+	e->Marked = 'n';
+	e->next = NULL;
+	e->down = NULL;
+	e->dir = 0;
+	/* Initialize all tape back-up names to nulls */
+	for(i=0; i < MAXBACKUPS; i++){
+		for(j=0; j < MAXTAPNAM; j++)
+			e->tapes[i][j] = ' ';
+		e->tapes[i][MAXTAPNAM] = '\0'; /* Stick null at end of tape name */
+	}
+	for(i=1; i < MAXBACKUPS; i++)
+		e->inodes[i] = 0;
+	e->inodes[0] = inode;
+
+	return(e);
+}
+
+X/* LinkNode:  Links the node passed after the pointer passed. */
+
+linknode(e,ptr)
+PTRNODE	e,ptr;
+{
+	e->next = ptr->next;
+	ptr->next = e;
+}
+
+X/* Adjust:  Standardizes the daily dump tape names. At this point (12/83),
+            the tapes are the one-character capitalized alphabetics A thru J.
+            If the tape name is a one-character alphabetic, adjust will
+            convert it to upper-case.                                    */
+
+char *adjust(tapename)
+char 	*tapename;
+{
+	if ((strlen(tapename) == 1) && (isalpha(*tapename))){
+		if (islower(*tapename)) tapename[0] = (toupper(tapename[0]));
+	}
+	return(tapename);
+}
+
+Write_Sys(st_ptr,filsys_fil)
+PTRNODE	st_ptr;
+char	*filsys_fil;
+{
+	if ((fp=fopen(filsys_fil,"w")) == NULL){
+		fprintf(stderr,"Can't open %s to UPDATE\n",filsys_fil);
+		exit(1);
+	}
+	Recurse_Write(st_ptr);
+	fclose(fp);
+	return;
+}
+
+Recurse_Write(st_ptr)
+PTRNODE	st_ptr;
+{
+	PTRNODE	trav;
+	/* This marker marks the end of a directory, in the filsys_fil */
+
+	trav = st_ptr->down;
+	while (trav != NULL){
+		/* Make an entry for this node */
+		makentry(trav);
+		if (trav->dir && strcmp(".",trav->name) != 0
+				&& strcmp("..",trav->name) != 0){
+			/* If this node is a directory, then Recurse it's
+			   sub-dirs and write out its nodes */
+			Recurse_Write(trav);
+		}
+		trav = trav->next;
+	}
+	/* A directory has just been written, so add a marker
+	   to mark the end of the directory */
+	makentry(marker);
+}
+
+X/*============================================================================*/
+X/* GetEntry & MakEntry are the only interface between the file 
+   /etc/filesontapes and the user program.  If format of file changes
+   these two routines must jointly agree on the changed format */
+
+makentry(e)
+PTRNODE	e;
+{
+	int i;
+	/* format is: 	inodes, (not converted to ascii)
+			tapenames,
+			dirflag (byte)
+			file name (terminated with null byte)
+	*/
+	/* write out inode numbers (not converted to ascii) */
+	for (i=0; i < MAXBACKUPS; i++)
+		fwrite((char*)&(e->inodes[i]),sizeof(e->inodes)/MAXBACKUPS,
+			1,fp);
+	/* write out tape names (not terminated with null byte) */
+	for (i=0; i < MAXBACKUPS; i++)
+		fwrite(e->tapes[i],MAXTAPNAM,1,fp);
+	/* write out directory flag */
+	if (e->dir)
+		/* then this entry is a directory */
+		fwrite("1",1,1,fp);
+	else
+		/* this entry is a normal file */
+		fwrite("0",1,1,fp);
+	/* write file name - including null byte */
+	fwrite(e->name,strlen(e->name)+1,1,fp);
+	if (sopt){ /* If Keeping Summary information */
+		s_totent++; /* total # of entries */
+		if (e->dir && strcmp(e->name,".") != 0 && 
+			strcmp(e->name,"..") != 0){ /* This is a directory */
+			s_dirent++; /* inc # of directory entries */
+		}
+		/* If "." or ".." entry */
+		if (e->dir && (strcmp(e->name,".") == 0 || 
+			strcmp(e->name,"..") == 0)){
+			s_dotent++; /* inc # of dot or dotdot entries */
+		}
+		/* If normal file */
+		if (e->dir == 0 && strcmp(e->name,"/") != 0) 
+			s_filent++; /* inc # of file entries */
+		if (e->dir == 0 && strcmp(e->name,"/") == 0)
+			s_nomkrs++; /* inc # of markers */
+	}
+
+	return;
+}
+
+PTRNODE
+getentry()
+{
+	PTRNODE e;
+	int	nmread=1,i;
+	char 	c,*name;
+ 
+        r_totent++;
+	e = getnode("",0); /* get and initialize a node to use */
+	/* read inodes */
+	for (i=0; i < MAXBACKUPS && nmread > 0; i++)
+		nmread = fread((char*)&(e->inodes[i]),
+					sizeof(e->inodes[i]),1,fp);
+	/* Check for end of file */
+	/* Actually, if an incomplete record occured here it would go
+	   undetected. Oh well. */
+	if (nmread = 0) /* Reached EOF - normal case */
+		return(NULL);
+	/* read tape names */
+	for (i=0; i < MAXBACKUPS; i++){
+		fread(e->tapes[i],MAXTAPNAM,1,fp);
+		e->tapes[i][MAXTAPNAM] = '\0'; /* Add null byte to end of tape name */
+	}
+	/* read directory flag */
+	fread(&c,1,1,fp);
+	switch (c){
+	case '0': /* This entry is a normal file */
+		e->dir = 0;
+		break;
+	case '1': /* This entry is a directory */
+		e->dir = 1;
+		break;
+	default: /* Error in file */
+		fprintf(stderr,"Error in /etc/filesontapes - bad directory flag %c\n",c);
+		break;
+	}
+	/* Read in file name */
+	for (name=e->name; (nmread = fread(&c,1,1,fp)) > 0 && c != '\0'; )
+		*name++ = c; /* Read until null byte */
+	*name = '\0'; /* Add null byte at end of name */
+	/* Just double check to see if unexpected end of file occured */
+	if (nmread = 0){
+		fprintf(stderr,"INCOMPLETE Record - at EOF\n");
+		return((PTRNODE) ERROR);
+	}
+
+	/* Return a pointer to the node just read */
+	return(e);
+}
+
+X/*============================================================================*/
+
+printlist(ptr)
+PTRNODE	ptr;
+{
+	PTRNODE t;
+	printf("\nList of nodes starting from %d\n",ptr);
+	t = ptr;
+	while (t != NULL){
+		/* print a short list of just names */
+		printf("%s%s",t->name,(t->next==NULL)?"\n\n":",");
+		t = t->next;
+	}
+	printf("\n\n");
+}
+
+X/* This routine updates the information kept for each node.
+   Information is stacked. (ie. Whenever an update is made the newest
+   information is pushed on the front of the stack, pushing all the
+   other information back one position.)
+   Only MAXBACKUPS backup entries are kept. So any attempts made to
+   updates beyond that cause the oldest entry to be lost.  This is
+   consistent to stack behavior. */
+
+update(ptr,inode,tapnam)
+PTRNODE	ptr;
+ino_t	inode;
+char	*tapnam;
+{
+	int i;
+
+	ptr->Marked = 'y';
+	for (i=MAXBACKUPS-2; i >= 0; i--)
+		strcpy(ptr->tapes[i+1],ptr->tapes[i]);
+	strcpy(ptr->tapes[0],tapnam);
+	for (i=MAXBACKUPS-2; i >= 0; i--)
+		ptr->inodes[i+1] = ptr->inodes[i];
+	ptr->inodes[0] = inode;
+}
+
+
+PTRNODE
+talloc()
+{	char *malloc();
+	static PTRNODE heap,retptr;
+	static int  count = 0;
+
+	if (count == 0){
+		heap = (PTRNODE) malloc(NUMALLOCS * sizeof(NODE));
+		count = NUMALLOCS;
+	}
+	retptr = heap++;
+	count--;
+	return((PTRNODE) retptr);
+}
+
+X/* printree:  This routine recursively prints all or part of the file
+   system, begining at a particular node. */
+
+printree(st_ptr,pathname)
+PTRNODE	st_ptr;
+char	*pathname;
+{
+register	PTRNODE	trav;
+	char	fullname[100];
+
+	trav = st_ptr->down;
+	while (trav != NULL){
+		/* Print all entries in "current" directory */
+		strcpy(fullname,pathname);
+		strcat(fullname,trav->name);
+		fullprint(fullname,trav);
+		if (trav->dir && strcmp(fullname,".") != 0 && 
+			strcmp(fullname,"..") != 0){
+			/* This entry is a directory, so recursively
+			   print all of its entries */
+			strcat(fullname,"/"); /* prepare path name */
+			printree(trav,fullname);
+		}
+		trav = trav->next;
+	}
+}
+
+fullprint(fullname,ptr)
+char	*fullname;
+PTRNODE	ptr;
+{
+	int i,j,idx;
+
+	printf("file: %s\t(%d)\n",fullname,ptr);
+	/* print out inodes for this entry */
+	for (i=0; i < (MAXBACKUPS-1)/3 + 1; i++){ /* for each row */
+		for (j=0; j<3; j++){ /* for each column */
+			if ((idx=j+i*3) < MAXBACKUPS){ 
+				/* only print as many columns as are needed */
+				if (j == 0)
+					printf("%s",(i==0)?"inodes:\t":"\t");
+				printf("(%d) = %5d\t",idx+1,ptr->inodes[idx]);
+			}
+		}
+		printf("\n");
+	} /* print out inodes */
+	/* print out tape names for this entry */
+	for (i=0; i < (MAXBACKUPS-1)/3 + 1; i++){ /* for each row */
+		for (j=0; j<3; j++){ /* for each column */
+			if ((idx=j+i*3) < MAXBACKUPS){ 
+				/* only print as many columns as are needed */
+				if (j == 0)
+					printf("%s",(i==0)?"tapes:\t":"\t");
+				printf("(%d) = %5s\t",idx+1,ptr->tapes[idx]);
+			}
+		}
+		printf("\n");
+	} /* print out tape names */
+}
+
+printnode(ptr)
+PTRNODE	ptr;
+{
+	int i;
+
+	if (ptr != NULL){
+		fullprint(ptr->name,ptr);
+		printf("\tdown = %d  next = %d\n",ptr->down,ptr->next);
+	}
+	else
+		printf("Null Node -- can't be printed\n");
+}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 filtapmgr.c
+	/bin/echo -n '	'; /bin/ls -ld filtapmgr.c
+fi
+-- 
+Call-Me:   Pete Cottrell, Univ. of Md. Comp. Sci. Dept.
+UUCP:	   {seismo,allegra,brl-bmd}!umcp-cs!petec
+CSNet:	   petec@umcp-cs
+ARPA:	   petec.umcp-cs@CSNet-Relay
+
+

@@ -1,0 +1,1726 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,77dc2f7ac9d282a2,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-12-18 13:21:25 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site omen.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!gamma!epsilon!zeta!sabre!petrus!bellcore!decvax!tektronix!reed!omen!caf
+From: caf@omen.UUCP (Chuck Forsberg WA7KGX)
+Newsgroups: net.sources
+Subject: VMS 4.x version of rb and sb (YMODEM)
+Message-ID: <273@omen.UUCP>
+Date: Wed, 18-Dec-85 16:21:25 EST
+Article-I.D.: omen.273
+Posted: Wed Dec 18 16:21:25 1985
+Date-Received: Sat, 21-Dec-85 00:43:54 EST
+Distribution: net
+Organization: Omen Technology, Portland
+Lines: 1705
+
+Here is an updated VMS version of YMODEM batch send/receive programs.
+They are more efficient than the last examined UMODEM because of
+multi character terminal reads and writes, as well as supporting YMODEM's
+1k packet size and batch file transfers.
+
+They correct problems with VMS 4.x returning an illegal parity setting.
+Man pages are sent separately, normally part of RBSB.SH (RBSB.SHQ).
+Consult the source listings for compile and install hints.  Enjoy.
+#	This is a shell archive.
+#	Remove everything above and including the cut line.
+#	Then run the rest of the file through sh.
+-----cut here-----cut here-----cut here-----cut here-----
+#!/bin/sh
+# shar:	Shell Archiver
+#	Run the following text with /bin/sh to create:
+#	vmodem.h
+#	vvmodem.c
+#	vvrb.c
+#	vvsb.c
+# This archive created: Wed Dec 18 13:08:13 1985
+echo shar: extracting vmodem.h '(882 characters)'
+cat << \SHAR_EOF > vmodem.h
+/*
+ *  VMODEM.H
+ *  VMS support for UMODEM program
+ *
+ *	#INCLUDE files defining structures associated with terminal
+ *	information structure TT_INFO.
+ *	Information about the terminal is passed around in UMODEM in a
+ *	STRUCT TT_INFO.
+ *
+ *  Walter Reiher
+ *  Harvard University
+ *  Department of Chemistry
+ *  12 Oxford Street
+ *  Cambridge, MA 02138
+ *  March 10, 1983
+ */
+
+struct	tt_mode				/*  Info for a IO$_SETMODE call  */
+{
+	char			class;
+	char			type;
+	short			page_width;
+	char			bcharacteristics[3];
+	char			page_length;
+	int			echaracteristics;
+};
+
+struct	tt_mode_iosb			/*  Terminal IO$_SENSEMODE IOSB  */
+{
+	short			status;
+	char			t_speed;
+	char			r_speed;
+	char			CR_fill;
+	char			LF_fill;
+	char			parity_flags;
+	char			unused2;
+};
+
+struct	tt_info				/*  Summary of terminal infomation  */
+{
+	struct	tt_mode		dev_characteristics;
+	struct	tt_mode_iosb	dev_modes;
+};
+SHAR_EOF
+echo shar: extracting vvmodem.c '(6148 characters)'
+cat << \SHAR_EOF > vvmodem.c
+/*
+ *  VMODEM
+ *  VMS support for UMODEM and vvrb/vvsb programs
+ *
+ *	Defined herein are some utility routines to make the UNIX
+ *	program UMODEM run under VAX/VMS C:
+ *
+ *		assign_channel	Calls the VMS System Service $ASSIGN
+ *				to assign a channel to a device.
+ *				The routine currently has the device
+ *				"TT" hardwired into it.
+ *		gtty		Gets terminal characteristics, almost
+ *				like the UNIX GTTY system call.
+ *		filestat	Returns the length of the file.
+ *		raw_read	Reads characters from the terminal
+ *				without any echoing or interpretation
+ *				and with an optional timeout period.
+ *		raw_write	Writes a character to the terminal
+ *				without any interpretation.
+ *		raw_wbuf	Writes a buffer to the terminal
+ *				without any interpretation.
+ *		stty		Sets terminal characteristics, almost
+ *				like the UNIX STTY system call.
+ *
+ *	Some of the ideas used here were obtained from code written
+ *	by Max Benson and Robert Bruccoleri.
+ *
+ *  Walter Reiher
+ *  Harvard University
+ *  Department of Chemistry
+ *  12 Oxford Street
+ *  Cambridge, MA 02138
+ *  March 11, 1983
+ *
+ *  Modified 12-18-85 Chuck Forsberg, Omen Technology Inc
+ *  17505-V NW Sauvie IS RD Portland OR 97231 omen!caf
+ */
+#include descrip
+#include iodef
+#include rms
+#include ssdef
+#include stdio
+#include "vmodem.h"
+
+#define  TRUE	1
+#define  FALSE	0
+
+static char	tt_name[]	= "TT";
+static short	tt_chan		= -1;		/*  Terminal channel number  */
+
+struct	tt_io_iosb				/*  Terminal I/O IOSB  */
+{
+	short	status;
+	short	byte_count;
+	short	terminator;
+	short	terminator_size;
+};
+
+/*
+ *	Terminator mask for PASSALL reads.
+ *	Permits reads of all possible 8-bit characters.
+ */
+int	t_mask[32] =  {
+	0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+	0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+	0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+	0,  0	};
+
+struct	terminator_mask {
+	short	size ;
+	short	unused ;
+	int	*mask ;
+}
+
+termin_mask	= { 32, 0, t_mask };
+
+/*
+ *	ASSIGN a channel to the logical name TT, which is usually
+ *	the terminal.
+ */
+assign_channel()
+{
+	int	status;
+	$DESCRIPTOR(tt_descriptor, tt_name);
+
+	if (tt_chan == -1)
+		status	= sys$assign(&tt_descriptor, &tt_chan, 0, 0);
+	else
+		status	= SS$_NORMAL;
+
+	if (status != SS$_NORMAL || tt_chan == -1)
+		error("ASSIGN_CHANNEL:  error in SYS$ASSIGN\n", FALSE);
+
+	return;
+}
+
+/*
+ *	Gets terminal information from VMS.
+ */
+gtty(tt_characteristics)
+struct	tt_info	*tt_characteristics;
+{
+	int				status;
+
+	if (tt_chan == -1)
+		assign_channel();
+
+	status	= sys$qiow(0, tt_chan, IO$_SENSEMODE,
+	  &(tt_characteristics->dev_modes), NULL, 0,
+	  &(tt_characteristics->dev_characteristics), 12,
+	  0, 0, 0, 0);
+	if (status != SS$_NORMAL ||
+	  tt_characteristics->dev_modes.status != SS$_NORMAL)
+		error("GTTY:  sense mode QIO error return.\n", FALSE);
+
+	return(status);
+}
+
+/*
+ *  FILESTAT
+ *  Provide FILE STATistics under VMS
+ *
+ *	Opens the file and counts the bytes (GROSS!!)
+ *	This appears to be the only to get the exact number, given
+ *	all of RMS's permutations of file structure.
+ *	Returns the number of bytes in the file, returns -1 on error.
+ */
+long	filestat(name)
+char	*name;
+{
+	FILE		*fin;
+	long		bytes = -1;
+
+	if (fin = fopen(name, "r")) {
+		while (++bytes, getc(fin) != EOF)
+			;
+		fclose(fin);
+	}
+	return bytes;
+}
+
+
+
+/*
+ *	Read NCHAR characters from the terminal without echoing or
+ *	interpretation.
+ *	If the argument SECONDS is non-zero, use that as the
+ *	timeout period in seconds for the read.
+ *
+ *	NOTE THAT THIS FUNCTION RETURNS AN INT, NOT A CHAR!
+ *	That is because of the possibility of a SS$_TIMEOUT return.
+ *	Returns SS$_TIMEOUT in case of timeout or other error.
+ */
+int		raw_read(nchar, charbuf, seconds)
+char		*charbuf;
+int		nchar;
+unsigned	seconds;
+{
+	short			function;
+	int			status;
+	struct	tt_io_iosb	iosb;
+
+	if (tt_chan == -1)
+		assign_channel();
+
+	function	= IO$_READVBLK | IO$M_NOECHO | IO$M_NOFILTR;
+
+	if (seconds)
+		status	= sys$qiow(0, tt_chan, function | IO$M_TIMED,
+		  &iosb, NULL, 0,
+		  charbuf, nchar, seconds,
+		  &termin_mask, NULL, 0);
+	else
+		status	= sys$qiow(0, tt_chan, function,
+		  &iosb, NULL, 0,
+		  charbuf, nchar, 0,
+		  &termin_mask, NULL, 0);
+
+	if (status == SS$_TIMEOUT || iosb.status == SS$_TIMEOUT)
+		return(SS$_TIMEOUT);
+	else if (status != SS$_NORMAL || iosb.status != SS$_NORMAL)
+		return(SS$_TIMEOUT);
+
+	return((int)*charbuf);
+}
+
+/*
+ *	Writes a character to the terminal without echoing or
+ *	interpretation.
+ */
+raw_write(c)
+char	c;
+{
+	int			status;
+	struct	tt_io_iosb	iosb;
+
+	if (tt_chan == -1)
+		assign_channel();
+
+	status	= sys$qiow(0, tt_chan,
+	  IO$_WRITEVBLK | IO$M_CANCTRLO | IO$M_NOFORMAT,
+	  &iosb, NULL, 0,
+	  &c, 1, 0, 0, 0, 0);
+
+	if (status != SS$_NORMAL || iosb.status != SS$_NORMAL)
+		error("RAW_WRITE:  write QIO error return.\n", TRUE);
+
+	return;
+}
+
+/*
+ *	Writes a buffer to the terminal without echoing or
+ *	interpretation.
+ */
+raw_wbuf(nchar, charbuf)
+char		*charbuf;
+int		nchar;
+{
+	int			status;
+	struct	tt_io_iosb	iosb;
+
+	if (tt_chan == -1)
+		assign_channel();
+
+	status	= sys$qiow(0, tt_chan,
+	  IO$_WRITEVBLK | IO$M_CANCTRLO | IO$M_NOFORMAT,
+	  &iosb, NULL, 0,
+	  charbuf, nchar, 0, 0, 0, 0);
+
+	if (status != SS$_NORMAL || iosb.status != SS$_NORMAL)
+		error("RAW_WRITE:  write QIO error return.\n", TRUE);
+
+	return;
+}
+
+/*
+ *  Sets terminal information from VMS.
+ *	 Modified 12-85 Larry Farr/Chuck Forsberg to not use
+ *	 bad parity returned by VMS 4.
+ */
+stty(tt_characteristics)
+struct	tt_info	*tt_characteristics;
+{
+	short			*f_ptr, /* *p_ptr, */ *s_ptr;
+	int			status;
+	struct	tt_mode_iosb	iosb;
+
+	if (tt_chan == -1)
+		assign_channel();
+
+/*
+ *	We do the following in order to get a full short, concatenating
+ *	two adjacent chars:
+ */
+	s_ptr	= &(tt_characteristics->dev_modes.t_speed);	/*  Speeds  */
+	f_ptr	= &(tt_characteristics->dev_modes.CR_fill);	/*  Fills  */
+	/* p_ptr	= &(tt_characteristics->dev_modes.parity_flags); */
+
+	status	= sys$qiow(0, tt_chan, IO$_SETMODE,
+	  &iosb, NULL, 0,
+	  &(tt_characteristics->dev_characteristics), 12,
+	  /* *s_ptr, *f_ptr, *p_ptr, 0);	*/
+	  *s_ptr, *f_ptr, 0, 0);
+	if (status != SS$_NORMAL || iosb.status != SS$_NORMAL)
+		printf("STTY:  set mode QIO returned %d\n", status);
+
+	return(status);
+}
+
+SHAR_EOF
+echo shar: extracting vvrb.c '(15539 characters)'
+cat << \SHAR_EOF > vvrb.c
+#define VERSION "vvrb 1.01 12-18-85"
+
+/*
+ *
+ * vvrb.c By Chuck Forsberg
+ *	with code fragments stolen from VMS version of UMODEM.C
+ *
+ * A program for VMS which can receive
+ *  files from computers running YAM or MODEM.
+ *  If no filename is given, YMODEM (YAM batch) protocol is assumed.
+ *
+ *  Supports the CRC option or regular checksum.
+ *  Received pathnames containing no lowercase letters will be changed
+ *  to lower case unless -u option is given.
+ *
+ *  Unless the -b (binary) option is given, 
+ *  ^Z (which is discarded) acts as end of file.
+ *
+ *  If the raw pathname ends in any of the extensions in Extensions,
+ *   or .?Q* (squeezed file), or if the first sector contains binary-like
+ *   data (parity bits or characters in the range 0 to 6 before ^Z is seen),
+ *   or if the transmitted file mode has the 0100000 but set,
+ *   that file will be received in binary mode anyway.
+ *
+ *
+ * A log of activities is appended to LOGFILE with the -v option
+ *
+ * To compile on VMS:
+ *		cc vvrb.c
+ *		cc vmodem.c
+ *		link vvrb,vmodem
+ *	rb :== $disk$user2:[username.subdir]vvrb.exe
+ *
+ *	Manual page is "rb.1" in the Unix version rbsb.sh file
+ */
+#define LOGFILE "rblog"
+
+#include <stdio.h>
+#include <ctype.h>
+#include "vmodem.h"
+
+#ifdef vms
+#include ssdef
+#include tt2def
+#include ttdef
+#define SS_NORMAL SS$_NORMAL
+#else
+#define SS_NORMAL 0
+#endif
+
+/*  VMS structures  */
+#ifdef vms
+/*
+ *	TT_INFO structures are used for passing information about
+ *	the terminal.  Used in GTTY and STTY calls.
+ */
+struct	tt_info	ttys, ttysnew, ttystemp;
+#endif
+
+#define OK 0
+#define FALSE 0
+#define TRUE 1
+#define ERROR (-1)
+
+char *substr();
+FILE *fout;
+
+char *Extensions[] = {
+	".A",
+	".ARC",
+	".CCC",
+	".CL",
+	".CMD",
+	".COM",
+	".CRL",
+	".DAT",
+	".DIR",
+	".EXE",
+	".O",
+	".OBJ",
+	".OVL",
+	".PAG",
+	".REL",
+	".SAV",
+	".SUB",
+	".SWP",
+	".SYS",
+	".TAR",
+	".UTL",
+	".a",
+	".o",
+	".tar",
+	""
+};
+
+/* Ward Christensen / CP/M parameters - Don't change these! */
+#define ENQ 005
+#define CAN ('X'&037)
+#define XOFF ('s'&037)
+#define XON ('q'&037)
+#define SOH 1
+#define STX 2
+#define EOT 4
+#define ACK 6
+#define NAK 025
+#define CPMEOF 032
+#define WANTCRC 0103	/* send C not NAK to get crc not checksum */
+#define TIMEOUT (-2)
+#define RETRYMAX 10
+#define WCEOT (-10)
+#define SECSIZ 128	/* cp/m's Magic Number record size */
+#define PATHLEN 257	/* ready for 4.2 bsd ? */
+#define KSIZE 1024	/* record size with k option */
+#define UNIXFILE 0x8000	/* happens to the the S_IFREG file mask bit for stat */
+
+int Lastrx;
+int Crcflg;
+int Firstsec;
+int Eofseen;		/* indicates cpm eof (^Z) has been received */
+int totblocks;		/* total number of blocks received */
+int errors;
+
+#define DEFBYTL 2000000000L	/* default rx file size */
+long Bytesleft;		/* number of bytes of incoming file left */
+long Modtime;		/* Unix style mod time for incoming file */
+short Filemode;		/* Unix style mode for incoming file */
+char Pathname[PATHLEN];
+
+int Batch=0;
+int Wcsmask=0377;
+int MakeLCPathname=TRUE;	/* make received pathname lower case */
+int Verbose=0;
+int Quiet=0;		/* overrides logic that would otherwise set verbose */
+int Rxbinary=FALSE;	/* receive all files in bin mode */
+int Thisbinary;		/* current file is to be received in bin mode */
+int Blklen;		/* record length of received packets */
+char secbuf[KSIZE];
+char linbuf[KSIZE];
+int Lleft=0;		/* number of characters in linbuf */
+
+unsigned short updcrc();
+
+main(argc, argv)
+char *argv[];
+{
+	register char *cp;
+	register npats;
+	char **patts;
+	int exitcode;
+
+	setbuf(stderr, NULL);
+	npats = 0;
+	while (--argc) {
+		cp = *++argv;
+		if (*cp == '-') {
+			while( *++cp) {
+				switch(*cp) {
+				case '7':
+					Wcsmask = 0177;
+				case 'b':
+					Rxbinary=TRUE; break;
+				case 'k':
+				case 'c':
+					Crcflg=TRUE; break;
+				case 'q':
+					Quiet=TRUE; Verbose=0; break;
+				case 'u':
+					MakeLCPathname=FALSE; break;
+				case 'v':
+					++Verbose; break;
+				default:
+					usage();
+				}
+			}
+		}
+		else if ( !npats && argc>0) {
+			if (argv[0][0]) {
+				npats=argc;
+				patts=argv;
+			}
+		}
+	}
+	if (npats > 1)
+		usage();
+	if (Verbose) {
+		if (freopen(LOGFILE, "a", stderr)==NULL) {
+			printf("Can't open log file %s\n",LOGFILE);
+			exit(SS_NORMAL);
+		}
+		setbuf(stderr, NULL);
+	}
+	setmodes();
+
+	if (wcreceive(npats, patts)==ERROR) {
+		exitcode=0200;
+		canit();
+	}
+	restoremodes(FALSE);
+	if (exitcode != 0)	/* bellow again with all thy might. */
+		canit();
+	exit(SS_NORMAL);
+}
+
+
+usage()
+{
+	fprintf(stderr,"rb %s by Chuck Forsberg\n", VERSION);
+	fprintf(stderr,"Usage:	rb [-buv]\n\tor rb [-bcuv] file\n");
+	exit(SS_NORMAL);
+}
+
+wcreceive(argc, argp)
+char **argp;
+{
+	if (Batch || argc==0) {
+		Crcflg=(Wcsmask==0377);
+		fprintf(stderr, "rb: ready ");
+		for (;;) {
+			totblocks=0;
+			if (wcrxpn(secbuf)== ERROR)
+				goto fubar;
+			if (secbuf[0]==0)
+				return OK;
+			if (procheader(secbuf) == ERROR)
+				goto fubar;
+			if (wcrx()==ERROR)
+				goto fubar;
+		}
+	} else {
+		totblocks=0; Bytesleft = DEFBYTL; Filemode = 0; Modtime = 0L;
+
+		strcpy(Pathname, *argp);
+		if (fopen(*argp, "r") != NULL) {
+			fprintf(stderr, "rb: %s exists\n", Pathname);
+			goto fubar;
+		}
+		fprintf(stderr, "\nrb: ready to receive %s ", Pathname);
+		if ((fout=fopen(Pathname, "w")) == NULL)
+			return ERROR;
+		if (wcrx()==ERROR)
+			goto fubar;
+	}
+	return OK;
+fubar:
+	canit();
+	if (fout)
+		fclose(fout);
+	return ERROR;
+}
+
+
+/*
+ * Fetch a pathname from the other end as a C ctyle ASCIZ string.
+ * Length is indeterminate as long as less than Blklen
+ * a null string represents no more files
+ */
+wcrxpn(rpn)
+char *rpn;	/* receive a pathname */
+{
+	register c;
+
+et_tu:
+	Firstsec=TRUE;
+	sendline(Crcflg?WANTCRC:NAK);
+	while ((c = wcgetsec(rpn, 100)) != 0) {
+		log( "Pathname fetch returned %d\n", c);
+		if (c == WCEOT) {
+			sendline(ACK); readline(1); goto et_tu;
+		}
+		return ERROR;
+	}
+	sendline(ACK);
+	return OK;
+}
+
+/*
+ * Adapted from CMODEM13.C, written by
+ * Jack M. Wierda and Roderick W. Hart
+ */
+
+wcrx()
+{
+	register int sectnum, sectcurr;
+	register char sendchar;
+	register char *p;
+	int cblklen;			/* bytes to dump this block */
+	long timep[2];
+
+	Firstsec=TRUE;sectnum=0; Eofseen=FALSE;
+	sendchar=Crcflg?WANTCRC:NAK;
+
+	for (;;) {
+		sendline(sendchar);	/* send it now, we're ready! */
+		sectcurr=wcgetsec(secbuf, (sectnum&0177)?50:130);
+		report(sectcurr);
+		if (sectcurr==(sectnum+1 &Wcsmask)) {
+
+			if (sectnum==0 && !Thisbinary)
+				for (p=secbuf,sectcurr=Blklen;
+				*p != 032 && --sectcurr>=0; ++p)
+					if (*p < 07 || (*p & 0200)) {
+						Thisbinary++;
+						if (Verbose)
+							fprintf(stderr, "Changed to BIN\n");
+						break;
+					}
+			sectnum++;
+			cblklen = Bytesleft>Blklen ? Blklen:Bytesleft;
+			if (putsec(secbuf, cblklen)==ERROR)
+				return ERROR;
+			if ((Bytesleft-=cblklen) < 0)
+				Bytesleft = 0;
+			sendchar=ACK;
+		}
+		else if (sectcurr==(sectnum&Wcsmask)) {
+			log( "Received dup Sector\n");
+			sendchar=ACK;
+		}
+		else if (sectcurr==WCEOT) {
+			if (fclose(fout)==ERROR) {
+				canit();
+				fprintf(stderr, "file close ERROR\n");
+				return ERROR;
+			}
+			if (Modtime) {
+				timep[0] = time(NULL);
+				timep[1] = Modtime;
+/*
+				utime(Pathname, timep);
+*/
+			}
+			if (Filemode)
+				chmod(Pathname, (07777 & Filemode));
+			sendline(ACK);
+			return OK;
+		}
+		else if (sectcurr==ERROR)
+			return ERROR;
+		else {
+			log( "Sync Error\n");
+			return ERROR;
+		}
+	}
+}
+
+/*
+ * wcgetsec fetches a Ward Christensen type sector.
+ * Returns sector number encountered or ERROR if valid sector not received,
+ * or CAN CAN received
+ * or WCEOT if eot sector
+ * time is timeout for first char, set to 4 seconds thereafter
+ ***************** NO ACK IS SENT IF SECTOR IS RECEIVED OK **************
+ *    (Caller must do that when he is good and ready to get next sector)
+ */
+
+wcgetsec(rxbuf, maxtime)
+char *rxbuf;
+int maxtime;
+{
+	register checksum, wcj, firstch;
+	register unsigned short oldcrc;
+	register char *p;
+	int sectcurr;
+
+	for (Lastrx=errors=0; errors<RETRYMAX; errors++) {
+
+		if ((firstch=readline(maxtime))==STX) {
+			Blklen=KSIZE; goto get2;
+		}
+		if (firstch==SOH) {
+			Blklen=SECSIZ;
+get2:
+			sectcurr=readline(5);
+			if ((sectcurr+(oldcrc=readline(5)))==Wcsmask) {
+				oldcrc=checksum=0;
+				for (p=rxbuf, wcj=Blklen; wcj; wcj -= 128) {
+					if (raw_read(128,p,7) == SS$_TIMEOUT) {
+						firstch=TIMEOUT; goto bilge;
+					}
+					p += 128;
+				}
+				for (p=rxbuf, wcj=Blklen; --wcj>=0; ) {
+					firstch = *p++ & Wcsmask;
+					oldcrc=updcrc(firstch, oldcrc);
+					checksum += (firstch);
+				}
+				if ((firstch=readline(5)) < 0)
+					goto bilge;
+				if (Crcflg) {
+					oldcrc=updcrc(firstch, oldcrc);
+					if ((firstch=readline(5)) < 0)
+						goto bilge;
+					oldcrc=updcrc(firstch, oldcrc);
+					if (oldcrc)
+						log("CRC=0%o\n", oldcrc);
+					else {
+						Firstsec=FALSE;
+						return sectcurr;
+					}
+				}
+				else if (((checksum-firstch)&Wcsmask)==0) {
+					Firstsec=FALSE;
+					return sectcurr;
+				}
+				else
+					log( "Checksum Error\n");
+			}
+			else
+				log("Sector number garbled 0%o 0%o\n",
+				sectcurr, oldcrc);
+		}
+		/* make sure eot really is eot and not just mixmash */
+		else if (firstch==EOT && Lleft==0)
+			return WCEOT;
+		else if (firstch==CAN) {
+			if (Lastrx==CAN) {
+				log( "Sender CANcelled\n");
+				return ERROR;
+			} else {
+				Lastrx=CAN;
+				continue;
+			}
+		}
+		else if (firstch==TIMEOUT) {
+			if (Firstsec)
+				goto humbug;
+bilge:
+			log( "Timeout\n");
+		}
+		else
+			log( "Got 0%o sector header\n", firstch);
+
+humbug:
+		Lastrx=0;
+		if (firstch != TIMEOUT)
+			junkpacket();
+		if (Firstsec)
+			sendline(Crcflg?WANTCRC:NAK);
+		else {
+			maxtime=40; sendline(NAK);
+		}
+	}
+	/* try to stop the bubble machine. */
+	canit();
+	return ERROR;
+}
+
+
+/* update CRC */
+unsigned short
+updcrc(c, crc)
+register c;
+register unsigned crc;
+{
+	register count;
+
+	for (count=8; --count>=0;) {
+		if (crc & 0x8000) {
+			crc <<= 1;
+			crc += (((c<<=1) & 0400)  !=  0);
+			crc ^= 0x1021;
+		}
+		else {
+			crc <<= 1;
+			crc += (((c<<=1) & 0400)  !=  0);
+		}
+	}
+	return crc;	
+}
+
+/*
+ * process incoming header
+ */
+procheader(name)
+char *name;
+{
+	register char *openmode, *p, **pp;
+
+	/* set default parameters */
+	openmode = "w"; Thisbinary=Rxbinary;
+	Bytesleft = DEFBYTL; Filemode = 0; Modtime = 0L;
+
+	p = name + 1 + strlen(name);
+	if (*p) {	/* file coming from Unix type system */
+		sscanf(p, "%ld%lo%o", &Bytesleft, &Modtime, &Filemode);
+		if (Filemode & UNIXFILE)
+			++Thisbinary;
+		if (Verbose) {
+			fprintf(stderr,  "Incoming: %s %ld %lo %o\n",
+			name, Bytesleft, Modtime, Filemode);
+		}
+	}
+	else {		/* File coming from CP/M type system */
+		for (p=name; *p; ++p)		/* change / to _ */
+			if ( *p == '/')
+				*p = '_';
+
+		if ( *--p == '.')		/* zap trailing period */
+			*p = 0;
+	}
+
+	/* scan for extensions that signify a binary file */
+	if (p=substr(name, "."))
+		for (pp=Extensions; **pp; ++pp)
+			if (strcmp(p, *pp)==0) {
+				Thisbinary=TRUE; break;
+			}
+
+	/* scan for files which should be appended */
+	if ( !Thisbinary
+	&& (substr(name, ".TXT")
+	|| substr(name, ".txt")
+	|| substr(name, ".MSG")))
+		openmode = "a";
+	if (MakeLCPathname && !IsAnyLower(name))
+		uncaps(name);
+	strcpy(Pathname, name);
+	if (Verbose) {
+		fprintf(stderr,  "Receiving %s %s %s\n",
+		name, Thisbinary?"BIN":"ASCII", openmode);
+	}
+	if ((fout=fopen(name, openmode)) == NULL)
+		return ERROR;
+	return OK;
+}
+
+/* make string s lower case */
+uncaps(s)
+register char *s;
+{
+	for ( ; *s; ++s)
+		if (isupper(*s))
+			*s = tolower(*s);
+}
+
+
+/*
+ * IsAnyLower returns TRUE if string s has lower case letters.
+ */
+IsAnyLower(s)
+register char *s;
+{
+	for ( ; *s; ++s)
+		if (islower(*s))
+			return TRUE;
+	return FALSE;
+}
+/*
+ * putsec writes the n characters of buf to receive file fout.
+ *  If not in binary mode, carriage returns, and all characters
+ *  starting with CPMEOF are discarded.
+ */
+putsec(buf, n)
+char *buf;
+register n;
+{
+	register char *p;
+
+	++totblocks;
+	if (Thisbinary)
+	{
+		for (p=buf; --n>=0; )
+			putc( *p++, fout);
+	}
+	else {
+		if (Eofseen)
+			return OK;
+		for (p=buf; --n>=0; ++p ) {
+/*
+			if ( *p == '\r')
+				continue;
+*/
+			if (*p == CPMEOF) {
+				Eofseen=TRUE; return OK;
+			}
+			putc(*p ,fout);
+		}
+	}
+	return OK;
+}
+
+
+/*
+ * substr(string, token) searches for token in string s
+ * returns pointer to token within string if found, NULL otherwise
+ */
+char *
+substr(s, t)
+register char *s,*t;
+{
+	register char *ss,*tt;
+	/* search for first char of token */
+	for (ss=s; *s; s++)
+		if (*s == *t)
+			/* compare token with substring */
+			for (ss=s,tt=t; ;) {
+				if (*tt == 0)
+					return s;
+				if (*ss++ != *tt++)
+					break;
+			}
+	return NULL;
+}
+
+/*VARARGS1*/
+log(s,p,u)
+char *s, *p, *u;
+{
+	if (!Verbose)
+		return;
+	fprintf(stderr, "error %d: ", errors);
+	fprintf(stderr, s, p, u);
+}
+
+/* send 10 CAN's to try to get the other end to shut up */
+canit()
+{
+	register n;
+	for (n=10; --n>=0; )
+		sendline(CAN);
+}
+
+#ifdef REGULUS
+/*
+ * copies count bytes from s to d
+ * (No structure assignment in Regulus C compiler)
+ */
+
+movmem(s, d, count)
+register char *s, *d;
+register count;
+{
+	while (--count >= 0)
+		*d++ = *s++;
+}
+#endif
+
+
+report(sct)
+int sct;
+{
+	if (Verbose>1)
+		fprintf(stderr,"%03d%c",sct,sct%10? ' ' : '\r');
+}
+
+/* set tty modes for vvrb transfers */
+setmodes()
+{
+/*  Device characteristics for VMS  */
+#ifdef vms
+	int	*iptr, parameters;
+
+/*
+ *	Get current terminal parameters.
+ */
+	if (gtty(&ttys) != SS$_NORMAL)
+		error("SETMODES:  error return from GTTY (1)", FALSE);
+	if (gtty(&ttysnew) != SS$_NORMAL)
+		error("SETMODES:  error return from GTTY (2)", FALSE);
+
+/*
+ *	Set new terminal parameters.
+ *	Note that there are three bytes of terminal characteristics,
+ *	so we should make sure the fourth byte of the integer is unchanged.
+ */
+	iptr	= &(ttysnew.dev_characteristics.bcharacteristics);
+	parameters	= *iptr;
+
+	parameters	&= ~TT$M_ESCAPE;		/*  ESCAPE   OFF  */
+	parameters	&= ~TT$M_HOSTSYNC;		/*  HOSTSYNC OFF  */
+	parameters	|=  TT$M_NOECHO;		/*  NOECHO   ON   */
+	parameters	|=  TT$M_PASSALL;		/*  PASSALL  ON   */
+	parameters	&= ~TT$M_READSYNC;		/*  READSYNC OFF  */
+	parameters	&= ~TT$M_TTSYNC;		/*  TTSYNC   OFF  */
+	parameters	&= ~TT$M_WRAP;			/*  WRAP     OFF  */
+	parameters	|= TT$M_EIGHTBIT;		/*  EIGHTBIT ON   */
+
+	*iptr		= parameters;
+
+	if (stty(&ttysnew) != SS_NORMAL)
+		error("SETMODES:  error return from STTY", TRUE);
+#endif
+}
+
+
+
+/* restore normal tty modes */
+restoremodes(errcall)
+int errcall;
+{
+/*  Device characteristic restoration for VMS  */
+#ifdef vms
+	if (stty(&ttys) != SS_NORMAL)		/*  Restore original modes  */
+		{
+		if (!errcall)
+			error("Error restoring original terminal params.",
+									FALSE);
+		else
+			{
+			printf("vvrb/RESTOREMODES:  ");
+			printf("Error restoring original terminal params.\n");
+			}
+		}
+#endif
+}
+
+/*
+	BBUFSIZ  - 128 or 1024 etc.
+	raw_read(BBUFSIZ + 7, inbuf, 5 + 3 * (BBUFSIZ + 6));
+*/
+
+
+
+
+/* get a byte from data stream -- timeout if "dseconds" elapses */
+/*	NOTE, however, that this function returns an INT, not a BYTE!!!  */
+readline(dseconds)
+{
+	int seconds;
+	int	c;
+
+	seconds = dseconds/10;
+	if (seconds < 5)
+		seconds = 5;
+#ifdef vms
+	c	= raw_read(1, &c, seconds);
+
+	if (c == SS$_TIMEOUT)
+		return(TIMEOUT);
+
+	return(c & 0377);  /* return the char */
+#endif
+}
+
+/* junkpacket gets the line cleared */
+junkpacket()
+{
+	int	c;
+
+#ifdef vms
+	for (;;) {
+		c	= raw_read(1, &c, 1);
+
+		if (c == SS$_TIMEOUT)
+			return;
+		}
+#endif
+}
+
+/* send a byte to data stream */
+sendline(data)
+{
+	char	dataout;
+
+	dataout	= data;
+#ifdef vms
+	raw_write(dataout);
+#endif
+
+}
+
+
+/* print error message and exit; if mode == TRUE, restore normal tty modes */
+error(msg, mode)
+char *msg;
+int mode;
+{
+	if (mode)
+		restoremodes(TRUE);  /* put back normal tty modes */
+	printf("vvrb:  %s\n", msg);
+	exit(SS_NORMAL);
+}
+
+SHAR_EOF
+echo shar: extracting vvsb.c '(10903 characters)'
+cat << \SHAR_EOF > vvsb.c
+#define VERSION "vvsb 1.01 12-18-85"
+
+/*
+
+ * vvsb.c By Chuck Forsberg
+ *
+ * A small program for VMS which can send 1 or more
+ * files with YMODEM protocol to computers running YAM or compatible programs.
+ * (Use the "rb" command in YAM.)
+ * Supports the CRC option or regular checksum.
+ *
+ * accepts -k option for 1kb record length.
+ *
+ * Typical compile and install sequence:
+ *		cc vvsb.c
+ *		cc vmodem.c
+ *		link vvsb,vmodem
+ *	sb :== $disk$user2:[username.subdir]vvsb.exe
+ *
+ *	Manual page is "sb.1" in the Unix version rbsb.sh file
+ */
+
+#define LOGFILE "sblog"
+
+#include stdio.h
+#include ctype.h
+#include "vmodem.h"
+
+#ifdef vms
+#include ssdef
+#include tt2def
+#include ttdef
+#define SS_NORMAL SS$_NORMAL
+#else
+#define SS_NORMAL 0
+#endif
+
+/*  VMS structures  */
+#ifdef vms
+/*
+ *	TT_INFO structures are used for passing information about
+ *	the terminal.  Used in GTTY and STTY calls.
+ */
+struct	tt_info	ttys, ttysnew, ttystemp;
+#endif
+
+
+#define OK 0
+#define FALSE 0
+#define TRUE 1
+#define ERROR (-1)
+
+FILE *in;
+
+/* Ward Christensen / CP/M parameters - Don't change these! */
+#define ENQ 005
+#define CAN ('X'&037)
+#define XOFF ('s'&037)
+#define XON ('q'&037)
+#define SOH 1
+#define STX 2
+#define EOT 4
+#define ACK 6
+#define NAK 025
+#define CPMEOF 032
+#define WANTCRC 0103	/* send C not NAK to get crc not checksum */
+#define TIMEOUT (-2)
+#define RETRYMAX 10
+#define SECSIZ 128	/* cp/m's Magic Number record size */
+#define KSIZE 1024
+
+char Lastrx;
+char Crcflg;
+int Verbose=0;
+int Quiet=0;		/* overrides logic that would otherwise set verbose */
+int Fullname=0;		/* transmit full pathname */
+int firstsec;
+int errcnt=0;		/* number of files unreadable */
+int blklen=SECSIZ;	/* length of transmitted records */
+int Totsecs;		/* total number of sectors this file */
+char txbuf[KSIZE];
+int Filcnt=0;		/* count of number of files opened */
+
+unsigned updcrc();
+char *substr(), *getenv();
+
+
+
+main(argc, argv)
+char *argv[];
+{
+	register char *cp;
+	register npats;
+	int agcnt; char **agcv;
+	char **patts;
+	int exitcode;
+#ifndef REGULUS
+	static char xXbuf[BUFSIZ];
+#endif
+
+	npats=0;
+	if (argc<2)
+		goto usage;
+#ifndef REGULUS
+	setbuf(stdout, xXbuf);		
+#endif
+	while (--argc) {
+		cp = *++argv;
+		if (*cp == '-') {
+			while ( *++cp) {
+				switch(*cp) {
+				case 'f':
+					Fullname=TRUE; break;
+				case 'k':
+					blklen=KSIZE; break;
+				case 'q':
+					Quiet=TRUE; Verbose=0; break;
+				case 'v':
+					++Verbose; break;
+				default:
+					goto usage;
+				}
+			}
+		}
+		else if ( !npats && argc>0) {
+			if (argv[0][0]) {
+				npats=argc;
+				patts=argv;
+			}
+		}
+	}
+	if (npats < 1) {
+usage:
+		fprintf(stderr,"%s by Chuck Forsberg\n", VERSION);
+		fprintf(stderr,"Usage: sb [-fkqv] file ...\n");
+		exit(SS_NORMAL);
+	}
+	
+	if (Verbose) {
+		if (freopen(LOGFILE, "a", stderr)==NULL) {
+			printf("Can't open log file %s\n",LOGFILE);
+			exit(SS_NORMAL);
+		}
+		setbuf(stderr, NULL);
+	}
+	if (Verbose != 1) {
+		fprintf(stderr, "sb: %d file%s requested:\r\n",
+		 npats, npats>1?"s":"");
+		for ( agcnt=npats, agcv=patts; --agcnt>=0; ) {
+			fprintf(stderr, "%s ", *agcv++);
+		}
+	}
+
+	setmodes();
+
+	if (wcsend(npats, patts)==ERROR) {
+		exitcode=0200;
+		canit();
+	}
+	fflush(stdout);
+	restoremodes(FALSE);
+	exit(SS_NORMAL);
+}
+
+wcsend(argc, argp)
+char *argp[];
+{
+	register n;
+
+	Crcflg=FALSE;
+	firstsec=TRUE;
+	for (n=0; n<argc; ++n) {
+		Totsecs = 0;
+		if (wcs(argp[n])==ERROR)
+			goto fubar;
+	}
+	Totsecs = 0;
+	if (Filcnt==0) {	/* bitch if we couldn't open ANY files */
+		fprintf(stderr,"\r\nCan't open any requested files.\n");
+		return ERROR;
+	}
+	else if (wctxpn("")==ERROR)
+		goto fubar;
+	return OK;
+fubar:
+	canit(); return ERROR;
+}
+
+wcs(name)
+char *name;
+{
+	register c;
+
+	if ((in=fopen(name, "r"))==NULL) {
+		++errcnt;
+		return OK;	/* pass over it, there may be others */
+	}
+	++Filcnt;
+	if (wctxpn(name)!= ERROR)
+		return wctx();
+	else {
+		return ERROR;
+	}
+}
+
+/*
+ * generate and transmit pathname block consisting of
+ *  pathname (null terminated),
+ *  file length provided by RMS
+ */
+wctxpn(name)
+char *name;
+{
+	register firstch;
+	register char *p, *q;
+	long filestat();
+
+	uncaps(name);		/* Get it out of VMS RADIX50 */
+
+	logent("\r\nAwaiting pathname nak for %s\r\n", *name?name:"<END>");
+	if ((firstch=readline(800))==TIMEOUT) {
+		logent("Timeout on pathname\n");
+		return ERROR;
+	}
+	if (firstch==WANTCRC)
+		Crcflg=TRUE;
+	for (p=name, q=txbuf ; *p; )
+		if ((*q++ = *p++) == '/' && !Fullname)
+			q = txbuf;
+	*q++ = 0;
+	p=q;
+	while (q < (txbuf + KSIZE))
+		*q++ = 0;
+
+	if (*name)
+		sprintf(p, "%lu", filestat(name));
+
+	/* force 1k blocks if name won't fit in 128 byte block */
+	if (strlen(txbuf) > 127)
+		blklen=KSIZE;
+	if (wcputsec(txbuf, 0, SECSIZ)==ERROR)
+		return ERROR;
+	return OK;
+}
+
+wctx()
+{
+	register int sectnum, attempts, firstch;
+
+	firstsec=TRUE;
+
+	while ((firstch=readline(400))!=NAK && firstch != WANTCRC
+	  && firstch!=TIMEOUT && firstch!=CAN)
+		;
+	if (firstch==CAN) {
+		logent("Receiver CANcelled\n");
+		return ERROR;
+	}
+	if (firstch==WANTCRC)
+		Crcflg=TRUE;
+	sectnum=1;
+	while (filbuf(txbuf, blklen)) {
+		if (wcputsec(txbuf, sectnum, blklen)==ERROR) {
+			return ERROR;
+		} else
+			sectnum++;
+	}
+	if (Verbose>1)
+		fprintf(stderr, " Closing ");
+	fclose(in);
+	attempts=0;
+	do {
+		logent(" EOT ");
+		readline(1);
+		sendline(EOT);
+		fflush(stdout);
+		++attempts;
+	}
+		while ((firstch=(readline(100)) != ACK) && attempts < RETRYMAX);
+	if (attempts == RETRYMAX) {
+		logent("No ACK on EOT\n");
+		return ERROR;
+	}
+	else
+		return OK;
+}
+
+wcputsec(buf, sectnum, cseclen)
+char *buf;
+int sectnum;
+int cseclen;	/* data length of this sector to send */
+{
+	register checksum, wcj;
+	register char *cp;
+	unsigned oldcrc;
+	int firstch;
+	int attempts;
+
+	firstch=0;	/* part of logic to detect CAN CAN */
+
+	if (Verbose>1)
+		fprintf(stderr, "\rSector %3d %2dk ", Totsecs, Totsecs/8 );
+	for (attempts=0; attempts <= RETRYMAX; attempts++) {
+		Lastrx= firstch;
+		sendline(cseclen==KSIZE?STX:SOH);
+		sendline(sectnum);
+		sendline(-sectnum -1);
+		oldcrc=checksum=0;
+		for (cp=txbuf, wcj=cseclen; wcj; wcj -= 128) {
+			raw_wbuf(128, cp);
+			cp += 128;
+		}
+		for (cp=txbuf, wcj=cseclen; --wcj>=0; ) {
+			oldcrc=updcrc(*cp, oldcrc);
+			checksum += (*cp++);
+		}
+		if (Crcflg) {
+			oldcrc=updcrc(0,updcrc(0,oldcrc));
+			sendline((int)oldcrc>>8);
+			sendline((int)oldcrc);
+		}
+		else
+			sendline(checksum);
+
+
+		firstch = readline(400);
+gotnak:
+		switch (firstch) {
+		case CAN:
+			if(Lastrx == CAN) {
+cancan:
+				logent("Cancelled\n");  return ERROR;
+			}
+			break;
+		case TIMEOUT:
+			logent("Timeout on sector ACK\n"); continue;
+		case WANTCRC:
+			if (firstsec)
+				Crcflg = TRUE;
+		case NAK:
+			logent("NAK on sector\n"); continue;
+		case ACK: 
+			firstsec=FALSE;
+			Totsecs += (cseclen>>7);
+			return OK;
+		default:
+			logent("Got %02x for sector ACK\n", firstch);
+			break;
+		}
+		for (;;) {
+			Lastrx = firstch;
+			if ((firstch = readline(400)) == TIMEOUT)
+				break;
+			if (firstch == NAK || firstch == WANTCRC)
+				goto gotnak;
+			if (firstch == CAN && Lastrx == CAN)
+				goto cancan;
+		}
+	}
+	if (Verbose)
+		logent("Retry Count Exceeded\n");
+	return ERROR;
+}
+
+
+/* fill buf with count chars padding with ^Z for CPM */
+filbuf(buf, count)
+register char *buf;
+{
+	register c, m;
+	m=count;
+	while ((c=getc(in))!=EOF) {
+		*buf++ =c;
+		if (--m == 0)
+			break;
+	}
+	if (m==count)
+		return 0;
+	else
+		while (--m>=0)
+			*buf++ = CPMEOF;
+	return count;
+}
+
+
+
+
+
+/* update CRC */
+unsigned updcrc(c, crc)
+register c;
+register unsigned crc;
+{
+	register count;
+
+	for (count=8; --count>=0;) {
+		if (crc & 0x8000) {
+			crc <<= 1;
+			crc += (((c<<=1) & 0400)  !=  0);
+			crc ^= 0x1021;
+		}
+		else {
+			crc <<= 1;
+			crc += (((c<<=1) & 0400)  !=  0);
+		}
+	}
+	return crc;	
+}
+
+/* send 10 CAN's to try to get the other end to shut up */
+canit()
+{
+	register n;
+	for (n=10; --n>=0; )
+		sendline(CAN);
+}
+
+#ifdef REGULUS
+/*
+ * copies count bytes from s to d
+ * (No structure assignment in Regulus C compiler)
+ */
+movmem(s, d, count)
+register char *s, *d;
+register count;
+{
+	while (--count >= 0)
+		*d++ = *s++;
+}
+#endif
+
+/*VARARGS1*/
+logent(a, b, c)
+char *a, *b, *c;
+{
+	if(Verbose)
+		fprintf(stderr, a, b, c);
+}
+
+
+/*
+ * substr(string, token) searches for token in string s
+ * returns pointer to token within string if found, NULL otherwise
+ */
+char *
+substr(s, t)
+register char *s,*t;
+{
+	register char *ss,*tt;
+	/* search for first char of token */
+	for (ss=s; *s; s++)
+		if (*s == *t)
+			/* compare token with substring */
+			for (ss=s,tt=t; ;) {
+				if (*tt == 0)
+					return s;
+				if (*ss++ != *tt++)
+					break;
+			}
+	return NULL;
+}
+
+
+/* set tty modes for sb transfers */
+setmodes()
+{
+/*  Device characteristics for VMS  */
+#ifdef vms
+	int	*iptr, parameters;
+
+/*
+ *	Get current terminal parameters.
+ */
+	if (gtty(&ttys) != SS$_NORMAL)
+		error("SETMODES:  error return from GTTY (1)", FALSE);
+	if (gtty(&ttysnew) != SS$_NORMAL)
+		error("SETMODES:  error return from GTTY (2)", FALSE);
+
+/*
+ *	Set new terminal parameters.
+ *	Note that there are three bytes of terminal characteristics,
+ *	so we should make sure the fourth byte of the integer is unchanged.
+ */
+	iptr	= &(ttysnew.dev_characteristics.bcharacteristics);
+	parameters	= *iptr;
+
+	parameters	&= ~TT$M_ESCAPE;		/*  ESCAPE   OFF  */
+	parameters	&= ~TT$M_HOSTSYNC;		/*  HOSTSYNC OFF  */
+	parameters	|=  TT$M_NOECHO;		/*  NOECHO   ON   */
+	parameters	|=  TT$M_PASSALL;		/*  PASSALL  ON   */
+	parameters	&= ~TT$M_READSYNC;		/*  READSYNC OFF  */
+	parameters	&= ~TT$M_TTSYNC;		/*  TTSYNC   OFF  */
+	parameters	&= ~TT$M_WRAP;			/*  WRAP     OFF  */
+	parameters	|= TT$M_EIGHTBIT;		/*  EIGHTBIT ON   */
+
+	*iptr		= parameters;
+
+	if (stty(&ttysnew) != SS_NORMAL)
+		error("SETMODES:  error return from STTY", TRUE);
+#endif
+}
+
+
+
+/* restore normal tty modes */
+restoremodes(errcall)
+int errcall;
+{
+/*  Device characteristic restoration for VMS  */
+#ifdef vms
+	if (stty(&ttys) != SS_NORMAL)		/*  Restore original modes  */
+		{
+		if (!errcall)
+			error("Error restoring original terminal params.",
+									FALSE);
+		else
+			{
+			printf("sb/RESTOREMODES:  ");
+			printf("Error restoring original terminal params.\n");
+			}
+		}
+#endif
+}
+
+/* get a byte from data stream -- timeout if "dseconds" elapses */
+/*	NOTE, however, that this function returns an INT, not a BYTE!!!  */
+readline(dseconds)
+{
+	int seconds;
+	int	c;
+
+	seconds = dseconds/10;
+	if (seconds < 5)
+		seconds = 5;
+#ifdef vms
+	c	= raw_read(1, &c, seconds);
+
+	if (c == SS$_TIMEOUT)
+		return(TIMEOUT);
+
+	return(c & 0377);  /* return the char */
+#endif
+}
+
+/* send a byte to data stream */
+sendline(data)
+{
+	char	dataout;
+
+	dataout	= data;
+#ifdef vms
+	raw_write(dataout);
+#endif
+
+}
+
+
+/* print error message and exit; if mode == TRUE, restore normal tty modes */
+error(msg, mode)
+char *msg;
+int mode;
+{
+	if (mode)
+		restoremodes(TRUE);  /* put back normal tty modes */
+	printf("sb:  %s\n", msg);
+	logent("Fatal Error:  %s\n", msg);
+	exit(SS_NORMAL);
+}
+
+
+/* make string s lower case */
+uncaps(s)
+register char *s;
+{
+	for ( ; *s; ++s)
+		if ( ! (*s & 0200))
+			*s = tolower(*s);
+}
+
+
+SHAR_EOF
+#	End of shell archive
+exit 0
+-- 
+  Chuck Forsberg WA7KGX   ...!tektronix!reed!omen!caf   CIS:70715,131
+Omen Technology Inc     17505-V NW Sauvie Island Road Portland OR 97231
+Home of Professional-YAM, the most powerful COMM program for the IBM PC
+Voice: 503-621-3406 TeleGodzilla: 621-3746 (Hit CRs) L.sys entry for omen:
+omen Any ACU 1200 1-503-621-3746 se:--se: link ord: Giznoid in:--in: uucp
+
+

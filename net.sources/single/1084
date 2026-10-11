@@ -1,0 +1,588 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,46fb8658b074578,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-04-09 12:13:45 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10 5/3/83; site utcsrgv.UUCP
+Path: utzoo!utcsrgv!outer
+From: outer@utcsrgv.UUCP (Richard Outerbridge)
+Newsgroups: net.sources
+Subject: lucifer.c: a cryptographic algorithm (reposting)
+Message-ID: <3801@utcsrgv.UUCP>
+Date: Mon, 9-Apr-84 15:13:45 EST
+Article-I.D.: utcsrgv.3801
+Posted: Mon Apr  9 15:13:45 1984
+Date-Received: Mon, 9-Apr-84 16:03:04 EST
+Organization: CSRG, University of Toronto
+Lines: 568
+
+This is essentially a reposting of <3718@utcsrgv.UUCP>.  Several people from
+different sites have written asking for the source that the corrections posted
+later last week corrected, so here it is already corrected and slightly faster.
+Apparently the original had a very limited distribution.  Apologies to those
+sites unlucky enough not to have escaped it the first time around.
+_________
+
+This is a set of routines which implement the IBM LUCIFER algorithm.
+They are derived from the article "LUCIFER: A Cryptographic Algorithm"
+by Arthur Sorkin (CRYPTOLOGIA, Vol. 8, No. 1, January 1984), and the
+FORTRAN routines published as appendices to the article, as recently
+corrected by the author.  LUCIFER was developed by IBM in the early
+seventies, and is a direct predecessor of the NBS Data Encryption Standard.
+It seems to be a MUCH weaker algorithm, even though it uses a 128-bit key 
+and operates on 16-byte data blocks.  The main program lets you use LUCIFER
+to encrypt files in one of several different ways, or to compute checksums.
+The program chunks along rather slowly as compared to UNIX crypt(1).
+As LUCIFER has been obsoleted by the DES, these routines are primarily
+intended for academic research and non-UNIX (i.e. micro) systems with
+'C' compilers but no cryptography.  If you modify them, please ensure
+that taking the checksum of a null stream results in the hex value given
+near the end of the file.  Thanks.
+
+8404.08 	Richard Outerbridge	outer@utcsrgv
+
+/************************* lucifer - applications ***********************/
+/*					(programmed by R.W.Outerbridge)	*/
+
+/* lucifer: encrypt/decrypt files with the IBM LUCIFER algorithm.
+ *
+ *	Usage: lucifer (+|-)([ecb]|<cbc|pcc|cks>) key1 <key2>
+ *		       EN/DE  MODES OF OPERATION     KEYS
+ *
+ *	+ :	ENcrypt (default if MODE specified)
+ *	- :	DEcrypt (presumes encrypted input)
+ *
+ *	Modes of Operation (choose ONE):
+ *
+ *	ecb : (default) Electronic Code Book.  Only uses one key.
+ *		If simply "+" or "-" is specified, ecb is used.
+ *	cbc : Cipher Block Chaining.  Uses two keys.
+ *	pcc : Plaintext-Ciphertext Chaining.  Uses two keys.
+ *		Performs automatic message authentication.
+ *	cks : ChecKSum.  Generates a 128-bit checksum using two keys.
+ *
+ *	Both keys may be up to 16 characters long.  NON-ASCII MACHINES
+ *	MAY GET DIFFERENT RESULTS.  Any character may be used in keys,
+ *	but the one letter key "@", when used as "key1", will cause
+ *	lucifer to use a preset default key for "key1".  This is used
+ *	for verification and testing.  Failing to specify "key2", if
+ *	required, will result in "key1" being used for both keys.  It
+ *	is an error to omit "key1".  There is no provision for specifying
+ *	arbitrary, absolute, bit-valued keys.
+ *
+ *	Lucifer reads from its stdin stream, and writes to its stdout stream.
+ *	Mucking up the arguments will get you messages on the stderr stream.
+ *	As painful as they are to use, long and complex keys are MUCH safer.
+ *
+ *					~~ Graven Cyphers, 8403.30
+ *					   University of Toronto
+ */
+
+#include <stdio.h>
+#define EN	0
+#define DE	1
+#define PCC	2
+#define MODS	4
+
+void ruderr(), copy16(), xor16();
+void lucifer(), loadkey(), getkey(), put16(), resetIO();
+
+int Block[16], Link[16], Temp[16], IV[16];
+int DFLTKY[16] = { 1,35,69,103,137,171,205,239,254,220,186,152,118,84,50,16 };
+			/* 0x0123456789abcdeffedcba9876543210	*/
+
+int Ecb(), Cbc(), Pcc(), Cks();
+struct modes {
+	char *name;
+	int (*func)();
+	};
+struct modes ModsOp[MODS] = {
+	{ "ecb", Ecb },
+	{ "cbc", Cbc },
+	{ "pcc", Pcc },
+	{ "cks", Cks }	};
+
+main(argc, argv)
+int argc;
+char **argv;
+	{
+	int (*xeqtr)();
+	int step, ende, edio, ok, i;
+	int kv[16];
+
+	argv++; argc--;
+	if(argc > 3 || argc < 2) ruderr();
+
+	for(step=0; argc > 0; step++) {
+		switch(step) {
+		case 0:	/* set en/de and/or default mode	*/
+			if(*argv[0] == '+' || *argv[0] == '-') {
+				ende = (*argv[0] == '+') ? EN : DE;
+				*argv[0]++ = NULL;
+				if(*argv[0] == NULL) {
+					xeqtr = Ecb;	/* default mode	*/
+					edio = ende;
+					argv++; argc--;
+					break;
+					}
+				}
+			else ende = EN;
+
+			for(i=ok=0; i<MODS && !ok; i++) {
+				if(strcmp(argv[0], ModsOp[i].name) == 0) {
+					xeqtr = ModsOp[i].func;
+					ok = 1;
+					}
+				}
+			if(!ok) {
+				fprintf(stderr, "Lucifer: unknown mode >%s<.\n", argv[0]);
+				ruderr();
+				}
+			while(*argv[0]) *argv[0]++ = NULL;
+			argv++; argc--;
+
+			/* set appropriate IO modes	*/
+			if(xeqtr == Cks) edio = EN|PCC;	/* IO kludge	*/
+			else if(xeqtr == Pcc) edio = ende|PCC;
+			else edio = ende;
+
+		/* falling through....	*/
+		case 1: /* get the key and IV, if needed and present	*/
+			if(strcmp(argv[0], "@") == 0) copy16(DFLTKY, kv);
+			else getkey(argv[0], kv);
+			argv++; argc--;
+			
+			/* if nothing left, but an IV needed, use the key	*/
+			if(argc == 0) {
+				if(xeqtr != Ecb) copy16(kv, IV);
+				break;
+				}
+			else if(xeqtr == Ecb) {
+				fprintf(stderr, "Lucifer: (warning) - key2 ignored.\n");
+				while(*argv[0]) *argv[0]++ = NULL;
+				argv++; argc--;
+				break;
+				}
+
+			else getkey(argv[0], IV);
+			argv++; argc--;
+			break;
+
+		default:
+			fprintf(stderr, "Lucifer: Programming error!\n");
+			exit(1);
+			break;
+			}	/* switch	*/
+		}	/* argument parsing	*/
+
+	resetIO(stdin, stdout, edio);
+	loadkey(kv);
+	(*xeqtr)(ende);		/* ta-da!  Take it away xeqtr!	*/
+	exit(0);
+	}	/* end of main	*/
+
+void ruderr() {
+	fprintf(stderr, "Usage: lucifer (+|-)([ecb]|<cbc|pcc|cks>) key1 <key2>\n");
+	exit(1);
+	}
+
+Cbc(e_d)	/* Cipher Block Chaining		*/
+int e_d;	/* Ciphertext errors are self-healing.	*/
+	{
+	copy16(IV, Link);
+	while(get16(Block) != EOF) {
+		if(e_d == DE) copy16(Block, Temp);
+		else xor16(Block, Link);
+		lucifer(Block, e_d);
+		if(e_d == DE) {
+			xor16(Block, Link);
+			copy16(Temp, Link);
+			}
+		else copy16(Block, Link);
+		put16(Block);
+		}
+	return;
+	}
+
+Cks(e_d)	/* CBC authentication checksum generator	*/
+int e_d;	/* The banks use this for verifications.	*/
+	{
+	int i, j, k;
+	long count = 0;
+	copy16(IV, Link);
+	while(get16(Block) != EOF) {
+		xor16(Block, Link);
+		lucifer(Block, e_d);
+		copy16(Block, Link);
+		count += 16L;
+		}
+	fprintf(stdout, ": %0ld bytes\t: ", count);
+	for(i=j=0; i<4; i++) {
+		for(k=0; k<4; k++, j++) fprintf(stdout, "%02x", Link[j]&0377);
+		putc(' ', stdout);
+		}
+	fprintf(stdout, ":\n");
+	return;
+	}
+
+Pcc(e_d)	/* Plaintext-Ciphertext feedback block Chaining */
+int e_d;	/* This is the best, but if you lose >1< bit...	*/
+	{
+	int i, j;
+	copy16(IV, Link);
+	while(get16(Block) != EOF) {
+		if(e_d == DE) {
+			copy16(Block, Temp);
+			lucifer(Temp, DE);
+			xor16(Link, Temp);
+			}
+		else {
+			xor16(Link, Block);
+			lucifer(Link, EN);
+			}
+		put16(Link);
+		xor16(Link, Block);
+		}
+	if(e_d == DE) {
+		lucifer(Temp, EN);
+		xor16(Link, Temp);
+		for(i=j=0; i<16; i++) j += (Link[i] ^ IV[i])&0377;
+		if(j != 0) {
+			fprintf(stderr, "Lucifer: Corrupt authenticator (%03x)!\n", j);
+			exit(1);
+			}
+		}
+	else {
+		xor16(Link, IV);
+		lucifer(Link, EN);
+		put16(Link);
+		}
+	return;
+	}
+
+Ecb(e_d)	/* Electronic Code Book	: simple substitution	*/
+int e_d;	/* Yawn.  For static data and random access.	*/
+	{
+	while(get16(Block) != EOF) {
+		lucifer(Block, e_d);
+		put16(Block);
+		}
+	return;
+	}
+
+void copy16(from, to)
+register int *from, *to;
+	{
+	register int *ep;
+	ep = &to[16];
+	while(to<ep) *to++ = *from++;
+	return;
+	}
+
+void xor16(to, with)
+register int *to, *with;
+	{
+	register int *ep;
+	ep = &to[16];
+	while(to<ep) *to++ ^= *with++;
+	return;
+	}
+
+/*			(rwo/8404.08.06:12/V2.2)			*/
+/**************************** lucifer - applications ********************/
+/******************************** lucifer *******************************/
+
+/* LUCIFER is a cryptographic algorithm developed by IBM in the early
+ *	seventies.  It was a predecessor of the DES, and is much simpler
+ *	than that algorithm.  In particular, it has only two substitution
+ *	boxes and just one permutation box.  The permutation box is only
+ *	eight bits wide.  It does, however, use a 128 bit key and operates
+ *	on sixteen byte data blocks...
+ *
+ *	This implementation of LUCIFER was crafted by Graven Cyphers at the
+ *	University of Toronto, Canada, with programming assistance from
+ *	Richard Outerbridge.  It is based on the FORTRAN routines which
+ *	concluded Arthur Sorkin's article "LUCIFER: A Cryptographic Algorithm",
+ *	CRYPTOLOGIA, Volume 8, Number 1, January 1984, pp22-42.	 The interested
+ *	reader should refer to that article rather than this program for more
+ *	details on LUCIFER.
+ *
+ *	These routines bear little resemblance to the actual LUCIFER algorithm,
+ *	which has been severely twisted in the interests of speed.  They do
+ *	perform the same transformations, and are believed to be UNIX portable.
+ *	The package was developed for use on UNIX-like systems lacking crypto
+ *	facilities.  They are not very fast, but the cipher is very strong.
+ *	The routines in this file are suitable for use as a subroutine library
+ *	after the fashion of crypt(3).  When linked together with applications
+ *	routines they can also provide a high-level cryptographic system.
+ */
+
+/*	#include <stdio.h>
+	#define EN	0
+	#define DE	1	*/
+#include <ctype.h>
+
+/* IO variables.  resetIO() must be called to initialise them	*/
+static int Ed_IO, End, Twice, Save0[16], Save1[16], *Former, *Last;
+static FILE *Finp, *Foutp;
+
+static int DP[8][8] = { 	/* Diffusion Pattern schedule	*/
+	{ 7,6,2,1,5,0,3,4 },
+	{ 0,7,3,2,6,1,4,5 },
+	{ 1,0,4,3,7,2,5,6 },
+	{ 2,1,5,4,0,3,6,7 },
+	{ 3,2,6,5,1,4,7,0 },
+	{ 4,3,7,6,2,5,0,1 },
+	{ 5,4,0,7,3,6,1,2 },
+	{ 6,5,1,0,4,7,2,3 },    };
+
+/* Precomputed S&P Boxes, Two Varieties	*/
+static char TCB0[256] = {	/* NB: char to save space.	*/
+	 87, 21,117, 54, 23, 55, 20, 84,116,118, 22, 53, 85,119, 52, 86,
+	223,157,253,190,159,191,156,220,252,254,158,189,221,255,188,222,
+	207,141,237,174,143,175,140,204,236,238,142,173,205,239,172,206,
+	211,145,241,178,147,179,144,208,240,242,146,177,209,243,176,210,
+	215,149,245,182,151,183,148,212,244,246,150,181,213,247,180,214,
+	 95, 29,125, 62, 31, 63, 28, 92,124,126, 30, 61, 93,127, 60, 94,
+	219,153,249,186,155,187,152,216,248,250,154,185,217,251,184,218,
+	 67,  1, 97, 34,  3, 35,  0, 64, 96, 98,  2, 33, 65, 99, 32, 66,
+	195,129,225,162,131,163,128,192,224,226,130,161,193,227,160,194,
+	199,133,229,166,135,167,132,196,228,230,134,165,197,231,164,198,
+	203,137,233,170,139,171,136,200,232,234,138,169,201,235,168,202,
+	 75,  9,105, 42, 11, 43,  8, 72,104,106, 10, 41, 73,107, 40, 74,
+	 91, 25,121, 58, 27, 59, 24, 88,120,122, 26, 57, 89,123, 56, 90,
+	 71,  5,101, 38,  7, 39,  4, 68,100,102,  6, 37, 69,103, 36, 70,
+	 79, 13,109, 46, 15, 47, 12, 76,108,110, 14, 45, 77,111, 44, 78,
+	 83, 17,113, 50, 19, 51, 16, 80,112,114, 18, 49, 81,115, 48, 82	};
+
+static char TCB1[256] = {
+	 87,223,207,211,215, 95,219, 67,195,199,203, 75, 91, 71, 79, 83,
+	 21,157,141,145,149, 29,153,  1,129,133,137,  9, 25,  5, 13, 17,
+	117,253,237,241,245,125,249, 97,225,229,233,105,121,101,109,113,
+	 54,190,174,178,182, 62,186, 34,162,166,170, 42, 58, 38, 46, 50,
+	 23,159,143,147,151, 31,155,  3,131,135,139, 11, 27,  7, 15, 19,
+	 55,191,175,179,183, 63,187, 35,163,167,171, 43, 59, 39, 47, 51,
+	 20,156,140,144,148, 28,152,  0,128,132,136,  8, 24,  4, 12, 16,
+	 84,220,204,208,212, 92,216, 64,192,196,200, 72, 88, 68, 76, 80,
+	116,252,236,240,244,124,248, 96,224,228,232,104,120,100,108,112,
+	118,254,238,242,246,126,250, 98,226,230,234,106,122,102,110,114,
+	 22,158,142,146,150, 30,154,  2,130,134,138, 10, 26,  6, 14, 18,
+	 53,189,173,177,181, 61,185, 33,161,165,169, 41, 57, 37, 45, 49,
+	 85,221,205,209,213, 93,217, 65,193,197,201, 73, 89, 69, 77, 81,
+	119,255,239,243,247,127,251, 99,227,231,235,107,123,103,111,115,
+	 52,188,172,176,180, 60,184, 32,160,164,168, 40, 56, 36, 44, 48,
+	 86,222,206,210,214, 94,218, 66,194,198,202, 74, 90, 70, 78, 82	};
+
+static int Key[16], Pkey[16];
+static int P[8] = { 3,5,0,4,2,1,7,6 };
+static int Smask[16] = { 128,64,32,16,8,4,2,1 };
+
+void lucifer(bytes, edf)
+int *bytes;	/* points to a 16-byte array	*/
+int edf;	/* 0 = encrypt, 1 = decrypt	*/
+	{
+	register int *cp, *sp, *dp, val, j, k;
+	int kc, ks, i, *h0, *h1, *sbs;
+
+	h0 = &bytes[0];		/* the "lower" half	*/
+	h1 = &bytes[8];		/* the "upper" half	*/
+	kc = (edf == DE) ? 8 : 0;
+
+	for(i=0; i<16; i++) {
+		if(edf == DE) kc = (++kc)&017;
+		ks = Key[kc];	/* the "first" byte of key, this round	*/
+#ifdef SATAN
+		for(j=0, cp=h1; j<8; j++) ks ^= *cp++;
+#endif
+		sbs = Smask;
+
+		for(j=0; j<8; j++) {
+			/* nibbles are selected by the bits of ks	*/
+			if(ks&*sbs++) val = TCB1[h1[j]];
+			else val = TCB0[h1[j]];
+			val ^= Pkey[kc];
+
+			/* fiddle bits in the "lower" half	*/
+			dp = &DP[j][0];
+			sp = Smask;
+			for(k=0; k<8; k++) {
+				cp = &h0[*dp++];
+				*cp ^= (val&*sp++);
+				}
+
+			if(j<7 || (edf == DE)) kc = (++kc)&017;
+			}
+
+		/* swap (virtual) halves	*/
+		cp = h0;
+		h0 = h1;
+		h1 = cp;
+		}
+
+	/* REALLY swap halves	*/
+	dp = &bytes[0];
+	cp = &bytes[8];
+	for(sp=cp; dp<sp; dp++, cp++) {
+		val = *dp;
+		*dp = *cp;
+		*cp = val;
+		}
+	return;
+	} 
+
+void loadkey(keystr)		/* sets master key	*/
+register int *keystr;
+	{
+	register int *ep, *cp, *pp, i;
+	cp = Key;
+	pp = Pkey;
+	ep = &Key[16];
+	while(cp < ep) {
+		*cp++ = *keystr;
+		for(*pp=i=0; i<8; i++)
+			if(*keystr&Smask[i]) *pp |= Smask[P[i]];
+		keystr++;
+		pp++;
+		}
+	return;
+	}
+
+/* getkey: using up to 16 bytes of aptr, makeup a 16 byte key in savp.
+	aptr must be NULL terminated, savp 16 bytes long.  The key
+	returned in savp is aptr encrypted with itself ONCE.	*/ 
+void getkey(aptr, savp)
+register char *aptr;
+register int *savp;
+	{
+	register int i,	*store, *cp;
+	store = savp;
+
+	/* copy aptr into savp; NULL aptr	*/
+	for(i=0; i<16 && (*aptr != NULL); i++) {
+		*savp++ = toascii(*aptr);
+		*aptr++ = NULL;
+		}
+	while(*aptr) *aptr++ = NULL;
+	if(i == 0) savp++;	/* aptr could have been NULL	*/
+
+	/* expand savp out to 16 bytes of "something" and encrypt it	*/
+	for(cp=store, savp--; i<16;) store[i++] = (*cp++ + *savp++)&0377;
+	loadkey(store);
+	lucifer(store, EN);
+	return;
+	}
+
+/* Input/Output: ENcrypting is straightforward (almost).  gets and puts
+ *	are done immediately.  The last block is padded with NULLs and the 
+ *	number of NULLs; if there were an even 16 bytes in the last block
+ *	no padding is done (unless Ed_IO != 0, ie Ed_IO == 2) and instead
+ *	a single '0' is output and EOF returned.  DEcrypting is more
+ *	complicated (sigh).  Writes are delayed by two reads.  On EOF,
+ *	if in the middle of a block, there has either been an error OR
+ *	there were no NULLs.  Any pending output is written and EOF 
+ *	returned.  If EOF occurs at the start of a block, and if Ed_IO != 1
+ *	(ie Ed_IO == 3), the oldest output block is written and the next
+ *	output block is depadded and written.  Else the oldest output
+ * 	block is written, and the last output block is ignored.  (In this
+ *	case the last output block was the authenticator, which Pcc()
+ *	regenerates itself).  WARNING: when decrypting, calls to put16() &
+ *	get16() MUST be interleaved, ie get16(), put16(), get16() ..., or
+ *	else utter nonsense will result from the delayed writing.
+ */
+
+void put16(block)
+register int *block;
+	{
+	register int *ep, *to;
+	ep = &block[16];
+	if(Ed_IO&DE) {
+		to = Former;
+		while(block<ep) *to++ = *block++;
+		to = Former;
+		Former = Last;
+		Last = to;
+		}
+	else vraiput(block, ep);
+	return;
+	}
+
+get16(input)
+int *input;
+	{
+	register int i, j, *cp;
+	if(End == 1) return(EOF);	/* no more input	*/
+
+	if(Ed_IO&DE) {	/* DECRYPTION	*/
+		if((i = vraiget(input)) == 16) {
+			if(Twice == 2) vraiput(Former, &Former[16]);
+			else Twice++;
+			}
+		else {		/* EOF on input */
+			End = 1;
+			if(i != 0) {	/* no NULLs,  or an error	*/
+				if(Twice == 2) vraiput(Former, &Former[16]);
+				if(Twice >= 1) vraiput(Last, &Last[16]);
+				}
+			else {	/* an even 16 bytes	*/
+				if(Ed_IO == DE && (Twice == 2)) vraiput(Former, &Former[16]);
+				if(Twice >= 1) {	/* then there are NULLs	*/
+					if(Ed_IO == DE) cp = Last;
+					else cp = Former;
+					i = cp[15]&037;
+					if(i>16) i = 0;	/* hmmmm.	*/
+					vraiput(cp, &cp[16-i]);
+					}
+				}
+			return(EOF);
+			}
+		}
+	else {	/* ENCRYPTION	*/
+		if((i = vraiget(input)) != 16) {
+			End = 1;
+			if(i == 0 && (Ed_IO == EN)) {
+				putc('0', Foutp);
+				return(EOF);
+				}
+			for(j=i; j<16; j++) input[j] = NULL;
+			input[15] = 16-i;
+			}
+		}
+
+	return(0);
+	}
+
+static vraiput(cp, ep)
+register int *cp, *ep;
+	{
+	while(cp<ep) putc(*cp++, Foutp);
+	return;
+	}
+
+static vraiget(into)
+register int *into;
+	{
+	register int i, j;	
+	for(i=0; i<16 && ((j = getc(Finp)) != EOF); i++) *into++ = j&0377;
+	return(i);
+	}
+
+/* (re)set IO variables.  Call before any IO on a new stream.	*/
+void resetIO(fin, fout, mode)
+register FILE *fin, *fout;
+register int mode;
+	{
+	End = Twice = 0;
+	Ed_IO = mode;
+	Finp = fin;
+	Foutp = fout;
+	Former = Save0;
+	Last = Save1;
+	return;
+	}
+
+/*	lucifer cks @ < /dev/null 
+ *	: 16 bytes	: 32186510 6acf6094 87953eba 196f5a75 :
+ *			(rwo/8404.08.06:12/V3.1)			*/
+/**************************** lucifer ***********************************/
+
+

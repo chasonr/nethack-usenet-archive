@@ -1,0 +1,2595 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,8d5ee2faa7ab9f49,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-08-19 02:51:17 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!mnetor!seismo!mcvax!ukc!dcl-cs!sslvax!smj
+From: smj@ssl-macc.co.uk (Steve Jefferson)
+Newsgroups: net.sources
+Subject: B-tree code in C
+Message-ID: <359@ssl-macc.co.uk>
+Date: Tue, 19-Aug-86 05:51:17 EDT
+Article-I.D.: ssl-macc.359
+Posted: Tue Aug 19 05:51:17 1986
+Date-Received: Thu, 21-Aug-86 01:44:36 EDT
+Reply-To: smj@sslvax.UUCP (Steve Jefferson)
+Distribution: net.sources
+Organization: Software Sciences Ltd, Macclesfield, UK
+Lines: 2574
+Keywords: B-tree
+
+This article consists of a set of C sources to implement a B-tree
+algorithm and several accompanying tests. It was derived from a single 
+program obtained from net.sources some time ago but has been revised and
+extended somewhat since then. 
+
+The code builds to 2 executables:
+(1) btree.fe	- an interactive front-end to the main B-tree system
+		  this implements a simple set of commands
+		  <number>	: insert given key value into the tree
+		  i<number>	: ditto
+		  d<number>	: delete given key value from tree
+		  l<number>	: locate a given key in tree
+		  p		: print current tree
+		  s		: set up a default tree
+		  x		: exit from program
+(2) btree.test	- a series of tests for the B-tree system - typically this
+		  should be run after any significant change to the B-tree
+		  code. 
+		- 3 tests are performed as follows (a test will only
+		  proceed if the previous test succeeded):
+			(i)   Perform a series of random inserts, deletes
+			      and searches, maintaining an external checklist 
+			      and checking the shape of the tree after every
+			      action
+			(ii)  Insert a fixed number of keys in ascending order
+			      then delete them in ascending order
+			(iii) As (ii) but everything is in descending order
+
+Limitations:
+	(1)	The B-tree is implemented as a series of *struct*s in
+		memory - explicit reads and writes of (disc) blocks would
+		be more useful.
+	(2)	The current system only allows for unique key values
+		and not data with identical key values which can then be
+		distinguished by the actual information content of the data.
+
+If anyone has any suggestions or modifications for this code, or indeed has 
+any B-tree code of their own which they are willing to release, I would most 
+interested.
+
+				Steve Jefferson
+			(smj@uk.co.ssl-macc or smj@sslvax.UUCP)
+
+
+--------------------------------- cut here -----------------------------------
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create:
+#
+#	btree.c		- the main B-tree code, organised as a set of
+#			  procedures returning error/ success codes
+#	btree.h		- error codes for btree.c
+#	btree.fe.c	- the B-tree "front-end" system 
+#	btree.fe.h	- the real code of the front-end system
+#	btree.test.c	- the B-tree test system 
+#	btree.test.h	- various constants used by the tests
+#	btree.prt.h	- routines used for printing out B-trees
+#			  used by both the front-end and the tests
+#	btree.fe.M	- makefile for constructing the btree front-end
+#	btree.test.M	- makefile for constructing the btree test
+#
+# 4. Upon completion, execute
+#	(i)	'make -f btree.fe.M' to build the front-end system
+#		(executable 'btree.fe').
+#	(ii)	'make -f btree.test.M' to build the test system
+#		(executable 'btree.test').
+#
+# This archive created: Mon Aug 18  16:11:03 1986
+#
+echo shar: "extracting btree.c"
+if test -f 'btree.c'
+then
+	echo shar: "will not over-write existing file 'btree.c'"
+else
+	cat << \SHAR_EOF > 'btree.c'
+/********************************************************************
+*********************************************************************
+ 
+Module Name:		btree.c
+============
+ 
+Function:		Provide a library of routines for creating 
+=========		and manipulating B-Trees.  
+			The "order" of the B-Tree is controlled by a 
+			manifest constant.
+
+Description:
+============
+	Main btree code Insert, Delete, Search etc.
+
+	Interface Routines:
+	-------------------
+	int Insert(*tree, dtm)	
+		Insert DATUM dtm into B-tree "tree",
+		returns an error/success code.
+	int Delete(*tree, key)	
+		Remove the entry associated with "key" from the B-Tree
+		returns an error/success code.
+	int Search(tree, key, dtmptr)	
+		Look for key "key" in B-tree "tree".
+		Set "dtmptr" to point to matching DATUM or to NULL.
+		Return an error/success code.
+
+	Libraries Used:
+	---------------
+	stdio.h
+	btree.h 
+
+****************************************************************************
+****************************************************************************/
+
+static char btreeprog[] = "@(#)btree.c	1.7 7/17/86";
+
+#include <stdio.h>
+#include "btree.h"
+
+#define TRUE	1	/* A couple of useful constants */
+#define FALSE	0
+
+#define	M	2	/* This constant defines the order of the B-tree */
+
+
+
+/************** Global types and data structures **************/ 
+
+typedef int	KEY;	/* Define the key field type */
+typedef int	INFO;	/* and define the type of the information field
+			   associated with this key */
+
+typedef struct 		/* Define a structure (DATUM) consisting of a key */
+{			/* and an information field */
+	KEY	key;
+	INFO	inf;
+} DATUM;
+
+
+			/* The following is the structure used for defining 
+			   B-trees and their nodes */
+typedef struct btnode 
+{
+	int	t_active;		/* # of active keys */
+	DATUM	t_dat[2*M];		/* Keys  + Data */
+	struct btnode *t_ptr[2*M+1];	/* Subtree ptrs */
+} NODE, *BTREE;
+
+
+/**********************************************************************
+* INSERTION ROUTINES
+**********************************************************************/
+
+static BTREE splittree;	/* 
+			A global variable used by "InternalInsert"
+			to return the right hand portion of a tree
+			which has been bisected .
+			*/
+
+/*
+** INSERT 
+** ======
+**
+** Purpose:	Enter the given key into the B-tree.
+**
+** Parameters:	dtm	= DATUM to be inserted into tree
+**		tree	= B-tree to insert into
+**
+** Returns:	An error/success code which will be one of:
+**			SUCCESS
+**			KEY_EXISTS_ERROR
+**		In addition the tree "tree" is updated.
+**
+** Description: This is the "front end" of the insertion routine
+**		- most of the work is done by "InternalInsert".
+**
+*/
+
+int Insert(treeptr, dtm)
+BTREE	*treeptr;
+DATUM	dtm;
+{
+	int status;
+	int InternalInsert();
+	BTREE MkNode();
+
+	/* 
+	Invoke the main insertion routine, let it do the guts of the
+	insertions, then let it return a final status code.
+	*/
+	status = InternalInsert(*treeptr, &dtm);
+
+	/* 
+	Now examine the returned status code - there are 3 cases:
+	(1) NODE_SPLIT
+	The root node was split - then stitch the tree together by
+	creating a new root node containing dtm only and link 'tree'
+	to the left-hand link and 'splittree' to the right-hand link
+	(2) SUCCESS
+	The tree has already been reassembled into a consistent state
+	so just return a success code
+	(3) KEY_EXISTS_ERROR
+	The given key already exists - the tree should already be unchanged
+	- just exit with this error code
+	*/
+	if (status==NODE_SPLIT)
+	{
+		*treeptr = MkNode(dtm, *treeptr, splittree);
+		return SUCCESS;
+	}
+	else
+		return status;
+}
+
+
+/*
+** INTERNALINSERT
+** ==============
+**
+** Purpose:	This routine performs the major part of key insertion
+**
+** Parameters: 	tree	= B-tree to use.
+**		dtmptr	= Pointer to the datum to be inserted into the tree
+**			  on exit this should contain any datum to be passed
+**			  back up the tree as a result of splitting.
+**
+** Returns: 	An error/success/information code which will be one of:
+**		SUCCESS: Tree is okay, no split occurred dtmptr will not
+**			 point at anything meaningful and splittree will be
+**			 NULL.
+**		NODE_SPLIT:
+**			 Top level node has been split - dtmptr and splittree
+**			 are now meaningful.
+**		KEY_EXISTS_ERROR:
+**			 The key to be inserted already exists - the tree is
+**			 unchanged.
+**
+** Description: This routine works in a recursive manner under the following 
+**		algorithm:
+**		1) Scan down the tree for a place to insert the new datum
+**		   - this should be a leaf unless the datum itself is found
+**		     (in which case return an error code)
+**		2) Try to insert the new datum in the located node
+**		   - if it will fit, then slot it into the node and exit with
+**		     a success code.
+**		   - if the node is already full, split it into 2 separate 
+**		     nodes (one for the lowest M keys, one for the highest M
+**		     keys) and return the NODE_SPLIT code and everything
+**		     associated with it
+**
+*/
+
+int InternalInsert(tree, dtmptr)
+DATUM	*dtmptr;
+BTREE	tree;
+{
+	int	index,
+		j;
+	int	SearchNode();
+	int 	status;
+	BTREE	tmp;
+	BTREE	MkNode();
+
+	if (tree == (BTREE) NULL) 
+	{
+	/* 
+	If current tree is NULL then we're at a leaf, so we can't insert the
+	datum here - the procedure is to act as if we've just split a node
+	and are returning a datum to be slotted in further up the tree - the 
+	only difference is that splittree is set to NULL.
+	*/
+		splittree = (BTREE) NULL;
+		return NODE_SPLIT;
+	} 
+	else 
+	{
+		/* 
+		Tree is not null - now search for occurence of datum's key 
+		in the current top-level node - return its position (or index 
+		of pointer to subtree) as a by-product.
+		*/
+		if (SearchNode(tree, (*dtmptr).key, &index))
+			/*
+			If key has been found then return an error code 
+			*/
+			return KEY_EXISTS_ERROR;
+		/*
+		If not found the try to insert datum in next level of tree -
+		this action will then return a status code and possibly a
+		splittree.
+		*/
+		status = InternalInsert(tree->t_ptr[index],dtmptr);
+		
+		/*
+		If we have had a successful insertion (with tree in good order)
+		or we have had a key insertion error, then return with this 
+		status code without further ado.
+		*/
+		if (status != NODE_SPLIT)
+			return status;
+		/*
+		We've now had a split node at the level below with dtmptr now
+		pointing to a datum throw back up from it and splittree 
+		pointing to the right-hand part of the split node
+		Next stage is to try to insert things here and tidy up the tree
+		once and for all - so check to see whether current top level
+		node is full or not (ie. can it support an insertion ?).
+		*/
+		if (tree->t_active < 2*M)
+		{
+			/* 
+			If there is room then everything's hunky dory
+			*/
+			InsInNode(tree, *dtmptr, splittree);
+			return SUCCESS;
+		}
+
+		/*
+		Current top-level node is full - so split it into two 
+		- set left-hand half to contain lower M keys and leave it
+		  attached to main tree.
+		- set splittree to point to right-hand half (which contains
+		  the highest M keys).
+		- set dtmptr to point to central key value
+		*/
+		if (index <= M) 
+		{
+			/* 
+			If datum should go in a left-hand or central position
+			of current top-level node then shift right-element out
+			Note that we need a temporary B-tree here just to do
+			the swap of datums
+			*/
+			tmp = MkNode(tree->t_dat[2*M-1], (BTREE)NULL, tree->t_ptr[2*M]);
+			tree->t_active--;
+			InsInNode(tree, *dtmptr, splittree);
+		} 
+		else
+			/* 
+			If datum is definitely part of right-hand half of
+			the 2M+1 keys then transfer it to (what will be) 
+			splittree immediately.
+			*/
+			tmp = MkNode(*dtmptr, (BTREE)NULL, splittree);
+
+		/*
+		Final part is to move right hand half of current top level node
+		out into (whta is about to become) the new splittree
+		and then mode central (Mth) key of current top-level node into
+		*dtmptr
+		*/
+		for (j = M+1; j < 2*M; j++)
+			InsInNode(tmp, tree->t_dat[j], tree->t_ptr[j+1]);
+
+		*dtmptr		= tree->t_dat[M];
+		tree->t_active 	= M;
+		tmp->t_ptr[0] 	= tree->t_ptr[M+1];
+		splittree	= tmp;
+
+		/* 
+		Finally return NODE_SPLIT code
+		*/
+		return NODE_SPLIT;
+	}
+}
+
+
+/*
+** INSINNODE
+** =========
+** 
+** Purpose:	Add a datum into a B-tree node working on the assumption 
+**		that there is room for it.
+**
+** Parameters: 	nodeptr	= Ptr to the node,
+**		dtm	= Datum to enter,
+**		ptr	= "Greater than" link to subordinate node.
+**
+** Returns: 	None.
+**
+** Description:	The workings of this routine are pretty straightforward - just
+**		sort out where the key should go, shift all greater keys
+**		right one position and then insert the key and pointer.
+*/
+
+InsInNode(nodeptr, dtm, ptr)
+BTREE	nodeptr,
+	ptr;
+DATUM	dtm;
+{
+	int	index;
+	int	KeyCmp();
+
+	for (index = nodeptr->t_active; index>0 && KeyCmp(dtm.key, nodeptr->t_dat[index-1].key)<0; index--) 
+	{
+		nodeptr->t_dat[index]   = nodeptr->t_dat[index-1];
+		nodeptr->t_ptr[index+1] = nodeptr->t_ptr[index];
+	}
+
+	nodeptr->t_active++;
+	nodeptr->t_dat[index]   = dtm;
+	nodeptr->t_ptr[index+1] = ptr;
+}
+
+
+/*************************************************************************
+* DELETION ROUTINES
+*************************************************************************/
+
+/*
+** DELETE
+** ======
+**
+** Purpose:	Remove the data associated with a given key from a B-tree.
+**
+** Parameters:	tree	= B-tree to update
+**		key  	= Key to use,
+**
+** Returns:	An error/success code
+**		SUCCESS / KEY_NOT_FOUND_ERROR / TREE_CORRUPTED_ERROR
+**
+** Description: The real work to do with deletion is performed by RealDelete()
+**		this routine only checks that RealDelete has actually done
+**		a deletion and tidies things up afterwards.
+**
+*/
+
+int Delete(treeptr, key)
+BTREE	*treeptr;
+KEY	key;
+{
+	int	status;
+	int	RealDelete();
+	BTREE	savetree;
+
+	/*
+	Do the main deletion then check whether it managed to find anything
+	to delete. If it didn't - return an error code.
+	*/
+	status = RealDelete(*treeptr, key);
+	if (status != SUCCESS)
+		return status;
+
+	/* 
+	Now check to see whether the previous root node has now
+	been superceded.
+	*/
+	else if ((*treeptr)->t_active == 0) 
+	{
+		/* 
+		If so then deallocate the space that was set aside for the
+		root node and make its leftmost child the new root node.
+		*/
+		savetree = (*treeptr)->t_ptr[0];
+		Dispose(*treeptr);
+		*treeptr = savetree;
+	} 
+	return SUCCESS;
+}
+
+
+/*
+** REALDELETE 
+** ==========
+**
+** Purpose:	Remove a key from a tree
+**
+** Parameters:	tree	= B-tree to be updated
+**		key	= Key to use,
+**
+** Returns:	Returns an error/success code (SUCCESS/KEY_NOT_FOUND_ERROR)
+**
+** Description:	This routine operates recursively in the following manner:
+**		1) Locate the required key within the tree.
+**		2) If it's in a leaf then remove it and rebalance the tree
+**		   otherwise replace it by the next key in the tree (in 
+**		   ascending order), then delete that key from its node 
+**		   (which must be a leaf).
+*/
+
+int RealDelete(tree, key)
+BTREE	tree;
+KEY	key;
+{
+	int index;
+	int status;
+	int SearchNode();
+	KEY nextkey;
+
+	if (tree == (BTREE)NULL)
+		/* 
+		If now trying to scan down a non-existant link,
+		mark required key as not found and exit 
+		*/
+		return KEY_NOT_FOUND_ERROR;
+
+	/* 
+	First stage is to search for key within current top-level node
+	If it's not there then we must continue down the tree looking
+	for it.
+	*/
+	if (! SearchNode(tree, key, &index))
+	{
+		/* 
+		If required key not found in current top-level node
+		then try deleting it from the next node down 
+		*/
+		status = RealDelete(tree->t_ptr[index], key);
+		if (status==SUCCESS)
+			Balance(tree,index);
+		return status;
+	}
+	/* 
+	If the key was found, then check whether this is
+	a leaf 
+	*/
+	if (tree->t_ptr[index] == (BTREE)NULL)
+	{
+		/* 
+		If this is a leaf, then just remove the required key for now 
+		- the tree will be rebalanced on the way back up 
+		*/
+		Remove(tree,index);
+		return SUCCESS;
+	}
+	else 
+	{
+		/* 
+		If this isn't a leaf, the rule is to replace the key by 
+		the next highest in the tree, deleting that key from its 
+		node and rebalancing the tree 
+		*/
+		nextkey = Succ(tree, index);
+		status  = RealDelete(tree->t_ptr[index+1],nextkey);
+		if (status==SUCCESS)
+		{
+			Balance(tree,index+1);
+			return status;
+		}
+		else
+			return TREE_CORRUPTED_ERROR;
+	}
+}
+
+
+/*
+** REMOVE
+** ======
+**
+** Purpose:	Remove a single datum
+**
+** Parameters: 	tree	= Ptr to the B-tree node,
+**		pos	= Index of the key to be removed.
+**
+** Returns: 	None.
+**
+** Description:	Remove a datum from a B-tree node and fill the gap left
+**		by the deletion by shuffling across the other DATUMs and 
+**		pointers.
+**
+*/
+
+Remove(tree, pos)
+BTREE	tree;
+int	pos;
+{
+	int	i;
+
+	/* 
+	This is all pretty trivial - just shuffle everything to the
+	right of the deleted key, left by one.
+	*/
+	for (i=pos; i<((tree->t_active)-1); ++i) 
+	{
+		tree->t_dat[i]   = tree->t_dat[i+1];
+		tree->t_ptr[i+1] = tree->t_ptr[i+2];
+	}
+
+	/* 
+	Finally decrement the number of valid keys in the node 
+	*/
+	tree->t_active--;
+}
+
+
+/*
+** SUCC 
+** ====
+**
+** Purpose:	Replace a key by its successor
+**
+** Parameters: 	tree	= Ptr to a B-tree node,
+**		pos	= Index of the key to be succ'ed.
+**
+** Returns: 	Returns the successor key
+**
+** Description: Using the natural ordering, replace a key with its successor 
+**		(ie the next key in the tree in ascending order).
+**		This routine relies on the fact	that the successor of a key 
+**		will be the leftmost key in the leftmost leaf of the 
+**		"greater than" subtree of the key to be deleted.
+**
+*/
+
+KEY Succ(tree, pos)
+BTREE	tree;
+int	pos;
+{
+	BTREE	ltree;
+	DATUM 	successor;
+
+	/*
+	Using the "greater than" branch the key chain down to leftmost node 
+	below it.
+	*/
+	for (ltree = tree->t_ptr[pos+1]; ltree->t_ptr[0] != (BTREE)NULL; ltree = ltree->t_ptr[0])
+		;		/* NULL BODY */
+
+	successor = ltree->t_dat[0]; 
+	tree->t_dat[pos] = successor;
+
+	return successor.key;
+}
+
+
+/*
+** BALANCE 
+** =======
+**
+** Purpose:	Restore balance to a potentially unbalanced B-tree
+**
+** Parameters: 	parent	= Ptr to the parent node of a B-tree structure,
+**		pos	= Index of the out-of-balance point within the
+**			  parent node.
+**
+** Returns: 	None.
+**
+** Description: After removing an item from a B-tree we must restore 
+**		the balance to the tree.
+** 		In this routine we consider the DATUM in t->t_dat[pos-1]
+**		and the DATUMs in its immediate children (and there should 
+**		be children for this routine to be called).
+**		The rules are:
+**		(1) 	If total number of DATUMs <= 2M then we can combine 
+**			them into a single node 
+**		(2)	Otherwise if the difference in numbers between the 2
+**			children is greater than 1, then we must shuffle 
+**			DATUM(s) out of the fullest node, through the parent 
+**			and into the emptiest node 
+**
+*/
+
+Balance(parent, pos)
+BTREE	parent;
+int	pos;
+{
+	int 	lchildindex, rchildindex;
+	int 	lchildlen, rchildlen;
+
+	/*  
+	Firstly decide where the children are - this pretty obvious
+	- t_ptr[pos] and t_ptr[pos+1] - unless pos=tree->t_active
+	when we have t_ptr[t_active-1] & t_ptr[t_active]
+	*/
+	if (pos==parent->t_active)
+		rchildindex = parent->t_active;
+	else
+		rchildindex = pos+1;
+	lchildindex = rchildindex - 1;
+
+	/* 
+	Now find out how many valid DATUMs reside in each of the children 
+	*/
+	lchildlen = (parent->t_ptr[lchildindex])->t_active;
+	rchildlen = (parent->t_ptr[rchildindex])->t_active;
+
+	/* 
+	Check total number of DATUMs involved 
+	*/
+	if ((lchildlen + rchildlen + 1) <= 2*M)
+		/* 
+		If <=2M then combine into 1 node 
+		*/
+		Combine(parent,rchildindex);
+
+	/* 
+	Otherwise if difference in sizes of children is >1 then shift 
+	DATUMs one way or the other 
+	*/
+	else if ((lchildlen-rchildlen)>1)
+		MoveRight(parent,lchildindex);
+	else if ((rchildlen-lchildlen)>1)
+		MoveLeft(parent,rchildindex);
+}
+
+
+/*
+** COMBINE 
+** =======
+**
+** Purpose: 	Coalesce two nodes of a B-tree when they have too many DATUMs.
+**
+** Parameters: 	parent	= Ptr to parent B-tree node,
+**		rindex	= Index of the right-hand of the 2 nodes to be combined.
+**
+** Returns: 	None.
+**
+** Description: This all pretty simple - just move parent DATUM, followed by
+**		DATUMs from right-hand child into left-hand child. Then throw
+**		away right-hand child, delete parent DATUM and close the gap in
+**		the parent node.
+*/
+
+Combine(parent, rindex)
+BTREE	parent;
+int	rindex;
+{
+	int	i;
+	BTREE	ltree,
+		rtree;
+
+	/* 
+	Set up pointers to the 2 child trees 
+	*/
+	ltree = parent->t_ptr[rindex-1];
+	rtree = parent->t_ptr[rindex];
+
+	/* 
+	We are going to combine the 2 trees into the left-hand tree
+	so first thing is to tag parent datum onto end of this left-hand
+	child node 
+	*/
+	ltree->t_active++;
+	ltree->t_dat[(ltree->t_active)-1] = parent->t_dat[rindex-1];
+
+	/* 
+	Now set right-hand link from this left-hand child to be the left-hand 
+	link right-hand child 
+	*/
+	ltree->t_ptr[ltree->t_active] = rtree->t_ptr[0];
+
+	/* 
+	Now tag all of right-hand child onto end of left-hand child 
+	*/
+	for (i = 1; i <= rtree->t_active; ++i) 
+	{
+		ltree->t_active++;
+		ltree->t_dat[ltree->t_active-1] = rtree->t_dat[i-1];
+		ltree->t_ptr[ltree->t_active]   = rtree->t_ptr[i];
+	}
+
+	/* 
+	Finally, remove parent DATUM from parent node by shifting
+	contents of parent node left as necessary 
+	*/
+	for (i = rindex; i <= parent->t_active-1; ++i)
+	{
+		parent->t_dat[i-1] = parent->t_dat[i];
+		parent->t_ptr[i]   = parent->t_ptr[i+1];
+	}
+	parent->t_active--;
+
+	Dispose(rtree);
+}
+
+
+/*
+** MOVERIGHT
+** =========
+**
+** Purpose: 	Move DATUMs right out of one child into its right-hand 
+**		brother.
+**
+** Parameters: 	parent	= Ptr to the parent B-tree node,
+**		lindex	= Index of the link to the left-hand child 
+**			  from the parent node.
+**
+** Returns: 	None.
+**
+** Description: Main thing to note is that we only need to shift 1 DATUM
+**		because the current imbalance was caused by a deletion from 
+**		the right-hand child and, prior to that, things were okay (the 
+**		tree was balanced last time around).
+*/
+
+MoveRight(parent, lindex)
+BTREE	parent;
+int	lindex;
+{
+	int	i;
+	BTREE	ltree,
+		rtree;
+
+	/*
+	Set up pointers to 2 trees concerned
+	*/
+	ltree = parent->t_ptr[lindex];
+	rtree = parent->t_ptr[lindex+1];
+
+	/* 
+	First stage is to shift contents of right-hand child right by one
+	in order to accommodate the incoming DATUM from the parent node 
+	*/
+	rtree->t_active++;
+	for (i = rtree->t_active; i >= 1; i--) 
+	{
+		rtree->t_dat[i]   = rtree->t_dat[i-1];
+		rtree->t_ptr[i+1] = rtree->t_ptr[i];
+	}
+	rtree->t_ptr[1] = rtree->t_ptr[0];
+
+	/* 
+	Now copy parent DATUM into r-hand child 
+	*/
+	rtree->t_dat[0] = parent->t_dat[lindex];
+
+	/* 
+	Finally move rhand DATUM of lhand child into parent node 
+	*/
+	rtree->t_ptr[0]  	= ltree->t_ptr[ltree->t_active];
+	parent->t_dat[lindex] 	= ltree->t_dat[(ltree->t_active)-1];
+	ltree->t_active--;
+}
+
+
+/*
+** MOVELEFT
+** ========
+**
+** Purpose: 	Move DATUM left from a right-hand child, through its parent
+**		DATUM and into a left-hand child.
+**
+** Parameters: 	parent	= Ptr to the parent B-tree node,
+**		rindex	= Index of the right-hand child within the
+**			  parent node. 
+**
+** Returns: 	None.
+**
+** Description: As with MoveRight (above) the main thing to note is that we
+**		only have to shift 1 DATUM.
+*/
+
+MoveLeft(parent, rindex)
+BTREE	parent;
+int	rindex;
+{
+	int	i;
+	BTREE	ltree,
+		rtree;
+
+	/*
+	Set up pointers to 2 children
+	*/
+	ltree = parent->t_ptr[rindex-1];
+	rtree = parent->t_ptr[rindex];
+
+	/* 
+	First stage is to shift DATUM from parent node onto end of
+	lhand child 
+	*/
+	ltree->t_active++;
+	ltree->t_dat[(ltree->t_active)-1] = parent->t_dat[rindex-1];
+
+	/* 
+	Now move lhand link from rhand child to be rhand link from
+	lhand child 
+	*/
+	ltree->t_ptr[ltree->t_active] = rtree->t_ptr[0];
+
+	/* 
+	Next, shift lhand DATUM of rhand node into parent node 
+	*/
+	parent->t_dat[rindex-1] = rtree->t_dat[0];
+
+	/* 
+	Finally shift contents of rhand child left by one 
+	*/
+
+	rtree->t_ptr[0] = rtree->t_ptr[1];
+	for (i = 1; i <= rtree->t_active; ++i) 
+	{
+		rtree->t_dat[i-1] = rtree->t_dat[i];
+		rtree->t_ptr[i]   = rtree->t_ptr[i+1];
+	}
+	rtree->t_active--;
+}
+
+
+/*****************************************************************************
+* SEARCH ROUTINE
+*****************************************************************************/
+
+/*
+** SEARCH
+** ======
+**
+** Purpose:	Look for a key in a tree.
+**
+** Parameters:  tree	= Tree to look in
+**		key	= key to look for
+**		dtmptr  = pointer to found datum
+**
+** Returns: 	A success/error code (SUCCESS/KEY_NOT_FOUND_ERROR)
+**
+** Description:
+**
+*/
+
+int Search(tree, key, dtmptr)
+BTREE	tree;
+KEY	key;
+DATUM 	*dtmptr;
+{
+	DATUM	dtm;
+	int	index;
+	int 	SearchNode();
+
+	while (tree != (BTREE)NULL) 
+	{
+		/* 
+		For each node just check to see whether the requd key value
+		is there - if not, go down 1 more level ...
+		*/
+		if (SearchNode(tree, key, &index))
+		{
+			dtm = (tree->t_dat[index]);
+			*dtmptr = dtm;
+			return SUCCESS;
+		}
+		tree = tree->t_ptr[index];
+	}
+	dtmptr = (DATUM *)NULL;
+	return KEY_NOT_FOUND_ERROR;
+}
+
+
+/**************************************************************************
+* MISCELLANEOUS ROUTINES
+**************************************************************************/
+
+/*
+** SEARCHNODE 
+** ==========
+**
+** Purpose: 	Look for a key in a single B-tree node.
+**
+** Parameters: 	nodeptr	= Ptr to B-tree node,
+**		key	= Key to look for,
+**		pindex  = Pointer to integer vbl in which to place
+**			  index position of key within node
+**
+** Returns: 	TRUE/FALSE result indicating whether key was in the node
+**
+** Description:	The workings of this routine are pretty trivial -see code.
+*/
+
+int SearchNode(nodeptr, key, pindex)
+BTREE	nodeptr;
+KEY	key;
+int	*pindex;
+{
+	int	i;
+	int	cmp;
+	int	KeyCmp();
+
+	/* 
+	Scan down the node from highest to lowest key value - stop when 
+	a key <= 'key' is found
+	*/
+	for (i=(nodeptr->t_active)-1; i>=0; i--)
+	{
+		cmp = KeyCmp(key,(nodeptr->t_dat[i]).key);
+		if (cmp>=0)
+		{
+			*pindex = (cmp==0)? i: i+1;
+			return (cmp==0);
+		}
+	}
+
+	/* 
+	If passed through loop unscathed then 'key' must be less than 
+	everything in the node - so act accordingly
+	*/
+	*pindex = 0;
+	return FALSE;
+}
+
+
+/*
+** KEYCMP 
+** ======
+**
+** Purpose:	To compare two key values
+**
+** Parameters:	key1	= First key,
+**		key2	= Second key.
+**
+** Returns: 	-1 	if key1 < key2;
+**		 0	if key1 = key2;
+**		 1	if key1 > key2;
+**
+** Description:	The contents of this routine are dependent upon the type of
+**		key being used - as long as it accepts the same parameters
+**		and returns the same results, any key type can be used.
+*/
+
+int KeyCmp(key1, key2)
+KEY	key1,
+	key2;
+{
+	return key1<key2 ? -1 : key1==key2 ? 0 : 1;
+}
+
+
+/*
+** MKNODE
+** ======
+**
+** Purpose:	Allocate storage for a new B-tree node and copy in an
+**		initial datum and two pointers from it.
+**
+** Parameters:	dtm	= Initial datum for new node
+**		ptr0	= "less than" pointer from dtm
+**		ptr1	= "greater than" pointer from dtm
+**
+** Returns: 	Reference to the new node.
+**
+** Description:	All pretty obvious...
+*/
+
+BTREE MkNode(dtm, ptr0, ptr1)
+DATUM	dtm;
+BTREE	ptr0,
+	ptr1;
+{
+	char	*malloc();
+	BTREE	tree;
+
+	tree = (BTREE) malloc(sizeof(NODE));
+
+	tree->t_ptr[0] = ptr0;
+	tree->t_ptr[1] = ptr1;
+	tree->t_dat[0] = dtm;
+	tree->t_active = 1;
+
+	return tree;
+}
+
+
+/*
+** DISPOSE 
+** =======
+**
+** Purpose:	Return the storage occupied by a tree node to the pool.
+**
+** Parameters: 	nodeptr	= Ptr to the tree node.
+**
+** Returns: 	None.
+**
+** Description: Another simple one ...
+*/
+
+Dispose(nodeptr)
+BTREE	nodeptr;
+{
+	free((char *) nodeptr);
+}
+
+SHAR_EOF
+fi
+echo shar: "extracting btree.h"
+if test -f 'btree.h'
+then
+	echo shar: "will not over-write existing file 'btree.h'"
+else
+cat << \SHAR_EOF > 'btree.h'
+/************************************************************************
+*
+* B-tree header file
+*
+* This just defines various error codes etc.
+*
+***********************************************************************/
+
+static char btree_header[] = "@(#)btree.h	1.3 7/16/86";
+
+#define	NODE_SPLIT		-1	/* Information code - used internally
+					   within insertion code */
+#define SUCCESS		 	 0	/* Success code */
+#define KEY_EXISTS_ERROR 	 1	/* Returned by insertion routines */
+#define KEY_NOT_FOUND_ERROR	 2	/* Returned by deletion & search */
+#define TREE_CORRUPTED_ERROR	 3	/* Returned by deletion */
+SHAR_EOF
+fi
+echo shar: "extracting btree.fe.c"
+if test -f 'btree.fe.c'
+then
+	echo shar: "will not over-write existing file 'btree.fe.c'"
+else
+cat << \SHAR_EOF > 'btree.fe.c'
+/********************************************************************
+*********************************************************************
+ 
+Module Name:		btree.fe.c
+============
+ 
+Function:		Front end for btree code ...
+=========		
+
+Description:
+============
+	Implements a front-end program for the btree code
+
+	Libraries:
+		stdio.h
+		btree.fe.h
+		btree.c	(-> btree.h)
+		bree.prt.h
+
+****************************************************************************
+****************************************************************************/
+
+static char btreefrontendc[] = "@(#)btree.fe.c	1.1 7/16/86";
+
+#include <stdio.h>
+#include "btree.c"
+#include "btree.fe.h"
+#include "btree.prt.h"
+
+
+/*
+** MAIN PROGRAM
+** ============
+**
+** Purpose:	Front panel type thing for btree code - allows interactive
+**		manipulation of tree
+**
+** Parameters:	none
+**
+** Returns:	none
+**
+*/
+
+main()
+{
+	frontend();
+}
+SHAR_EOF
+fi
+echo shar: "extracting btree.fe.h"
+if test -f 'btree.fe.h'
+then
+	echo shar: "will not over-write existing file 'btree.fe.h'"
+else
+cat << \SHAR_EOF > 'btree.fe.h'
+/********************************************************************
+*********************************************************************
+ 
+Module Name:		btree.fe.h
+============
+ 
+Function:		Front end for btree code ...
+=========		
+
+Description:
+============
+	Implements a front-end program for the btree code
+
+****************************************************************************
+****************************************************************************/
+
+static char btreefrontend[] = "@(#)btree.fe.h	1.2 8/18/86";
+
+
+
+/*
+** FRONTEND
+** ========
+**
+** Purpose:	Front panel type thing for btree code - allows interactive
+**		manipulation of tree
+**
+** Parameters:	none
+**
+** Returns:	none
+**
+** Description:	The following 'commands' are implemented
+**		<n>	Insert key 'n'
+**		i<n>	ditto
+**		d<n>	Delete key 'n'
+**		l<n>	Locate key 'n'
+**		p<n>	Print tree
+**		s	Set up default tree
+**		x	Exit from front end
+*/
+
+frontend()
+{
+	int 	status;
+	BTREE	tree;
+	DATUM	dtm,
+		dtm2;
+	KEY	key;
+	char	buf[BUFSIZ];
+
+	tree = (BTREE)NULL;
+
+	printf("Command: "); fflush(stdout);
+	while (fgets(buf, sizeof buf, stdin) != NULL) 
+	{
+		buf[strlen(buf) - 1] = '\0';
+		switch (buf[0]) 
+		{
+		default:		/* Error case */
+			fprintf(stderr, "i, d, l, p, s or x please!\n");
+			break;
+
+		case '0':
+		case '1':
+		case '2':
+		case '3':
+		case '4':
+		case '5':
+		case '6':
+		case '7':
+		case '8':
+		case '9':
+			sscanf(buf, "%d", &dtm.key);
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			break;
+
+		case 's':	/* Set up default tree */
+			tree = (BTREE)NULL;
+			dtm.key = 20;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 10;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 15;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 30;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 40;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 7;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 18;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 22;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 26;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 5;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 35;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 13;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 27;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 32;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 42;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 46;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 24;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 45;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			dtm.key = 25;
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			ShowTree(tree, 0);
+			break;
+
+		case 'i':		/* Insert a key */
+			sscanf(buf+1, "%d", &dtm.key);
+			status = Insert(&tree, dtm);
+			if (status != SUCCESS)
+				btree_err(status);
+			break;
+
+		case 'd':		/* Delete a key */
+			sscanf(buf+1, "%d", &dtm.key);
+			status = Delete(&tree, dtm.key);
+			if (status != SUCCESS)
+				btree_err(status);
+			break;
+
+		case 'l':		/* Lookup a key */
+			sscanf(buf+1, "%d", &dtm.key);
+			status = Search(tree, dtm.key, &dtm2);
+			if (status != SUCCESS)
+				btree_err(status);
+			printf("Found %d\n",dtm2.key);
+			break;
+
+		case 'p':		/* Show the tree */
+			ShowTree(tree, 0);
+			break;
+		
+		case 'x':
+			break;
+		}
+		if (buf[0]=='x')
+			break;
+		else
+		{
+			printf("Command: "); 
+			fflush(stdout);
+		}
+	}
+}
+
+
+/*
+** ERROR ROUTINE
+** =============
+**
+** Purpose:	Error message routine for btree front-end system
+**
+** Parameters:	errcode	= errcode
+**
+** Returns:	none
+**
+** Description:	Pretty simple...
+*/
+
+btree_err(errcode)
+int	errcode;
+{
+	switch (errcode)
+	{
+	case KEY_EXISTS_ERROR:
+		fprintf(stderr,"Key already exists !\n");
+		break;
+	case KEY_NOT_FOUND_ERROR:
+		fprintf(stderr,"Key not found !\n");
+		break;
+	case TREE_CORRUPTED_ERROR:
+		fprintf(stderr,"Tree corrupted !\n");
+		break;
+	}
+}
+SHAR_EOF
+fi
+echo shar: "extracting btree.test.c"
+if test -f 'btree.test.c'
+then
+	echo shar: "will not over-write existing file 'btree.test.c'"
+else
+cat << \SHAR_EOF > 'btree.test.c'
+/***************************************************************************
+*
+* Module Name:		btree.test.c
+* ============
+*
+* Function:		BTREE TEST PROGRAM
+* =========
+*
+* Description:
+* ============
+*	-see main routine
+*	Libraries
+*	----------
+*	stdio.h
+*	btree.c (--> btree.h)
+*	btree.test.h
+*	btree.prt.h
+*
+******************************************************************************/
+
+static char btree_tests[] = "@(#)btree.test.c	1.1 7/16/86";
+
+
+/*****************************************************************************
+* INCLUDES and TEST PROGRAM PARAMETERS
+*****************************************************************************/
+
+#include <stdio.h>
+#include "btree.c"
+#include "btree.test.h"
+#include "btree.prt.h"
+
+	/*
+	Number of key values to be used
+	*/
+#define MAXKEYS	1500	
+
+	/*
+	Values used by flag table (below)
+	*/
+#define IN_TREE		1
+#define NOT_IN_TREE 	0
+
+	/* 
+	Seed for random number generator
+	*/
+static int	seed;
+	/* 
+	This array will contain boolean values -
+	if flag[i]=NOT_IN_TREE then key i is currently not in the tree
+	if flag[i]=IN_TREE     then key i is currently in the tree.
+	*/
+static int	flag[MAXKEYS];	
+
+static int	keytotal;
+
+BTREE 	tree;	/* Tree to be used */
+
+/******************************************************************************
+* MAIN TEST PROGRAM
+******************************************************************************/
+
+/*
+** MAIN TEST PROGRAM
+** =================
+**
+** Purpose:	Test the B-tree routines
+**
+** Parameters:	argv[1]		= "" or a seed for the random tests
+**
+** Returns:	A continuous set of diagnostic messages is sent to stdout
+**		This continues until the tests are successfully completed or
+**		until the first error occurs
+** 
+** Description:	There are 3 sets of tests performed
+**		(1) Random tests - a large number of random inserts, deletes
+**			and searches is performed.
+**		(2) All keys are inserted into the tree in ascending order
+**			then deleted in ascending order.
+**		(3) All keys are inserted into the tree in descending order
+**			then deleted in descending order.
+**		For the purposes of this test a limited range of keys is used
+**		- these are numbered 0 to MAXKEYS-1 (where MAXKEYS is #defined
+**		above) and a function getkey() returns the actual key value of
+**		a given key number - currently keys are integers so 
+**		getkey(i) = i.
+*/
+
+main(argc,argv)
+int	argc;
+char	*argv[];
+{
+	int statuscode;
+	int randomtest(), ascendingtest(), descendingtest();
+
+	/* 
+	First thing to do is to check for a seed parameter
+	*/
+	if (argc != 0)
+		sscanf(argv[1],"%d",&seed);
+	else
+		seed = 0;
+	srandom(seed);
+
+	/*
+	Random test
+	*/
+	statuscode = randomtest();
+	if (statuscode != SUCCESS)
+		error(statuscode);
+	
+	/*
+	Ascending test
+	*/
+	statuscode = ascendingtest();
+	if (statuscode != SUCCESS)
+		error(statuscode);
+
+	/*
+	Descending test
+	*/
+	statuscode = descendingtest();
+	if (statuscode != SUCCESS)
+		error(statuscode);
+	
+	/*
+	Given message to say that it all worked
+	*/
+	printf("\n\n----> TESTS SUCCEEDED <----\n\n\n");
+	exit(1);
+}
+
+
+/****************************************************************************
+* RANDOM INSERT/DELETE/SEARCH TEST
+****************************************************************************/
+
+	/*
+	Number of inserts + deletes + searches for random tests.
+	*/
+#define PASSES		2000
+
+	/* 
+	Number of actions available to random test and the codes associated 
+	with them.
+	*/
+#define ACTIONS		3
+#define SEARCH		0
+#define INSERT		1
+#define DELETE		2
+
+
+
+/*
+** RANDOMTEST
+** ==========
+** Purpose:	Perform the random tests
+**
+** Parameters:	None
+**
+** Returns:	Diagnostic messages are continuously fed to stdout
+**		and upon completion/error a success/error code is returned
+**		SUCCESS:	Everything went okay
+**		others :	see routines 	testsearch(),
+**						testinsert(),
+**						testdelete().
+**
+** Description: For a given number of iterations (PASSES), generate a random
+**		key number and randomly select an insert, a delete or a search
+**		to do on the key corresponding to the key number. 
+*/
+
+int randomtest()
+{
+	int 	keynumber;
+	int 	pass,
+		status;
+	int	randrange();
+
+	/*
+	Set up tree for new test
+	*/
+	inittree();
+
+	/*
+	Send start-of-test-banner
+	*/
+	printf("**************** RANDOM TESTS *****************\n\n");
+
+	/*
+	Now repeat the following process PASSES times:
+	1) Generate a random key value
+	2) Generate a random number to determine what action to perform
+	   on that key
+	3) Perform the action and check the resulting tree.
+	*/
+
+	for (pass=1; pass<PASSES; pass++)
+	{
+		keynumber = randrange(MAXKEYS);
+		switch (randrange(ACTIONS))
+		{
+		case SEARCH:
+			status = testsearch(keynumber);
+			break;
+		case INSERT:
+			status = testinsert(keynumber);
+			break;
+		case DELETE:
+			status = testdelete(keynumber);
+			break;
+		}
+		if (status != SUCCESS)
+			return status;
+	}
+	return SUCCESS;
+}
+
+
+/*
+** RANDRANGE
+** =========
+**
+** Purpose:	Generate a random integer within a given range
+**
+** Parameters:	number_of_values	= range of random int to be generated
+**
+** Returns:	a random in in the range 0..(number_of_values-1)
+**
+** Description: Very simple - most of work done by a system routine.
+*/
+
+int randrange(number_of_values)
+int number_of_values;
+/* 
+Routine to generate a random number in a given range
+*/
+{
+	long	random();
+
+	return	(random() % number_of_values);
+}
+
+
+/*****************************************************************************
+* ASCENDING KEY TEST
+*****************************************************************************/
+
+/*
+** ASCENDINGTEST
+** =============
+**
+** Purpose:	Performs ascending key value test
+**
+** Parameters:	None
+**
+** Returns:	Sends continuous diagnostic stream to stdout
+**		Returns a success/error code at end of tests or if an error
+**		occurs.
+**
+** Description: Clear the tree, fill it with keys by adding them in ascending 
+**		order, then delete them all in ascending key order.
+*/
+
+int ascendingtest()
+{
+	int	i;
+	int	status;
+
+	/*
+	Set up tree for new test
+	*/
+	inittree();
+
+	/*
+	Print start-of-test banner
+	*/
+	printf("*************** ASCENDING TESTS ******************\n\n");
+
+	/*
+	Insert keys in order
+	*/
+	for (i=0; i<MAXKEYS; i++)
+	{
+		status = testinsert(i);
+		if (status != SUCCESS)
+			return(status);
+	}
+
+	/*
+	Delete keys in order
+	*/
+	for (i=0; i<MAXKEYS; i++)
+	{
+		status = testdelete(i);
+		if (status != SUCCESS)
+			return(status);
+	}
+	return SUCCESS;
+}
+
+
+/*****************************************************************************
+* DESCENDING KEY TEST
+*****************************************************************************/
+
+/*
+** DESCENDINGTEST
+** ==============
+**
+** Purpose:	Performs descending key value test
+**
+** Parameters:	None
+**
+** Returns:	Sends continuous diagnostic stream to stdout
+**		Returns a success/error code at end of tests or if an error
+**		occurs.
+**
+** Description: Clear the tree, fill it with keys by adding them in descending 
+**		order, then delete them all in descending key order.
+*/
+
+descendingtest()
+{
+	int	i;
+	int	status;
+
+	/*
+	Set up tree for new test
+	*/
+	inittree();
+	/*
+	Print start-of-test banner
+	*/
+	printf("*************** DESCENDING TESTS ******************\n\n");
+
+	/*
+	Insert keys in order
+	*/
+	for (i=MAXKEYS-1; i>=0; --i)
+	{
+		status = testinsert(i);
+		if (status != SUCCESS)
+			return(status);
+	}
+
+	/*
+	Delete keys in order
+	*/
+	for (i=MAXKEYS-1; i>=0; --i)
+	{
+		status = testdelete(i);
+		if (status != SUCCESS)
+			return(status);
+	}
+	return SUCCESS;
+}
+
+
+/*****************************************************************************
+* TREE INITIALISATION
+*****************************************************************************/
+
+/*
+** INITTREE
+** ========
+**
+** Purpose:	Set up tree & lookup tables ready for a new test
+**
+** Parameters:	none.
+**
+** Returns:	none.
+**
+** Description:	trivial.
+*/
+
+inittree()
+{
+	int i;
+
+	tree = (BTREE)NULL;
+	for (i=0; i<MAXKEYS; i++)
+		flag[i] = NOT_IN_TREE;
+	keytotal = 0;
+}
+
+
+/***********************************************************************
+* TEST ROUTINES FOR SEARCH/INSERT/DELETE
+***********************************************************************/
+
+/*
+** TESTSEARCH
+** ==========
+** 
+** Purpose:	Test a search for a given key
+**
+** Parameters:	keynumber	= number of key to be located
+**
+** Returns:	A diagnostic message is sent to stdout and upon completion
+**		an error/success code is returned:
+**			SUCCESS	- everything worked
+**			FOUND_NON_EXISTANT_KEY
+**				- error - located a key when it wasn't in
+**				  the tree
+**			NOT_FOUND_EXISTING_KEY
+**				- error - could locate a key which should be
+**				  in the tree.
+**
+** Description:	Basically, do the search and compare the result with the
+**		flag lookup table - also, if found successfully, check that
+**		the routine has returned a pointer to the correct keyed DATUM.
+*/
+
+int testsearch(keynumber)
+int keynumber;
+/*
+Routine to test the search for a key within a tree
+*/
+{
+	KEY 	getkey();
+	KEY 	key;
+	DATUM 	dtm;
+	int	i;
+	int 	status;
+
+	/*
+	Translate a key number into a key value
+	*/
+	key = getkey(keynumber);
+
+	/*
+	Send message to log file
+	*/
+	printf("Search\t");
+	printkey(key);
+
+	
+	/*
+	Now attempt the search itself
+	*/
+	status = Search(tree,key,&dtm);
+	
+	/*
+	Print out result of search
+	*/
+	if (status==SUCCESS)
+		printf("found       \t");
+	else
+		printf("not found   \t");
+
+	/*
+	We can get 2 sorts of error:
+	(1) A non-existant key was found
+	(2) An existing key could not be found
+	(3) 'dtm' doesn't point to the right key
+	*/
+	if ((status==SUCCESS) && (flag[i]==NOT_IN_TREE))
+		return FOUND_NON_EXISTANT_KEY;
+	if ((status==KEY_NOT_FOUND_ERROR) && (flag[i]==IN_TREE))
+		return NOT_FOUND_EXISTING_KEY;
+	if ((status==SUCCESS) && (dtm.key != key))
+		return FOUND_WRONG_KEY;
+
+	/*
+	Send final diagnostic message then exit successfully
+	*/
+	printf("CORRECT\n");
+	return SUCCESS;
+}
+
+
+/*
+** TESTINSERT
+** ==========
+** 
+** Purpose:	Test the insertion of a given key
+**
+** Parameters:	keynumber	= number of key to be inserted
+**
+** Returns:	A diagnostic message is sent to stdout and upon completion
+**		an error/success code is returned:
+**			SUCCESS	- everything worked
+**			INSERTED_EXISTING_KEY
+**				- error - successfully inserted a key which was
+**				  already in the tree
+**			CANNOT_INSERT_KEY
+**				- error - could insert the key although it 
+**				  shouldn't be in the tree.
+**			also can get various errors from check_consistency()
+**
+** Description:	Basically, do the insert, compare the result with the
+**		flag lookup table - if everything seems to be okay then
+**		update the lookup table and check the consistency of the
+**		new B-tree
+*/
+
+int testinsert(keynumber)
+int keynumber;
+{
+	DATUM	dtm;
+	int 	status;
+
+	/*
+	Translate key index number into a key value
+	*/
+	dtm.key = getkey(keynumber);
+	
+	/*
+	Send message to log file
+	*/
+	printf("Insert\t");
+	printkey(dtm.key);
+
+	/*
+	Now do the insert itself - can get two main errors:
+	(1) Successfully inserted a key which was already there
+	(2) Couldn't insert a key even though it wasn't there
+	*/
+	status = Insert(&tree,dtm);
+
+	/*
+	Now print out result of insert 
+	*/
+	if (status==SUCCESS)
+		printf("inserted    \t");
+	else
+		printf("not inserted\t");
+
+	/*
+	Check for error
+	*/
+	if ((status==SUCCESS) && (flag[keynumber]==IN_TREE))
+		return INSERTED_EXISTING_KEY;
+	if ((status==KEY_EXISTS_ERROR) && (flag[keynumber]==NOT_IN_TREE))
+		return CANNOT_INSERT_KEY;
+
+	/*
+	Update lookup table
+	*/
+	if (status==SUCCESS)
+	{
+		keytotal++;
+		flag[keynumber] = IN_TREE;
+	}
+
+	/*
+	Print 'no errors' message
+	*/
+	printf("CORRECT\t");
+
+	/*
+	Now check consistency of tree 
+	*/
+	status = check_consistency();
+	if (status==SUCCESS)
+		printf("tree still okay\n");
+	return status;
+}
+
+
+/*
+** TESTDELETE
+** ==========
+** 
+** Purpose:	Test the deletion of a given key
+**
+** Parameters:	keynumber	= number of key to be deleted
+**
+** Returns:	A diagnostic message is sent to stdout and upon completion
+**		an error/success code is returned:
+**			SUCCESS	- everything worked
+**			TREE_CORRUPTED_ERROR
+**				- this is an error generated by Delete()
+**				  itself when it thinks the tree has become
+**				  corrupted
+**			DELETED_NON_EXISTANT_KEY
+**				- error - successfully deleted a key which
+**				  should have been there in the first place
+**			CANNOT_DELETE_KEY
+**				- error - could delete a key which should have
+**				  been in the tree
+**			also can get various errors from check_consistency()
+**
+** Description:	Basically, do the delete, compare the result with the
+**		flag lookup table - if everything seems to be okay then
+**		update the lookup table and check the consistency of the
+**		new B-tree
+*/
+
+int testdelete(keynumber)
+int keynumber;
+{
+	KEY	key;
+	int 	status;
+
+	/*
+	Translate key index number into a key value
+	*/
+	key = getkey(keynumber);
+	
+	/*
+	Send message to log file
+	*/
+	printf("Delete\t");
+	printkey(key);
+
+	/*
+	Now do the delete itself - can get three main errors:
+	(1) Successfully deleted a key which wasn't there
+	(2) Couldn't delete a key even though it was there
+	(3) Delete detected a corrupted tree
+	*/
+	status = Delete(&tree,key);
+
+	/*
+	Print result of delete 
+	*/
+	if (status==SUCCESS)
+		printf("deleted     \t");
+	else
+		printf("not deleted \t");
+
+	/*
+	Check for errors
+	*/
+	if (status == TREE_CORRUPTED_ERROR)
+		return status;
+	if ((status==SUCCESS) && (flag[keynumber]==NOT_IN_TREE))
+		return DELETED_NON_EXISTANT_KEY;
+	if ((status==KEY_NOT_FOUND_ERROR) && (flag[keynumber]==IN_TREE))
+		return CANNOT_DELETE_KEY;
+
+	/*
+	Update lookup table
+	*/
+	if (status==SUCCESS)
+	{
+		flag[keynumber] = NOT_IN_TREE;
+		--keytotal;
+	}
+
+	/*
+	Print acknowledgement of success
+	*/
+	printf("CORRECT\t");
+	/*
+	Now check consistency of tree 
+	*/
+	status = check_consistency();
+	if (status==SUCCESS)
+		printf("tree still okay\n");
+	return status;
+}
+
+
+/*********************************************************************
+* CONSISTENCY CHECK ROUTINES
+*********************************************************************/
+
+	/*
+	Total of number of keys found so far
+	*/
+static int 	total;
+
+	/*
+	Depth of tree
+	*/
+static int	treedepth;
+
+
+/*
+** CHECKCONSISTENCY
+** ================
+**
+** Purpose:	Routine to check that a tree is in a consistent state
+**
+** Parameters:	None
+**
+** Returns:	One of the following error/success codes
+**		SUCCESS - all okay
+**		NODE_NOT_HALF_FULL
+**			- a node was found which was not half full and it
+**			  wasn't the root.
+**		WRONG_KEY_IN_NODE
+**			- a node was found with a key value outside its
+**			  specified range
+**		TREE_DEPTH_INCONSISTENT
+**			- the depth of the tree is not constant throughout
+**		KEY_TOTAL_MISMATCH
+**			- an external count of keys in the tree does not
+**			  tally with a scan of the tree.
+**
+** Description:	This routine fires off the 'performcheck' routine which
+**		is a recursive affair - upon return, any error from
+**		'performcheck' is returned to the calling routine
+**		- otherwise the total number of keys in the tree is checked
+**		and this determines the final return code.
+*/
+
+int check_consistency()
+{
+	KEY getkey();
+	int status;
+	
+	/*
+	Set up initial total number of keys and depth of tree
+	*/
+	total = 0;
+	treedepth = 0;
+
+	/*
+	Now do the real consistency check
+	*/
+	status = performcheck(tree, 0, getkey(-1), getkey(MAXKEYS));
+	
+	/*
+	if this gives any sort of error, return the error code
+	*/
+	if (status != SUCCESS)
+		return status;
+
+	/*
+	The only remaining check is the number of keys in the tree
+	- compare the test program running total (keytotal) with the
+	total from this tree scan (total)
+	*/
+	if (total != keytotal)
+		return KEY_TOTAL_MISMATCH;
+	return SUCCESS;
+}
+
+
+/*
+** PERFORMCHECK
+** ============
+**
+** Purpose:	The main routine for checking consistency of a tree
+**
+** Parameters:	tree	= pointer to (sub-)tree to be checked
+**		thisdepth 
+**			= depth of parent node (for root this is 0)
+**		lowkey	= lower bound on range of key values in
+**			  current top-level node
+**		highkey	= upper bound on range of key values in
+**			  current top-level node
+**
+** Returns:	An error / success code
+**			SUCCESS - all okay
+**			TREE_DEPTH_INCONSISTENT
+**				- tree isn't of constant depth
+**			NODE_NOT_HALF_FULL
+**				- current top level node is not the root
+**				  and is not 1/2 full
+**			WRONG_KEY_IN_NODE
+**				- a key (or keys) in this node does not
+**				  lie in the correct key value range
+**			KEYS_NOT_IN_ORDER
+**				- at least 1 key of a node is not in order
+**
+** Description:	This routine is a pretty complex affair and recursive to boot
+**		- the basic algorithm is:
+**		if we're at a root
+**		then check that depth agrees with system total
+**		else check size of node, range of keys in it and
+**		if these are okay, try all subtrees below here
+*/
+
+int performcheck(tree, thisdepth, lowkey, highkey)
+BTREE 	tree;
+int	thisdepth;
+KEY	lowkey,
+	highkey;
+{
+	int 	i;
+	int 	keys_in_node;
+	KEY	lo,
+		hi,
+		upper;
+	int 	status;
+
+	/*
+	Update record of dpeth of current node
+	*/
+	thisdepth++;
+
+	/*
+	If current tree is null we've hit a leaf
+	- only check that can be performed is whether the depth is correct
+	*/
+	if (tree==(BTREE)NULL)
+	{
+		/*
+		Check the depth we've reached
+		*/
+		if (treedepth == 0)
+		{
+			/*
+			If overall depth is 0 then this is the first
+			leaf we've reached so no error
+			*/
+			treedepth = thisdepth;
+			return SUCCESS;
+		}
+		if (treedepth != thisdepth)
+			/* 
+			if overall depth differs from current depth then
+			generate an error
+			*/
+			return TREE_DEPTH_INCONSISTENT;
+		return SUCCESS;
+	}
+
+	keys_in_node = tree->t_active;
+	/*
+	If not at a leaf, check whether this node is at least 1/2 full
+	- which is a prerequisite of all non-root nodes
+	*/
+	if ((keys_in_node<M) && (thisdepth != 1))
+		return NODE_NOT_HALF_FULL;
+
+	/*
+	Now update running total of keys found so far
+	*/
+	total += keys_in_node;
+
+	/*
+	Now check whether the keys in this node are between lowkey and
+	highkey - this only checks the left- and right- hand keys of the
+	node - a check for the order of keys in a node is done later.
+	*/
+	if ((KeyCmp(tree->t_dat[0].key, lowkey)<=0) || 
+	    (KeyCmp(tree->t_dat[keys_in_node-1].key, highkey)>=0))
+		return WRONG_KEY_IN_NODE;
+	
+	/*
+	If all's okay so far, go into the guts of the test - a recursive
+	consistency check of all nodes below here
+	*/
+	for (i=0; i<=keys_in_node; i++)
+	{
+		/*
+		Establish 3 quantities:
+			lo    = lower bound on t_dat[i] and keys under t_ptr[i]
+			hi    = upper bound on values in t_ptr[i]
+			upper = upper bound on t_dat[i]
+		*/
+		if (i==0)
+			lo = lowkey;
+		else
+			lo = tree->t_dat[i-1].key;
+
+		if (i==keys_in_node)
+			hi = highkey;
+		else
+		{
+			hi = tree->t_dat[i].key;
+			
+			/*
+			The quantity 'upper' is only needed here 
+			(where i<keys_in_node)
+			*/
+			if (i==(keys_in_node-1))
+				upper = highkey;
+			else
+				upper = tree->t_dat[i+1].key;
+			
+			/*
+			Now check that t_dat[i] lies between 'lo' and 'upper'
+			*/
+		    	if ((KeyCmp(tree->t_dat[i].key,lo)<=0) ||
+			    (KeyCmp(tree->t_dat[i].key,upper)>=0))
+				return KEYS_NOT_IN_ORDER;
+		}
+
+		/*
+		Do consistency check of subtree t_ptr[i]
+		*/
+		status = performcheck(tree->t_ptr[i],thisdepth,lo,hi);
+
+		/*
+		If a check of the subtree gave an error then bail out now
+		*/
+		if (status != SUCCESS)
+			break;
+	}
+	return status;
+}
+		
+
+/*************************************************************************
+* VARIOUS MISCELLANEOUS ROUTINES
+*************************************************************************/
+
+/*
+** GETKEY
+** ======
+**
+** Purpose:	Routine to translate a key number into a key value
+**
+** Parameters:	keynumber	= number of key to be obtained
+**
+** Returns:	Returns a key value
+**
+** Description:	This routine is key dependent - it just returns a key value
+**		coresponding to a key number.
+**		Note that the routine must return keys with key values
+**		-1 ... MAXKEYS - where the 2 extremes are used in consistency
+**		checks for bounds on the key values in a tree.
+*/
+
+KEY getkey(keynumber)
+int keynumber;
+{
+	return keynumber;
+}
+
+
+/*
+** PRINTKEY
+** ========
+**
+** Purpose:	Routine to print a key value
+**
+** Parameters:	key	= key value to be printed
+**
+** Returns:	None
+**
+** Description:	Mind-numbingly simple
+*/
+
+printkey(key)
+KEY key;
+{
+	printf("%d\t",key);
+}
+
+
+
+/*
+** ERROR
+** =====
+**
+** Purpose:	Routine to convert an error number into an error message
+**
+** Parameters:	errno	= error number
+**
+** Returns:	none.
+**
+** Description:	Nothing particularly taxing about this one
+*/
+
+error(errno)
+int errno;
+{
+	printf("\n");
+	switch (errno)
+	{
+	case FOUND_NON_EXISTANT_KEY:
+		printf("!!! SEARCH found a key which should be in the tree\n");
+		break;
+	case NOT_FOUND_EXISTING_KEY:
+		printf("!!! SEARCH failed to find a key which should be in the tree\n");
+		break;
+	case FOUND_WRONG_KEY:
+		printf("!!! SEARCH located the wrong key\n");
+		break;
+	case INSERTED_EXISTING_KEY:
+		printf("!!! INSERT inserted a key into the tree when it was already there\n");
+		break;
+	case CANNOT_INSERT_KEY:
+		printf("!!! INSERT claimed that a key was already in the tree when it wasn't\n");
+		break;
+	case DELETED_NON_EXISTANT_KEY:
+		printf("!!! DELETE managed to delete a key which wasn't in the tree");
+		break;
+	case CANNOT_DELETE_KEY:
+		printf("!!! DELETE claimed that a key wasn't in the tree when it was\n");
+		break;
+	case TREE_CORRUPTED_ERROR:
+		printf("!!! TREE CORRUPTED\n");
+		break;
+	case NODE_NOT_HALF_FULL:
+		printf("!!! CONSISTENCY ERROR - a node was found to be less than half full\n");
+		break;
+	case WRONG_KEY_IN_NODE:
+		printf("!!! CONSISTENCY ERROR - a key was found in the wrong node\n"); 
+		break;
+	case TREE_DEPTH_INCONSISTENT:
+		printf("!!! CONSISTENCY ERROR - the tree is not of constant depth\n");
+		break;
+	case KEYS_NOT_IN_ORDER:
+		printf("!!! CONSISTENCY ERROR - the keys within a node are not in ascending order\n");
+		break;
+	case KEY_TOTAL_MISMATCH:
+		printf("!!! CONSISTENCY ERROR - the total number of keys in the tree is wrong\n");
+		break;
+	}
+	printf("\nThe tree is :-\n");
+	ShowTree(tree,0);
+	printf("\n\n ----> TEST ABORTED <----\n\n\n");
+	exit(0);
+}
+SHAR_EOF
+fi
+echo shar: "extracting btree.test.h"
+if test -f 'btree.test.h'
+then
+	echo shar: "will not over-write existing file 'btree.test.h'"
+else
+cat << \SHAR_EOF > 'btree.test.h'
+**************************************************************************
+
+Module Name:		btree.test.h
+============
+
+Function:		Defines various error codes used by btree.test.c
+=========
+
+Description:
+============
+		Just defines a set of error codes
+***************************************************************************
+**************************************************************************/
+
+static char btree_test_prog_hdr[]	= "@(#)btree.test.h	1.1 7/15/86";
+
+#define	FOUND_NON_EXISTANT_KEY		100
+#define	NOT_FOUND_EXISTING_KEY		101
+#define	FOUND_WRONG_KEY			102
+#define	INSERTED_EXISTING_KEY		103
+#define	CANNOT_INSERT_KEY		104
+#define	DELETED_NON_EXISTANT_KEY	105
+#define	CANNOT_DELETE_KEY		106
+#define	NODE_NOT_HALF_FULL		107
+#define	WRONG_KEY_IN_NODE		108
+#define	TREE_DEPTH_INCONSISTENT		109
+#define KEYS_NOT_IN_ORDER		110
+#define	KEY_TOTAL_MISMATCH		111
+SHAR_EOF
+fi
+echo shar: "extracting btree.prt.h"
+if test -f 'btree.prt.h'
+then
+	echo shar: "will not over-write existing file 'btree.prt.h'"
+else
+cat << \SHAR_EOF > 'btree.prt.h'
+/****************************************************************************
+*****************************************************************************
+**
+** Module Name:		btree.prt.h
+** ============
+**
+** Function:		routine for printing a tree
+** =========
+**
+** Modification History
+** --------------------
+** Vers		Date		Mdfr	Reason for Change
+** ------------------------------------------------------
+** 1.1		17/07/86	SMJ	Adapted from btree.c v1.4
+** -------------------------------------------------------
+**
+** Description:
+** ============
+** 	See for yourself
+*/
+
+static char btreeprt[] = "@(#)btree.prt.h	1.1 7/17/86";
+
+/****************************************************************************
+* TREE PRINTING ROUTINES 
+****************************************************************************/
+
+/*
+** SHOWTREE
+** ========
+**
+** Purpose:	Print the contents of a tree, showing the level of each node.
+**
+** Parameters: 	tree	= Tree to print,
+**		level	= Depth in tree.
+**
+** Returns: 	None.
+**
+** Description:	Recursively scan down the tree, printing out the
+**		contents of each node in turn, indented in accordance with
+**		their depth in the tree.
+**		The 'level' parameter allows a limit to be set on the depth
+**		printout.
+*/
+
+ShowTree(tree, level)
+BTREE	tree;
+int	level;
+{
+	int	i;
+
+	if (tree != (BTREE)NULL) 
+	{
+		for (i=0; i<level; ++i)
+			putchar('	');
+		for (i=0; i<tree->t_active; ++i)
+			ShowDatum(tree->t_dat[i]);
+		putchar('\n');
+		for (i=0; i<=tree->t_active; ++i)
+			ShowTree(tree->t_ptr[i], 1+level);
+	}
+}
+
+
+/*
+** SHOWDATUM
+** =========
+**
+** Purpose:	Routine to print the contents of a given datum
+**
+** Parameters: 	dtm	= Datum to print.
+**
+** Returns: 	None.
+**
+*/
+
+ShowDatum(dtm)
+DATUM	dtm;
+{
+	printf("%d ", dtm.key);
+}
+SHAR_EOF
+fi
+echo shar: "extracting btree.fe.M"
+if test -f 'btree.fe.M'
+then
+	echo shar: "will not over-write existing file 'btree.fe.M'"
+else
+cat << \SHAR_EOF > 'btree.fe.M'
+#*********************************************************************
+#
+# Title:	btree.fe.M
+#
+# Function:	btree front-end makefile
+#
+#*********************************************************************
+#
+# @(#)btree.fe.M	1.1 7/16/86
+
+btree.fe:	btree.fe.o btree.o btree.prt.h
+	cc -O -o btree.fe btree.fe.o
+
+btree.fe.o:	btree.fe.c btree.fe.h
+	cc -c -O btree.fe.c
+
+btree.o:	btree.c btree.h
+	cc -c -O btree.c
+SHAR_EOF
+fi
+echo shar: "extracting btree.test.M"
+if test -f 'btree.test.M'
+then
+	echo shar: "will not over-write existing file 'btree.test.M'"
+else
+	cat << \SHAR_EOF > 'btree.test.M'
+#*********************************************************************
+#
+# Title:	btree.test.M
+#
+# Function:	btree test makefile
+#
+#*********************************************************************
+#
+# @(#)btree.test.M	1.1 7/16/86
+
+btree.test:	btree.test.o btree.o btree.prt.h
+	cc -O -o btree.test btree.test.o
+
+btree.test.o:	btree.test.c btree.test.h
+	cc -c -O btree.test.c
+
+btree.o:	btree.c btree.h
+	cc -c -O btree.c
+SHAR_EOF
+fi
+echo "Done."
+
+

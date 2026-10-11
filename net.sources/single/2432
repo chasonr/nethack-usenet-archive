@@ -1,0 +1,987 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,b7e2088d6269ad77,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-02-12 00:17:11 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site sdcc3.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxr!mhuxb!mhuxn!mhuxm!mhuxj!houxm!whuxlm!harpo!decvax!ittvax!dcdwest!sdcsvax!sdcc3!muller
+From: muller@sdcc3.UUCP (Keith Muller)
+Newsgroups: net.sources
+Subject: load control (5 of 8)
+Message-ID: <2680@sdcc3.UUCP>
+Date: Tue, 12-Feb-85 03:17:11 EST
+Article-I.D.: sdcc3.2680
+Posted: Tue Feb 12 03:17:11 1985
+Date-Received: Wed, 13-Feb-85 07:39:05 EST
+Organization: U.C. San Diego, Academic Computer Center
+Lines: 967
+
+This is part 5 of the load control system. Part 1 must be unpacked before any
+other part.
+	Keith Muller
+	ucbvax!sdcsvax!muller
+
+
+
+# This is a shell archive.  Remove anything before this line,
+# then unpack it by saving it in a file and typing "sh file".
+#
+# Wrapped by sdcc3!muller on Sat Feb  9 13:54:09 PST 1985
+# Contents:  control/ldccmdtab.c control/ldcmain.c control/ldqmain.c
+#	control/ldrmmain.c control/list.c
+ 
+echo x - control/ldccmdtab.c
+sed 's/^@//' > "control/ldccmdtab.c" <<'@//E*O*F control/ldccmdtab.c//'
+
+/*---------------------------------------------------------------------------
+ * commandtab.c - control
+ *
+ * tables of commands that the load program will call
+ *
+ *---------------------------------------------------------------------------
+ */
+
+/* $Log$ */
+
+#include "../h/control.h"
+
+char	aborhelp[] =	"terminate the server (disable load control)";
+char	delhelp[] =	"remove specified jobs (by pid or user) from the queue";
+char	errhelp[] =	"print the contents of the error logging file";
+char	helphelp[] =	"get help on any command";
+char	listhelp[] =	"list all the jobs queued for a specified user";
+char	loadhelp[] =	"change the load level above which jobs are queued";
+char	longhelp[] =	"list all queued jobs";
+char	movehelp[] =	"move a processes position in the queue";
+char	purghelp[] =	"remove ALL the jobs from the queue (the jobs terminate)";
+char	quithelp[] =	"exit the control program";
+char	runhelp[] =	"run specified jobs (by pid or user) from the queue";
+char	sizehelp[] =	"change the maximium number of jobs that can be queued";
+char	statushelp[] =	"print the current settings of changeable parameters";
+char	timerhelp[] =	"change the number of seconds between load average checks";
+char	waithelp[] =	"change the maximium time (seconds) a job can be queued";
+
+/*
+ * import the functions
+ */
+extern int abortserv(), delete(), errprint(), help(), list(), loadlimit(), longlist();
+extern int move(), purge(), quit(), run(), sizeset(), status(), timerset(), waitset();
+
+/*
+ * the command table
+ * the privledge column restrict certain commands to root (root only
+ * as other changes could cause the server to be aborted with no
+ * way to restart!
+ */
+
+struct cmd cmdtab[] = {
+
+/*	   command	helpmessage	routine		privledge */
+
+	{ "abort",	aborhelp,	abortserv,	RESTRICT },
+	{ "delete",	delhelp,	delete,		NORESTRICT },
+	{ "errors",	errhelp,	errprint,	NORESTRICT },
+	{ "help",	helphelp,	help,		NORESTRICT },
+	{ "list",	listhelp,	list,		NORESTRICT },
+	{ "loadlimit",	loadhelp,	loadlimit,	RESTRICT },
+	{ "longlist",	longhelp,	longlist,	NORESTRICT },
+	{ "move",	movehelp,	move,		RESTRICT },
+	{ "purge",	purghelp,	purge,		RESTRICT },
+	{ "quit",	quithelp,	quit,		NORESTRICT },
+	{ "run",	runhelp,	run,		RESTRICT },
+	{ "sizeset",	sizehelp,	sizeset,	RESTRICT },
+	{ "status",	statushelp,	status,		NORESTRICT },
+	{ "timerset",	timerhelp,	timerset,	RESTRICT },
+	{ "waitset",	waithelp,	waitset,	RESTRICT },
+	{ "?",		helphelp,	help,		NORESTRICT },
+	{ 0 },
+};
+
+int	NCMDS = sizeof (cmdtab) / sizeof (cmdtab[0]);
+@//E*O*F control/ldccmdtab.c//
+chmod u=r,g=r,o=r control/ldccmdtab.c
+ 
+echo x - control/ldcmain.c
+sed 's/^@//' > "control/ldcmain.c" <<'@//E*O*F control/ldcmain.c//'
+
+/*-------------------------------------------------------------------------
+ * main.c - control/ldc
+ *
+ * the ldc program is used to send commands to the server that can 
+ * alter the servers execution or display the servers current state
+ *
+ * Author: Keith Muller
+ *	   University Of California, San Diego
+ *	   Academic Computer Center C - 010
+ *	   La Jolla, Ca 92093
+ *	   ucbvax!sdcsvax!sdcc3!muller
+ *	   (619) 452-6090
+ *-------------------------------------------------------------------------
+ */
+
+/* $Log$ */
+
+#include "../h/common.h"
+#include "../h/control.h"
+#include <sys/uio.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/time.h>
+#include <stdio.h>
+#include <setjmp.h>
+#include <errno.h>
+
+int fromatty;		/* set to 1 if interactive, 0 otherwise */
+char cmdline[256];	/* buffer for the command */
+char *margv[64];	/* args in interactive mode */
+int margc;		/* count of args */
+jmp_buf toplevel;	/* jmp_buf used if a command is aborted premature */
+
+/*-------------------------------------------------------------------------
+ * main
+ *
+ *-------------------------------------------------------------------------
+ */
+main(argc, argv)
+int argc;
+char *argv[];
+{
+	register struct cmd *c;
+	extern int uid;
+	extern int isatty();
+	extern char *gets();
+	extern struct cmd *getcmd();
+
+	/*
+	 * set up the necessary overhead 
+	 */
+	setup();
+
+	/*
+	 * could be a single line command
+	 */
+	if (--argc > 0) {
+		if ((c = getcmd(*++argv)) == 0)
+			quit();
+		if ((c->c_priv == RESTRICT) && (uid != 0)){
+			printf("?Privileged command\n");
+			quit();
+		}
+		/*
+		 * run the entry from the command table
+		 */
+		(*c->c_handler)(argc, argv);
+		/*
+		 * clean up
+		 */
+		quit();
+	}
+
+	/*
+	 * see if the program is attached to a tty
+	 */
+	fromatty = isatty(fileno(stdin));
+
+	/*
+	 * on an interrupt return to this point!
+	 */
+	(void)setjmp(toplevel);
+
+	for (;;) {
+		if (fromatty){
+			printf("\nldc> ");
+			(void)fflush(stdout);
+		}
+
+		/*
+		 * wait for io either on the tty or a status message
+		 * from the server is read.
+		 */
+		if (iowait() == 0)
+			continue;
+
+		if (gets(cmdline) == NULL)
+			break;
+		if (cmdline[0] == '\0')
+			continue;
+		/*
+		 * transform into a argv argc array
+		 */
+		makeargv();
+
+		/*
+		 * valid command?
+		 */
+		if ((c = getcmd(margv[0])) == 0)
+			continue;
+
+		if ((c->c_priv == RESTRICT) && (uid != 0)) {
+			printf("?Privileged command\n");
+			continue;
+		}
+
+		/*
+		 * run the command from the command table
+		 */
+		(*c->c_handler)(margc, margv);
+	}
+	quit();
+}
+
+/*-------------------------------------------------------------------------
+ * onint
+ *
+ * when an interrupt occurs jump here!
+ *-------------------------------------------------------------------------
+ */
+onint()
+{
+	extern FILE *out;
+
+	/*
+	 * if fromtty == 0 standard input is not a tty, so exit
+	 */
+	if (fromatty == 0)
+		quit();
+	
+	/*
+	 * if list or status command was interrupted, close off the
+	 * open file
+	 */
+	if (out != NULL)
+		(void)fclose(out);
+
+	/*
+	 * interactive so continue
+	 */
+	putchar('\n');
+	longjmp(toplevel, 1);
+}
+
+/*-------------------------------------------------------------------------
+ * quit
+ *
+ *-------------------------------------------------------------------------
+ */
+quit()
+{
+	extern int sock;
+	extern char path[];
+
+	(void)close(sock);
+	(void)unlink(path);
+	exit(0);
+}
+
+/*-------------------------------------------------------------------------
+ * getcmd
+ *
+ * find closest fit for the command typed in
+ *-------------------------------------------------------------------------
+ */
+struct cmd *
+getcmd(comname)
+char *comname;
+{
+	register char *p;
+	register char *q;
+	register struct cmd *c;
+	register struct cmd *found;
+	int nmatches;
+	int longest;
+	extern struct cmd cmdtab[];
+
+	longest = 0;
+	nmatches = 0;
+	found = (struct cmd *)0;
+
+	for (c = cmdtab; (p = c->c_name) != (char *)0; c++) {
+		for (q = comname; *q == *p++; q++){
+			/*
+			 * exact match?
+			 */
+			if (*q == '\0')
+				return(c);
+		}
+
+		/*
+		 * name is a prefix
+		 */
+		if (*q == '\0') {
+			if (q - comname > longest) {
+				longest = q - comname;
+				nmatches = 1;
+				found = c;
+			} else if ((q - comname) == longest)
+				nmatches++;
+		}
+	}
+
+	/*
+	 * More than one match found
+	 */
+	if (nmatches > 1){
+		printf("?Ambiguous command\n");
+		return((struct cmd *)0);
+	}
+
+	/*
+	 * No match found in table
+	 */
+	if (found == (struct cmd *)0)
+		printf("?Invalid command\n");
+	return(found);
+}
+
+/*-------------------------------------------------------------------------
+ * makeargv
+ *
+ * Slice a string up into argc/argv.
+ *-------------------------------------------------------------------------
+ */
+makeargv()
+{
+	register char *cp;
+	register char **argp = margv;
+
+	margc = 0;
+	for (cp = cmdline; *cp != '\0'; ) {
+		/*
+		 * skip over the blanks
+		 */
+		while (*cp == ' ')
+			cp++;
+
+		if (*cp == '\0')
+			break;
+
+		*argp++ = cp;
+		margc = margc + 1;
+		while ((*cp != '\0') && (*cp != ' '))
+			cp++;
+
+		if (*cp == '\0')
+			break;
+
+		*cp++ = '\0';
+	}
+	*argp++ = (char *)0;
+}
+
+/*-------------------------------------------------------------------------
+ * Help command.
+ *
+ *-------------------------------------------------------------------------
+ */
+
+help(argc, argv)
+int argc;
+char *argv[];
+{
+	register struct cmd *c;
+	register int i;
+	register int j;
+	register int w;
+	char *arg;
+	int columns;
+	int width = 0;
+	int lines;
+	int len;
+	extern int NCMDS;
+
+	if (argc == 1) {
+		printf("Commands may be abbreviated.  Commands are:\n");
+
+		for (c = cmdtab; c < &(cmdtab[NCMDS-1]); c++) {
+			len = strlen(c->c_name);
+			if (len > width)
+				width = len;
+		}
+
+		width = (width + 8) &~ 7;
+		columns = 80 / width;
+		if (columns == 0)
+			columns = 1;
+		lines = (NCMDS + columns - 1) / columns;
+
+		for (i = 0; i < lines; i++) {
+			for (j = 0; j < columns; j++) {
+				c = cmdtab + j * lines + i;
+				printf("%s", c->c_name);
+				if (c + lines >= &(cmdtab[NCMDS-1])) {
+					printf("\n");
+					break;
+				}
+				w = strlen(c->c_name);
+				while (w < width) {
+					w = (w + 8) &~ 7;
+					putchar('\t');
+				}
+			}
+		}
+		return;
+	}
+	while (--argc > 0) {
+		arg = *++argv;
+		if ((c = getcmd(arg)) == (struct cmd *)0)
+			continue;
+		printf("%-*s\t%s\n", 10, c->c_name, c->c_help);
+	}
+}
+
+/*-------------------------------------------------------------------------
+ * iowait
+ *
+ * wait for io on either stdin or a status message from server.
+ *-------------------------------------------------------------------------
+ */
+iowait()
+{
+	int readfds;
+	int numfds;
+	char msg;
+	int fromlen = 0;
+	extern int errno;
+	extern int descsize;
+	extern int sockmask;
+	extern int stdinmask;
+	extern int sock;
+
+	for(;;){
+		readfds = sockmask | stdinmask;
+		numfds = select(descsize,&readfds,(int *)0,(int *)0,(struct timeval *)0);
+		if ((numfds < 0) && (errno != EINTR)){
+			perror("select failed");
+			quit();
+		}
+
+		if (numfds <= 0)
+			continue;
+
+		if (readfds & stdinmask)
+			return(1);
+
+		if (recvfrom(sock,&msg,sizeof(msg),0,(struct sockaddr *)0,&fromlen)<=0){
+			perror("Failed message from server");
+			quit();
+		}
+		switch(msg){
+			case POLLCMD:
+				printf("A new server just started\n");
+				break;
+			default:
+				printf("Unexpected message from server\n");
+				break;
+		}
+		return(0);
+	}
+}
+@//E*O*F control/ldcmain.c//
+chmod u=r,g=r,o=r control/ldcmain.c
+ 
+echo x - control/ldqmain.c
+sed 's/^@//' > "control/ldqmain.c" <<'@//E*O*F control/ldqmain.c//'
+
+/*-------------------------------------------------------------------------
+ * ldqmain.c - control/ldq
+ *
+ * the ldq program is used to print the contents of the load queue.
+ * The same function is also part of the ldc command.
+ *
+ * Author: Keith Muller
+ *	   University Of California, San Diego
+ *	   Academic Computer Center C - 010
+ *	   La Jolla, Ca 92093
+ *	   ucbvax!sdcsvax!sdcc3!muller
+ *	   (619) 452-6090
+ *-------------------------------------------------------------------------
+ */
+
+/* $Log$ */
+
+#include "../h/control.h"
+#include <stdio.h>
+
+/*-------------------------------------------------------------------------
+ * main
+ *
+ *-------------------------------------------------------------------------
+ */
+main(argc, argv)
+int argc;
+char *argv[];
+{
+	if (argc > 2){
+		printf("usage: ldq [-a] [user]\n");
+		exit(1);
+	}
+
+	/*
+	 * set up the necessary overhead 
+	 */
+	setup();
+
+	/*
+	 * call the correct list version (same as in ldc).
+	 */
+	if ((argc == 2) && (strcmp(argv[1],"-a") == 0)){
+		/*
+		 * decrement the argc count to get rid of the -a flag.
+		 */
+		argc = 1;
+		longlist(argc,argv);
+	}else{
+		/*
+		 * must be a short list call
+		 */
+		list(argc,argv);
+	}
+
+	/*
+	 * clean up the sockets
+	 */
+	quit();
+}
+
+/*-------------------------------------------------------------------------
+ * onint
+ *
+ * when an interrupt occurs jump here!
+ *-------------------------------------------------------------------------
+ */
+onint()
+{
+	printf("\n....interrupted\n");
+	quit();
+}
+
+/*-------------------------------------------------------------------------
+ * quit
+ *
+ *-------------------------------------------------------------------------
+ */
+quit()
+{
+	extern int sock;
+	extern char path[];
+
+	(void)close(sock);
+	(void)unlink(path);
+	exit(0);
+}
+@//E*O*F control/ldqmain.c//
+chmod u=r,g=r,o=r control/ldqmain.c
+ 
+echo x - control/ldrmmain.c
+sed 's/^@//' > "control/ldrmmain.c" <<'@//E*O*F control/ldrmmain.c//'
+
+/*-------------------------------------------------------------------------
+ * ldrmmain.c - control/ldrm
+ *
+ * the ldrm program is used to delete jobs from the load queue.
+ * The same function is also part of the ldc command.
+ *
+ * Author: Keith Muller
+ *	   University Of California, San Diego
+ *	   Academic Computer Center C - 010
+ *	   La Jolla, Ca 92093
+ *	   ucbvax!sdcsvax!sdcc3!muller
+ *	   (619) 452-6090
+ *-------------------------------------------------------------------------
+ */
+
+/* $Log$ */
+
+#include "../h/control.h"
+#include <stdio.h>
+
+/*-------------------------------------------------------------------------
+ * main
+ *
+ *-------------------------------------------------------------------------
+ */
+main(argc, argv)
+int argc;
+char *argv[];
+{
+	if (argc < 2){
+		printf("useage: ldrm [pids] [-u users]\n");
+		exit(1);
+	}
+ 	if (strncmp(argv[1], "-u", 2) == 0){
+		/*
+	 	 * remove all jobs by user (-u option)
+	 	 */
+		if (argc < 3){
+			printf("No user name.\n");
+			printf("Usage: ldrm [pids] [-u users]\n");
+			return;
+		}
+	}
+
+	/*
+	 * set up the necessary overhead 
+	 */
+	setup();
+
+	/*
+	 * call the delete routine
+	 */
+	delete(argc, argv);
+
+	/*
+	 * clean up the sockets
+	 */
+	quit();
+}
+
+/*-------------------------------------------------------------------------
+ * onint
+ *
+ * when an interrupt occurs jump here!
+ *-------------------------------------------------------------------------
+ */
+onint()
+{
+	printf("\n....interrupted\n");
+	quit();
+}
+
+/*-------------------------------------------------------------------------
+ * quit
+ *
+ *-------------------------------------------------------------------------
+ */
+quit()
+{
+	extern int sock;
+	extern char path[];
+
+	(void)close(sock);
+	(void)unlink(path);
+	exit(0);
+}
+@//E*O*F control/ldrmmain.c//
+chmod u=r,g=r,o=r control/ldrmmain.c
+ 
+echo x - control/list.c
+sed 's/^@//' > "control/list.c" <<'@//E*O*F control/list.c//'
+
+/*-----------------------------------------------------------------------
+ * list.c - control program
+ *
+ * this file contains the commands: longlist and list which are common
+ * to both ldc and ldq.
+ *-----------------------------------------------------------------------
+ */
+
+/* $Log$ */
+
+#include "../h/common.h"
+#include "../h/control.h"
+#include <sys/time.h>
+#include <stdio.h>
+#include <pwd.h>
+
+struct hashbuck names[HASHMOD];
+
+/*----------------------------------------------------------------------------
+ * getuname
+ *
+ * keep a local hash table of recently requested uids. Speeds up the list
+ * commands when repeatively invoked by ldc. This is done because looking
+ * up passwd entries are expensive. So expensive that it SHOULD NEVER be
+ * done by the server. The server NEVER SHOULD look up passwd entries. This
+ * routine helps unhashed (generic 4.2) passwd files greatly. It is even
+ * worthwhile on newer dbm passwd file.
+ *-----------------------------------------------------------------------------
+ */
+static char *
+getuname(huid)
+register int huid;
+{
+	register struct hashbuck *hashptr;
+	register struct passwd *pwd;
+	extern struct passwd *getpwuid();
+	extern char *strncpy();
+
+	/*
+	 * hash and find the address of the bucket
+	 */
+	hashptr = &(names[huid % HASHMOD]);
+
+	/*
+	 * if this is the user return the name
+	 */
+	if ((hashptr->buckuid == huid) && (hashptr->buckname[0] != '\0'))
+		return(hashptr->buckname);
+
+	/*
+	 * not the same user (or empty) so update this bucket. 
+	 * collisions should be rare if the hashtable is of reasonable
+	 * size reletive to the size of the passwd file.
+	 */
+	if ((pwd = getpwuid(huid)) != (struct passwd *)NULL){
+		hashptr->buckuid = huid;
+		(void)strncpy(hashptr->buckname, pwd->pw_name, PNAMSIZ);
+		return(hashptr->buckname);
+	}
+
+	/*
+	 * bad uid, skip it
+	 */
+	return((char *)0);
+}
+
+/*----------------------------------------------------------------------------
+ * longlist
+ *
+ * tell the server to update the list of queued jobs in the list file. When
+ * the server says the list is updated, show ALL the queued jobs to the user
+ *-----------------------------------------------------------------------------
+ */
+longlist(argc, argv)
+int argc;
+char **argv;
+{
+	int juid;
+	u_long jpid;
+	u_long jtime;
+	int pos;
+	int qcount;
+	char *jname;
+	char jcom[COMLEN];
+	struct timezone zone;
+	struct timeval now;
+	extern FILE *out;
+	extern int gettimeofday();
+	extern int fclose();
+	FILE *fopen();
+	extern struct request job;
+
+	if (argc != 1){
+		printf("Usage: longlist\n");
+		return;
+	}
+
+	job.type = LISTCMD;
+
+	/*
+	 * only try to print the list if the server says all is ok!
+	 */
+	if (sendcntrl() < 0)
+		return;
+	
+	if ((out = fopen(LISTFILE, "r")) == NULL){
+		printf("cannot open listfile file\n");
+		return;
+	}
+
+	/*
+	 * first entry in the queue is the qcount. if it is zero just say so
+	 */
+	if (fscanf(out,"%d",&qcount) != 1){
+		printf("No queue info available\n");
+		(void)fclose(out);
+		out = NULL;
+		return;
+	}
+
+	if (qcount < 1){
+		printf("Queue empty\n");
+		(void)fclose(out);
+		out = NULL;
+		return;
+	}
+
+	/*
+	 * at least one job is in the queue.
+	 */
+	printf(" rank\t  pid\t  user\t  time(sec)     commands\n");
+	printf("-------------------------------------------------------\n");
+	pos = 1;
+	(void)gettimeofday(&now, &zone);
+	while(fscanf(out,"%d %ld %ld %[^\n]",&juid,&jpid,&jtime,jcom) == 4){
+		printf(" %3d\t",pos++);
+		printf(" %5u\t",jpid);
+		if ((jname = getuname(juid)) != (char *)0)
+			printf(" %-8.8s",jname);
+		else
+			printf(" %-8.8d",juid);
+		printf("   %5ld",now.tv_sec - (long)jtime);
+		printf("      %s\n",jcom);
+	}
+
+	/*
+	 * if eof is not set, file has an error
+	 */
+	if (feof(out) == 0)
+		printf("Error in list file\n");
+	(void)fclose(out);
+	out = NULL;
+}
+
+/*----------------------------------------------------------------------------
+ * list
+ *
+ * tell the server to update the list of queued jobs in the list file. When
+ * the server says the list is updated, show ONLY this users jobs.
+ *-----------------------------------------------------------------------------
+ */
+list(argc, argv)
+int argc;
+char **argv;
+{
+	int juid;
+	int cmpuid;
+	u_long jpid;
+	u_long jtime;
+	int pos;
+	int qcount;
+	char *jname;
+	char jcom[COMLEN];
+	int found;
+	struct passwd *pwd;
+	struct timezone zone;
+	struct timeval now;
+	extern int uid;
+	extern FILE *out;
+	extern struct passwd *getpwnam();
+	extern int gettimeofday();
+	extern int fclose();
+	FILE *fopen();
+	extern struct request job;
+
+	if (argc > 2){
+		printf("Usage: list [user]\n");
+		return;
+	}
+
+	if (argc == 2){
+		/*
+	 	 * if a user is specified, look him up in the passwd file
+	  	 */
+		if ((pwd = getpwnam(argv[1])) == (struct passwd *)NULL){
+			printf("No such user: %s\n", argv[1]);
+			(void)endpwent();
+			return;
+		}
+		cmpuid = pwd->pw_uid;
+		jname = pwd->pw_name;
+		(void)endpwent();
+	}else{
+		/*
+		 * no user specified, use the current users uid
+		 */
+		cmpuid = uid;
+		if ((jname = getuname(uid)) == (char *)0){
+			printf("Cannot find you in the passwd file\n");
+			return;
+		}
+	}
+
+	job.type = LISTCMD;
+
+	/*
+	 * only try to print the list if the server says all is ok!
+	 */
+	if (sendcntrl() < 0)
+		return;
+	
+	if ((out = fopen(LISTFILE, "r")) == NULL){
+		printf("cannot open listfile file\n");
+		return;
+	}
+
+	/*
+	 * first entry in the queue is the qcount. if it is zero just say so
+	 */
+	if (fscanf(out,"%d",&qcount) != 1){
+		printf("No queue info available\n");
+		(void)fclose(out);
+		out = NULL;
+		return;
+	}
+
+	if (qcount < 1){
+		printf("Queue empty\n");
+		(void)fclose(out);
+		out = NULL;
+		return;
+	}
+
+	/*
+	 * at least one job is in the queue. Look for a job owned by the
+	 * specific user.
+	 */
+	found = 0;
+	pos = 0;
+	while(fscanf(out,"%d %ld %ld %[^\n]",&juid,&jpid,&jtime,jcom) == 4){
+		pos++;
+		if (cmpuid == juid){
+			/*
+			 * found a job owned by the user
+			 */
+			found = 1;
+			break;
+		}
+	}
+	if (found == 0){
+		/*
+		 * no jobs found, either an error or no jobs for that user
+		 * is in the queue.
+		 */
+		if (feof(out) == 0){
+			printf("Error in list file\n");
+		}else{
+			printf("No jobs in queue for: %s\n", jname);
+		}
+		(void)fclose(out);
+		out = NULL;
+		return;
+	}
+	(void)gettimeofday(&now, &zone);
+	printf(" rank\t  pid\t  user\t  time(sec)     commands\n");
+	printf("-------------------------------------------------------\n");
+	printf(" %3d\t %5u\t %-8.8s",pos++, jpid, jname);
+	printf("   %5ld",now.tv_sec - (long)jtime);
+	printf("      %s\n",jcom);
+	while(fscanf(out,"%d %ld %ld %[^\n]",&juid,&jpid,&jtime,jcom) == 4){
+		/*
+		 * only print this users jobs
+		 */
+		if (cmpuid != juid){
+			pos++;
+			continue;
+		}
+		printf(" %3d\t %5u\t %-8.8s",pos++, jpid, jname);
+		printf("   %5ld",now.tv_sec - (long)jtime);
+		printf("      %s\n",jcom);
+	}
+	if (feof(out) == 0)
+		printf("Error in list file\n");
+	(void)fclose(out);
+	out = NULL;
+}
+@//E*O*F control/list.c//
+chmod u=r,g=r,o=r control/list.c
+ 
+echo Inspecting for damage in transit...
+temp=/tmp/shar$$; dtemp=/tmp/.shar$$
+trap "rm -f $temp $dtemp; exit" 0 1 2 3 15
+cat > $temp <<\!!!
+      66     365    2506 ldccmdtab.c
+     373     968    7150 ldcmain.c
+      88     195    1754 ldqmain.c
+      87     185    1736 ldrmmain.c
+     297     910    6776 list.c
+     911    2623   19922 total
+!!!
+wc  control/ldccmdtab.c control/ldcmain.c control/ldqmain.c control/ldrmmain.c control/list.c | sed 's=[^ ]*/==' | diff -b $temp - >$dtemp
+if [ -s $dtemp ]
+then echo "Ouch [diff of wc output]:" ; cat $dtemp
+else echo "No problems found."
+fi
+exit 0
+
+

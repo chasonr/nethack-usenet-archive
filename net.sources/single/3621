@@ -1,0 +1,1133 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,3f49863156c45a1d,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-11-20 12:58:08 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/5/84; site anasazi.UUCP
+Path: utzoo!watmath!clyde!bonnie!akgua!gatech!seismo!hao!noao!terak!mot!anasazi!duane
+From: duane@anasazi.UUCP (Duane Morse)
+Newsgroups: net.sources
+Subject: z80 disassembler subroutine
+Message-ID: <376@anasazi.UUCP>
+Date: Wed, 20-Nov-85 15:58:08 EST
+Article-I.D.: anasazi.376
+Posted: Wed Nov 20 15:58:08 1985
+Date-Received: Mon, 25-Nov-85 06:55:58 EST
+Distribution: net
+Organization: Anasazi, Phoenix Az.
+Lines: 1112
+
+Here's a routine which will disassemble one instruction into z80
+mnemonics. It will also indicate whether the instruction references
+something which might be in a symbol table, so the calling program
+can display the nearest symbol name on the same line.
+
+Note: z80dis.c uses Fred Fish's Debug package, though the current
+z80dis.o is compiled with -DDBUG_OFF. If you don't have the debug
+package, delete "DBUG_3" and "DBUG_ENTER" statements, change "DBUG_VOID_RETURN"
+to "return", and change "DBUG_RETURN(x)" to "return(x)".
+-----------------------------Cut here ------------------------------
+# This is a shell archive.  Remove anything before this line,
+# then unpack it by saving it in a file and typing "sh file".
+#
+# Wrapped by duane on Wed Nov 20 13:50:30 MST 1985
+# Contents:  z80dis.3 z80dis.c
+ 
+echo x - z80dis.3
+sed 's/^@//' > "z80dis.3" <<'@//E*O*F z80dis.3//'
+@.TH Z80DIS 3 "Anasazi Programmer's Manual"
+@.SH NAME
+z80dis \- disassemble memory into Z80 instructions
+@.SH SYNOPSIS
+@.nf
+int z80dis(op_buf, outbuf, b_addr, lblflag)
+unsigned char *op_buf;
+char *outbuf;
+unsigned short b_addr;
+long *lblflag;
+@.SH RETURNS
+Length of the disassembled instruction in bytes (1 to 4).
+@.SH DESCRIPTION
+z80dis disassembles one Z80 instruction into an uppercase ASCII string.
+The instruction to be disassembled starts at
+@.B op_buf
+and should be at least 4 bytes long (the longest Z80 instruction uses
+4 bytes). The null-terminated ASCII string is returned in
+@.B outbuf.
+The program counter corresponding to the start of the instruction
+is in
+@.B b_addr.
+On return, lblflag is -1 unless the disassembled instruction contained
+a full-word address, in which case lblflag contains that address. (If
+the caller has access to a symbol table, lblflag can be used to indicate
+the nearest symbol name referenced by the instruction.)
+@.SH EXAMPLE
+instrlen = z80dis(mem_buf, dumpbuf, baseaddr, &z80addr);
+@.SH "BUGS AND CAUTIONS"
+If z80dis doesn't understand the instruction, it returns a length of
+1 and the string is "??".
+@//E*O*F z80dis.3//
+chmod u=rw,g=r,o=r z80dis.3
+ 
+echo x - z80dis.c
+sed 's/^@//' > "z80dis.c" <<'@//E*O*F z80dis.c//'
+/*TITLE z80dis.c - disassemble into Z80 mnemonics - 11/20/85 10:03:34 */
+/*SUBTTL Includes, defines, data storage, and declarations */
+static char *version = "@(#)z80dis.c	1.1 11/20/85 10:03:34";
+
+/*
+** This file contains routine z80dis, which disassembles one z80 instruction.
+*/
+
+#include <stdio.h>
+#include <dbug.h>
+
+#define STATIC static
+
+#define FAKEHLIDX 0x20		/* Needed for some IX/IY translation */
+
+struct codestring {
+  unsigned short simplecode;	/* Op code */
+  char *simplestring;		/* String that corresponds to simplecode */
+} ;
+
+/* Main variables */
+
+/* Points to next byte to disassemble */
+STATIC unsigned char *dis_addr; 
+
+/* Points to where to put the output byte */
+STATIC char *outptr;
+
+/* Points to start of ASCII output buffer */
+STATIC char *org_buf;
+
+/* Length of the current instruction in bytes */
+STATIC int instr_len;
+
+/* If not -1, addr of "label" in instruction. Caller may have symbol table. */
+STATIC long labeladdr;
+
+/* address of the current byte being disassembled */
+STATIC unsigned short curaddr;
+
+/* 'X' or 'Y' if current instruction uses IX or IY */
+STATIC char ixiyop;
+
+/* Current op code */
+STATIC unsigned char this_op;
+
+/* Count of characters displayed before the op code string */
+STATIC int count;
+/*PAGE*/
+/* Register names in order by Z80 convention */
+
+STATIC char *rtbl[] = {
+  "B", "C", "D", "E", "H", "L", "(HL)", "A"
+} ;
+
+/* Register pair names (ends with SP) */
+
+STATIC char *rptbl[] = {
+  "BC", "DE", "HL", "SP"
+} ;
+
+/* Alternate table of register pair names (ends with afF) */
+
+STATIC char *rptbla[] = {
+  "BC", "DE", "HL", "AF"
+} ;
+
+/* Condition code strings */
+
+STATIC char *cctbl[] = {
+  "NZ", "Z", "NC", "C", "PO", "PE", "P", "M"
+} ;
+
+/* String address for STRN routine and for op codes 80 to BF */
+
+STATIC char *strntb[] = {
+  "ADD A,", "ADC A,", "SUB ", "SBC A,", "AND ", "XOR ", "OR ", "CP "
+} ;
+
+/* String addresses for shft00 */
+
+STATIC char *shfttb[] = {
+  "RLC ", "RRC ", "RL ", "RR ", "SLA ", "SRA ", NULL, "SRL "
+} ;
+/*PAGE*/
+/* Allowed IX and IY op codes other than CB xx */
+STATIC unsigned char ixytb[] = {
+  0x09, 0x19, 0x21, 0x22, 0x23, 0x29, 0x2a,
+  0x2b, 0x34, 0x35, 0x36, 0x39, 0x46, 0x4e,
+  0x56, 0x5e, 0x66, 0x6e, 0x70, 0x71, 0x72,
+  0x73, 0x74, 0x75, 0x77, 0x7e, 0x86, 0x8e,
+  0x96, 0x9e, 0xa6, 0xae, 0xb6, 0xbe, 0xe1,
+  0xe3, 0xe5, 0xe9, 0xf9
+} ;
+
+/* Op code and string tables */
+/*
+**  The following tables contain pairs of op codes and string addresses.
+**  If an op code can be handled entirely by displaying a string, it
+**  appears in one of these tables.
+*/
+
+/* Op codes 00 to FF, excluding ED combinations. */
+
+STATIC struct codestring strtb1[] = {
+  {0x00, "NOP"},
+  {0x02, "LD (BC),A"},
+  {0x07, "RLCA"},
+  {0x08, "EX AF,AF'"},
+  {0x0a, "LD A,(BC)"},
+  {0x0f, "RRCA"},
+  {0x12, "LD (DE),A"},
+  {0x17, "RLA"},
+  {0x1a, "LD A,(DE)"},
+  {0x1f, "RRA"},
+  {0x27, "DAA"},
+  {0x2f, "CPL"},
+  {0x37, "SCF"},
+  {0x3f, "CCF"},
+  {0x76, "HALT"},
+  {0xc9, "RET"},
+  {0xd9, "EXX"},
+  {0xeb, "EX DE,HL"},
+  {0xf3, "DI"},
+  {0xfb, "EI"}
+} ;
+/*PAGE*/
+/* Op codes ED 40 through ED BF */
+
+STATIC struct codestring strtb2[] = {
+  {0x44, "NEG"},
+  {0x45, "RETN"},
+  {0x46, "IM 0"},
+  {0x47, "LD I,A"},
+  {0x4d, "RETI"},
+  {0x4f, "LD R,A"},
+  {0x56, "IM 1"},
+  {0x57, "LD A,I"},
+  {0x5e, "IM 2"},
+  {0x5f, "LD A,R"},
+  {0x67, "RRD"},
+  {0x6f, "RLD"},
+  {0xa0, "LDI"},
+  {0xa1, "CPI"},
+  {0xa2, "INI"},
+  {0xa3, "OUTI"},
+  {0xa8, "LDD"},
+  {0xa9, "CPD"},
+  {0xaa, "IND"},
+  {0xab, "OUTD"},
+  {0xb0, "LDIR"},
+  {0xb1, "CPIR"},
+  {0xb2, "INIR"},
+  {0xb3, "OTIR"},
+  {0xb8, "LDDR"},
+  {0xb9, "CPDR"},
+  {0xba, "INDR"},
+  {0xbb, "OTDR"}
+} ;
+/*PAGE*/
+/* Declaractions */
+
+STATIC unsigned char nxtbyt();
+STATIC int disasm(), doed(), shifts(), exmtbl(), exmstr(), outrpc();
+STATIC void jrcom(), dorela(), outchr(), oct1(), hex1(), hex2();
+STATIC void outrs0(), outrs3(), outr(), sout(), badop();
+STATIC void doixiy(), outrp4(), outrpa(), doaddr(), donpar(), doadrp();
+/*SUBTTL z80dis - disassemble an instruction */
+/*
+** int z80dis(op_buf, outbuf, b_addr, lblflag)
+**
+**  Disassemble one Z80 instruction.
+**
+** Parameters:
+**  op_buf = points to where object code to be disassembled is found.
+**  outbuf = points to where z80dis sends the ASCII output.
+**  b_addr = address of the instruction pointed at by op_buf.
+**  lblflag = if not -1, address of a possible label in the instruction
+**    (e.g. in a jump instruction, call, etc.).
+**
+** Returns:
+**  Length of the instruction disassembled.
+*/
+
+int z80dis(op_buf, outbuf, b_addr, lblflag)
+
+unsigned char *op_buf;
+char *outbuf;
+unsigned short b_addr;
+long *lblflag;
+
+{
+  DBUG_ENTER("z80dis");
+  /* Set up the globals */
+  dis_addr = op_buf;
+  org_buf = outptr = outbuf;
+  curaddr = b_addr;
+  labeladdr = -1;
+  instr_len = 0;
+  count = 5;
+  ixiyop = '\0';
+
+  /* Do the work */
+  if (disasm())
+    badop();
+  else if (ixiyop) {
+    if (disasm())
+      badop();
+  }
+  *outptr = '\0';
+  *lblflag = labeladdr;
+  DBUG_RETURN(instr_len);
+}
+/*SUBTTL disasm - disassemble */
+/*
+** int disasm()
+**
+**  Disassemble an instruction. If an IX/IY instruction is encountered,
+**  this routine will be called twice.
+**
+** Parameters:
+**
+**  ixiyop = null if not an IX or IY instruction, 'X' or 'Y' otherwise.
+**
+** Returns:
+**  0 if successful, -1 if the instruction is invalid.
+*/
+
+STATIC int disasm()
+
+{
+  unsigned char op;
+
+  DBUG_ENTER("disasm");
+  /* Get the next byte in the message */
+  this_op = nxtbyt();
+
+  /* Am I in the middle of an IX or IY instruction? */
+  if (ixiyop) {
+    /* Yes - handle illegal values */
+    if (this_op == 0xdd || this_op == 0xfd || this_op == 0xed)
+      DBUG_RETURN(-1);
+    if (this_op == 0xcb) {
+      op = *(dis_addr + 1);
+      if (op == 0x36)
+	DBUG_RETURN(-1);
+      op &= 0xf;
+      if (op != 6 && op != 0xe)
+	DBUG_RETURN(-1);
+      DBUG_RETURN(shifts());
+    }
+
+    /* See if op code makes sense with IX/IY */
+    if (exmtbl(ixytb, sizeof(ixytb)))
+      DBUG_RETURN(-1);
+  }
+/*PAGE*/
+  /* See if a simple string will do */
+  if (exmstr(strtb1, sizeof(strtb1) / sizeof(struct codestring)) == 0)
+    DBUG_RETURN(0);
+  
+  /* Try miscellaneous instructions */
+  switch (this_op) {
+    case 0x10: /* DJNZ */
+      dorela("DJNZ ");
+      DBUG_RETURN(0);
+    case 0x18: /* JR */
+      jrcom(NULL);
+      DBUG_RETURN(0);
+    case 0x20: /* JR NZ */
+      jrcom("NZ");
+      DBUG_RETURN(0);
+    case 0x22: /* LD (addr),HL */
+      sout("LD ");
+      doadrp();
+      this_op = FAKEHLIDX;
+      outrp4(",");
+      DBUG_RETURN(0);
+    case 0x28: /* JR Z */
+      jrcom("Z");
+      DBUG_RETURN(0);
+    case 0x2a: /* LD HL,(addr) */
+      this_op = FAKEHLIDX;
+      outrp4("LD ");
+      outchr(',');
+      doadrp();
+      DBUG_RETURN(0);
+    case 0x30: /* JR NC */
+      jrcom("NC");
+      DBUG_RETURN(0);
+    case 0x32: /* LD (addr),A */
+      sout("LD ");
+      doadrp();
+      sout(",A");
+      DBUG_RETURN(0);
+    case 0x38: /* JR C */
+      jrcom("C");
+      DBUG_RETURN(0);
+    case 0x3a: /* LD A,(addr) */
+      sout("LD A,");
+      doadrp();
+      DBUG_RETURN(0);
+    case 0xc3: /* JP addr */
+      sout("JP ");
+      doaddr();
+      DBUG_RETURN(0);
+    case 0xcb: /* shift */
+      DBUG_RETURN(shifts());
+    case 0xcd: /* CALL */
+      sout("CALL ");
+      doaddr();
+      DBUG_RETURN(0);
+    case 0xd3: /* OUT (nn),A */
+      sout("OUT ");
+      donpar();
+      sout(",A");
+      DBUG_RETURN(0);
+    case 0xdb: /* IN A,(nn) */
+      sout("IN A,");
+      donpar();
+      DBUG_RETURN(0);
+    case 0xdd: /* IX instruction */
+      ixiyop = 'X';
+      DBUG_RETURN(0);
+    case 0xe3: /* EX (SP),HL */
+      this_op = FAKEHLIDX;
+      outrp4("EX (SP),");
+      DBUG_RETURN(0);
+    case 0xe9: /* JP (HL) */
+      this_op = FAKEHLIDX;
+      outrp4("JP (");
+      outchr(')');
+      DBUG_RETURN(0);
+    case 0xed: /* various */
+      DBUG_RETURN(doed());
+    case 0xf9: /* LD SP,HL */
+      this_op = FAKEHLIDX;
+      outrp4("LD SP,");
+      DBUG_RETURN(0);
+    case 0xfd: /* IY instruction */
+      ixiyop = 'Y';
+      DBUG_RETURN(0);
+    default:
+      break;
+  }
+/*PAGE*/
+  /* Handle op codes from 00 to 3f */
+  if (this_op < 0x40) {
+    switch (this_op & 0x0f) {
+      case 1: /* ld rp,nnnn */
+	outrp4("LD ");
+	outchr(',');
+	doaddr();
+	DBUG_RETURN(0);
+      case 3: /* inc rp */
+	outrp4("INC ");
+	DBUG_RETURN(0);
+      case 4: case 0xc: /* inc r */
+	outrs3("INC ");
+	DBUG_RETURN(0);
+      case 5: case 0xd: /* dec r */
+	outrs3("DEC ");
+	DBUG_RETURN(0);
+      case 6: case 0xe: /* ld r,nn */
+	outrs3("LD ");
+	outchr(',');
+	hex2((int) nxtbyt());
+	DBUG_RETURN(0);
+      case 9: /* add hl,rp */
+	if (ixiyop) {
+	  sout("ADD ");
+	  doixiy();
+	  outrp4(",");
+	}
+	else
+	  outrp4("ADD HL,");
+	DBUG_RETURN(0);
+      case 0xb: /* DEC rp */
+	outrp4("DEC ");
+	DBUG_RETURN(0);
+      default: 
+	DBUG_RETURN(-1);
+    }
+  }
+
+  /* Handle op codes from 40 to 7f */
+  if (this_op < 0x80) {
+    /* Instruction is LD r,r' */
+    outrs3("LD ");
+    outchr(',');
+    outrs0();
+    DBUG_RETURN(0);
+  }
+
+  /* Handle op codes from 80 to bf */
+  if (this_op < 0xc0) {
+    sout(strntb[(this_op >> 3) & 0x7]);
+    outrs0();
+    DBUG_RETURN(0);
+  }
+/*PAGE*/
+  /* Op code is from c0 to ff */
+  switch (this_op & 0xf) {
+    case 0: case 8: /* RET cc */
+      sout("RET ");
+      sout(cctbl[(this_op >> 3) & 0x7]);
+      DBUG_RETURN(0);
+    case 1: /* pop rp */
+      outrpa("POP ");
+      DBUG_RETURN(0);
+    case 2: case 0xa: /* JP cc,addr */
+      sout("JP ");
+      sout(cctbl[(this_op >> 3) & 0x7]);
+      outchr(',');
+      doaddr();
+      DBUG_RETURN(0);
+    case 4: case 0xc: /* CALL cc,addr */
+      sout("CALL ");
+      sout(cctbl[(this_op >> 3) & 0x7]);
+      outchr(',');
+      doaddr();
+      DBUG_RETURN(0);
+    case 5: /* PUSH rp */
+      outrpa("PUSH ");
+      DBUG_RETURN(0);
+    case 6: case 0xe: /* Various */
+      sout(strntb[((this_op - 0xc6) >> 3) & 0xf]);
+      hex2(nxtbyt());
+      DBUG_RETURN(0);
+    case 7: case 0xf: /* rst p */
+      sout("RST ");
+      hex2(this_op & 0x38);
+      DBUG_RETURN(0);
+    default:
+      break;
+  }
+  DBUG_RETURN(-1);
+}
+/*SUBTTL Functions for putting addresses and registers together */
+/*
+** void jrcom(s)
+**
+**  Handle jr xx,e or jr e instructions.
+**
+** Parameters:
+**  s = NULL or string pointer for condition code.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void jrcom(s)
+
+char *s;
+
+{
+  DBUG_ENTER("jrcom");
+  sout("JR ");
+  if (s != NULL) {
+    sout(s);
+    outchr(',');
+  }
+  dorela();
+  DBUG_VOID_RETURN;
+}
+
+/*
+** void dorela(s)
+**
+**  Compute a relative address and save the absolute address for
+**  a relative jump.
+**
+** Parameters:
+**  s = string to display before doing other stuff.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void dorela(s)
+
+char *s;
+
+{
+  unsigned char op;
+  int offset;
+
+  sout(s);
+  op = nxtbyt();
+  offset = (char) op;
+  labeladdr = curaddr + offset;
+  if (offset < 0) {
+    offset = -offset;
+    sout(".-");
+  }
+  else
+    sout(".+");
+  hex2(offset);
+}
+/*SUBTTL Handle ED op codes */
+/*
+** int doed()
+**
+**  Handle op codes beginning with ED.
+**
+** Parameters:
+**  None.
+**
+** Returns:
+**  0 if successful, -1 otherwise.
+*/
+
+STATIC int doed()
+
+{
+  DBUG_ENTER("doed");
+  this_op = nxtbyt();
+  if (exmstr(strtb2, sizeof(strtb2) / sizeof(struct codestring)) == 0)
+    DBUG_RETURN(0);
+  if (this_op < 0x40 || this_op >= 0x80)
+    DBUG_RETURN(-1);
+  switch (this_op & 0xf) {
+    case 0: case 8: /* IN r,(C) */
+      if (this_op == 0x70)
+	DBUG_RETURN(-1);
+      outrs3("IN ");
+      sout(",(C)");
+      DBUG_RETURN(0);
+    case 1: case 9: /* OUT (C),r */
+      if (this_op == 0x71)
+	DBUG_RETURN(-1);
+      outrs3("OUT (C),");
+      DBUG_RETURN(0);
+    case 2: /* SBC HL,rp */
+      outrp4("SBC HL,");
+      DBUG_RETURN(0);
+    case 3: /* LD (addr),rp */
+      sout("LD ");
+      doadrp();
+      outrp4(",");
+      DBUG_RETURN(0);
+    case 0xa: /* ADC HL,rp */
+      outrp4("ADC HL,");
+      DBUG_RETURN(0);
+    case 0xb: /* LD rp,(addr) */
+      outrp4("LD ");
+      outchr(',');
+      doadrp();
+      DBUG_RETURN(0);
+    default:
+      break;
+    }
+  DBUG_RETURN(-1);
+}
+/*SUBTTL Handle CB op codes - shifts */
+/*
+** int shifts()
+**
+**  Handle shift instructions.
+**
+** Parameters:
+**  None.
+**
+** Returns:
+**  0 if the instruction is valid, -1 otherwise.
+*/
+
+STATIC int shifts()
+
+{
+  int k;
+
+  DBUG_ENTER("shifts");
+  this_op = ixiyop ? *(dis_addr + 1) : nxtbyt();
+  if (this_op < 0x40) {
+    k = (this_op >> 3) & 0x7;
+    if (k == 6)
+      DBUG_RETURN(-1);
+    sout(shfttb[k]);
+    outrs0();
+    if (ixiyop)
+      nxtbyt();
+    DBUG_RETURN(0);
+  }
+  if (this_op < 0x80)
+    sout("BIT ");
+  else if (this_op < 0xc0)
+    sout("RES ");
+  else
+    sout("SET ");
+    
+  k = (this_op >> 3) & 7;
+  outchr('0' + k);
+  outchr(',');
+  outrs0();
+  if (ixiyop)
+    nxtbyt();
+  DBUG_RETURN(0);
+}
+/*SUBTTL exmtbl & exmstr - see if op code found in table */
+/*
+** int exmtbl(s, n)
+**
+**  See of this_op is found in the op code table pointed at by s.
+**
+** Parameters:
+**  s = points to table of op codes.
+**  n = number of entries in the table.
+**  
+**  this_op = op code to seek.
+**
+** Returns:
+**  0 if found, -1 otherwise.
+*/
+
+STATIC int exmtbl(s, n)
+
+register unsigned char *s;
+register int n;
+
+{
+  register unsigned char c;
+
+  DBUG_ENTER("exmtbl");
+  for (c = this_op; n--; )
+    if (*s++ == c)
+      DBUG_RETURN(0);
+  DBUG_RETURN(-1);
+}
+/*PAGE*/
+/*
+** int exmstr(ptr, n)
+**
+**  Look for this_op in a table of op code & strings. If the op code is
+**  found, display the associated string.
+**
+** Parameters:
+**  ptr = points to the op code/string table.
+**  n = number of entries in the table.
+**
+**  this_op = op code to seek.
+**
+** Returns:
+**  0 if successful, -1 otherwise.
+*/
+
+STATIC int exmstr(ptr, n)
+
+register struct codestring *ptr;
+register int n;
+
+{
+  register short c;
+
+  DBUG_ENTER("exmstr");
+  for (c = this_op; n--; ptr++)
+    if (ptr->simplecode == c) {
+      sout(ptr->simplestring);
+      DBUG_RETURN(0);
+    }
+  DBUG_RETURN(-1);
+}
+/*SUBTTL String-oriented subroutines */
+/*
+** outchr(c)
+**
+**  Display the character in c, making sure that there are always
+**  5 characters before the operand.
+**
+** Parameters:
+**  c = character to display.
+**
+** Returns;
+**  Nothing.
+*/
+
+STATIC void outchr(c)
+
+{
+  count--;
+  if (c != ' ') {
+    *outptr++ = c;
+    return;
+  }
+
+  while (count-- > 0)
+    *outptr++ = ' ';
+  *outptr++ = ' ';
+}
+/*PAGE*/
+/*
+** void hex1(k)
+**
+**  Display a value as one hex digit.
+**
+** Parameters:
+**  k = value to convert to hex.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void hex1(k)
+
+int k;
+
+{
+  k &= 0xf;
+  if (k < 10)
+    outchr('0' + k);
+  else
+    outchr('A' + k - 10);
+}
+
+/*
+** void hex2(k)
+**
+**  Display a value as 2 hex digits.
+**
+** Parameters:
+**  k = value to display.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void hex2(k)
+
+int k;
+
+{
+  hex1(k >> 4);
+  hex1(k);
+}
+/*PAGE*/
+/*
+** void outrs0()
+**
+**  Output the name of a register using the last 3 bits of this_op.
+**
+** Parameters:
+**
+**  this_op = current op code.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void outrs0()
+
+{
+  outr(this_op & 0x7);
+}
+
+/*
+** void outrs3(s)
+**
+**  Display the name of a register using bits 2-4 of this_op.
+**
+** Parameters:
+**  s = points to string to display first.
+**
+**  this_op = current op code.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void outrs3(s)
+
+char *s;
+
+{
+  sout(s);
+  outr((this_op >> 3) & 0x7);
+}
+/*PAGE*/
+/*
+** void outr(k)
+**
+**  Display a register based on an index.
+**
+** Parameters:
+**  k = register's index.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void outr(k)
+
+int k;
+
+{
+  int offset;
+
+  if (k == 6 && ixiyop) {
+    /* It's (IX+d) or (IY+d) */
+    sout("(I");
+    outchr(ixiyop);
+    offset = (char) nxtbyt();
+    if (offset < 0) {
+      outchr('-');
+      offset = -offset;
+    }
+    else
+      outchr('+');
+    hex2(offset);
+    outchr(')');
+    return;
+  }
+  sout(rtbl[k]);
+}
+/*PAGE*/
+/*
+** void sout(s)
+**
+**  Display a string.
+**
+** Parameters:
+**  s = points to string to display.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void sout(s)
+
+register char *s;
+
+{
+  while (*s)
+    outchr(*s++);
+}
+
+/*
+** int outrpc()
+**
+**  Compute register pair index and handle IX/IY if necessary.
+**
+** Parameters:
+**
+**  this_op = current op code.
+**
+** Returns:
+**  -1 if an IX/IY register pair was displayed, 0 otherwise.
+*/
+
+STATIC int outrpc()
+
+{
+  int k;
+
+  DBUG_ENTER("outrpc");
+  k = (this_op >> 4) & 0x3;
+  if (k != 2 || ixiyop == '\0')
+    DBUG_RETURN(0);
+  doixiy();
+  DBUG_RETURN(-1);
+}
+/*PAGE*/
+/*
+** void doixiy()
+**
+**  Display IX or IY.
+**
+** Parameters:
+**
+**  ixiyop = 'X' or 'Y'.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void doixiy()
+
+{
+  outchr('I');
+  outchr(ixiyop);
+}
+
+/*
+** void outrp4(s)
+**
+**  Output a register pair name. Bits 2-3 of this_op contain the index.
+**
+** Parameters:
+**  s = points to string to display first.
+**
+**  this_op = current op code.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void outrp4(s)
+
+char *s;
+
+{
+  DBUG_ENTER("outrp4");
+  sout(s);
+  if (outrpc())
+    DBUG_VOID_RETURN;
+  sout(rptbl[(this_op >> 4) & 0x3]);
+}
+/*PAGE*/
+/*
+** void outrpa(s)
+**
+**  Output a register pair name. Bits 2-3 of this_op contain the index.
+**  (This is like outrp4 except register pair SP is replaced with AF.
+**
+** Parameters:
+**  s = points to string to display first.
+**
+**  this_op = current op code.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void outrpa(s)
+
+char *s;
+
+{
+  DBUG_ENTER("outrpa");
+  sout(s);
+  if (outrpc())
+    DBUG_VOID_RETURN;
+  sout(rptbla[(this_op >> 4) & 0x3]);
+}
+/*PAGE*/
+/*
+** void doaddr()
+**
+**  Display the address pointed at by dis_addr.
+**
+** Parameters:
+**
+**  dis_addr = points to first byte of address.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void doaddr()
+
+{
+  unsigned short addr;
+
+  addr = nxtbyt();
+  addr |= ((nxtbyt() << 8) & 0xff00);
+  hex2(addr >> 8);
+  hex2(addr);
+  labeladdr = addr;
+}
+
+/*
+** void donpar()
+**
+**  Display the next byte in hex surrounded by parentheses.
+**
+** Parameters:
+**
+**  dis_addr = points to the byte to fetch.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void donpar()
+
+{
+  outchr('(');
+  hex2((int) nxtbyt());
+  outchr(')');
+}
+/*PAGE*/
+/*
+** void doadrp()
+**
+**  Display the address pointed at by dis_addr surrounded by parentheses.
+**
+** Parameters:
+**
+**  dis_addr = points to first byte of address.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void doadrp()
+
+{
+  outchr('(');
+  doaddr();
+  outchr(')');
+}
+/*SUBTTL nxtbyt - get next byte to examine */
+/*
+** unsigned char nxtbyt()
+**
+**  Return the next byte of the instruction and advance pointers and
+**  counters.
+**
+** Parameters:
+**
+**  dis_addr = points to the next byte to fetch.
+**  instr_len = current instruction length.
+**  curaddr = address of the current byte.
+**
+** Returns:
+**  The next byte.
+**
+** Side effects:
+**  dis_addr, instr_len, and curaddr are advanced.
+*/
+
+STATIC unsigned char nxtbyt()
+
+{
+  DBUG_ENTER("nxtbyt");
+  curaddr++;
+  instr_len++;
+  DBUG_3("nxtbyt", "returning %x", *dis_addr);
+  DBUG_RETURN(*dis_addr++);
+}
+/*SUBTTL badop - handle unknown instruction */
+/*
+** void badop()
+**
+**  Replace whatever was being worked on with generic bad operand info.
+**
+** Parameters:
+**  None.
+**
+** Returns:
+**  Nothing.
+*/
+
+STATIC void badop()
+
+{
+  outptr = org_buf;
+  sout("??");
+  labeladdr = -1;
+  instr_len = 1;
+}
+@//E*O*F z80dis.c//
+chmod u=rw,g=rw,o=rw z80dis.c
+ 
+exit 0
+-- 
+
+Duane Morse	...!noao!{terak|mot}!anasazi!duane
+(602) 870-3330
+
+

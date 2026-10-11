@@ -1,0 +1,2645 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 162299,48f7f181df756352,start
+X-Google-Attributes: gid162299,public
+X-Google-ArrivalTime: 1985-04-09 17:12:39 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83 (MC840302); site mcvax.UUCP
+Path: utzoo!linus!philabs!cmcl2!seismo!mcvax!aeb
+From: aeb@mcvax.UUCP (Andries Brouwer)
+Newsgroups: net.sources.games
+Subject: Hack 1.0.2 - part 6 of 10
+Message-ID: <586@mcvax.UUCP>
+Date: Tue, 9-Apr-85 20:12:39 EST
+Article-I.D.: mcvax.586
+Posted: Tue Apr  9 20:12:39 1985
+Date-Received: Fri, 12-Apr-85 05:38:35 EST
+Reply-To: aeb@mcvax.UUCP (Andries Brouwer)
+Followup-To: net.games.hack
+Organization: CWI, Amsterdam
+Lines: 2623
+
+
+# This is a shell archive.  Remove anything before this line, then
+# unpack it by saving it in a file and typing "sh file".  (Files
+# unpacked will be owned by you and have default permissions.)
+#
+# This archive contains:
+# hack.main.c hack.mkmaze.c hack.mkshop.c hack.o_init.c hack.objnam.c
+# hack.options.c hack.pager.c hack.potion.c
+
+echo x - hack.main.c
+cat > "hack.main.c" << '//E*O*F hack.main.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.main.c - version 1.0.2 */
+
+#include <stdio.h>
+#include <signal.h>
+#include <errno.h>
+#include "hack.h"
+
+extern char *getlogin(), *getenv();
+extern char plname[PL_NSIZ], pl_character[PL_CSIZ];
+
+int (*afternmv)();
+int (*occupation)();
+char *occtxt;			/* defined when occupation != NULL */
+
+int done1();
+int hangup();
+
+char safelock[] = "safelock";
+int hackpid;				/* current pid */
+xchar locknum;				/* max num of players */
+#ifdef DEF_PAGER
+char *catmore;				/* default pager */
+#endif DEF_PAGER
+char SAVEF[PL_NSIZ + 10] = "save/";	/* save/99999player */
+char perm[] = "perm";
+char *hname;		/* name of the game (argv[0] of call) */
+char obuf[BUFSIZ];	/* BUFSIZ is defined in stdio.h */
+
+extern char *nomovemsg;
+extern long wailmsg;
+
+main(argc,argv)
+int argc;
+char *argv[];
+{
+	register int fd;
+#ifdef CHDIR
+	register char *dir;
+#endif CHDIR
+
+	hname = argv[0];
+	hackpid = getpid();
+
+#ifdef CHDIR			/* otherwise no chdir() */
+	/*
+	 * See if we must change directory to the playground.
+	 * (Perhaps hack runs suid and playground is inaccessible
+	 *  for the player.)
+	 * The environment variable HACKDIR is overridden by a
+	 *  -d command line option (must be the first option given)
+	 */
+
+	dir = getenv("HACKDIR");
+	if(argc > 1 && !strncmp(argv[1], "-d", 2)) {
+		argc--;
+		argv++;
+		dir = argv[0]+2;
+		if(*dir == '=' || *dir == ':') dir++;
+		if(!*dir && argc > 1) {
+			argc--;
+			argv++;
+			dir = argv[0];
+		}
+		if(!*dir)
+		    error("Flag -d must be followed by a directory name.");
+	}
+#endif CHDIR
+
+	/*
+	 * Who am i? Algorithm: 1. Use name as specified in HACKOPTIONS
+	 *			2. Use $USER or $LOGNAME	(if 1. fails)
+	 *			3. Use getlogin()		(if 2. fails)
+	 * The resulting name is overridden by command line options.
+	 * If everything fails, or if the resulting name is some generic
+	 * account like "games", "play", "player", "hack" then eventually
+	 * we'll ask him.
+	 * Note that we trust him here; it is possible to play under
+	 * somebody else's name.
+	 */
+	{ register char *s;
+
+	  initoptions();
+	  if(!*plname && (s = getenv("USER")))
+		(void) strncpy(plname, s, sizeof(plname)-1);
+	  if(!*plname && (s = getenv("LOGNAME")))
+		(void) strncpy(plname, s, sizeof(plname)-1);
+	  if(!*plname && (s = getlogin()))
+		(void) strncpy(plname, s, sizeof(plname)-1);
+	}
+
+	/*
+	 * Now we know the directory containing 'record' and
+	 * may do a prscore().
+	 */
+	if(argc > 1 && !strncmp(argv[1], "-s", 2)) {
+#ifdef CHDIR
+		chdirx(dir,0);
+#endif CHDIR
+		prscore(argc, argv);
+		exit(0);
+	}
+
+	/*
+	 * It seems he really wants to play.
+	 * Remember tty modes, to be restored on exit.
+	 */
+	gettty();
+	setbuf(stdout,obuf);
+	setrandom();
+	startup();
+	cls();
+	(void) signal(SIGHUP, hangup);
+
+	/*
+	 * Find the creation date of this game,
+	 * so as to avoid restoring outdated savefiles.
+	 */
+	gethdate(hname);
+
+	/*
+	 * We cannot do chdir earlier, otherwise gethdate will fail.
+	 */
+#ifdef CHDIR
+	chdirx(dir,1);
+#endif CHDIR
+
+	/*
+	 * Process options.
+	 */
+	while(argc > 1 && argv[1][0] == '-'){
+		argv++;
+		argc--;
+		switch(argv[0][1]){
+#ifdef WIZARD
+		case 'D':
+			if(!strcmp(getlogin(), WIZARD))
+				wizard = TRUE;
+			else
+				printf("Sorry.\n");
+			break;
+#endif WIZARD
+#ifdef NEWS
+		case 'n':
+			flags.nonews = TRUE;
+			break;
+#endif NEWS
+		case 'u':
+			if(argv[0][2])
+			  (void) strncpy(plname, argv[0]+2, sizeof(plname)-1);
+			else if(argc > 1) {
+			  argc--;
+			  argv++;
+			  (void) strncpy(plname, argv[0], sizeof(plname)-1);
+			} else
+				printf("Player name expected after -u\n");
+			break;
+		default:
+			/* allow -T for Tourist, etc. */
+			(void) strncpy(pl_character, argv[0]+1,
+				sizeof(pl_character)-1);
+
+			/* printf("Unknown option: %s\n", *argv); */
+		}
+	}
+
+	if(argc > 1)
+		locknum = atoi(argv[1]);
+#ifdef MAX_NR_OF_PLAYERS
+	if(!locknum || locknum > MAX_NR_OF_PLAYERS)
+		locknum = MAX_NR_OF_PLAYERS;
+#endif MAX_NR_OF_PLAYERS
+#ifdef DEF_PAGER
+	if(!(catmore = getenv("HACKPAGER")) && !(catmore = getenv("PAGER")))
+		catmore = DEF_PAGER;
+#endif DEF_PAGER
+#ifdef MAIL
+	getmailstatus();
+#endif MAIL
+#ifdef WIZARD
+	if(wizard) (void) strcpy(plname, "wizard"); else
+#endif WIZARD
+	if(!*plname || !strncmp(plname, "player", 4)
+		    || !strncmp(plname, "games", 4))
+		askname();
+	plnamesuffix();		/* strip suffix from name; calls askname() */
+				/* again if suffix was whole name */
+				/* accepts any suffix */
+#ifdef WIZARD
+	if(!wizard) {
+#endif WIZARD
+		/*
+		 * check for multiple games under the same name
+		 * (if !locknum) or check max nr of players (otherwise)
+		 */
+		(void) signal(SIGQUIT,SIG_IGN);
+		(void) signal(SIGINT,SIG_IGN);
+		if(!locknum)
+			(void) strcpy(lock,plname);
+		lockcheck();	/* sets lock if locknum != 0 */
+#ifdef WIZARD
+	} else {
+		register char *sfoo;
+		(void) strcpy(lock,plname);
+		if(sfoo = getenv("MAGIC"))
+			while(*sfoo) {
+				switch(*sfoo++) {
+				case 'n': (void) srand(*sfoo++);
+					break;
+				}
+			}
+		if(sfoo = getenv("GENOCIDED")){
+			if(*sfoo == '!'){
+				extern struct permonst mons[CMNUM+2];
+				extern char genocided[], fut_geno[];
+				register struct permonst *pm = mons;
+				register char *gp = genocided;
+
+				while(pm < mons+CMNUM+2){
+					if(!index(sfoo, pm->mlet))
+						*gp++ = pm->mlet;
+					pm++;
+				}
+				*gp = 0;
+			} else
+				(void) strcpy(genocided, sfoo);
+			(void) strcpy(fut_geno, genocided);
+		}
+	}
+#endif WIZARD
+	setftty();
+	u.uhp = 1;	/* prevent RIP on early quits */
+	u.ux = FAR;	/* prevent nscr() */
+	(void) sprintf(SAVEF, "save/%5d%s", getuid(), plname);
+	if((fd = open(SAVEF,0)) >= 0 &&
+	   (uptodate(fd) || unlink(SAVEF) == 666)) {
+		(void) signal(SIGINT,done1);
+		puts("Restoring old save file...");
+		(void) fflush(stdout);
+		if(!dorecover(fd))
+			goto not_recovered;
+		flags.move = 0;
+	} else {
+not_recovered:
+		fobj = fcobj = invent = 0;
+		fmon = fallen_down = 0;
+		ftrap = 0;
+		fgold = 0;
+		flags.ident = 1;
+		init_objects();
+		u_init();
+
+		(void) signal(SIGINT,done1);
+		mklev();
+		u.ux = xupstair;
+		u.uy = yupstair;
+		(void) inshop();
+		setsee();
+		flags.botlx = 1;
+		makedog();
+		{ register struct monst *mtmp;
+		  if(mtmp = m_at(u.ux, u.uy)) mnexto(mtmp);	/* riv05!a3 */
+		}
+		seemons();
+#ifdef NEWS
+		if(flags.nonews || !readnews())
+			/* after reading news we did docrt() already */
+#endif NEWS
+			docrt();
+		pickup(1);
+		read_engr_at(u.ux,u.uy);
+		flags.move = 1;
+	}
+
+#ifdef QUEST
+	pline("Hello %s, welcome to quest!", plname);
+#else
+	pline("Hello %s, welcome to hack!", plname);
+#endif QUEST
+	flags.moonphase = phase_of_the_moon();
+	if(flags.moonphase == FULL_MOON) {
+		pline("You are lucky! Full moon tonight.");
+		u.uluck++;
+	} else if(flags.moonphase == NEW_MOON) {
+		pline("Be careful! New moon tonight.");
+	}
+
+	initrack();
+
+	for(;;) {
+		if(flags.move) {	/* actual time passed */
+
+			settrack();
+
+			if(moves%2 == 0 ||
+			  (!(Fast & ~INTRINSIC) && (!Fast || rn2(3)))) {
+				extern struct monst *makemon();
+				movemon();
+				if(!rn2(70))
+				    (void) makemon((struct permonst *)0, 0, 0);
+			}
+			if(Glib) glibr();
+			timeout();
+			++moves;
+			if(flags.time) flags.botl = 1;
+			if(u.uhp < 1) {
+				pline("You die...");
+				done("died");
+			}
+			if(u.uhp*10 < u.uhpmax && moves-wailmsg > 50){
+			    wailmsg = moves;
+			    if(u.uhp == 1)
+			    pline("You hear the wailing of the Banshee...");
+			    else
+			    pline("You hear the howling of the CwnAnnwn...");
+			}
+			if(u.uhp < u.uhpmax) {
+				if(u.ulevel > 9) {
+					if(Regeneration || !(moves%3)) {
+					    flags.botl = 1;
+					    u.uhp += rnd((int) u.ulevel-9);
+					    if(u.uhp > u.uhpmax)
+						u.uhp = u.uhpmax;
+					}
+				} else if(Regeneration ||
+					(!(moves%(22-u.ulevel*2)))) {
+					flags.botl = 1;
+					u.uhp++;
+				}
+			}
+			if(Teleportation && !rn2(85)) tele();
+			if(Searching && multi >= 0) (void) dosearch();
+			gethungry();
+			invault();
+			amulet();
+		}
+		if(multi < 0) {
+			if(!++multi){
+				pline(nomovemsg ? nomovemsg :
+					"You can move again.");
+				nomovemsg = 0;
+				if(afternmv) (*afternmv)();
+				afternmv = 0;
+			}
+		}
+
+		find_ac();
+#ifndef QUEST
+		if(!flags.mv || Blind)
+#endif QUEST
+		{
+			seeobjs();
+			seemons();
+			nscr();
+		}
+		if(flags.botl || flags.botlx) bot();
+
+		flags.move = 1;
+
+		if(multi >= 0 && occupation) {
+			if(monster_nearby())
+				stop_occupation();
+			else if ((*occupation)() == 0)
+				occupation = 0;
+			continue;
+		}
+
+		if(multi > 0) {
+#ifdef QUEST
+			if(flags.run >= 4) finddir();
+#endif QUEST
+			lookaround();
+			if(!multi) {	/* lookaround may clear multi */
+				flags.move = 0;
+				continue;
+			}
+			if(flags.mv) {
+				if(multi < COLNO && !--multi)
+					flags.mv = flags.run = 0;
+				domove();
+			} else {
+				--multi;
+				rhack(save_cm);
+			}
+		} else if(multi == 0) {
+#ifdef MAIL
+			ckmailstatus();
+#endif MAIL
+			rhack((char *) 0);
+		}
+		if(multi && multi%7 == 0)
+			(void) fflush(stdout);
+	}
+}
+
+lockcheck()
+{
+	extern int errno;
+	register int i = 0, fd;
+
+	/* we ignore QUIT and INT at this point */
+	if (link(perm, safelock) == -1) {
+		perror("safelock");
+		error("Cannot link safelock. (Try again or rm safelock.)");
+	}
+
+	if(locknum > 25) locknum = 25;
+
+	do {
+		if(locknum) lock[0] = 'a' + i++;
+
+		if((fd = open(lock, 0)) == -1) {
+			if(errno == ENOENT) goto gotlock;    /* no such file */
+			(void) unlink(safelock);
+			perror(lock);
+			error("Cannot open %s", lock);
+		}
+		if(veryold(fd))		/* this closes fd and unlinks lock */
+			goto gotlock;
+		(void) close(fd);
+	} while(i < locknum);
+
+	(void) unlink(safelock);
+	error(locknum ? "Too many hacks running now."
+		      : "There is a game in progress under your name.");
+gotlock:
+	fd = creat(lock, FMASK);
+	if(unlink(safelock) == -1)
+		error("Cannot unlink safelock.");
+	if(fd == -1) {
+		error("cannot creat lock file.");
+	} else {
+		if(write(fd, (char *) &hackpid, sizeof(hackpid))
+		    != sizeof(hackpid)){
+			error("cannot write lock");
+		}
+		if(close(fd) == -1) {
+			error("cannot close lock");
+		}
+	}
+}
+
+glo(foo)
+register foo;
+{
+	/* construct the string  xlock.n  */
+	register char *tf;
+
+	tf = lock;
+	while(*tf && *tf!='.') tf++;
+	if(foo)
+		(void) sprintf(tf, ".%d", foo);
+	else
+		*tf = 0;
+}
+
+/*
+ * plname is filled either by an option (-u Player  or  -uPlayer) or
+ * explicitly (-w implies wizard) or by askname.
+ * It may still contain a suffix denoting pl_character.
+ */
+askname(){
+register int c,ct;
+	printf("\nWho are you? ");
+	ct = 0;
+	while((c = getchar()) != '\n'){
+		if(c == EOF) error("End of input\n");
+		/* some people get confused when their erase char is not ^H */
+		if(c == '\010') {
+			if(ct) ct--;
+			continue;
+		}
+		if(c != '-')
+		if(c < 'A' || (c > 'Z' && c < 'a') || c > 'z') c = '_';
+		if(ct < sizeof(plname)-1) plname[ct++] = c;
+	}
+	plname[ct] = 0;
+	if(ct == 0) askname();
+}
+
+/*VARARGS1*/
+impossible(s,x1,x2)
+register char *s;
+{
+	pline(s,x1,x2);
+	pline("Program in disorder - perhaps you'd better Quit");
+}
+
+#ifdef CHDIR
+static
+chdirx(dir, wr)
+char *dir;
+boolean wr;
+{
+
+#ifdef SECURE
+	if(dir					/* User specified directory? */
+#ifdef HACKDIR
+	       && strcmp(dir, HACKDIR)		/* and not the default? */
+#endif HACKDIR
+		) {
+		(void) setuid(getuid());		/* Ron Wessels */
+		(void) setgid(getgid());
+	}
+#endif SECURE
+
+#ifdef HACKDIR
+	if(dir == NULL)
+		dir = HACKDIR;
+#endif HACKDIR
+
+	if(dir && chdir(dir) < 0) {
+		perror(dir);
+		error("Cannot chdir to %s.", dir);
+	}
+
+	/* warn the player if he cannot write the record file */
+	/* perhaps we should also test whether . is writable */
+	/* unfortunately the access systemcall is worthless */
+	if(wr) {
+	    register fd;
+
+	    if(dir == NULL)
+		dir = ".";
+	    if((fd = open(RECORD, 2)) < 0) {
+		printf("Warning: cannot write %s/%s", dir, RECORD);
+		getret();
+	    } else
+		(void) close(fd);
+	}
+}
+#endif CHDIR
+
+stop_occupation()
+{
+	if(occupation) {
+		pline("You stop %s.", occtxt);
+		occupation = 0;
+	}
+}
+//E*O*F hack.main.c//
+
+echo x - hack.mkmaze.c
+cat > "hack.mkmaze.c" << '//E*O*F hack.mkmaze.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.mkmaze.c - version 1.0.2 */
+
+#include "hack.h"
+#include "def.mkroom.h"		/* not really used */
+extern struct monst *makemon();
+extern struct permonst pm_wizard;
+extern struct obj *mkobj_at();
+extern coord mazexy();
+struct permonst hell_hound =
+	{ "hell hound", 'd', 12, 14, 2, 3, 6, 0 };
+
+makemaz()
+{
+	int x,y;
+	register zx,zy;
+	coord mm;
+	boolean al = (dlevel >= 30 && !flags.made_amulet);
+
+	for(x = 2; x < COLNO-1; x++)
+		for(y = 2; y < ROWNO-1; y++)
+			levl[x][y].typ = (x%2 && y%2) ? 0 : HWALL;
+	if(al) {
+	    register struct monst *mtmp;
+
+	    zx = 2*(COLNO/4) - 1;
+	    zy = 2*(ROWNO/4) - 1;
+	    for(x = zx-2; x < zx+4; x++) for(y = zy-2; y <= zy+2; y++) {
+		levl[x][y].typ =
+		    (y == zy-2 || y == zy+2 || x == zx-2 || x == zx+3) ? POOL :
+		    (y == zy-1 || y == zy+1 || x == zx-1 || x == zx+2) ? HWALL:
+		    ROOM;
+	    }
+	    (void) mkobj_at(AMULET_SYM, zx, zy);
+	    flags.made_amulet = 1;
+	    walkfrom(zx+4, zy);
+	    if(mtmp = makemon(&hell_hound, zx, zy))
+		mtmp->msleep = 1;
+	    if(mtmp = makemon(PM_WIZARD, zx+1, zy)) {
+		mtmp->msleep = 1;
+		flags.no_of_wizards = 1;
+	    }
+	} else {
+	    mm = mazexy();
+	    zx = mm.x;
+	    zy = mm.y;
+	    walkfrom(zx,zy);
+	    (void) mksobj_at(WAN_WISHING, zx, zy);
+	    (void) mkobj_at(ROCK_SYM, zx, zy);	/* put a rock on top of it */
+	}
+
+	for(x = 2; x < COLNO-1; x++)
+		for(y = 2; y < ROWNO-1; y++) {
+			switch(levl[x][y].typ) {
+			case HWALL:
+				levl[x][y].scrsym = '-';
+				break;
+			case ROOM:
+				levl[x][y].scrsym = '.';
+				break;
+			}
+		}
+	for(x = rn1(8,11); x; x--) {
+		mm = mazexy();
+		(void) mkobj_at(rn2(2) ? GEM_SYM : 0, mm.x, mm.y);
+	}
+	for(x = rn1(10,2); x; x--) {
+		mm = mazexy();
+		(void) mkobj_at(ROCK_SYM, mm.x, mm.y);
+	}
+	mm = mazexy();
+	(void) makemon(PM_MINOTAUR, mm.x, mm.y);
+	for(x = rn1(5,7); x; x--) {
+		mm = mazexy();
+		(void) makemon((struct permonst *) 0, mm.x, mm.y);
+	}
+	for(x = rn1(6,7); x; x--) {
+		mm = mazexy();
+		mkgold(0L,mm.x,mm.y);
+	}
+	for(x = rn1(6,7); x; x--)
+		mktrap(0,1,(struct mkroom *) 0);
+	mm = mazexy();
+	levl[(xupstair = mm.x)][(yupstair = mm.y)].scrsym = '<';
+	levl[xupstair][yupstair].typ = STAIRS;
+	xdnstair = ydnstair = 0;
+}
+
+walkfrom(x,y) int x,y; {
+register int q,a,dir;
+int dirs[4];
+	levl[x][y].typ = ROOM;
+	while(1) {
+		q = 0;
+		for(a = 0; a < 4; a++)
+			if(okay(x,y,a)) dirs[q++]= a;
+		if(!q) return;
+		dir = dirs[rn2(q)];
+		move(&x,&y,dir);
+		levl[x][y].typ = ROOM;
+		move(&x,&y,dir);
+		walkfrom(x,y);
+	}
+}
+
+move(x,y,dir)
+register int *x, *y;
+register int dir;
+{
+	switch(dir){
+		case 0: --(*y); break;
+		case 1: (*x)++; break;
+		case 2: (*y)++; break;
+		case 3: --(*x); break;
+	}
+}
+
+okay(x,y,dir)
+int x,y;
+register int dir;
+{
+	move(&x,&y,dir);
+	move(&x,&y,dir);
+	if(x<3 || y<3 || x>COLNO-3 || y>ROWNO-3 || levl[x][y].typ != 0)
+		return(0);
+	else
+		return(1);
+}
+
+coord
+mazexy(){
+	coord mm;
+	mm.x = 3 + 2*rn2(COLNO/2 - 2);
+	mm.y = 3 + 2*rn2(ROWNO/2 - 2);
+	return mm;
+}
+//E*O*F hack.mkmaze.c//
+
+echo x - hack.mkshop.c
+cat > "hack.mkshop.c" << '//E*O*F hack.mkshop.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.mkshop.c - version 1.0.2 */
+
+#ifndef QUEST
+#include "hack.h"
+#include "def.mkroom.h"
+#include "def.eshk.h"
+#define	ESHK	((struct eshk *)(&(shk->mextra[0])))
+extern struct monst *makemon();
+extern struct obj *mkobj_at();
+extern int nroom;
+extern char shtypes[];	/* = "=/)%?!["; 8 types: 7 specialized, 1 mixed */
+schar shprobs[] = { 3,3,5,5,10,10,14,50 };	/* their probabilities */
+
+mkshop(){
+register struct mkroom *sroom;
+register int sh,sx,sy,i = -1;
+register char let;
+int roomno;
+register struct monst *shk;
+#ifdef WIZARD
+	/* first determine shoptype */
+	if(wizard){
+		extern char *getenv();
+		register char *ep = getenv("SHOPTYPE");
+		if(ep){
+			if(*ep == 'z' || *ep == 'Z'){
+				mkzoo(ZOO);
+				return;
+			}
+			if(*ep == 'm' || *ep == 'M'){
+				mkzoo(MORGUE);
+				return;
+			}
+			if(*ep == 'b' || *ep == 'B'){
+				mkzoo(BEEHIVE);
+				return;
+			}
+			if(*ep == 's' || *ep == 'S'){
+				mkswamp();
+				return;
+			}
+			for(i=0; shtypes[i]; i++)
+				if(*ep == shtypes[i]) break;
+			goto gottype;
+		}
+	}
+gottype:
+#endif WIZARD
+	for(sroom = &rooms[0], roomno = 0; ; sroom++, roomno++){
+		if(sroom->hx < 0) return;
+		if(sroom - rooms >= nroom) {
+			pline("rooms not closed by -1?");
+			return;
+		}
+		if(sroom->rtype) continue;
+		if(!sroom->rlit || has_dnstairs(sroom) || has_upstairs(sroom))
+			continue;
+		if(
+#ifdef WIZARD
+		   (wizard && getenv("SHOPTYPE") && sroom->doorct != 0) ||
+#endif WIZARD
+			sroom->doorct == 1) break;
+	}
+
+	if(i < 0) {			/* shoptype not yet determined */
+	    register int j;
+
+	    for(j = rn2(100), i = 0; (j -= shprobs[i])>= 0; i++)
+		if(!shtypes[i]) break;			/* superfluous */
+	    if(isbig(sroom) && i + SHOPBASE == WANDSHOP)
+		i = GENERAL-SHOPBASE;
+	}
+	sroom->rtype = i + SHOPBASE;
+	let = shtypes[i];
+	sh = sroom->fdoor;
+	sx = doors[sh].x;
+	sy = doors[sh].y;
+	if(sx == sroom->lx-1) sx++; else
+	if(sx == sroom->hx+1) sx--; else
+	if(sy == sroom->ly-1) sy++; else
+	if(sy == sroom->hy+1) sy--; else {
+#ifdef WIZARD
+	    /* This is said to happen sometimes, but I've never seen it. */
+	    if(wizard) {
+		register int j = sroom->doorct;
+		extern int doorindex;
+
+		pline("Where is shopdoor?");
+		pline("Room at (%d,%d),(%d,%d)", sroom->lx, sroom->ly,
+			sroom->hx, sroom->hy);
+		pline("doormax=%d doorct=%d fdoor=%d",
+			doorindex, sroom->doorct, sh);
+		while(j--) {
+			pline("door [%d,%d]", doors[sh].x, doors[sh].y);
+			sh++;
+		}
+		more();
+	    }
+#endif WIZARD
+	    return;
+	}
+	if(!(shk = makemon(PM_SHK,sx,sy))) return;
+	shk->isshk = shk->mpeaceful = 1;
+	shk->msleep = 0;
+	shk->mtrapseen = ~0;	/* we know all the traps already */
+	ESHK->shoproom = roomno;
+	ESHK->shoplevel = dlevel;
+	ESHK->shd = doors[sh];
+	ESHK->shk.x = sx;
+	ESHK->shk.y = sy;
+	ESHK->robbed = 0;
+	ESHK->visitct = 0;
+	ESHK->following = 0;
+	shk->mgold = 1000 + 30*rnd(100);	/* initial capital */
+	ESHK->billct = 0;
+	findname(ESHK->shknam, let);
+	for(sx = sroom->lx; sx <= sroom->hx; sx++)
+	for(sy = sroom->ly; sy <= sroom->hy; sy++){
+		register struct monst *mtmp;
+		if((sx == sroom->lx && doors[sh].x == sx-1) ||
+		   (sx == sroom->hx && doors[sh].x == sx+1) ||
+		   (sy == sroom->ly && doors[sh].y == sy-1) ||
+		   (sy == sroom->hy && doors[sh].y == sy+1)) continue;
+		if(rn2(100) < dlevel && !m_at(sx,sy) &&
+		   (mtmp = makemon(PM_MIMIC, sx, sy))){
+			mtmp->mimic = 1;
+			mtmp->mappearance =
+			    (let && rn2(10) < dlevel) ? let : ']';
+			continue;
+		}
+		(void) mkobj_at(let, sx, sy);
+	}
+}
+
+mkzoo(type)
+int type;
+{
+	register struct mkroom *sroom;
+	register struct monst *mon;
+	register int sh,sx,sy,i;
+	int goldlim = 500 * dlevel;
+	int moct = 0;
+	struct permonst *morguemon();
+
+	i = nroom;
+	for(sroom = &rooms[rn2(nroom)]; ; sroom++) {
+		if(sroom == &rooms[nroom])
+			sroom = &rooms[0];
+		if(!i-- || sroom->hx < 0)
+			return;
+		if(sroom->rtype)
+			continue;
+		if(type == MORGUE && sroom->rlit)
+			continue;
+		if(has_upstairs(sroom) || (has_dnstairs(sroom) && rn2(3)))
+			continue;
+		if(sroom->doorct == 1 || !rn2(5))
+			break;
+	}
+	sroom->rtype = type;
+	sh = sroom->fdoor;
+	for(sx = sroom->lx; sx <= sroom->hx; sx++)
+	for(sy = sroom->ly; sy <= sroom->hy; sy++){
+		if((sx == sroom->lx && doors[sh].x == sx-1) ||
+		   (sx == sroom->hx && doors[sh].x == sx+1) ||
+		   (sy == sroom->ly && doors[sh].y == sy-1) ||
+		   (sy == sroom->hy && doors[sh].y == sy+1)) continue;
+		mon = makemon(
+		   (type == MORGUE) ? morguemon() :
+		   (type == BEEHIVE) ? PM_KILLER_BEE : (struct permonst *) 0,
+		   sx, sy);
+		if(mon) mon->msleep = 1;
+		switch(type) {
+		case ZOO:
+		   i = sq(dist2(sx,sy,doors[sh].x,doors[sh].y));
+		   if(i >= goldlim) i = 5*dlevel;
+		   goldlim -= i;
+		   mkgold((long)(10 + rn2(i)), sx, sy);
+		   break;
+		case MORGUE:
+		   /* Usually there is one dead body in the morgue */
+		   if(!moct && rn2(3)) {
+			mksobj_at(CORPSE, sx, sy);
+			moct++;
+		   }
+		   break;
+		case BEEHIVE:
+		   if(!rn2(3)) mksobj_at(LUMP_OF_ROYAL_JELLY, sx, sy);
+		   break;
+		}
+	}
+}
+
+struct permonst *
+morguemon()
+{
+	extern struct permonst pm_ghost;
+	register int i = rn2(100), hd = rn2(dlevel);
+
+	if(hd > 10 && i < 10) return(PM_DEMON);
+	if(hd > 8 && i > 85) return(PM_VAMPIRE);
+	return((i < 40) ? PM_GHOST : (i < 60) ? PM_WRAITH : PM_ZOMBIE);
+}
+
+mkswamp()	/* Michiel Huisjes & Fred de Wilde */
+{
+	register struct mkroom *sroom;
+	register int sx,sy,i,eelct = 0;
+	extern struct permonst pm_eel;
+
+	for(i=0; i<5; i++) {		/* 5 tries */
+		sroom = &rooms[rn2(nroom)];
+		if(sroom->hx < 0 || sroom->rtype ||
+		   has_upstairs(sroom) || has_dnstairs(sroom))
+			continue;
+
+		/* satisfied; make a swamp */
+		sroom->rtype = SWAMP;
+		for(sx = sroom->lx; sx <= sroom->hx; sx++)
+		for(sy = sroom->ly; sy <= sroom->hy; sy++)
+		if((sx+sy)%2 && !o_at(sx,sy) && !t_at(sx,sy)
+			     && !m_at(sx,sy) && !nexttodoor(sx,sy)){
+			levl[sx][sy].typ = POOL;
+			levl[sx][sy].scrsym = POOL_SYM;
+			if(!eelct || !rn2(4)) {
+				(void) makemon(PM_EEL, sx, sy);
+				eelct++;
+			}
+		}
+	}
+}
+
+nexttodoor(sx,sy)
+register sx,sy;
+{
+	register dx,dy;
+	register struct rm *lev;
+	for(dx = -1; dx <= 1; dx++) for(dy = -1; dy <= 1; dy++)
+		if((lev = &levl[sx+dx][sy+dy])->typ == DOOR ||
+		    lev->typ == SDOOR || lev->typ == LDOOR)
+			return(1);
+	return(0);
+}
+
+has_dnstairs(sroom)
+register struct mkroom *sroom;
+{
+	return(sroom->lx <= xdnstair && xdnstair <= sroom->hx &&
+		   sroom->ly <= ydnstair && ydnstair <= sroom->hy);
+}
+
+has_upstairs(sroom)
+register struct mkroom *sroom;
+{
+	return(sroom->lx <= xupstair && xupstair <= sroom->hx &&
+		   sroom->ly <= yupstair && yupstair <= sroom->hy);
+}
+
+isbig(sroom)
+register struct mkroom *sroom;
+{
+	register int area = (sroom->hx - sroom->lx) * (sroom->hy - sroom->ly);
+	return( area > 20 );
+}
+
+dist2(x0,y0,x1,y1){
+	return((x0-x1)*(x0-x1) + (y0-y1)*(y0-y1));
+}
+
+sq(a) int a; {
+	return(a*a);
+}
+#endif QUEST
+//E*O*F hack.mkshop.c//
+
+echo x - hack.o_init.c
+cat > "hack.o_init.c" << '//E*O*F hack.o_init.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.o_init.c - version 1.0.2 */
+
+#include	"config.h"		/* for typedefs */
+#include	"def.objects.h"
+#include	"hack.onames.h"		/* for LAST_GEM */
+extern char *index();
+
+int
+letindex(let) register char let; {
+register int i = 0;
+register char ch;
+	while((ch = obj_symbols[i++]) != 0)
+		if(ch == let) return(i);
+	return(0);
+}
+
+init_objects(){
+register int i, j, first, last, sum, end;
+register char let, *tmp;
+	/* init base; if probs given check that they add up to 100, 
+	   otherwise compute probs; shuffle descriptions */
+	end = SIZE(objects);
+	first = 0;
+	while( first < end ) {
+		let = objects[first].oc_olet;
+		last = first+1;
+		while(last < end && objects[last].oc_olet == let
+				&& objects[last].oc_name != NULL)
+			last++;
+		i = letindex(let);
+		if((!i && let != ILLOBJ_SYM) || bases[i] != 0)
+			error("initialization error");
+		bases[i] = first;
+	check:
+		if(let == GEM_SYM) {
+			extern xchar dlevel;
+			for(j=0; j < 9-dlevel/3; j++)
+				objects[first+j].oc_prob = 0;
+			first += j;
+			if(first >= last || first >= LAST_GEM)
+	printf("Not enough gems? - first=%d last=%d j=%d LAST_GEM=%d\n",
+				first, last, j, LAST_GEM);
+			for(j = first; j < LAST_GEM; j++)
+			    objects[j].oc_prob = (20+j-first)/(LAST_GEM-first);
+		}
+
+		sum = 0;
+		for(j = first; j < last; j++) sum += objects[j].oc_prob;
+		if(sum == 0) {
+			for(j = first; j < last; j++)
+			    objects[j].oc_prob = (100+j-first)/(last-first);
+			goto check;
+		}
+		if(sum != 100)
+			error("init-prob error for %c", let);
+
+		if(objects[first].oc_descr != NULL && let != TOOL_SYM){
+			/* shuffle, also some additional descriptions */
+			while(last < end && objects[last].oc_olet == let)
+				last++;
+			j = last;
+			while(--j > first) {
+				i = first + rn2(j+1-first);
+				tmp = objects[j].oc_descr;
+				objects[j].oc_descr = objects[i].oc_descr;
+				objects[i].oc_descr = tmp;
+			}
+		}
+		first = last;
+	}
+}
+
+probtype(let) register char let; {
+register int i = bases[letindex(let)];
+register int prob = rn2(100);
+	while((prob -= objects[i].oc_prob) >= 0) i++;
+	if(objects[i].oc_olet != let || !objects[i].oc_name)
+		panic("probtype(%c) error, i=%d", let, i);
+	return(i);
+}
+
+extern long *alloc();
+
+savenames(fd) register fd; {
+register int i;
+unsigned len;
+	bwrite(fd, (char *) bases, sizeof bases);
+	bwrite(fd, (char *) objects, sizeof objects);
+	/* as long as we use only one version of Hack/Quest we
+	   need not save oc_name and oc_descr, but we must save
+	   oc_uname for all objects */
+	for(i=0; i < SIZE(objects); i++) {
+		if(objects[i].oc_uname) {
+			len = strlen(objects[i].oc_uname)+1;
+			bwrite(fd, (char *) &len, sizeof len);
+			bwrite(fd, objects[i].oc_uname, len);
+		}
+	}
+}
+
+restnames(fd) register fd; {
+register int i;
+unsigned len;
+	mread(fd, (char *) bases, sizeof bases);
+	mread(fd, (char *) objects, sizeof objects);
+	for(i=0; i < SIZE(objects); i++) if(objects[i].oc_uname) {
+		mread(fd, (char *) &len, sizeof len);
+		objects[i].oc_uname = (char *) alloc(len);
+		mread(fd, objects[i].oc_uname, len);
+	}
+}
+
+dodiscovered()				/* free after Robert Viduya */
+{
+    extern char *typename();
+    register int i, end;
+    int	ct = 0;
+
+    cornline(0, "Discoveries");
+
+    end = SIZE(objects);
+    for (i = 0; i < end; i++) {
+	if (interesting_to_discover (i)) {
+	    ct++;
+	    cornline(1, typename(i));
+	}
+    }
+    if (ct == 0) {
+	pline ("You haven't discovered anything yet...");
+	cornline(3, (char *) 0);
+    } else
+	cornline(2, (char *) 0);
+
+    return(0);
+}
+
+interesting_to_discover(i)
+register int i;
+{
+    return(
+	objects[i].oc_uname != NULL ||
+	 (objects[i].oc_name_known && objects[i].oc_descr != NULL)
+    );
+}
+//E*O*F hack.o_init.c//
+
+echo x - hack.objnam.c
+cat > "hack.objnam.c" << '//E*O*F hack.objnam.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.objnam.c - version 1.0.2 */
+
+#include	"hack.h"
+#define Sprintf (void) sprintf
+#define Strcat  (void) strcat
+#define	Strcpy	(void) strcpy
+#define	PREFIX	15
+extern char *eos();
+extern int bases[];
+
+char *
+strprepend(s,pref) register char *s, *pref; {
+register int i = strlen(pref);
+	if(i > PREFIX) {
+		pline("WARNING: prefix too short.");
+		return(s);
+	}
+	s -= i;
+	(void) strncpy(s, pref, i);	/* do not copy trailing 0 */
+	return(s);
+}
+
+char *
+sitoa(a) int a; {
+static char buf[13];
+	Sprintf(buf, (a < 0) ? "%d" : "+%d", a);
+	return(buf);
+}
+
+char *
+typename(otyp)
+register int otyp;
+{
+static char buf[BUFSZ];
+register struct objclass *ocl = &objects[otyp];
+register char *an = ocl->oc_name;
+register char *dn = ocl->oc_descr;
+register char *un = ocl->oc_uname;
+register int nn = ocl->oc_name_known;
+	switch(ocl->oc_olet) {
+	case POTION_SYM:
+		Strcpy(buf, "potion");
+		break;
+	case SCROLL_SYM:
+		Strcpy(buf, "scroll");
+		break;
+	case WAND_SYM:
+		Strcpy(buf, "wand");
+		break;
+	case RING_SYM:
+		Strcpy(buf, "ring");
+		break;
+	default:
+		if(nn) {
+			Strcpy(buf, an);
+			if(otyp >= TURQUOISE && otyp <= JADE)
+				Strcat(buf, " stone");
+			if(un)
+				Sprintf(eos(buf), " called %s", un);
+			if(dn)
+				Sprintf(eos(buf), " (%s)", dn);
+		} else {
+			Strcpy(buf, dn ? dn : an);
+			if(ocl->oc_olet == GEM_SYM)
+				Strcat(buf, " gem");
+			if(un)
+				Sprintf(eos(buf), " called %s", un);
+		}
+		return(buf);
+	}
+	/* here for ring/scroll/potion/wand */
+	if(nn)
+		Sprintf(eos(buf), " of %s", an);
+	if(un)
+		Sprintf(eos(buf), " called %s", un);
+	if(dn)
+		Sprintf(eos(buf), " (%s)", dn);
+	return(buf);
+}
+
+char *
+xname(obj)
+register struct obj *obj;
+{
+static char bufr[BUFSZ];
+register char *buf = &(bufr[PREFIX]);	/* leave room for "17 -3 " */
+register int nn = objects[obj->otyp].oc_name_known;
+register char *an = objects[obj->otyp].oc_name;
+register char *dn = objects[obj->otyp].oc_descr;
+register char *un = objects[obj->otyp].oc_uname;
+register int pl = (obj->quan != 1);
+	if(!obj->dknown && !Blind) obj->dknown = 1; /* %% doesnt belong here */
+	switch(obj->olet) {
+	case AMULET_SYM:
+		Strcpy(buf, (obj->spe < 0 && obj->known)
+			? "cheap plastic imitation of the " : "");
+		Strcat(buf,"Amulet of Yendor");
+		break;
+	case TOOL_SYM:
+		if(!nn) {
+			Strcpy(buf, dn);
+			break;
+		}
+		Strcpy(buf,an);
+		break;
+	case FOOD_SYM:
+		if(obj->otyp == DEAD_HOMUNCULUS && pl) {
+			pl = 0;
+			Strcpy(buf, "dead homunculi");
+			break;
+		}
+		/* fungis ? */
+		/* fall into next case */
+	case WEAPON_SYM:
+		if(obj->otyp == WORM_TOOTH && pl) {
+			pl = 0;
+			Strcpy(buf, "worm teeth");
+			break;
+		}
+		if(obj->otyp == CRYSKNIFE && pl) {
+			pl = 0;
+			Strcpy(buf, "crysknives");
+			break;
+		}
+		/* fall into next case */
+	case ARMOR_SYM:
+	case CHAIN_SYM:
+	case ROCK_SYM:
+		Strcpy(buf,an);
+		break;
+	case BALL_SYM:
+		Sprintf(buf, "%sheavy iron ball",
+		  (obj->owt > objects[obj->otyp].oc_weight) ? "very " : "");
+		break;
+	case POTION_SYM:
+		if(nn || un || !obj->dknown) {
+			Strcpy(buf, "potion");
+			if(pl) {
+				pl = 0;
+				Strcat(buf, "s");
+			}
+			if(!obj->dknown) break;
+			if(un) {
+				Strcat(buf, " called ");
+				Strcat(buf, un);
+			} else {
+				Strcat(buf, " of ");
+				Strcat(buf, an);
+			}
+		} else {
+			Strcpy(buf, dn);
+			Strcat(buf, " potion");
+		}
+		break;
+	case SCROLL_SYM:
+		Strcpy(buf, "scroll");
+		if(pl) {
+			pl = 0;
+			Strcat(buf, "s");
+		}
+		if(!obj->dknown) break;
+		if(nn) {
+			Strcat(buf, " of ");
+			Strcat(buf, an);
+		} else if(un) {
+			Strcat(buf, " called ");
+			Strcat(buf, un);
+		} else {
+			Strcat(buf, " labeled ");
+			Strcat(buf, dn);
+		}
+		break;
+	case WAND_SYM:
+		if(!obj->dknown)
+			Sprintf(buf, "wand");
+		else if(nn)
+			Sprintf(buf, "wand of %s", an);
+		else if(un)
+			Sprintf(buf, "wand called %s", un);
+		else
+			Sprintf(buf, "%s wand", dn);
+		break;
+	case RING_SYM:
+		if(!obj->dknown)
+			Sprintf(buf, "ring");
+		else if(nn)
+			Sprintf(buf, "ring of %s", an);
+		else if(un)
+			Sprintf(buf, "ring called %s", un);
+		else
+			Sprintf(buf, "%s ring", dn);
+		break;
+	case GEM_SYM:
+		if(!obj->dknown) {
+			Strcpy(buf, "gem");
+			break;
+		}
+		if(!nn) {
+			Sprintf(buf, "%s gem", dn);
+			break;
+		}
+		Strcpy(buf, an);
+		if(obj->otyp >= TURQUOISE && obj->otyp <= JADE)
+			Strcat(buf, " stone");
+		break;
+	default:
+		Sprintf(buf,"glorkum %c (0%o) %u %d",
+			obj->olet,obj->olet,obj->otyp,obj->spe);
+	}
+	if(pl) {
+		register char *p;
+
+		for(p = buf; *p; p++) {
+			if(!strncmp(" of ", p, 4)) {
+				/* pieces of, cloves of, lumps of */
+				register int c1, c2 = 's';
+
+				do {
+					c1 = c2; c2 = *p; *p++ = c1;
+				} while(c1);
+				goto nopl;
+			}
+		}
+		p = eos(buf)-1;
+		if(*p == 's' || *p == 'z' || *p == 'x' ||
+		    (*p == 'h' && p[-1] == 's'))
+			Strcat(buf, "es");	/* boxes */
+		else if(*p == 'y' && !index(vowels, p[-1]))
+			Strcpy(p, "ies");	/* rubies, zruties */
+		else
+			Strcat(buf, "s");
+	}
+nopl:
+	if(obj->onamelth) {
+		Strcat(buf, " named ");
+		Strcat(buf, ONAME(obj));
+	}
+	return(buf);
+}
+
+char *
+doname(obj)
+register struct obj *obj;
+{
+char prefix[PREFIX];
+register char *bp = xname(obj);
+	if(obj->quan != 1)
+		Sprintf(prefix, "%u ", obj->quan);
+	else
+		Strcpy(prefix, "a ");
+	switch(obj->olet) {
+	case AMULET_SYM:
+		if(strncmp(bp, "cheap ", 6))
+			Strcpy(prefix, "the ");
+		break;
+	case ARMOR_SYM:
+		if(obj->owornmask & W_ARMOR)
+			Strcat(bp, " (being worn)");
+		/* fall into next case */
+	case WEAPON_SYM:
+		if(obj->known) {
+			Strcat(prefix, sitoa(obj->spe));
+			Strcat(prefix, " ");
+		}
+		break;
+	case WAND_SYM:
+		if(obj->known)
+			Sprintf(eos(bp), " (%d)", obj->spe);
+		break;
+	case RING_SYM:
+		if(obj->owornmask & W_RINGR) Strcat(bp, " (on right hand)");
+		if(obj->owornmask & W_RINGL) Strcat(bp, " (on left hand)");
+		if(obj->known && (objects[obj->otyp].bits & SPEC)) {
+			Strcat(prefix, sitoa(obj->spe));
+			Strcat(prefix, " ");
+		}
+		break;
+	}
+	if(obj->owornmask & W_WEP)
+		Strcat(bp, " (weapon in hand)");
+	if(obj->unpaid)
+		Strcat(bp, " (unpaid)");
+	if(!strcmp(prefix, "a ") && index(vowels, *bp))
+		Strcpy(prefix, "an ");
+	bp = strprepend(bp, prefix);
+	return(bp);
+}
+
+/* used only in hack.fight.c (thitu) */
+setan(str,buf)
+register char *str,*buf;
+{
+	if(index(vowels,*str))
+		Sprintf(buf, "an %s", str);
+	else
+		Sprintf(buf, "a %s", str);
+}
+
+char *
+aobjnam(otmp,verb) register struct obj *otmp; register char *verb; {
+register char *bp = xname(otmp);
+char prefix[PREFIX];
+	if(otmp->quan != 1) {
+		Sprintf(prefix, "%u ", otmp->quan);
+		bp = strprepend(bp, prefix);
+	}
+
+	if(verb) {
+		/* verb is given in plural (i.e., without trailing s) */
+		Strcat(bp, " ");
+		if(otmp->quan != 1)
+			Strcat(bp, verb);
+		else if(!strcmp(verb, "are"))
+			Strcat(bp, "is");
+		else {
+			Strcat(bp, verb);
+			Strcat(bp, "s");
+		}
+	}
+	return(bp);
+}
+
+char *
+Doname(obj)
+register struct obj *obj;
+{
+	register char *s = doname(obj);
+
+	if('a' <= *s && *s <= 'z') *s -= ('a' - 'A');
+	return(s);
+}
+
+char *wrp[] = { "wand", "ring", "potion", "scroll", "gem" };
+char wrpsym[] = { WAND_SYM, RING_SYM, POTION_SYM, SCROLL_SYM, GEM_SYM };
+
+struct obj *
+readobjnam(bp) register char *bp; {
+register char *p;
+register int i;
+int cnt, spe, spesgn, typ, heavy;
+char let;
+char *un, *dn, *an;
+/* int the = 0; char *oname = 0; */
+	cnt = spe = spesgn = typ = heavy = 0;
+	let = 0;
+	an = dn = un = 0;
+	for(p = bp; *p; p++)
+		if('A' <= *p && *p <= 'Z') *p += 'a'-'A';
+	if(!strncmp(bp, "the ", 4)){
+/*		the = 1; */
+		bp += 4;
+	} else if(!strncmp(bp, "an ", 3)){
+		cnt = 1;
+		bp += 3;
+	} else if(!strncmp(bp, "a ", 2)){
+		cnt = 1;
+		bp += 2;
+	}
+	if(!cnt && digit(*bp)){
+		cnt = atoi(bp);
+		while(digit(*bp)) bp++;
+		while(*bp == ' ') bp++;
+	}
+	if(!cnt) cnt = 1;		/* %% what with "gems" etc. ? */
+
+	if(*bp == '+' || *bp == '-'){
+		spesgn = (*bp++ == '+') ? 1 : -1;
+		spe = atoi(bp);
+		while(digit(*bp)) bp++;
+		while(*bp == ' ') bp++;
+	} else {
+		p = rindex(bp, '(');
+		if(p) {
+			if(p > bp && p[-1] == ' ') p[-1] = 0;
+			else *p = 0;
+			p++;
+			spe = atoi(p);
+			while(digit(*p)) p++;
+			if(strcmp(p, ")")) spe = 0;
+			else spesgn = 1;
+		}
+	}
+	/* now we have the actual name, as delivered by xname, say
+		green potions called whisky
+		scrolls labeled "QWERTY"
+		egg
+		dead zruties
+		fortune cookies
+		very heavy iron ball named hoei
+		wand of wishing
+		elven cloak
+	*/
+	for(p = bp; *p; p++) if(!strncmp(p, " named ", 7)) {
+		*p = 0;
+/*		oname = p+7; */
+	}
+	for(p = bp; *p; p++) if(!strncmp(p, " called ", 8)) {
+		*p = 0;
+		un = p+8;
+	}
+	for(p = bp; *p; p++) if(!strncmp(p, " labeled ", 9)) {
+		*p = 0;
+		dn = p+9;
+	}
+
+	/* first change to singular if necessary */
+	if(cnt != 1) {
+		/* find "cloves of garlic", "worthless pieces of blue glass" */
+		for(p = bp; *p; p++) if(!strncmp(p, "s of ", 5)){
+			while(*p = p[1]) p++;
+			goto sing;
+		}
+		/* remove -s or -es (boxes) or -ies (rubies, zruties) */
+		p = eos(bp);
+		if(p[-1] == 's') {
+			if(p[-2] == 'e') {
+				if(p[-3] == 'i') {
+					if(!strcmp(p-7, "cookies"))
+						goto mins;
+					Strcpy(p-3, "y");
+					goto sing;
+				}
+
+				/* note: cloves / knives from clove / knife */
+				if(!strcmp(p-6, "knives")) {
+					Strcpy(p-3, "fe");
+					goto sing;
+				}
+
+				/* note: nurses, axes but boxes */
+				if(!strcmp(p-5, "boxes")) {
+					p[-2] = 0;
+					goto sing;
+				}
+			}
+		mins:
+			p[-1] = 0;
+		} else {
+			if(!strcmp(p-9, "homunculi")) {
+				Strcpy(p-1, "us"); /* !! makes string longer */
+				goto sing;
+			}
+			if(!strcmp(p-5, "teeth")) {
+				Strcpy(p-5, "tooth");
+				goto sing;
+			}
+			/* here we cannot find the plural suffix */
+		}
+	}
+sing:
+	if(!strcmp(bp, "amulet of yendor")) {
+		typ = AMULET_OF_YENDOR;
+		goto typfnd;
+	}
+	p = eos(bp);
+	if(!strcmp(p-5, " mail")){	/* Note: ring mail is not a ring ! */
+		let = ARMOR_SYM;
+		an = bp;
+		goto srch;
+	}
+	for(i = 0; i < sizeof(wrpsym); i++) {
+		register int j = strlen(wrp[i]);
+		if(!strncmp(bp, wrp[i], j)){
+			let = wrpsym[i];
+			bp += j;
+			if(!strncmp(bp, " of ", 4)) an = bp+4;
+			/* else if(*bp) ?? */
+			goto srch;
+		}
+		if(!strcmp(p-j, wrp[i])){
+			let = wrpsym[i];
+			p -= j;
+			*p = 0;
+			if(p[-1] == ' ') p[-1] = 0;
+			dn = bp;
+			goto srch;
+		}
+	}
+	if(!strcmp(p-6, " stone")){
+		p[-6] = 0;
+		let = GEM_SYM;
+		an = bp;
+		goto srch;
+	}
+	if(!strcmp(bp, "very heavy iron ball")){
+		heavy = 1;
+		typ = HEAVY_IRON_BALL;
+		goto typfnd;
+	}
+	an = bp;
+srch:
+	if(!an && !dn && !un)
+		goto any;
+	i = 1;
+	if(let) i = bases[letindex(let)];
+	while(i <= NROFOBJECTS && (!let || objects[i].oc_olet == let)){
+		if(an && strcmp(an, objects[i].oc_name))
+			goto nxti;
+		if(dn && strcmp(dn, objects[i].oc_descr))
+			goto nxti;
+		if(un && strcmp(un, objects[i].oc_uname))
+			goto nxti;
+		typ = i;
+		goto typfnd;
+	nxti:
+		i++;
+	}
+any:
+	if(!let) let = wrpsym[rn2(sizeof(wrpsym))];
+	typ = probtype(let);
+typfnd:
+	{ register struct obj *otmp;
+	  extern struct obj *mksobj();
+	let = objects[typ].oc_olet;
+	otmp = mksobj(typ);
+	if(heavy)
+		otmp->owt += 15;
+	if(cnt > 0 && index("%?!*)", let) &&
+		(cnt < 4 || (let == WEAPON_SYM && typ <= ROCK && cnt < 20)))
+		otmp->quan = cnt;
+
+	if(spe > 3 && spe > otmp->spe)
+		spe = 0;
+	else if(let == WAND_SYM)
+		spe = otmp->spe;
+	if(spe == 3 && u.uluck < 0)
+		spesgn = -1;
+	if(let != WAND_SYM && spesgn == -1)
+		spe = -spe;
+	if(let == BALL_SYM)
+		spe = 0;
+	else if(let == AMULET_SYM)
+		spe = -1;
+	else if(typ == WAN_WISHING && rn2(10))
+		spe = 0;
+	otmp->spe = spe;
+
+	if(spesgn == -1)
+		otmp->cursed = 1;
+
+	return(otmp);
+    }
+}
+//E*O*F hack.objnam.c//
+
+echo x - hack.options.c
+cat > "hack.options.c" << '//E*O*F hack.options.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.options.c - version 1.0.2 */
+
+#include "config.h"
+#include "hack.h"
+extern char *eos();
+boolean female;		/* should have been flags.female */
+
+initoptions()
+{
+	register char *opts;
+	extern char *getenv();
+
+	flags.time = flags.nonews = flags.notombstone = flags.end_own =
+	flags.standout = flags.nonull = FALSE;
+	flags.no_rest_on_space = TRUE;
+	flags.end_top = 5;
+	flags.end_around = 4;
+	female = FALSE;			/* players are usually male */
+
+	if(opts = getenv("HACKOPTIONS"))
+		parseoptions(opts,TRUE);
+}
+
+parseoptions(opts, from_env)
+register char *opts;
+boolean from_env;
+{
+	register char *op,*op2;
+	unsigned num;
+	boolean negated;
+
+	if(op = index(opts, ',')) {
+		*op++ = 0;
+		parseoptions(op, from_env);
+	}
+	if(op = index(opts, ' ')) {
+		op2 = op;
+		while(*op++)
+			if(*op != ' ') *op2++ = *op;
+	}
+	if(!*opts) return;
+	negated = FALSE;
+	while((*opts == '!') || !strncmp(opts, "no", 2)) {
+		if(*opts == '!') opts++; else opts += 2;
+		negated = !negated;
+	}
+	
+	if(!strncmp(opts,"standout",8)) {
+		flags.standout = !negated;
+		return;
+	}
+
+	if(!strncmp(opts,"null",3)) {
+		flags.nonull = negated;
+		return;
+	}
+
+	if(!strncmp(opts,"tombstone",4)) {
+		flags.notombstone = negated;
+		return;
+	}
+
+	if(!strncmp(opts,"news",4)) {
+		flags.nonews = negated;
+		return;
+	}
+
+	if(!strncmp(opts,"time",4)) {
+		flags.time = !negated;
+		flags.botl = 1;
+		return;
+	}
+
+	if(!strncmp(opts,"restonspace",4)) {
+		flags.no_rest_on_space = negated;
+		return;
+	}
+
+	if(!strncmp(opts,"male",4)) {
+		female = negated;
+		return;
+	}
+	if(!strncmp(opts,"female",6)) {
+		female = !negated;
+		return;
+	}
+
+	/* name:string */
+	if(!strncmp(opts,"name",4)) {
+		extern char plname[PL_NSIZ];
+		if(!from_env) {
+		  pline("The playername can be set only from HACKOPTIONS.");
+		  return;
+		}
+		op = index(opts,':');
+		if(!op) goto bad;
+		(void) strncpy(plname, op+1, sizeof(plname)-1);
+		return;
+	}
+
+	/* endgame:5t[op] 5a[round] o[wn] */
+	if(!strncmp(opts,"endgame",3)) {
+		op = index(opts,':');
+		if(!op) goto bad;
+		op++;
+		while(*op) {
+			num = 1;
+			if(digit(*op)) {
+				num = atoi(op);
+				while(digit(*op)) op++;
+			} else
+			if(*op == '!') {
+				negated = !negated;
+				op++;
+			}
+			switch(*op) {
+			case 't':
+				flags.end_top = num;
+				break;
+			case 'a':
+				flags.end_around = num;
+				break;
+			case 'o':
+				flags.end_own = !negated;
+				break;
+			default:
+				goto bad;
+			}
+			while(letter(*++op)) ;
+			if(*op == '/') op++;
+		}
+		return;
+	}
+bad:
+	if(!from_env) {
+		if(!strncmp(opts, "help", 4)) {
+			pline("%s%s%s",
+"To set options use `HACKOPTIONS=\"<options>\"' in your environment, or ",
+"give the command 'o' followed by the line `<options>' while playing. ",
+"Here <options> is a list of <option>s separated by commas." );
+			pline("%s%s%s",
+"Simple (boolean) options are rest_on_space, news, time, ",
+"null, tombstone, (fe)male. ",
+"These can be negated by prefixing them with '!' or \"no\"." );
+			pline("%s",
+"A string option is name, as in HACKOPTIONS=\"name:Merlin-W\"." );
+			pline("%s%s%s",
+"A compound option is endgame; it is followed by a description of what ",
+"parts of the scorelist you want to see. You might for example say: ",
+"`endgame:own scores/5 top scores/4 around my score'." );
+			return;
+		}
+		pline("Bad option: %s.", opts);
+		pline("Type `o help<cr>' for help.");
+		return;
+	}
+	puts("Bad syntax in HACKOPTIONS.");
+	puts("Use for example:");
+	puts(
+"HACKOPTIONS=\"!restonspace,notombstone,endgame:own/5 topscorers/4 around me\""
+	);
+	getret();
+}
+
+doset()
+{
+	char buf[BUFSZ];
+
+	pline("What options do you want to set? ");
+	getlin(buf);
+	if(!buf[0]) {
+	    (void) strcpy(buf,"HACKOPTIONS=");
+	    (void) strcat(buf,female ? "female," : "male,");
+	    if(flags.standout) (void) strcat(buf,"standout,");
+	    if(flags.nonull) (void) strcat(buf,"nonull,");
+	    if(flags.nonews) (void) strcat(buf,"nonews,");
+	    if(flags.time) (void) strcat(buf,"time,");
+	    if(flags.notombstone) (void) strcat(buf,"notombstone,");
+	    if(flags.no_rest_on_space)
+		(void) strcat(buf,"!rest_on_space,");
+	    if(flags.end_top != 5 || flags.end_around != 4 || flags.end_own){
+		(void) sprintf(eos(buf), "endgame: %u topscores/%u around me",
+			flags.end_top, flags.end_around);
+		if(flags.end_own) (void) strcat(buf, "/own scores");
+	    } else {
+		register char *eop = eos(buf);
+		if(*--eop == ',') *eop = 0;
+	    }
+	    pline(buf);
+	} else
+	    parseoptions(buf, FALSE);
+
+	return(0);
+}
+//E*O*F hack.options.c//
+
+echo x - hack.pager.c
+cat > "hack.pager.c" << '//E*O*F hack.pager.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.pager.c - version 1.0.2 */
+
+/* This file contains the command routine dowhatis() and a pager. */
+/* Also readmail() and doshell(), and generally the things that
+   contact the outside world. */
+
+#include	<stdio.h>
+#include	<signal.h>
+#include "hack.h"
+extern int CO, LI;	/* usually COLNO and ROWNO+2 */
+extern char *CD;
+extern char quitchars[];
+extern char *getenv(), *getlogin();
+int done1();
+
+dowhatis()
+{
+	FILE *fp;
+	char bufr[BUFSZ+6];
+	register char *buf = &bufr[6], *ep, q;
+	extern char readchar();
+
+	if(!(fp = fopen("data","r")))
+		pline("Cannot open data file!");
+	else {
+		pline("Specify what? ");
+		q = readchar();
+		if(q != '\t')
+		while(fgets(buf,BUFSZ,fp))
+		    if(*buf == q) {
+			ep = index(buf, '\n');
+			if(ep) *ep = 0;
+			/* else: bad data file */
+			/* Expand tab 'by hand' */
+			if(buf[1] == '\t'){
+				buf = bufr;
+				buf[0] = q;
+				(void) strncpy(buf+1, "       ", 7);
+			}
+			pline(bufr);
+			if(ep[-1] == ';') {
+				pline("More info? ");
+				if(readchar() == 'y')
+					page_more(fp,1); /* does fclose() */
+			}
+			return(0);
+		    }
+		pline("I've never heard of such things.");
+		(void) fclose(fp);
+	}
+	return(0);
+}
+
+/* make the paging of a file interruptible */
+static int got_intrup;
+
+intruph(){
+	got_intrup++;
+}
+
+/* simple pager, also used from dohelp() */
+page_more(fp,strip)
+FILE *fp;
+int strip;	/* nr of chars to be stripped from each line (0 or 1) */
+{
+	register char *bufr, *ep;
+	int (*prevsig)() = signal(SIGINT, intruph);
+
+	set_pager(0);
+	bufr = (char *) alloc((unsigned) CO);
+	bufr[CO-1] = 0;
+	while(fgets(bufr,CO-1,fp) && (!strip || *bufr == '\t') && !got_intrup){
+		ep = index(bufr, '\n');
+		if(ep)
+			*ep = 0;
+		if(page_line(bufr+strip)) {
+			set_pager(2);
+			goto ret;
+		}
+	}
+	set_pager(1);
+ret:
+	free(bufr);
+	(void) fclose(fp);
+	(void) signal(SIGINT, prevsig);
+	got_intrup = 0;
+}
+
+static boolean whole_screen = TRUE;
+#define	PAGMIN	12	/* minimum # of lines for page below level map */
+
+set_whole_screen() {	/* called in termcap as soon as LI is known */
+	whole_screen = (LI-ROWNO-2 <= PAGMIN || !CD);
+}
+
+#ifdef NEWS
+readnews() {
+	register int ret;
+
+	whole_screen = TRUE;	/* force a docrt(), our first */
+	ret = page_file(NEWS, TRUE);
+	set_whole_screen();
+	return(ret);		/* report whether we did docrt() */
+}
+#endif NEWS
+
+set_pager(mode)
+register int mode;	/* 0: open  1: wait+close  2: close */
+{
+	static boolean so;
+	if(mode == 0) {
+		if(!whole_screen) {
+			/* clear topline */
+			clrlin();
+			/* use part of screen below level map */
+			curs(1, ROWNO+4);
+		} else {
+			cls();
+		}
+		so = flags.standout;
+		flags.standout = 1;
+	} else {
+		if(mode == 1) {
+			curs(1, LI);
+			more();
+		}
+		flags.standout = so;
+		if(whole_screen)
+			docrt();
+		else {
+			curs(1, ROWNO+4);
+			cl_eos();
+		}
+	}
+}
+
+page_line(s)		/* returns 1 if we should quit */
+register char *s;
+{
+	extern char morc;
+
+	if(cury == LI-1) {
+		if(!*s)
+			return(0);	/* suppress blank lines at top */
+		putchar('\n');
+		cury++;
+		cmore("q\033");
+		if(morc) {
+			morc = 0;
+			return(1);
+		}
+		if(whole_screen)
+			cls();
+		else {
+			curs(1, ROWNO+4);
+			cl_eos();
+		}
+	}
+	puts(s);
+	cury++;
+	return(0);
+}
+
+/*
+ * Flexible pager: feed it with a number of lines and it will decide
+ * whether these should be fed to the pager above, or displayed in a
+ * corner.
+ * Call:
+ *	cornline(0, title or 0)	: initialize
+ *	cornline(1, text)	: add text to the chain of texts
+ *	cornline(2, morcs)	: output everything and cleanup
+ *	cornline(3, 0)		: cleanup
+ */
+
+cornline(mode, text)
+int mode;
+char *text;
+{
+	static struct line {
+		struct line *next_line;
+		char *line_text;
+	} *texthead, *texttail;
+	static int maxlen;
+	static int linect;
+	register struct line *tl;
+
+	if(mode == 0) {
+		texthead = 0;
+		maxlen = 0;
+		linect = 0;
+		if(text) {
+			cornline(1, text);	/* title */
+			cornline(1, "");	/* blank line */
+		}
+		return;
+	}
+
+	if(mode == 1) {
+	    register int len;
+
+	    if(!text) return;	/* superfluous, just to be sure */
+	    linect++;
+	    len = strlen(text);
+	    if(len > maxlen)
+		maxlen = len;
+	    tl = (struct line *)
+		alloc((unsigned)(len + sizeof(struct line) + 1));
+	    tl->next_line = 0;
+	    tl->line_text = (char *)(tl + 1);
+	    (void) strcpy(tl->line_text, text);
+	    if(!texthead)
+		texthead = tl;
+	    else
+		texttail->next_line = tl;
+	    texttail = tl;
+	    return;
+	}
+
+	/* --- now we really do it --- */
+	if(mode == 2 && linect == 1)			    /* topline only */
+		pline(texthead->line_text);
+	else
+	if(mode == 2) {
+	    register int curline, lth;
+
+	    lth = CO - maxlen - 2;		   /* Use full screen width */
+	    if (linect < LI && lth >= 10) {		     /* in a corner */
+		home ();
+		cl_end ();
+		flags.toplin = 0;
+		curline = 1;
+		for (tl = texthead; tl; tl = tl->next_line) {
+		    curs (lth, curline);
+		    if(curline > 1)
+			cl_end ();
+		    putsym(' ');
+		    putstr (tl->line_text);
+		    curline++;
+		}
+		curs (lth, curline);
+		cl_end ();
+		cmore (text);
+		home ();
+		cl_end ();
+		docorner (lth, curline-1);
+	    } else {					/* feed to pager */
+		set_pager(0);
+		for (tl = texthead; tl; tl = tl->next_line) {
+		    if (page_line (tl->line_text)) {
+			set_pager(2);
+			goto cleanup;
+		    }
+		}
+		if(text) {
+			cgetret(text);
+			set_pager(2);
+		} else
+			set_pager(1);
+	    }
+	}
+
+cleanup:
+	while(tl = texthead) {
+		texthead = tl->next_line;
+		free((char *) tl);
+	}
+}
+
+dohelp()
+{
+	char c;
+
+	pline ("Long or short help? ");
+	while (((c = readchar ()) != 'l') && (c != 's') && !index(quitchars,c))
+		bell ();
+	if (!index(quitchars, c))
+		(void) page_file((c == 'l') ? HELP : SHELP, FALSE);
+	return(0);
+}
+
+page_file(fnam, silent)	/* return: 0 - cannot open fnam; 1 - otherwise */
+register char *fnam;
+boolean silent;
+{
+#ifdef DEF_PAGER			/* this implies that UNIX is defined */
+      {
+	/* use external pager; this may give security problems */
+
+	register int fd = open(fnam, 0);
+
+	if(fd < 0) {
+		if(!silent) pline("Cannot open %s.", fnam);
+		return(0);
+	}
+	if(child(1)){
+		external char *catmore;
+
+		/* Now that child() does a setuid(getuid()) and a chdir(),
+		   we may not be able to open file fnam anymore, so make
+		   it stdin. */
+		(void) close(0);
+		if(dup(fd)) {
+			if(!silent) printf("Cannot open %s as stdin.\n", fnam);
+		} else {
+			execl(catmore, "page", (char *) 0);
+			if(!silent) printf("Cannot exec %s.\n", catmore);
+		}
+		exit(1);
+	}
+	(void) close(fd);
+      }
+#else DEF_PAGER
+      {
+	FILE *f;			/* free after Robert Viduya */
+
+	if ((f = fopen (fnam, "r")) == (FILE *) 0) {
+		if(!silent) {
+			home(); perror (fnam); flags.toplin = 1;
+			pline ("Cannot open %s.", fnam);
+		}
+		return(0);
+	}
+	page_more(f, 0);
+      }
+#endif DEF_PAGER
+
+	return(1);
+}
+
+#ifdef UNIX
+#ifdef SHELL
+dosh(){
+register char *str;
+	if(child(0)) {
+		if(str = getenv("SHELL"))
+			execl(str, str, (char *) 0);
+		else
+			execl("/bin/sh", "sh", (char *) 0);
+		pline("sh: cannot execute.");
+		exit(1);
+	}
+	return(0);
+}
+#endif SHELL
+
+#ifdef BSD
+#include	<sys/wait.h>
+#else
+#include	<wait.h>
+#endif BSD
+
+child(wt) {
+register int f = fork();
+	if(f == 0){		/* child */
+		settty((char *) 0);		/* also calls end_screen() */
+		(void) setuid(getuid());
+		(void) setgid(getgid());
+#ifdef CHDIR
+		(void) chdir(getenv("HOME"));
+#endif CHDIR
+		return(1);
+	}
+	if(f == -1) {	/* cannot fork */
+		pline("Fork failed. Try again.");
+		return(0);
+	}
+	/* fork succeeded; wait for child to exit */
+	(void) signal(SIGINT,SIG_IGN);
+	(void) signal(SIGQUIT,SIG_IGN);
+	(void) wait((union wait *) 0);
+	gettty();
+	setftty();
+	(void) signal(SIGINT,done1);
+#ifdef WIZARD
+	if(wizard) (void) signal(SIGQUIT,SIG_DFL);
+#endif WIZARD
+	if(wt) getret();
+	docrt();
+	return(0);
+}
+#endif UNIX
+//E*O*F hack.pager.c//
+
+echo x - hack.potion.c
+cat > "hack.potion.c" << '//E*O*F hack.potion.c//'
+/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+/* hack.potion.c - version 1.0.2 */
+
+#include "hack.h"
+extern int float_down();
+extern char *nomovemsg;
+extern struct monst youmonst;
+
+dodrink() {
+	register struct obj *otmp,*objs;
+	register struct monst *mtmp;
+	register int unkn = 0, nothing = 0;
+
+	otmp = getobj("!", "drink");
+	if(!otmp) return(0);
+	switch(otmp->otyp){
+	case POT_RESTORE_STRENGTH:
+		unkn++;
+		pline("Wow!  This makes you feel great!");
+		if(u.ustr < u.ustrmax) {
+			u.ustr = u.ustrmax;
+			flags.botl = 1;
+		}
+		break;
+	case POT_BOOZE:
+		unkn++;
+		pline("Ooph!  This tastes like liquid fire!");
+		Confusion += d(3,8);
+		/* the whiskey makes us feel better */
+		if(u.uhp < u.uhpmax) losehp(-1, "bottle of whiskey");
+		if(!rn2(4)) {
+			pline("You pass out.");
+			multi = -rnd(15);
+			nomovemsg = "You awake with a headache.";
+		}
+		break;
+	case POT_INVISIBILITY:
+		if(Invis)
+		  nothing++;
+		else {
+		  if(!Blind)
+		    pline("Gee!  All of a sudden, you can't see yourself.");
+		  else
+		    pline("You feel rather airy."), unkn++;
+		  newsym(u.ux,u.uy);
+		}
+		Invis += rn1(15,31);
+		break;
+	case POT_FRUIT_JUICE:
+		pline("This tastes like fruit juice.");
+		lesshungry(20);
+		break;
+	case POT_HEALING:
+		pline("You begin to feel better.");
+		flags.botl = 1;
+		u.uhp += rnd(10);
+		if(u.uhp > u.uhpmax)
+			u.uhp = ++u.uhpmax;
+		if(Blind) Blind = 1;	/* see on next move */
+		if(Sick) Sick = 0;
+		break;
+	case POT_PARALYSIS:
+		if(Levitation)
+			pline("You are motionlessly suspended.");
+		else
+			pline("Your feet are frozen to the floor!");
+		nomul(-(rn1(10,25)));
+		break;
+	case POT_MONSTER_DETECTION:
+		if(!fmon) {
+			strange_feeling(otmp, "You feel threatened.");
+			return(1);
+		} else {
+			cls();
+			for(mtmp = fmon; mtmp; mtmp = mtmp->nmon)
+				if(mtmp->mx > 0)
+				at(mtmp->mx,mtmp->my,mtmp->data->mlet);
+			prme();
+			pline("You sense the presence of monsters.");
+			more();
+			docrt();
+		}
+		break;
+	case POT_OBJECT_DETECTION:
+		if(!fobj) {
+			strange_feeling(otmp, "You feel a pull downward.");
+			return(1);
+		} else {
+		    for(objs = fobj; objs; objs = objs->nobj)
+			if(objs->ox != u.ux || objs->oy != u.uy)
+				goto outobjmap;
+		    pline("You sense the presence of objects close nearby.");
+		    break;
+		outobjmap:
+			cls();
+			for(objs = fobj; objs; objs = objs->nobj)
+				at(objs->ox,objs->oy,objs->olet);
+			prme();
+			pline("You sense the presence of objects.");
+			more();
+			docrt();
+		}
+		break;
+	case POT_SICKNESS:
+		pline("Yech! This stuff tastes like poison.");
+		if(Poison_resistance)
+    pline("(But in fact it was biologically contaminated orange juice.)");
+		losestr(rn1(4,3));
+		losehp(rnd(10), "poison potion");
+		break;
+	case POT_CONFUSION:
+		if(!Confusion)
+			pline("Huh, What?  Where am I?");
+		else
+			nothing++;
+		Confusion += rn1(7,16);
+		break;
+	case POT_GAIN_STRENGTH:
+		pline("Wow do you feel strong!");
+		if(u.ustr >= 118) break;	/* > 118 is impossible */
+		if(u.ustr > 17) u.ustr += rnd(118-u.ustr);
+		else u.ustr++;
+		if(u.ustr > u.ustrmax) u.ustrmax = u.ustr;
+		flags.botl = 1;
+		break;
+	case POT_SPEED:
+		if(Wounded_legs) {
+			if((Wounded_legs & BOTH_SIDES) == BOTH_SIDES)
+				pline("Your legs feel somewhat better.");
+			else
+				pline("Your leg feels somewhat better.");
+			Wounded_legs = 0;
+			unkn++;
+			break;
+		}
+		if(!(Fast & ~INTRINSIC))
+			pline("You are suddenly moving much faster.");
+		else
+			pline("Your legs get new energy."), unkn++;
+		Fast += rn1(10,100);
+		break;
+	case POT_BLINDNESS:
+		if(!Blind)
+			pline("A cloud of darkness falls upon you.");
+		else
+			nothing++;
+		Blind += rn1(100,250);
+		seeoff(0);
+		break;
+	case POT_GAIN_LEVEL: 
+		pluslvl();
+		break;
+	case POT_EXTRA_HEALING:
+		pline("You feel much better.");
+		flags.botl = 1;
+		u.uhp += d(2,20)+1;
+		if(u.uhp > u.uhpmax)
+			u.uhp = (u.uhpmax += 2);
+		if(Blind) Blind = 1;
+		if(Sick) Sick = 0;
+		break;
+	case POT_LEVITATION:
+		if(!Levitation)
+			float_up();
+		else
+			nothing++;
+		Levitation += rnd(100);
+		u.uprops[PROP(RIN_LEVITATION)].p_tofn = float_down;
+		break;
+	default:
+		impossible("What a funny potion! (%u)", otmp->otyp);
+		return(0);
+	}
+	if(nothing) {
+	    unkn++;
+	    pline("You have a peculiar feeling for a moment, then it passes.");
+	}
+	if(otmp->dknown && !objects[otmp->otyp].oc_name_known) {
+		if(!unkn) {
+			objects[otmp->otyp].oc_name_known = 1;
+			more_experienced(0,10);
+		} else if(!objects[otmp->otyp].oc_uname)
+			docall(otmp);
+	}
+	useup(otmp);
+	return(1);
+}
+
+pluslvl()
+{
+	register num;
+
+	pline("You feel more experienced.");
+	num = rnd(10);
+	u.uhpmax += num;
+	u.uhp += num;
+	u.uexp = (10*pow(u.ulevel-1))+1;
+	pline("Welcome to experience level %u.", ++u.ulevel);
+	flags.botl = 1;
+}
+
+strange_feeling(obj,txt)
+register struct obj *obj;
+register char *txt;
+{
+	if(flags.beginner)
+	    pline("You have a strange feeling for a moment, then it passes.");
+	else
+	    pline(txt);
+	if(!objects[obj->otyp].oc_name_known && !objects[obj->otyp].oc_uname)
+		docall(obj);
+	useup(obj);
+}
+
+char *bottlenames[] = {
+	"bottle", "phial", "flagon", "carafe", "flask", "jar", "vial"
+};
+
+potionhit(mon, obj)
+register struct monst *mon;
+register struct obj *obj;
+{
+	extern char *xname();
+	register char *botlnam = bottlenames[rn2(SIZE(bottlenames))];
+	boolean uclose, isyou = (mon == &youmonst);
+
+	if(isyou) {
+		uclose = TRUE;
+		pline("The %s crashes on your head and breaks into shivers.",
+			botlnam);
+		losehp(rnd(2), "thrown potion");
+	} else {
+		uclose = (dist(mon->mx,mon->my) < 3);
+		pline("The %s crashes on %s's head and breaks into shivers.",
+			botlnam, monnam(mon));
+		if(rn2(5) && mon->mhp > 1)
+			mon->mhp--;
+	}
+	pline("The %s evaporates.", xname(obj));
+
+	if(!isyou && !rn2(3)) switch(obj->otyp) {
+
+	case POT_RESTORE_STRENGTH:
+	case POT_GAIN_STRENGTH:
+	case POT_HEALING:
+	case POT_EXTRA_HEALING:
+		if(mon->mhp < mon->mhpmax) {
+			mon->mhp = mon->mhpmax;
+			pline("%s looks sound and hale again!", Monnam(mon));
+		}
+		break;
+	case POT_SICKNESS:
+		if(mon->mhpmax > 3)
+			mon->mhpmax /= 2;
+		if(mon->mhp > 2)
+			mon->mhp /= 2;
+		break;
+	case POT_CONFUSION:
+	case POT_BOOZE:
+		mon->mconf = 1;
+		break;
+	case POT_INVISIBILITY:
+		unpmon(mon);
+		mon->minvis = 1;
+		pmon(mon);
+		break;
+	case POT_PARALYSIS:
+		mon->mfroz = 1;
+		break;
+	case POT_SPEED:
+		mon->mspeed = MFAST;
+		break;
+	case POT_BLINDNESS:
+		mon->mblinded |= 64 + rn2(64);
+		break;
+/*	
+	case POT_GAIN_LEVEL:
+	case POT_LEVITATION:
+	case POT_FRUIT_JUICE:
+	case POT_MONSTER_DETECTION:
+	case POT_OBJECT_DETECTION:
+		break;
+*/
+	}
+	if(uclose && rn2(5))
+		potionbreathe(obj);
+	obfree(obj, Null(obj));
+}
+
+potionbreathe(obj)
+register struct obj *obj;
+{
+	switch(obj->otyp) {
+	case POT_RESTORE_STRENGTH:
+	case POT_GAIN_STRENGTH:
+		if(u.ustr < u.ustrmax) u.ustr++, flags.botl = 1;
+		break;
+	case POT_HEALING:
+	case POT_EXTRA_HEALING:
+		if(u.uhp < u.uhpmax) u.uhp++, flags.botl = 1;
+		break;
+	case POT_SICKNESS:
+		if(u.uhp <= 5) u.uhp = 1; else u.uhp -= 5;
+		flags.botl = 1;
+		break;
+	case POT_CONFUSION:
+	case POT_BOOZE:
+		if(!Confusion)
+			pline("You feel somewhat dizzy.");
+		Confusion += rnd(5);
+		break;
+	case POT_INVISIBILITY:
+		pline("For an instant you couldn't see your right hand.");
+		break;
+	case POT_PARALYSIS:
+		pline("Something seems to be holding you.");
+		nomul(-rnd(5));
+		break;
+	case POT_SPEED:
+		Fast += rnd(5);
+		pline("Your knees seem more flexible now.");
+		break;
+	case POT_BLINDNESS:
+		if(!Blind) pline("It suddenly gets dark.");
+		Blind += rnd(5);
+		seeoff(0);
+		break;
+/*	
+	case POT_GAIN_LEVEL:
+	case POT_LEVITATION:
+	case POT_FRUIT_JUICE:
+	case POT_MONSTER_DETECTION:
+	case POT_OBJECT_DETECTION:
+		break;
+*/
+	}
+	/* note: no obfree() */
+}
+
+/*
+ * -- rudimentary -- to do this correctly requires much more work
+ * -- all sharp weapons get one or more qualities derived from the potions
+ * -- texts on scrolls may be (partially) wiped out; do they become blank?
+ * --   or does their effect change, like under Confusion?
+ * -- all objects may be made invisible by POT_INVISIBILITY
+ * -- If the flask is small, can one dip a large object? Does it magically
+ * --   become a jug? Etc.
+ */
+dodip(){
+	register struct obj *potion, *obj;
+
+	if(!(obj = getobj("#", "dip")))
+		return(0);
+	if(!(potion = getobj("!", "dip into")))
+		return(0);
+	pline("Interesting...");
+	if(obj->otyp == ARROW || obj->otyp == DART ||
+	   obj->otyp == CROSSBOW_BOLT) {
+		if(potion->otyp == POT_SICKNESS) {
+			useup(potion);
+			obj->spe++;	/* %% */
+		}
+	}
+	return(1);
+}
+//E*O*F hack.potion.c//
+
+exit 0
+
+

@@ -1,0 +1,195 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,f908298645fdfb7d,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1986-03-22 07:20:27 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/3/84; site maynard.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!genrad!panda!talcott!wjh12!maynard!campbell
+From: campbell@maynard.UUCP (Larry Campbell)
+Newsgroups: net.sources
+Subject: Find lost blocks in V6 filesystem
+Message-ID: <272@maynard.UUCP>
+Date: Sat, 22-Mar-86 10:20:27 EST
+Article-I.D.: maynard.272
+Posted: Sat Mar 22 10:20:27 1986
+Date-Received: Tue, 25-Mar-86 02:45:18 EST
+Distribution: net
+Organization: The Boston Software Works Inc., Maynard, MA
+Lines: 174
+
+V6 and V7 apparently have filesystem bug(s) that can result in a file
+claiming to be n bytes long but actually owning many more than (n+511)/512
+blocks.  fsck doesn't help;  everything seems consistent, but when you
+add everything up you find that you're short several thousand blocks.
+
+This program, originally written for V7 by Fred Toth, is a lifesaver.
+It will find all the files that incorrectly own big chunks of the disk;
+you can then copy the files (cp only copies up to the EOF pointer) and
+delete the original to free up the space.  I have modified it for V6
+filesystems to run on my VENIX 2.0 system (V7 kernel with V6 filesystem).
+
+Share and enjoy.
+------------------------------cut here------------------------------
+/*
+ * This posting is for those interested in the 'disappearing disk space'
+ * discussion in net.unix-wizards.
+ *
+ * Fred Toth
+ * Washburn Graphics, Inc.
+ * Charlotte, NC
+ * decvax!mcnc!unccvax!wgivax!fpt
+ *
+ * scani.c
+ *
+ * This program scans a v7 file system, looking for inodes
+ * that have more blocks allocated to them then they need
+ * based on the size field.
+ *
+ * It reads it's standard input and reports inode numbers.
+ * Ncheck can then be used to find the files.
+ * Copying them and deleting the original will free the blocks.
+ *
+ ***********************************************************************
+ *
+ * Modified for V6 (VENIX, actually, V7 kernel with V6 filesystem)
+ * by Larry Campbell (maynard!campbell)
+ *
+ */
+#include <stdio.h>
+#include <sys/param.h>
+#include <sys/filsys.h>
+#include <sys/ino.h>
+
+struct filsys sb;
+
+struct inode mynod;
+
+#define NADDR 8		/* number of disk address in inode */
+#define SINODE 32	/* size of an inode in bytes */
+#define BLKSIZ 512	/* size of a disk block */
+#define NBLKADR (BLKSIZ / (sizeof daddr_t))	/* disk addresses per block */
+
+long ci, cii, ciii;
+
+main()
+{
+	int i;
+	unsigned toti, in;
+	long has, need, countb(), extra, totex, totb, size;
+	int files;
+
+	files = 0;
+	totb = totex = 0L;
+	lseek(0, (long) BLKSIZ, 0);
+	read(0, &sb, sizeof(struct filsys));
+	toti = (sb.s_isize - 2) * (BLKSIZ / SINODE);
+	printf("%u inodes\n", toti);
+	lseek(0, (long) BLKSIZ*2, 0);
+	in = 0;
+	while (toti--) {
+		in++;
+		lseek(0, (((long) in - 1L) * 32L) + (long) BLKSIZ*2, 0);
+		if (read(0, &mynod, sizeof(struct inode)) == NULL)
+			break;
+		if (mynod.i_mode) {
+			if (mynod.i_mode & IFCHR)
+				continue;
+			files++;
+			size = (((long) mynod.i_size0) << 16) + mynod.i_size1;
+			need = (size + (BLKSIZ-1)) / BLKSIZ;
+			if ((has = countb()) > need) {
+				extra = has - need;
+				totex += extra;
+				printf("i %u, needs %D, has %D, %D extra\n", in, need, has, extra);
+			}
+			totb += has;
+		}
+	}
+	printf("Did %u inodes, %d files\n", in, files);
+	printf("%D extra allocated blocks\n", totex);
+	printf("%D data, %D i, %D, ii, %D iii\n", totb, ci, cii, ciii);
+}
+long
+countb()
+{
+	int i;
+	long count, cindir(), cdoub(), ctrip();
+
+	count = 0;
+	if (mynod.i_mode & ILARG)
+	    {
+	    for (i = 0; i < 6; i++)
+		if (mynod.i_addr[i])
+		    count += cindir(mynod.i_addr[i]);
+	    if (mynod.i_addr[7])
+	        count += cdoub(mynod.i_addr[7]);
+	    }
+	else
+	    for (i = 0; i < 7; i++)
+		if (mynod.i_addr[i])
+		    count++;
+	return(count);
+}
+long
+cindir(blk)
+daddr_t blk;
+{
+	long count;
+	daddr_t ib[256];
+	int i;
+
+	count = 0;
+	getblk(ib, blk);
+	ci++;
+	for (i = 0; i < 256; i++)
+		if (ib[i])
+			count++;
+	return(count);
+}
+getblk(p, no)
+char *p;
+daddr_t no;
+{
+	lseek(0, ((long) no) * BLKSIZ, 0);
+	if (read(0, p, BLKSIZ) <= 0)
+		printf("bad read, b %D\n", no);
+}
+long
+cdoub(blk)
+daddr_t blk;
+{
+	daddr_t dib[256];
+	long count;
+	int i;
+
+	count = 0;
+	getblk(dib, blk);
+	cii++;
+	for (i = 0; i < 256; i++)
+		if (dib[i])
+			count += cindir(dib[i]);
+	return(count);
+}
+long
+ctrip(blk)
+daddr_t blk;
+{
+	daddr_t tib[256];
+	long count;
+	int i;
+
+	count = 0;
+	getblk(tib, blk);
+	ciii++;
+	for (i = 0; i < 256; i++)
+		if (tib[i])
+			count += cdoub(tib[i]);
+	return(count);
+}
+
+-- 
+Larry Campbell                                 The Boston Software Works, Inc.
+ARPA: maynard.UUCP:campbell@harvard.ARPA       120 Fulton Street
+UUCP: {harvard,cbosgd}!wjh12!maynard!campbell  Boston MA 02109
+
+

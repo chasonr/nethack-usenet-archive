@@ -1,0 +1,2008 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,aa1c04597cc2398b,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1993-06-10 18:02:01 PST
+Path: gmd.de!newsserver.jvnc.net!howland.reston.ans.net!gatech!emory!ogicse!news.tek.com!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v17i105:  nethack31 - display oriented dungeons & dragons (Ver. 3.1), Patch2dd/33
+Message-ID: <1v8j2d$je0@ying.cna.tek.com>
+Date: 11 Jun 93 00:19:25 GMT
+Article-I.D.: ying.1v8j2d$je0
+Organization: Tektronix, Inc, Redmond, OR, USA
+Lines: 1990
+Approved: billr@saab.CNA.TEK.COM
+NNTP-Posting-Host: saab.cna.tek.com
+
+Submitted-by: izchak@linc.cis.upenn.edu (Izchak Miller)
+Posting-number: Volume 17, Issue 105
+Archive-name: nethack31/Patch2dd
+Patch-To: nethack31: Volume 16, Issue 1-116
+Environment: Amiga, Atari, Mac, MS-DOS, Windows-NT, OS2, Unix, VMS, X11
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 30 (of 33)."
+# Contents:  sys/mac/mrecover.c sys/os2/Install.os2
+#   sys/winnt/Install.nt
+# Wrapped by billr@saab on Thu Jun 10 16:55:08 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'sys/mac/mrecover.c' -a "${1}" != "-c" ; then 
+  echo shar: Renaming existing file \"'sys/mac/mrecover.c'\" to \"'sys/mac/mrecover.c.orig'\"
+  mv -f 'sys/mac/mrecover.c' 'sys/mac/mrecover.c.orig'
+fi
+echo shar: Extracting \"'sys/mac/mrecover.c'\" \(30445 characters\)
+sed "s/^X//" >'sys/mac/mrecover.c' <<'END_OF_FILE'
+X/*	SCCS Id: @(#)mrecover.c	3.1	           93/04/15       */
+X/*      Copyright (c) David Hairston, 1993.                       */
+X/* NetHack may be freely redistributed.  See license for details. */
+X
+X/* Macintosh Recovery Application */
+X
+X/* based on code in util/recover.c.  the significant differences are:
+X * - define MAC is implicit so config.h is not included (95% laziness).
+X * - GUI vs. CLI.  the vast majority of code here supports the GUI.
+X * - Mac toolbox equivalents are used in place of ANSI functions.
+X * - void restore_savefile(void) is event driven.
+X * - integral type substitutions here and there.
+X */
+X
+X/*
+X * Think C 5.0.4 project specs:
+X * signature: 'nhRc'
+X * SIZE (-1) info: flags: 0x5880, size: 65536L/65536L (64k/64k)
+X * libraries: MacTraps [yes], MacTraps2 (HFileStuff) [yes], ANSI [no]
+X * compatibility: system 6 and system 7
+X * misc: sizeof(int): 4, "\p": unsigned char, enum size varies,
+X *   prototypes required, type checking enforced, no optimizers,
+X *   FAR CODE [no], FAR DATA [no], SEPARATE STRS [no], single segment,
+X *   short macsbug symbols
+X */
+X 
+X/*
+X * To do (maybe, just maybe):
+X * - Merge with the code in util/recover.c.
+X * - Document launch (e.g. GUI equivalent of 'recover basename').
+X * - Drag and drop.
+X * - Internal memory tweaks (stack and heap usage).
+X * - Use status file to allow resuming aborted recoveries.
+X * - Bundle 'LEVL' files with recover (easier document launch).
+X * - Prohibit recovering games "in progress".
+X * - Share AppleEvents with NetHack to auto-recover crashed games.
+X */
+X
+X#if 1
+X/************************************************************************\
+X * (1) precompile header => mrecover.h, (0) compile code
+X\************************************************************************/
+X
+X/**** Toolbox defines ****/
+X
+X/* MPW C headers (99.44% pure) */
+X#include <Types.h>
+X#include <Errors.h>
+X#include <Memory.h>
+X#include <OSUtils.h>
+X#include <Resources.h>
+X#include <Files.h>
+X#include <SysEqu.h>
+X#include <SegLoad.h>
+X
+X#include <Quickdraw.h>
+X#include <Fonts.h>
+X#include <Windows.h>
+X#include <Menus.h>
+X#include <Dialogs.h>
+X
+X#include <Desk.h>
+X#include <DiskInit.h>
+X#include <Events.h>
+X#include <Notification.h>
+X#include <Packages.h>
+X#include <Script.h>
+X#include <StandardFile.h>
+X#include <ToolUtils.h>
+X
+X#if 1	/* glue for System 7 Icon Family call (needed by Think C 5.0.4) */
+Xpascal OSErr GetIconSuite(Handle *theIconSuite, short theResID, long selector)
+X	= {0x303C, 0x0501, 0xABC9};
+X#endif
+X
+X
+X/**** Application defines ****/
+X
+X/* Memory */
+Xtypedef struct memBytes	/* format of 'memB' resource, preloaded/locked */
+X{
+X	short	memReserved;
+X	short	memCleanup;	/* 4   - memory monitor activity limit */
+X	long	memPreempt;	/* 32k - start iff FreeMem() > */
+X	long	memWarning;	/* 12k - warn if MaxMem() < */
+X	long	memAbort;	/* 4k  - abort if MaxMem() < */
+X	long	memIOBuf;	/* 16k - read/write buffer size */
+X} memBytes, *memBytesPtr, **memBytesHandle;
+X
+X#define membID			128				/* 'memB' resource ID */
+X
+X
+X/* Cursor */
+X#define CURS_FRAME		4L				/* 1/15 second - spin cursor */
+X#define CURS_LATENT		60L				/* pause before spin cursor */
+X#define curs_Init		(-1)			/* token for set arrow */
+X#define curs_Total		8				/* maybe 'acur' would be better */
+X#define cursorOffset	128				/* GetCursor(cursorOffset + i) */
+X
+X
+X/* Menu */
+Xenum
+X{
+X	mbar_Init = -1,
+X	mbarAppl,							/* normal mode */
+X	mbarRecover,						/* in recovery mode */
+X	mbarDA								/* DA in front mode */
+X};
+Xenum
+X{
+X	menuApple,
+X	menuFile,
+X	menuEdit,
+X	menu_Total,
+X
+X	muidApple = 128,
+X	muidFile,
+X	muidEdit
+X};
+Xenum
+X{
+X	/* Apple menu */
+X	mitmAbout = 1,
+X	mitmHelp,
+X	____128_1,
+X
+X	/* File menu */
+X	mitmOpen = 1,
+X	____129_1,
+X	mitmClose_DA,
+X	____129_2,
+X	mitmQuit
+X
+X	/* standard minimum required Edit menu */
+X};
+X
+X
+X/* Alerts */
+Xenum
+X{
+X	alrtNote,							/* general messages */
+X	alrtHelp,							/* help message */
+X	alrt_Total,
+X
+X	alertAppleMenu = 127,				/* menuItem to alert ID offset */
+X	alidNote,
+X	alidHelp
+X};
+X
+X#define aboutBufSize	80				/* i.e. 2 lines of 320 pixels */
+X
+X
+X/* Notification */
+X#define nmBufSize		(32 + aboutBufSize + 32)
+Xtypedef struct notifRec
+X{
+X	NMRec				nmr;
+X	struct notifRec	*	nmNext;
+X	short				nmDispose;
+X	unsigned char		nmBuf[nmBufSize];
+X} notifRec, *notifPtr;
+X
+X#define nmPending		nmRefCon			/* &in.Notify */
+X#define iconNotifyID	128
+X#define ics_1_and_4		0x00000300
+X
+X/* Dialogs */
+Xenum
+X{
+X	dlogProgress = 256
+X};
+Xenum
+X{
+X	uitmThermo = 1
+X};
+Xenum
+X{
+X	initItem,
+X	invalItem,
+X	drawItem
+X};
+X
+X
+X/* Miscellaneous */
+Xtypedef struct modeFlags
+X{
+X	short	Front;			/* fg/bg event handling */
+X	short	Notify;			/* level of pending NM notifications */
+X	short	Dialog;			/* a modeless dialog is open */
+X	short	Recover;		/* restoration progress index */
+X} modeFlags;
+X
+X/* convenient define to allow easier (for me) parsing of 'vers' resource */
+Xtypedef struct versXRec
+X{
+X	NumVersion		numVers;
+X	short			placeCode;
+X	unsigned char	versStr[];	/* (small string)(large string) */
+X} versXRec, *versXPtr, **versXHandle;
+X
+X#else
+X/************************************************************************\
+X * compile source code
+X\************************************************************************/
+X
+X#include "mrecover.h"
+X
+X/**** Global variables ****/
+XmodeFlags		in = {1};				/* in Front */
+XEventRecord		wnEvt;
+XSysEnvRec		sysEnv;
+Xunsigned char	aboutBuf[aboutBufSize];	/* vers 1 "Get Info" string */
+XmemBytesPtr		pBytes;					/* memory management */
+Xunsigned short	memActivity;			/* more memory management */
+XMenuHandle		mHnd[menu_Total];
+XCursPtr			cPtr[curs_Total];		/* busy cursors */
+Xunsigned long	timeCursor;				/* next cursor frame time */
+Xshort			oldCursor = curs_Init;	/* see adjustGUI() below */
+XnotifPtr		pNMQ;					/* notification queue pointer */
+XnotifRec		nmt;					/* notification template */
+XDialogTHndl		thermoTHnd;
+XDialogRecord	dlgThermo;				/* progress thermometer */
+X#define DLGTHM	((DialogPtr) &dlgThermo)
+X#define WNDTHM	((WindowPtr) &dlgThermo)
+X#define GRFTHM	((GrafPtr) &dlgThermo)
+X
+XPoint			sfGetWhere;				/* top left corner of get file dialog */
+XPtr				pIOBuf;					/* read/write buffer pointer */
+Xshort			vRefNum;				/* SFGetFile working directory/volume refnum */
+Xlong			dirID;					/* directory i.d. */
+X
+X#define CREATOR		'nh31'				/* NetHack signature */
+X#define SAVETYPE	'SAVE'				/* save file type */
+X#define FILENAME	256					/* macconf.h */
+Xtypedef signed char	schar;				/* config.h */
+Xtypedef schar		xchar;				/* global.h */
+X#define MAX_RECOVER_COUNT	256
+X
+X#define APP_NAME_RES_ID		(-16396)	/* macfile.h */
+X#define PLAYER_NAME_RES_ID	1001		/* macfile.h */
+X
+X/* variables from util/recover.c */
+X#define SAVESIZE	FILENAME
+Xunsigned char	savename[SAVESIZE];		/* originally a C string */
+Xunsigned char	lock[256];				/* pascal string */
+X
+Xlong			hpid;					/* NetHack (unix-style) process i.d. */
+Xshort			saveRefNum;				/* save file descriptor */
+Xshort			gameRefNum;				/* level 0 file descriptor */
+Xshort			levRefNum;				/* level n file descriptor */
+X
+X
+X/**** Prototypes ****/
+Xstatic	void warmup(void);
+Xstatic	Handle alignTemplate(ResType, short, short, short, Point *);
+Xpascal	void nmCompletion(NMRec *);
+Xstatic	void noteErrorMessage(unsigned char *, unsigned char *);
+Xstatic	void note(short, short, unsigned char *);
+Xstatic	void adjustGUI(void);
+Xstatic	void adjustMemory(void);
+Xstatic	void optionMemStats(void);
+Xstatic	void MenuEvent(long);
+Xstatic	void eventLoop(void);
+Xstatic	void cooldown(void);
+X
+Xpascal	void drawThermo(WindowPtr, short);
+Xstatic	void itemizeThermo(short);
+Xpascal	Boolean basenameFileFilter(ParmBlkPtr);
+Xstatic	void beginRecover(void);
+Xstatic	void continueRecover(void);
+Xstatic	void endRecover(void);
+Xstatic	short saveRezStrings(void);
+X
+X/* analogous prototypes from util/recover.c */
+Xstatic	void set_levelfile_name(long);
+Xstatic	short open_levelfile(long);
+Xstatic	short create_savefile(unsigned char *);
+Xstatic	void copy_bytes(short, short);
+Xstatic	void restore_savefile(void);
+X
+X/* auxiliary prototypes */
+Xstatic	long read_levelfile(short, Ptr, long);
+Xstatic	long write_savefile(short, Ptr, long);
+Xstatic	void close_file(short *);
+Xstatic	void unlink_file(unsigned char *);
+X
+X
+X/**** Routines ****/
+X
+Xmain()
+X{
+X	/* heap adjust */
+X	MaxApplZone();
+X	MoreMasters();
+X	MoreMasters();
+X
+X	/* manager initialization */
+X	InitGraf(&qd.thePort);
+X	InitFonts();
+X	InitWindows();
+X	InitMenus();
+X	TEInit();
+X	InitDialogs((ResumeProcPtr) 0);
+X	InitCursor();
+X
+X	/* get system environment, notification requires 6.0 or better */
+X	(void) SysEnvirons(curSysEnvVers, &sysEnv);
+X	if (sysEnv.systemVersion < 0x0600)
+X	{
+X		ParamText("\pAbort: System 6.0 is required", "\p", "\p", "\p");
+X		(void) Alert(alidNote, (ModalFilterProcPtr) 0L);
+X		ExitToShell();
+X	}
+X
+X	warmup();
+X	eventLoop();
+X
+X	/* normally these routines are never reached from here */
+X	cooldown();
+X	ExitToShell();
+X}
+X
+Xstatic void
+Xwarmup()
+X{
+X	short		i;
+X
+X	/* pre-System 7 MultiFinder hack for smooth launch */
+X	for (i = 0; i < 10; i++)
+X	{
+X		if (WaitNextEvent(osMask, &wnEvt, 2L, (RgnHandle) 0L))
+X			if (((wnEvt.message & osEvtMessageMask) >> 24) == suspendResumeMessage)
+X				in.Front = (wnEvt.message & resumeFlag);
+X	}
+X
+X	/* clear out the Finder info */
+X	{
+X		short	message, count;
+X
+X		CountAppFiles(&message, &count);
+X		while(count)
+X			ClrAppFiles(count--);
+X	}
+X
+X	/* fill out the notification template */
+X	nmt.nmr.qType = nmType;
+X	nmt.nmr.nmMark = 1;
+X	nmt.nmr.nmSound = (Handle) -1L;		/* system beep */
+X	nmt.nmr.nmStr = nmt.nmBuf;
+X	nmt.nmr.nmResp = nmCompletion;
+X	nmt.nmr.nmPending = (long) &in.Notify;
+X
+X	/* prepend app name (31 chars or less) to notification buffer */
+X	{
+X		short	apRefNum;
+X		Handle	apParams;
+X
+X		GetAppParms(* (Str255 *) &nmt.nmBuf, &apRefNum, &apParams);
+X	}
+X
+X	/* add formatting (two line returns) */
+X	nmt.nmBuf[++(nmt.nmBuf[0])] = '\r';
+X	nmt.nmBuf[++(nmt.nmBuf[0])] = '\r';
+X
+X	/**** note() is usable now but not aesthetically complete ****/
+X
+X	/* get notification icon */
+X	if (sysEnv.systemVersion < 0x0700)
+X	{
+X		if (! (nmt.nmr.nmIcon = GetResource('SICN', iconNotifyID)))
+X			note(nilHandleErr, 0, "\pNil SICN Handle");
+X	}
+X	else
+X	{
+X		if (GetIconSuite(&nmt.nmr.nmIcon, iconNotifyID, ics_1_and_4))
+X			note(nilHandleErr, 0, "\pBad Icon Family");
+X	}
+X
+X	/* load and align various dialog/alert templates */
+X	(void) alignTemplate('ALRT', alidNote, 0, 4, (Point *) 0L);
+X	(void) alignTemplate('ALRT', alidHelp, 0, 4, (Point *) 0L);
+X
+X	thermoTHnd = (DialogTHndl) alignTemplate('DLOG', dlogProgress, 20, 8, (Point *) 0L);
+X
+X	(void) alignTemplate('DLOG', getDlgID, 0, 6, (Point *) &sfGetWhere);
+X
+X	/* get the "busy cursors" (preloaded/locked) */
+X	for (i = 0; i < curs_Total; i++)
+X	{
+X		CursHandle		cHnd;
+X
+X		if (! (cHnd = GetCursor(i + cursorOffset)))
+X			note(nilHandleErr, 0, "\pNil CURS Handle");
+X
+X		cPtr[i] = *cHnd;
+X	}
+X
+X	/* get the 'vers' 1 long (Get Info) string - About Recover... */
+X	{
+X		versXHandle		vHnd;
+X
+X		if (! (vHnd = (versXHandle) GetResource('vers', 1)))
+X			note(nilHandleErr, 0, "\pNil vers Handle");
+X
+X		i = (**vHnd).versStr[0] + 1;		/* offset to Get Info pascal string */
+X
+X		if ((aboutBuf[0] = (**vHnd).versStr[i]) > (aboutBufSize - 1))
+X			aboutBuf[0] = aboutBufSize - 1;
+X
+X		i++;
+X
+X		MoveHHi((Handle) vHnd);			/* DEE - Fense ... */
+X		HLock((Handle) vHnd);
+X		BlockMove(&((**vHnd).versStr[i]), &(aboutBuf[1]), aboutBuf[0]);
+X		ReleaseResource((Handle) vHnd);
+X	}
+X
+X	/* form the menubar */
+X	for (i = 0; i < menu_Total; i++)
+X	{
+X		if (! (mHnd[i] = GetMenu(i + muidApple)))
+X			note(nilHandleErr, 0, "\pNil MENU Handle");
+X
+X		/* expand the apple menu */
+X		if (i == menuApple)
+X			AddResMenu(mHnd[menuApple], 'DRVR');
+X
+X		InsertMenu(mHnd[i], 0);
+X	}
+X
+X	/* pre-emptive memory check */
+X	{
+X		memBytesHandle	hBytes;
+X		Size			grow;
+X
+X		if (! (hBytes = (memBytesHandle) GetResource('memB', membID)))
+X			note(nilHandleErr, 0, "\pNil Memory Handle");
+X
+X		pBytes = *hBytes;
+X
+X		if (MaxMem(&grow) < pBytes->memPreempt)
+X			note(memFullErr, 0, "\pMore Memory Required\rTry adding 16k");
+X
+X		memActivity = pBytes->memCleanup;		/* force initial cleanup */
+X	}
+X
+X	/* get the I/O buffer */
+X	if (! (pIOBuf = NewPtr(pBytes->memIOBuf)))
+X		note(memFullErr, 0, "\pNil I/O Pointer");
+X}
+X
+X/* align a window-related template to the main screen */
+Xstatic Handle
+XalignTemplate(ResType rezType, short rezID, short vOff, short vDenom, Point *pPt)
+X{
+X	Handle	rtnHnd;
+X	Rect	*pRct;
+X
+X	vOff += GetMBarHeight();
+X
+X	if (! (rtnHnd = GetResource(rezType, rezID)))
+X		note(nilHandleErr, 0, "\pNil Template Handle");
+X
+X	pRct = (Rect *) *rtnHnd;
+X
+X	/* don't move memory while aligning rect */
+X	pRct->right -= pRct->left;		/* width */
+X	pRct->bottom -= pRct->top;		/* height */
+X	pRct->left = (qd.screenBits.bounds.right - pRct->right) / 2;
+X	pRct->top = (qd.screenBits.bounds.bottom - pRct->bottom - vOff) / vDenom;
+X	pRct->top += vOff;
+X	pRct->right += pRct->left;
+X	pRct->bottom += pRct->top;
+X
+X	if (pPt)
+X		*pPt = * (Point *) pRct;	/* top left corner */
+X
+X	return rtnHnd;
+X}
+X
+X/* notification completion routine */
+Xpascal void
+XnmCompletion(NMRec * pNMR)
+X{
+X	(void) NMRemove(pNMR);
+X
+X	(* (short *) (pNMR->nmPending))--;	/* decrement pending note level */
+X	((notifPtr) pNMR)->nmDispose = 1;	/* allow DisposPtr() */
+X}
+X
+X/*
+X * handle errors inside of note().  the error message is appended to the
+X * given message but on a separate line and must fit within nmBufSize.
+X */
+Xstatic void
+XnoteErrorMessage(unsigned char *msg, unsigned char *errMsg)
+X{
+X	short	i = nmt.nmBuf[0] + 1;		/* insertion point */
+X
+X	BlockMove(&msg[1], &nmt.nmBuf[i], msg[0]);
+X	nmt.nmBuf[i + msg[0]] = '\r';
+X	nmt.nmBuf[0] += (msg[0] + 1);
+X
+X	note(memFullErr, 0, errMsg);
+X}
+X
+X/*
+X * display messages using Notification Manager or an alert.
+X * no run-length checking is done.  the messages are created to fit
+X * in the allocated space (nmBufSize and aboutBufSize).
+X */
+Xstatic void
+Xnote(short errorSignal, short alertID, unsigned char *msg)
+X{
+X	if (! errorSignal)
+X	{
+X		Size	grow;
+X
+X		if (MaxMem(&grow) < pBytes->memAbort)
+X			noteErrorMessage(msg, "\pOut of Memory");
+X	}
+X
+X	if (errorSignal || !in.Front)
+X	{
+X		notifPtr	pNMR;
+X		short		i = nmt.nmBuf[0] + 1;	/* insertion point */
+X
+X		if (errorSignal)		/* use notification template */
+X		{
+X			pNMR = &nmt;
+X
+X			/* we're going to abort so add in this prefix */
+X			BlockMove("Abort: ", &nmt.nmBuf[i], 7);
+X			i += 7;
+X			nmt.nmBuf[0] += 7;
+X		}
+X		else					/* allocate a notification record */
+X		{
+X			if (! (pNMR = (notifPtr) NewPtr(sizeof(notifRec))))
+X				noteErrorMessage(msg, "\pNil New Pointer");
+X
+X			/* initialize it */
+X			*pNMR = nmt;
+X			pNMR->nmr.nmStr = (StringPtr) &(pNMR->nmBuf);
+X
+X			/* update the notification queue */
+X			if (!pNMQ)
+X				pNMQ = pNMR;
+X			else
+X			{
+X				notifPtr	pNMX;
+X
+X				/* find the end of the queue */
+X				for (pNMX = pNMQ; pNMX->nmNext; pNMX = pNMX->nmNext)
+X					;
+X
+X				pNMX->nmNext = pNMR;
+X			}
+X		}
+X
+X		/* concatenate the message */
+X		BlockMove(&msg[1], &((pNMR->nmBuf)[i]), msg[0]);
+X		(pNMR->nmBuf)[0] += msg[0];
+X
+X		in.Notify++;			/* increase note pending level */
+X
+X		NMInstall((NMRec *) pNMR);
+X
+X		if (errorSignal)
+X			cooldown();
+X
+X		return;
+X	}
+X
+X	/* in front and no error so use an alert */
+X	ParamText(msg, "\p", "\p", "\p");
+X	(void) Alert(alertID, (ModalFilterProcPtr) 0L);
+X	ResetAlrtStage();
+X
+X	memActivity++;
+X}
+X
+Xstatic void
+XadjustGUI()
+X{
+X	static short	oldMenubar = mbar_Init;	/* force initial update */
+X	short			newMenubar;
+X	WindowPeek		frontWindow;
+X
+X	/* oldCursor is external so it can be reset in endRecover() */
+X	static short	newCursor = curs_Init;
+X	unsigned long	timeNow;
+X	short			useArrow;
+X
+X	/* adjust menubar 1st */
+X	newMenubar = in.Recover ? mbarRecover : mbarAppl;
+X
+X	/* desk accessories take precedence */
+X	if (frontWindow = (WindowPeek) FrontWindow())
+X		if (frontWindow->windowKind < 0)
+X			newMenubar = mbarDA;
+X
+X	if (newMenubar != oldMenubar)
+X	{
+X		/* adjust menus */
+X		switch (oldMenubar = newMenubar)
+X		{
+X		case mbarAppl:
+X			EnableItem(mHnd[menuFile], mitmOpen);
+X			SetItemMark(mHnd[menuFile], mitmOpen, noMark);
+X			DisableItem(mHnd[menuFile], mitmClose_DA);
+X			DisableItem(mHnd[menuEdit], 0);
+X			break;
+X
+X		case mbarRecover:
+X			DisableItem(mHnd[menuFile], mitmOpen);
+X			SetItemMark(mHnd[menuFile], mitmOpen, checkMark);
+X			DisableItem(mHnd[menuFile], mitmClose_DA);
+X			DisableItem(mHnd[menuEdit], 0);
+X			break;
+X
+X		case mbarDA:
+X			DisableItem(mHnd[menuFile], mitmOpen);
+X			EnableItem(mHnd[menuFile], mitmClose_DA);
+X			EnableItem(mHnd[menuEdit], 0);
+X			break;
+X		}
+X
+X		DrawMenuBar();
+X	}
+X
+X	/* now adjust the cursor */
+X	if (useArrow = (!in.Recover || (newMenubar == mbarDA)))
+X		newCursor = curs_Init;
+X	else if ((timeNow = TickCount()) >= timeCursor)		/* spin cursor */
+X	{
+X		timeCursor = timeNow + CURS_FRAME;
+X		if (++newCursor >= curs_Total)
+X			newCursor = 0;
+X	}
+X
+X	if (newCursor != oldCursor)
+X	{
+X		oldCursor = newCursor;
+X
+X		SetCursor(useArrow ? &qd.arrow : cPtr[newCursor]);
+X	}
+X}
+X
+Xstatic void
+XadjustMemory()
+X{
+X	Size		grow;
+X
+X	memActivity = 0;
+X
+X	if (MaxMem(&grow) < pBytes->memWarning)
+X		note(noErr, alidNote, "\pWarning: Memory is running low");
+X
+X	(void) ResrvMem((Size) FreeMem());		/* move all handles high */
+X}
+X
+X/* show memory stats: FreeMem, MaxBlock, PurgeSpace, and StackSpace */
+Xstatic void
+XoptionMemStats()
+X{
+X	unsigned char	*pFormat = "\pFree:#k  Max:#k  Purge:#k  Stack:#k";
+X	char			*pSub = "#";		/* not a pascal string */
+X	unsigned char	nBuf[16];
+X	long			nStat, contig;
+X	Handle			strHnd;
+X	long			nOffset;
+X	short			i;
+X
+X	if (wnEvt.modifiers & shiftKey)
+X		adjustMemory();
+X
+X	if (! (strHnd = NewHandle((Size) 128)))
+X	{
+X		note(noErr, alidNote, "\pOops: Memory stats unavailable!");
+X		return;
+X	}
+X	
+X	SetString((StringHandle) strHnd, pFormat);
+X	nOffset = 1L;
+X
+X	for (i = 1; i <= 4; i++)
+X	{
+X		/* get the replacement number stat */
+X		switch (i)
+X		{
+X		case 1: nStat = FreeMem();				break;
+X		case 2: nStat = MaxBlock();				break;
+X		case 3: PurgeSpace(&nStat, &contig);	break;
+X		case 4: nStat = StackSpace();			break;
+X		}
+X
+X		NumToString((nStat >> 10), * (Str255 *) &nBuf);
+X
+X		**strHnd += nBuf[0] - 1;
+X		nOffset = Munger(strHnd, nOffset, (Ptr) pSub, 1L, (Ptr) &nBuf[1], nBuf[0]);
+X	}
+X
+X	MoveHHi(strHnd);
+X	HLock(strHnd);
+X	note(noErr, alidNote, (unsigned char *) *strHnd);
+X	DisposHandle(strHnd);
+X}
+X
+Xstatic void
+XMenuEvent(long menuEntry)
+X{
+X	short menuID = HiWord(menuEntry);
+X	short menuItem = LoWord(menuEntry);
+X
+X	switch (menuID)
+X	{
+X	case muidApple:
+X		switch (menuItem)
+X		{
+X		case mitmAbout:
+X			if (wnEvt.modifiers & optionKey)
+X				optionMemStats();
+X			/* fall thru */
+X		case mitmHelp:
+X			note(noErr, (alertAppleMenu + menuItem), aboutBuf);
+X			break;
+X
+X		default:	/* DA's or apple menu items */
+X			{
+X				unsigned char	daName[32];
+X
+X				GetItem(mHnd[menuApple], menuItem, * (Str255 *) &daName);
+X				(void) OpenDeskAcc(daName);
+X
+X				memActivity++;
+X			}
+X			break;
+X		}
+X		break;
+X
+X	case muidFile:
+X		switch (menuItem)
+X		{
+X		case mitmOpen:
+X			beginRecover();
+X			break;
+X
+X		case mitmClose_DA:
+X			{
+X				WindowPeek	frontWindow;
+X				short		refNum;
+X
+X				if (frontWindow = (WindowPeek) FrontWindow())
+X					if ((refNum = frontWindow->windowKind) < 0)
+X						CloseDeskAcc(refNum);
+X
+X				memActivity++;
+X			}
+X			break;
+X
+X		case mitmQuit:
+X			cooldown();
+X			break;
+X		}
+X		break;
+X
+X	case muidEdit:
+X		(void) SystemEdit(menuItem - 1);
+X		break;
+X	}
+X
+X	HiliteMenu(0);
+X}
+X
+Xstatic void
+XeventLoop()
+X{
+X	short	wneMask = (in.Front ? everyEvent : (osMask + updateMask));
+X	long	wneSleep = (in.Front ? 0L : 3L);
+X
+X	while (1)
+X	{
+X		if (in.Front)
+X			adjustGUI();
+X
+X		if (memActivity >= pBytes->memCleanup)
+X			adjustMemory();
+X
+X		(void) WaitNextEvent(wneMask, &wnEvt, wneSleep, (RgnHandle) 0L);
+X
+X		if (in.Dialog)
+X			(void) IsDialogEvent(&wnEvt);
+X
+X		switch (wnEvt.what)
+X		{
+X		case osEvt:
+X			if (((wnEvt.message & osEvtMessageMask) >> 24) == suspendResumeMessage)
+X			{
+X				in.Front = (wnEvt.message & resumeFlag);
+X				wneMask = (in.Front ? everyEvent : (osMask + updateMask));
+X				wneSleep = (in.Front ? 0L : 3L);
+X			}
+X			break;
+X
+X		case nullEvent:
+X			/* adjust the FIFO notification queue */
+X			if (pNMQ && pNMQ->nmDispose)
+X			{
+X				notifPtr pNMX = pNMQ->nmNext;
+X
+X				DisposPtr((Ptr) pNMQ);
+X				pNMQ = pNMX;
+X
+X				memActivity++;
+X			}
+X
+X			if (in.Recover)
+X				continueRecover();
+X			break;
+X
+X		case mouseDown:
+X			{
+X				WindowPtr	whichWindow;
+X				
+X				switch(FindWindow( wnEvt . where , &whichWindow))
+X				{
+X				case inMenuBar:
+X					MenuEvent(MenuSelect( wnEvt . where ));
+X					break;
+X
+X				case inSysWindow:
+X					SystemClick(&wnEvt, whichWindow);
+X					break;
+X
+X				case inDrag:
+X					{
+X						Rect	boundsRect = qd.screenBits.bounds;
+X						Point	offsetPt;
+X
+X						InsetRect(&boundsRect, 4, 4);
+X						boundsRect.top += GetMBarHeight();
+X
+X						DragWindow(whichWindow, * ((Point *) &wnEvt.where), &boundsRect);
+X
+X						boundsRect = whichWindow->portRect;
+X						offsetPt = * (Point *) &(whichWindow->portBits.bounds);
+X						OffsetRect(&boundsRect, -offsetPt.h, -offsetPt.v);
+X
+X						* (Rect *) *thermoTHnd = boundsRect;
+X					}
+X					break;
+X				}
+X			}
+X			break;
+X
+X		case keyDown:
+X			{
+X				char	key = (wnEvt.message & charCodeMask);
+X
+X				if (wnEvt.modifiers & cmdKey)
+X				{
+X					if (key == '.')
+X					{
+X						if (in.Recover)
+X						{
+X							endRecover();
+X							note(noErr, alidNote, "\pSorry: Recovery aborted");
+X						}
+X					}
+X					else
+X						MenuEvent(MenuKey(key));
+X				}
+X			}
+X			break;
+X
+X		/* without windows these events belong to our thermometer */
+X		case updateEvt:
+X		case activateEvt:
+X		{
+X			DialogPtr	dPtr;
+X			short		itemHit;
+X
+X			(void) DialogSelect(&wnEvt, &dPtr, &itemHit);
+X		}
+X
+X		case diskEvt:
+X			if (HiWord(wnEvt.message))
+X			{
+X				Point	pt = {60, 60};
+X
+X				(void) DIBadMount(pt, wnEvt.message);
+X				DIUnload();
+X
+X				memActivity++;
+X			}
+X			break;
+X		}			/* switch (wnEvt.what) */
+X	}				/* while (1) */
+X}
+X
+Xstatic void
+Xcooldown()
+X{
+X	if (in.Recover)
+X		endRecover();
+X
+X	/* wait for pending notifications to complete */
+X	while (in.Notify)
+X		(void) WaitNextEvent(0, &wnEvt, 3L, (RgnHandle) 0L);
+X
+X	ExitToShell();
+X}
+X
+X/* draw the progress thermometer and frame.  1 level <=> 1 horiz. pixel */
+Xpascal void
+XdrawThermo(WindowPtr wPtr, short inum)
+X{
+X	itemizeThermo(drawItem);
+X}
+X
+X/* manage progress thermometer dialog */
+Xstatic void
+XitemizeThermo(short itemMode)
+X{
+X	short	iTyp, iTmp;
+X	Handle	iHnd;
+X	Rect	iRct;
+X
+X	GetDItem(DLGTHM, uitmThermo, &iTyp, &iHnd, &iRct);
+X
+X	switch(itemMode)
+X	{
+X	case initItem:
+X		SetDItem(DLGTHM, uitmThermo, iTyp, (Handle) drawThermo, &iRct);
+X		break;
+X
+X	case invalItem:
+X		{
+X			GrafPtr	oldPort;
+X
+X			GetPort(&oldPort);
+X			SetPort(GRFTHM);
+X
+X			InsetRect(&iRct, 1, 1);
+X			InvalRect(&iRct);
+X
+X			SetPort(oldPort);
+X		}
+X		break;
+X
+X	case drawItem:
+X			FrameRect(&iRct);
+X			InsetRect(&iRct, 1, 1);
+X
+X			iTmp = iRct.right;
+X			iRct.right = iRct.left + in.Recover;
+X			PaintRect(&iRct);
+X
+X			iRct.left = iRct.right;
+X			iRct.right = iTmp;
+X			EraseRect(&iRct);
+X		break;
+X	}
+X}
+X
+X/* show only <pid-plname>.0 files in get file dialog */
+Xpascal Boolean
+XbasenameFileFilter(ParmBlkPtr pPB)
+X{
+X	unsigned char	*pC;
+X
+X	if (! (pC = (unsigned char *) pPB->fileParam.ioNamePtr))
+X		return true;
+X
+X	if ((*pC < 4) || (*pC > 28))						/* save/ 1name .0 */
+X		return true;
+X
+X	if ((pC[*pC - 1] == '.') && (pC[*pC] == '0'))		/* bingo! */
+X		return false;
+X
+X	return true;
+X}
+X
+Xstatic void
+XbeginRecover()
+X{
+X	SFTypeList		levlType = {'LEVL'};
+X	SFReply			sfGetReply;
+X
+X	SFGetFile(sfGetWhere, "\p", &basenameFileFilter, 1, levlType,
+X				(DlgHookProcPtr) 0L, &sfGetReply);
+X
+X	memActivity++;
+X
+X	if (! sfGetReply.good)
+X		return;
+X
+X	/* get volume (working directory) refnum, basename, and directory i.d. */
+X	vRefNum = sfGetReply.vRefNum;
+X	BlockMove(sfGetReply.fName, lock, sfGetReply.fName[0] + 1);
+X	{
+X		static CInfoPBRec	catInfo;
+X
+X		catInfo.hFileInfo.ioNamePtr = (StringPtr) sfGetReply.fName;
+X		catInfo.hFileInfo.ioVRefNum = sfGetReply.vRefNum;
+X		catInfo.hFileInfo.ioDirID = 0L;
+X
+X		if (PBGetCatInfoSync(&catInfo))
+X		{
+X			note(noErr, alidNote, "\pSorry: Bad File Info");
+X			return;
+X		}
+X
+X		dirID = catInfo.hFileInfo.ioFlParID;
+X	}
+X
+X	/* open the progress thermometer dialog */
+X	(void) GetNewDialog(dlogProgress, (Ptr) &dlgThermo, (WindowPtr) -1L);
+X	if (ResError() || MemError())
+X		note(noErr, alidNote, "\pOops: Progress thermometer unavailable");
+X	else
+X	{
+X		in.Dialog = 1;
+X		memActivity++;
+X
+X		itemizeThermo(initItem);
+X
+X		ShowWindow(WNDTHM);
+X	}
+X
+X	timeCursor = TickCount() + CURS_LATENT;
+X	saveRefNum = gameRefNum = levRefNum = -1;
+X	in.Recover = 1;
+X}
+X
+Xstatic void
+XcontinueRecover()
+X{
+X	restore_savefile();
+X
+X	/* update the thermometer */
+X	if (in.Dialog && ! (in.Recover % 4))
+X		itemizeThermo(invalItem);
+X
+X	if (in.Recover <= MAX_RECOVER_COUNT)
+X		return;
+X
+X	endRecover();
+X
+X	if (saveRezStrings())
+X		return;
+X
+X	note(noErr, alidNote, "\pOK: Recovery succeeded");
+X}
+X
+X/* no messages from here (since we might be quitting) */
+Xstatic void
+XendRecover()
+X{
+X	in.Recover = 0;
+X
+X	oldCursor = curs_Init;
+X	SetCursor(&qd.arrow);
+X
+X	/* clean up abandoned files */
+X	if (gameRefNum >= 0)
+X		(void) FSClose(gameRefNum);
+X
+X	if (levRefNum >= 0)
+X		(void) FSClose(levRefNum);
+X
+X	if (saveRefNum >= 0)
+X	{
+X		(void) FSClose(saveRefNum);
+X		(void) FlushVol((StringPtr) 0L, vRefNum);
+X		/* its corrupted so trash it ... */
+X		(void) HDelete(vRefNum, dirID, savename);
+X	}
+X
+X	saveRefNum = gameRefNum = levRefNum = -1;
+X
+X	/* close the progress thermometer dialog */
+X	in.Dialog = 0;
+X	CloseDialog(DLGTHM);
+X	DisposHandle(dlgThermo.items);
+X	memActivity++;
+X}
+X
+X/* add friendly, non-essential resource strings to save file */
+Xstatic short
+XsaveRezStrings()
+X{
+X	short			sRefNum;
+X	StringHandle	strHnd;
+X	short			i, rezID;
+X	unsigned char	*plName;
+X
+X	HCreateResFile(vRefNum, dirID, savename);
+X
+X	sRefNum = HOpenResFile(vRefNum, dirID, savename, fsRdWrPerm);
+X	if (sRefNum <= 0)
+X	{
+X		note(noErr, alidNote, "\pOK: Minor resource map error");
+X		return 1;
+X	}
+X
+X	/* savename and hpid get mutilated here... */
+X	plName = savename + 5;				/* save/ */
+X	*savename -= 5;
+X	do
+X	{
+X		plName++;
+X		(*savename)--;
+X		hpid /= 10L;
+X	}
+X	while (hpid);
+X	*plName = *savename;
+X
+X	for (i = 1; i <= 2; i++)
+X	{
+X		switch (i)
+X		{
+X		case 1:
+X			rezID = PLAYER_NAME_RES_ID;
+X			strHnd = NewString(* (Str255 *) plName);
+X			break;
+X
+X		case 2:
+X			rezID = APP_NAME_RES_ID;
+X			strHnd = NewString(* (Str255 *) "\pNetHack");
+X			break;
+X		}
+X
+X		if (! strHnd)
+X		{
+X			note(noErr, alidNote, "\pOK: Minor \'STR \' resource error");
+X			CloseResFile(sRefNum);
+X			return 1;
+X		}
+X
+X		/* should check for errors... */
+X		AddResource((Handle) strHnd, 'STR ', rezID, * (Str255 *) "\p");
+X	}
+X
+X	memActivity++;
+X
+X	/* should check for errors... */
+X	CloseResFile(sRefNum);
+X	return 0;
+X}
+X
+Xstatic void
+Xset_levelfile_name(long lev)
+X{
+X	unsigned char	*tf;
+X
+X	/* find the dot.  this is guaranteed to happen. */
+X	for (tf = (lock + *lock); *tf != '.'; tf--, lock[0]--)
+X		;
+X
+X	/* append the level number string (pascal) */
+X	if (tf > lock)
+X	{
+X		NumToString(lev, * (Str255 *) tf);
+X		lock[0] += *tf;
+X		*tf = '.';
+X	}
+X	else	/* huh??? */
+X	{
+X		endRecover();
+X		note(noErr, alidNote, "\pSorry: File Name Error");
+X	}
+X}
+X
+Xstatic short
+Xopen_levelfile(long lev)
+X{
+X	OSErr	openErr;
+X	short	fRefNum;
+X
+X	set_levelfile_name(lev);
+X	if (! in.Recover)
+X		return (-1);
+X
+X	if ((openErr = HOpen(vRefNum, dirID, lock, fsRdWrPerm, &fRefNum))
+X			&& (openErr != fnfErr))
+X	{
+X		endRecover();
+X		note(noErr, alidNote, "\pSorry: File Open Error");
+X		return (-1);
+X	}
+X
+X	return (openErr ? -1 : fRefNum);
+X}
+X
+Xstatic short
+Xcreate_savefile(unsigned char *savename)
+X{
+X	short	fRefNum;
+X
+X	/* translate savename to a pascal string (in place) */
+X	{
+X		unsigned char	*pC;
+X		short			nameLen;
+X
+X		for (pC = savename; *pC; pC++);
+X
+X		nameLen = pC - savename;
+X
+X		for ( ; pC > savename; pC--)
+X			*pC = *(pC - 1);
+X
+X		*savename = nameLen;
+X	}
+X
+X	if (HCreate(vRefNum, dirID, savename, CREATOR, SAVETYPE)
+X		|| HOpen(vRefNum, dirID, savename, fsRdWrPerm, &fRefNum))
+X	{
+X		endRecover();
+X		note(noErr, alidNote, "\pSorry: File Create Error");
+X		return (-1);
+X	}
+X
+X	return fRefNum;
+X}
+X
+Xstatic void
+Xcopy_bytes(short inRefNum, short outRefNum)
+X{
+X	char	*buf = (char *) pIOBuf;
+X	long	bufSiz = pBytes->memIOBuf;
+X
+X	long	nfrom, nto;
+X
+X	do
+X	{
+X		nfrom = read_levelfile(inRefNum, buf, bufSiz);
+X		if (! in.Recover)
+X			return;
+X
+X		nto = write_savefile(outRefNum, buf, nfrom);
+X		if (! in.Recover)
+X			return;
+X
+X		if (nto != nfrom)
+X		{
+X			endRecover();
+X			note(noErr, alidNote, "\pSorry: File Copy Error");
+X			return;
+X		}
+X	}
+X	while (nfrom == bufSiz);
+X}
+X
+Xstatic void
+Xrestore_savefile()
+X{
+X	static long	savelev;
+X	long		saveTemp, lev;
+X	xchar		levc;
+X
+X	/* level 0 file contains:
+X	 *	pid of creating process (ignored here)
+X	 *	level number for current level of save file
+X	 *	name of save file nethack would have created
+X	 *	and game state
+X	 */
+X
+X	lev = in.Recover - 1;
+X	if (lev == 0L)
+X	{
+X		gameRefNum = open_levelfile(0L);
+X
+X		if (in.Recover)
+X			(void) read_levelfile(gameRefNum, (Ptr) &hpid, sizeof(hpid));
+X
+X		if (in.Recover)
+X			saveTemp = read_levelfile(gameRefNum, (Ptr) &savelev, sizeof(savelev));
+X
+X		if (in.Recover && (saveTemp != sizeof(savelev)))
+X		{
+X			endRecover();
+X			note(noErr, alidNote, "\pSorry: \"checkpoint\" was not enabled");
+X			return;
+X		}
+X
+X		if (in.Recover)
+X			(void) read_levelfile(gameRefNum, (Ptr) savename, sizeof(savename));
+X
+X		/* save file should contain:
+X		 *	current level (including pets)
+X		 *	(non-level-based) game state
+X		 *	other levels
+X		 */
+X		if (in.Recover)
+X			saveRefNum = create_savefile(savename);
+X
+X		if (in.Recover)
+X			levRefNum = open_levelfile(savelev);
+X
+X		if (in.Recover)
+X			copy_bytes(levRefNum, saveRefNum);
+X
+X		if (in.Recover)
+X			close_file(&levRefNum);
+X
+X		if (in.Recover)
+X			unlink_file(lock);
+X
+X		if (in.Recover)
+X			copy_bytes(gameRefNum, saveRefNum);
+X
+X		if (in.Recover)
+X			close_file(&gameRefNum);
+X
+X		if (in.Recover)
+X			set_levelfile_name(0L);
+X
+X		if (in.Recover)
+X			unlink_file(lock);
+X	}
+X	else if (lev != savelev)
+X	{
+X		levRefNum = open_levelfile(lev);
+X		if (levRefNum >= 0)
+X		{
+X			/* any or all of these may not exist */
+X			levc = (xchar) lev;
+X
+X			(void) write_savefile(saveRefNum, (Ptr) &levc, sizeof(levc));
+X
+X			if (in.Recover)
+X				copy_bytes(levRefNum, saveRefNum);
+X
+X			if (in.Recover)
+X				close_file(&levRefNum);
+X
+X			if (in.Recover)
+X				unlink_file(lock);
+X		}
+X	}
+X
+X	if (in.Recover == MAX_RECOVER_COUNT)
+X		close_file(&saveRefNum);
+X
+X	if (in.Recover)
+X		in.Recover++;
+X}
+X
+Xstatic long
+Xread_levelfile(short rdRefNum, Ptr bufPtr, long count)
+X{
+X	OSErr	rdErr;
+X	long	rdCount = count;
+X
+X	if ((rdErr = FSRead(rdRefNum, &rdCount, bufPtr)) && (rdErr != eofErr))
+X	{
+X		endRecover();
+X		note(noErr, alidNote, "\pSorry: File Read Error");
+X		return (-1L);
+X	}
+X
+X	return rdCount;
+X}
+X
+Xstatic long
+Xwrite_savefile(short wrRefNum, Ptr bufPtr, long count)
+X{
+X	long	wrCount = count;
+X
+X	if (FSWrite(wrRefNum, &wrCount, bufPtr))
+X	{
+X		endRecover();
+X		note(noErr, alidNote, "\pSorry: File Write Error");
+X		return (-1L);
+X	}
+X
+X	return wrCount;
+X}
+X
+Xstatic void
+Xclose_file(short *pFRefNum)
+X{
+X	if (FSClose(*pFRefNum) || FlushVol((StringPtr) 0L, vRefNum))
+X	{
+X		endRecover();
+X		note(noErr, alidNote, "\pSorry: File Close Error");
+X		return;
+X	}
+X
+X	*pFRefNum = -1;
+X}
+X
+Xstatic void
+Xunlink_file(unsigned char *filename)
+X{
+X	if (HDelete(vRefNum, dirID, filename))
+X	{
+X		endRecover();
+X		note(noErr, alidNote, "\pSorry: File Delete Error");
+X		return;
+X	}
+X}
+X#endif
+END_OF_FILE
+if test 30445 -ne `wc -c <'sys/mac/mrecover.c'`; then
+    echo shar: \"'sys/mac/mrecover.c'\" unpacked with wrong size!
+fi
+# end of 'sys/mac/mrecover.c'
+if test -f 'sys/os2/Install.os2' -a "${1}" != "-c" ; then 
+  echo shar: Renaming existing file \"'sys/os2/Install.os2'\" to \"'sys/os2/Install.os2.orig'\"
+  mv -f 'sys/os2/Install.os2' 'sys/os2/Install.os2.orig'
+fi
+echo shar: Extracting \"'sys/os2/Install.os2'\" \(15129 characters\)
+sed "s/^X//" >'sys/os2/Install.os2' <<'END_OF_FILE'
+X             Instructions for compiling and installing NetHack 3.1
+X                               on an OS/2 system
+X             =====================================================
+X                                Timo Hakulinen
+X                          Last revision: 31 May 1993
+X
+X0.  Read this entire file before starting, and come back to the Notes below if
+X    you have any problems.
+X
+X1.  Make sure all the NetHack files are in the appropriate directory
+X    structure.  You should have a top directory (e.g. nh31, or whatever you
+X    like) with subdirectories dat, doc, include, src, util, sys\share,
+X    sys\os2, and win\tty.  You may have other subdirectories under sys and
+X    win, but they will not affect compilation for an OS/2 system.  If you do
+X    not follow this structure, the makefile will not function properly.  The
+X    .c files for the main program belong in src, those for utility programs in
+X    util, and OS/2-specific ones in sys\os2.  All the .h files belong in
+X    include, the documentation in doc, and assorted data files in dat.  There
+X    are also some necessary files in sys\share (pc*.c, random.c, dgn_*.*,
+X    lev_*.*).  A more detailed explanation of the directory structure is found
+X    in file Files, which should be in the top directory.
+X
+X    If you downloaded or ftp'd the sources from a UNIX system, the lines may
+X    end in UNIX-style newlines instead of the carriage return and line feed
+X    pairs used by DOS and OS/2.  You'll have to convert them (with a utility
+X    like Rahul Dhesi's "flip").  Also, every file should end with a carriage
+X    return / line feed pair, because Microsoft C has had a habit of ignoring
+X    the last line of each file otherwise.  Besides, even editing UNIX-style
+X    files with DOS editors is often a royal pain.
+X
+X2.  The makefile for OS/2, Makefile.os2, is found in directory sys\os2.  Copy
+X    it to directory src and rename it Makefile.  From now on, Makefile.os2
+X    will be referred to as "the makefile" in this document.
+X
+X    The makefile supports the following make utilities:
+X
+X    NDMAKE      a public domain make utility for DOS by Don Kneller
+X    NMAKE       make shipped with Microsoft languages and IBM C Set/2
+X    DMAKE       a public domain make for DOS and OS/2 by Dennis Vadura
+X
+X    Both NDMAKE and DMAKE are available at major archive sites.  The
+X    following compilers are supported:
+X
+X    compiler:                           runs in:            compiles for:
+X
+X    Microsoft C 5.1                     DOS / OS/2 1.0-2.x  OS/2 1.x
+X    Microsoft 6.0A (see note 5)         - " -               - " -
+X    IBM C Set/2 1.00, Toolkit/2 2.00    OS/2 2.x            OS/2 2.x
+X    GCC emx 0.8f (see note 6)           OS/2 2.x            OS/2 2.x
+X
+X    Note that code compiled for OS/2 versions 1.0-1.3 runs unmodified in OS/2
+X    versions 2.0 and up.  In principle it should be possible to cross compile
+X    NetHack 3.1 for OS/2 in DOS using NDMAKE and MSC, but this is not
+X    recommended (see note 3).
+X
+X    If you're using some other compiler than one listed above, you will have
+X    to adapt the makefile to your needs.  In particular, change the CC,
+X    CFLAGS, LINK, and LFLAGS macros to your C compiler's and linker's liking.
+X    See the makefile for more information.
+X
+X    If you are going to be constructing Fred Fish's termcap library, you'll
+X    need Makefile.lib in sys\share (see note 4).
+X
+X3.  Go to the include subdirectory.  First edit config.h according to the
+X    comments to match your system and desired set of features.  In particular,
+X    make sure that OS2 is defined, and that UNIX, HACKDIR, and COMPRESS are
+X    *not* defined.  If your compiler is ANSI compliant (like practically all
+X    OS/2 compilers are), it's probable that nothing else needs to be
+X    configured in config.h.  However, if you have VISION_TABLES defined and
+X    get a compilation error while processing vis_tab.c, you may have to
+X    uncomment BRACES too.
+X
+X    Next look at os2conf.h.  This file shouldn't need much changing.  If you
+X    want to use the hardcoded OS/2 system definitions in def_os2.h instead of
+X    the compiler's standard headers, comment out OS2_USESYSHEADERS.  This may
+X    become necessary if you are using a compiler which doesn't come with
+X    proper system headers by default.  In this case you may have to edit the
+X    definitions there, because every compiler has its own way of declaring
+X    the necessary system functions and data structures.  In general you
+X    should prefer the compiler's offerings, if possible.
+X
+X    If you are going to compile the game on an HPFS drive, uncomment OS2_HPFS,
+X    which enables the use of longer file names during compilation.  The
+X    generated executable will only use file names compatible with FAT drives,
+X    however.
+X
+X    If you are using a 32 bit compiler other than GCC emx 0.8f or C Set/2 in
+X    OS/2 2.x, force OS2_32BITAPI to be defined.  Otherwise it is defined only
+X    for the above mentioned compilers.
+X
+X    If you are not going to include random.c, because you are using the
+X    random number generator provided by your compiler, you will need to
+X    comment out RANDOM.
+X
+X    If you want to muck with different termcap settings, uncomment TERMLIB to
+X    enable the use of termcap routines (see note 4).  This is not necessary to
+X    create a fully functional game, however.
+X
+X4.  If you are using another compiler than MSC, GCC, or IBM C Set/2, you may
+X    want to look through system.h in the include directory.  This file matches
+X    the return and parameter types for system calls and library routines with
+X    various flavors of compilers and operating systems.  Leaving this file
+X    alone is unlikely to cause problems, but if you get compile errors with
+X    any functions in the standard library, it's worth checking the
+X    declarations there.
+X
+X5.  If you want to change the high score list behavior, examine the top of
+X    topten.c, in the src directory.  You may want to change the definitions of
+X    PERSMAX, POINTSMIN, and ENTRYMAX.
+X
+X6.  Go to the src directory and edit the top of the makefile.  Be sure that
+X    the directory you want the game installed to actually exists.
+X
+X    You'll need nroff and/or TeX/LaTeX to do the files in doc.  If you don't
+X    have either of these, you can skip it.
+X
+X    If you elected not to use the high quality BSD random number routines by
+X    commenting out RANDOM in os2conf.h, comment out (or set equal to nothing)
+X    the RANDOM macro in the makefile.
+X
+X    If you elected to use Fred Fish's termcap library (bundled in as
+X    termcap.uu in directory sys\share), you will have to generate termlib.lib
+X    from those sources by typing "make -f makefile.lib termlib.lib".  You must
+X    set the TERMLIB option in the makefile to link the resulting termlib.lib
+X    into the game.
+X
+X    If you are recompiling after patching your sources, or if you got your
+X    files from somewhere other than the official distribution, "touch
+X    makedefs.c" to ensure that certain files (onames.h and pm.h) are remade,
+X    lest potentially troublesome time stamps fool make.
+X
+X    If you have lex and yacc programs, or the equivalent flex and bison
+X    programs, you can set up the makefile to generate the appropriate .h and
+X    .c files from their .l and .y counterparts whenever you recompile.  This
+X    is done by changing the do_yacc and do_lex targets in the makefile to
+X    depend on targets yacc_act and lex_act instead of yacc_cpy and lex_cpy.
+X    Otherwise the makefile will copy pre-generated yacc and lex output files
+X    dgn_*.* and lev_*.* from directory sys\share to util and include.
+X
+X    Now, enter "make all", and take a siesta; your computer will be occupied
+X    for a fair amount of time.  If all goes well, you will get an executable.
+X
+X7.  All the support data files should have been copied to the game directory
+X    by the make process.  Here is the complete list in alphabetical order of
+X    all the files that should have gotten there during a full build:
+X
+X    A-filla.lev    A-fillb.lev    A-goal.lev     A-locate.lev   A-start.lev
+X    B-filla.lev    B-fillb.lev    B-goal.lev     B-locate.lev   B-start.lev
+X    C-filla.lev    C-fillb.lev    C-goal.lev     C-locate.lev   C-start.lev
+X    E-filla.lev    E-fillb.lev    E-goal.lev     E-locate.lev   E-start.lev
+X    H-filla.lev    H-fillb.lev    H-goal.lev     H-locate.lev   H-start.lev
+X    K-filla.lev    K-fillb.lev    K-goal.lev     K-locate.lev   K-start.lev
+X    P-filla.lev    P-fillb.lev    P-goal.lev     P-locate.lev   P-start.lev
+X    R-filla.lev    R-fillb.lev    R-goal.lev     R-locate.lev   R-start.lev
+X    S-filla.lev    S-fillb.lev    S-goal.lev     S-locate.lev   S-start.lev
+X    T-filla.lev    T-fillb.lev    T-goal.lev     T-locate.lev   T-start.lev
+X    V-filla.lev    V-fillb.lev    V-goal.lev     V-locate.lev   V-start.lev
+X    W-filla.lev    W-fillb.lev    W-goal.lev     W-locate.lev   W-start.lev
+X    air.lev        asmodeus.lev   astral.lev     baalz.lev      bigroom.lev
+X    castle.lev     cmdhelp        data           dungeon        earth.lev
+X    fakewiz1.lev   fakewiz2.lev   fire.lev       help           hh
+X    history        juiblex.lev    knox.lev       license        medusa-1.lev
+X    medusa-2.lev   mine_end.lev   minefill.lev   minetown.lev   nethack.cmd
+X    nethack.cnf    nethack.exe    nethack.ico    opthelp        options
+X    oracle.lev     oracles        orcus.lev      quest.dat      recover.exe
+X    rumors         sanctum.lev    tower1.lev     tower2.lev     tower3.lev
+X    valley.lev     water.lev      wizard1.lev    wizard2.lev    wizard3.lev
+X    wizhelp
+X
+X    Yes.  It's 106 files for a full featured NetHack 3.1.  If any of the files
+X    are missing, try to rerun make.  If that doesn't help, you'll have to try
+X    to decipher the makefile to find out how to manually create the missing
+X    files.  These kinds of troubles shouldn't happen except for two reasons:
+X    You've run out of disk space while compiling or your make utility doesn't
+X    understand the makefile properly for some reason.  In either case, you
+X    should get some warnings from the make, though.
+X
+X    If you have old record, logfile, or news files in the game directory, they
+X    are not overwritten.  Of course, old records from NetHack 3.0 are not
+X    worth keeping with 3.1, since these games are really quite different.
+X
+X    Edit file nethack.cnf in the game directory to reflect your particular
+X    setup and personal preferences, following the comments there.  More info
+X    about settable options can be found in the file opthelp and the guidebook.
+X
+X    If you compiled in the TERMLIB feature, also move the sys\share\termcap
+X    file to your game directory.
+X
+X8.  If you'll be running NetHack from a different subdirectory, you will want
+X    to "set HACKDIR=c:\games\nh31" (or whatever directory you want to use).
+X    Add it to your config.sys, if you'll be playing often.
+X
+X    You can also create a special NetHack entry in your Presentation Manager /
+X    Workplace Shell desktop.  This will use the included NetHack icon.
+X    The following is a sample program description for OS/2 1.3 desktop, but
+X    it's similar for OS/2 2.0:
+X
+X    Program title:          NetHack 3.1
+X    Path and file name:     c:\games\nh31\nethack.cmd
+X    Parameters:
+X    Working directory:      c:\games\nh31
+X    Program type:           OS/2 Full screen
+X
+X    Naturally you must fill in your own game directory and parameters if you
+X    want to set any.  The program type can be either OS/2 Full screen or OS/2
+X    Windowed.  Note that you should set the executable path to use the .cmd
+X    file generated by the makefile.  This file generates an extra pause after
+X    the program exit, because otherwise you wouldn't get to see the high score
+X    list upon quitting due to PM/WPS automatically closing the program window.
+X    When starting NetHack normally from OS/2 command prompt, the command
+X    processor starts nethack.exe instead, so no extra pause is generated.
+X
+X9.  If you want to clear up the temporary files and objects created by the
+X    compilation process, you may issue "make spotless".  This will return your
+X    source tree to near-distribution condition.  Naturally, it will not affect
+X    your newly built game files in any way.
+X
+X10. Play NetHack.  If it works, you're done!
+X
+X
+XNotes
+X-----
+X
+X1)  Save-files and bones-files from previous versions will not work with
+X    NetHack 3.1.  Don't bother trying to keep them.
+X
+X2)  To install an update of NetHack after changing something, enter "make"
+X    from the src directory.  If you add, delete, or reorder monsters or
+X    objects, or you change the format of saved level files, delete any save
+X    and bones files.  (Trying to use such files sometimes produces amusing
+X    confusions on the game's part, but usually crashes.)
+X
+X3)  When cross-compiling for OS/2 in DOS, NDMAKE is the best choice because it
+X    requires the least RAM for itself.  Note however, that cross-compilation
+X    in DOS is discouraged, because it is considered obsolete (OS/2 is really
+X    a much better place to compile).  If you still want to try, here are some
+X    suggestions:
+X
+X    During linking, Microsoft linker will need temporary storage space.  Make
+X    sure you have about 1 MB of free disk where ever you have defined your
+X    temporary storage.  It is also a good idea to compile with as much free
+X    RAM as possible.  It may otherwise get crowded with the bigger, more
+X    complex source files (compiler bombs with "out of heap space" or similar).
+X    If this happens, strip your configuration, zap TSR's, get a better memory
+X    manager etc.
+X
+X4)  The file sys\share\termcap.uu is the fixed version of the Fred Fish
+X    termcap library.  You will need to run a uudecode utility on it to
+X    generate the file termcap.zip.  termcap.zip contains several files of
+X    termcap routines.  Using them with NetHack involves very little knowledge
+X    of the UNIX concept of a termcap database; mostly you need to know enough
+X    to set a TERM environment variable.  You can unzip termcap.zip in the
+X    sys\share directory, but if you are going to use it, it is probably best
+X    to unzip a copy in the src directory.  That way you will not miss copying
+X    any files over.  Wherever you unzip it, get rid of the included makefile
+X    since a better version has been provided as Makefile.lib.  After creating
+X    the termcap library file termlib.lib, copy it to src before compiling the
+X    game main source.
+X
+X5)  When compiling with MSC 6.0, the maintenance version 6.0A should be used
+X    instead of the original 6.0, which was all too buggy to successfully build
+X    NetHack 3.1.
+X
+X6)  Note that emx 0.8f is the first version of GCC for OS/2 that can properly
+X    compile NetHack.  Earlier versions do not work, because they don't support
+X    the 16 bit API calls of OS/2.
+X
+X    GCC emx 0.8f does not currently work properly when fseek() function is
+X    used with text files.  This is well documented in the compiler's
+X    documentation.  Unfortunately NetHack uses fseek() in several places in
+X    connection with text data.  This means that some help texts may not come
+X    out right, but no serious problems should emerge.
+END_OF_FILE
+if test 15129 -ne `wc -c <'sys/os2/Install.os2'`; then
+    echo shar: \"'sys/os2/Install.os2'\" unpacked with wrong size!
+fi
+# end of 'sys/os2/Install.os2'
+if test -f 'sys/winnt/Install.nt' -a "${1}" != "-c" ; then 
+  echo shar: Renaming existing file \"'sys/winnt/Install.nt'\" to \"'sys/winnt/Install.nt.orig'\"
+  mv -f 'sys/winnt/Install.nt' 'sys/winnt/Install.nt.orig'
+fi
+echo shar: Extracting \"'sys/winnt/Install.nt'\" \(10776 characters\)
+sed "s/^X//" >'sys/winnt/Install.nt' <<'END_OF_FILE'
+X	Copyright (c) NetHack PC Development Team 1990 - 1993.
+X	NetHack may be freely redistributed.  See license for details.
+X	    ======================================================
+X	    Instructions for compiling and installing
+X		 NetHack 3.1 on a Windows NT system
+X	    ======================================================
+X		 (or, How to make NT NetHack 3.1.2)
+X		    Last revision: Apr 16, 1993
+X
+XCredit for the PC versions of NetHack goes to the PC Development team 
+Xconsisting of Norm Meluch, Kevin Smolkowski, Paul Winner and Steve 
+XVanDevender who built on the work of Pierre Martineau, Stephen Spackman, 
+XSteve Creps, Mike Threepoint and Don Kneller.  
+X
+XCredit for the porting of NetHack to Windows NT goes to the NT Porting 
+XTeam started by Michael Allison.
+X
+XThe NT porting team also wishes to thank the following people for
+Xtheir help, testing effort, and suggestions which contributed to the 
+Xcompletion of the first Windows NT port of NetHack: Doug Thompson, 
+XPhil Mills, Scott Murray. 
+X
+XThis first version of NetHack for Windows NT is a tty port utilizing 
+Xthe NT WIN32 Console I/O subsystem.
+X
+X
+XI.  Dispelling the Myths:
+X
+X    Compiling NetHack is not as easy as it sounds, nor as hard as it looks,
+X    however it will behoove you to read this entire file through before
+X    beginning the task.
+X
+X    We have provided the proper makefiles for building NetHack using the
+X    following compilers:
+X
+X    Microsoft Windows NT March 1993 SDK C Compiler.
+X
+X    All the makefiles were created for use with MS NMAKE which
+X    is provided with the Windows NT SDK (Software Development Kit).
+X
+X    You may find it useful to obtain copies of lex (flex) and yacc (bison).
+X    While not strictly necessary to compile nethack, they are required should
+X    you desire to make any changes to the level and dungeon compilers.
+X    Flex and Yacc for NT are available in the "Porting from UNIX to
+X    NT" library on the MSWIN32 Forum on compuserve and other places.
+X
+X    To use the distributed NetHack icon, a version of uudecode is required,
+X    but this is not a necessary step for compiling NT NetHack.
+X
+XII. To compile your copy of NetHack on a Windows NT machine:
+X    (or "just follow these few 'simple' steps outlined below.")
+X
+XSetting Up
+X
+X1.  It almost goes without saying that you should make sure that your tools
+X    are set up and running correctly.
+X
+X2.  Make sure all the NetHack files are in the appropriate directory
+X    structure.  You should have a main directory with subdirectories
+X    dat, doc, include, src, sys\share, sys\winnt, util and win\tty.
+X    Other subdirectories may also be included in your distribution, but
+X    they are not necessary for use with NT.  You can delete them
+X    to save space.
+X
+X    Required Directories for NT:
+X
+X                            top
+X                             |
+X        -------------------------------------------- 
+X        |       |     |        |       |     |     | 
+X       util    dat   doc    include   src   sys   win
+X                                             |     |
+X                                          ------   ---- 
+X                                          |    |      | 
+X                                       share  winnt  tty
+X 
+X
+X    Check the file "Files" in your top level directory for an exact
+X    listing of what file is in which directory.  In order for the
+X    Makefiles to work, all the source files must be in the proper
+X    locations.
+X
+X    If you downloaded or ftp'd the sources from a UNIX system, the lines
+X    will probably end in UNIX-style newlines, instead of the carriage
+X    return and line feed pairs used by DOS.  Some programs have trouble
+X    with them, so you may need to convert them (with a utility like
+X    Rahul Dhesi's "flip").  Also, every file should end with an empty
+X    line, because Microsoft C has a habit of ignoring the
+X    last line of each file. 
+X
+X3.  Go to the sys\winnt directory and run the setup.bat batch file.
+X    The necessary Makefile movements will be accomplished for you. It
+X    will also verify that your directories are set up properly.
+X
+X4.  Now go to the include subdirectory to check a couple of the header
+X    files there.  Things *should* work as they are, but since you have
+X    probably set up your system in some sort of custom configuration
+X    it doesn't hurt to check out the following:
+X
+X    First check config.h according to the comments to match your system and
+X    desired set of features.  Mostly you need to check the WIZARD option,
+X    make sure the HACKDIR is set properly.
+X
+X    Also check COMPRESS.
+X
+X    You may include all or as few of the special game features as you wish.
+X
+X    Also check ntconf.h, which should not need much editing. It is there that
+X    you may choose to enable color text character support by leaving
+X    TERMCOLOR uncommented, or disable color support by commenting out 
+X    TERMCOLOR.
+X
+X5.  If you want to change the high score list behavior, examine the top of
+X    topten.c, in the src directory.  You may want to change the definitions of
+X    PERSMAX, POINTSMIN, and ENTRYMAX.  I set POINTSMIN to 51 and ENTRYMAX to
+X    50 to keep the size of the score list down.
+X
+X6.  Go to the src directory and edit the top of your Makefile.
+X    Change the setting of (GAMEDIR) to reflect the directory where
+X    you want NetHack to be installed.  
+X
+X    ie.  GAMEDIR = \games\nethack
+X
+X    The directory you specify *MUST* exist for all remaining steps to be 
+X    successful. Be sure the directory you want the game installed 
+X    actually exists.  If it doesn't, create it now.
+X
+X    If you elected not to use the high-quality BSD random number routines by
+X    commenting out RANDOM in ntconf.h, comment out (or set equal
+X    to nothing) the RANDOM macro in your Makefile.
+X
+X    If you want, you can choose to have a default NetHack ICON embedded
+X    into your executable. You must have first uudecoded the file
+X    sys\winnt\nhico.uu into sys\winnt\nethack.ico.
+X    Change the Makefile macro RESFILE to point to the second
+X    choice (make the macro specify the .rbj file, rather than being set
+X    equal to nothing).
+X
+X    If you are recompiling after patching your sources, or if you got your
+X    files from somewhere other than the official distribution, "touch
+X    makedefs.c" to ensure that certain files (onames.h and pm.h) are remade,
+X    lest potentially troublesome timestamps fool "nmake".
+X
+XCompiling
+X
+X7.  Now that everything is set up, go to the util directory and
+X    run nmake.  If you get any errors along the way then something
+X    has not been set up correctly.
+X
+X8.  Next, go to the dat directory and run nmake (just as you did for util).
+X    Once again, if you get any errors then something has not been 
+X    set up correctly.
+X
+X9.  Finally, go to the src directory and "nmake install".  The time it takes
+X    to compile depends on your particular machine of course, but you should 
+X    be able to go for lunch and return to find everything finished.  The 
+X    less memory, and slower your machine, the longer the lunch you may take.
+X    
+X    In any case, it is likely that the command prompt window where you are 
+X    doing the compiling will be occupied for a quite a while.  If all 
+X    goes well, you will get an NetHack executable.
+X
+XRunning NetHack
+X
+X10. Make sure the support files -- data, rumors, cmdhelp, opthelp, help, hh,
+X    history, options and license -- were copied to the game directory.  If not,
+X    move them there from the dat directory yourself.  
+X    Assuming you are still in the src,dat, or util directory,
+X    "rumors." can be created manually by entering "..\util\makedefs -r"
+X    "data." can be created by entering "..\util\makedefs -d".
+X
+X    Make sure the file NetHack.cnf made it to your game directory.
+X    If not, go to sys\winnt and copy winnt.cnf to NetHack.cnf in 
+X    your game directory.  Edit NetHack.cnf to reflect your
+X    particular setup and personal preferences, by following the comments.
+X  
+XRunning from Command Prompt
+X
+X11. If you are running it from the command prompt, you must first set the
+X    HACKDIR environment variable to the location where the nethack 
+X    executable resides:
+X
+X	set HACKDIR=c:\games\nethack)
+X	(or whatever drive and directory you want to use)
+X
+X    You should also add the directory containing the NetHack executable
+X    to your PATH, so that you can just type "nethack" or "nethack -umike"
+X    to start it up.  Alternatively, you can explicitly invoke it with 
+X    "c:\games\nethack\nethack" (specifying whatever drive and directory your
+X    executable resides in) each time.
+X
+X
+XRunning from Windows NT Program Manager
+X
+X12. If you will be running it by launching it from the Program Manager,
+X    be sure to specify the location of your NetHack executable in the 
+X    "Working Directory:" dialogue box field when creating your 
+X    Program Manager Icon:
+X
+X    ie.  Description      :  NetHack 3.1.2 
+X         Command Line     :  C:\GAMES\NETHACK\NETHACK.EXE
+X         Working Directory:  C:\GAMES\NETHACK
+X         Shortcut key     :
+X
+X13. If you did not elect to embed an ICON into the NetHack executable
+X    when you built it, then you may point the program manager to the 
+X    ICON of your choice using the program manager (f)ile, (p)roperties,
+X    change icon option.
+X
+X    A NetHack icon has been provided in the file SYS\WINNT\NHICO.UU.
+X    This is a uuencoded copy of the icon file, and you must use uudecode
+X    to turn it into a Windows NT icon file, in order to use the icon.
+X
+X14. Play NetHack.  If it works, you're done!
+X
+XNotes:
+X
+X1)  To install an update of NetHack after changing something, enter "nmake"
+X    from the src directory.  If you add, delete, or reorder monsters or
+X    objects, or you change the format of saved level files, delete any save
+X    and bones files.  (Trying to use such files sometimes produces amusing
+X    confusions on the game's part, but usually crashes.)
+X
+X    If you made changes to any of the level compiler software, you may have
+X    to delete dgn_flex.c, dgn_yacc.c, lev_flex.c, and lev_yacc.c from the
+X    util directory to ensure that they are remade.
+X
+X2)  The executable produced by this port is a 32-bit, flat-address space, 
+X    non-overlayed .exe file, which should run on any Windows NT system. 
+X    It is also a rather large file:
+X
+X	More than 1,900,000 bytes, nethack.exe when debugging information 
+X        is included in the .exe, and more than 1,200,000 bytes without.
+X
+X3)  If you want to use the number pad on the keyboard for movement when
+X    playing the game, be sure the NUMLOCK is on.
+X
+X4)  A true Windows (WIN32s) version of NetHack is currently under development
+X    by the PC Windows Porting team.
+X
+X5)  If you have comments or suggestions, feel free to drop any one of
+X    us a line c/o nethack-bugs@linc.cis.upenn.edu.  From compuserve,
+X    try  >INTERNET:nethack-bugs@linc.cis.upenn.edu.
+END_OF_FILE
+if test 10776 -ne `wc -c <'sys/winnt/Install.nt'`; then
+    echo shar: \"'sys/winnt/Install.nt'\" unpacked with wrong size!
+fi
+# end of 'sys/winnt/Install.nt'
+echo shar: End of archive 30 \(of 33\).
+cp /dev/null ark30isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 33 archives.
+    echo "Now execute ./patchit.sh"
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

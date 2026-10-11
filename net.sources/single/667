@@ -1,0 +1,581 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,324b6d5c3884f93e,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-10-06 09:19:27 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!decvax!harpo!floyd!clyde!ihnp4!zehntel!hplabs!hao!csu-cs!rro
+From: rro@csu-cs.UUCP
+Newsgroups: net.sources
+Subject: Minimal perfect hash table generator
+Message-ID: <2423@csu-cs.UUCP>
+Date: Thu, 6-Oct-83 12:19:27 EDT
+Article-I.D.: csu-cs.2423
+Posted: Thu Oct  6 12:19:27 1983
+Date-Received: Sun, 9-Oct-83 07:38:43 EDT
+Lines: 563
+
+This is the program I promised in a recently posted article in net.lang.
+     hplabs!csu-cs!rro
+
+ program lhashd( input, output ); 
+
+(* minimal perfect hash table generation program
+
+   input:  a list of words which are to be organized into a dense 
+           list so that the hash function 
+              f(word) = length(word) + value(firstletter(word)) + 
+                        value(lastletter(word)) 
+           will find the word in one probe, or the word is not in 
+           the list.  
+
+  output:  the values associated with each letter 
+           the minimal perfect hash table containing the words. 
+
+  reference:  cook, curtis r. and oldehoeft, r. r., "more on minimal
+              perfect hash tables," colorado state university technical 
+              report, april 1981. 
+
+*)
+
+   const maxwordsize = 16;             (* up to 16-char words *)
+         maxlistsize = 110;            (* up to 110 input words *)
+         maxhashsize = 400;            (* hash table max index = 400 *) 
+         cha = 'a'; 
+         chz = 'z'; 
+
+   type  listsize = 1..maxlistsize; 
+         wordsize = 1..maxwordsize; 
+         letters  = cha..chz; 
+         hashsize = 1..maxhashsize; 
+         wordinfo = record
+                     row,col : char;
+                     index,length : integer 
+                    end;
+         freqinfo = record
+                     letter : char; 
+                     num : integer
+                    end;
+         parray   = packed array[wordsize] of char; 
+
+   var graph    :  array[listsize] of wordinfo;  (* word triples *) 
+       order    :  array[1..26] of char;         (* decreasing freq letters *)
+       pnames   :  array[listsize] of parray;    (* input words *)
+       name     :  array[wordsize] of char; 
+       lorder   :  array[letters] of integer;    (* index of ordered letters *) 
+       values   :  array[letters] of integer;    (* letter values *)
+       freq     :  array[1..26] of freqinfo;     (* letter frequencies *) 
+       slot     :  array[1..30] of integer; 
+       hashtable:  array[hashsize] of integer;   (* perfect hash table *) 
+       diagonal :  array[letters] of boolean;    (* occur twice in a word *)
+       twordrec :  wordinfo;
+       temprec  :  freqinfo;
+                                                 (* miscellaneous constants *)
+       i, j, k, size, pos, len, lastletter, numslots, point, 
+       val, entime, sttime, lowest, highest:  integer;
+       ch, ch1, ch2: char;
+
+
+(**************** procedure initialize ************************)
+
+  procedure initialize; 
+    begin 
+      for i := 1 to maxlistsize do
+        graph[i].length := 0; 
+      for ch := cha to chz do 
+        begin 
+          values [ch] := 0; 
+          diagonal [ch] := false
+        end;
+      for i := 1 to maxhashsize do
+        hashtable [i] := 0; 
+      lowest := 100;  
+      highest := 0; 
+      k := ord('a') - 1;
+      for i := 1 to 26 do 
+        begin 
+          k := k +1;  
+          freq [i].num := 0;
+          freq [i].letter := chr(k) 
+        end 
+    end; (* initialize *) 
+
+ (******************** procedure readnames ****************************** 
+
+      readnames inputs words separated by commas or blanks. 
+      finds first and last letter and length of each word.
+      computes frequency of each letter (number of times it occurs as first or
+      last letter in a word). 
+
+        pnames[i]............ i th word 
+        graph[i].row ........ first letter of i th word 
+        graph[i].col ........ last letter of i th word
+        graph[i].length...... length of i th word 
+        diagonal[ch] ........ true if character ch is first and last letter of
+                              same word; otherwise it is false. 
+        freq[i]......num .... frequency of i th letter ( a = 1, b = 2,...)
+        size ................ number of words input 
+
+    *)
+  procedure readnames;
+     var current : integer; 
+     begin  
+       current := 0;  
+       k := ord('a')-1; 
+       read(ch);
+       while (ch = ' ') or (ch = ',') do  
+         read(ch);
+       while not eof do 
+         begin
+           current := current + 1;
+           len := 0;  
+           repeat 
+             len := len + 1;
+             name[len] := ch; 
+             read(ch);
+           until (ch = ' ') or (ch = ',');
+
+       (* blank fill rest of name and place name in pnames  *)
+
+           for i := len + 1 to maxwordsize do 
+             name[i] := ' ';
+           pack(name,1,pnames[current]);
+           ch1 := name[1];
+           ch2 := name[len];
+           if ch1 = ch2 
+              then
+                 diagonal [ch1] := true;  
+           i := ord(ch1) - k; 
+           freq[i].num := freq[i].num + 1;
+           i := ord(ch2) - k; 
+           freq[i].num := freq[i].num + 1;
+           graph[current].row := ch1; 
+           graph[current].col := ch2; 
+           graph[current].length := len;  
+           graph[current].index := current; 
+           while ((ch = ' ') or (ch = ',')) and (not eof) do  
+             read(ch);
+         end; 
+       size := current
+    end; (*  readnames   *) 
+
+
+(****************** procedure findorder ************************
+
+     findorder computes an ordering of the letters based on following 
+     algorithm: 
+     1. if letter appears as first and last letter of same word add 100 
+        to its frequency. 
+     2. multiply frequency of each letter by 100. 
+     3. for each letter and each word it appears in, add the original fre-
+        quency of the other letter in the word to the frequency of the  
+        letter. 
+     4. sort letters in order of decreasing frequency.
+
+      order[i] ............. letter in i th position in ordering
+      lorder[ch] ........... position of letter ch in ordering
+
+  *)
+  procedure findorder;
+    label 
+       99;  
+    var 
+      max,j,j1,j2 : integer;
+      tarray : array [1..26] of integer;  
+    begin (* order by frequency *)
+      k := ord('a') -1; 
+      for ch := cha to chz do 
+        begin 
+          j := ord(ch) -k;
+          tarray[j] := freq[j].num; 
+          if diagonal[ch] 
+            then
+              freq[j].num := freq[j].num + 100; 
+          freq[j].num := freq[j].num * 100
+        end;
+      for i := 1 to size do 
+        begin 
+          j1 := ord(graph[i].row) - k;
+          j2 := ord(graph[i].col) - k;
+          freq[j1].num := freq[j1].num + tarray[j2];
+          freq[j2].num := freq[j2].num + tarray[j1];
+        end;
+      for i := 1 to 25 do 
+         begin
+           max := i;  
+           for j := i + 1 to 26 do
+            if freq [j].num > freq [max].num
+               then 
+                 max := j;
+          if freq [max].num = 0 
+            then goto 99; 
+              if max <> i 
+                then  
+                  begin 
+                    temprec := freq[ i ]; 
+                    freq [ i ] := freq [max]; 
+                    freq [max] := temprec 
+                  end;
+        end;
+  99: i := 1; 
+      while i <= 26 do
+         begin
+           if freq[i].num > 0 
+              then
+                begin 
+                  ch := freq [i].letter;
+                  order [i] := ch;
+                  lorder [ch] := i; 
+                  lastletter := i;
+                  i := i + 1
+                end 
+             else 
+                i := 27 
+         end
+     end;  (* findorder  *) 
+
+
+(*************************** procedure ordergraph **********************
+
+     each word is represented by a triple (first letter,last letter,length) or
+     (graph[i].row, graph[i].col, graph[i].length).  for each triple, inter-
+     change first letter and last letter if last letter precedes first letter 
+     in letter ordering.  then sort triples according to the letter ordering
+     using graph[i].col as key. 
+
+  *)
+
+   procedure ordergraph;
+      begin 
+
+        (* order row col pairs    *)
+
+        for i := 1 to size do 
+          if lorder [ graph [i].col ] < lorder[graph[i].row]
+             then 
+               begin  
+                 ch := graph[i].col;
+                 graph[i].col := graph[i].row;
+                 graph[i].row := ch 
+               end; 
+
+        (* order points of graph  *)
+
+        pos := 0; 
+        for j := 1 to lastletter do 
+          begin 
+            ch := order[j]; 
+            for i := pos + 1 to size do 
+              if graph[i].col = ch
+                 then 
+                   begin
+                     pos := pos + 1;
+                     twordrec := graph[i];
+                     graph[i] := graph[pos];
+                     graph[pos] := twordrec 
+                   end; 
+          end;
+        i := 1; 
+        while i <= size do
+          begin 
+            ch := graph[i].col ;
+            if diagonal[ch] 
+              then
+                begin 
+                  j := i + 1; 
+                  while graph[j].col = ch do
+                    j := j + 1; 
+                  k := i; 
+                  i := j; 
+                  j := j -1;
+                  while k < j do
+                    begin 
+                     if graph[k].row = ch 
+                        then
+                          begin 
+                            twordrec := graph[j]; 
+                            graph[j] := graph[k]; 
+                            graph[k] := twordrec; 
+                            j := j -1 
+                          end; 
+                     k := k + 1
+                    end 
+                 end  
+              else
+                i := size + 1 
+          end 
+    end; (* ordergraph *) 
+  procedure backup (var ch:char; var point : integer);
+    forward;
+
+
+(************************ function checkdiag **************************** 
+
+
+     function checkdiag(ch) returns the value false if ch is the first and
+     last letter of the same word and the value assignment for ch hashes
+     one of these words to a non-empty slot.  otherwise it returns true.
+
+
+*)
+  function checkdiag(ch:char;val,point:integer): boolean; 
+    var  check : boolean; 
+    begin 
+      check := true;  
+      if diagonal[ch] 
+         then 
+           begin
+             len := graph[point].length;
+             while graph[point].col = ch do 
+               begin  
+                 check := check and (hashtable[2*val + len] = 0); 
+                 point := point + 1;
+               end
+           end; 
+       checkdiag := check;
+    end;  (*  checkdiag   *)
+
+
+(************************* procedure undo ********************************
+
+
+      undo(ch) deletes the value assignment for letter ch and all associated
+      hash table entries for triples with middle component ch.
+
+
+*)
+  procedure undo(ch:char);
+    label 99; 
+    var j : integer;  
+    begin (* undo  *) 
+       point := point -1; 
+       val := values[ch]; 
+       while graph[point].col = ch do 
+         begin
+           j := graph[point].length + values[graph[point].row] + val; 
+           hashtable[j] := 0; 
+           if j = lowest then 
+              if lowest = highest then
+                 begin lowest := 100; highest := 0; goto 99 end 
+              else
+                 while hashtable[lowest] = 0 do lowest := lowest + 1
+           else 
+              if j = highest then 
+                 while hashtable[highest] = 0 do highest := highest - 1;
+           point := point - 1 
+          end;
+     point := point + 1;
+99:end; (* undo  *) 
+
+
+(************************* procedure findchval ***************************
+
+
+      for all triples with middle component ch, findchval attempts to find
+      a value assignment for ch so that all the triples hash to empty hash
+      table slots.  findchval begins the search with the starting value start.
+      result is returned via val.  findchval is successful if the value re- 
+      turned via is not -1000.  if val = -1000 then no value assignment is
+      possible because two of the triples have the same other letter value
+      and length sum. 
+
+*)
+
+   procedure findchval (ch:char;start,point:integer;var val:integer); 
+      label 99; 
+      var 
+          empty : boolean;
+          i,j,min,temp  : integer;
+      begin 
+         numslots := 0; 
+         while (graph[point].col = ch) and (graph[point].row <> ch) and 
+               (point <= size) do 
+           begin
+             numslots := numslots + 1;
+             slot[numslots] := graph[point].length + values[graph[point].row];
+             point := point + 1 
+           end; 
+         if numslots > 0
+           then 
+              begin 
+               if numslots > 1  
+                  then
+                    begin 
+                      for i := 1 to numslots do 
+                        begin 
+                          min := i; 
+                          for j := i + 1 to numslots do 
+                            if slot[j] < slot[min]  
+                              then
+                                min := j; 
+                          if min <> i 
+                             then 
+                               begin
+                                 temp := slot[min]; 
+                                 slot[min] := slot[i];
+                                 slot[i] := temp
+                               end
+                         end; 
+                       for i := 1 to numslots - 1 do
+                         if slot[i] = slot[i+1] 
+                           then 
+                             begin
+                               point := point - 1;  
+                               while graph[point].length +
+                                     values[graph[point].row] <> slot[i] do 
+                                 point := point - 1;
+                               ch1 := graph[point].row; 
+                               point := point - 1;  
+                               while graph[point].length +
+                                     values[graph[point].row] <> slot[i] do 
+                                 point := point - 1;
+                               ch2 := graph[point].row; 
+                               val := -1000;
+                               goto 99
+                             end
+                    end;
+             (* handle special case of letter with frequency one  *)
+               j := lorder[ch]; 
+               if freq[j].num < 200 
+                 then 
+                   start := -slot[1] + 1 + lowest;  
+                empty := false; 
+                val := start -1;
+                while not empty do
+                  begin 
+                    val := val + 1; 
+                    empty := true;
+                    for k := 1 to numslots do 
+                      empty := empty and (hashtable[val+slot[k]] = 0);  
+                    empty := empty and checkdiag(ch,val,point); 
+                  end; (* while  *) 
+              end (* then  *) 
+           else 
+              begin 
+                val := start; 
+                while not checkdiag(ch,val,point) do
+                  val := val + 1
+              end;
+   99:end;  (*  findchval   *)  
+
+
+(*********************** procedure createtable **************************** 
+
+
+      createtable finds letter value assignments and makes hash table entries 
+      for a minimal perfect hash.  it does the letter value assignments by
+      considering all groups of triples with the same middle component begin- 
+      ning with the first letter in the letter ordering.
+
+
+*)
+  procedure createtable;
+    label 99 , 98 ; 
+      begin 
+        point := 1; 
+      i := 1; 
+      while i <= lastletter do  
+        begin 
+          ch := order[i]; 
+          findchval(ch,0,point,val);
+    98:   if val = -1000
+            then
+              begin 
+                repeat
+                  i := i -1;
+                  ch := order[i]; 
+                  undo(ch); 
+                until (ch = ch1) or (ch = ch2); 
+                val := values[ch] + 1;
+                findchval(ch,val,point,val);
+                goto 98 
+              end;
+           values[ch] := val; 
+           while graph[point].col = ch do 
+             begin
+               j := graph[point].length + values[graph[point].row] + val; 
+               if ( j <= highest - size)  
+                 then 
+                   begin
+                     undo(ch);  
+                     findchval(ch,val+1,point,val); 
+                     goto 98
+                   end; 
+                 if (j >= lowest + size)  
+                   then 
+                     begin
+                       backup(ch,point);
+                       goto 98  
+                     end
+                   else 
+                     if hashtable[j] <> 0 
+                       then 
+                         begin  
+                           ch := graph[point].col;
+                           undo(ch);
+                           val := values[ch]; 
+                           findchval(ch,val+1,point,val); 
+                           goto 98
+                         end
+                       else 
+                         begin  
+                           hashtable[j] := graph[point].index;
+                           if j < lowest  
+                              then
+                                lowest := j;
+                           if j > highest 
+                              then
+                                highest := j; 
+                           if point >= size 
+                             then 
+                                goto 99 
+                             else 
+                               point := point + 1 
+                         end
+             end; 
+           i := i + 1 
+         end; 
+     99:end; (*  createtable   *) 
+
+
+(************************* procedure backup ********************************
+
+
+      letter value assignment returned by findchval does not yield minimal
+      table.  backup undoes value assignment and any  associated hash table 
+      entries for the group of triples with the current letter and the group of 
+      triples for the previous letter.
+
+*)
+  procedure backup; 
+    begin 
+      if graph[point-1].col = ch
+        then
+          undo(ch); 
+      repeat
+        i := i-1; 
+        ch := order[i]; 
+      until graph[point -1].col = ch; 
+      undo(ch); 
+      findchval(ch,val+1,point,val);
+      values[ch] := val 
+    end;  (*  backup  *)
+    begin   (* main program   *)
+        initialize; 
+        readnames;
+        findorder;
+        ordergraph; 
+        sttime := clock;
+        createtable;
+	entime := clock;
+        writeln('  execution time = ', (entime-sttime)); 
+        writeln('  letter  value ');
+        for ch := cha to chz do 
+          writeln('   ',ch,values[ch] :8);
+        for i := lowest to highest do 
+          begin 
+            j := hashtable[i];
+            writeln('  hash table[',i:3,']  ',pnames[j])
+          end 
+  end. (* main program  *)
+
+

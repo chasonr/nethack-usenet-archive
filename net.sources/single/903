@@ -1,0 +1,376 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,ec1600702f569843,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-12-21 22:57:55 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!philabs!seismo!hao!hplabs!hpda!fortune!amd70!decwrl!flairvax!turtleva!ken
+From: ken@turtleva.UUCP (Ken Turkowski)
+Newsgroups: net.sources
+Subject: Graphics source in C: hsalgs/u_tiler.c
+Message-ID: <298@turtleva.UUCP>
+Date: Thu, 22-Dec-83 01:57:55 EST
+Article-I.D.: turtleva.298
+Posted: Thu Dec 22 01:57:55 1983
+Date-Received: Sun, 18-Dec-83 09:05:01 EST
+Lines: 358
+
+echo x - hsalgs/u_tiler.c
+cat >hsalgs/u_tiler.c <<'!Funky!Stuff!'
+
+
+/* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ 
+    u_tiler.c - "Universal" anti-aliasing tiler for convex polygons with
+    an arbitrary number of parameters/vertex.
+       Entries: 
+     - u_tiler(npts,pts,npars,px_proc)
+        short npts,npars;  void (*px_proc)(); 
+        double pts[];
+NOTE!!!  needs to be loaded with BB file providing px_proc(),
+						   getseg() and putseg(). 
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */  
+
+#define MAX_HRES        640     /* maximum horizontal resolution */
+#define MAX_VRES        484     /* maximum vertical resolution */
+#define SUBPIX          .01     /* minimum allowable width or height */
+#define MAX_OPAQUE      .02     /* maximum transmittance considered opaque */
+#define MAXLTS          16      /* max number of light sources */ 
+#define MAXLONG  0x7FFFFFFF 
+#define MAXFLOAT 0xFFFF7FFF   /* yes, that's right (look in the VAX manual) */
+#define TRUE   1
+#define FALSE  0
+#define X      0
+#define Y      1
+#define PAR1             3    /* array index of first non-specific parameter */ 
+#define NORMS  		12
+#define NORM_PARMS	 6
+#define MAX_PARS   NORMS + NORM_PARMS*MAXLTS   /* max allowed number of parms */
+#define sqr(x) ((x)*(x))
+
+static void (*px_proc)();		/* pointer to pixel write procedure */
+
+/* parameters for image placement in big buffer memory */
+short Xofset,Yofset;
+short hres,vres,Y_pos,xleft,xrght;
+
+/* polygon edge data structure */
+typedef struct  {  short        lnth;
+	           double       x,ht,par[MAX_PARS - PAR1];
+                }  edge_position;
+
+
+/* +++++++++++++++++++++++++ U_TILINIT ++++++++++++++++++++++++++++++++++++ */
+
+u_tilinit(divisions,frmnum)  /* init tiler */
+short divisions,frmnum;
+{   short i;    double pow(),sqrt();    unsigned long array[4];
+    static short palred[256],palgrn[256],palblu[256];   /* pallette */
+
+    if (bbopen() < 0)  exit();
+    if (frmnum == 0) 
+    {   for (i=0; i<256; i++) 
+            palred[i] = palgrn[i] = palblu[i] = 4096. * pow(i/256.,.43);
+        bbpalw(palred,palgrn,palblu,0,256);
+    }
+
+    array[0] = frmnum;  array[1] = divisions;  array[2] = 24;  array[3] = 1; 
+    bbwrite(0,502,array,4);    /* load animation control */
+    divisions = sqrt((double)divisions);
+    hres = (32/divisions)*20;           vres = 484/divisions;
+    Xofset = (frmnum % divisions) * hres;
+    Yofset = (divisions-1 - (frmnum / divisions)) * vres;
+    hres /= 2;  vres /= 2;      /* use half-res for scaling later */
+    bbzoom(divisions, Xofset + hres, Yofset + vres + 1);
+}
+
+
+
+ 
+/* +++++++++++++++++++++++++ U_TILER +++++++++++++++++++++++++++++++++++ */ 
+
+u_tiler(npts,pts,npars,pxl_proc)    /* tile a convex poly, taken clockwise */ 
+    short npts,npars;   double pts[];    void (*pxl_proc)();
+{ 
+    edge_position l_edge,r_edge,l_incr,r_incr,l_old,r_old; 
+    short i,lpt,rpt,ptcnt,top_pt,next_line,top_line;
+    double top,bot,lft,rgt,ceil(),floor(),fabs();
+
+    if (npts < 3) {  printf(" degenerate polygon\n");    return;   } 
+
+    px_proc = pxl_proc;	/* set pointer to pixel write procedure */
+
+    top = 0.0;    bot = MAX_VRES;    lft = MAX_HRES;    rgt = 0.; 
+    for(i=0; i<npts; i++)        /* scale to screen and find topmost vertex */
+    {   short j;
+        j = i * npars;          /* offset for vertex */
+        pts[j+X] = hres * (pts[j+X] + 1.) + SUBPIX + Xofset; 
+        pts[j+Y] = vres * (pts[j+Y] + 1.) + SUBPIX + Yofset;   
+        if (pts[j+Y] > top)  {   top = pts[j+Y];    top_pt = i;   } 
+        if (pts[j+Y] < bot)  bot = pts[j+Y];  /* get bounding box */
+        if (pts[j+X] < lft)  lft = pts[j+X];  /* for size check */
+        if (pts[j+X] > rgt)  rgt = pts[j+X];
+    } 
+    if ((top - bot < SUBPIX) || (rgt - lft < SUBPIX))  /* ignore tiny polys */ 
+    {   printf(" rejected eensy polygon\n");    return;   } 
+
+    l_edge.lnth = r_edge.lnth = 0;                         /* scanlines left */
+    lpt = top_pt;  rpt = top_pt;                        /* vertex pointers */
+    Y_pos =  floor(top);                             /* set to top scanline */
+    next_line = FALSE;    top_line = TRUE;
+    xleft = MAX_HRES;    xrght = 0;            /* initialize segment extremes */
+    ptcnt = 0;     /* zero processed point count */ 
+
+    r_edge.x  = l_edge.x  = pts[top_pt*npars+X];       /* load top position */
+    r_edge.ht = l_edge.ht = pts[top_pt*npars+Y] - floor(pts[top_pt*npars+Y]);
+    for (i=PAR1; i<npars; i++) 
+        r_edge.par[i-PAR1] = l_edge.par[i-PAR1] = pts[top_pt*npars+i];
+
+    /* ----------------------- scan loop --------------------------------- */ 
+    while(ptcnt <= npts) 
+    {  
+        /* get left side bottom positions */ 
+        copy(&l_edge,&l_old,npars-PAR1,next_line);/* copy to top posns */ 
+        if ((l_edge.lnth > 0) && next_line)
+            increment(&l_edge,&l_incr,&pts[lpt*npars],npars-PAR1);
+        else if (l_edge.lnth <= 0)             /* get new edge block if nec. */
+        {   mkedge(&lpt,pts,npars,&l_edge,&l_incr,npts-1,npts);   ptcnt++;   } 
+
+        /* get right side bottom positions */ 
+        copy(&r_edge,&r_old,npars-PAR1,next_line);/* copy to top posns */ 
+        if ((r_edge.lnth > 0) && next_line) 
+            increment(&r_edge,&r_incr,&pts[rpt*npars],npars-PAR1);
+        else if (r_edge.lnth <= 0)            /* get new edge block if nec. */ 
+        {   mkedge(&rpt,pts,npars,&r_edge,&r_incr,npts+1,npts);   ptcnt++;   }
+
+        scanseg(&l_edge,&l_old,&r_old,&r_edge,npars-PAR1,next_line | top_line);
+    
+        if ((l_edge.ht == 0.) && (r_edge.ht == 0.)) /* outpt seg if lin done */
+        {   next_line = TRUE;   putseg(Y_pos,xleft,xrght);   Y_pos--;   }
+        else            next_line = FALSE; 
+
+ top_line = FALSE;
+
+ if ((Y_pos <= bot)     && (ptcnt >= npts) &&
+     (l_edge.lnth == 0) && (r_edge.lnth == 0))  break; /* quit if done */ 
+    } 
+    putseg(Y_pos,xleft,xrght);        /* store away bottom segment */
+}
+
+
+/* ++++++++++++++++++++++++++++ COPY ++++++++++++++++++++++++++++++++++++ */ 
+
+copy(bot,top,npars,newln)
+   /* copy bottom-of-scanline pos. to top-of-scanline pos. */
+    edge_position  *bot,*top;    short newln;
+{   short i;
+    top->x = bot->x;    top->ht = newln?  1. : bot->ht;
+    for (i=0; i<npars; i++)   top->par[i] = bot->par[i]; 
+}
+
+
+
+/* +++++++++++++++++++++++++++ INCREMENT ++++++++++++++++++++++++++++++++++ */
+
+increment(edge,incr,pts,npars)            /* increment edge block */
+    edge_position *edge,*incr;    short npars; 
+    double pts[]; 
+{   double floor();   short i;
+    if (edge->lnth > 1) 
+    {   edge->x += incr->x;
+        edge->lnth--;
+        for (i=0; i<npars; i++)   edge->par[i] += incr->par[i];
+    } 
+    else
+    {   edge->x = pts[X]; 
+        edge->ht = pts[Y] - floor(pts[Y]); 
+        edge->lnth = 0;
+        for (i=0; i<npars; i++)   edge->par[i] = pts[PAR1 + i]; 
+    }
+} 
+
+
+
+/* +++++++++++++++++++++++++++++ SCANSEG +++++++++++++++++++++++++++++ */ 
+
+scanseg(lbot,ltop,rtop,rbot,npars,newln) /*trapezoidal section of scan segment*/
+    edge_position  *lbot,*ltop,*rtop,*rbot;    short npars,newln;
+{   short left_top,rght_top,new_left,new_rght,same_slope;
+    double left_ht,rght_ht,get_ht();
+    edge_position *lb,*lt,*rt,*rb,*v1,*v2,*v3,*v4;
+
+    /* allow for twisted or counterclockwise polygons */
+    if (ltop->x > rtop->x)  { lt=rtop;  rt=ltop; }  else { lt=ltop;  rt=rtop; }
+    if (lbot->x > rbot->x)  { lb=rbot;  rb=lbot; }  else { lb=lbot;  rb=rbot; }
+    
+    /* find leftmost and rightmost pixels */
+    left_top = (lt->x < lb->x)?  TRUE : FALSE; 
+    rght_top = (rt->x > rb->x)?  TRUE : FALSE;
+    
+    /* get section of scanline if new line or smaller left or bigger right */ 
+    new_left = left_top?  lt->x : lb->x;   new_rght = rght_top?  rt->x : rb->x;
+    if (newln)
+    {   xleft = new_left;   xrght = new_rght;   getseg(Y_pos,xleft,xrght);   } 
+    else {  if (new_rght > xrght)  {   getseg(Y_pos,xrght+1,new_rght);
+                                       xrght = new_rght;            } 
+            if (new_left < xleft)  {   getseg(Y_pos,new_left,xleft-1);
+                                       xleft = new_left;            }
+         }
+    
+    /* order left-to-right and calculate thickness at inner vertices */ 
+    if (left_top) 
+    {  v1 = lt; 
+       if (rght_top) if (lb->x < rb->x) { v2=lb; v3=rb; 
+                                                        same_slope = FALSE; }
+                                   else               { v2=rb; v3=lb; 
+                                                        same_slope = FALSE; }
+                     else          if (lb->x < rt->x) { v2=lb; v3=rt; 
+                                                        same_slope = TRUE; } 
+                                   else               { v2=rt; v3=lb; 
+                                                        same_slope = TRUE; }
+    }
+    else          
+    {  v1 = lb; 
+       if (rght_top) if (lt->x < rb->x) { v2=lt; v3=rb; 
+                                                        same_slope = TRUE; }
+                                   else               { v2=rb; v3=lt; 
+                                                        same_slope = TRUE; }
+                     else          if (lt->x < rt->x) { v2=lt; v3=rt; 
+                                                        same_slope = FALSE; } 
+                                   else               { v2=rt; v3=lt;
+                                                        same_slope = FALSE; }
+    }
+    v4 = rght_top?  rt : rb;
+    if (same_slope) {   left_ht = get_ht(v1,v2,v3); 
+                        rght_ht = get_ht(v2,v3,v4);   }
+    else            {   left_ht = get_ht(v1,v2,v4); 
+                        rght_ht = get_ht(v1,v3,v4);   }
+    
+    /* call shader  for nonzero length segments */ 
+    if ((v2->x - v1->x) > SUBPIX)  shader(v1,     0.,v2,left_ht,npars); 
+    if ((v3->x - v2->x) > SUBPIX)  shader(v2,left_ht,v3,rght_ht,npars); 
+    if ((v4->x - v3->x) > SUBPIX)  shader(v3,rght_ht,v4,     0.,npars); 
+    
+}
+
+
+
+
+/* +++++++++++++++++++++++ GET_HT +++++++++++++++++++++++++++++++++++++ */ 
+double get_ht(v1,v2,v3) /* vertical distance from v2 to line from v1 to v3 */ 
+edge_position *v1,*v2,*v3; 
+{   double fabs(),div;
+    div = v3->x - v1->x;    if (div <= 0.)  div = 1.;
+    return  fabs( v2->ht - ( v1->ht + (v3->ht - v1->ht) * 
+                                        (v2->x - v1->x) / div )); 
+}
+
+
+
+
+
+/* +++++++++++++++++++++++ SHADER +++++++++++++++++++++++++++++++++++++++ */
+shader(left,lht,rght,rht,npars)   /* shade segment - trapezoid with sloping 
+                                     top, aligned with scanline at bottom and
+                                     with vertical sides assumed     */
+edge_position *left,*rght;    double lht,rht;    short npars;
+{   short xleft,xrght;
+
+    xleft = left->x;    xrght = rght->x;
+
+    /* --------------------------
+    |   single pixel spanned    | 
+    -------------------------- */
+    if (xleft == xrght)
+    {   double cvrge; 
+        cvrge = (rght->x - left->x) * (lht + rht) / 2;
+        (*px_proc)(xleft,left->par,cvrge);
+    }
+
+    /* ------------------------
+    |   two pixels spanned    |
+    ------------------------ */
+    else if (xleft - xrght == 1)
+    {   double lcvrge,rcvrge,midhght;
+        lcvrge = xleft + 1 - left->x;    rcvrge = rght->x - xrght;
+        midhght = lht + (rht - lht) * lcvrge / (lcvrge + rcvrge);
+        lcvrge = lcvrge * (lht + midhght) / 2.;
+        rcvrge = rcvrge * (rht + midhght) / 2.;
+        (*px_proc)(xleft,left->par,lcvrge);
+        (*px_proc)(xrght,rght->par,rcvrge);
+    }
+
+    /* ---------------------
+    |   Multiple pixels    |
+    --------------------- */ 
+    else
+    {   double pixel[MAX_PARS],px_inc[MAX_PARS];
+        short i,ix;    double adj,xlnth,ht,hxinc,cvrge;
+        
+        xlnth = (rght->x - left->x);            /* ----  do left pixel ----- */
+        hxinc = (rht - lht) / xlnth;            /* height increment / pixel */
+        adj = xleft + 1 - left->x;
+        ht = lht + hxinc * adj; 
+        cvrge = (xleft + 1 - left->x) * (lht + ht) / 2; /* part pixel covrge */
+        (*px_proc)(xleft,left->par,cvrge);
+        
+        for (i=0; i<npars; i++)                 /* increments */ 
+        {   px_inc[i] = (rght->par[i] - left->par[i]) / xlnth; 
+            pixel[i]  = left->par[i] + adj * px_inc[i];
+        } 
+        for (ix=xleft+1; ix<=xrght; ix++) /* - loop through rest of pixels - */ 
+        {   if (ix != xrght)  cvrge = ht + hxinc/2.;         /* middle pixel */
+            else              cvrge = (rght->x - ix) * (ht + rht)/2.; /* rgt */
+            (*px_proc)(ix,pixel,cvrge);
+            if (ix != xrght)                               /* middle pixel */
+            {   for (i=0; i<npars; i++)   pixel[i] += px_inc[i]; 
+                ht      += hxinc;
+            }
+        } 
+    }
+}
+
+
+
+
+/* ++++++++++++++++++++++++ MKEDGE ++++++++++++++++++++++++++++++++ */ 
+
+mkedge(ptr,pts,npars,edge,incmnts,ptrinc,npts) /* calculate edge block */ 
+    short *ptr,npars,ptrinc,npts; 
+    double pts[];
+    edge_position *edge,*incmnts;
+{
+    short opt,i;  double floor();
+
+    opt = *ptr; *ptr = (*ptr + ptrinc) % npts;     /* increment vertex ptr. */
+							   /* lines spanned */
+    edge->lnth = floor(pts[opt*npars + Y]) - floor(pts[(*ptr)*npars + Y]);
+
+    if (edge->lnth <= 0)            /* -------- all in one scanline -------- */ 
+    {   edge->x = pts[(*ptr)*npars + X];               /* load edge posns. */
+        edge->ht = pts[(*ptr)*npars + Y] - floor(pts[(*ptr)*npars+ Y]);
+        for (i=0; i<npars-PAR1; i++)
+            edge->par[i] = pts[(*ptr)*npars + i + PAR1];
+        return;
+    }
+    else                             /* ----- multiple scanlines ----------- */
+    {   double adj,ydif; 
+        ydif = pts[opt*npars + Y] - pts[(*ptr)*npars + Y];
+        incmnts->x  = (pts[(*ptr)*npars + X]  - pts[opt*npars + X]) / ydif; 
+        for (i=0; i<npars-PAR1; i++)
+           incmnts->par[i] =  (pts[(*ptr)*npars + i + PAR1]
+                             - pts[  opt *npars + i + PAR1]) / ydif; 
+                                                      /* adjust to scanline */ 
+        adj = pts[opt*npars + Y] - floor(pts[opt*npars + Y]);
+        edge->x  = pts[opt*npars + X] + incmnts->x  * adj; 
+        edge->ht = 0.;
+        for (i=0; i<npars-PAR1; i++) 
+            edge->par[i] = pts[opt*npars + i + PAR1] + incmnts->par[i] * adj;
+    } 
+}
+
+
+
+
+
+!Funky!Stuff!
+
+

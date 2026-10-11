@@ -1,0 +1,438 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,e55bbbc37e6fefeb,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-09-03 20:50:28 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site brl-tgr.ARPA
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!think!harvard!seismo!brl-tgr!gwyn
+From: gwyn@brl-tgr.ARPA (Doug Gwyn <gwyn>)
+Newsgroups: net.sources
+Subject: You too can have crabs!
+Message-ID: <1204@brl-tgr.ARPA>
+Date: Tue, 3-Sep-85 23:50:28 EDT
+Article-I.D.: brl-tgr.1204
+Posted: Tue Sep  3 23:50:28 1985
+Date-Received: Thu, 5-Sep-85 08:28:44 EDT
+Distribution: net
+Organization: Ballistic Research Lab
+Lines: 417
+
+/*
+	crabs -- see September 1985 Scientific American pages 18..23
+
+	last edit:	85/09/03	D A Gwyn
+
+	SCCS ID:	@(#)crabs.c	1.1	Teletype 5620 DMD version
+
+To compile:
+	$ dmdcc -o crabs.m crabs.c	# -g -O also recommended
+
+To run:
+	$ 32ld crabs.m			# only runs under mpx mode
+or
+	$ 32ld crabs.m -		# for invisible crabs
+*/
+
+#ifndef lint
+static char	SCCS_ID[] = "@(#)crabs.c	1.1 85/09/03";	/* for "what" utility */
+#endif
+
+
+#include	<blit.h>
+
+
+typedef int	bool;			/* Boolean data type */
+#define	false	0
+#define	true	1
+
+
+#define	NCRABS	32			/* total number of crabs (1..32) */
+
+#define	MAXVEL	8			/* bound on absolute velocity component */
+
+#define	PERIOD	2			/* sleep time (ticks) per cycle */
+
+
+static bool	visible;		/* true if crabs are to be shown */
+
+static Texture	grey =			/* background texture */
+	{
+	0x11111111, 0x44444444, 0x11111111, 0x44444444,
+	0x11111111, 0x44444444, 0x11111111, 0x44444444,
+	0x11111111, 0x44444444, 0x11111111, 0x44444444,
+	0x11111111, 0x44444444, 0x11111111, 0x44444444,
+	0x11111111, 0x44444444, 0x11111111, 0x44444444,
+	0x11111111, 0x44444444, 0x11111111, 0x44444444,
+	0x11111111, 0x44444444, 0x11111111, 0x44444444,
+	0x11111111, 0x44444444, 0x11111111, 0x44444444
+	};
+
+static struct
+	{
+	Point	ulc;			/* upper left corner screen coordinates */
+	Point	vel;			/* velocity (pixels/cycle) */
+	}	crab[NCRABS];		/* keeps track of crabs' state */
+
+static Bitmap	screen =		/* full screen definition */
+	{
+	(Word *)0x700000L,		/* DMD screen image base address */
+	(XMAX + 31) / 32,		/* bitmap width in 32-bit Words */
+	0, 0, XMAX, YMAX		/* screen rectangle within bitmap */
+	};
+
+/* There are 4 possible crab orientations, each of which
+   has 4 possible relationships with the grey background.
+   (Scientific American article says 8, but it's wrong.) */
+
+/* Crab images XORed with grey texture at various offsets: */
+
+static Word	upcrab[] =		/* facing up */
+	{
+	0x6E4C2A66,
+	0xB377E6D5,
+	0x80818101,
+	0xB935AC9D,
+	0x6E5C3A76,
+	0x3A766E5C,
+	0xAC9DB935,
+	0x02424240
+	};
+
+static Word	downcrab[] =		/* facing down */
+	{
+	0x42400242,
+	0xB935AC9D,
+	0x6E5C3A76,
+	0x3A766E5C,
+	0xAC9DB935,
+	0x81018081,
+	0xEECDAB67,
+	0x32766654
+	};
+
+static Word	rightcrab[] =		/* facing right */
+	{
+	0x4E4C0A46,
+	0xB333A291,
+	0x6A593B73,
+	0x3A726A58,
+	0x68593971,
+	0x3B736A59,
+	0xA291B333,
+	0x0A464E4C
+	};
+
+static Word	leftcrab[] =		/* facing left */
+	{
+	0x62503272,
+	0x8945CCCD,
+	0xCEDC9A56,
+	0x9A168E9C,
+	0x4E5C1A56,
+	0x9A56CEDC,
+	0xCCCD8945,
+	0x32726250
+	};
+
+/* The bitmaps for the four orientations: */
+
+static Bitmap	upmap = { upcrab, 1, 0, 0, 32, 8 };		/* facing up */
+static Bitmap	downmap = { downcrab, 1, 0, 0, 32, 8 };		/* facing down */
+static Bitmap	rightmap = { rightcrab, 1, 0, 0, 32, 8 };	/* facing right */
+static Bitmap	leftmap = { leftcrab, 1, 0, 0, 32, 8 };		/* facing left */
+
+/* Crab "vicinities" are recorded in the following
+   global map; see Collide() and Draw() for details: */
+
+static int	vicinity[(XMAX + 31) / 32 + 2][(YMAX + 31) / 32 + 2];
+					/* includes margins all around */
+
+static void	Cycle(), DrawCrab(), HideCrabs(), Init(), ModVel(), NewVel();
+static int	Collide(), RandInt();
+
+
+main( argc, argv )
+	int	argc;
+	char	*argv[];
+	{
+	Init( argc, argv );		/* set up initial grey crab layer */
+
+	for ( ; ; )			/* no way out! */
+		{
+		sleep( PERIOD );	/* relinquish the processor */
+
+		Cycle();		/* move the crabs */
+		}
+	/*NOTREACHED*/
+	}
+
+
+static void
+Init( argc, argv )			/* set up initial crab layer */
+	int	argc;
+	char	*argv[];
+	{
+	int	i;			/* crab # */
+
+	visible = argc <= 1;		/* default is to show crabs */
+
+	texture( &display, display.rect, &grey, F_STORE );	/* crab layer */
+
+/* DEBUG
+	display.rect.corner = display.rect.origin;	/* make unpickable */
+
+	/* Create initial set of crabs: */
+
+	for ( i = 0; i < NCRABS; ++i )
+		{
+		/* Assign random position within "crabs" layer: */
+
+		crab[i].ulc.x = RandInt( display.rect.origin.x,
+					 display.rect.corner.x - 8
+				       );
+		crab[i].ulc.y = RandInt( display.rect.origin.y,
+					 display.rect.corner.y - 8
+				       );
+
+		/* Assign random velocity: */
+
+		NewVel( i );
+
+		/* Draw crab at initial position (within "crabs" layer): */
+
+		if ( visible )
+			DrawCrab( i );
+		}
+	}
+
+
+static void
+Cycle()					/* one motion cycle for all crabs */
+	{
+	static Word	old[8];		/* old contents of new crab position */
+	static Bitmap	oldmap = { old, 1, 0, 0, 8, 8 };
+	Point		p;		/* new crab upper left corner */
+	Rectangle	r;		/* new crab area */
+	int		syndrome;	/* crab collision mask */
+	int		i;		/* crab # */
+	int		w;		/* index for old[.] */
+
+	for ( i = 0; i < NCRABS; ++i )
+		{
+		DrawCrab( i );		/* erase crab from previous position */
+
+		for ( ; ; )		/* determine a new position */
+			{
+			p.x = crab[i].ulc.x + crab[i].vel.x;	/* motion */
+			p.y = crab[i].ulc.y + crab[i].vel.y;
+
+			if ( p.x >= 0 && p.x < XMAX - 8
+			  && p.y >= 0 && p.y < YMAX - 8
+			   )
+				break;	/* on-screen, proceed */
+
+			/* Bounce off edge of screen: */
+
+			NewVel( i );	/* assign new velocity */
+			}
+
+		r.origin = p;
+		r.corner.x = p.x + 8;
+		r.corner.y = p.y + 8;
+
+		/* Check for collision with other crabs;
+		   if you don't worry about this, you get
+		   crud left behind from crab collisions
+		   (visible in Scientific American article).
+		   (Note that crab # i has been removed.) */
+
+		/* The strategy is: only undraw possibly colliding crabs.
+		   The obvious alternative, not showing any crabs until
+		   all locations have been painted, would probably cause
+		   the set of crabs to flicker or to appear too faint. */
+
+		if ( (syndrome = Collide( p )) != 0 )
+			HideCrabs( syndrome );	/* save from the following code */
+
+		/* Save old contents of new crab location: */
+
+		bitblt( &screen, r, &oldmap, Pt( 0, 0 ), F_STORE );
+
+		/* Paint the new location grey: */
+
+		texture( &screen, r, &grey, F_STORE );
+
+		/* Determine if new location used to be grey: */
+
+		bitblt( &screen, r, &oldmap, Pt( 0, 0 ), F_XOR );
+
+		for ( w = 0; w < 8; ++w )
+			if ( old[w] != 0 )
+				{	/* this location has been nibbled */
+				p = crab[i].ulc;	/* reset position */
+
+				NewVel( i );	/* bounce away from bite */
+
+				break;
+				}
+
+		if ( syndrome != 0 )
+			HideCrabs( syndrome );	/* bring them back */
+
+		/* Draw the crab in its new position: */
+
+		crab[i].ulc = p;
+
+		ModVel( i );		/* randomly alter crab velocity */
+
+		DrawCrab( i );
+		}
+	}
+
+
+static int
+Collide( p )				/* return syndrome for crab collision */
+	Point	p;			/* crab upper left corner */
+	{
+	int	syndrome;		/* accumulate syndrome here */
+	bool	right = p.x % 32 > 32 - 8,
+		down = p.y % 32 > 32 - 8;	/* more than one vicinity? */
+	int	x32 = p.x / 32,
+		y32 = p.y / 32;		/* vicinity array indices */
+
+	/* "Or" in crabs from overlapping vicinities: */
+
+	syndrome = vicinity[x32 + 1][y32 + 1];
+	if ( right )
+		syndrome |= vicinity[x32 + 1 + 1][y32 + 1];
+	if ( down )
+		syndrome |= vicinity[x32 + 1][y32 + 1 + 1];
+	if ( right && down )
+		syndrome |= vicinity[x32 + 1 + 1][y32 + 1 + 1];	
+
+	return syndrome;
+	}
+
+
+static void
+HideCrabs( syndrome )			/* draw crabs contained in syndrome */
+	int	syndrome;		/* syndrome (crab bit flags) */
+	{
+	int	i;			/* indexes crab[.] */
+	int	m;			/* bit mask for crab # i */
+
+	for ( m = 1, i = 0; i < NCRABS; m <<= 1, ++i )
+		if ( (m & syndrome) != 0 )	/* crab contained in syndrome */
+			DrawCrab( i );	/* toggle crab */
+	}
+
+
+static void
+DrawCrab( i )				/* draw specified crab */
+	int	i;			/* crab # (0..NCRABS-1) */
+	{
+	Point	p;			/* upper left corner for crab image */
+	Point	v;			/* crab velocity */
+	Bitmap	*whichmap;		/* -> 1 of 4 possible crab orientations */
+	int	index;			/* selects 1 of 4 crab offsets wrt grey */
+	int	x32, y32;		/* vicinity array indices */
+	bool	right, down;		/* more than one vicinity? */
+	int	syn_bit;		/* crab possible-occupancy bit */
+
+	if ( visible )
+		{
+		p = crab[i].ulc;
+		v = crab[i].vel;
+
+		if ( abs( v.x ) >= abs( v.y ) )
+			if ( v.x > 0 )
+				whichmap = &upmap;
+			else
+				whichmap = &downmap;
+		else
+			if ( v.y > 0 )
+				whichmap = &rightmap;
+			else
+				whichmap = &leftmap;
+
+		index = (p.x + p.y * 2) % 4 * 8;
+		bitblt( whichmap,
+			Rect( index, 0, index + 8, 8 ),
+			&screen,
+			p,
+			F_XOR
+		      );
+
+		/* A crab's vicinities are the disjoint 32x32 regions
+		   that contain any piece of the crab's 8x8 square.
+		   On the average, 9 out of 16 crabs occupy just 1
+		   vicinity; 6 out of 16 crabs occupy 2 vicinities,
+		   and 1 out of every 16 crabs occupies 4 vicinities. */
+
+		x32 = p.x / 32;
+		y32 = p.y / 32;		/* coords for upper left vicinity */
+
+		right = p.x % 32 > 32 - 8;	/* also next vicinity right? */
+		down = p.y % 32 > 32 - 8;	/* also next vicinty down? */
+
+		/* Toggle crab's occupancy bit in all occupied vicinities: */
+
+		syn_bit = 1 << i;
+
+		vicinity[x32 + 1][y32 + 1] ^= syn_bit;
+		if ( right )
+			vicinity[x32 + 1 + 1][y32 + 1] ^= syn_bit;
+		if ( down )
+			vicinity[x32 + 1][y32 + 1 + 1] ^= syn_bit;
+		if ( right && down )
+			vicinity[x32 + 1 + 1][y32 + 1 + 1] ^= syn_bit;	
+		}
+	/* else nibble away but don't show crabs */
+	}
+
+
+static void
+NewVel( i )				/* assign new velocity to crab */
+	int	i;			/* crab # */
+	{
+	crab[i].vel.x = RandInt( 1 - MAXVEL, MAXVEL );
+	crab[i].vel.y = RandInt( 1 - MAXVEL, MAXVEL );
+
+	/* Velocity (0,0) is okay since we repeatedly modify all velocities. */
+	}
+
+
+static void
+ModVel( i )				/* randomly modify crab velocity */
+	int	i;			/* crab # */
+	{
+	int	d;			/* increment */
+
+	if ( crab[i].vel.x >= MAXVEL - 1 )
+		d = RandInt( -1, 1 );
+	else if ( crab[i].vel.x <= 1 - MAXVEL )
+		d = RandInt( 0, 2 );
+	else
+		d = RandInt( -1, 2 );
+
+	crab[i].vel.x += d;
+
+	if ( crab[i].vel.y >= MAXVEL - 1 )
+		d = RandInt( -1, 1 );
+	else if ( crab[i].vel.y <= 1 - MAXVEL )
+		d = RandInt( 0, 2 );
+	else
+		d = RandInt( -1, 2 );
+
+	crab[i].vel.y += d;
+	}
+
+
+static int
+RandInt( lo, hi )			/* generate random integer in range */
+	int	lo, hi;			/* range lo..hi-1 */
+	{
+	return lo + (hi - lo) * rand() / 32768;
+	}
+
+

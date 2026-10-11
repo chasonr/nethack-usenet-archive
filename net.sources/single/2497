@@ -1,0 +1,1444 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,ac448dfea1d25172,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1985-02-27 20:00:00 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version nyu B notes v1.5 12/10/84; site acf4.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!godot!harvard!seismo!cmcl2!acf4!tsc2597
+From: tsc2597@acf4.UUCP (Sam Chin)
+Newsgroups: net.sources
+Subject: New UNIX Kermit (Part 1 of 5)
+Message-ID: <1590002@acf4.UUCP>
+Date: Wed, 27-Feb-85 23:00:00 EST
+Article-I.D.: acf4.1590002
+Posted: Wed Feb 27 23:00:00 1985
+Date-Received: Fri, 1-Mar-85 09:32:03 EST
+Organization: New York University
+Lines: 1424
+
+Here is the much asked for new version of KERMIT for BSD 4.2.
+*** Warning *** This is supposedly a prerelease version but it
+seems to work fine as far as i've used it - which isn't much. This
+is the first of five shar files. I tried to keep them small but some
+of the files were 60K in length and I didn't want to split them. I
+hope the number of requests for this justifies the posting. Let's hope
+Okstate reads this and doesn't attempt a simultaneous posting.
+
+                                         Sam Chin
+                                         allegra!cmcl2!acf4!tsc2597
+                                         tsc2597@nyu-acf4
+
+------------------ C U T ------ H E R E ----------------------------
+# This is a shell archive.  Remove anything before this line,
+# then unpack it by saving it in a file and typing "sh file".
+#
+# Wrapped by acf4!tsc2597  on Wed Feb 27 22:18:35 EST 1985
+# Contents:  ckcmd.c ckcmd.h ckconu.c ckdebu.h ckermi.ann
+ 
+echo x - ckcmd.c
+sed 's/^@//' > "ckcmd.c" <<'@//E*O*F ckcmd.c//'
+char *cmdv = "Unix cmd package V1.0(014) 1 Feb 85";
+
+/*  C K C M D  --  Interactive command package for Unix  */
+/*
+ Modelled after the DECSYSTEM-20 command parser (the COMND JSYS)
+
+ Features:
+ . parses and verifies keywords, text strings, numbers, and other data
+ . displays appropriate menu or help message when user types "?"
+ . does keyword and filename completion when user types ESC
+ . accepts any unique abbreviation for a keyword
+ . allows keywords to have attributes, like "invisible"
+ . can supply defaults for fields omitted by user
+ . provides command line editing (character, word, and line deletion)
+ . accepts input from keyboard, command files, or redirected stdin
+ . allows for full or half duplex operation, character or line input
+ . settable prompt, protected from deletion
+
+ Functions:
+  cmsetp - Set prompt
+  cmsavp - Save current prompt
+  prompt - Issue prompt
+  cmini  - Clear the command buffer (before parsing a new command)
+  cmres  - Reset command buffer pointers (before reparsing)
+  cmkey  - Parse a keyword
+  cmnum  - Parse a number
+  cmifi  - Parse an input file name
+  cmofi  - Parse an output file name
+  cmfld  - Parse an arbitrary field
+  cmtxt  - Parse a text string
+  cmcfm  - Parse command confirmation (end of line)
+
+ Return codes:
+  -3: no input provided when required
+  -2: input was invalid
+  -1: reparse required (user deleted into a preceding field)
+   0 or greater: success
+  See individual functions for greater detail.
+
+ Before using these routines, the caller should #include ckcmd.h, and
+ set the program's prompt by calling cmsetp().  If the file parsing
+ functions cmifi and cmofi are to be used, this module must be linked
+ with a ckz??? file system support module for the appropriate system,
+ e.g. ckzbsd for Berkeley Unix.  If the caller puts the terminal in
+ character wakeup ("cbreak") mode with no echo, then these functions will
+ provide line editing -- character, word, and line deletion, as well as
+ keyword and filename completion upon ESC and help strings, keyword, or
+ file menus upon '?'.  If the caller puts the terminal into character
+ wakeup/noecho mode, care should be taken to restore it before exit from
+ or interruption of the program.  If the character wakeup mode is not
+ set, the system's own line editor may be used.
+
+ Author: Frank da Cruz (SY.FDC@CU20B),
+ Columbia University Center for Computing Activities, Jan 1985.
+ Copyright (C) 1985, Trustees of Columbia University in the City of New York.
+ Permission is granted to any individual or institution to copy or use this
+ software except for explicitly commercial purposes, provided this copyright
+ notice is retained.
+*/
+
+/* Includes */
+
+#include <stdio.h>			/* Standard C I/O package */
+#include <ctype.h>			/* Character types */
+#include "ckcmd.h"			/* Command parsing definitions */
+#include "ckdebu.h"			/* Formats for debug() */
+
+/* Local variables */
+
+int psetf = 0,				/* Flag that prompt has been set */
+    cc = 0,				/* Character count */
+    dpx = 0;				/* Duplex (0 = full) */
+
+int hw = HLPLW,				/* Help line width */
+    hc = HLPCW,				/* Help line column width */
+    hh,					/* Current help column number */
+    hx;					/* Current help line position */
+
+#define PROML 60			/* Maximum length for prompt */
+
+char cmprom[PROML+1];			/* Program's prompt */
+char *dfprom = "Command? ";		/* Default prompt */
+
+int cmflgs;				/* Command flags */
+
+char cmdbuf[CMDBL+4];			/* Command buffer */
+char hlpbuf[HLPBL+4];			/* Help string buffer */
+char atmbuf[ATMBL+4];			/* Atom buffer */
+char filbuf[ATMBL+4];			/* File name buffer */
+
+/* Command buffer pointers */
+
+static char *bp,			/* Current command buffer position */
+    *pp,				/* Start of current field */
+    *np;				/* Start of next field */
+
+/*  C M S E T P  --  Set the program prompt.  */
+
+cmsetp(s) char *s; {
+    char *strncpy();
+    psetf = 1;				/* Flag that prompt has been set. */
+    strncpy(cmprom,s,PROML - 1);	/* Copy the string. */
+    cmprom[PROML] = NUL;
+}
+
+
+/*  C M S A V P  --  Save a copy of the current prompt.  */
+
+cmsavp(s,n) int n; char s[]; {
+    strncpy(s,cmprom,n-1);
+    s[n] = NUL;
+}
+
+
+/*  P R O M P T  --  Issue the program prompt.  */
+
+prompt() {
+    if (psetf == 0) cmsetp(dfprom);	/* If no prompt set, set default. */
+    printf("\r%s",cmprom);		/* Print the prompt. */
+}
+
+
+/*  C M R E S  --  Reset pointers to beginning of command buffer.  */
+
+cmres() {  
+    cc = 0;				/* Reset character counter. */
+    pp = np = bp = cmdbuf;		/* Point to command buffer. */
+    cmflgs = -5;			/* Parse not yet started. */
+}
+
+
+/*  C M I N I  --  Clear the command and atom buffers, reset pointers.  */
+
+/*
+The argument specifies who is to echo the user's typein --
+  1 means the cmd package echoes
+  0 somebody else (system, front end, terminal) echoes
+*/
+
+cmini(d) int d; {
+    for (bp = cmdbuf; bp < cmdbuf+CMDBL; bp++) *bp = NUL;
+    *atmbuf = NUL;
+    dpx = d;
+    cmres();
+}
+
+/*  C M N U M  --  Parse a number in the indicated radix  */
+
+/*  For now, only works for positive numbers in base 10.  */
+
+/*
+ Returns
+   -3 if no input present when required,
+   -2 if user typed an illegal number,
+   -1 if reparse needed,
+    0 otherwise, with n set to number that was parsed
+*/
+cmnum(xhlp,xdef,radix,n) char *xhlp, *xdef; int radix, *n; {
+    int x; char *s;
+
+    if (radix != 10) {			/* Just do base 10 for now */
+	printf("cmnum: illegal radix - %d\n",radix);
+	return(-1);
+    }
+
+    x = cmfld(xhlp,xdef,&s);
+    debug(F101,"cmnum: cmfld","",x);
+    if (x < 0) return(x);    /* Parse a field */
+
+    if (digits(atmbuf)) {		/* Convert to number */
+	*n = atoi(atmbuf);
+	return(x);
+    } else {
+	printf("\n?not a number - %s\n",s);
+	return(-2);	
+    }
+}
+
+/*  C M O F I  --  Parse the name of an output file  */
+
+/*
+ Depends on the external function zchko(); if zchko() not available, use
+ cmfld() to parse output file names.
+
+ Returns
+   -3 if no input present when required,
+   -2 if permission would be denied to create the file,
+   -1 if reparse needed,
+    0 or 1 otherwise, with xp pointing to name.
+*/
+cmofi(xhlp,xdef,xp) char *xhlp, *xdef, **xp; {
+    int x; char *s;
+
+    if (*xhlp == NUL) xhlp = "Output file";
+    *xp = "";
+
+    if ((x = cmfld(xhlp,xdef,&s)) < 0) return(x);
+
+    if (chkwld(s)) {
+	printf("\n?Wildcards not allowed - %s\n",s);
+	return(-2);
+    }
+    if (zchko(s) < 0) {
+	printf("\n?Write permission denied - %s\n",s);
+	return(-2);
+    } else {
+	*xp = s;
+	return(x);
+    }
+}
+
+/*  C M I F I  --  Parse the name of an existing file  */
+
+/*
+ This function depends on the external functions:
+   zchki()  - Check if input file exists and is readable.
+   zxpand() - Expand a wild file specification into a list.
+   znext()  - Return next file name from list.
+ If these functions aren't available, then use cmfld() to parse filenames.
+*/
+/*
+ Returns
+   -4 EOF
+   -3 if no input present when required,
+   -2 if file does not exist or is not readable,
+   -1 if reparse needed,
+    0 or 1 otherwise, with:
+	xp pointing to name,
+    	wild = 1 if name contains '*' or '?', 0 otherwise.
+*/
+cmifi(xhlp,xdef,xp,wild) char *xhlp, *xdef, **xp; int *wild; {
+    int i, x, xc, y; char *sp;
+
+    cc = xc = 0;			/* Initialize counts & pointers */
+    *xp = "";
+    if ((x = cmflgs) != 1) {		/* Already confirmed? */
+	x = getwd();			/* No, get a word */
+    } else {
+	cc = setatm(xdef);		/* If so, use default, if any. */
+    }
+    *xp = atmbuf;			/* Point to result. */
+    *wild = chkwld(*xp);
+
+    while (1) {
+	xc += cc;			/* Count the characters. */
+	debug(F111,"cmifi: getwd",atmbuf,xc);
+    	switch (x) {
+	    case -4:			/* EOF */
+	    case -2:			/* Out of space. */
+	    case -1:			/* Reparse needed */
+	    	return(x);
+
+/* cont'd... */
+
+/* ...cmifi(), cont'd */
+
+
+	    case 0:			/* SP or NL */
+	    case 1:
+	    	if (xc == 0) *xp = xdef;    /* If no input, return default. */
+		else *xp = atmbuf;
+		if (**xp == NUL) return(-3); /* If field empty, return -3. */
+		
+		/* If filespec is wild, see if there are any matches */
+
+		*wild = chkwld(*xp);
+		debug(F101," *wild","",*wild);
+		if (*wild != 0) {
+		    y = zxpand(*xp);
+		    if (y == 0) {
+			printf("\n?No files match - %s\n",*xp);
+			return(-2);
+		    } else if (y < 0) {
+			printf("\n?Too many files match - %s\n",*xp);
+			return(-2);
+		    } else return(x);
+		}
+
+		/* If not wild, see if it exists and is readable. */
+
+		y = zchki(*xp);
+		if (y == -3) {
+		    printf("\n?Read permission denied - %s\n",*xp);
+		    return(-2);
+		} else if (y == -2) {
+		    printf("\n?File not readable - %s\n",*xp);
+		    return(-2);
+		} else if (y < 0) {
+		    printf("\n?File not found - %s\n",*xp);
+		    return(-2);
+		}
+		return(x);
+/* cont'd... */
+
+/* ...cmifi(), cont'd */
+
+
+	    case 2:			/* ESC */
+	    	if (xc == 0) {
+		    if (*xdef != '\0') {
+			printf("%s ",xdef); /* If at beginning of field, */
+			addbuf(xdef);	/* supply default. */
+			cc = setatm(xdef);
+		    } else {		/* No default */
+			putchar(BEL);
+		    }
+		    break;
+		} 
+		if (*wild = chkwld(*xp)) {  /* No completion if wild */
+		    putchar(BEL);
+		    break;
+		}
+		sp = atmbuf + cc;
+		*sp++ = '*';
+		*sp-- = '\0';
+		y = zxpand(atmbuf);	/* Add * and expand list. */
+		*sp = '\0';		/* Remove *. */
+
+		if (y == 0) {
+		    printf("\n?No files match - %s\n",atmbuf);
+		    return(-2);
+		} else if (y < 0) {
+		    printf("\n?Too many files match - %s\n",atmbuf);
+		    return(-2);
+		} else if (y > 1) {	/* Not unique, just beep. */
+		    putchar(BEL);
+		} else {		/* Unique, complete it.  */
+		    znext(filbuf);	/* Get whole name of file. */
+		    sp = filbuf + cc;	/* Point past what user typed. */
+		    printf("%s ",sp);	/* Complete the name. */
+		    addbuf(sp);		/* Add the characters to cmdbuf. */
+		    setatm(pp);		/* And to atmbuf. */
+		    *xp = atmbuf;	/* Return pointer to atmbuf. */
+		    return(cmflgs = 0);
+		}
+		break;
+
+/* cont'd... */
+
+/* ...cmifi(), cont'd */
+
+
+	    case 3:			/* Question mark */
+	    	if (*xhlp == NUL)
+	    	    printf(" Input file specification");
+		else
+		    printf(" %s",xhlp);
+		if (xc > 0) {
+		    sp = atmbuf + cc;	/* Insert * at end */
+		    *sp++ = '*';
+		    *sp-- = '\0';
+		    y = zxpand(atmbuf);
+		    *sp = '\0';
+		    if (y == 0) {		    
+			printf("\n?No files match - %s\n",atmbuf);
+			return(-2);
+		    } else if (y < 0) {
+			printf("\n?Too many file match - %s\n",atmbuf);
+			return(-2);
+		    } else {
+			printf(", one of the following:\n");
+			clrhlp();
+			for (i = 0; i < y; i++) {
+			    znext(filbuf);
+			    addhlp(filbuf);
+			}
+			dmphlp();
+		    }
+		} else printf("\n");
+		printf("%s%s",cmprom,cmdbuf);
+		break;
+	}
+    x = getwd();
+    }
+}
+
+
+
+/*  C H K W L D  --  Check for wildcard characters '*' or '?'  */
+
+chkwld(s) char *s; {
+
+    for ( ; *s != '\0'; s++) {
+    	if ((*s == '*') || (*s == '?'))
+	    return(1);
+    }
+    return(0);
+}
+
+/*  C M F L D  --  Parse an arbitrary field  */
+/*
+ Returns
+   -3 if no input present when required,
+   -2 if field too big for buffer,
+   -1 if reparse needed,
+    0 otherwise, xp pointing to string result.
+*/
+cmfld(xhlp,xdef,xp) char *xhlp, *xdef, **xp; {
+    int x, xc;
+
+    cc = xc = 0;			/* Initialize counts & pointers */
+    *xp = "";
+    if ((x = cmflgs) != 1) {		/* Already confirmed? */
+	x = getwd();			/* No, get a word */
+    } else {
+	cc = setatm(xdef);		/* If so, use default, if any. */
+    }
+    *xp = atmbuf;			/* Point to result. */
+
+    while (1) {
+	xc += cc;			/* Count the characters. */
+	debug(F111,"cmfld: getwd",atmbuf,xc);
+	debug(F101," x","",x);
+    	switch (x) {
+	    case -4:			/* EOF */
+	    case -2:			/* Out of space. */
+	    case -1:			/* Reparse needed */
+	    	return(x);
+	    case 0:			/* SP or NL */
+	    case 1:
+	    	if (xc == 0) *xp = xdef;    /* If no input, return default. */
+		else *xp = atmbuf;
+		if (**xp == NUL) x = -3;    /* If field empty, return -3. */
+		return(x);
+	    case 2:			/* ESC *** (maybe treat as SP) */
+	    	if (xc == 0) {
+		    printf("%s ",xdef);	/* If at beginning of field, */
+		    addbuf(xdef);	/* supply default. */
+		    cc = setatm(xdef);
+		} else {
+		    putchar(BEL);	/* Beep if already into field. */
+    	    	}		    
+		break;
+	    case 3:			/* Question mark */
+	    	if (*xhlp == NUL)
+		    printf(" Please complete this field");
+		else
+	            printf(" %s",xhlp);
+		printf("\n%s%s",cmprom,cmdbuf);
+		break;
+	}
+    x = getwd();
+    }
+}
+
+/*  C M T X T  --  Get a text string, including confirmation  */
+
+/*
+  Print help message 'xhlp' if ? typed, supply default 'xdef' if null
+  string typed.  Returns
+
+   -1 if reparse needed or buffer overflows.
+    1 otherwise.
+
+  with cmflgs set to return code, and xp pointing to result string.
+*/
+
+cmtxt(xhlp,xdef,xp) char *xhlp; char *xdef; char **xp; {
+
+    int x, xc;
+
+    cc = xc = 0;			/* Start counters off at 0 */
+    *xp = "";				/* And pointer to null string. */
+    *atmbuf = NUL;			/* And empty atom buffer. */
+    if ((x = cmflgs) != 1) {
+	x = getwd();			/* Get first word. */
+	*xp = pp;			/* Save pointer to it. */
+    }
+    while (1) {
+	xc += cc;			/* Accumulate count. */
+	debug(F111,"cmtxt: getwd",atmbuf,xc);
+	switch (x) {
+	    case -4:			/* EOF */
+	    case -2:			/* Overflow */
+	    case -1:			/* Deletion */
+	        return(x);
+	    case 0:			/* Space */
+		break;
+	    case 1:			/* CR or LF */
+	        if (xc == 0) *xp = xdef;
+		return(x);
+	    case 2:			/* ESC */
+	    	if (xc == 0) {
+		    printf("%s ",xdef);
+		    cc = addbuf(xdef);
+		} else {
+		    putchar(BEL);
+		}
+		break;
+	    case 3:			/* Question Mark */
+	    	if (*xhlp == NUL)
+		    printf(" Text string");
+		else
+		    printf(" %s",xhlp);
+		printf("\n%s%s",cmprom,cmdbuf);
+		break;
+            default:
+	    	printf("\n?Unexpected return code from getwd() - %d\n",x);
+		return(-2);
+        }
+	x = getwd();
+    }
+}
+
+/*  C M K E Y  --  Parse a keyword  */
+
+/*
+ Call with:
+   table    --  keyword table, in 'struct keytab' format;
+   n        --  number of entries in table;
+   xhlp     --  pointer to help string;
+   xdef     --  pointer to default keyword;
+
+ Returns:
+   -3       --  no input supplied and no default available
+   -2       --  input doesn't uniquely match a keyword in the table
+   -1       --  user deleted too much, command reparse required
+    n >= 0  --  value associated with keyword
+*/
+
+cmkey(table,n,xhlp,xdef) struct keytab table[]; int n; char *xhlp, *xdef; {
+    int i, y, z, zz, xc;
+    char *xp;
+
+    xc = cc = 0;			/* Clear character counters. */
+
+    if ((zz = cmflgs) == 1) 		/* Command already entered? */
+	setatm(xdef);
+    else zz = getwd(); 
+
+debug(F101,"cmkey: table length","",n);
+while (1) {
+    xc += cc;
+    debug(F111,"cmkey: getwd",atmbuf,xc);
+
+    switch(zz) {
+	case -4:			/* EOF */
+	case -2:			/* Buffer overflow */
+    	case -1:			/* Or user did some deleting. */
+	    return(zz);
+
+	case 0:				/* User terminated word with space */
+	case 1:				/* or newline */
+	    if (cc == 0) setatm(xdef);
+	    y = lookup(table,atmbuf,n,&z);
+	    switch (y) {
+		case -2:
+		    printf("\n?Ambiguous - %s\n",atmbuf);
+		    return(cmflgs = -2);
+		case -1:
+		    printf("\n?Invalid - %s\n",atmbuf);
+		    return(cmflgs = -2);
+		default:
+		    break;
+	    }
+	    return(y);
+
+/* cont'd... */
+
+/* ...cmkey(), cont'd */
+
+	case 2:				/* User terminated word with ESC */
+	    if (cc == 0) {
+	    	if (*xdef != NUL) {	/* Nothing in atmbuf */
+		    printf("%s ",xdef);	/* Supply default if any */
+		    addbuf(xdef);
+		    cc = setatm(xdef);
+		    debug(F111,"cmkey: default",atmbuf,cc);
+		} else {
+		    putchar(BEL);	/* No default, just beep */
+		    break;
+		}
+	    }
+	    y = lookup(table,atmbuf,n,&z); /* Something in atmbuf */
+	    debug(F111,"cmkey: esc",atmbuf,y);
+	    if (y == -2) {
+		putchar(BEL);
+		break;
+    	    }
+	    if (y == -1) {
+		printf("\n?Invalid - %s\n",atmbuf);
+		return(cmflgs = -2);
+	    }
+	    xp = table[z].kwd + cc;
+    	    printf("%s ",xp);
+	    addbuf(xp);
+	    debug(F110,"cmkey: addbuf",cmdbuf,0);
+	    return(y);
+
+/* cont'd... */
+
+/* ...cmkey(), cont'd */
+
+	case 3:				/* User terminated word with "?" */
+	    y = lookup(table,atmbuf,n,&z);
+	    if (y > -1) {
+		printf(" %s\n%s%s",table[z].kwd,cmprom,cmdbuf);
+		break;
+	    } else if (y == -1) {
+		printf("\n?Invalid\n");
+		return(cmflgs = -2);
+	    }
+
+	    if (*xhlp == NUL)
+	    	printf(" One of the following:\n");
+	    else
+	    	printf(" %s, one of the following:\n",xhlp);
+
+	    clrhlp();
+	    for (i = 0; i < n; i++) {	
+		if (!strncmp(table[i].kwd,atmbuf,cc)
+		    	&& !test(table[i].flgs,CM_INV))
+		    addhlp(table[i].kwd);
+	    }
+	    dmphlp();
+	    printf("%s%s", cmprom, cmdbuf);
+	    break;
+
+    	default:	    
+	    printf("\n%d - Unexpected return code from getwd\n",zz);
+	    return(cmflgs = -2);
+        }
+	zz = getwd();
+    }
+}
+
+/*  C M C F M  --  Parse command confirmation (end of line)  */
+
+/*
+ Returns
+   -2: User typed anything but whitespace or newline
+   -1: Reparse needed
+    0: Confirmation was received
+*/
+
+cmcfm() {
+    int x, xc;
+
+    debug(F101,"cmcfm: cmflgs","",cmflgs);
+
+    xc = cc = 0;
+    if (cmflgs == 1) return(0);
+
+    while (1) {
+	x = getwd();
+	xc += cc;
+	debug(F111,"cmcfm: getwd",atmbuf,xc);
+        switch (x) {
+	    case -4:			/* EOF */
+	    case -2:
+	    case -1:
+		return(x);
+
+	    case 0:			/* Space */
+	    	continue;
+	    case 1:			/* End of line */
+	    	if (xc > 0) {
+		    printf("?Not confirmed - %s\n",atmbuf);
+		    return(-2);
+    	    	} else return(0);		    
+	    case 2:
+	    	putchar(BEL);
+		continue;
+
+            case 3:
+	    	if (xc > 0) {
+		    printf("\n?Not confirmed - %s\n",atmbuf);
+		    return(-2);
+		}
+	        printf("\n Type a carriage return to confirm the command\n");
+		printf("%s%s",cmprom,cmdbuf);
+		continue;
+	}
+    }
+}
+
+/* Keyword help routines */
+
+
+/*  C L R H L P -- Initialize/Clear the help line buffer  */
+
+clrhlp() {				/* Clear the help buffer */
+    hlpbuf[0] = NUL;
+    hh = hx = 0;
+}
+
+
+/*  A D D H L P  --  Add a string to the help line buffer  */
+
+addhlp(s) char *s; {			/* Add a word to the help buffer */
+    int j;
+
+    hh++;				/* Count this column */
+
+    for (j = 0; j < hc; j++) {		/* Fill the column */
+	if (*s != NUL)			/* First with chars from the string */
+	    hlpbuf[hx++] = *s++;
+	else {
+	    if (hh < (hw / hc))		/* Then with spaces */
+	    	hlpbuf[hx++] = SP;
+	    else {
+		hlpbuf[hx++] = NUL;	/* If last column, no spaces. */
+		dmphlp();		/* Print it. */
+		return;
+		}
+    	} 
+    }
+    if (*s != NUL)			/* Still some chars left in string? */
+	hlpbuf[hx-1] = '+';		/* Mark as too long for column. */
+}
+
+
+/*  D M P H L P  --  Dump the help line buffer  */
+
+dmphlp() {				/* Print the help buffer */
+    hlpbuf[hx++] = NUL;
+    printf(" %s\n",hlpbuf);
+    clrhlp();
+}
+
+/*  L O O K U P  --  Lookup the string in the given array of strings  */
+
+/*
+ Call this way:  v = lookup(table,word,n,&x);
+
+   table - a 'struct keytab' table.
+   word  - the target string to look up in the table.
+   n     - the number of elements in the table.
+   x     - address of an integer for returning the table array index.
+
+ The keyword table must be arranged in ascending alphabetical order, and
+ all letters must be lowercase.
+
+ Returns the keyword's associated value ( zero or greater ) if found,
+ with the variable x set to the array index, or:
+
+  -3 if nothing to look up (target was null),
+  -2 if ambiguous,
+  -1 if not found.
+
+ A match is successful if the target matches a keyword exactly, or if
+ the target is a prefix of exactly one keyword.  It is ambiguous if the
+ target matches two or more keywords from the table.
+*/
+
+lookup(table,cmd,n,x) char *cmd; struct keytab table[]; int n, *x; {
+
+    int i, v, cmdlen;
+
+/* Lowercase & get length of target, if it's null return code -3. */
+
+    if ((((cmdlen = lower(cmd))) == 0) || (n < 1)) return(-3);
+
+/* Not null, look it up */
+
+    for (i = 0; i < n-1; i++) {
+	if (!strcmp(table[i].kwd,cmd) ||
+           ((v = !strncmp(table[i].kwd,cmd,cmdlen)) &&
+             strncmp(table[i+1].kwd,cmd,cmdlen))) {
+		*x = i;
+		return(table[i].val);
+	     }
+	if (v) return(-2);
+    }	
+
+/* Last (or only) element */
+
+    if (!strncmp(table[n-1].kwd,cmd,cmdlen)) {
+	*x = n-1;
+	return(table[n-1].val);
+    } else return(-1);
+}
+
+/*  G E T W D  --  Gets a "word" from the command input stream  */
+
+/*
+Usage: retcode = getwd();
+
+Returns:
+ -4 if end of file (e.g. pipe broken)
+ -2 if command buffer overflows
+ -1 if user did some deleting
+  0 if word terminates with SP or tab
+  1 if ... CR
+  2 if ... ESC
+  3 if ... ?
+
+With:
+  pp pointing to beginning of word in buffer
+  bp pointing to after current position
+  atmbuf containing a copy of the word
+  cc containing the number of characters in the word copied to atmbuf
+*/
+getwd() {
+
+    int c;				/* Current char */
+    static int inword = 0;		/* Flag for start of word found */
+    int quote = 0;			/* Flag for quote character */
+    int echof = 0;			/* Flag for whether to echo */
+
+    pp = np;				/* Start of current field */
+    debug(F101,"getwd: cmdbuf","",(int) cmdbuf);
+    debug(F101," bp","",(int) bp);
+    debug(F101," pp","",(int) pp);
+    debug(F110," cmdbuf",cmdbuf,0);
+
+    while (bp < cmdbuf+CMDBL) {		/* Loop */
+
+	echof = 0;			/* Flag for whether to echo */
+
+	if ((c = *bp) == NUL) {		/* Get next character */
+	    if (dpx) echof = 1;		/* from reparse buffer */
+	    c = getchar();		/* or from tty. */
+	    if (c == EOF) return(-4);
+	}
+
+	if (quote == 0) {
+
+	    if (c == '\\') {		/* Quote character */
+	       quote = 1;
+	       continue;
+    	    }
+	    if (c == FF) {		/* Formfeed. */
+	    	c = NL;			/* Replace with newline */
+	    	system("clear");	/* and clear the screen. */
+	    }
+
+	    if (c == HT) c = SP; 	/* Substitute space for tab. */
+
+/* cont'd... */
+
+/* ...getwd(), cont'd */
+
+    	    if (c == SP) {		/* If space */
+		*bp++ = c;		/* deposit it in buffer. */
+		if (echof) putchar(c);	/* echo it. */
+		if (inword == 0) {	/* If leading, gobble it. */
+		    pp++;
+		    continue;
+		} else {		/* If terminating, return. */
+		    np = bp;
+		    setatm(pp);
+		    inword = 0;
+		    return(cmflgs = 0);
+		}
+	    }
+	    if (c == NL) { 		/* CR, LF */
+		*bp = NUL;		/* End the string */
+		if (echof) putchar(c);	/* Echo the typein */
+		np = bp;		/* Where to start next field. */
+		setatm(pp);		/* Copy this field to atom buffer. */
+		inword = 0;
+		return(cmflgs = 1);
+	    }
+	    if (c == '?') { 		/* Question mark */
+		putchar(c);
+		*bp = NUL;
+		setatm(pp);
+		return(cmflgs = 3);
+    	    }
+	    if (c == ESC) { 		/* ESC */
+		*bp = NUL;
+		setatm(pp);
+		return(cmflgs = 2);
+	    }
+	    if (c == BS || c == RUB) { 	/* Character deletion */
+		if (bp > cmdbuf) {	/* If still in buffer... */
+		    printf("\b \b");	/* erase character from screen, */
+		    bp--;		/* point behind it, */
+		    if (*bp == SP) inword = 0; /* Flag if current field gone */
+		    *bp = NUL;		/* Erase character from buffer. */
+		} else {		/* Otherwise, */
+		    putchar(BEL);	/* beep, */
+		    cmres();		/* and start parsing a new command. */
+		}
+		if (pp < bp) continue;
+		else return(cmflgs = -1);
+	    }
+	    if (c == LDEL) { 		/* ^U, line deletion */
+	    	while ((bp--) > cmdbuf) {
+	    	    printf("\b \b");
+		    *bp = NUL;
+		}
+		cmres();		/* Restart the command. */
+		inword = 0;
+		return(cmflgs = -2);
+	    }
+
+/* cont'd... */
+
+/* ...getwd(), cont'd */
+
+    	    if (c == WDEL) { 		/* ^W, word deletion */
+	    	if (bp <= cmdbuf) {	/* Beep if nothing to delete */
+		    putchar(BEL);
+		    cmres();
+		    return(cmflgs = -1);
+		}
+		bp--;
+		for ( ; (bp >= cmdbuf) && (*bp == SP) ; bp--) {
+		    printf("\b \b");
+		    *bp = NUL;
+		}
+		for ( ; (bp >= cmdbuf) && (*bp != SP) ; bp--) {
+		    printf("\b \b");
+		    *bp = NUL;
+		}
+		*bp++ == NUL;
+		inword = 0;
+		return(cmflgs = -1);
+	    }
+	    if (c == RDIS) { 		/* ^R, redisplay */
+		*bp = NUL;
+		printf("\n%s%s",cmprom,cmdbuf);
+		continue;
+	    }
+    	}
+	if (echof) putchar(c);		/* If tty input, echo. */
+	inword = 1;			/* Flag we're in a word. */
+	quote = 0;			/* Turn off quote. */
+	*bp++ = c;			/* And deposit it. */
+    }					/* end of big while */
+    putchar(BEL);			/* Get here if... */
+    printf("\n?Buffer full\n");
+    return(cmflgs = -2);
+}
+
+/* Utilility functions */
+
+/* A D D B U F  -- Add the string pointed to by cp to the command buffer  */
+
+addbuf(cp) char *cp; {
+    int len = 0;
+    while ((*cp != NUL) && (bp < cmdbuf+CMDBL)) {
+    	*bp++ = *cp++;			/* Copy and */
+    	len++;				/* count the characters. */
+    }	
+    *bp++ = SP;				/* Put a space at the end */
+    *bp = NUL;				/* Terminate with a null */
+    np = bp;				/* Update the next-field pointer */
+    return(len);			/* Return the length */
+}
+
+/*  S E T A T M  --  Deposit a string in the atom buffer  */
+
+setatm(cp) char *cp; {
+    char *ap;
+    cc = 0;
+    ap = atmbuf;
+    *ap = NUL;
+    while (*cp == SP) cp++;
+    while ((*cp != SP) && (*cp != NL) && (*cp != NUL)) {
+	*ap++ = *cp++;
+	cc++;
+    }
+    *ap++ = NUL;
+    return(cc);				/* Return length */
+}
+
+/*  D I G I T S  -- Verify that all the characters in line are digits  */
+
+digits(s) char *s; {
+    while (*s) {
+        if (!isdigit(*s)) return(0);
+        s++;
+    }
+    return(1);
+}
+
+/*  L O W E R  --  Lowercase a string  */
+
+lower(s) char *s; {
+    int n = 0;
+    while (*s) {
+	if (isupper(*s)) *s = tolower(*s);
+	s++, n++;
+    }
+    return(n);
+}
+
+/*  T E S T  --  Bit test  */
+
+test(x,m) int x, m; { /*  Returns 1 if any bits from m are on in x, else 0  */
+    return((x & m) ? 1 : 0);
+}
+@//E*O*F ckcmd.c//
+chmod u=rw,g=r,o=r ckcmd.c
+ 
+echo x - ckcmd.h
+sed 's/^@//' > "ckcmd.h" <<'@//E*O*F ckcmd.h//'
+/*  C K C M D . H  --  Header file for cmd package  */
+
+/* Sizes of things */
+
+#define HLPLW  78			/* Width of ?-help line */
+#define HLPCW  19			/* Width of ?-help column */
+#define CMDBL  200			/* Command buffer length */
+#define HLPBL  100			/* Help string buffer length */
+#define ATMBL  100			/* Command atom buffer length*/
+
+/* Special characters */
+
+#define NUL  '\0'			/* Null */
+#define HT   '\t'			/* Horizontal Tab */
+#define NL   '\n'			/* Newline */
+#define FF   0014			/* Formfeed    (^L) */
+#define RDIS 0022			/* Redisplay   (^R) */
+#define LDEL 0025			/* Delete line (^U) */
+#define WDEL 0027			/* Delete word (^W) */
+#define ESC  0033			/* Escape */
+#define RUB  0177			/* Rubout */
+
+#ifndef BEL
+#define BEL  0007			/* Bell */
+#endif
+
+#ifndef BS
+#define BS   0010			/* Backspace */
+#endif
+
+#ifndef SP
+#define SP   0040			/* Space */
+#endif
+
+/* Keyword table flags */
+
+#define CM_INV 1			/* Invisible keyword */
+
+/* Keyword Table Template */
+
+struct keytab {				/* Keyword table */
+    char *kwd;				/* Pointer to keyword string */
+    int val;				/* Associated value */
+    int flgs;				/* Flags (as defined above) */
+};
+@//E*O*F ckcmd.h//
+chmod u=rw,g=r,o=r ckcmd.h
+ 
+echo x - ckconu.c
+sed 's/^@//' > "ckconu.c" <<'@//E*O*F ckconu.c//'
+char *connv = "Connect Command for Unix, V4.0(002) 24 Jan 85";
+
+/*  C O N N E C T  --  Dumb terminal connection to remote system  */
+
+/*
+ This module should work under all versions of Unix.  It calls externally
+ defined system-depended functions for i/o, but depends upon the existence
+ of the fork() function.
+*/
+
+#include "ckermi.h"
+
+extern int local, speed, escape, handsh, duplex, parity, flow, seslog;
+extern char ttname[], sesfil[];
+
+int i, active;				/* Variables global to this module */
+char *chstr();
+#define LBUFL 100			/* Line buffer */
+char lbuf[LBUFL];
+
+/*  C O N E C T  --  Perform terminal connection  */
+
+conect() {
+    int pid, n;
+    char c;
+    char errmsg[50], *erp;
+
+	if (!local) {
+	    printf("Sorry, you must 'set line' first\n");
+	    return;
+	}
+	if (speed < 0) {
+	    printf("Sorry, you must 'set speed' first\n");
+	    return;
+        }
+	if ((escape < 0) || (escape > 0177)) {
+	    printf("Your escape character is not ASCII - %d\n",escape);
+	    return;
+	}
+	if (ttopen(ttname) < 0) {
+	    erp = errmsg;
+	    sprintf(erp,"Sorry, can't open %s",ttname);
+	    perror(errmsg);
+	    return;
+    	}
+    	printf("Connecting thru %s, speed %d.\r\n",ttname,speed);
+	printf("The escape character is %s (%d).\r\n",chstr(escape),escape);
+	printf("Type the escape character followed by C to get back,\r\n");
+	printf("or followed by ? to see other options.\r\n");
+	if (seslog) printf("(Session logged to %s.)\r\n",sesfil);
+
+/* cont'd... */
+
+/* ...connect, cont'd */
+
+
+/* Condition console terminal and communication line */	    
+
+    	if (conbin() < 0) {
+	    printf("Sorry, can't condition console terminal\n");
+	    return;
+    	}
+	if (ttvt(speed,flow) < 0) {
+	    conres();
+	    printf("Sorry, Can't condition communication line\n");
+	    return;
+    	}
+	pid = fork();			/* All ok, make a fork */
+	if (pid) {			
+	    active = 1;			/* This fork reads, sends keystrokes */
+	    while (active) {
+		c = coninc() & 0177;
+		if (c == escape) {   	/* Look for escape char */
+		    c = coninc() & 0177;
+		    doesc(c);
+		} else {		/* Ordinary character */
+		    ttoc(dopar(c));	/* Send it out with desired parity */
+		    if (duplex) {	/* Half duplex? */
+			conoc(c);	/* Yes, also echo it. */
+			if (seslog) zchout(ZSFILE,c);	/* And maybe log it. */
+    	    	    }			
+		}
+    	    }
+	    kill(pid,9);		/* Done, kill inferior. */
+	    wait(0);			/* Wait till gone. */
+	    conres();			/* Reset the console. */
+	    ttclos();			/* Reset & close communication line. */
+	    printf("C-Kermit Disconnected\n");
+	    return;
+	} else {			/* Inferior reads, prints port input */
+	    while (1) {
+		c = ttinc(0) & 0177;	/* Wait for a character. */
+		conoc(c);
+		if (seslog) zchout(ZSFILE,c);
+		n = ttchk();		/* Any more left in buffer? */
+		if (n > 0) {
+		    if (n > LBUFL) n = LBUFL;  /* Get them all at once. */
+		    if ((n = ttxin(n,lbuf)) > 0) {
+			for (i = 0; i < n; i++) lbuf[i] &= 0177;
+			conxo(n,lbuf);
+			if (seslog) zsoutx(ZSFILE,lbuf,n);
+		    }
+	    	}
+	    }
+    	}
+}
+
+/*  H C O N N E  --  Give help message for connect.  */
+
+hconne() {
+    int c;
+    char *hlpmsg = "\
+\r\nC to close the connection, or:\
+\r\n  S for status\
+\r\n  ? for help\
+\r\n  B to send a BREAK\
+\r\n  0 to send a null\
+\r\n escape character twice to send the escape character.\r\n\r\n";
+
+    conol(hlpmsg);			/* Print the help message. */
+    conol("Command>");			/* Prompt for command. */
+    c = coninc();
+    conoc(c);				/* Echo it. */
+    conoll("");
+    c &= 0177;				/* Strip any parity. */
+    return(c);				/* Return it. */
+}
+
+
+/*  C H S T R  --  Make a printable string out of a character  */
+
+char *
+chstr(c) int c; {
+    static char s[8];
+    char *cp = s;
+
+    if (c < SP) {
+	sprintf(cp,"CTRL-%c",ctl(c));
+    } else sprintf(cp,"'%c'\n",c);
+    cp = s;
+    return(cp);
+}
+
+/*  D O E S C  --  Process an escape character argument  */
+
+doesc(c) char c; {
+    int d;
+  
+    c &= 0177;
+    while (1) {
+	if (c == escape) {		/* Send escape character */
+	    d = dopar(c);
+	    ttoc(d);
+	    return;
+    	} else				/* Or else look it up below. */
+	    if (isupper(c)) c = tolower(c);
+
+	switch (c) {
+
+	case 'c':			/* Close connection */
+	case '\03':
+	    active = 0;
+	    conol("\r\n");
+	    return;
+
+	case 'b':			/* Send a BREAK */
+	case '\02':
+	    ttsndb();
+	    return;
+
+	case 's':			/* Status */
+	case '\023':
+	    conol("\r\nConnected thru ");
+	    conoll(ttname);
+	    if (seslog) {
+		conol(", logging to ");
+		conol(sesfil);
+            }
+	    return;
+
+	case '?':			/* Help */
+	    c = hconne();
+	    continue;
+
+	case '0':			/* Send a null */
+	    c = '\0';
+	    d = dopar(c);
+	    ttoc(d);
+	    return;
+
+	case SP:			/* Space, ignore */
+	    return;
+
+	default:			/* Other */
+	    conoc(BEL); 		/* Invalid esc arg, beep */
+	    return;
+    	}	    
+    }
+}    
+@//E*O*F ckconu.c//
+chmod u=rw,g=r,o=r ckconu.c
+ 
+echo x - ckdebu.h
+sed 's/^@//' > "ckdebu.h" <<'@//E*O*F ckdebu.h//'
+#define F000 0				/* Formats for debug() */
+
+#define F001 1
+#define F010 2
+#define F011 3
+#define F100 4
+#define F101 5
+#define F110 6
+#define F111 7
+
+@//E*O*F ckdebu.h//
+chmod u=rw,g=r,o=r ckdebu.h
+ 
+echo x - ckermi.ann
+sed 's/^@//' > "ckermi.ann" <<'@//E*O*F ckermi.ann//'
+ 5-Feb-85 16:10:21-EST,5392;000000000001
+Mail-From: SY.FDC created at  5-Feb-85 16:09:41
+Date: Tue 5 Feb 85 16:09:41-EST
+@From: Frank da Cruz <SY.FDC@CU20B.ARPA>
+Subject: Info-Kermit Digest V2 #1 -- New Unix Kermit
+To: Info-Kermit-Members@CU20B.ARPA
+cc: Info-Unix@BRL-TGR.ARPA
+Reply-To: Info-Kermit@CU20B
+Queries-To: Info-Kermit-Request@CU20B
+
+Info-Kermit Digest         Tue,  5 Feb 1985       Volume 2 : Number  1
+
+  ANNOUNCEMENTS -
+      New Unix Kermit Available for Testing
+
+----------------------------------------------------------------------
+
+My apologies for the long delay since the last issue of the Info-Kermit
+Digest, which was Vol.1, No.46, dated 31 December 1984.  This first issue
+of Volume 2 is to announce a test release of the new Unix Kermit.  In
+subsequent issues, I'll attempt to catch up on other overdue items.
+
+A new Kermit program has been written in C, initially for 4.2 Berkeley Unix.
+The features of this program include:
+
+@. Full implementation of the Kermit protocol, except for Attribute packets:
+  - Acts as server
+  - Talks to server
+  - All packet encoding and error checking options are provided
+  - File transfer interruption
+  - Filename collision avoidance
+  - Binary and text file transfer
+@. Modular construction for easy portability to other systems
+@. An interactive command parser as well as Unix-style command line arguments
+@. Command and initialization files
+@. Piped operation
+@. Improved terminal connect, with optional logging
+@. Logs for debugging, packets, and transactions
+@. Communication with IBM mainframes
+
+Several items on the wish list were not done for lack of time.  They will
+probably be added in the future:
+
+@. File attributes
+@. Command macros
+@. Login scripts
+@. Raw file transmit
+
+The new program is called "C-Kermit" because it is intended as a basis for
+Kermit programs for any systems that have C compilers.  Its version number
+is 4.0, to distinguish it from earlier releases of Unix Kermit, the most
+recent of which was 3.0.
+
+This prerelease test version of the program runs only under Berkeley Unix 4.2.
+We also intend to bring it to the following systems within the coming weeks:
+
+@. DEC Pro-350 and Pro-380 with Venix (a Unix v7 derivative)
+@. Amdahl UTS on IBM 370-series mainframes
+@. Apple Macintosh (maybe)
+
+Support for other systems will have to be added elsewhere.  The program is
+being "pre-released" at this time for two reasons:
+
+1. It seems to be perfectly usable on Berkeley 4.2 systems, and is an
+   improvement over the previous version.
+
+2. The modular design may need some adjustment to accommodate certain systems.
+   Before a great deal of additional coding is done, it is highly desirable
+   to get the design and specification of the system-dependent modules stable.
+
+Therefore, please take the files, read the documentation, try running the
+program on your Berkeley Unix system if you have one, and send comments or bug
+reports to me as soon as you can.  If you have a Unix system that is not
+Berkeley Unix, or a non-Unix system with a C compiler, please take a look at
+the system-dependent modules to see how they could be adapted to your system;
+again, if you have any suggestions or criticisms of the design, please let me
+know.  I'm particularly interested in issues of portability.  After a round or
+two of this, perhaps the design can be agreed upon, and then those who would
+like to contribute support for Version 6, System III, System V, Xenix, PC/IX,
+etc etc, can do so without fear of running into other people's changes for
+other systems.  Before attempting to adapt C-Kermit to a new system, please
+let me know so I can tell you whether someone else is already at work on the
+same thing, and perhaps put you in touch.
+
+The files are on CU20B as KER:CK*.*, available via anonymous FTP.  The file
+CKERMI.DOC provides user-level documentation as well as a description of the
+program organization and hints for adapting it to new systems.  Within several
+days the files should also be available on BITNET via KERMSRV (to get started
+with KERMSRV, type SMSG RSCS MSG CUVMA KERMSRV HELP), and to Unix systems via
+UUCP from Oklahoma State University, Stillwater, OK.
+
+Here's how to UUCP to OK State:
+
+You need to set up "okstate" as a site in your "L.sys" UUCP dialing file
+using the information listed below.  You can then issue the following 
+command on your system:
+
+	uucp okstate\!/u/kermit/ck\* /usr/spool/uucppublic
+
+   (this example will retrieve the new Unix version of Kermit)
+
+The "/usr/spool/uucppublic" is chosen as the destination on your system since
+the destination must be WIDE OPEN (drwxrwxrwx) to everyone.  You should
+not remove files from your uucppublic until the entire transfer is complete
+including any redials that are necessary.  If you do remove some files
+our system may retransmit them, resulting in a higher phone bill for you. 
+
+-- UUCP Login information --
+
+Site Name    :  okstate
+Phone number :  (405) 624-6953  (one line only)
+Login name   :  uucpker
+Password     :  thefrog
+Hours        :  10:00pm - 10:00am central time (7 day per week)
+Problem      :  okstate!uucp-support  (UUCP)
+  reports    :  uucp-support%okstate@csnet-relay  (ARPA)
+
+The phone number is for 300/1200 baud (bell compatible).
+
+------------------------------
+
+End of Info-Kermit Digest
+*************************
+-------
+@//E*O*F ckermi.ann//
+chmod u=rw,g=r,o=r ckermi.ann
+ 
+echo Inspecting for damage in transit...
+temp=/tmp/shar$$; dtemp=/tmp/.shar$$
+trap "rm -f $temp $dtemp; exit" 0 1 2 3 15
+cat > $temp <<\!!!
+     985    4187   25236 ckcmd.c
+      45     202    1139 ckcmd.h
+     199     735    4764 ckconu.c
+      10      29     151 ckdebu.h
+     124     836    5310 ckermi.ann
+    1363    5989   36600 total
+!!!
+wc  ckcmd.c ckcmd.h ckconu.c ckdebu.h ckermi.ann | sed 's=[^ ]*/==' | diff -b $temp - >$dtemp
+if [ -s $dtemp ]
+then echo "Ouch [diff of wc output]:" ; cat $dtemp
+else echo "No problems found."
+fi
+exit 0
+
+

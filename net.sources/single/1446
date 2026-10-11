@@ -1,0 +1,377 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,c6e80b5c6f7c205d,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-07-27 13:23:02 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site jimlad.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxl!houxm!houxz!vax135!ukc!qtlon!jimlad!jmc
+From: jmc@jimlad.UUCP (John M Collins M.A.)
+Newsgroups: net.sources
+Subject: Spooler:spshed.c
+Message-ID: <261@jimlad.UUCP>
+Date: Fri, 27-Jul-84 16:23:02 EDT
+Article-I.D.: jimlad.261
+Posted: Fri Jul 27 16:23:02 1984
+Date-Received: Sat, 14-Jul-84 02:40:42 EDT
+Organization: Quantime, London
+Lines: 357
+
+/*
+ *	SCCS:	@(#)spshed.c	1.2	25/6/84	19:50:29
+ *	Spool scheduler process.
+ *
+ *	Copyright J.M. Collins 1984
+ */
+
+#include <stdio.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/dir.h>
+#include <sys/stat.h>
+#include "spq.h"
+#include "filenams.h"
+#include <pwd.h>
+
+#define	CMASK	0077		/*  Umask value  */
+#define	CMODE	0666
+
+#define	PENDTIME	200
+
+unsigned  alarm();
+
+char	*malloc(), *realloc();
+void	syncfls(), enqueue(), addptr(), delptr(), halt(), heoj();
+void	addoper(), selectj(), doabort(), gop(), chjob(), haltall();
+void	restart(), report(), prdone(), qprocess(), deloper(), startp();
+void	tellopers(), killops();
+
+struct	sp_req	*qread();
+
+int	errno;
+int	fifofd, jfilefd, pfilefd;
+int	njobs, jbsize, nptrs;
+int	numopers, readers;
+int	jqpend, pqpend;
+
+#define	INITJBUF	50
+
+struct	spq	*jbuf;
+struct	spptr	pbuf[MAXPTRS];
+
+char	spdir[] = SPDIR;
+char	fifo[] = FIFO;
+char	jfile[] = JFILE;
+char	pfile[] = PFILE;
+
+void	nomem()
+{
+	report("Run out of memory");
+	exit(100);
+}
+
+/*
+ *	Try to exit gracefully and quickly....
+ */
+
+void	niceend()
+{
+	haltall();
+	syncfls();
+	killops();
+	(void) unlink(fifo);
+	exit(0);
+}
+
+/*
+ *	Open FIFO file, which also constitutes the lock file for the process.
+ */
+
+void	openrfile()
+{
+	if  (mknod(fifo, S_IFIFO|CMODE, 0) < 0)  {
+		if  (errno == EEXIST)
+			exit(0);
+		report("could not create control file");
+	}
+	(void) chown(fifo, DAEMUID, getgid());
+	
+	/*
+	 *	Open in read/write mode, not because we are intending
+	 *	to write, but because otherwise when we read, we will
+	 *	get a zero-length read if no one has it open for writing.
+	 */
+	
+	if  ((fifofd = open(fifo, O_RDWR)) < 0)
+		report("could not open control file");
+
+	/*
+	 *	Set close-on-exec flag.
+	 */
+	
+	(void) fcntl(fifofd, F_SETFD, 1);
+}
+
+/*
+ *	Create/open job file. Read it into memory if it exists.
+ */
+
+void	openjfile()
+{
+	struct	stat	sbuf;
+	register  int	i, njs;
+	
+	if  ((jfilefd = open(jfile, O_RDWR|O_CREAT, CMODE)) < 0)
+		report("Could not open job file");
+	(void) chown(jfile, DAEMUID, getgid());
+	(void) fcntl(jfilefd, F_SETFD, 1);
+	(void) fstat(jfilefd, &sbuf);
+	njs = sbuf.st_size / sizeof(struct spq);
+	jbsize = njs;
+	if  (jbsize < INITJBUF)
+		jbsize = INITJBUF;
+	jbuf = (struct spq *)malloc(jbsize * sizeof(struct spq));
+	if  (jbuf == NULL)
+		nomem();
+	if  (njs > 0)
+		(void) read(jfilefd,
+				(char *)jbuf,
+		     		njs * sizeof(struct spq));
+	
+	/*
+	 *	Count entries in job queue.
+	 *	Clear extra ones.
+	 */
+	
+	njobs = 0;
+	for  (i = 0;  i < njs;  i++)  {
+		if  (jbuf[i].spq_job == 0)
+			break;
+		njobs++;
+	}
+	for  (;  i < jbsize;  i++)
+		jbuf[i].spq_job = 0;
+}
+
+/*
+ *	Create/open print file. Read it into memory if it exists.
+ */
+
+void	openpfile()
+{
+	struct	stat	sbuf;
+	int	lng;
+	register  int	i;
+	
+	if  ((pfilefd = open(pfile, O_RDWR|O_CREAT, CMODE)) < 0)
+		report("Could not open printer file");
+	(void) chown(pfile, DAEMUID, getgid());
+	(void) fcntl(pfilefd, F_SETFD, 1);
+	(void) fstat(pfilefd, &sbuf);
+	lng = sbuf.st_size / sizeof(struct spptr);
+	if  (lng > MAXPTRS)
+		lng = MAXPTRS;
+	(void) read(pfilefd, (char *)pbuf, lng * sizeof(struct spptr));
+
+	/*
+	 *	For each printer in list, which is not actually halted,
+	 *	set ready, and kick off process.
+	 */
+	
+	for  (i = 0;  i < MAXPTRS;  i++)  if  (pbuf[i].spp_state != SPP_NULL) {
+		nptrs++;
+		pbuf[i].spp_job = 0;
+		if  (pbuf[i].spp_state != SPP_HALT)  {
+			pbuf[i].spp_state = SPP_WAIT;
+			startp(&pbuf[i]);
+		}
+	}
+}
+
+/*
+ *	This routine is used to catch alarm messages to refresh the files.
+ */
+
+int	catchalrm()
+{
+	(void) signal(SIGALRM, catchalrm);	/*  Reset signal  */
+	syncfls();				/*  Write files  */
+}
+	
+/*
+ *	This routine is the main process.
+ */
+
+void	process()
+{
+	struct	sp_req	inreq;
+	register  struct  sp_req  *irp;
+	int	bytes;
+	
+	(void) signal(SIGALRM, catchalrm);
+	
+	for  (;;)  {
+		
+		/*
+		 *	Dont fiddle with queue if people are reading it.
+		 */
+		
+		if  (readers > 0)
+			qprocess();
+
+		if  ((irp = qread()) == NULL)  {
+			irp = &inreq;
+			
+			/*
+			 *	Refresh files if nothing happens for a while.
+			 */
+			
+			if  (jqpend + pqpend > 0)
+				(void) alarm(PENDTIME);
+			if  ((bytes =
+			     read(fifofd,(char *)irp,sizeof(struct sp_req)))!=
+			     sizeof(struct sp_req))  {
+				if  (bytes < 0 && errno == EINTR)
+					continue;
+				report("Bad read from control file");
+			}
+			if  (jqpend + pqpend > 0)
+				(void) alarm(0);
+		}
+
+		switch	(irp->spr_act)  {
+		default:
+			report("Invalid code");
+			
+		case  SP_ENQ:
+			enqueue(irp);
+			break;
+			
+		case  SP_CHNG:
+			chjob(irp);
+			break;
+			
+		case  SP_MON:
+			addoper(irp);
+			continue;
+			
+		case  SP_DMON:
+			deloper(irp);
+		case  SP_READ:		/*  Ignored here  */
+			continue;
+			
+		case  SP_AB:
+			doabort(irp);
+			break;
+			
+		case  SP_RSP:
+			restart(irp);
+			break;
+			
+		case  SP_PHLT:
+			heoj(irp);
+			break;
+			
+		case  SP_PSTP:
+			halt(irp);
+			break;
+			
+		case  SP_PGO:
+			gop(irp);
+			break;
+			
+		case  SP_ADDP:
+		case  SP_CHGP:
+			addptr(irp);
+			break;
+			
+		case  SP_DELP:
+			delptr(irp);
+			break;
+			
+		case  SP_DONE:
+			prdone(irp, 0);
+			break;
+			
+		case  SP_DAB:
+			prdone(irp, 1);
+			break;
+			
+		case  SP_SSTOP:
+			niceend();
+		}
+		
+		/*
+		 *	Fall through to here if we can select a new job.
+		 */
+		
+		selectj();
+		if  (numopers > 0  && jqpend + pqpend > 0)
+			tellopers();
+	}
+}
+
+/*
+ *	Ye olde main routine.
+ *	I don't expect any arguments & will ignore any the fool gives me.
+ */
+
+main()
+{
+	int	pid;
+	register  int	i;
+	
+	/*
+	 *	As parent process, close files etc and open request FIFO.
+	 *	This is because if the scheduler is invoked by 'spr', the
+	 *	latter does not want to restart until the FIFO has been
+	 *	created.
+	 */
+	
+	for  (i = 0;  i < 20;  i++)
+		(void) close(i);
+
+	signal(SIGHUP, SIG_IGN);
+	signal(SIGINT, SIG_IGN);
+	signal(SIGQUIT, SIG_IGN);
+	
+	setuid(geteuid());
+	
+	(void) umask(CMASK);
+	(void) setpgrp();
+	
+	if  (chdir(spdir) < 0)
+		report("Unable to chdir");
+
+	openrfile();
+
+	/*
+	 *	Fork off to leave an orphaned child process.
+	 */
+	
+	pid = fork();
+	if  (pid > 0)		/*  Main path  */
+		exit(0);
+		
+	if  (pid < 0)
+		report("Unable to fork");
+
+	/*
+	 *	Ignore PIPE errors in case daemon processes quit.
+	 */
+	
+	(void) signal(SIGPIPE, SIG_IGN);
+	
+	/*
+	 *	Open job and printer files.
+	 */
+
+	openjfile();
+	openpfile();
+
+	selectj();		/*  Initial job selection  */
+	process();		/*  Never returns  */
+}
+
+

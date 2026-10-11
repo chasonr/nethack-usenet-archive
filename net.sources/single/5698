@@ -1,0 +1,1798 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,7e5d10de165b4881,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1987-03-30 22:15:07 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!utgpu!water!watnot!watmath!clyde!rutgers!sri-spam!mordor!styx!lll-lcc!pyramid!batcomputer!prove
+From: prove@batcomputer.UUCP
+Newsgroups: net.sources
+Subject: PREP, new version, part 3 of 3
+Message-ID: <575@batcomputer.tn.cornell.edu>
+Date: Tue, 31-Mar-87 01:15:07 EST
+Article-I.D.: batcompu.575
+Posted: Tue Mar 31 01:15:07 1987
+Date-Received: Thu, 2-Apr-87 01:29:15 EST
+Organization: Theory Center, Cornell U., Ithaca NY
+Lines: 1778
+Keywords: fortran, preprocessor
+
+
+# This is a shell archive.  Remove anything before this line,
+# then unpack it by saving it in a file and typing "sh file".
+#
+# Wrapped by tralfaz!ove on Mon Mar 30 18:37:29 PST 1987
+# Contents:  macro.c flow.c ifdef.c str.c
+ 
+echo x - macro.c
+sed 's/^@//' > "macro.c" <<'@//E*O*F macro.c//'
+/* MACRO.c
+ *
+ *   The routines in this file support the macro processing facilities
+ * of PREP.  The style is similar to that of c #define macros, except
+ * that : is used instead of #define and ; terminates the macro.  
+ *   Recursive definitions are permitted, but will cause an abort
+ * (and possibly a memory allocation error) on expansion.  For each
+ * line submitted to expand_macros, a count of is kept for each
+ * stored macro indicating how many times it has been expanded in
+ * the current line.  When this exceeds MAX_CALLS, the program 
+ * assumes a macro definition is recursive and stops.  Macros
+ * are expanded starting with the one with the longest name, so that
+ * if the definitions
+ *
+ * : >=		.ge. ;
+ * : >		.gt. ;
+ *
+ * are in effect, >= will be changed to .ge. rather than .gt.=.  This
+ * is only a potential problem when macro names are not fully
+ * alphanumeric, since "arg" will not be flagged if "r" is defined.
+ *   If a definition contains no test ( : name ; ) then name is
+ * removed from the list if present.  This can be used for undefining
+ * macro defs.
+ *
+ * 11/4/86 P.R.OVE
+ */
+
+
+#include "prep.h"
+
+#define	MAX_MACROS	1000
+#define MAX_CALLS	100	/* if exceeded, assume recursive */
+#define MAXCHAR		127	/* max ascii char allowed in names (for bm) */
+
+/* macro structure */
+struct Macro {
+	char	*name ;		/* macro name */
+	int	namelength ;	/* macro name length */
+	char	*text ;		/* text with parm codes */
+	int	parmcount ;	/* number of parms */
+	int	callcount ;	/* recursion check counter */
+	int	alpha ;		/* 1 if an alphanumeric border exists */
+	unsigned short	*skip1, *skip2 ; /* Boyer-Moore search tables */
+} macro[MAX_MACROS], *macrop ;
+
+int	defined_macros = 0 ;	/* number of defined macros */
+
+/* function types */
+char	*expand_macros(), *mac_expand(), *search(), *strmatch() ;
+int	define_macro() ;
+
+
+
+
+/* Macro processor.
+ *
+ *   This routine defines and expands macros.  The definition phase
+ * is invoked when a leading : is found in the record.  Text is
+ * then taken until the terminating ; is found.  Text following the
+ * ; is ignored.  Multiline macros are permitted: they will be
+ * converted to at least as many lines in the fortran program.
+ * Failure to have a terminating ; will define the entire program
+ * to be a macro.
+ *   A NULL pointer is returned if a macro has been defined.  Otherwise
+ * a pointer to the buffer with the expanded text is returned (even if
+ * no macros have been expanded).  The buffer is temporary and should
+ * be eliminated by the caller.
+ */
+ 
+char	*mac_proc()
+{
+int	i, j, size ;
+char	*text, *def ;
+
+
+/* see if this is a definition (look for leading :) */
+for ( i=0, text=NULL; in_buff[i] != NULL; i++ ) {
+	if ( in_buff[i] == BLANK | in_buff[i] == TAB ) continue ;
+	if ( in_buff[i] == ':' ) text = &in_buff[i] ;
+	break ;
+}
+
+if ( text == NULL ) {
+/* expand macro if not a definition */
+	if ( defined_macros == 0 ) {
+		GET_MEM( text, strlen(in_buff) ) ;
+		strcpy( text, in_buff ) ;
+		return( text ) ;
+	}
+	else return( expand_macros( in_buff ) ) ;
+
+}
+else {
+
+/* macro definition, get characters until ; */
+	GET_MEM( def, strlen(text)+10 ) ;
+	strcpy( def, text ) ;
+	for ( j=1;; j++ ) {
+
+		switch ( def[j] ) {
+
+		case ';':	def[j+1] = NULL ;
+				define_macro( def ) ;
+				free( def ) ;
+				return( NULL ) ;
+			
+		case NULL :	def[j] = '\n' ;
+				def[j+1] = NULL ;
+				if ( NULL == get_rec() )
+					abort("MACRO: EOF in macro def") ;
+				size = strlen(def) + strlen(in_buff) + 10 ;
+				if ( NULL == (def=realloc(def,size)) )
+					abort("MACRO: realloc error") ;
+				strcat( def, in_buff ) ;
+		}
+	}
+}
+}
+
+
+
+
+/* Process the macro definition in the argument string.
+ * A macro has the form:
+ *
+ * : name( parm1, parm2, ... )	text with parms ;
+ *
+ * In a definition the delimeter must follow the name
+ * without whitespace.  In the source code this requirement is
+ * relaxed.  Alphanumeric macros must be not be next to an alpha or 
+ * number character or they will not be recognized.
+ *
+ * This routine puts the macro string into a more easily handled
+ * structure, replacing parms in the text with n, where n is a
+ * binary value (128 to 128+MAX_TOKENS).
+ *
+ * The macro is placed in a structure of the form:
+ *
+ * struct Macro {
+ *	char	*name ;
+ *	char	namelength ;
+ *	char	*text ;
+ *	int	parmcount ;
+ *	int	callcount ;
+ *	unsigned short	*skip1, *skip2 ;
+ * } macro[MAX_MACROS], *macrop ;
+ *
+ * where the text string has binary symbols where the parms were.
+ * Returns the macro index.  The number of macros defined is stored
+ * in global variable defined_macros.  Skip1 and skip2 are Boyer-Moore
+ * search tables.
+ * 
+ * The macros are entered in order of their name length, so that
+ * the macro expander will expand those with long names first.
+ *
+ * If no text is present the macro is removed from the list.
+ */
+
+int	define_macro(string)
+char	*string ;
+{
+struct	Macro spare_macro ;
+char	*pntr, *pntr1, *name, *parms[MAX_TOKENS],
+	*parm, *text,
+	*open_parens, *close_parens ;
+int	i, j, l ;
+
+/* macrop is a pointer to the macro structure that will be used */
+	if ( defined_macros >= MAX_MACROS ) {
+		sprintf(errline,"DEFINE_MACRO: too many macros: %s",string);
+		abort( errline ) ;
+	}
+	macrop = &macro[defined_macros] ;
+	defined_macros++ ;
+
+/* get the name */
+	name = strtokp( string, ":; \n\t(" ) ;	/* pointer to the name */
+	macrop->namelength = strlen(name) ;
+	GET_MEM( macrop->name, macrop->namelength ) ;
+	strcpy( macrop->name, name ) ;
+	macrop->alpha = isalnum( *macrop->name ) ||
+			isalnum( *(macrop->name + macrop->namelength - 1) ) ;
+
+/* set up the Boyer-Moore skip tables */
+	if ( macrop->namelength > 1 ) makeskip( macrop ) ;
+	else {
+		macrop->skip1 = NULL ;
+		macrop->skip2 = NULL ;
+	}
+	
+/* get the parameters */
+	for ( i=0; i<MAX_TOKENS; i++ ) parms[i] = NULL ;
+	open_parens = strmatch(string,name) + macrop->namelength ;
+	if ( NULL == line_end( open_parens ) ) {
+		sprintf( errline, "DEFINE_MACRO: unterminated: %s", string ) ;
+		abort( errline ) ;
+	}
+
+	/* get the text storage here to avoid memory allocation tangles */
+	text = open_parens ;
+	GET_MEM( macrop->text, strlen(text) ) ;
+
+	if ( strchr( "([{\'\"", *open_parens ) ) {
+		if ( NULL == ( close_parens = mat_del( open_parens ) ) ) {
+			sprintf(errline,"DEFINE_MACRO: missing delimeter: %s",
+				string ) ;
+			abort( errline ) ;
+		}
+		text = close_parens + 1 ;
+		i = (int)(close_parens - open_parens) - 1 ;
+		pntr = open_parens + 1 ;
+		*close_parens = NULL ;
+		for ( i=0, pntr1 = pntr; i<MAX_TOKENS; i++, pntr1 = NULL ) {
+			if ( NULL == ( parm = strtokp( pntr1, ", \t" ) ) )
+				break ;
+			GET_MEM( parms[i], strlen(parm) ) ;
+			strcpy( parms[i], parm ) ;
+		}
+	}
+
+	
+/* get the text, plugging in binary codes for parameters */
+
+	/* remove leading whitespace */
+	if ( NULL == (text=line_end( text )) ) {
+		sprintf( errline, "DEFINE_MACRO: unterminated: %s", string ) ;
+		abort( errline ) ;
+	}
+
+	/* remove the trailing ';' but NOT whitespace */
+	for ( i=strlen(text)-1; i>=0; i-- ) {
+		if ( text[i] == ';' ) { text[i] = NULL ; break ; }
+	}
+
+	/* if the text is snow white at this stage, delete the entry
+	 * and any other entries with the same name, then return.
+	 */
+	if ( NULL == line_end(text) ) {
+		for ( i=defined_macros-2; i>=0; i-- ) {
+			if ( NULL == strcmp( macrop->name, macro[i].name ) ) {
+				mac_del(i) ;
+				macrop = &macro[defined_macros-1] ;
+			}
+		}
+		mac_del(defined_macros-1) ;
+		return(-1) ;
+	}
+
+	strcpy( macrop->text, text ) ;
+	text = macrop->text ;
+
+	for ( i=0; i<MAX_TOKENS && NULL != (parm = parms[i]); i++ ) {
+
+		/* replace parm by code, if not next to an alpha or number */
+		l = strlen(parm) ;
+		for ( pntr=text; NULL != (pntr1=strmatch(pntr,parm));
+		pntr=pntr1+1 ) {
+			if ( !( isalnum(*(pntr1-1)) && isalnum(*pntr1) ) &&
+			     !( isalnum(*(pntr1+l-1)) && isalnum(*(pntr1+l)))) {
+			     	*pntr1 = i + 128 ;
+				strcpy( pntr1 + 1, pntr1 + strlen(parm) ) ;
+			}
+		}
+	}
+
+
+/* count parms and free up temporary storage */
+	macrop->parmcount = 0 ;
+	for ( i=0; i<MAX_TOKENS && NULL != parms[i]; i++ ) {
+		free( parms[i] ) ;
+		macrop->parmcount++ ;
+	}
+
+/* rearrange the macro table so it is sorted by name length */
+	for ( i=0; i<defined_macros-1; i++ ) {
+		if ( macrop->namelength < macro[i].namelength ) {
+			mac_copy( &spare_macro, macrop ) ;
+			for ( j=defined_macros-1; j>i; j-- )
+				mac_copy( &macro[j], &macro[j-1] ) ;
+			mac_copy( &macro[i], &spare_macro ) ;
+			break ;
+		}
+		/* replace if name already exists */
+		if ( macrop->namelength == macro[i].namelength &&
+		     NULL == strcmp( macrop->name, macro[i].name ) ) {
+			mac_swap( &macro[i], macrop ) ;
+			mac_del( defined_macros - 1 ) ;
+			break ;
+		}
+	}
+	
+/* return the index of the new macro */
+	return(i) ;
+}
+
+
+
+/* MAC_COPY
+ *
+ * Copy macro p2 into p1 (just changing pointers)
+ */
+mac_copy( p1, p2 )
+struct Macro *p1, *p2 ;
+{
+	p1->name = p2->name ;
+	p1->namelength = p2->namelength ;
+	p1->text = p2->text ;
+	p1->parmcount = p2->parmcount ;
+	p1->callcount = p2->callcount ;
+	p1->alpha = p2 ->alpha ;
+	p1->skip1 = p2->skip1 ;
+	p1->skip2 = p2->skip2 ;
+}
+
+
+
+/* MAC_SWAP
+ *
+ * Exchange macro contents.
+ */
+mac_swap( p1, p2 )
+struct Macro *p1, *p2 ;
+{
+struct Macro mac ;
+
+	mac_copy( &mac, p1 ) ;
+	mac_copy( p1, p2 ) ;
+	mac_copy( p2, &mac ) ;
+}
+
+
+
+/* MAC_DEL
+ *
+ * Remove a macro, specified by index, and shift the table.
+ */
+
+/* the skip parameters may be null if the name is short */
+#define FREE(s)		if ( NULL != s ) free(s)
+
+mac_del( i )
+int	i ;
+{
+int	j ;
+
+	if ( i >= defined_macros ) return ;	/* index not defined */
+
+	FREE( macro[i].name ) ;
+	FREE( macro[i].text ) ;
+	FREE( (char *)macro[i].skip1 ) ;
+	FREE( (char *)macro[i].skip2 ) ;
+	for ( j=i; j<defined_macros-1; j++ )
+		mac_copy( &macro[j], &macro[j+1] ) ;
+
+	defined_macros-- ;
+}
+
+
+
+/* Expand the macros in the argument string.  Returns a pointer
+ * to the expanded string, which is likely to be huge.  The memory
+ * should be freed as soon as possible.  The macros are expanded
+ * starting with the one with the highest index.  Recursive macro
+ * definitions will be flagged, but may cause a termination due to
+ * allocation failure before doing so.  Caution must be exercised
+ * to avoid accidental recursive definitions involving
+ * more than one macro:
+ *	: h	i+x ;
+ *	: i(y)	func(y) ;
+ *	: func	h ;
+ * This will generate the successive strings (from a = func(x)):
+ *	a = h(x)
+ *	a = i+x(x)
+ *	a = func()+x(x)
+ *	a = h()+x(x) .... and so on.  Beware.
+ * The string is deallocated by this routine.
+ */
+
+/* macros to check for being next to an alpha */
+#define ALPHA_BEFORE(s)	( (s!=text) && (isalnum(*(s-1)) && isalnum(*( s ))) )
+#define ALPHA_AFTER(s)	(               isalnum(*( s )) && isalnum(*(s+1))  )
+#define NEXT_TO_ALPHA(s,l)	( ALPHA_AFTER(s+l-1) || ALPHA_BEFORE(s) )
+
+char	*expand_macros(string)
+char	*string ;
+{
+char	*pntr, *candidate, *text, *stop ;
+int	i, hit, l ;
+
+/* Allocate some initial storage */
+	GET_MEM( text, strlen(string) ) ;
+	strcpy( text, string ) ;
+
+/* clear the recursion check counters */
+	for ( i=0; i<defined_macros; i++ ) macro[i].callcount = 0 ;
+
+/* search for macros */
+	do {
+	stop = text + strlen(text) - 1 ; /* length changed in mac_expand */
+
+	for ( i=defined_macros-1; i>=0; i-- ) {
+		hit = 0 ;		
+		l = macro[i].namelength ;
+	 	quoted( text, text ) ;	/* reset the quote function */
+	 	
+	/* See if macro[i] is in the present string.  If the "edges"
+	 * of the macro name are alphanumeric, don't accept the string
+	 * if the adjacent character is also alphanumeric.  This avoids
+	 * having variables such as "arg" flagged if "r" is defined.
+	 * Potential macros are also rejected if quoted with '.
+	 */
+		for ( pntr=text;; pntr=candidate+1 ) {
+			if ( macro[i].namelength == 1 )
+				candidate = strchr( pntr, macro[i].name[0] ) ;
+			else
+				candidate = search( pntr, stop, &macro[i] ) ;
+			if ( candidate == NULL ) break ;
+
+			/* see if its not an illusion, easiest checks 1st */
+			if ( macro[i].alpha && NEXT_TO_ALPHA(candidate,l) )
+				continue ;
+			if ( quoted( candidate, NULL ) ) continue ;
+
+			/* got one */
+			hit = 1 ;
+			text = mac_expand( text, candidate, i ) ;
+			break ;
+		}
+		if ( hit != 0 ) break ;	/* start over if one was found */
+	}
+	} while( hit != 0 ) ; 
+
+
+	return( text ) ;
+}
+
+
+
+/* Expand a single macro in a text string, freeing the old storage
+ * and returning a pointer to the new string.  Name points to the
+ * macro in the string and index is the macro index.
+ */
+
+char	*mac_expand( text, name, index )
+char	*text, *name ;
+int	index ;
+{
+char	*pntr, *newtext, *parm, *parms[MAX_TOKENS], *temp,
+	*open_parens, *close_parens, *rest_of_text ;
+int	i, j, size ;
+unsigned char	 c ;
+
+	macrop = &macro[index] ;
+	if ( macrop->callcount++ > MAX_CALLS ) {
+		sprintf( errline,
+		"MAC_EXPAND: possible recursion involving: \'%s\' in\n%s",
+			macrop->name, in_buff ) ;
+		abort( errline ) ;
+	}
+	
+
+/* get the parameters if there are any for this macro */
+	for ( i=0; i<MAX_TOKENS; i++ ) parms[i] = NULL ;
+	rest_of_text = &name[ macrop->namelength ] ;
+	if ( macrop->parmcount != 0 ) {
+		open_parens = &rest_of_text[ strspn( rest_of_text, " \t" ) ] ;
+		if ( (NULL != strchr( "([{\'\"", *open_parens )) &&
+		     (NULL != *open_parens )) {
+			if (NULL == (close_parens=mat_del(open_parens)) ) {
+				sprintf( errline,
+				"MAC_EXPAND: missing delimeter: %s", in_buff ) ;
+				abort( errline ) ;
+			}
+			i = (int)(close_parens - open_parens) - 1 ;
+			pntr = open_parens + 1 ;
+			c = *close_parens ;		/* save *close_parens */
+			*close_parens = NULL ;		/* make parm block a string */
+			i = tokenize( pntr, parms ) ;	/* break out the parms */
+			*close_parens = (char)c ; 	/* restore text */
+			rest_of_text = close_parens + 1 ;
+		}
+	}
+
+	
+/* find out how much memory we will need, then allocate */
+	size = strlen(text) ;
+	if ( NULL != ( pntr = macrop->text ) ) size += strlen(pntr) ;
+	for ( i=0; NULL != (c=pntr[i]); i++ ) {
+		if ( c > 127 && parms[c-128] != NULL )
+			size += strlen(parms[c-128]) ;
+	}
+	GET_MEM( newtext, size ) ;
+
+
+/* copy up to macro verbatim */
+	*name = NULL ;
+	strcpy( newtext, text ) ;
+
+/* expand the macro itself if there is text */
+	if ( NULL != (pntr = macrop->text) ) {
+		for ( i=0, j=strlen(newtext); NULL != (c=pntr[i]); i++, j++ ) {
+			if ( c > 127 ) {
+				if ( parms[c-128] != NULL ) {
+					strcat( newtext, parms[c-128] ) ;
+					j += strlen( parms[c-128] ) - 1 ;
+				}
+				else j-- ;
+			}
+			else {		/* keep null terminated */
+				newtext[j] = c ;
+				newtext[j+1] = NULL ;
+			}
+		}
+	}
+	
+
+/* finish off trailing text */
+	strcat( newtext, rest_of_text ) ;
+	
+/* free up temporary storage and return pointer to new allocation */
+	for ( i=0; i<MAX_TOKENS && NULL != parms[i]; i++ ) free( parms[i] ) ;
+	free( text ) ;
+	return( newtext ) ;
+}
+
+
+
+
+/* isalnum: returns nonzero value if the character argument belongs to the 
+ * sets { a-z, A-Z, 0-9 }.
+ */
+ 
+int	isalnum( c )
+char	c ;
+{
+	if ( c >= 97 && c <= 122 ) return (1) ;	/* a-z */
+	if ( c >= 65 && c <= 90 ) return (2) ;	/* A-Z */
+	if ( c >= 48 && c <= 57 ) return (3) ;	/* 0-9 */
+	return(0) ;				/* miss */
+}
+
+
+
+
+/* Return TRUE if the pointer is quoted in the string (pntr marks
+ * a position in the string).  The quote character the apostrophe.
+ * If pntr is not in the the result will be meaningless.  This
+ * routine keeps a static index and quote flag, so it doesn't have
+ * to keep starting back at the beginning.  To reset it, call with
+ * string != NULL pointer.  Subsequent calls should have string NULL,
+ * and pntr >= the original string.  Since macros can be on multiple
+ * lines, the quote flag is reset on newline.
+ */
+ 
+int	quoted( pntr, s )
+char	*pntr, *s ;
+{
+static int	i, quote ;
+static char	*string ;
+
+	if ( s != NULL ) {
+		i = 0 ;
+		quote = FALSE ;
+		string = s ;
+	}
+	else {
+		for ( ; NULL != string[i] && &string[i] < pntr; i++ ) {
+			switch ( string[i] ) {
+				case '\'':	quote = !quote ; break ;
+				case '\n':	quote = FALSE ;
+			}
+		}
+	}
+		
+	return( quote ) ;
+}
+
+
+
+
+
+
+
+/* Guts of the Boyer-Moore algorithm, using already defined skip tables.
+ * Returns a pointer to the location where the text is found, else a
+ * NULL pointer.
+ */
+
+char *search( start, stop, macrop )
+char			*start, *stop ;		/* 1st and last in buffer */
+struct Macro		*macrop ;
+
+{
+register char 	*k,		/* indexes text */
+		*j ;		/* indexes pattern */
+register int	skip ;		/* skip distance */
+char		*patend ;	/* pointer to last char in pattern */
+
+patend = macrop->name + macrop->namelength - 1 ;
+
+	k = start ;
+	skip = macrop->namelength - 1 ;
+	while ( skip <= (stop-k) ) {
+
+		for ( j=patend, k=k+skip; *j == *k; --j, --k )
+			if ( j == macrop->name ) return(k) ;
+
+		skip = max( macrop->skip1[ *(unsigned char *)k ],
+			    macrop->skip2[ j - macrop->name ]      ) ;
+	}
+
+	/* reaching here ==> search failed */
+	return(NULL) ;
+}
+
+
+
+
+/* Generate the skip tables for Boyer-Moore string search algorithm.
+ * Skip1 is the skip depending on the character which failed to match
+ * the pattern (name), and skip2 is the skip depending on how far we
+ * got into the name.
+ */
+
+makeskip( macrop )
+struct Macro *macrop ;
+{
+char	*name, *p ;
+unsigned short	*skip1, *skip2 ;
+int	namelength ;
+int	*backtrack ;	/* backtracking table for t when building skip2 */
+int	c ;		/* general purpose constant */
+int	j, k, t, tp ;	/* indices into skip's and backtrack */
+
+	
+	name = macrop->name ;
+	namelength = macrop->namelength ;
+
+	/* allocate space for the skip strings */ 
+	GET_MEM( p, sizeof(int) * (MAXCHAR + 1) ) ;
+	skip1 = (unsigned short int *)p ;
+	GET_MEM( p, sizeof(int) * namelength ) ;
+	skip2 = (unsigned short int *)p ;
+	
+	macrop->skip1 = skip1 ;
+	macrop->skip2 = skip2 ;
+	
+	/* allocate temporary space for the backtracking table */
+	GET_MEM( p, sizeof(int) * namelength ) ;
+	backtrack = (int *)p ;
+	
+	for (c=0; c<=MAXCHAR; ++c) skip1[c] = namelength ;
+
+	for (k=0; k<namelength; k++) {
+		skip1[name[k]] = namelength - k - 1 ;
+		skip2[k] = 2 * namelength - k - 1 ;
+	}
+
+	for (j=namelength - 1,t=namelength; j >= 0; --j,--t) {
+		backtrack[j] = t ;
+		while (t<namelength && name[j] != name[t]) {
+			skip2[t] = min(skip2[t], namelength - j - 1) ;
+			t = backtrack[t] ;
+		}
+	}
+
+	for (k=0; k<=t; ++k) skip2[k] = min(skip2[k],namelength+t-k) ;
+	tp=backtrack[t] ;
+
+	while( tp < namelength ) {
+		while( t < namelength ) {
+			skip2[t] = min( skip2[t], tp-t+namelength ) ;
+			++t ;
+		}
+		tp = backtrack[tp] ;
+	}
+
+	free(backtrack) ;
+}
+
+
+
+/* MAC_QUERY
+ *
+ * Determine if a given string a defined macro.  Returns the index of
+ * the macro, or -1 on failure.  The list is assumed sorted by length.
+ */
+int	mac_query( s )
+char	*s ;
+{
+int	index, i, l ;
+
+	l = strlen( s ) ;
+
+	/* Find first macro with length l (need not be efficient here) */
+	for ( index=0; index<defined_macros; index++ ) {
+		if ( macro[index].namelength==l ) break ;
+		if ( macro[index].namelength>l || index==defined_macros-1 )
+			return(-1) ;
+	}
+
+	/* Look for a match */
+	for ( i=index; macro[i].namelength==l && i<defined_macros; i++ ) {
+		if ( NULL == strcmp( s, macro[i].name ) ) return(i) ;
+	}
+
+	return(-1) ;
+}
+@//E*O*F macro.c//
+chmod u=rw,g=r,o=r macro.c
+ 
+echo x - flow.c
+sed 's/^@//' > "flow.c" <<'@//E*O*F flow.c//'
+/* Flow control extensions and related routines */
+
+#include "prep.h"
+
+/* data declarations for the routines in the flow control set */
+char	*case_exp[NESTING] ;		/* case expression storage */
+char	*exp ;				/* general expression storage pointer */
+char	alabel[NESTING][6] ;		/* again label storage */
+char	blabel[NESTING][6] ;		/* begin label storage */
+char	clabel[NESTING][6] ;		/* case label storage */
+char	dlabel[NESTING][6] ;		/* do/end_do label storage */
+char	elabel[NESTING][6] ;		/* leave_do label storage */
+
+int	of_count[NESTING] ;   /* counters for of statements */
+int	leave_do_flag[NESTING] ;   /* marks if leave_do in current loop */
+
+int	alabel_count = 0 ;    /* alabel = alabel_count + 15000 */
+int	blabel_count = 0 ;    /* blabel = blabel_count + 17500 */
+int	clabel_count = 0 ;    /* clabel = clabel_count + 20000 */
+int	dlabel_count = 0 ;    /* dlabel = dlabel_count + 12500 */
+int	elabel_count = 0 ;    /* elabel = elabel_count + 22500 */
+
+int	do_count = 0 ;        /* nesting counter for do/end_do */
+int	begin_count = 0 ;     /* nesting counter for begin ... loops */
+int	case_count = 0 ;      /* case nesting level */
+
+
+
+
+/* FLOW_INIT
+ *
+ * Initialize the flow control routines
+ */
+flow_init()
+{
+int i ;
+
+for ( i = 0; i < NESTING; i++ ) leave_do_flag[i] = FALSE ;
+}
+
+
+
+/* Function AGAIN_PROC
+ *
+ * Process again statements.
+ * 3/2/86
+ */
+
+again_proc()     
+{                  
+
+/* on missing begin statement, abort */
+if ( begin_count <= 0 ) {
+	sprintf( errline, "Again: no matching begin: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+/* construct the goto statement back to begin */
+sprintf( out_buff, "      goto %s", blabel[begin_count] ) ;
+dump( out_buff ) ;
+
+/* construct label statement */
+sprintf( out_buff, "%s continue", alabel[begin_count] ) ;
+dump( out_buff ) ;
+
+begin_count-- ;
+IN_BUFF_DONE
+}
+
+
+
+
+/* Function BEGIN_PROC.C
+ *
+ * Process begin statements.  Construct a label for the
+ * while, until, and again statements to branch to.  The
+ * label for again is created here as well.
+ *
+ * P. R. OVE  3/2/86
+ */
+
+begin_proc() 
+{
+int	count ;
+                      
+/* keep track of the nesting */
+begin_count++ ;
+if ( begin_count >= NESTING ) {
+	sprintf( errline, "Begin: nesting too deep: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+/* make up a label (for begin) and store it in blabel[begin_count] */
+count = 17500 + blabel_count ;
+blabel_count++ ;
+if ( count > 19999 ) {
+	sprintf( errline, "Begin: too many labels: %s", in_buff ) ;
+	abort( errline ) ;
+}
+sprintf( blabel[begin_count], "%d", count ) ;
+
+/* make up a label (for again) and store it in alabel[begin_count] */
+count = 15000 + alabel_count ;
+alabel_count++ ;
+if ( count > 17499 ) {
+	sprintf( errline, "Begin: too many labels: %s", in_buff ) ;
+	abort( errline ) ;
+}
+sprintf( alabel[begin_count], "%d", count ) ;
+
+/* construct and dump the output record */
+sprintf( out_buff, "%s continue", blabel[begin_count] ) ;
+dump( out_buff ) ;
+
+IN_BUFF_DONE
+}                            
+
+
+
+
+/* Function CASE_PROC
+ *
+ * Process again statements.
+ * 11/9/85
+ */
+
+case_proc()     
+{                  
+int	n, count ;
+char	*open_parens, *close_parens ;
+
+/* get the comparison expression */
+open_parens = line_end( first_nonblank + name_length ) ;
+close_parens = mat_del( open_parens ) ;
+
+/* if char after case is not a blank, tab, or delimeter assume a */
+/* variable name beginning with case                             */
+if ((close_parens == NULL) && (open_parens == first_nonblank + name_length))
+	return ;
+
+/* keep track of the nesting */
+case_count++ ;
+if ( case_count >= NESTING ) {
+	sprintf( errline, "Case: nesting too deep: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+/* get logical expression, set to NULL if it is missing */
+if ( open_parens == NULL ) { 
+	case_exp[ case_count ][0] = NULL ;
+}
+else {  
+	if ( close_parens == NULL ) {
+		sprintf( errline, "Case: missing delimeter: %s", in_buff ) ;
+		abort( errline ) ;
+	}
+	n = close_parens - open_parens - 1 ;
+	GET_MEM( case_exp[case_count], n+5 ) ;
+	case_exp[case_count][0] = '(' ;
+	strncpy( case_exp[case_count] + 1, open_parens + 1, n ) ;
+	case_exp[case_count][n+1] = ')' ;
+	case_exp[case_count][n+2] = NULL ;
+}                              
+
+
+/* make label for continue to return to, store it in clabel[case_count] */
+count = 20000 + clabel_count ;
+clabel_count++ ;
+if ( count > 22499 ) {
+	sprintf( errline, "Case: too many labels: %s", in_buff ) ;
+	abort( errline ) ;
+}
+sprintf( clabel[case_count], "%d", count ) ;
+
+/* construct and dump the output record */
+sprintf( out_buff, "%s continue", clabel[case_count] ) ;
+dump( out_buff ) ;
+
+
+/* signal that in_buff is empty */
+IN_BUFF_DONE
+}
+
+
+
+
+/* Function CONTINUE_CASE_PROC
+ *
+ * Process continue_case statements (part of case construct).
+ *
+ * P. R. OVE  10/10/86
+ */
+
+continue_case_proc()     
+{                  
+int	n, count ;
+char	*pntr, *open_parens, *close_parens ;
+
+/* get the comparison expression */
+open_parens = line_end( first_nonblank + name_length ) ;
+close_parens = mat_del( open_parens ) ;
+                                           
+/* if there is stuff on the line (open_parens != NULL) and no open
+ * parens (close_parens == NULL) assume variable name */
+if ( (open_parens != NULL) && (close_parens == NULL) ) return ;
+
+/* on missing case statement, abort */
+if ( case_count <= 0 ) {
+	sprintf( errline, "CONTINUE_CASE: no matching CASE: %s", in_buff ) ;
+	abort( errline ) ;
+}
+                                   
+/* get the logical expression if there is one */
+if (open_parens != NULL) {
+	n = close_parens - open_parens - 1 ;
+	GET_MEM( exp, n+5 ) ;
+	exp[0] = '(' ;
+	strncpy( exp + 1, open_parens + 1, n ) ;
+	exp[n+1] = ')' ;
+	exp[n+2] = NULL ;
+}
+
+/* construct and dump the jump back to the case statement */
+if (open_parens != NULL) {
+	strcpy( out_buff, "      if " ) ;
+	strcat( out_buff, exp ) ;
+	strcat( out_buff, " goto " ) ;
+	strcat( out_buff, clabel[case_count] ) ;
+	free( exp ) ;
+}
+else {
+	strcpy( out_buff, "      goto " ) ;
+	strcat( out_buff, clabel[case_count] ) ;
+}
+
+dump( out_buff ) ;
+
+IN_BUFF_DONE
+}
+
+
+
+
+/* Function CONTINUE_DO_PROC
+ *
+ * Process continue_do statements (part of do/end_do construct).
+ *
+ * P. R. OVE  11/13/86
+ */
+
+continue_do_proc()     
+{                  
+int	n, count ;
+char	*pntr, *open_parens, *close_parens ;
+
+/* get the comparison expression */
+open_parens = line_end( first_nonblank + name_length ) ;
+close_parens = mat_del( open_parens ) ;
+                                           
+/* if there is stuff on the line (open_parens != NULL) and no open
+ * parens (close_parens == NULL) assume variable name like CONTINUE_DOit */
+if ( (open_parens != NULL) && (close_parens == NULL) ) return ;
+
+/* on missing do statement, abort */
+if ( do_count <= 0 ) {
+	sprintf( errline, "CONTINUE_DO: not in do/end_do loop: %s", in_buff ) ;
+	abort( errline ) ;
+}
+                                    
+/* get the logical expression if there is one */
+if (open_parens != NULL) {
+	n = close_parens - open_parens - 1 ;
+	GET_MEM( exp, n+5 ) ;
+	exp[0] = '(' ;
+	strncpy( exp + 1, open_parens + 1, n ) ;
+	exp[n+1] = ')' ;
+	exp[n+2] = NULL ;
+}
+
+/* construct and dump the jump to the end_do label */
+if (open_parens != NULL) {
+	strcpy( out_buff, "      if " ) ;
+	strcat( out_buff, exp ) ;
+	strcat( out_buff, " goto " ) ;
+	strcat( out_buff, dlabel[do_count] ) ;
+	free( exp ) ;
+}
+else {
+	strcpy( out_buff, "      goto " ) ;
+	strcat( out_buff, dlabel[do_count] ) ;
+}
+
+dump( out_buff ) ;
+
+IN_BUFF_DONE
+}
+
+
+
+
+/* Function CONTINUE_PROC
+ *
+ * Process continue statements (part of begin construct).
+ *
+ * P. R. OVE  10/10/86
+ */
+
+continue_proc()     
+{                  
+int	n, count ;
+char	*pntr, *open_parens, *close_parens ;
+
+/* get the comparison expression */
+open_parens = line_end( first_nonblank + name_length ) ;
+close_parens = mat_del( open_parens ) ;
+                                           
+/* if there is stuff on the line (open_parens != NULL) and no open
+ * parens (close_parens == NULL) assume variable name like CONTINUEit */
+if ( (open_parens != NULL) && (close_parens == NULL) ) return ;
+
+/* on missing begin statement, abort */
+if ( begin_count <= 0 ) {
+	sprintf( errline, "CONTINUE: no matching BEGIN: %s", in_buff ) ;
+	abort( errline ) ;
+}
+                                   
+/* get the logical expression if there is one */
+if (open_parens != NULL) {
+	n = close_parens - open_parens - 1 ;
+	GET_MEM( exp, n+5 ) ;
+	exp[0] = '(' ;
+	strncpy( exp + 1, open_parens + 1, n ) ;
+	exp[n+1] = ')' ;
+	exp[n+2] = NULL ;
+}
+
+/* construct and dump the back to the begin statement */
+if (open_parens != NULL) {
+	strcpy( out_buff, "      if " ) ;
+	strcat( out_buff, exp ) ;
+	strcat( out_buff, " goto " ) ;
+	strcat( out_buff, blabel[begin_count] ) ;
+	free( exp ) ;
+}
+else {
+	strcpy( out_buff, "      goto " ) ;
+	strcat( out_buff, blabel[begin_count] ) ;
+}
+
+dump( out_buff ) ;
+
+IN_BUFF_DONE
+}
+
+
+
+
+/* Function DEFAULT_PROC
+ *
+ * Process default statements.
+ *
+ * P. R. OVE  11/9/85
+ */
+
+default_proc()     
+{                  
+char	*pntr ;
+
+if ( case_count <= 0 ) {
+	sprintf( errline, "DEFAULT: no matching CASE: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+dump( "      else" ) ;
+
+/* eliminate "default" from the input buffer */
+pntr = line_end( first_nonblank + name_length ) ;
+if ( pntr != NULL ) {
+	strcpy( in_buff, "\t" ) ;
+	strcat( in_buff, pntr ) ;
+}
+else { IN_BUFF_DONE }
+
+}
+
+
+
+
+/* Function DO_PROC
+ *
+ * Process do statements.  If there is a label (ala
+ * fortran) just dump it to the output.  If no label
+ * exists make one up in anticipation of an eventual
+ * end_do statement.
+ *
+ * P. R. OVE  11/9/85
+ */
+
+do_proc() 
+{
+char	*after_do, *pntr ;
+int	count ;
+                      
+/* return without processing if the first nonblank char after DO is a label
+   or if there is no blank/tab after the DO */
+pntr = first_nonblank + name_length ;
+after_do = line_end( pntr ) ;
+if ( ( strchr( "0123456789", *after_do ) != NULL ) | 
+     ( after_do == pntr )                            ) return ;
+                      
+/* keep track of the nesting */
+do_count++ ;
+if ( do_count >= NESTING ) {
+	sprintf( errline, "DO: nesting too deep: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+/* make up a label and store it in dlabel[do_count] */
+count = 12500 + dlabel_count ;
+dlabel_count++ ;
+if ( count > 14999 ) {
+	sprintf( errline, "DO: too many labels: %s", in_buff ) ;
+	abort( errline ) ;
+}
+sprintf( dlabel[do_count], "%d", count ) ;
+
+/* make label for leave_do to jump to and store it in elabel[do_count] */
+count = 22500 + elabel_count ;
+elabel_count++ ;
+if ( count > 24999 ) {
+	sprintf( errline, "DO: too many labels: %s", in_buff ) ;
+	abort( errline ) ;
+}
+sprintf( elabel[do_count], "%d", count ) ;
+
+/* construct and dump the output record */
+sprintf( out_buff, "      do %s %s", dlabel[do_count], after_do ) ;
+dump( out_buff ) ;
+
+IN_BUFF_DONE
+}                            
+
+
+
+/* Function END_CASE_PROC
+ *
+ * Process end_case statements.
+ *
+ * P. R. OVE  11/9/85
+ */
+
+end_case_proc()
+{                  
+	of_count[ case_count ] = 0 ;
+	free( case_exp[ case_count ] ) ;
+	case_count-- ;
+	IN_BUFF_DONE
+
+	if ( case_count < 0 ) { 
+		case_count = 0 ;
+		return ; }		
+		
+	dump( "      end if" ) ;
+}
+
+
+
+
+/* Function END_DO_PROC
+ *
+ * Process end_do statements.  Use the label indexed
+ * by the current value of do_count (the do nesting
+ * index).
+ *
+ * P. R. OVE  11/9/85
+ */
+
+end_do_proc() 
+{
+                      
+/* signal error if no matching do has been found */
+if ( do_count <= 0 )  {
+	sprintf( errline, "END_DO: no matching do: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+/* construct and dump the normal do loop continue statement */
+sprintf( out_buff, "%s continue", dlabel[do_count] ) ;
+dump( out_buff ) ;
+
+/* construct and dump the leave_do label if needed */
+if ( leave_do_flag[do_count] == TRUE ) {
+	sprintf( out_buff, "%s continue", elabel[do_count] ) ;
+	dump( out_buff ) ;
+	leave_do_flag[do_count] = FALSE ;
+}
+
+do_count -= 1 ;
+IN_BUFF_DONE
+}                            
+
+
+
+
+/* Function LEAVE_DO_PROC
+ *
+ * Process leave_do statements.
+ *
+ * P. R. OVE  3/2/86
+ */
+
+leave_do_proc()     
+{                  
+int	n, count ;
+char	*pntr, *open_parens, *close_parens ;
+
+/* get the comparison expression */
+open_parens = line_end( first_nonblank + name_length ) ;
+close_parens = mat_del( open_parens ) ;
+                                           
+/* if there is stuff on the line (open_parens != NULL) and no              */
+/* open parens (close_parens == NULL) assume variable name like LEAVE_DOit */
+if ( (open_parens != NULL) && (close_parens == NULL) ) return ;
+
+/* on missing do statement, abort */
+if ( do_count <= 0 ) {
+	sprintf( errline, "LEAVE_DO: not in do/end_do loop: %s", in_buff ) ;
+	abort( errline ) ;
+}
+                                    
+/* get the logical expression if there is one */
+if (open_parens != NULL) {
+	n = close_parens - open_parens - 1 ;
+	GET_MEM( exp, n+5 ) ;
+	exp[0] = '(' ;
+	strncpy( exp + 1, open_parens + 1, n ) ;
+	exp[n+1] = ')' ;
+	exp[n+2] = NULL ;
+}
+
+/* construct and dump the jump out of the loop */
+if (open_parens != NULL) {
+	strcpy( out_buff, "      if " ) ;
+	strcat( out_buff, exp ) ;
+	strcat( out_buff, " goto " ) ;
+	strcat( out_buff, elabel[do_count] ) ;
+	free( exp ) ;
+}
+else {
+	strcpy( out_buff, "      goto " ) ;
+	strcat( out_buff, elabel[do_count] ) ;
+}
+
+leave_do_flag[do_count] = TRUE ;
+
+dump( out_buff ) ;
+
+IN_BUFF_DONE
+}
+
+
+
+
+/* Function LEAVE_PROC
+ *
+ * Process leave statements.
+ *
+ * P. R. OVE  3/2/86
+ */
+
+leave_proc()     
+{                  
+int	n, count ;
+char	*pntr, *open_parens, *close_parens ;
+
+/* get the comparison expression */
+open_parens = line_end( first_nonblank + name_length ) ;
+close_parens = mat_del( open_parens ) ;
+                                           
+/* if there is stuff on the line (open_parens != NULL) and no           */
+/* open parens (close_parens == NULL) assume variable name like LEAVEit */
+if ( (open_parens != NULL) && (close_parens == NULL) ) return ;
+
+/* on missing begin statement, abort */
+if ( begin_count <= 0 ) {
+	sprintf( errline, "LEAVE: no matching begin: %s", in_buff ) ;
+	abort( errline ) ;
+}
+                                    
+/* get the logical expression if there is one */
+if (open_parens != NULL) {
+	n = close_parens - open_parens - 1 ;
+	GET_MEM( exp, n+5 ) ;
+	exp[0] = '(' ;
+	strncpy( exp + 1, open_parens + 1, n ) ;
+	exp[n+1] = ')' ;
+	exp[n+2] = NULL ;
+}
+
+/* construct and dump the jump to again */
+if (open_parens != NULL) {
+	strcpy( out_buff, "      if " ) ;
+	strcat( out_buff, exp ) ;
+	strcat( out_buff, " goto " ) ;
+	strcat( out_buff, alabel[begin_count] ) ;
+	free( exp ) ;
+}
+else {
+	strcpy( out_buff, "      goto " ) ;
+	strcat( out_buff, alabel[begin_count] ) ;
+}
+
+dump( out_buff ) ;
+
+IN_BUFF_DONE
+}
+
+
+
+/* Function OF_PROC
+ *
+ * Process of statements.
+ *
+ * P. R. OVE  11/9/85
+ */
+
+of_proc()     
+{                  
+int	n ;
+char	*pntr, *open_parens, *close_parens ;
+
+/* get the comparison expression */
+open_parens = line_end( first_nonblank + name_length) ;
+close_parens = mat_del( open_parens ) ;
+                                           
+/* if no open parens assume variable name like OFile */
+/* (no open parens <==> close_parens will be NULL)   */
+if ( close_parens == NULL ) return ;
+
+/* abort on missing case statement */
+if ( case_count <= 0 ) {
+	sprintf( errline, "OF: missing CASE statement: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+/* keep track of "of's" for each case level */
+of_count[ case_count ] += 1 ;
+
+/* get the logical expression */
+n = close_parens - open_parens - 1 ;
+GET_MEM( exp, n+5 ) ;
+exp[0] = '(' ;
+strncpy( exp + 1, open_parens + 1, n ) ;
+exp[n+1] = ')' ;
+exp[n+2] = NULL ;
+
+/* construct the "if" or "if else" statement.  If there is a case */
+/* logical expression us .eq. to determine the result             */
+if ( case_exp[ case_count ][0] == NULL ) {
+	if ( of_count[ case_count ] != 1 ) {
+		strcpy( out_buff, "      else if " ) ; }
+     	else {
+		strcpy( out_buff, "      if " )      ; }
+	strcat( out_buff, exp ) ;
+	strcat( out_buff, " then " ) ; }
+else {
+	if ( of_count[ case_count ] != 1 ) {
+		strcpy( out_buff, "      else if (" ) ; }
+     	else {
+		strcpy( out_buff, "      if (" )      ; }
+	strcat( out_buff, case_exp[ case_count ] ) ;
+	strcat( out_buff, ".eq." ) ;
+	strcat( out_buff, exp ) ;
+	strcat( out_buff, ") then " ) ; }
+                                   
+dump( out_buff ) ;
+
+/* eliminate "of stuff" from the input buffer */
+pntr = line_end( close_parens + 1 ) ;
+if ( pntr != NULL ) {
+	strcpy( in_buff, "\t" ) ;
+	strcat( in_buff, pntr ) ;
+}
+else { IN_BUFF_DONE }
+
+free( exp ) ;
+}
+
+
+
+
+/* Function UNTIL_PROC
+ *
+ * Process until statements.
+ *
+ * P. R. OVE  3/2/86
+ */
+
+until_proc()     
+{                  
+int	n, count ;
+char	*pntr, *open_parens, *close_parens ;
+
+/* get the comparison expression */
+open_parens = line_end( first_nonblank + name_length ) ;
+close_parens = mat_del( open_parens ) ;
+                                           
+/* if no open parens assume variable name like UNTILon */
+/* (no open parens <==> close_parens will be NULL)   */
+if ( close_parens == NULL ) return ;
+
+/* on missing begin statement, abort */
+if ( begin_count <= 0 ) {
+	sprintf( errline, "UNTIL: no matching begin: %s", in_buff ) ;
+	abort( errline ) ;
+}
+                                    
+/* get the logical expression */
+n = close_parens - open_parens - 1 ;
+GET_MEM( exp, n+5 ) ;
+exp[0] = '(' ;
+strncpy( exp + 1, open_parens + 1, n ) ;
+exp[n+1] = ')' ;
+exp[n+2] = NULL ;
+
+/* construct and dump the conditional jump to begin */
+sprintf( out_buff, "      if (.not.%s) goto %s",
+	exp, blabel[begin_count] ) ;
+dump( out_buff ) ;
+
+/* construct a label statement (for leave to jump to) */
+sprintf( out_buff, "%s continue", alabel[begin_count] ) ;
+dump( out_buff ) ;
+
+begin_count-- ;
+free( exp ) ;
+IN_BUFF_DONE
+}
+
+
+
+
+/* Function WHILE_PROC
+ *
+ * Process while statements.
+ *
+ * P. R. OVE  3/2/86
+ */
+
+while_proc()     
+{                  
+int	n, count ;
+char	*pntr, *open_parens, *close_parens ;
+
+/* get the comparison expression */
+open_parens = line_end( first_nonblank + name_length ) ;
+close_parens = mat_del( open_parens ) ;
+                                           
+/* if no open parens assume variable name like WHILEon */
+/* (no open parens <==> close_parens will be NULL)   */
+if ( close_parens == NULL ) return ;
+
+/* on missing begin statement, abort */
+if ( begin_count <= 0 ) {
+	sprintf( errline, "WHILE: no matching begin: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+/* get the logical expression */
+n = close_parens - open_parens - 1 ;
+GET_MEM( exp, n+5 ) ;
+exp[0] = '(' ;
+strncpy( exp + 1, open_parens + 1, n ) ;
+exp[n+1] = ')' ;
+exp[n+2] = NULL ;
+
+/* construct and dump the output record */
+strcpy( out_buff, "      if (.not." ) ;
+strcat( out_buff, exp ) ;
+strcat( out_buff, ") goto " ) ;
+strcat( out_buff, alabel[begin_count] ) ;
+dump( out_buff ) ;
+
+free( exp ) ;
+IN_BUFF_DONE
+}
+@//E*O*F flow.c//
+chmod u=rw,g=r,o=r flow.c
+ 
+echo x - ifdef.c
+sed 's/^@//' > "ifdef.c" <<'@//E*O*F ifdef.c//'
+/* Routines related to conditional compilation.  Ignore_flag is
+ * a global external that controls input.  If ignore_flag is TRUE
+ * input is ignored.  File inclusion stuff is also here.
+ */
+
+#include "prep.h"
+
+int	ifdef_list[NESTING], ifdef_count ;
+
+
+
+
+/* Function IFDEF_PROC
+ *
+ * #ifdef name1 name2 name3....namen
+ * 
+ * Different from the cpp conditional compilation directive, since
+ * in PREP the symbols | and & (and nearly anything) are legal macro
+ * names.  Here the instructions in the #if block will be kept if
+ * ANY of the names are defined.  The names must be separated by
+ * blanks or tabs.
+ */
+
+ifdef_proc()     
+{                  
+int	i ;
+char	*name, *pntr ;
+
+/* keep track of the nesting */
+ifdef_count++ ;
+if ( ifdef_count >= NESTING ) {
+	sprintf( errline, "#Ifdef: nesting too deep: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+/* see if any of the tokens is a macro name */
+i = ifdef_count - 1 ;
+ifdef_list[i] = FALSE ;
+for (pntr = first_nonblank + name_length;; pntr = NULL ) {
+	if ( NULL == ( name = strtok( pntr, " \t" ) ) ) break ;
+	if ( mac_query(name) >= 0 ) {
+		ifdef_list[i] = TRUE ;
+		break ;
+	}
+}
+
+/* set a flag to inhibit input if any ifdef flags are FALSE */
+ignore_flag = FALSE ;
+for ( i=0; i<ifdef_count; i++ )
+	if ( ifdef_list[i] == FALSE ) ignore_flag = TRUE ;
+
+/* signal that in_buff is empty */
+IN_BUFF_DONE
+}
+
+
+
+/* Function IFNDEF_PROC
+ *
+ * #ifndef name1 name2 name3....namen
+ * 
+ * Here the instructions in the #ifndef block will be kept if
+ * ANY of the names are NOT defined.  The names must be separated by
+ * blanks or tabs.
+ */
+
+ifndef_proc()     
+{                  
+int	i ;
+char	*name, *pntr ;
+
+/* keep track of the nesting */
+ifdef_count++ ;
+if ( ifdef_count >= NESTING ) {
+	sprintf( errline, "#Ifdef: nesting too deep: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+/* see if any of the tokens is not a macro name */
+i = ifdef_count - 1 ;
+ifdef_list[i] = FALSE ;
+for (pntr = first_nonblank + name_length;; pntr = NULL ) {
+	if ( NULL == ( name = strtok( pntr, " \t" ) ) ) break ;
+	if ( mac_query(name) < 0 ) {
+		ifdef_list[i] = TRUE ;
+		break ;
+	}
+}
+
+/* set a flag to inhibit input if any ifdef flags are FALSE */
+ignore_flag = FALSE ;
+for ( i=0; i<ifdef_count; i++ )
+	if ( ifdef_list[i] == FALSE ) ignore_flag = TRUE ;
+
+/* signal that in_buff is empty */
+IN_BUFF_DONE
+}
+
+
+
+/* ELSE_PROC
+ *
+ * #else conditional compilation directive.
+ */
+else_proc()
+{
+int	i ;
+
+/* on missing #ifdef statement, abort */
+if ( ifdef_count <= 0 ) {
+	sprintf( errline, "#Else: no matching ifdef: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+ifdef_list[ ifdef_count-1 ] = NOT ifdef_list[ ifdef_count-1 ] ;
+
+/* set a flag to inhibit input if any ifdef flags are FALSE */
+ignore_flag = FALSE ;
+for ( i=0; i<ifdef_count; i++ )
+	if ( ifdef_list[i] == FALSE ) ignore_flag = TRUE ;
+
+/* signal that in_buff is empty */
+IN_BUFF_DONE
+}
+
+
+
+/* ENDIF_PROC
+ *
+ * #endif conditional compilation directive.
+ */
+endif_proc()
+{
+int	i ;
+
+/* on missing #ifdef statement, abort */
+if ( ifdef_count <= 0 ) {
+	sprintf( errline, "#Endif: no matching ifdef: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+ifdef_count-- ;
+
+/* set a flag to inhibit input if any ifdef flags are FALSE */
+ignore_flag = FALSE ;
+for ( i=0; i<ifdef_count; i++ )
+	if ( ifdef_list[i] == FALSE ) ignore_flag = TRUE ;
+
+/* signal that in_buff is empty */
+IN_BUFF_DONE
+}
+
+
+
+/* INCLUDE_PROC
+ *
+ * Handle file inclusion
+ *
+ * P. R. OVE  11/9/85
+ */
+ 
+include_proc()     
+{                  
+char	*pntr, *open_parens, *close_parens, *name ;
+
+/* This routine could be called when the conditional compilation
+ * flag has been set (#include is in the same group).
+ */
+if ( ignore_flag ) { IN_BUFF_DONE ; return ; }
+
+/* get the file name */
+open_parens = line_end( first_nonblank + name_length ) ;
+if ( NULL == ( close_parens = mat_del( open_parens ) ) ) {
+	sprintf( errline, "INCLUDE: syntax: %s", in_buff ) ;
+	abort( errline ) ;
+}
+name = open_parens+1 ;
+*close_parens = NULL ;
+
+/* push the old input file handle onto the filestack */
+if ( NULL == pushfile(&in) ) {
+	sprintf( errline, "INCLUDE: nesting too deep: %s", in_buff ) ;
+	abort( errline ) ;
+}
+
+/* open the new file */
+if ( NULL == ( in = fopen( name, "r" ) ) ) {
+	sprintf( errline, "INCLUDE: can't open file: %s", name ) ;
+	abort( errline ) ;
+}
+
+IN_BUFF_DONE ;
+}
+
+
+/* push a file handle onto the filestack.  return NULL on error. */
+int	pushfile(handleaddress)
+FILE	*(*handleaddress) ;
+{
+	if ( include_count >= NESTING ) return(NULL) ;
+	filestack[include_count] = *handleaddress ;
+	include_count++ ;
+	return(1) ;
+}
+
+
+/* pop a file handle from the filestack.  return NULL on error */
+int	popfile(handleaddress)
+FILE	*(*handleaddress) ;
+{
+	if ( include_count <= 0 ) return(NULL) ;
+	include_count-- ;
+	*handleaddress = filestack[include_count] ;
+	return(1) ;
+}
+
+@//E*O*F ifdef.c//
+chmod u=rw,g=r,o=r ifdef.c
+ 
+echo x - str.c
+sed 's/^@//' > "str.c" <<'@//E*O*F str.c//'
+/* A few string functions missing from Sun unix */
+
+#include <stdio.h>
+#include "string.h"
+
+/* Find the first occurrence of c in string */
+char	*strchr( s, c )
+char	*s, c ;
+{
+int	length, i ;
+	length = strlen(s) ;
+
+	for ( i=0; i<=length; i++ ) if ( s[i] == c ) return( &s[i] ) ;
+	return( NULL ) ;
+}
+
+/* find the index of the first char in s1 that is not in s2 */
+int	strspn( s1, s2 )
+char	*s1, *s2 ;
+{
+int	i ;
+
+	for ( i=0 ; s1[i] != NULL ; i++ ) {
+		if ( NULL == strchr(s2,s1[i]) ) break ;
+		}
+	return(i) ;
+}
+
+
+/* find the index of the first char in s1 that is in s2 */
+int	strcspn( s1, s2 )
+char	*s1, *s2 ;
+{
+int	i ;
+
+	for ( i=0 ; s1[i] != NULL ; i++ ) {
+		if ( NULL != strchr(s2,s1[i]) ) break ;
+		}
+	return(i) ;
+}
+@//E*O*F str.c//
+chmod u=rw,g=r,o=r str.c
+ 
+exit 0
+
+

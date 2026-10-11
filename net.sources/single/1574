@@ -1,0 +1,1744 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,84e63af039c6f4e5,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-08-28 06:20:50 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 ggr 02/21/84; site bentley.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxl!ihnp4!bentley!fjh
+From: fjh@bentley.UUCP (FJ Hirsch)
+Newsgroups: net.sources
+Subject: Macintosh: new rmaker.c
+Message-ID: <471@bentley.UUCP>
+Date: Tue, 28-Aug-84 09:20:50 EDT
+Article-I.D.: bentley.471
+Posted: Tue Aug 28 09:20:50 1984
+Date-Received: Wed, 29-Aug-84 00:49:19 EDT
+Organization: AT&T Bell Laboratories, Piscataway
+Lines: 1724
+
+# Here is the new rmaker.c for you non-ARPA People. Thanks to Bill
+# Croft for sending it to me!
+# Fred.
+#
+#Date: Wed, 22 Aug 84 19:11:51 pdt
+#
+#! /bin/sh
+: This is a shar archive.  Extract with sh, not csh.
+echo x - cmd/rmaker.c
+cat > cmd/rmaker.c << '28336!Funky!Stuff!'
+/*	rmaker.c	1.0	04/11/84	*/
+
+/*
+ * Resource compiler.
+ */
+
+/* 
+ * Copyright (C) 1984, Stanford Univ. SUMEX project.  
+ * May be used but not sold without permission.
+ */
+
+/*
+ * history
+ * 04/11/84	Croft	Created.
+ * 04/16/84	Croft	Reloc info now imbedded in long addresses.
+ * 06/18/84	Schilit Added DITL and ALRT.
+ * 07/06/84	Croft	Added DLOG WIND MENU CNTL ICON ICN# CURS PAT.
+ * 07/21/84	Croft	Added DRVR; multiple code segs (jks).
+ * 07/26/84	Schuster Added resource names.
+ */
+
+#include <stdio.h>
+#include <mac/res.h>
+#include <mac/b.out.h>
+#include <mac/quickdraw.h>
+#include <mac/toolintf.h>
+
+#define	bh	filhdr
+
+struct	bhdr	bh;		/* b.out header */
+char 	*malloc();
+char	*index();
+char	*rindex();
+unsigned short	htons();	/* host to "net" byte order, short. */
+unsigned long	htonl();
+
+char	seg0[sizeof(struct jumphead) + sizeof(struct jumptab)] = {
+	0,0,0,0x28,  0,0,2,0,  0,0,0,8,  0,0,0,0x20,
+	0,0,  0x3F,0x3C,  0,1,  0xA9,0xF0
+};				/* "standard" segment 0 jump header/table */
+char	seg1[sizeof(struct codehead)] = { 0,0,  0,1 };
+
+#define	CRTMAGIC 0x602C		/* jump at beginning of crtmac.s */
+#define	CRTLEN	10		/* length of relocation table in crtmac.s */
+
+#define	NRESCOMP 50		/* max number of resources per compile */
+
+struct	rescomp {		/* resource being compiled */
+	char	rc_type[8];	/* resource type (e.g. "CODE") */
+ 	char	*rc_name;	/* resource name */
+	int	rc_id;		/* resource id number */
+	int	rc_att;		/* attributes */
+	int	rc_length;	/* length in resource file */
+	char	*rc_data;	/* pointer to data */
+	int	rc_datalen;	/* length of data */
+	FILE	*rc_file;	/* file to read data from */
+	int	rc_filelen;	/* length of data in file */
+	int	rc_bss;		/* number of zero pad bytes */
+} rescomp[NRESCOMP], *rcp;
+
+struct	resfile	rf;		/* compiled resource file header */
+struct	resmap	rm;		/* compiled resource map header */
+struct	restype	rt[NRESCOMP];	/* compiled resource type list */
+struct	resid	ri[NRESCOMP];	/* compiled resource id list */
+
+#define NAMELEN 1024
+char 	rn[NAMELEN];		/* compiled resource name list */
+
+char	debugtype[8];		/* debug type switch */
+FILE	*fout;			/* file for compiler output */
+FILE	*fin;			/* file for compiler commands */
+char	fineof;			/* true after all commands read */
+char	line[256];		/* line buffer */
+char	*lp;			/* current position in line */
+int	linenum;		/* line number in command file */
+
+char	*relpnt;		/* current position in longrun area */
+int	rellen;			/* length of longrun area */
+int	reloff;			/* current relocation offset */
+
+char	token[128];		/* current token being parsed */
+char	data[8*1024];		/* area to build simple resource data */
+char	*datap;			/* pointer to data area */
+
+/* type format handlers */
+extern	handstr(), handhexa(), handcode(), handdrvr();
+extern	handdlog(), handalrt(), handditl();
+extern	handwind(), handmenu(), handcntl();
+
+struct	typehand {		/* type string to handler table */
+	char	th_type[8];	/* e.g. "CODE" */
+	int	(*th_handler)(); /* format handler function */
+} typehand[] = {
+	"STR ",	handstr,
+	"HEXA",	handhexa,
+	"CODE",	handcode,
+	"DRVR",	handdrvr,
+	"ALRT", handalrt,
+	"DITL", handditl, 
+	"DLOG", handdlog,
+	"WIND", handwind,
+	"MENU", handmenu,
+	"CNTL", handcntl,
+	"ICON", handhexa,
+	"ICN#", handhexa,
+	"CURS", handhexa,
+	"PAT ", handhexa,
+	0,	0
+};
+
+
+main(argc, argv)
+	char **argv;
+{
+	for (argc--,argv++ ; argc > 0 ; argc--,argv++) {
+		if (argv[0][0] != '-')
+			break;
+		switch (argv[0][1]) {
+		case 'd':
+			argc--,argv++;
+			if (argc < 1) abort("syntax: -d TYPE");
+			strcpy(debugtype,argv[0]);
+			break;
+		}
+	}
+	if (argc != 1)
+		abort("usage: rmaker commandfilename");
+	if ((fin = fopen(argv[0], "r")) == NULL)
+		abort("can't open commandfile");
+	rmaker();
+	buildrf();	/* build resource file from rescomp */
+	exit(0);
+}
+
+
+rmaker()
+{
+	register i;
+ 	char infile[32], *ip;
+	struct typehand *thp;
+	int haveoutfile = 0;
+	int items, id, att;
+	char littype[32], type[32], format[32];
+
+	rcp = &rescomp[0];
+	while (fineof == 0) {
+		if (getline() == 0)
+			continue;	/* skip blank lines */
+		if (haveoutfile == 0) {	/* if output file not yet open */
+			if ((fout = fopen(lp, "w")) == NULL)
+				abort("can't open output file %s", lp);
+			haveoutfile++;
+			continue;
+		}
+		littype[0] = type[0] = 0;
+		items = sscanf(lp, "%s %s = %s", littype, type, format);
+		if (items < 2 || strcmp(littype, "Type") != 0)
+			abort("bad Type line");
+		checktype(type);
+		strcpy(rcp->rc_type, type);
+		if (items == 3) {
+			checktype(format);
+			strcpy(type, format);
+		}
+		if (getline() == 0)
+			abort("bad id");
+		if (skipsp() == 0)
+			abort("bad id");
+		for (i=0 ; *lp != ',' && *lp != 0 ; lp++,i++)
+			infile[i] = *lp;
+		infile[i] = 0;
+		if (*lp != ',')
+			abort("bad id");
+		lp++;
+		id = att = 0;
+		items = sscanf(lp, " %d(%d) ", &id, &att);
+ 		ip = index(infile, '|');
+ 		if (ip) {
+ 			*ip++ = 0;
+ 			if ((rcp->rc_name = malloc(strlen(ip) + 1)) == 0)
+ 				abort("name malloc");
+ 			strcpy(rcp->rc_name, ip);
+ 		} else
+ 			rcp->rc_name = 0;
+		if (items < 1)
+			abort("bad id");
+		if (strlen(infile)) {
+			if ((rcp->rc_file = fopen(infile, "r")) == NULL)
+				abort("can't open input file %s", infile);
+		} else {
+			rcp->rc_file = 0;
+		}
+		rcp->rc_id = id;
+		rcp->rc_att = att;
+		/* search for type handler */
+		for (thp = &typehand[0] ; ; thp++) {
+			if (thp->th_handler == 0)
+				abort("type %s not implemented", type);
+			if (strcmp(thp->th_type, type) == 0)
+				break;
+		}
+		datap = data;
+		(*thp->th_handler)();
+		if (datap != data) {
+			int len = datap - data;
+			if (len & 1) {
+				len++;
+				*datap++ = 0;
+			}
+			if ((rcp->rc_data = malloc(len)) == 0)
+				abort("data malloc");
+			bcopy(data, rcp->rc_data, len);
+			rcp->rc_datalen = rcp->rc_length = len;
+		}
+		if (strcmp(type, debugtype) == 0)
+			printrcp();
+		rcp++;
+		if ((rcp - &rescomp[0]) > NRESCOMP - 3)
+			abort("too many resources");
+	}
+	if (rcp == &rescomp[0] || fout == 0)
+		abort("nothing to do");
+}
+
+
+/*
+ * Build resource file output from incore rescomp structure.
+ */
+buildrf()
+{
+	register struct rescomp *rcpp;
+	register struct resid *rip;
+	register struct restype *rtp;
+ 	register char *rnp;
+	struct restype *rtpp;
+	int offdata, roundtomap, sizetypes, sizemap;
+	register i;
+	register char *cp;
+	numtypes_t numtypes;
+	lendata_t lendata;
+
+	/* XXX TODO: before scanning, sort rescomp by type/id */
+	rtp = &rt[0];
+	rip = &ri[0];
+ 	rnp = rn;
+	rcpp = &rescomp[0];
+	offdata = 0;
+	/*
+	 * Scan through the resources making type and id lists.  In this
+	 * 1st pass, the rt_offids field is set to the offset from the
+	 * start of the id's list.  Below, the 2nd pass adds the size
+	 * of the type list to this field.
+	 */
+	bcopy(rcpp->rc_type, rtp->rt_type, 4);	/* preset 1st type */
+	for ( ; rcpp < rcp ; rcpp++) {
+		if (strncmp(rcpp->rc_type, rtp->rt_type, 4) != 0) {
+			rtp++;		/* we've found a new type */
+			bcopy(rcpp->rc_type, rtp->rt_type, 4);
+			rtp->rt_offids = (rip - &ri[0]) * sizeof *rip;
+		}
+		rtp->rt_numids++;
+		rip->ri_id = htons(rcpp->rc_id); /* ensure final byte order */
+ 		if (rcpp->rc_name) {
+ 			rip->ri_offname = htons(rnp - rn);
+ 			i = strlen(rcpp->rc_name);
+ 			if (((rnp - rn) + i + 2) > NAMELEN)
+ 				abort("namemap exhausted");
+ 			if (strncmp(rcpp->rc_type, "DRVR", 4))
+ 				*rnp++ = (char) i;
+ 			else {
+ 				*rnp++ = (char)(i + 1);
+ 				*rnp++ = 0;
+ 			}
+ 			bcopy(rcpp->rc_name, rnp, i);
+ 			rnp += i;
+ 		}
+ 		else
+ 			rip->ri_offname = htons(-1);
+		rip->ri_att = rcpp->rc_att;
+		rip->ri_offdata = htons(offdata & 0xFFFF);
+		rip->ri_offdatahi = ((offdata >> 16) & 0xFF);
+		rip++;
+		offdata += (rcpp->rc_length + sizeof lendata);
+	}
+	rtp++;
+	/*
+	 * Write the file header and pad it out.
+	 */
+	rf.rf_offdata = htonl(OFFDATA);
+	offdata += OFFDATA;
+	roundtomap = (offdata & (ROUNDMAP-1));
+	if (roundtomap)
+		roundtomap = ROUNDMAP - roundtomap;  /* # of pad bytes */
+	rf.rf_offmap = offdata + roundtomap;
+	rf.rf_lendata = htonl(rf.rf_offmap - OFFDATA);
+	rf.rf_offmap = htonl(rf.rf_offmap);
+	sizetypes = ((numtypes = rtp - &rt[0]) * sizeof *rtp);
+ 	if ((rnp - rn) & 1)		/* to be conservative */
+ 		*rnp++ = 0;
+	sizemap = sizeof rm + sizetypes + sizeof numtypes
+ 	    + ((rip - &ri[0]) * sizeof *rip) + (rnp - rn);
+	rf.rf_lenmap = htonl(sizemap);
+	fwrite(&rf, sizeof rf, 1, fout);
+	i = OFFDATA - sizeof rf;
+	do { putc(0, fout); } while (--i);
+	/*
+	 * correct type list.
+	 */
+	for (rtpp = &rt[0] ; rtpp < rtp ; rtpp++) {
+		rtpp->rt_offids = htons(rtpp->rt_offids 
+		    + sizetypes + sizeof numtypes);
+		rtpp->rt_numids = htons(rtpp->rt_numids - 1);
+	}
+	/*
+	 * For each resource, write data, file, and bss.
+	 */
+	for (rcpp = &rescomp[0] ; rcpp < rcp ; rcpp++) {
+		lendata = htonl(rcpp->rc_length);
+		fwrite(&lendata, sizeof lendata, 1, fout);
+		if ((cp = rcpp->rc_data))
+			for (i = rcpp->rc_datalen ; i > 0 ; i--)
+				putc(*cp++, fout);
+		if (rcpp->rc_file)
+			for (i = rcpp->rc_filelen ; i > 0 ; i--)
+				putc(getc(rcpp->rc_file), fout);
+		for (i = rcpp->rc_bss ; i > 0 ; i--)
+			putc(0, fout);
+	}
+	for (i = roundtomap ; i > 0 ; i--)
+		putc(0, fout);
+	/*
+	 * Write the resource map.
+	 */
+	rm.rm_offtype = htons(sizeof rm);
+ 	rm.rm_offname = htons(sizemap - (rnp - rn));
+	fwrite(&rm, sizeof rm, 1, fout);
+	numtypes--;
+	numtypes = htons(numtypes);
+	fwrite(&numtypes,sizeof numtypes, 1, fout);
+	fwrite(&rt[0], sizeof *rtp, rtp - &rt[0], fout);
+	fwrite(&ri[0], sizeof *rip, rip - &ri[0], fout);
+ 	fwrite(rn, rnp - rn, 1, fout);
+}
+
+
+/*
+ * Get next command line.
+ * Returns 0 if end of block, 1 if normal line.
+ */
+getline()
+{
+	register i;
+
+again:
+	if ((fgets(line, sizeof line, fin)) == NULL) {
+		fineof++;
+		return (0);
+	}
+	linenum++;
+	if ((i = strlen(line)) <= 0)
+		return (0);
+	if (line[i-1] == '\n')
+		line[i-1] = 0;
+	lp = line;
+	if (*lp == 0)
+		return (0);
+	if (*lp == '*')
+		goto again;
+	return (1);
+}
+
+
+/*
+ * Abort with message.
+ */
+abort(s,a,b)
+	char *s;
+{
+	fprintf(stderr, "rmaker: ");
+	fprintf(stderr, s, a, b);
+	if (linenum)
+		fprintf(stderr, "; line number %d", linenum);
+	fprintf(stderr, "\n");
+	exit(1);
+}
+
+
+/*
+ * Check for legal length type.  Fix "STR ".
+ */
+checktype(s)
+	char *s;
+{
+	register len;
+
+	len = strlen(s);
+	if (len < 3 || len > 4)
+		abort("bad type");
+	if (len == 3) {
+		s[3] = ' ';
+		s[4] = 0;
+	}
+}
+
+
+/*
+ * Copy bytes.
+ */
+bcopy(a, b, n)
+	register n;
+	register char *a, *b;
+{
+	if (n <= 0)
+		return;
+	do { *b++ = *a++; } while (--n);
+}
+
+
+/*
+ * Store a short into the data area.
+ */
+datashort(i)
+{
+	*(unsigned short *)datap = htons(i);
+	datap += sizeof (short);
+}
+
+
+/*
+ * Store a long into the data area.
+ */
+datalong(i)
+{
+	*(unsigned long *)datap = htonl(i);
+	datap += sizeof (long);
+}
+
+
+/*
+ * Store string into data area.  If "round" is set, round up length.
+ * Returns length of data.
+ */
+datastring(sp,round)
+	char *sp;
+{
+	char *cp = datap;	/* remember old value to store length */
+	int len;
+
+	for (datap++, len = 0 ; *sp ; len++)
+		*datap++ = *sp++;
+	*cp = len;
+	len++;
+	if (round && (len & 1)) {
+		len++;
+		*datap++ = 0;
+	}
+	return (len);
+}
+
+
+/*
+ * Scan next number from line and return it.
+ */
+scanfn(fmt)
+	char *fmt;
+{
+	int val;
+
+	if (skipsp() == 0 || sscanf(lp,fmt,&val) != 1)
+		abort("no number found");
+	do {
+		lp++;
+	} while (*lp != ' ' && *lp != '/0'); /* skip to next number */
+	return (val);
+}
+
+
+/*
+ * Scan next string from "line" into "token";  return 0 if none left.
+ */
+scanft()
+{
+	char *cp;
+
+	if (skipsp() == 0)
+		return (0);
+	cp = token;
+	while (*lp != ' ' && *lp != 0)
+		*cp++ = *lp++;
+	*cp = 0;
+	return (1);
+}
+
+
+/*
+ * Skip spaces.  Return 0 if end of line.
+ */
+skipsp() 
+{
+	while (*lp == ' ' && *lp != 0) 
+  		lp++;
+	return(*lp);
+}
+
+
+/*
+ * Print the data portion of the current rcp record.
+ */
+printrcp()
+{
+ 	char *cp;
+	int i;
+	unsigned int j;
+
+	printf("Type %s, ID %d, length %d, datalen %d\n",
+		rcp->rc_type, rcp->rc_id, rcp->rc_length, rcp->rc_datalen);
+	cp = rcp->rc_data;		/* pick up the data pointer */
+	for (i=0 ; i < rcp->rc_datalen ; i++) {
+		j = *cp++ & 0xFF;
+		if ((i % 16) == 15) 
+			printf("%02X\n",j);
+		else 
+			printf("%02X ",j);
+	}
+	printf("\n");
+}
+
+
+#define VAX
+#define nohtonl
+#ifdef nohtonl	/* if not in library */
+#ifdef	VAX
+/*
+ * "Host" to "net" byte order swappers.
+ */
+unsigned short htons(a)
+	unsigned short a;
+{
+	unsigned short result;
+	register char *sp = (char *)&a;
+	register char *dp = (char *)&result;
+
+	dp[1] = *sp++;
+	dp[0] = *sp;
+	return (result);
+}
+
+unsigned long htonl(a)
+	unsigned long a;
+{
+	unsigned long result;
+	register char *sp = (char *)&a;
+	register char *dp = (char *)&result;
+
+	dp[3] = *sp++;
+	dp[2] = *sp++;
+	dp[1] = *sp++;
+	dp[0] = *sp;
+	return (result);
+}
+
+#else	/* if running on a native 68K, don't need byte swapping */
+
+unsigned short htons(a)
+	unsigned short a;
+{
+	return (a);
+}
+
+unsigned long htonl(a)
+	unsigned long a;
+{
+	return (a);
+}
+
+#endif	VAX
+
+#endif	nohtonl
+
+
+
+/*
+ *	T Y P E   H A N D L E R S
+ */
+
+
+/*
+ * Handle string format data.
+ */
+handstr()
+{
+	if (getline() == 0)
+		abort("missing string");
+	datastring(lp,1);
+}
+	
+
+/*
+ * Handle hexadecimal format data.
+ */
+handhexa()
+{
+	char hex[4];
+	int val, items, len;
+
+	hex[2] = 0;
+	while (getline() != 0) {
+		for (len = strlen(lp) ; len > 0 ; ) {
+			if (*lp == ' ') {
+				lp++;  len--;
+				continue;
+			}
+			strncpy(hex, lp, 2);
+			items = sscanf(hex, "%x", &val);
+			if (items != 1)
+				abort("bad digits");
+			*datap++ = val;
+			lp += 2;  len -= 2;
+			if ((datap - data) >= sizeof data)
+				abort("too much data");
+		}
+	}
+	len = datap - data;
+	if (len & 1) {
+		len++;
+		*datap++ = 0;
+	}
+}
+
+
+/*
+ * Handle program (code) data.
+ */
+handcode()
+{
+	register i;
+	struct reloc rl;
+
+	/*
+	 * setup CODE, id=0 (jumptable)
+	 */
+	if (rcp->rc_id == 0) {
+		rcp[1] = rcp[0];	/* duplicate rescomp entry */
+		rcp->rc_att = ATT_PURGEABLE;
+		rcp->rc_datalen = rcp->rc_length = sizeof seg0;
+		rcp->rc_data = seg0;
+		rcp->rc_file = (FILE *)0;
+		rcp->rc_bss = 0;
+		rcp++;
+	}
+	/*
+	 * setup CODE, id=1 (text/data)
+	 */
+	if (fread(&bh, sizeof bh, 1, rcp->rc_file) != 1
+	    || bh.fmagic != FMAGIC)
+		abort("bad b.out header");
+	if ((rcp->rc_data = malloc(rcp->rc_datalen = bh.tsize
+	    + bh.dsize + sizeof seg1)) == 0)
+		abort("code malloc");
+	rcp->rc_id++;		/* normally id is now 1 */
+	seg1[3] = rcp->rc_id;	/* put id in jump table */
+	bcopy(seg1, rcp->rc_data, sizeof seg1);
+	rcp->rc_data += sizeof seg1;
+	if (fread(rcp->rc_data, rcp->rc_datalen - sizeof seg1,
+	    1, rcp->rc_file) != 1)
+		abort("code readerror");
+	rcp->rc_bss = bh.bsize;
+	rcp->rc_length = rcp->rc_datalen + rcp->rc_bss;
+	if (!rcp->rc_att)	/* set default attributes if none supplied */
+		rcp->rc_att = ATT_PURGEABLE | ATT_LOCKED | ATT_PRELOAD;
+	if ((bh.rtsize + bh.rdsize) <= 0)
+		abort("b.out must have reloc info");
+	fseek(rcp->rc_file, RTEXTPOS, 0);
+	if (*(short *)rcp->rc_data != htons(CRTMAGIC))
+		abort("no crtmac.s prefix");
+	relpnt = rcp->rc_data + 2;		/* start of longrun table */
+	rellen = CRTLEN;			/* length of longrun table */
+	reloff = 0;
+	readrel(0, bh.rtsize/sizeof rl);	/* reloc text */
+	readrel(bh.tsize, bh.rdsize/sizeof rl);	/* reloc data */
+	*(rcp->rc_data+reloff) = 0377;		/* signals end of reloc data */
+	rcp->rc_data -= sizeof seg1;
+	fclose(rcp->rc_file);
+	rcp->rc_file = 0;
+	fprintf(stderr, " text %d, data %d, bss %d, longruns %d\n",
+		bh.tsize, bh.dsize, bh.bsize, CRTLEN - rellen);
+}
+
+
+/*
+ * Read relocation data and run length encode it.
+ */
+readrel(off, nrel)
+{
+	struct reloc rl;
+	register char *cp;
+	int run, newoff;
+
+	for ( ; nrel > 0 ; nrel--) {
+		if (fread(&rl, sizeof rl, 1, rcp->rc_file) != 1)
+			abort("error reading reloc");
+		if (rl.rsize != RLONG || (rl.rpos & 1)
+		    || rl.rsymbol || rl.rsegment == REXT)
+			abort("impossible relocation");
+		newoff = (rl.rpos + off);
+		run = (newoff - reloff) >> 1;
+		if (reloff == 0 || run >= 0377) {
+			*(long *)relpnt = htonl(newoff);
+			relpnt += sizeof (long);
+			if (--rellen <= 0)
+				abort("too many longruns");
+		} else {
+			*(rcp->rc_data+reloff) = run;
+		}
+		reloff = newoff;
+	}
+}
+
+
+/*
+ * Handle device driver (or desk accessory.).
+ */
+
+#define	CRTOFF	50	/* offset of longruns in DRVR resource */
+
+handdrvr()
+{
+	register i;
+	struct reloc rl;
+
+	if (fread(&bh, sizeof bh, 1, rcp->rc_file) != 1
+	    || bh.fmagic != FMAGIC)
+		abort("bad b.out header");
+	if ((rcp->rc_data = malloc(rcp->rc_datalen = bh.tsize
+	    + bh.dsize)) == 0)
+		abort("drvr malloc");
+	if (fread(rcp->rc_data, rcp->rc_datalen, 1, rcp->rc_file) != 1)
+		abort("drvr readerror");
+	rcp->rc_bss = bh.bsize;
+	rcp->rc_length = rcp->rc_datalen + rcp->rc_bss;
+	if ((bh.rtsize + bh.rdsize) <= 0)
+		abort("b.out must have reloc info");
+	fseek(rcp->rc_file, RTEXTPOS, 0);
+	if (*(short *)(rcp->rc_data+CRTOFF) != htons(CRTMAGIC))
+		abort("no crtdrvr.s prefix");
+	relpnt = rcp->rc_data + CRTOFF + 2;	/* start of longrun table */
+	rellen = CRTLEN;			/* length of longrun table */
+	reloff = 0;
+	readrel(0, bh.rtsize/sizeof rl);	/* reloc text */
+	readrel(bh.tsize, bh.rdsize/sizeof rl);	/* reloc data */
+	*(rcp->rc_data+reloff) = 0377;		/* signals end of reloc data */
+	fclose(rcp->rc_file);
+	rcp->rc_file = 0;
+	fprintf(stderr, " drvr text %d, data %d, bss %d, longruns %d\n",
+		bh.tsize, bh.dsize, bh.bsize, CRTLEN - rellen);
+}
+
+
+/*
+ * Handle dialog template (DLOG).
+ */
+
+/*
+ * This structure is defined in toolintf.h, but to avoid byte swap
+ * and alignment problems, we fill it "by hand".
+ *
+ *	typedef	struct	{
+ *		Rect	boundsRect;
+ *		short	procID;
+ *		char	visible;
+ *		char	filler1;
+ *		char	goAwayFlag;
+ *		char	filler2;
+ *		long	refCon;
+ *		short	itemsID;
+ *		Str255	title;
+ *	} DialogTemplate;
+ */
+
+handdlog()
+{
+	int vis,go,pid,ref;
+	register i;
+
+	if (getline() == 0) 
+		abort("no dlog rectangle");
+	for (i=0 ; i<4 ; i++) 		/* parse 4 ints - rectangle */
+		datashort(scanfn("%d"));
+	if (getline() == 0) 
+		abort("no dlog vis/proc");
+	scanft();
+	vis = (token[0] == 'V' ? 1 : 0);
+	pid = scanfn("%d");
+	scanft();
+	go = (token[0] == 'G' ? 1 : 0);
+	ref = scanfn("%d");
+	datashort(pid);
+	*datap++ = vis;  *datap++ = 0;
+	*datap++ = go;   *datap++ = 0;
+	datalong(ref);
+	if (getline() == 0)
+		abort("missing Item list ID");
+	datashort(scanfn("%d"));
+	if (getline() != 0)
+		datastring(lp,1);
+	else
+		datashort(0);
+}
+
+
+/*
+ * Handle alert template.
+ */
+
+/*
+ * This structure is defined in toolintf.h, but to avoid byte swap
+ * and alignment problems, we fill it "by hand".
+ *
+ *	typedef	struct {
+ *		Rect	boundsRect;
+ *		short	itemsID;
+ *		short	stages;
+ *	} AlertTemplate;
+ */
+
+handalrt() 
+{
+	int i;
+
+	getline();
+	for (i=0 ; i<4 ; i++) 		/* parse 4 ints - rectangle */
+		datashort(scanfn("%d"));
+	getline();
+	datashort(scanfn("%d"));
+	getline();
+	datashort(scanfn("%x"));
+}
+
+
+/* 
+ * Handle Dialog and Alert Item Lists (Type DITL)
+ *
+ */
+
+/*
+ * Structure of an item list.
+ *
+ *	struct {
+ *		long	zero;		placeholder for handle 
+ *		Rect	itemrect;
+ *		char	itemtype;
+ *		char	itemlength;
+ *		...  			followed by variable length data
+ *	}
+ */
+
+struct ditlkeys {
+	char *ditl_name;
+	int ditl_value;
+} ditlkeys[] = {
+	"CtrlItem",CtrlItem,		/*  used in conjunction with: */
+	"BtnCtrl",BtnCtrl,		/*   a button control */
+	"ChkCtrl",ChkCtrl,		/*   checkbox  */
+	"RadCtrl",RadCtrl,		/*   etc... */
+	"ResCtrl",ResCtrl,
+ 	"RadioItem",RadCtrl+CtrlItem,
+ 	"ChkItem",ChkCtrl+CtrlItem,
+	"StatText",StatText,
+	"EditText",EditText,
+	"IconItem",IconItem,
+	"PicItem",PicItem,
+	"UserItem",UserItem,
+	"ItemDisable",ItemDisable,
+	"BtnItem",BtnCtrl+CtrlItem,	/* abbreviation */
+	"Enabled",0,
+	"Disabled",ItemDisable,		/* synonym */
+	"Disable",ItemDisable,		/* synonym */
+	"ItemDisabled",ItemDisable,	/* synonym */
+	0,0
+};
+
+
+handditl()
+{
+	char *lenp;
+	int i,len;
+	int val,types;
+	register struct ditlkeys *dk;
+
+	/* first line is item count, drop in count-1 */
+	if (getline() == 0 || (val = scanfn("%d")) < 1)
+		abort("bad DITL item count");
+	datashort(val-1);
+
+	/* for each item */
+	for ( ; val > 0 ; val--) {
+		datalong(0);
+ 		if (getline() == 0)		/* line with item types */
+			abort("Missing DITL item type");
+		types = 0;
+		while (scanft()) {
+			for (dk = &ditlkeys[0] ; dk->ditl_name ; dk++)
+				if (strcmp(dk->ditl_name,token) == 0)
+					goto found;
+			abort("bad DITL item type %s",token);
+		found:
+			types += dk->ditl_value;
+		}
+ 		if (getline() == 0)
+			abort("Missing DITL rectangle");		
+		for ( i=0 ; i < 4 ; i++)
+			datashort(scanfn("%d"));
+		*datap++ = types;
+ 		if ((getline() == 0) && (types&(~ItemDisable) != EditText))
+			abort("Missing DITL data");
+		skipsp();
+
+		lenp = datap++;		/* remember spot for length */
+		types &= ~ItemDisable;		/* don't care about this bit */
+
+		switch (types) {	
+
+		case IconItem:		/* 2 byte resource ID */
+		case PicItem:
+		case CtrlItem+ResCtrl: 
+			datashort(scanfn("%d"));
+			*lenp = sizeof (short);
+			break;	
+		
+		case UserItem:
+			*lenp = 0;		/* is nothing */
+			break;
+
+		case CtrlItem+BtnCtrl:
+		case CtrlItem+ChkCtrl:
+		case CtrlItem+RadCtrl:
+		case StatText:	
+		case EditText:
+			len = strlen(lp);
+			strcpy(datap,lp);
+			datap += len;
+			if (len & 1) {
+				len++;
+				*datap++ = 0;
+			}
+			*lenp = len;
+			break;
+		} 
+		if (getline() != 0)
+			abort("Expected blank line in DITL");
+	}
+}
+
+
+/*
+ * Handle window template (WIND).
+ */
+
+/*
+ *	typedef	struct	{
+ *		Rect	boundsRect;
+ *		short	procID;
+ *		char	visible;
+ *		char	filler1;
+ *		char	goAwayFlag;
+ *		char	filler2;
+ *		long	refCon;
+ *		Str255	title;
+ *	} WindowTemplate;
+ */
+
+handwind()
+{
+	int vis,go,pid,ref;
+	char title[128];
+	register i;
+
+	getline();
+	skipsp();
+	strcpy(title,lp);
+	getline();
+	for (i=0 ; i<4 ; i++) 		/* parse 4 ints - rectangle */
+		datashort(scanfn("%d"));
+	getline();
+	scanft();
+	vis = (token[0] == 'V' ? 1 : 0);
+	scanft();
+	go = (token[0] == 'G' ? 1 : 0);
+	getline();
+	pid = scanfn("%d");
+	getline();
+	ref = scanfn("%d");
+	datashort(pid);
+	*datap++ = vis;  *datap++ = 0;
+	*datap++ = go;   *datap++ = 0;
+	datalong(ref);
+	datastring(title,1);
+}
+
+
+/*
+ * Handle control template (CNTL).
+ */
+
+/*
+ *	typedef	struct	{
+ *		Rect	boundsRect;
+ *		short	value;
+ *		char	visible;
+ *		char	filler1;
+ *		short	max;
+ *		short	min;
+ *		short	procID;
+ *		long	refCon;
+ *		Str255	title;
+ *	} ControlTemplate;
+ */
+
+handcntl()
+{
+	int vis,min,max,pid,ref;
+	char title[128];
+	register i;
+
+	getline();
+	skipsp();
+	strcpy(title,lp);
+	getline();
+	for (i=0 ; i<4 ; i++) 		/* parse 4 ints - rectangle */
+		datashort(scanfn("%d"));
+	getline();
+	scanft();
+	vis = (token[0] == 'V' ? 1 : 0);
+	getline();
+	pid = scanfn("%d");
+	getline();
+	ref = scanfn("%d");
+	getline();
+	datashort(scanfn("%d"));
+	*datap++ = vis;  *datap++ = 0;
+	min = scanfn("%d");
+	max = scanfn("%d");
+	datashort(max);
+	datashort(min);
+	datashort(pid);
+	datalong(ref);
+	datastring(title,1);
+}
+
+
+/*
+ * Handle menu template (MENU).
+ */
+
+/*
+ *	typedef	struct	{
+ *		short	menuID;
+ *		long	fill1,fill2;	placeholder
+ *		long	enableFlags;
+ *		Str255	title;
+ *	  for each menu item:
+ *		Str255	text;
+ *		char	icon#;
+ *		char	keyboardequiv;
+ *		char	mark;
+ *		char	textstyle;
+ *	  finally:
+ *		char	zero;		end of items.
+ *	}
+ */
+
+handmenu()
+{
+	int iconid, styleid, cmdid, markid;
+	int *flagsp, flags, item;
+	register char *cp,*dp,*sp;
+	char itext[128];
+	static char styles[] = "BIUOS";
+
+	datashort(rcp->rc_id);
+	datalong(0);
+	datalong(0);
+	flagsp = (long *)datap;	/* remember where the flags were */
+	flags = -1;		/* enable all items */
+	datalong(-1);	/* placeholder */
+	getline();
+	scanft();
+	datastring(token,0);
+	for (item = 1 ; getline() && item < 32 ; item++) {
+		skipsp();
+		iconid = styleid = cmdid = markid = 0;
+		for (cp = lp, dp = itext ; *cp ; cp++) {
+			switch (*cp) {
+			default:
+				*dp++ = *cp;
+				break;
+
+			case '(':
+				flags &= ~(1<<item);
+				break;
+
+			case '^':
+				cp++;
+				iconid = *cp;
+				break;
+			
+			case '/':
+				cp++;
+				cmdid = *cp;
+				break;
+
+			case '!':
+				cp++;
+				markid = *cp;
+				break;
+
+			case '<':
+				cp++;
+				sp = index(styles, *cp);
+				if (sp == 0)
+					abort("BIUOS expected after <");
+				styleid |= (1 << (sp-styles));
+				break;
+			}
+		}
+		*dp++ = 0;
+		datastring(itext,0);
+		*datap++ = iconid;
+		*datap++ = cmdid;
+		*datap++ = markid;
+		*datap++ = styleid;
+	}
+	/* end of items */
+	*datap++ = 0;
+	*flagsp = htonl(flags);
+}
+28336!Funky!Stuff!
+echo x - drvr/Makefile
+cat > drvr/Makefile << '28336!Funky!Stuff!'
+.SUFFIXES: .rsrc .b
+
+.c.b:
+	cc68 -O -c $<
+
+.s.b:
+	cc68 -c $<
+
+.b.rsrc:
+	cc68 -z -m $<
+	rmaker $*.rc
+
+all:	rd.rsrc
+
+rd.rsrc: rd.b rdlib.b crtdrvr.b rd.rc
+	ld68 -X -r -d -e drvr -T 0 crtdrvr.b rd.b rdlib.b -lmac -lc -x 
+	rmaker $*.rc
+
+clean:
+	rm *.b *.rsrc b.out *.dl
+
+28336!Funky!Stuff!
+echo x - drvr/crtdrvr.s
+cat > drvr/crtdrvr.s << '28336!Funky!Stuff!'
+|
+| crtdrvr.s - self relocating C runtime startoff for Mac device driver.
+|
+| Copyright (C) 1984, Stanford Univ. SUMEX project
+| May be used but not sold without permission.
+|
+| history
+| 07/20/84	Croft	Created.
+|
+	.data
+	.text
+	.globl	_savea5
+	.globl	drvr
+	.globl	drvrOpen,drvrPrime,drvrCtl,drvrStatus,drvrClose
+
+| driver header
+
+drvr:
+	.word	0x4f00		| locked, read, write, ctrl, status
+	.word	0
+	.word	0		| delay, emask
+	.word	0		| menu
+doffset:
+	.word	reloc-drvr	| replaced by "dopen-drvr" after initialization
+	.word	dprime-drvr
+	.word	dctl-drvr
+	.word	dstatus-drvr
+	.word	dclose-drvr
+	.byte	8
+	.ascii	".cdriver "
+	.blkb	22		| 32 bytes total for name
+
+reloc:	jra	.L21
+	.long	0,0,0,0,0,0,0,0,0,0		| longruns from rmaker
+_savea5:.long	0
+|
+| a1 = next longrun address
+| a2 = current reloc address
+| d1 = relocation factor
+|
+.L21:
+ 	moveml	#0xffff,sp@-
+	lea	pc@([drvr-.-2]),a1	| reloc factor
+	movl	a1,d1
+	lea	pc@([reloc+2-.-2]),a1
+	movl	a1@+,a2		| pickup 1st relocation
+	addl	d1,a2
+.L16:
+|	for(;;) {
+|		i = *a2;
+|		*a2 = 0;
+|		*(u_long *)a2 += (u_long)d1;
+|		if (i == 0377)
+|			goto start;
+|		if (i == 0) {
+|			a2 = *a1++;
+|			a2 += d1;
+|			continue;
+|		}
+|		a2 += (i << 1);
+|	}
+	movb	a2@,d7
+	andl	#255,d7
+	clrb	a2@
+	addl	d1,a2@
+	cmpl	#255,d7
+	beqs	.L18
+	tstl	d7
+	bnes	.L19
+	movl	a1@+,a2
+	addl	d1,a2
+	bras	.L16
+.L19:
+	roll	#1,d7
+	addl	d7,a2
+	bras	.L16
+|
+| if shift button is pressed on entry, beep and hang around for an NMI.
+|
+.L18:
+	btst	#0,0x17b
+	beqs	.L31		| if not pressed
+	movw	#1,sp@-		| sysbeep, duration 1
+	.word	/A9C8
+	moveq	#1,d0
+.L22:
+	tstl	d0
+	bnes	.L22		| hang, waiting for NMI
+.L31:
+	movl	a5,_savea5
+	movw	doff2,doffset	| above code is once-only
+ 	moveml	sp@+,#0xffff
+|
+| driver entry points
+|
+dopen:
+	movl	#drvrOpen,d0
+	bras	call
+dclose:
+	movl	#drvrClose,d0
+	bras	call
+dctl:
+	movl	#drvrCtl,d0
+	bras	call
+dstatus:
+	movl	#drvrStatus,d0
+	bras	call
+dprime:
+	movl	#drvrPrime,d0
+call:
+	moveml	#0x3ffc,sp@-
+	movl	a1,sp@-
+	movl	a0,sp@-
+	movl	d0,a0
+	jsr	a0@
+	addql	#8,sp
+	moveml	sp@+,#0x3ffc
+	cmpl	#0x40000000,d0
+	bnes	done
+	clrl	d0
+	rts
+
+jiodone = 0x8fc
+done:
+	movl	jiodone,sp@-
+	rts
+
+doff2:	.word	dopen-drvr
+28336!Funky!Stuff!
+echo x - drvr/device.h
+cat > drvr/device.h << '28336!Funky!Stuff!'
+/*	device.h	1.0	07/21/84	*/
+
+/*
+ * Device driver definitions.
+ */
+
+/* 
+ * Copyright (C) 1984, Stanford Univ. SUMEX project.  
+ * May be used but not sold without permission.
+ */
+
+/*
+ * history
+ * 07/21/84	Croft	Created.
+ * 07/27/84	Schuster Added accessory status codes.
+ */
+
+/*
+ * Driver structure.  
+ */
+struct drvr {
+	short	drvrFlags;	/* flags */
+	short	drvrDelay;	/* ticks between actions */
+	short	drvrEMask;	/* desk accessory event mask */
+	short	drvrMenu;	/* menu ID */
+	short	drvrOpen;	/* offset to open routine */
+	short	drvrPrime;	/* ..		prime */
+	short	drvrCtl;	/* ..		control */
+	short	drvrStatus;	/* ..		status */
+	short	drvrClose;	/* ..		close */
+	char	drvrName[32];	/* driver name (pascal string) */
+};
+
+struct drvr drvr;		/* global instance of my drvr struct */
+
+/* flags in drvrFlags */
+#define	dReadEnable	0x100
+#define	dWritEnable	0x200
+#define	dCtlEnable	0x400
+#define	dStatEnable	0x800
+#define	dNeedGoodBye	0x1000
+#define	dNeedTime	0x2000
+#define	dNeedLock	0x4000
+#define	dOpened		0x20
+#define	dRAMBased	0x40
+#define	drvrActive	0x80
+
+/*
+ * Device control entry structure.
+ */
+struct dce {
+	Handle	dCtlDriver;	/* pointer/handle to driver */
+	short	dCtlFlags;
+	short	dCtlQueue;
+	Ptr	dCtlQHead;	/* 1st entry in IO queue */
+	Ptr	dCtlQTail;
+	long	dCtlPosition;	/* offset used by R/W calls */
+	Handle	dCtlStorage;	/* private storage */
+	short	dCtlRefNum;	/* driver's refnum */
+	long	dCtlCurTicks;	/* current tick count (kept by Device Mgr) */
+	WindowPtr dCtlWindow;	/* window record (if any) */
+	short	dCtlDelay;	/* ticks between actions */
+	short	dCtlEMask;	/* event mask (desk acc) */
+	short	dCtlMenu;	/* menu ID */
+};
+
+/*
+ * Commands in (low byte of) ioTrap.
+ */
+#define	aRdCmd	2
+#define	aWrCmd	3
+#define	aCtlCmd	4
+#define	aStsCmd	5
+
+/*
+ * Special return codes from driver entry points.
+ *
+ * A zero or negative return from the driver routines causes an IOdone,
+ * with the return status in D0.  The return values below (large 
+ * positive numbers) cause the indicated action.
+ */
+#define	IOrts 0x40000000
+#define	IOkill	IOrts
+#define	IOdone	0
+
+/*
+ * Control and status codes.
+ */
+#define	KillCode	1
+#define	EjectCode	7
+#define	DrvStsCode	8
+
+/*
+ * IO System Errors (should be in osintf.h)
+ */
+#define	ControlErr	-17
+#define	StatusErr	-18
+#define	ReadErr		-19
+#define	WritErr		-20
+#define	BadUnitErr	-21
+#define	UnitEmptyErr	-22
+#define	OpenErr		-23
+#define	ClosErr		-24
+#define	DRemovErr	-25
+#define	DInstErr	-26
+#define	AbortErr	-27
+#define	NotOpenErr	-28
+
+
+/*
+ * Control and Status codes for desk accessories.
+ */
+#define accEvent 64
+#define accRun 65
+#define accCursor 66
+#define accMenu 67
+#define accUndo 68
+#define accCut 70
+#define accCopy 71
+#define accPaste 72
+#define accClear 73
+28336!Funky!Stuff!
+echo x - drvr/rd.c
+cat > drvr/rd.c << '28336!Funky!Stuff!'
+/*
+ * MacIntosh RAM Disk Driver
+ * (c) Apple Computer 1983
+ * 
+ * This is the unofficial Mac ramdisk driver.  Most useful on 512K Macs
+ * Written in Dec '83 my MDB
+ * 
+ * Routines:
+ * 
+ *  Open   --  Zero the ram and create a  directory
+ * 
+ *  Prime  -- read and write calls.  Get correct info from read or write param
+ *            block, and get or put the bytes.  All calls are synchronous, since
+ *            ram doesn't have a lot of latency.
+ * 
+ *  Close  -- Not closable at present 
+ */
+
+/*
+ * history
+ * 12/xx/83	MDB	Created.
+ * 07/21/84	Croft	translated to C.
+ */
+
+#include "mac/quickdraw.h"
+#include "mac/osintf.h"
+#include "mac/toolintf.h"
+#include "device.h"
+
+/*
+ * for small mac, disk is kept in heap, so use bootconfig 
+ * to up sysheap from 16K to 24K;  sigh, but then MacPaint/MacTerm are too big.
+ */
+#define	myramSize 0x2000	/* 8K */
+
+#define	asize	512		/* allocation block size */
+#define	dblocks	5		/* 0,1=boot;2,3=mdb;4=fdir */
+#define	ablocks	myramSize/asize - dblocks
+
+struct DR {
+	char	drSigWord[2];		/* signature */
+	long	drCrDate;		/* creation date/time*/
+	long	drLsBkUp;		/* last backup */
+	short	drAtrb;			/* attributes */
+	short	drNmFls;		/* number of files in dir */
+	short	drDirSt;		/* 1st file directory block */
+	short	drBlLn;			/* length of file dir in blocks */
+	short	drNmAlBlks;		/* number of allocation blocks */
+	long	drAlBlkSiz;		/* alloc block size */
+	long	drClpSiz;		/* bytes to try to alloc as clump */
+	short	drAlBlSt;		/* 1st data block */
+	long	drNxtFNum;		/* next free file number */
+	short	drFreeBks;		/* number free blocks */
+	char	drVN[28];		/* volume name */
+};
+
+struct DR myDir = {
+	0xd2, 0xd7,			/* signature */
+	0,
+	0,
+	0,
+	0,
+	4,				/* 1st file dir block */
+	1,				/* # dir blocks */
+	ablocks,			/* # alloc blocks */
+	asize,				/* alloc block size */
+	asize,				/* clump size */
+	5,				/* 1st data block */
+	1,				/* next file # */
+	ablocks,			/* # free blocks */
+	"\07RamDisk"
+};
+
+Ptr	myramBase, NewPtrSys();
+
+
+
+/*
+ * driver Open.
+ */
+drvrOpen(pb,dce)
+	ioParam *pb;
+	struct dce *dce;
+{
+	if ((myramBase = NewPtrSys(myramSize)) == 0)
+		return (MFulErr);
+	bzero(myramBase,myramSize);
+	bcopy(&myDir,myramBase+1024,sizeof myDir);
+	return (IOrts);
+}
+
+
+/*
+ * driver Close.
+ */
+drvrClose(pb,dce)
+	ioParam *pb;
+	struct dce *dce;
+{
+	return (IOrts);
+}
+
+
+/*
+ * driver Prime.
+ */
+drvrPrime(pb,dce)
+	register ioParam *pb;
+	register struct dce *dce;
+{
+	register char *cp;
+	register count;
+
+	cp = myramBase + (dce->dCtlPosition & (~0x1ff)); /* truncate offset */
+	count = pb->ioActCount = pb->ioReqCount;
+	count = (count + 0x1ff) & (~0x1ff);	/* round to 512 mult */
+	switch (pb->ioTrap & 0xff) {
+
+	case aWrCmd:
+		bcopy(pb->ioBuffer, cp, count);
+		break;
+
+	case aRdCmd:
+		bcopy(cp, pb->ioBuffer, count);
+		break;
+	}
+	return (IOdone);
+}
+
+
+/*
+ * driver Control.
+ */
+drvrCtl(pb,dce)
+	register CntrlParam *pb;
+	register struct dce *dce;
+{
+	switch (pb->CSCode) {
+	case KillCode:
+		return (IOkill);
+
+	case EjectCode:
+	default:
+		return (ControlErr);
+	}
+}
+
+
+/*
+ * driver Status.
+ */
+drvrStatus(pb,dce)
+	register CntrlParam *pb;
+	register struct dce *dce;
+{
+	return (ControlErr);
+}
+28336!Funky!Stuff!
+echo x - drvr/rd.rc
+cat > drvr/rd.rc << '28336!Funky!Stuff!'
+rd.rsrc
+
+Type DRVR
+   b.out,31(64)
+28336!Funky!Stuff!
+echo x - drvr/rdinit.text
+cat > drvr/rdinit.text << '28336!Funky!Stuff!'
+; I'm lazy and hacked this together from some pieces on the workshop,
+; should convert to SUMacC...
+; File: rdInit.Text - init resource to bring in ramdisk driver at boot time
+
+            .NoList
+            .Include        Tlasm/SysEqu.Text
+            .Include        Tlasm/SysMacs.Text
+            .Include        Tlasm/SysErr.Text
+            .Include        Tlasm/ToolMacs.Text
+            .List
+            .NOMACROLIST
+            .Proc   rdInit,0
+
+rdInstall
+;            move.l  #$11000,BufPtr
+OpenIt
+            MOVEQ   #<IOQElSize/2>-1,D0
+@0          CLR.W   -(SP)               ; clear a parameter blk off the stack
+            DBRA    D0,@0
+;
+            clr.w   -(sp)
+            _button
+            tst.w   (sp)+
+            bne     initexit        ;if user wants to skip the ramdisk
+
+            MOVE.L  SP,A0
+
+            LEA     rdName,A1
+            MOVE.L  A1,IOFileName(A0)
+            _Open
+            BNE     InitExit
+
+            CLR.L   -(SP)
+            MOVE.L  #'DRVR',-(SP)
+
+            move.w  #31,-(sp)
+            _GetResource
+            _DetachResource
+;
+; add to drive queue
+;
+          MOVEQ     #DQElLnth,D0             ; get size of drive queue element
+          _NewPtr,SYS                        ;  and allocate one
+
+          MOVE.W    #0,DQFSID(A0)            ; zero means local file system
+
+          MOVEQ     #3,D0                    ; call it drive number 3
+          SWAP      D0
+          MOVE.W    #-32,D0          ;  my refnum
+          _AddDrive
+
+          LEA       Mparams,A0               ; point to params
+          _MountVol                          ; mount as a volume
+
+InitExit
+            ADD     #IOQElSize,SP
+            LEA     rdInstall,A0
+            _RecoverHandle
+            _DisposHandle
+            RTS
+
+rdName      .Byte   8
+            .Ascii  '.ramdisk '
+            .Align  2
+
+
+
+
+Mparams   .BLOCK          12,0                ; header
+          .WORD           0,0                 ; completion routine  (NIL)
+          .WORD           0                   ; ioresult
+          .WORD           0,0                 ; misc don't-cares
+          .WORD           3                   ; drive num
+
+          .end
+
+
+
+28336!Funky!Stuff!
+echo x - drvr/rdinitr.text
+cat > drvr/rdinitr.text << '28336!Funky!Stuff!'
+* ramstart resource definition file
+*
+*
+
+rdinit.Rsrc
+
+Type INIT = PACK
+
+   rdinit,3
+28336!Funky!Stuff!
+echo x - drvr/rdlib.s
+cat > drvr/rdlib.s << '28336!Funky!Stuff!'
+	.insrt	"../h/sysequ.h"
+	.insrt	"../h/toolmacs.h"
+
+	.text
+	.globl	NewPtrSys
+NewPtrSys:
+	movl	sp@(4),d0
+	.word	__newptr+_sys_
+	movl	a0,d0
+	rts
+
+	.globl	bcopy
+bcopy:
+	movl	sp@(4),a0
+	movl	sp@(8),a1
+	movl	sp@(12),d0
+	subql	#1,d0
+.L1:
+	movb	a0@+,a1@+
+	dbra	d0,.L1
+	rts
+
+	.globl	bzero
+bzero:
+	movl	sp@(4),a0
+	movl	sp@(8),d0
+	subql	#1,d0
+.L2:
+	clrb	a0@+
+	dbra	d0,.L2
+	rts
+28336!Funky!Stuff!
+
+-- 
+
+<*> Fred Hirsch <*> AT&T Bell Laboratories <*> ihnp4!bentley!fjh <*>
+
+

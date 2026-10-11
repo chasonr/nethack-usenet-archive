@@ -1,0 +1,511 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,9969f90b4497d39c,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1983-11-07 10:38:39 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!linus!philabs!seismo!harpo!floyd!clyde!akgua!sb1!mb2c!jed
+From: jed@mb2c.UUCP (John E. Duncan III)
+Newsgroups: net.sources
+Subject: 'dir.c' for APPLE AZTEC 'C' system
+Message-ID: <185@mb2c.UUCP>
+Date: Mon, 7-Nov-83 13:38:39 EST
+Article-I.D.: mb2c.185
+Posted: Mon Nov  7 13:38:39 1983
+Date-Received: Wed, 9-Nov-83 00:32:08 EST
+Lines: 493
+
+/* dir
+ *	This program runs on the AZTEC APPLE 'C' system.  It looks at the
+ * diskette VTOC to determine how many free tracks there are
+ * on the current diskette (er...directory).  It will then print
+ * out a sorted list of files (in default 2 column format with 80
+ * column screen).  If an optional mask or masks are specified, they
+ * will be used to limit the search on the specified diskette.
+ *
+ *	OPTIONS:
+ *		-l	Long listing, like CATALOG but print total/free secs too
+ *		-dn	Drive to search (default slot)
+ *		-sn Use slot 'n' instead of default slot
+ *		-1	Use single column format (automatic if not 80 column screen)
+ *		-p  DON'T pause at the end of each screen (auto if not to screen)
+ */
+#include <kbctl.h>
+
+#define LINES 21
+#define STDIN 0
+#define STDOUT 1
+#define STDERR 2
+
+/* Default DOS Value locations */
+
+#define DRIVE	0xB7F8	/* Last drive accessed */
+#define SLOT	0xB7F7	/* Last slot accessed */
+#define VTRACK	17		/* VTOC Track */
+#define VSEC	0		/* VTOC Map Sector */
+
+/* RWTS Definitions */
+
+#define SEEK 0
+#define READ 1
+#define WRITE 2
+#define FORMAT 4
+
+struct vtoc {
+	char xvtoc1;			/* 00    not used */
+	char ctrack1;		/* 01    Track number of first catalog sector */
+	char csec1;			/* 02    Sector number of first catalog sector */
+	char release;		/* 03    Release number of DOS used to INIT disk */
+	char xvtoc2[2];			/* 04-05 not used */
+	char volume;		/* 06    Diskette volume number */
+	char xvtoc3[32];		/* 07-26 not used */
+	char tsec;			/* Max. t/s pairs which fit in 1 file t/s list sec */
+	char xvtoc4[8];			/* 28-2F not used */
+	char ltrack;		/* 30    Last track where sectors were allocated */
+	char whichway;		/* 31    Direction of track allocation +1 or -1 */
+	char xvtoc5[2];			/* 32-33 not used */
+	char tpd;			/* 34    Tracks per diskette */
+	char spt;			/* 35	 Sectors per track */
+	int bps;			/* 36-37 Bytes per sector */
+	struct bitmap {
+		char tmap[4];	/*       Bit map of track */
+	} bmap [50];        /* Bit maps */
+};
+
+struct catalog {
+	char xxcat1;			/* 00    not used */
+	char tnext;			/* 01    Track number of next catalog sector */
+	char snext;			/* 02    Sector number of next catalog sector */
+	char xxcat2[8];			/* 03-0A not used */
+	struct fdesc {		/* File Descriptions */
+		char ts_t;			/* 00    Track of first t/s list, FF if none */
+		char ts_s;				/* 01    Sector of above track */
+		char ftype;				/* 02    File type, hi bit = locked */
+#define		TEXT 0x80				/* TEXT file */
+#define		INT  0x81				/* INTEGER BASIC file */
+#define		FP	 0x82               /* APPLESOFT BASIC file */
+#define		BIN	 0x84				/* BINARY file */
+#define		STYP 0x88				/* S type file */
+#define		REL	 0x90				/* RELOCATABLE object module file */
+#define		ATYP 0xA0				/* A type file */
+#define		BTYP 0xC0				/* B type file */
+		char fname[30];			/* 03-20 File name */
+		unsigned flen;				/* lo byte of file len is OK */
+	} fd [7];
+};
+static char tcode[] = {
+	TEXT, 'T',
+	INT,  'I',
+	FP,   'A',
+	BIN,  'B',
+	STYP, 'S',
+	REL,  'R',
+	ATYP, 'a',
+	BTYP, 'b',
+	0 };
+static struct dir {
+	char *fname;
+	unsigned flen;
+	char ftype;
+} dlist[200];	/* Pointers to entries */
+static int dcnt;			/* How many entries were found */
+static char drdef;			/* 0=use current drive, 1=use argument */
+static char sldef;			/* 0=use current slot, 1=use argument */
+static int dtot;			/* How many entries in total */
+static char drive, slot;
+static int dir_t1;			/* First directory track */
+static int dir_s1;			/* First directory sector */
+static int free_secs;		/* Free Sectors on diskette */
+static char lflag;			/* Long Listing flag */
+static int lcnt;			/* Lines on screen so far */
+static char oneflag;		/* 0=2 column, 1=1 column */
+static char pflag;			/* Pause after each screen */
+static long int bps;		/* Bytes per sector */
+static char spaces[41] =
+	"                                        ";
+static int spt;				/* Sectors per track */
+static int tpd;				/* Tracks per disk */
+static int vol;				/* Volume number */
+static char **mask;			/* Pointer to first mask */
+static int maskc;			/* Count of masks */
+static char lbuf[100];		/* Buffer for line output */
+
+main( argc, argv )
+	int argc;
+	char *argv[];
+{
+	register int i,j;
+	register char *targ;
+	register char ch;
+
+	/* Initialize here so we can 'run' it again if desired */
+
+	dcnt = -1;
+	lflag = oneflag = dtot = drdef = sldef = 0;
+	pflag = 1;
+
+	while( --argc ) {
+		if( **++argv != '-' ) break;
+		targ = *argv;
+		while(ch = *(++targ)) {
+			switch( ch ) {
+			case 'd':			/* which drive */
+				++targ;
+				if( *targ > '0' && *targ < '3') {
+					drive = *targ - '0';
+					drdef = 1;
+					break;
+				}
+				else {
+					errmesg( "dir: Drive number must be 1 or 2\n" );
+					exit( 1 );
+				}
+			case 'l':			/* long listing */
+				++lflag;
+			case '1':			/* single column listing */
+				oneflag = 1;
+				break;
+			case 'p':
+				pflag = 0;
+				break;
+			case 's':			/* which slot */
+				++targ;
+				if( *targ > '0' && *targ < '8') {
+					slot = *targ - '0';
+					sldef = 1;
+					break;
+				}
+				else {
+					errmesg( "dir: Slot number must be 1-7\n" );
+					exit( 1 );
+				}
+			default:
+				strcpy( lbuf, "Unknown flag -X\n" );
+				lbuf[14] = *targ;
+				errmesg( lbuf );
+				errmesg("Usage: dir [-1lp] [-sn] [-dn] [mask1] [mask2] ...\n");
+				exit( 1 );
+			}
+			if( ! *targ ) break;
+		}
+	}
+	maskc = argc;
+	mask = argv;
+
+	/* If we're not dealing with output to the terminal, turn off the pause */
+
+	i = ioctl( 1, KB_WID, 0);
+	if( i < 0 )		/* not the screen, turn off pauses */
+		pflag = 0;
+	if( i < 80 )	/* turn off double column mode */
+		oneflag = 1;
+
+	/* If no drive or slot was specified, we have to figure out which
+	 * one is wanted.  This is not easy since there is no system call
+	 * to find out the current slot and drive, so we just try to open
+	 * for reading a file with a ridiculous name and when it fails, we
+	 * take a peek into DOS to see which drive/slot it used.  It also
+	 * has the side effect of positioning the head to the VTOC, but
+	 * its a small consolation for all of the hassle.
+	 */
+
+	if( drdef == 0 || sldef == 0 ) {		/* here we go */
+		open( "$$unlikely @@", 0 );
+		if( drdef == 0 ) drive = *DRIVE;
+		if( sldef == 0 ) {
+			slot = *SLOT;
+			slot >>= 4;
+		}
+	}
+
+	/* Convert all masks to upper case since supposedly the only file
+     * names that will be encountered will be in upper case.
+     */
+
+	while( argc ) {
+		targ = *argv;
+		while( *targ ) {
+			*targ = toupper(*targ);
+			++targ;
+		}
+		--argc; ++argv;
+	}
+	getvtoc();
+	getnames();
+	if( lflag ) header();
+	else lcnt = 0;
+	if( dcnt == -1 ) exit( 3 );
+	sortnames();
+	output();
+}
+
+
+/* getvtoc()
+ *   Get the VTOC sector from the current drive, or the drive specified
+ * on the command line.  If the '-t' or '-l' flags are set, print out
+ * statistics on total sectors and available sectors.
+ */
+getvtoc()
+{
+	struct vtoc buf;
+	register int cmap;
+	register char *mptr, *mend;
+	register int fs = 0;
+	static int rc;
+
+	if ( rc=rwts( VTRACK, VSEC, &buf, READ, slot, drive, 0) )
+		vtocerr( VTRACK, VSEC, rc );
+	if ( buf.bps < 128 ) buf.bps = 256;		/* sanity patch */
+	bps = buf.bps;
+	dir_t1 = buf.ctrack1;
+	dir_s1 = buf.csec1;
+	tpd = buf.tpd;
+	spt = buf.spt;
+	vol = buf.volume;
+
+	/* we have the map in memory, interpret it */
+
+	mend = buf.bmap;
+	mend += tpd << 2;		/* multiply by 4 the fast way */
+	for( mptr=buf.bmap; mptr<mend; ++mptr ) {
+		cmap = *mptr;
+		while( cmap ) {
+			if( cmap & 1 ) ++fs;
+			cmap >>= 1;
+		}
+	}
+	free_secs = fs;
+}
+
+
+/* getnames()
+ *	 Search the directory and pick out all file names found.  Allocate
+ * memory to hold the names and set up the array to point to them. 
+ * Check the masks given before accepting an entry.
+ */
+getnames()
+{
+	register int ctrack, csec;		/* Current track and sector */
+	register int i,j, mcnt;
+	register char  *sptr, *tptr, **fmask;	/* Temporary pointers */
+	int ttype, tlen;				/* temporaries */
+	struct catalog dbuf;			/* Space for directory block */
+	int rc;
+
+	ctrack = dir_t1;
+	csec = dir_s1;
+
+	while( ctrack ) {
+		if ( rc=rwts( ctrack, csec, &dbuf, READ, slot, drive, 0) )
+			vtocerr( ctrack, csec, rc );
+		for( i=0; i<7; i++ ) {
+			j = dbuf.fd[i].ts_t;
+			if( j == 0 ) return;	/* virgin entry, done with VTOC */
+			if( j != 0xFF ) {		/* its a good entry */
+
+				/* Save file length before we maybe clobber with NULL */
+
+				++dtot;
+				tlen = dbuf.fd[i].flen;
+				ttype = dbuf.fd[i].ftype;
+
+				/* Convert buffer to NULL terminated format */
+
+				sptr = dbuf.fd[i].fname;
+				for( tptr = sptr + 29; *tptr == 0xA0; tptr-- );
+				*(++tptr) = 0;
+
+				/* Turn off all hi bits */
+
+				for( tptr=sptr; *tptr; tptr++ ) *tptr &= 0x7F;
+
+				/* Check filename against all masks to see if we want it */
+
+				if( maskc == 0 ) goto gotone;
+				mcnt = maskc;
+				fmask = mask;
+				while( mcnt-- ) {
+					if( match( *fmask, sptr )) goto gotone;
+					++fmask;
+				}
+				continue;
+
+				/* we want it, save everything */
+
+		gotone:
+				dlist[++dcnt].ftype = ttype;
+				dlist[dcnt].flen = tlen;
+				if( !(tptr = malloc( tptr - sptr + 1))) {
+					errmesg( "dir: Out of memory\n" );
+					exit( 2 );
+				}
+				strcpy( tptr, sptr );
+				dlist[dcnt].fname = tptr;
+			}
+		}
+		ctrack = dbuf.tnext;
+		csec = dbuf.snext;
+	}
+}
+
+/* sortnames
+ *		Just a little bubble sort since this won't take too long anyway.
+ */
+sortnames()
+{
+	register int i, j;
+	struct dir tmp;
+
+	for( i=0; i<dcnt; i++ ) {
+		for( j=i+1; j<=dcnt; j++ ) {
+			if( strcmp( dlist[i].fname, dlist[j].fname ) > 0 ) {
+				tmp = dlist[i];
+				dlist[i] = dlist[j];
+				dlist[j] = tmp;
+			}
+		}
+	}
+}
+
+/* output()
+ *		Print out the file names found.
+ */
+output()
+{
+	register int i, j;
+	register char *tptr, *bptr, ch;
+
+	for( i=0; i<=dcnt; i++) {
+		bptr = lbuf;
+		if( lflag ) {
+			ch = dlist[i].ftype;
+			*lbuf = (ch & 0x80) ? '*' : ' ' ;
+			lbuf[1] = '?';
+			if( tptr = index( tcode, ch | 0x80))	lbuf[1] = *++tptr;
+			sprintf( lbuf+2, " %6ld ", bps * (long int) dlist[i].flen );
+			bptr = lbuf + 10;
+		}
+		for( tptr = dlist[i].fname; ; tptr++ ) {
+			if( *tptr < 0x20 ) {
+				if( *tptr == 0 ) break;
+				*bptr++ = '^';
+				*bptr = *tptr | 0x40;
+			}
+			else
+				*bptr = *tptr;
+			++bptr;
+		}
+		if( ((i & 1) == 0) && (oneflag == 0) && ((j = bptr - lbuf) < 40)) {
+			strcpy( bptr, spaces + j );
+			bptr = lbuf + 40;
+		}
+		else {
+			*bptr++ = '\n';
+			*bptr = 0;
+			++lcnt;
+		}
+		write( STDOUT, lbuf, bptr - lbuf );
+		if( pflag && (lcnt > LINES) ) {
+			mesg( "\n(more...)" );
+			read( STDIN, lbuf, 1 );
+			mesg( "\n" );
+			lcnt = 0;
+		}
+	}
+	if( ((i & 1) == 1) && (oneflag == 0)) mesg("\n");
+}
+
+
+/* match
+ *		This routine will match a pattern 'mask' against a string 'str'.
+ * The pattern may consist of any characters plus the meta-characters
+ * '?' (match any one character), '*' (match any number of characters),
+ * [...] (match any character in the class).  Return 0 for fail, 1 for match.
+ */
+match( mask, str )
+	register char *mask;
+	register char *str;
+{
+	register char flush;
+
+	while( *mask ) {
+		if( ! *str ) return( 0 );
+		switch( *mask ) {
+		case '*':
+			if( *(++mask) == 0 ) return( 1 );		/* trailing '*' match */
+			while( *str ) {
+				if( match( mask, str )) return( 1 );
+				++str;
+			}
+			return( 0 );
+		case '[':			/* character class */
+			++mask;
+			flush = 0;
+			while( *mask && (*mask != ']') ) {
+				if( !flush )
+					if( (*mask == *str) ||
+						(( *mask == '-' ) &&
+							 (*(mask-1) <= *str) && (*(mask+1) >= *str)))
+						flush = 1;
+				++mask;
+			}
+			if( (! *mask) || (! flush) ) return( 0 );
+		case '?':			/* match any single character */
+			goto bump;
+		case '\\':			/* quote the single character */
+			++mask;
+		}
+		if( *mask != *str ) return( 0 );
+bump:
+		++mask;
+		++str;
+	}
+	if( *str ) return( 0 );		/* str has chars unmatched, no good */
+	return( 1 );
+}
+
+/* mesg
+ *	write out a message to STDOUT.
+ */
+mesg( str )
+	char *str;
+{
+	write( STDOUT, str, strlen( str ) );
+}
+
+/* errmesg
+ *	write out a message to STDERR
+ */
+errmesg( str )
+	char *str;
+{
+	write( STDERR, str, strlen( str ) );
+}
+
+/* vtocerr
+ *	Print out the error indicating where the error occurred and exit
+ */
+vtocerr( vtrack, vsec, vrc )
+	int vtrack, vsec, vrc;
+{
+	sprintf( lbuf,
+		 "I/O error on VTOC, slot %d, drive %d, track %d, sector %d, rc=%d\n",
+		slot, drive, vtrack, vsec, 0 - vrc );
+	errmesg( lbuf );
+	exit( 1 );
+}
+
+/* header
+ *		Print out the header message if this is a long listing.
+ */
+header()
+{
+	sprintf( lbuf, "Slot %d, Drive %d, Volume %d:  %d files\n",
+		slot, drive, vol, dtot );
+	mesg( lbuf );
+	sprintf( lbuf, "Total sectors: %d, free: %d = %ldK\n",
+		tpd * spt, free_secs, ((long) free_secs * bps)/1024 );
+	mesg( lbuf );
+	lcnt = 2;
+}
+
+

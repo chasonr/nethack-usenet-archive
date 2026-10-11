@@ -1,0 +1,1831 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 110267,32036abbb95c053d,start
+X-Google-Attributes: gid110267,public
+X-Google-ArrivalTime: 1988-01-18 09:06:16 PST
+Path: utzoo!utgpu!water!watmath!clyde!cbosgd!ucbvax!pasteur!ames!lll-lcc!lll-winken!uunet!tektronix!tekgen!tekred!games-request
+From: games-request@tekred.TEK.COM
+Newsgroups: comp.sources.games
+Subject: v03i043:  xchess - chess display program using X windows, Part02/06
+Message-ID: <2059@tekred.TEK.COM>
+Date: 18 Jan 88 17:06:16 GMT
+Sender: billr@tekred.TEK.COM
+Lines: 1814
+Approved: billr@tekred.TEK.COM
+
+Submitted by: faustus@ic.berkeley.edu (Wayne A. Christopher)
+Comp.sources.games: Volume 3, Issue 43
+Archive-name: xchess/Part02
+
+#! /bin/sh
+
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 2 (of 6)."
+# Contents:  scrollText/scrollText.c xchess.cur
+# Wrapped by billr@tekred on Mon Jan 18 08:48:07 1988
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f scrollText/scrollText.c -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"scrollText/scrollText.c\"
+else
+echo shar: Extracting \"scrollText/scrollText.c\" \(55874 characters\)
+sed "s/^X//" >scrollText/scrollText.c <<'END_OF_scrollText/scrollText.c'
+X/*
+X * A Scrollable Text Output Window
+X *
+X * David Harrison 
+X * University of California,  Berkeley
+X * 1986
+X *
+X * The following is an implementation for a scrollable text output
+X * system.  It handles exposure events only (other interactions are
+X * under user control).  For scrolling,  a always present scroll bar
+X * is implemented.  It detects size changes and compensates accordingly.
+X */
+X
+X#include <X/Xlib.h>
+X#include "scrollText.h"
+X
+Xextern char *malloc();
+Xextern char *realloc();
+X#define alloc(type)		(type *) malloc(sizeof(type))
+X#define numalloc(type, num)	(type *) malloc((unsigned) (num * sizeof(type)))
+X#define MAXINT		2147483647
+X
+Xextern XAssocTable *XCreateAssocTable();
+Xextern caddr_t XLookUpAssoc();
+X
+Xstatic XAssocTable *textWindows = (XAssocTable *) 0;
+X
+X#define NOOPTION	-1	/* Option hasn't been set yet                */
+X#define NORMSCROLL	0	/* Smooth scroll on LineToTop and TopToHere  */
+X#define JUMPSCROLL	1	/* Jump scrolling on LineToTop and TopToHere */
+X
+Xstatic int ScrollOption = NOOPTION;
+X
+Xtypedef char *Generic;
+X
+X#define BARSIZE		15
+X#define BARBORDER	1
+X#define MAXFONTS	8
+X#define INITBUFSIZE	1024
+X#define INITLINES	50
+X#define INITEXPARY	50
+X#define XPADDING	2
+X#define YPADDING	2
+X#define INTERLINE	1
+X#define INTERSPACE	1
+X#define CURSORWIDTH	2
+X#define EXPANDPERCENT	40
+X#define BUFSIZE		1024
+X#define CUROFFSET	1
+X#define MAXFOREIGN	250
+X#define NOINDEX		-1
+X
+X/* The wrap line indicator */
+X#define WRAPINDSIZE	7
+X#define STEMOFFSET	5
+X#define arrow_width 7
+X#define arrow_height 5
+Xstatic short arrow_bits[] = {
+X   0x0024, 0x0026, 0x003f, 0x0006,
+X   0x0004};
+Xstatic Pixmap arrowMap;
+X
+X#define NEWLINE		'\n'
+X#define BACKSPACE	'\010'
+X#define NEWFONT		'\006'
+X#define LOWCHAR		'\040'
+X#define HIGHCHAR	'\176'
+X
+X#define CHARMASK	0x00ff	/* Character mask */
+X#define FONTMASK	0x0700	/* Character font */
+X#define FONTSHIFT	8	/* Shift amount   */
+X
+X#define WRAPFLAG	0x01	/* Line wrap flag */
+X
+X/*
+X * Lines are represented by a pointer into the overall array of
+X * 16-bit characters.  The lower eight bits is used to indicate the character
+X * (in ASCII),  and the next two bits are used to indicate the font
+X * the character should be drawn in.
+X */
+X
+Xtypedef struct txtLine {
+X    int lineLength;		/* Current line length               */
+X    int lineHeight;		/* Full height of line in pixels     */
+X    int lineBaseLine;		/* Current baseline of the line      */
+X    int lineWidth;		/* Drawing position at end of line   */
+X    int lineText;		/* Offset into master buffer         */
+X    int lineFlags;		/* Line wrap flag is here            */
+X};
+X
+X
+X/*
+X * For ExposeCopy events,  we queue up the redraw requests collapsing
+X * them into line redraw requests until the CopyExpose event arrives.
+X * The queue is represented as a dynamic array of the following
+X * structure:
+X */
+X
+Xtypedef struct expEvent {
+X    int lineIndex;		/* Index of line to redraw  */
+X    int ypos;			/* Drawing position of line */
+X};
+X
+X
+X/*
+X * The text buffer is represented using a dynamic counted array
+X * of 16-bit quantities. This array expands as needed.
+X * For the screen representation,  a dynamic counted array
+X * of line structures is used.  This array points into the
+X * text buffer to denote the start of each line and its parameters.
+X * The windows are configured as one overall window which contains
+X * the scroll bar as a sub-window along its right edge.  Thus,
+X * the text drawing space is actually w-BARSIZE.
+X */
+X
+X#define NOTATBOTTOM	0x01	/* Need to scroll to bottom before appending */
+X#define FONTNUMWAIT	0x02	/* Waiting for font number                   */
+X#define COPYEXPOSE	0x04	/* Need to process a copy expose event       */
+X#define SCREENWRONG	0x08	/* TxtJamStr has invalidated screen contents */
+X
+Xtypedef struct txtWin {
+X    /* Basic text buffer */
+X    int bufAlloc;		/* Allocated size of buffer           */
+X    int bufSpot;		/* Current writing position in buffer */
+X    short *mainBuffer;		/* Main buffer of text                */
+X
+X    /* Line information */
+X    int numLines;		/* Number of display lines in buffer */
+X    int allocLines;		/* Number of lines allocated 	     */
+X    struct txtLine **txtBuffer;	/* Dynamic array of lines    	     */
+X
+X    /* Current Window display information */
+X    Window mainWindow;		/* Text display window       */
+X    Window scrollBar;		/* Subwindow for scroll bar  */
+X    int bgPix, fgPix, curPix;	/* Background and cursor     */
+X    FontInfo theFonts[MAXFONTS];/* Display fonts             */
+X    int theColors[MAXFONTS];	/* Display colors            */
+X    int curFont;		/* Which font is in use      */
+X    int curColor;		/* Current drawing color     */
+X    int w, h;			/* Current size              */
+X    int startLine;		/* Top line in display       */
+X    int endLine;		/* Bottom line in display    */
+X    int bottomSpace;		/* Space at bottom of screen */
+X    int flagWord;		/* If non-zero,  not at end  */
+X
+X    /* For handling ExposeCopy events */
+X    int exposeSize;		/* Current size of array      */
+X    int exposeAlloc;		/* Allocated size             */
+X    struct expEvent **exposeAry;/* Array of line indices      */
+X
+X    /* Drawing position information */
+X    int curLine;		/* Current line in buffer    */
+X    int curY;			/* Current vertical drawing  */
+X};
+X
+X/* Flags for the various basic character handling functions */
+X
+X#define DODISP		0x01	/* Update the display  */
+X#define NONEWLINE	0x02	/* Dont append newline */
+X
+X
+Xstatic int FindBaseLine(someFont)
+XFontInfo *someFont;
+X/*
+X * Due to inconsistencies in the font information,  the baseline
+X * must be computed for each new font.  The baseline here is
+X * defined as the number of pixels from the bottom of the font
+X * to the bottom of a non-decending character.  Some fonts the
+X * original baseline info is opposite this (from the top down).
+X * For certain well known fonts,  a table is used.
+X */
+X{
+X    if (someFont->baseline == 0) {
+X	if ((someFont->height == 10) || (someFont->height == 13))
+X	  return 2;
+X	if (someFont->height == 15)
+X	  return 3;
+X    }
+X    if (someFont->baseline > someFont->height / 2)
+X      return someFont->height - someFont->baseline;
+X    else return someFont->baseline;
+X}
+X
+X
+X
+Xstatic int InitLine(newLine)
+Xstruct txtLine *newLine;	/* Newly created line structure */
+X/*
+X * This routine initializes a newly created line structure.
+X */
+X{
+X    newLine->lineLength = 0;
+X    newLine->lineHeight = 0;
+X    newLine->lineBaseLine = 0;
+X    newLine->lineWidth = XPADDING;
+X    newLine->lineText = NOINDEX;
+X    newLine->lineFlags = 0;
+X    return 1;
+X}
+X
+X
+X
+X
+Xint TxtGrab(txtWin, program, mainFont, bg, fg, cur)
+XWindow txtWin;			/* Window to take over as scrollable text    */
+Xchar *program;			/* Program name for Xdefaults                */
+XFontInfo *mainFont;		/* Primary text font                         */
+Xint bg, fg, cur;		/* Background, foreground, and cursor colors */
+X/*
+X * This routine takes control of 'txtWin' and makes it into a scrollable
+X * text output window.  It will create a sub-window for the scroll bar
+X * with a background of 'bg' and an bar with color 'fg'.  Both fixed width
+X * and variable width fonts are supported.  Additional fonts can be loaded
+X * using 'TxtAddFont'.  Returns 0 if there were problems,  non-zero if
+X * everything went ok.
+X */
+X{
+X    struct txtWin *newWin;	/* Text package specific information */
+X    WindowInfo winInfo;		/* Window information                */
+X    Pixmap bdrMap, bgndMap;
+X    Bitmap arrowBM, scrollBM;
+X    int index;
+X    
+X    if (textWindows == (XAssocTable *) 0) {
+X	textWindows = XCreateAssocTable(32);
+X	if (textWindows == (XAssocTable *) 0) return(0);
+X    }
+X    if (XQueryWindow(txtWin, &winInfo) == 0) return 0;
+X
+X    if (ScrollOption == NOOPTION) {
+X	/* Read to see if the user wants jump scrolling or not */
+X	if (XGetDefault(program, "JumpScroll")) {
+X	    ScrollOption = JUMPSCROLL;
+X	} else {
+X	    ScrollOption = NORMSCROLL;
+X	}
+X    }
+X
+X    /* Initialize arrow pixmap */
+X    arrowBM = XStoreBitmap(arrow_width, arrow_height, arrow_bits);
+X    arrowMap = XMakePixmap(arrowBM, fg, bg);
+X    XFreeBitmap(arrowBM);
+X
+X    /* Initialize local structure */
+X    newWin = alloc(struct txtWin);
+X    newWin->bufAlloc = INITBUFSIZE;
+X    newWin->bufSpot = 0;
+X    newWin->mainBuffer = numalloc(short, INITBUFSIZE);
+X
+X    newWin->numLines = 1;
+X    newWin->allocLines = INITLINES;
+X    newWin->txtBuffer = numalloc(struct txtLine *, INITLINES);
+X    for (index = 0;  index < INITLINES;  index++) {
+X	newWin->txtBuffer[index] = alloc(struct txtLine);
+X	InitLine(newWin->txtBuffer[index]);
+X    }
+X
+X    /* Window display information */
+X    newWin->mainWindow = txtWin;
+X    newWin->w = winInfo.width;
+X    newWin->h = winInfo.height;
+X    newWin->startLine = 0;
+X    newWin->endLine = 0;
+X    newWin->bottomSpace = winInfo.height
+X      - YPADDING - mainFont->height - INTERLINE;
+X    newWin->flagWord = 0;
+X    newWin->bgPix = bg;
+X    newWin->fgPix = fg;
+X    newWin->curPix = cur;
+X
+X    /* Scroll Bar Creation */
+X    bdrMap = XMakeTile(fg);
+X    bgndMap = XMakeTile(bg);
+X    newWin->scrollBar = XCreateWindow(txtWin,
+X				      winInfo.width - BARSIZE,
+X				      0, BARSIZE - (2*BARBORDER),
+X				      winInfo.height - (2*BARBORDER), BARBORDER,
+X				      bdrMap, bgndMap);
+X    XSelectInput(newWin->scrollBar, ExposeWindow|ButtonReleased);
+X    XMapWindow(newWin->scrollBar);
+X    XFreePixmap(bdrMap);
+X    XFreePixmap(bgndMap);
+X
+X    /* Font and Color Initialization */
+X    newWin->theFonts[0] = *mainFont;
+X    newWin->theFonts[0].baseline = FindBaseLine(mainFont);
+X    newWin->theColors[0] = fg;
+X    for (index = 1;  index < MAXFONTS;  index++) {
+X	newWin->theFonts[index].id = 0;
+X	newWin->theColors[index] = TXT_NO_COLOR;
+X    }
+X    newWin->curFont = 0;
+X
+X    /* Initialize size of first line */
+X    newWin->txtBuffer[0]->lineHeight = newWin->theFonts[0].height;
+X    newWin->txtBuffer[0]->lineBaseLine = newWin->theFonts[0].baseline;
+X    newWin->txtBuffer[0]->lineText = 0;
+X
+X    /* ExposeCopy array initialization */
+X    newWin->exposeSize = 0;
+X    newWin->exposeAlloc = INITEXPARY;
+X    newWin->exposeAry = numalloc(struct expEvent *, INITEXPARY);
+X    for (index = 0;  index < newWin->exposeAlloc;  index++)
+X      newWin->exposeAry[index] = alloc(struct expEvent);
+X    /* Put plus infinity in last slot for sorting purposes */
+X    newWin->exposeAry[0]->lineIndex = MAXINT;
+X
+X    /* Drawing Position Information */
+X    newWin->curLine = 0;
+X    newWin->curY = YPADDING;
+X
+X    /* Attach it to both windows */
+X    XMakeAssoc(textWindows, (XId) txtWin, (caddr_t) newWin);
+X    XMakeAssoc(textWindows, (XId) newWin->scrollBar, (caddr_t) newWin);
+X    return 1;
+X}
+X
+X
+Xint TxtRelease(w)
+XWindow w;			/* Window to release */
+X/*
+X * This routine releases all resources associated with the
+X * specified window which are consumed by the text
+X * window package. This includes the entire text buffer,  line start
+X * array,  and the scroll bar window.  However,  the window
+X * itself is NOT destroyed.  The routine will return zero if
+X * the window is not owned by the text window package.
+X */
+X{
+X    struct txtWin *textInfo;
+X    int index;
+X
+X    if ((textInfo = (struct txtWin *) XLookUpAssoc(textWindows, (XId) w)) == 0)
+X      return 0;
+X
+X    free((Generic) textInfo->mainBuffer);
+X    for (index = 0;  index < textInfo->numLines;  index++) {
+X	free((Generic) textInfo->txtBuffer[index]);
+X    }
+X    free((Generic) textInfo->txtBuffer);
+X    XDestroyWindow(textInfo->scrollBar);
+X    for (index = 0;  index < textInfo->exposeSize;  index++) {
+X	free((Generic) textInfo->exposeAry[index]);
+X    }
+X    free((Generic) textInfo->exposeAry);
+X    XDeleteAssoc(textWindows, (XId) w);
+X    free((Generic) textInfo);
+X    return 1;
+X}
+X
+X
+X
+Xstatic int RecompBuffer(textInfo)
+Xstruct txtWin *textInfo;	/* Text window information */
+X/*
+X * This routine recomputes all line breaks in a buffer after
+X * a change in window size or font.  This is done by throwing
+X * away the old line start array and recomputing it.  Although
+X * a lot of this work is also done elsewhere,  it has been included
+X * inline here for efficiency.
+X */
+X{
+X    int startPos, endSize, linenum;
+X    register int index, chsize, curfont;
+X    register short *bufptr;
+X    register FontInfo *fontptr;
+X    register struct txtLine *lineptr;
+X
+X    /* Record the old position so we can come back to it */
+X    for (startPos = textInfo->txtBuffer[textInfo->startLine]->lineText;
+X	 (startPos > 0) && (textInfo->mainBuffer[startPos] != '\n');
+X	 startPos--)
+X      /* null loop body */;
+X    
+X    /* Clear out the old line start array */
+X    for (index = 0;  index < textInfo->numLines;  index++) {
+X	InitLine(textInfo->txtBuffer[index]);
+X    }
+X
+X    /* Initialize first line */
+X    textInfo->txtBuffer[0]->lineHeight = textInfo->theFonts[0].height;
+X    textInfo->txtBuffer[0]->lineBaseLine = textInfo->theFonts[0].baseline;
+X    textInfo->txtBuffer[0]->lineText = 0;
+X
+X    /* Process the text back into lines */
+X    endSize = textInfo->w - BARSIZE - WRAPINDSIZE;
+X    bufptr = textInfo->mainBuffer;
+X    lineptr = textInfo->txtBuffer[0];
+X    linenum = 0;
+X    fontptr = &(textInfo->theFonts[0]);
+X    curfont = 0;
+X    for (index = 0;  index < textInfo->bufSpot;  index++) {
+X	if ((bufptr[index] & FONTMASK) != curfont) {
+X	    int newFontNum, heightDiff, baseDiff;
+X
+X	    /* Switch fonts */
+X	    newFontNum = (bufptr[index] & FONTMASK) >> FONTSHIFT;
+X	    if (textInfo->theFonts[newFontNum].id != 0) {
+X		/* Valid font */
+X		curfont = bufptr[index] & FONTMASK;
+X		fontptr = &(textInfo->theFonts[newFontNum]);
+X		heightDiff = (fontptr->height - fontptr->baseline) -
+X		  (lineptr->lineHeight - lineptr->lineBaseLine);
+X		if (heightDiff < 0) heightDiff = 0;
+X		baseDiff = fontptr->baseline - lineptr->lineBaseLine;
+X		if (baseDiff > 0) {
+X		    heightDiff += baseDiff;
+X		    lineptr->lineBaseLine += baseDiff;
+X		}
+X		lineptr->lineHeight += heightDiff;
+X	    }
+X	}
+X	if ((bufptr[index] & CHARMASK) == '\n') {
+X	    /* Handle new line */
+X	    if (linenum >= textInfo->allocLines-1)
+X	      /* Expand number of lines */
+X	      ExpandLines(textInfo);
+X	    linenum++;
+X	    lineptr = textInfo->txtBuffer[linenum];
+X	    /* Initialize next line */
+X	    lineptr->lineHeight = fontptr->height;
+X	    lineptr->lineBaseLine = fontptr->baseline;
+X	    lineptr->lineText = index+1;
+X	    /* Check to see if its the starting line */
+X	    if (index == startPos) textInfo->startLine = linenum;
+X	} else {
+X	    /* Handle normal character */
+X	    chsize = (fontptr->fixedwidth ?
+X		      fontptr->width :
+X		      fontptr->widths[(bufptr[index] & CHARMASK) -
+X				      fontptr->firstchar] + 1);
+X	    if (lineptr->lineWidth + chsize > endSize) {
+X		/* Handle line wrap */
+X		lineptr->lineFlags |= WRAPFLAG;
+X		if (linenum >= textInfo->allocLines-1)
+X		  /* Expand number of lines */
+X		  ExpandLines(textInfo);
+X		linenum++;
+X		lineptr = textInfo->txtBuffer[linenum];
+X		/* Initialize next line */
+X		lineptr->lineHeight = fontptr->height;
+X		lineptr->lineBaseLine = fontptr->baseline;
+X		lineptr->lineText = index;
+X		lineptr->lineLength = 1;
+X		lineptr->lineWidth += chsize;
+X	    } else {
+X		/* Handle normal addition of character */
+X		lineptr->lineLength += 1;
+X		lineptr->lineWidth += chsize;
+X	    }
+X	}
+X    }
+X    /* We now have a valid line array.  Let's clean up some other fields. */
+X    textInfo->numLines = linenum+1;
+X    if (startPos == 0) {
+X	textInfo->startLine = 0;
+X    }
+X    textInfo->endLine = FindEndLine(textInfo, &(textInfo->bottomSpace));
+X    textInfo->curLine = linenum;
+X    /* Check to see if we are at the bottom */
+X    if (textInfo->endLine >= textInfo->numLines-1) {
+X	textInfo->curY = textInfo->h - textInfo->bottomSpace -
+X	  lineptr->lineHeight;
+X	textInfo->flagWord &= (~NOTATBOTTOM);
+X    } else {
+X	textInfo->flagWord |= NOTATBOTTOM;
+X    }
+X    return 1;
+X}
+X
+X
+X
+X
+Xint TxtAddFont(textWin, fontNumber, newFont, newColor)
+XWindow textWin;			/* Scrollable text window  */
+Xint fontNumber;			/* Place to add font (0-7) */
+XFontInfo *newFont;		/* Font to add             */
+Xint newColor;			/* Color of font           */
+X/*
+X * This routine loads a new font so that it can be used in a previously
+X * created text window.  There are eight font slots numbered 0 through 7.
+X * If there is already a font in the specified slot,  it will be replaced
+X * and an automatic redraw of the window will take place.  See TxtWriteStr
+X * for details on using alternate fonts.  The color specifies the foreground
+X * color of the text.  The default foreground color is used if this
+X * parameter is TXT_NO_COLOR.  Returns a non-zero value if
+X * everything went well.
+X */
+X{
+X    struct txtWin *textInfo;
+X    int redrawFlag;
+X
+X    if ((fontNumber < 0) || (fontNumber >= MAXFONTS)) return 0;
+X    if ((textInfo = (struct txtWin *)
+X	 XLookUpAssoc(textWindows, (XId) textWin)) == 0)
+X      return 0;
+X    if (newColor == TXT_NO_COLOR) {
+X	newColor = textInfo->fgPix;
+X    }
+X    redrawFlag = (textInfo->theFonts[fontNumber].id != 0) &&
+X      (((newFont) && (newFont->id != textInfo->theFonts[fontNumber].id)) ||
+X       (newColor != textInfo->theColors[fontNumber]));
+X    if (newFont) {
+X	textInfo->theFonts[fontNumber] = *newFont;
+X	textInfo->theFonts[fontNumber].baseline = FindBaseLine(newFont);
+X    }
+X    textInfo->theColors[fontNumber] = newColor;
+X
+X    if (redrawFlag) {
+X	RecompBuffer(textInfo);
+X	XClear(textWin);
+X	TxtRepaint(textWin);
+X    }
+X    return 1;
+X}
+X
+X
+X
+Xint TxtWinP(w)
+XWindow w;
+X/*
+X * Returns a non-zero value if the window has been previously grabbed
+X * using TxtGrab and 0 if it has not.
+X */
+X{
+X    if (XLookUpAssoc(textWindows, (XId) w))
+X      return(1);
+X    else return(0);
+X}
+X
+X
+X
+Xstatic int FindEndLine(textInfo, botSpace)
+Xstruct txtWin *textInfo;
+Xint *botSpace;
+X/*
+X * Given the starting line in 'textInfo->startLine',  this routine
+X * determines the index of the last line that can be drawn given the
+X * current size of the screen.  If there are not enough lines to
+X * fill the screen,  the index of the last line will be returned.
+X * The amount of empty bottom space is returned in 'botSpace'.
+X */
+X{
+X    int index, height, lineHeight;
+X
+X    height = YPADDING;
+X    index = textInfo->startLine;
+X    while (index < textInfo->numLines) {
+X	lineHeight = textInfo->txtBuffer[index]->lineHeight + INTERLINE;
+X	if (height + lineHeight > textInfo->h) break;
+X	height += lineHeight;
+X	index++;
+X    }
+X    if (botSpace) {
+X	*botSpace = textInfo->h - height;
+X    }
+X    return index - 1;
+X}
+X
+X
+X
+Xstatic int UpdateScroll(textInfo)
+Xstruct txtWin *textInfo;	/* Text window information */
+X/*
+X * This routine computes the current extent of the scroll bar
+X * indicator and repaints the bar with the correct information.
+X */
+X{
+X    int top, bottom;
+X
+X    if (textInfo->numLines > 1) {
+X	top = textInfo->startLine * (textInfo->h - 2*BARBORDER) /
+X	  (textInfo->numLines - 1);
+X	bottom = textInfo->endLine * (textInfo->h - 2*BARBORDER) /
+X	  (textInfo->numLines - 1);
+X    } else {
+X	top = 0;
+X	bottom = textInfo->h - (2*BARBORDER);
+X    }
+X
+X    /* Draw it - make sure there is a little padding */
+X    if (top == 0) top++;
+X    if (bottom == textInfo->h-(2*BARBORDER)) bottom--;
+X    XPixSet(textInfo->scrollBar, 0, 0, BARSIZE, top-1, textInfo->bgPix);
+X    XPixSet(textInfo->scrollBar, 1, top, BARSIZE - (2*BARBORDER) - 2,
+X	    bottom - top, textInfo->fgPix);
+X    XPixSet(textInfo->scrollBar, 0, bottom+1, BARSIZE,
+X	    textInfo->h - (2 * BARBORDER) - bottom,
+X	    textInfo->bgPix);
+X    return 1;
+X}
+X
+X
+X
+X
+Xint TxtClear(w)
+XWindow w;
+X/*
+X * This routine clears a scrollable text window.  It resets the current
+X * writing position to the upper left hand corner of the screen. 
+X * NOTE:  THIS ALSO CLEARS THE CONTENTS OF THE TEXT WINDOW BUFFER AND
+X * RESETS THE SCROLL BAR.  Returns 0 if the window is not a text window.
+X * This should be used *instead* of XClear.
+X */
+X{
+X    struct txtWin *textInfo;
+X    int index;
+X
+X    if ((textInfo = (struct txtWin *) XLookUpAssoc(textWindows, (XId) w)) == 0)
+X      return 0;
+X
+X    /* Zero out the arrays */
+X    textInfo->bufSpot = 0;
+X    for (index = 0;  index < textInfo->numLines;  index++) {
+X	InitLine(textInfo->txtBuffer[index]);
+X    }
+X    textInfo->txtBuffer[0]->lineHeight =
+X      textInfo->theFonts[textInfo->curFont].height;
+X    textInfo->txtBuffer[0]->lineBaseLine =
+X      textInfo->theFonts[textInfo->curFont].baseline;
+X
+X    textInfo->numLines = 1;
+X    textInfo->startLine = 0;
+X    textInfo->endLine = 0;
+X    textInfo->curLine = 0;
+X    textInfo->curY = YPADDING;
+X    textInfo->bottomSpace = textInfo->h - YPADDING -
+X      textInfo->theFonts[textInfo->curFont].height - INTERLINE;
+X    /* Actually clear the window */
+X    XClear(w);
+X    /* Draw the current cursor */
+X    XPixSet(w, XPADDING + CUROFFSET, YPADDING,
+X	    CURSORWIDTH, textInfo->theFonts[textInfo->curFont].height,
+X	    textInfo->curPix);
+X    /* Update the scroll bar */
+X    UpdateScroll(textInfo);
+X    return 1;
+X}
+X
+X
+Xstatic int WarpToBottom(textInfo)
+Xstruct txtWin *textInfo;	/* Text Information */
+X/*
+X * This routine causes the specified text window to display its
+X * last screen of information.   It updates the scroll bar
+X * to the appropriate spot.  The implementation scans backward
+X * through the buffer to find an appropriate starting spot for
+X * the window.
+X */
+X{
+X    int index, height, lineHeight;
+X
+X    index = textInfo->numLines-1;
+X    height = 0;
+X    while (index >= 0) {
+X	lineHeight = textInfo->txtBuffer[index]->lineHeight + INTERLINE;
+X	if (height + lineHeight > textInfo->h) break;
+X	height += lineHeight;
+X	index--;
+X    }
+X    textInfo->startLine = index + 1;
+X    textInfo->endLine = FindEndLine(textInfo, &(textInfo->bottomSpace));
+X    textInfo->curY = textInfo->h - textInfo->bottomSpace -
+X      textInfo->txtBuffer[textInfo->endLine]->lineHeight;
+X    XClear(textInfo->mainWindow);
+X    TxtRepaint(textInfo->mainWindow);
+X    return 1;
+X}
+X
+X
+X
+Xstatic int UpdateExposures(textInfo)
+Xstruct txtWin *textInfo;	/* Text window information */
+X/*
+X * Before a new scrolling action occurs,  the text window package
+X * must handle all COPYEXPOSE events generated by the last scrolling
+X * action.  This routine is called to do this.  Foreign events (those
+X * not handled by TxtFilter) are queued up and replaced on the queue
+X * after the processing of the exposure events is complete.
+X */
+X{
+X    XEvent foreignQueue[MAXFOREIGN];
+X    int index, lastItem = 0;
+X
+X    while (textInfo->flagWord & COPYEXPOSE) {
+X	XNextEvent(&(foreignQueue[lastItem]));
+X	if (!TxtFilter(&(foreignQueue[lastItem])))
+X	  lastItem++;
+X	if (lastItem >= MAXFOREIGN) {
+X	    printf("Too many foreign events to queue!\n");
+X	    textInfo->flagWord &= (~COPYEXPOSE);
+X	}
+X    }
+X    for (index = 0;  index < lastItem;  index++) {
+X	XPutBackEvent(&(foreignQueue[index]));
+X    }
+X    return 1;
+X}
+X
+X
+Xstatic int ScrollDown(textInfo)
+Xstruct txtWin *textInfo;	/* Text window information */
+X/*
+X * This routine scrolls the indicated text window down by one
+X * line.  The line below the current line must exist.  The window
+X * is scrolled so that the line below the last line is fully
+X * displayed.  This may cause many lines to scroll off the top.
+X * Scrolling is done using XCopyArea.  The exposure events should
+X * be caught using ExposeCopy.
+X */
+X{
+X    int lineSum, index, targetSpace, freeSpace, updateFlag;
+X
+X    lineSum = 0;
+X    if (textInfo->endLine + 1 >= textInfo->numLines) return 0;
+X    targetSpace = textInfo->txtBuffer[textInfo->endLine+1]->lineHeight +
+X      INTERLINE;
+X    if (textInfo->bottomSpace < targetSpace) {
+X	index = textInfo->startLine;
+X	while (index < textInfo->endLine) {
+X	    lineSum += (textInfo->txtBuffer[index]->lineHeight + INTERLINE);
+X	    if (textInfo->bottomSpace + lineSum >= targetSpace) break;
+X	    index++;
+X	}
+X	/* Must move upward by 'lineSum' pixels */
+X	XMoveArea(textInfo->mainWindow, 0, lineSum + YPADDING,
+X		  0, YPADDING, textInfo->w - BARSIZE, textInfo->h);
+X	textInfo->flagWord |= COPYEXPOSE;
+X	/* Repair the damage to the structures */
+X	textInfo->startLine = index + 1;
+X	updateFlag = 1;
+X    } else {
+X	updateFlag = 0;
+X    }
+X    /* More lines might be able to fit.  Let's check. */
+X    freeSpace = textInfo->bottomSpace + lineSum - targetSpace;
+X    index = textInfo->endLine + 1;
+X    while (index < textInfo->numLines-1) {
+X	if (freeSpace - textInfo->txtBuffer[index+1]->lineHeight - INTERLINE < 0)
+X	  break;
+X	freeSpace -= (textInfo->txtBuffer[index+1]->lineHeight + INTERLINE);
+X	index++;
+X    }
+X    textInfo->endLine = index;
+X    textInfo->bottomSpace = freeSpace;
+X    if (updateFlag) {
+X	UpdateExposures(textInfo);
+X    }
+X    UpdateScroll(textInfo);
+X    return 1;
+X}
+X
+X
+X
+X
+Xstatic int ExpandLines(textInfo)
+Xstruct txtWin *textInfo;	/* Text Information */
+X/*
+X * This routine allocates and initializes additional space in
+X * the line start array (txtBuffer).  The new space
+X * is allocated using realloc.  The expansion factor is a percentage
+X * given by EXPANDPERCENT.
+X */
+X{
+X    int newSize, index;
+X
+X    newSize = textInfo->allocLines;
+X    newSize += (newSize * EXPANDPERCENT) / 100;
+X
+X    textInfo->txtBuffer = (struct txtLine **)
+X      realloc((char *) textInfo->txtBuffer,
+X	      (unsigned) (newSize * sizeof(struct txtLine *)));
+X    for (index = textInfo->allocLines;  index < newSize;  index++) {
+X	textInfo->txtBuffer[index] = alloc(struct txtLine);
+X	InitLine(textInfo->txtBuffer[index]);
+X    }
+X    textInfo->allocLines = newSize;
+X    return 1;
+X}
+X
+Xstatic int ExpandBuffer(textInfo)
+Xstruct txtWin *textInfo;	/* Text information */
+X/*
+X * Expands the basic character buffer using realloc.  The expansion
+X * factor is a percentage given by EXPANDPERCENT.
+X */
+X{
+X    int newSize;
+X
+X    newSize = textInfo->bufAlloc + (textInfo->bufAlloc * EXPANDPERCENT) / 100;
+X    textInfo->mainBuffer = (short *)
+X      realloc((char *) textInfo->mainBuffer, (unsigned) newSize * sizeof(short));
+X    textInfo->bufAlloc = newSize;
+X    return 1;
+X}
+X
+X
+X
+Xstatic int HandleNewLine(textInfo, flagWord)
+Xstruct txtWin *textInfo;	/* Text Information            */
+Xint flagWord;			/* DODISP or NONEWLINE or both */
+X/*
+X * This routine initializes the next line for drawing by setting
+X * its height to the current font height,  scrolls the screen down
+X * one line,  and updates the current drawing position to the
+X * left edge of the newly cleared line.  If DODISP is specified,
+X * the screen will be updated (otherwise not).  If NONEWLINE is
+X * specified,  no newline character will be added to the text buffer
+X * (this is for line wrap).
+X */
+X{
+X    struct txtLine *curLine, *nextLine;
+X
+X    /* Check to see if a new line must be allocated */
+X    if (textInfo->curLine >= textInfo->allocLines-1)
+X      /* Expand the number of lines */
+X      ExpandLines(textInfo);
+X    textInfo->numLines += 1;
+X
+X    /* Then we initialize the next line */
+X    nextLine = textInfo->txtBuffer[textInfo->numLines-1];
+X    nextLine->lineHeight = textInfo->theFonts[textInfo->curFont].height;
+X    nextLine->lineBaseLine = textInfo->theFonts[textInfo->curFont].baseline;
+X
+X    curLine = textInfo->txtBuffer[textInfo->curLine];
+X    if (flagWord & DODISP) {
+X	/* Scroll down a line if required */
+X	if ((textInfo->curY + curLine->lineHeight +
+X	     nextLine->lineHeight + (INTERLINE * 2)) > textInfo->h)
+X	  {
+X	      ScrollDown(textInfo);
+X	  }
+X	else
+X	  {
+X	      /* Update the bottom space appropriately */
+X	      textInfo->bottomSpace -= (nextLine->lineHeight + INTERLINE);
+X	      textInfo->endLine += 1;
+X	  }
+X	/* Update drawing position */
+X	textInfo->curY = textInfo->h -
+X	  (textInfo->bottomSpace + INTERLINE + nextLine->lineHeight);
+X    }
+X
+X    /* Move down a line */
+X    textInfo->curLine += 1;
+X    if (!(flagWord & NONEWLINE)) {
+X	/* Append end-of-line to text buffer */
+X	if (textInfo->bufSpot >= textInfo->bufAlloc) {
+X	    /* Allocate more space in main text buffer */
+X	    ExpandBuffer(textInfo);
+X	}
+X	textInfo->mainBuffer[(textInfo->bufSpot)++] =
+X	  (textInfo->curFont << FONTSHIFT) | '\n';
+X    }
+X    nextLine->lineText = textInfo->bufSpot;
+X    return 1;
+X}
+X
+X
+X
+Xstatic int CharSize(textInfo, lineNum, charNum)
+Xstruct txtWin *textInfo;	/* Current Text Information */
+Xint lineNum;			/* Line in buffer           */
+Xint charNum;			/* Character in line        */
+X/*
+X * This routine determines the size of the specified character.
+X * It takes in account the font of the character and whether its
+X * fixed or variable.  The size includes INTERSPACE spacing between
+X * the characters.
+X */
+X{
+X    register FontInfo *charFont;
+X    register short *theLine;
+X    register short theChar;
+X
+X    theLine = &(textInfo->mainBuffer[textInfo->txtBuffer[lineNum]->lineText]);
+X    theChar = theLine[charNum];
+X    charFont = &(textInfo->theFonts[(theChar & FONTMASK) >> FONTSHIFT]);
+X    if (charFont->fixedwidth) {
+X	return charFont->width;
+X    } else {
+X	theChar &= CHARMASK;
+X	return charFont->widths[theChar - charFont->firstchar] + 1;
+X    }
+X}
+X
+X
+X
+X
+X
+Xstatic int HandleBackspace(textInfo, flagWord)
+Xstruct txtWin *textInfo;	/* Text Information  */
+Xint flagWord;			/* DODISP or nothing */
+X/*
+X * This routine handles a backspace found in the input stream.  The
+X * character before the current writing position will be erased and
+X * the drawing position will move back one character.  If the writing
+X * position is at the left margin,  the drawing position will move
+X * up to the previous line.  If it is a line that has been wrapped,
+X * the character at the end of the previous line will be erased.
+X */
+X{
+X    struct txtLine *thisLine, *prevLine;
+X    int chSize;
+X
+X    thisLine = textInfo->txtBuffer[textInfo->curLine];
+X    /* First,  determine whether we need to go back a line */
+X    if (thisLine->lineLength == 0) {
+X	/* Bleep if at top of buffer */
+X	if (textInfo->curLine == 0) {
+X	    XFeep(0);
+X	    return 0;
+X	}
+X
+X	/* See if we have to scroll in the other direction */
+X	if ((flagWord & DODISP) && (textInfo->curY <= YPADDING)) {
+X	    /* This will display the last lines of the buffer */
+X	    WarpToBottom(textInfo);
+X	}
+X
+X	/* Set drawing position at end of previous line */
+X	textInfo->curLine -= 1;
+X	prevLine = textInfo->txtBuffer[textInfo->curLine];
+X	textInfo->numLines -= 1;
+X	if (flagWord & DODISP) {
+X	    textInfo->curY -= (prevLine->lineHeight + INTERLINE);
+X	    textInfo->bottomSpace += (thisLine->lineHeight + INTERLINE);
+X	    textInfo->endLine -= 1;
+X	}
+X
+X	/* We are unlinewrapping if the previous line has flag set */
+X	if (prevLine->lineFlags & WRAPFLAG) {
+X	    /* Get rid of line wrap indicator */
+X	    if (flagWord & DODISP) {
+X		XPixSet(textInfo->mainWindow,
+X			textInfo->w - BARSIZE - WRAPINDSIZE,
+X			textInfo->curY,  WRAPINDSIZE,
+X			prevLine->lineHeight,
+X			textInfo->bgPix);
+X	    }
+X	    prevLine->lineFlags &= (~WRAPFLAG);
+X	    /* Call recursively to wipe out the ending character */
+X	    HandleBackspace(textInfo, flagWord);
+X	} else {
+X	    /* Delete the end-of-line in the primary buffer */
+X	    textInfo->bufSpot -= 1;
+X	}
+X    } else {
+X	/* Normal deletion of character */
+X	chSize =
+X	  CharSize(textInfo, textInfo->curLine,
+X		   textInfo->txtBuffer[textInfo->curLine]->lineLength - 1);
+X	/* Move back appropriate amount and wipe it out */
+X	thisLine->lineWidth -= chSize;
+X	if (flagWord & DODISP) {
+X	    XPixSet(textInfo->mainWindow, thisLine->lineWidth, textInfo->curY,
+X		    chSize, thisLine->lineHeight, textInfo->bgPix);
+X	}
+X	/* Delete from buffer */
+X	textInfo->txtBuffer[textInfo->curLine]->lineLength -= 1;
+X	textInfo->bufSpot -= 1;
+X    }
+X    return 1;
+X}
+X
+X
+X
+Xstatic int DrawLineWrap(win, x, y, h, col)
+XWindow win;			/* What window to draw it in     */
+Xint x, y;			/* Position of upper left corner */
+Xint h;				/* Height of indicator           */
+Xint col;			/* Color of indicator            */
+X/*
+X * This routine draws a line wrap indicator at the end of a line.
+X * Visually,  it is an arrow of the specified height directly against
+X * the scroll bar border.  The bitmap used for the arrow is stored
+X * in 'arrowMap' with size 'arrow_width' and 'arrow_height'.
+X */
+X{
+X    /* First,  draw the arrow */
+X    XPixmapPut(win, 0, 0, x, y + h - arrow_height, arrow_width,
+X	       arrow_height, arrowMap, GXcopy, AllPlanes);
+X    /* Then draw the stem */
+X    XLine(win, x + STEMOFFSET, y, x + STEMOFFSET, y + h - arrow_height,
+X	  1, 1, col, GXcopy, AllPlanes);
+X    return 1;
+X}
+X
+X
+X
+X
+Xstatic int DrawLine(textInfo, lineIndex, ypos)
+Xstruct txtWin *textInfo;	/* Text window information   */
+Xint lineIndex;			/* Index of line to draw     */
+Xint ypos;			/* Y position for line       */
+X/*
+X * This routine destructively draws the indicated line in the
+X * indicated window at the indicated position.  It does not
+X * clear to end of line however.  It draws a line wrap indicator
+X * if needed but does not draw a cursor.
+X */
+X{
+X    int index, startPos, curFont, theColor, curX, saveX;
+X    struct txtLine *someLine;
+X    char lineBuffer[BUFSIZE], *glyph;
+X    short *linePointer;
+X    FontInfo *theFont;
+X
+X    /* First,  we draw the text */
+X    index = 0;
+X    curX = XPADDING;
+X    someLine = textInfo->txtBuffer[lineIndex];
+X    linePointer = &(textInfo->mainBuffer[someLine->lineText]);
+X    while (index < someLine->lineLength) {
+X	startPos = index;
+X	saveX = curX;
+X	curFont = linePointer[index] & FONTMASK;
+X	theFont = &(textInfo->theFonts[curFont >> FONTSHIFT]);
+X	theColor = textInfo->theColors[curFont >> FONTSHIFT];
+X	if (theFont->fixedwidth) {
+X	    glyph = &(lineBuffer[0]);
+X	    while ((index < someLine->lineLength) &&
+X		   ((linePointer[index] & FONTMASK) == curFont))
+X	      {
+X		  *glyph = linePointer[index] & CHARMASK;
+X		  index++;
+X		  glyph++;
+X		  curX += theFont->width;
+X	      }
+X	} else {
+X	    glyph = &(lineBuffer[0]);
+X	    while ((index < someLine->lineLength) &&
+X		   ((linePointer[index] & FONTMASK) == curFont))
+X	      {
+X		  *glyph = linePointer[index] & CHARMASK;
+X		  index++;
+X		  curX += (theFont->widths[*glyph - theFont->firstchar] + 1);
+X		  glyph++;
+X	      }
+X	}
+X	/* Flush out the glyphs */
+X	if (theFont->fixedwidth) {
+X	    XText(textInfo->mainWindow, saveX,
+X		  ypos + (someLine->lineHeight - theFont->height) -
+X		  (someLine->lineBaseLine - theFont->baseline),
+X		  lineBuffer,
+X		  index - startPos,
+X		  theFont->id, theColor, textInfo->bgPix);
+X	} else {
+X	    XTextPad(textInfo->mainWindow, saveX,
+X		     ypos + (someLine->lineHeight - theFont->height) -
+X		     (someLine->lineBaseLine - theFont->baseline),
+X		     lineBuffer,
+X		     index - startPos,
+X		     theFont->id, 1, 1, theColor, textInfo->bgPix,
+X		     GXcopy, AllPlanes);
+X	}
+X    }
+X    /* Then the line wrap indicator (if needed) */
+X    if (someLine->lineFlags & WRAPFLAG) {
+X	DrawLineWrap(textInfo->mainWindow, textInfo->w - BARSIZE - WRAPINDSIZE,
+X		     ypos, someLine->lineHeight,
+X		     textInfo->fgPix);
+X    }
+X    return 1;
+X}
+X
+X
+X
+X
+Xstatic int HandleNewFont(fontNum, textInfo, flagWord)
+Xint fontNum;			/* Font number       */
+Xstruct txtWin *textInfo;	/* Text information  */
+Xint flagWord;			/* DODISP or nothing */
+X/*
+X * This routine handles a new font request.  These requests take
+X * the form "^F<digit>".  The parsing is done in TxtWriteStr.
+X * This routine is called only if the form is valid.  It may return
+X * a failure (0 status) if the requested font is not loaded.
+X * If the new font is larger than any of the current
+X * fonts on the line,  it will change the line height and redisplay
+X * the line.
+X */
+X{
+X    struct txtLine *thisLine;
+X    int heightDiff, baseDiff, redrawFlag;
+X
+X    if (textInfo->theFonts[fontNum].id == 0) {
+X	return 0;
+X    } else {
+X	thisLine = textInfo->txtBuffer[textInfo->curLine];
+X	textInfo->curFont = fontNum;
+X	redrawFlag = 0;
+X	heightDiff = (textInfo->theFonts[fontNum].height -
+X		      textInfo->theFonts[fontNum].baseline) -
+X			(thisLine->lineHeight - thisLine->lineBaseLine);
+X	if (heightDiff > 0) {
+X	    redrawFlag = 1;
+X	} else {
+X	    heightDiff = 0;
+X	}
+X	baseDiff = textInfo->theFonts[fontNum].baseline -
+X	  thisLine->lineBaseLine;
+X	if (baseDiff > 0) {
+X	    heightDiff += baseDiff;
+X	    thisLine->lineBaseLine += baseDiff;
+X	    redrawFlag = 1;
+X	}
+X	if (redrawFlag) {
+X	    if (flagWord & DODISP) {
+X		/* Clear current line */
+X		XPixSet(textInfo->mainWindow, 0, textInfo->curY, textInfo->w,
+X			thisLine->lineHeight, textInfo->bgPix);
+X		/* Check to see if it requires scrolling */
+X		if ((textInfo->curY + thisLine->lineHeight + heightDiff +
+X		     INTERLINE) > textInfo->h)
+X		  {
+X		      /* 
+X		       * General approach:  "unscroll" the last line up
+X		       * and then call ScrollDown to do the right thing.
+X		       */
+X		      textInfo->endLine -= 1;
+X		      textInfo->bottomSpace += thisLine->lineHeight + INTERLINE;
+X		      XPixSet(textInfo->mainWindow, 0,
+X			      textInfo->h - textInfo->bottomSpace,
+X			      textInfo->w, textInfo->bottomSpace,
+X			      textInfo->bgPix);
+X		      thisLine->lineHeight += heightDiff;
+X		      ScrollDown(textInfo);
+X		      textInfo->curY = textInfo->h -
+X			(textInfo->bottomSpace + INTERLINE +
+X			 thisLine->lineHeight);
+X		  }
+X		else 
+X		  {
+X		      /* Just update bottom space */
+X		      textInfo->bottomSpace -= heightDiff;
+X		      thisLine->lineHeight += heightDiff;
+X		  }
+X		/* Redraw the current line */
+X		DrawLine(textInfo, textInfo->curLine, textInfo->curY);
+X	    } else {
+X		/* Just update line height */
+X		thisLine->lineHeight += heightDiff;
+X	    }
+X	}
+X	return 1;
+X    }
+X}
+X
+X
+X
+Xint TxtWriteStr(w, str)
+XWindow w;			/* Text window            */
+Xregister char *str;		/* NULL terminated string */
+X/*
+X * This routine writes a string to the specified text window.
+X * The following notes apply:
+X *   - Text is always appended to the end of the text buffer.
+X *   - If the scroll bar is positioned such that the end of the
+X *     text is not visible,  an automatic scroll to the bottom
+X *     will be done before the appending of text.
+X *   - Non-printable ASCII characters are not displayed.
+X *   - The '\n' character causes the current text position to
+X *     advance one line and start at the left.
+X *   - Tabs are not supported.
+X *   - Lines too long for the screen will be wrapped and a line wrap
+X *     indication will be drawn.
+X *   - Backspace clears the previous character.  It will do the right
+X *     thing if asked to backspace past a wrapped line.
+X *   - A new font can be chosen using the sequence '^F<digit>' where
+X *     <digit> is 0-7.  The directive will be ignored if
+X *     there is no font in the specified slot.
+X * Returns 0 if something went wrong.  
+X */
+X{
+X    register int fontIndex;
+X    register struct txtWin *textInfo;
+X    register struct txtLine *thisLine;
+X
+X    if ((textInfo = (struct txtWin *) XLookUpAssoc(textWindows, (XId) w)) == 0)
+X      return 0;
+X    
+X    /* See if screen needs to be updated */
+X    if (textInfo->flagWord & SCREENWRONG) {
+X	TxtRepaint(textInfo->mainWindow);
+X    }
+X
+X    /* See if we have to scroll down to the bottom */
+X    if (textInfo->flagWord & NOTATBOTTOM) {
+X	WarpToBottom(textInfo);
+X	textInfo->flagWord &= (~NOTATBOTTOM);
+X    }
+X
+X    /* Undraw the current cursor */
+X    thisLine = textInfo->txtBuffer[textInfo->curLine];
+X    XPixSet(w,
+X	    thisLine->lineWidth + CUROFFSET,
+X	    textInfo->curY,
+X	    CURSORWIDTH,
+X	    thisLine->lineHeight,
+X	    textInfo->bgPix);
+X    for ( /* str is ok */ ; (*str != 0) ; str++) {
+X	/* Check to see if we are waiting on a font */
+X	if (textInfo->flagWord & FONTNUMWAIT) {
+X	    textInfo->flagWord &= (~FONTNUMWAIT);
+X	    fontIndex = *str - '0';
+X	    if ((fontIndex >= 0) && (fontIndex < MAXFONTS)) {
+X		if (HandleNewFont(fontIndex, textInfo, DODISP)) {
+X		    /* Handled font -- go get next character */
+X		    continue;
+X		}
+X	    }
+X	}
+X	/* Inline code for handling normal character case */
+X	if ((*str >= LOWCHAR) && (*str <= HIGHCHAR)) {
+X	    register FontInfo *thisFont;
+X	    register struct txtLine *thisLine;
+X	    register int charWidth;
+X	    int thisColor;
+X
+X	    /* Determine size of character */
+X	    thisFont = &(textInfo->theFonts[textInfo->curFont]);
+X	    thisColor = textInfo->theColors[textInfo->curFont];
+X	    if (thisFont->fixedwidth) {
+X		charWidth = thisFont->width;
+X	    } else {
+X		charWidth = thisFont->widths[(*str) - thisFont->firstchar] + 1;
+X	    }
+X	    /* Check to see if line wrap is required */
+X	    thisLine = textInfo->txtBuffer[textInfo->curLine];
+X	    if (thisLine->lineWidth + charWidth >
+X		(textInfo->w-BARSIZE-WRAPINDSIZE))
+X	      {
+X		  DrawLineWrap(textInfo->mainWindow,
+X			       textInfo->w-BARSIZE-WRAPINDSIZE,
+X			       textInfo->curY, thisLine->lineHeight,
+X			       textInfo->fgPix);
+X		  thisLine->lineFlags |= WRAPFLAG;
+X		  /* Handle the spacing problem the same way as a newline */
+X		  HandleNewLine(textInfo, DODISP | NONEWLINE);
+X		  thisLine = textInfo->txtBuffer[textInfo->curLine];
+X	      }
+X	    
+X	    /* Ready to draw character */
+X	    XText(textInfo->mainWindow, thisLine->lineWidth,
+X		  textInfo->curY + (thisLine->lineHeight - thisFont->height)-
+X		  (thisLine->lineBaseLine - thisFont->baseline),
+X		  str, 1, thisFont->id, thisColor, textInfo->bgPix);
+X	    
+X	    /* Append character onto main buffer */
+X	    if (textInfo->bufSpot >= textInfo->bufAlloc)
+X	      /* Make room for more characters */
+X	      ExpandBuffer(textInfo);
+X	    textInfo->mainBuffer[(textInfo->bufSpot)++] =
+X	      (textInfo->curFont << FONTSHIFT) | (*str);
+X	    
+X	    /* Update the line start array */
+X	    thisLine->lineLength += 1;
+X	    thisLine->lineWidth += charWidth;
+X	} else if (*str == NEWLINE) {
+X	    HandleNewLine(textInfo, DODISP);
+X	} else if (*str == NEWFONT) {
+X	    /* Go into waiting for font number mode */
+X	    textInfo->flagWord |= FONTNUMWAIT;
+X	} else if (*str == BACKSPACE) {
+X	    HandleBackspace(textInfo, DODISP);
+X	} else {
+X	    /* Ignore all others */
+X	}
+X    }
+X    /* Draw the cursor in its new position */
+X    thisLine = textInfo->txtBuffer[textInfo->curLine];
+X    XPixSet(w, thisLine->lineWidth + CUROFFSET, textInfo->curY, CURSORWIDTH,
+X	    thisLine->lineHeight, textInfo->curPix);
+X    return 1;
+X}
+X
+X
+X
+Xint TxtJamStr(w, str)
+XWindow w;			/* Text window            */
+Xregister char *str;		/* NULL terminated string */
+X/*
+X * This is the same as TxtWriteStr except the screen is NOT updated.
+X * After a call to this routine,  TxtRepaint should be called to
+X * update the screen.  This routine is meant to be used to load
+X * a text buffer with information and then allow the user to
+X * scroll through it at will.
+X */
+X{
+X    register int fontIndex;
+X    register struct txtWin *textInfo;
+X
+X    if ((textInfo = (struct txtWin *) XLookUpAssoc(textWindows, (XId) w)) == 0)
+X      return 0;
+X    
+X    for ( /* str is ok */ ; (*str != 0) ; str++) {
+X	/* Check to see if we are waiting on a font */
+X	if (textInfo->flagWord & FONTNUMWAIT) {
+X	    textInfo->flagWord &= (~FONTNUMWAIT);
+X	    fontIndex = *str - '0';
+X	    if ((fontIndex >= 0) && (fontIndex < MAXFONTS)) {
+X		if (HandleNewFont(fontIndex, textInfo, 0)) {
+X		    /* Handled font -- go get next character */
+X		    continue;
+X		}
+X	    }
+X	}
+X	/* Inline code for handling normal character case */
+X	if ((*str >= LOWCHAR) && (*str <= HIGHCHAR)) {
+X	    register FontInfo *thisFont;
+X	    register struct txtLine *thisLine;
+X	    register int charWidth;
+X	    
+X	    /* Determine size of character */
+X	    thisFont = &(textInfo->theFonts[textInfo->curFont]);
+X	    if (thisFont->fixedwidth) {
+X		charWidth = thisFont->width;
+X	    } else {
+X		charWidth = thisFont->widths[(*str) - thisFont->firstchar] + 1;
+X	    }
+X	    /* Check to see if line wrap is required */
+X	    thisLine = textInfo->txtBuffer[textInfo->curLine];
+X	    if (thisLine->lineWidth + charWidth >
+X		(textInfo->w-BARSIZE-WRAPINDSIZE))
+X	      {
+X		  thisLine->lineFlags |= WRAPFLAG;
+X		  /* Handle the spacing problem the same way as a newline */
+X		  HandleNewLine(textInfo, NONEWLINE);
+X		  thisLine = textInfo->txtBuffer[textInfo->curLine];
+X	      }
+X	    /* Append character onto main buffer */
+X	    if (textInfo->bufSpot >= textInfo->bufAlloc)
+X	      /* Make room for more characters */
+X	      ExpandBuffer(textInfo);
+X	    textInfo->mainBuffer[(textInfo->bufSpot)++] =
+X	      (textInfo->curFont << FONTSHIFT) | (*str);
+X	    
+X	    /* Update the line start array */
+X	    thisLine->lineLength += 1;
+X	    thisLine->lineWidth += charWidth;
+X	} else if (*str == NEWLINE) {
+X	    HandleNewLine(textInfo, 0);
+X	} else if (*str == NEWFONT) {
+X	    /* Go into waiting for font number mode */
+X	    textInfo->flagWord |= FONTNUMWAIT;
+X	} else if (*str == BACKSPACE) {
+X	    HandleBackspace(textInfo, 0);
+X	} else {
+X	    /* Ignore all others */
+X	}
+X    }
+X    textInfo->flagWord |= SCREENWRONG;
+X    return 1;
+X}
+X
+X
+X
+Xint TxtRepaint(w)
+XWindow w;
+X/*
+X * Repaints the given scrollable text window.  The routine repaints
+X * the entire window.  For handling exposure events,  the TxtFilter 
+X * routine should be used.
+X */
+X{
+X    struct txtWin *textInfo;
+X    int index, ypos;
+X
+X    if ((textInfo = (struct txtWin *) XLookUpAssoc(textWindows, (XId) w)) == 0)
+X      return 0;
+X
+X    /* Check to see if the screen is up to date */
+X    if (textInfo->flagWord & SCREENWRONG) {
+X	textInfo->endLine = FindEndLine(textInfo, &(textInfo->bottomSpace));
+X	textInfo->flagWord &= (~SCREENWRONG);
+X    }
+X
+X    ypos = YPADDING;
+X    index = textInfo->startLine;
+X    for (;;) {
+X	DrawLine(textInfo, index, ypos);
+X	if (index >= textInfo->endLine) break;
+X	ypos += (textInfo->txtBuffer[index]->lineHeight + INTERLINE);
+X	index++;
+X    }
+X    /* Draw the cursor (if on screen) */
+X    if (textInfo->endLine == textInfo->curLine) {
+X	XPixSet(w, textInfo->txtBuffer[index]->lineWidth + CUROFFSET,
+X		ypos, CURSORWIDTH,
+X		textInfo->txtBuffer[index]->lineHeight,
+X		textInfo->curPix);
+X    }
+X    /* Update the scroll bar */
+X    UpdateScroll(textInfo);
+X    return 1;
+X}
+X
+X
+X
+Xstatic int InsertIndex(textInfo, thisIndex, ypos)
+Xstruct txtWin *textInfo;	/* Text Window Information    */
+Xint thisIndex;			/* Line index of exposed line */
+Xint ypos;			/* Drawing position of line   */
+X/*
+X * This routine inserts the supplied line index into the copy
+X * exposure array for 'textInfo'.  The array is kept sorted
+X * from lowest to highest using insertion sort.  The array
+X * is dynamically expanded if needed.
+X */
+X{
+X    struct expEvent *newItem;
+X    int newSize, index, downIndex;
+X
+X    /* Check to see if we need to expand it */
+X    if ((textInfo->exposeSize + 3) >= textInfo->exposeAlloc) {
+X	newSize = textInfo->exposeAlloc +
+X	  (textInfo->exposeAlloc * EXPANDPERCENT / 100);
+X	textInfo->exposeAry = (struct expEvent **)
+X	  realloc((char *) textInfo->exposeAry,
+X		  (unsigned) (newSize * sizeof(struct expEvent *)));
+X	for (index = textInfo->exposeAlloc;  index < newSize;  index++)
+X	  textInfo->exposeAry[index] = alloc(struct expEvent);
+X	textInfo->exposeAlloc = newSize;
+X    }
+X    /* Find spot for insertion.  NOTE: last spot has big number */
+X    for (index = 0;  index <= textInfo->exposeSize;  index++) {
+X	if (textInfo->exposeAry[index]->lineIndex >= thisIndex) {
+X	    if (textInfo->exposeAry[index]->lineIndex > thisIndex) {
+X		/* Insert before this entry */
+X		newItem = textInfo->exposeAry[textInfo->exposeSize+1];
+X		for (downIndex = textInfo->exposeSize;
+X		     downIndex >= index;
+X		     downIndex--)
+X		  {
+X		      textInfo->exposeAry[downIndex+1] =
+X			textInfo->exposeAry[downIndex];
+X		  }
+X		/* Put a free structure at this spot */
+X		textInfo->exposeAry[index] = newItem;
+X		/* Fill it in */
+X		textInfo->exposeAry[index]->lineIndex = thisIndex;
+X		textInfo->exposeAry[index]->ypos = ypos;
+X		/* Break out of loop */
+X		textInfo->exposeSize += 1;
+X	    }
+X	    break;
+X	}
+X    }
+X    return 1;
+X}
+X
+X
+X
+Xstatic int ScrollUp(textInfo)
+Xstruct txtWin *textInfo;	/* Text window information   */
+X/*
+X * This routine scrolls the indicated text window up by one
+X * line.  The line above the current line must exist.  The
+X * window is scrolled so that the line above the start line
+X * is displayed at the top of the screen.  This may cause
+X * many lines to scroll off the bottom.  The scrolling is
+X * done using XCopyArea.  The exposure events should be caught
+X * by ExposeCopy.
+X */
+X{
+X    int targetSpace;
+X
+X    /* Make sure all exposures have been handled by now */
+X    if (textInfo->startLine == 0) return 0;
+X    targetSpace = textInfo->txtBuffer[textInfo->startLine-1]->lineHeight +
+X      INTERLINE;
+X    /* Move the area downward by the target amount */
+X    XMoveArea(textInfo->mainWindow, 0, YPADDING-targetSpace, 0, YPADDING,
+X	      textInfo->w - BARSIZE, textInfo->h);
+X    textInfo->flagWord |= COPYEXPOSE;
+X    /* Update the text window parameters */
+X    textInfo->startLine -= 1;
+X    textInfo->endLine = FindEndLine(textInfo, &(textInfo->bottomSpace));
+X    /* Clear out bottom space region */
+X    XPixSet(textInfo->mainWindow, 0, textInfo->h - textInfo->bottomSpace,
+X	    textInfo->w, textInfo->bottomSpace, textInfo->bgPix);
+X    UpdateExposures(textInfo);
+X    UpdateScroll(textInfo);
+X    return 1;
+X}
+X
+X
+Xstatic int ScrollToSpot(textInfo, ySpot)
+Xstruct txtWin *textInfo;	/* Text window information          */
+Xint ySpot;			/* Button position in scroll window */
+X/*
+X * This routine scrolls the specified text window relative to the
+X * position of the mouse in the scroll bar.  The center of the screen
+X * will be positioned to correspond to the mouse position.
+X */
+X{
+X    int targetLine, aboveLines;
+X
+X    targetLine = textInfo->numLines * ySpot / textInfo->h;
+X    textInfo->startLine = targetLine;
+X    textInfo->endLine = FindEndLine(textInfo, &(textInfo->bottomSpace));
+X    aboveLines = 0;
+X    /* Make the target line the *center* of the window */
+X    while ((textInfo->startLine > 0) &&
+X	   (aboveLines < textInfo->endLine - targetLine))
+X      {
+X	  textInfo->startLine -= 1;
+X	  textInfo->endLine = FindEndLine(textInfo, &(textInfo->bottomSpace));
+X	  aboveLines++;
+X      }
+X    if (textInfo->endLine == textInfo->numLines-1) {
+X	WarpToBottom(textInfo);
+X    } else {
+X	XClear(textInfo->mainWindow);
+X	TxtRepaint(textInfo->mainWindow);
+X    }
+X    return 1;
+X}
+X
+X
+X
+Xstatic int LineToTop(textInfo, pos)
+Xstruct txtWin *textInfo;	/* Text window information */
+Xint pos;			/* Y position of mouse     */
+X/*
+X * This routine scrolls the screen down until the line at the
+X * mouse position is at the top of the screen.  It stops
+X * if it can't scroll the buffer down that far.  If the
+X * global 'ScrollOption' is NORMSCROLL,  a smooth scroll
+X * is used.  Otherwise,  it jumps to the right position
+X * and repaints the screen.
+X */
+X{
+X    int index, sum;
+X
+X    /* First,  we find the current line */
+X    sum = 0;
+X    for (index = textInfo->startLine;  index <= textInfo->endLine;  index++) {
+X	if (sum + textInfo->txtBuffer[index]->lineHeight + INTERLINE> pos) break;
+X	sum += textInfo->txtBuffer[index]->lineHeight + INTERLINE;
+X    }
+X    /* We always want to scroll down at least one line */
+X    if (index == textInfo->startLine) index++;
+X    if (ScrollOption == NORMSCROLL) {
+X	/* Scroll down until 'index' is the starting line */
+X	while ((textInfo->startLine < index) && ScrollDown(textInfo)) {
+X	    /* Empty Loop Body */
+X	}
+X    } else {
+X	/* Immediately jump to correct spot */
+X	textInfo->startLine = index;
+X	textInfo->endLine = FindEndLine(textInfo, &(textInfo->bottomSpace));
+X	if (textInfo->endLine == textInfo->numLines-1) {
+X	    WarpToBottom(textInfo);
+X	} else {
+X	    XClear(textInfo->mainWindow);
+X	    TxtRepaint(textInfo->mainWindow);
+X	}
+X    }
+X    /* Check to see if at end of buffer */
+X    if (textInfo->endLine >= textInfo->numLines-1) {
+X	textInfo->flagWord &= (~NOTATBOTTOM);
+X    }
+X    return 1;
+X}
+X
+X
+X
+Xstatic int TopToHere(textInfo, pos)
+Xstruct txtWin *textInfo;	/* Text window information */
+Xint pos;			/* Y position of mouse     */
+X/*
+X * This routine scrolls the screen up until the top line of
+X * the screen is at the current Y position of the mouse.  Again,
+X * it will stop if it can't scroll that far.  If the global
+X * 'ScrollOption' is NORMSCROLL,  a smooth scroll is used.
+X * If it's not,  it will simply redraw the screen at the
+X * correct spot.
+X */
+X{
+X    int sum, target, linesup, index;
+X
+X    target = pos - textInfo->txtBuffer[textInfo->startLine]->lineHeight;
+X    /* We always want to scroll up at least one line */
+X    if (target <= 0) target = 1;
+X    sum = 0;
+X    linesup = 0;
+X    /* Check to see if we are at the top anyway */
+X    if (textInfo->startLine == 0) return 0;
+X    if (ScrollOption == NORMSCROLL) {
+X	/* Scroll up until sum of new top lines greater than target */
+X	while ((sum < target) && ScrollUp(textInfo)) {
+X	    sum += textInfo->txtBuffer[textInfo->startLine]->lineHeight;
+X	    linesup++;
+X	}
+X    } else {
+X	/* Search backward to find index */
+X	index = textInfo->startLine - 1;
+X	while ((index > 0) && (sum < target)) {
+X	    sum += textInfo->txtBuffer[index]->lineHeight;
+X	    linesup++;
+X	    index--;
+X	}
+X	/* Go directly to the index */
+X	textInfo->startLine = index;
+X	textInfo->endLine = FindEndLine(textInfo, &(textInfo->bottomSpace));
+X	XClear(textInfo->mainWindow);
+X	TxtRepaint(textInfo->mainWindow);
+X    }
+X    /* If we scrolled,  assert we are not at bottom of buffer */
+X    if (linesup > 0) {
+X	textInfo->flagWord |= NOTATBOTTOM;
+X    }
+X    return 1;
+X}
+X
+X
+X
+Xint TxtFilter(evt)
+XXEvent *evt;
+X/*
+X * This routine handles events associated with scrollable text windows.
+X * It will handle all exposure events and any button released events
+X * in the scroll bar of a text window.  It does NOT handle any other
+X * events.  If it cannot handle the event,  it will return 0.
+X */
+X{
+X    XExposeEvent *expose = (XExposeEvent *) evt;
+X    XButtonEvent *btEvt = (XButtonEvent *) evt;
+X    struct txtWin *textInfo;
+X    struct txtLine *thisLine;
+X    int index, ypos;
+X
+X    if (textWindows == (XAssocTable *) 0) {
+X	textWindows = XCreateAssocTable(32);
+X	if (textWindows == (XAssocTable *) 0) return(0);
+X    }
+X    if ((textInfo = (struct txtWin *)
+X	 XLookUpAssoc(textWindows, (XId) evt->window)) == 0)
+X      return 0;
+X
+X    /* Determine whether it's main window or not */
+X    if ((evt->window == textInfo->mainWindow) && (evt->subwindow == 0)) {
+X	/* Main Window - handle exposures */
+X	switch (evt->type) {
+X	case ExposeWindow:
+X	    if ((expose->width != textInfo->w) ||
+X		(expose->height != textInfo->h))
+X	      {
+X		  /* Window changed size */
+X		  textInfo->w = expose->width;
+X		  textInfo->h = expose->height;
+X		  /* Reconfigure scroll bar */
+X		  XConfigureWindow(textInfo->scrollBar,
+X				   textInfo->w - BARSIZE,
+X				   0, BARSIZE - (2 * BARBORDER),
+X				   textInfo->h - (2 * BARBORDER));
+X		  /* Recompute line breaks */
+X		  RecompBuffer(textInfo);
+X	      }
+X	    TxtRepaint(evt->window);
+X	    break;
+X	case ExposeRegion:
+X	    ypos = YPADDING;
+X	    for (index = textInfo->startLine;
+X		 index <= textInfo->endLine;
+X		 index++)
+X	      {
+X		  int lh = textInfo->txtBuffer[index]->lineHeight;
+X
+X		  if (((ypos + lh) >= expose->y) &&
+X		      (ypos <= (expose->y + expose->height)))
+X		    {
+X			/* Intersection region */
+X			if (expose->detail == ExposeCopy) {
+X			    /* Queue up line to be redrawn */
+X			    InsertIndex(textInfo, index, ypos);
+X			} else {
+X			    /* Draw line immediately */
+X			    DrawLine(textInfo, index, ypos);
+X			    /* And possibly draw cursor */
+X			    if (textInfo->curLine == index) {
+X				XPixSet(evt->window,
+X					textInfo->txtBuffer[index]->lineWidth +
+X					CUROFFSET,
+X					ypos, CURSORWIDTH,
+X					textInfo->txtBuffer[index]->lineHeight,
+X					textInfo->curPix);
+X			    }
+X			}
+X		    }
+X		  ypos += lh + INTERLINE;
+X	      }
+X	    break;
+X	case ExposeCopy:
+X	    /* Expose queued up lines */
+X	    for (index = 0;  index < textInfo->exposeSize;  index++) {
+X		DrawLine(textInfo, textInfo->exposeAry[index]->lineIndex,
+X			 textInfo->exposeAry[index]->ypos);
+X		/* And possibly draw cursor */
+X		thisLine=
+X		  textInfo->txtBuffer[textInfo->exposeAry[index]->lineIndex];
+X		if (textInfo->numLines==textInfo->exposeAry[index]->lineIndex) {
+X		    XPixSet(evt->window, thisLine->lineWidth + CUROFFSET,
+X			    ypos, CURSORWIDTH, thisLine->lineHeight,
+X			    textInfo->curPix);
+X		}
+X	    }
+X	    textInfo->exposeSize = 0;
+X	    textInfo->exposeAry[0]->lineIndex = MAXINT;
+X	    textInfo->flagWord &= (~COPYEXPOSE);
+X	    break;
+X	default:
+X	    /* Not one of our events */
+X	    return 0;
+X	}
+X    } else {
+X	switch (evt->type) {
+X	case ExposeWindow:
+X	    UpdateScroll(textInfo);
+X	    break;
+X	case ButtonReleased:
+X	    /* Find out which button */
+X	    switch (btEvt->detail & ValueMask) {
+X	    case RightButton:
+X		/* Scroll up until top line is at mouse position */
+X		TopToHere(textInfo, btEvt->y);
+X		break;
+X	    case MiddleButton:
+X		/* Scroll to spot relative to position */
+X		ScrollToSpot(textInfo, btEvt->y);
+X		if (textInfo->endLine >= textInfo->numLines-1) {
+X		    textInfo->flagWord &= (~NOTATBOTTOM);
+X		} else {
+X		    textInfo->flagWord |= NOTATBOTTOM;
+X		}
+X		break;
+X	    case LeftButton:
+X		/* Scroll down until pointed line is at top */
+X		LineToTop(textInfo, btEvt->y);
+X		break;
+X	    }
+X	    break;
+X	default:
+X	    /* Not one of our events */
+X	    return 0;
+X	}
+X    }
+X    return 1;
+X}
+END_OF_scrollText/scrollText.c
+if test 55874 -ne `wc -c <scrollText/scrollText.c`; then
+    echo shar: \"scrollText/scrollText.c\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f xchess.cur -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"xchess.cur\"
+else
+echo shar: Extracting \"xchess.cur\" \(267 characters\)
+sed "s/^X//" >xchess.cur <<'END_OF_xchess.cur'
+X#define xchess_width 16
+X#define xchess_height 16
+X#define xchess_x_hot 9
+X#define xchess_y_hot 8
+Xstatic short xchess_bits[] = {
+X   0x0000, 0x0000, 0x7000, 0xf800,
+X   0xfe00, 0xff80, 0xffc0, 0xff60,
+X   0xfdb0, 0x66d8, 0x3b6c, 0x1d76,
+X   0x1d98, 0x0ccc, 0x0060, 0x0000};
+END_OF_xchess.cur
+if test 267 -ne `wc -c <xchess.cur`; then
+    echo shar: \"xchess.cur\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+echo shar: End of archive 2 \(of 6\).
+cp /dev/null ark2isdone
+MISSING=""
+for I in 1 2 3 4 5 6 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 6 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+

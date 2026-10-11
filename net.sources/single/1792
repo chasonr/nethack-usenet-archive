@@ -1,0 +1,2957 @@
+X-Google-Language: ENGLISH,ASCII-7-bit
+X-Google-Thread: 159752,c0075afc438be0f9,start
+X-Google-Attributes: gid159752,public
+X-Google-ArrivalTime: 1984-10-05 09:07:20 PST
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site ut-ngp.UUCP
+Path: utzoo!linus!philabs!cmcl2!seismo!ut-sally!ut-ngp!knutson
+From: knutson@ut-ngp.UUCP (Jim Knutson)
+Newsgroups: net.sources
+Subject: MS-DOS Kermit sources (Part 4 of 7)
+Message-ID: <1007@ut-ngp.UUCP>
+Date: Fri, 5-Oct-84 12:07:20 EDT
+Article-I.D.: ut-ngp.1007
+Posted: Fri Oct  5 12:07:20 1984
+Date-Received: Sun, 7-Oct-84 04:33:48 EDT
+Organization: U.Texas Computation Center, Austin, Texas
+Lines: 2937
+
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting msterm.asm'
+sed 's/^X//' <<'//go.sysin dd *' >msterm.asm
+	public	clscpt, defkey, cptfcb, inicpt, clscpi, telnet
+	public  dopar, shokey, prkey
+	include msdefs.h
+
+datas 	segment	public 'datas'
+	extrn	flags:byte, trans:byte, buff:byte, portval:word
+
+targ	termarg	<0,1,80,24,cptchr,2dch,0,scntab,deftab,0,,parnon>
+ssp	dw	0		; Save SP in Telnet.
+crlf    db      cr,lf,'$'
+tmp	db	?,'$'
+temp	dw	0
+temp1   dw      ?               ; Temporary storage.
+temp2   dw      ?               ; Temporary storage.
+tmsg1	db	cr,lf,'[Connecting to host, type $' 
+tmsg3	db	' C to return to PC]',cr,lf,cr,lf,cr,lf,'$'
+tmsg2	db	cr,lf,'[Back at micro]',cr,lf,'$'
+erms22	db	cr,lf,'?No capture file open$' ;[jd]
+esctl	db	'Control-$'         ; [6]
+
+inthlp  db	cr,lf,' ?  This message'
+	db	cr,lf,' C  Close the connection'
+	db	cr,lf,' S  Status of the connection'
+	db	cr,lf,' B  Send a break'
+	db	cr,lf,' M  Toggle mode line'
+	db	cr,lf,' Q  Quit logging'
+	db	cr,lf,' R  Resume logging'
+	db	cr,lf,' 0  Send a null'
+	db	cr,lf,' Typing the escape character will send it to the host'
+	db	0
+
+intprm	db	'Command>$'
+
+CPTFCB	DB	25H DUP (?)
+CAPBUF	DB	200 DUP (?)
+CAPBP	DW	?
+CAPLFT	DB	?
+
+SCNTLEN	EQU	200		; MAX # OF DEFINITIONS ONE can have
+defbsiz	equ	400		; combined length of all definitions...
+scntab	dw	scntlen dup (?)	; scan codes redefined
+deftab	dw	scntlen dup (?) ; pointer to definition strings
+defbuf	db	defbsiz dup (?)
+defptr	dw	defbuf		; pointer starts at beginning
+deflen	dw	defbsiz		; amt of space left in buffer
+sttmsg	db	'Type space to continue$'
+shkmsg	db	cr,lf,'Press key: $'
+datas	ends
+
+code	segment	public
+	extrn 	comnd:near, outchr:near, stat0:near
+	extrn	escprt:near, clrbuf:near, term:near
+	extrn	cmblnk:near, locate:near, prtchr:near
+	extrn	beep:near, puthlp:near
+	extrn	serini:near,serrst:near, sendbr:near, showkey:near
+	assume	cs:code, ds:datas
+
+; the show key command.
+
+shokey	proc	near
+	mov	ah,cmcfm		; confirm with carriage return
+	call	comnd
+	 jmp	r			; uh oh...
+	mov	dx,offset shkmsg
+	mov	ah,prstr
+	int	dos			; print a prompt for it
+	mov	ax,offset targ		; give it terminal arg block.
+	call	showkey			; show them the key definition
+	push	ax
+	push	cx			; save results
+	mov	dx,offset crlf
+	mov	ah,prstr
+	int	dos
+	pop	cx
+	pop	ax
+	call	prkey			; print the buffer
+	mov	dx,offset crlf
+	mov	ah,prstr
+	int	dos
+	jmp	rskp			; and return
+shokey	endp
+
+; pass a string pointer in ax, length in cx.
+; Prints the string, quoting any unprintables, except crlf.
+
+prkey	proc	near
+	mov	si,ax			; copy string ptr
+	jcxz	prke6			; no string, stop here
+prke1:	push	cx			; save counter
+	lodsb				; get a byte
+	and	al,7fH			; only consider low-order 7 bits.
+	cmp	al,' '			; printable?
+	jb	prke2			; no, print the hard way
+	cmp	al,7fH			; maybe a delete?
+	jne	prke4			; no, can just put into string
+prke2:	jcxz	prke3			; last char, can't be crlf
+	cmp	al,cr			; carriage return?
+	jne	prke3			; no, go on
+	cmp	byte ptr [si],lf	; followed by linefeed?
+	jne	prke3
+	mov	ah,prstr
+	mov	dx,offset crlf
+	int	dos			; else just print crlf
+	inc	si			; skip over lf
+	pop	cx			; careful...
+	dec	cx
+	push	cx
+	jmp	short prke5
+prke3:	push	ax			; preserve the char
+	mov	ah,conout
+	mov	dl,'\'
+	int	dos			; print the quote character
+	pop	ax
+	call	proct			; print the octal byte
+	jmp	short prke5
+prke4:	mov	dl,al			; normal char, just print it
+	mov	ah,conout
+	int	dos
+prke5:	pop	cx			; restore count
+	loop	prke1
+prke6:	ret				; and return
+prkey	endp
+
+; print the byte in al as an octal number
+proct	proc	near
+	mov	dl,al			; get the byte
+	and	dl,7h			; keep low-order byte
+	mov	cl,3
+	shr	al,cl			; shift to get next digit
+	jz	proc1			; 0, no more to print
+	push	dx			; else save current digit
+	call	proct			; print rest
+	pop	dx
+proc1:	mov	ah,conout
+	add	dl,'0'			; make printable
+	int	dos
+	ret
+proct	endp
+
+;	This is the CONNECT command.
+ 
+TELNET 	PROC	NEAR
+	mov ah,cmcfm
+	call comnd		; Get a confirm.
+	 jmp r			;  Didn't get a confirm.
+	mov ah,prstr		; Output
+	mov dx,offset crlf	; a crlf.
+	int dos
+	call domsg		; Reassure user. [19b]
+	mov al,targ.flgs	; get present flags
+	and al,modoff		; this is only one we can keep around
+	or al,havtt		; defaults (!)
+	cmp flags.debug,0	; debug mode?
+	jz tel0			; no, keep going
+	or al,trnctl		; yes, show control chars
+tel0:	cmp flags.vtflg,0	; vt52 emulation?
+	jz tel1
+	or al,emheath
+tel1:	mov bx,portval
+	cmp [bx].ecoflg,0	; echoing?
+	jz tel2
+	or al,lclecho
+tel2:	mov targ.flgs,al	; store flags
+	mov ah,flags.comflg
+	mov targ.prt,ah		; Port 1 or 2
+	mov ah,trans.escchr
+	mov targ.escc,ah
+	mov ah,[bx].parflg
+	mov targ.parity,ah
+	mov ax,[bx].baud
+	mov targ.baudb,al
+	mov ah,flags.capflg
+	and ah,capt
+	or targ.flgs,ah
+	call serini		; init serial port
+tem:	mov ax,offset targ	; Point to terminal arguments
+	call term
+	or targ.flgs,scrsam	; assume screen is the same.
+intchr:	mov ah,dconio		; Direct console I/O.
+	mov dl,0FFH		; Input.
+	int dos			; Get a char.
+	jz intchr		; no char, keep looking
+	mov ah,al
+	jz intchr		; If so, go until we get a char.
+	cmp ah,' '		; space - ignore it
+	je tem
+	mov bh,ah		; Save the actual char.
+	and ah,not ('a'-'A')	; Convert to upper case.
+	or ah,40H		; convert ctl-char to actual char.
+	cmp ah,'C'		; Is it close?
+	jne intch1
+	call serrst		; reset serial port
+	jmp rskp		; and return
+intch1: cmp ah,'S'		; Is it status?
+	jnz intch2
+	call stat0		; If so, call stat0.
+	call puthlp		; put help on screen
+	mov dx,offset sttmsg
+	mov ah,prstr
+	int dos
+intch1a:mov ah,8		; console input, no echo
+	int dos
+	cmp al,' '		; space?
+	jne intch1a
+	and targ.flgs,not scrsam ; remember screen changed.
+	jmp tem
+intch2: cmp ah,'B'		; Send a break? [20g]
+	jne intch3		; No. [20g]
+	call sendbr		; Yes, so send a break. [20g]
+	jmp tem			; And return.  [20g]
+intch3:	cmp ah,'M'		; mode line?
+	jne intch4
+	xor targ.flgs,modoff	; toggle mode line
+	jmp tem			; and reconnect
+intch4:	cmp bh,'?'		; Is it help?
+	jne intch5		; If not, go to the next check.
+	mov ax,offset inthlp	; If so, get the address of the help message.
+	call puthlp		; write help msg
+	mov dx,offset intprm
+	mov ah,prstr		; Print it.
+	int dos
+	and targ.flgs,not scrsam ; remember screen changed
+	jmp intchr		; Get another char.
+intch5: cmp bh,trans.escchr	; Is it the escape char?
+	jne intch7		; If not, go send a beep to the user.
+intch6: mov ah,al
+	call outchr
+	nop
+	nop
+	nop
+	jmp tem			; Return, we are done here.
+intch7:	cmp ah,'Q'		; maybe want to stop logging?
+	jne intch8
+	test targ.flgs,capt	; not capturing, can't do this
+	jz intc10
+	and targ.flgs,not capt ; stop capturing
+	jmp tem			; and resume
+intch8:	cmp ah,'R'		; maybe resume?
+	jne intch9		; no, keep going
+	cmp flags.capflg,0	; can we capture?
+	jz intc10		; no, forget it
+	test targ.flgs,capt	; already capturing?
+	jnz intc10		; yes, can't toggle back on then
+	or targ.flgs,capt	; else turn flag on
+	jmp tem			; and resume
+intch9:	cmp bh,'0'		; perhaps want a null (note original chr in bh)
+	jne intc10
+	mov ah,0
+	call outchr
+	nop
+	nop
+	nop
+	jmp tem
+intc10:	call beep
+	jmp tem
+TELNET  ENDP
+
+; Reassure user about connection to the host.  Tell him what escape
+; sequence to use to return and the communications port and baud
+; rate being used.   [19b] 
+
+DOMSG	PROC	NEAR
+	mov ah,prstr
+	mov dx,offset tmsg1
+	int dos
+	call escprt
+	mov ah,prstr
+	mov dx,offset tmsg3
+	int dos
+	ret
+DOMSG	ENDP
+
+
+; Set parity for character in Register AL.
+
+dopar:	push bx
+	mov bx,portval
+	cmp [bx].parflg,parnon	; No parity?			[10 start]
+	je parret		; Just return
+	cmp [bx].parflg,parevn	; Even parity?
+	jne dopar0
+	and al,07FH		; Strip parity.
+	jpe parret		; Already even, leave it.
+	or al,080H		; Make it even parity.
+	jmp parret
+dopar0:	cmp [bx].parflg,parmrk	; Mark parity?
+	jne dopar1
+	or al,080H		; Turn on the parity bit.
+	jmp parret
+dopar1:	cmp [bx].parflg,parodd	; Odd parity?	
+	jne dopar2
+	and al,07FH		; Strip parity.
+	jpo parret		; Already odd, leave it.
+	or al,080H		; Make it odd parity.
+	jmp parret
+dopar2: and al,07FH		; Space parity - turn off parity bit.
+parret:	pop bx
+	ret					; [10 end]
+
+inicpt	proc	near
+	mov	capbp,offset capbuf
+	mov	caplft,128		; init buffer ptr & chrs left
+	ret				; and return
+inicpt	endp
+
+
+cptchr	proc	near			; capture routine, char in al
+	push	di
+	mov	di,capbp
+	mov	byte ptr [di],al
+	inc	di
+	mov	capbp,di		; restore pointer
+	pop	di
+	dec	caplft			; decrement chars remaining
+	jnz	cptch1			; more room, forget this part
+	call	cptdmp			; dump the info
+	call	inicpt			; re-init ptrs.
+cptch1:	ret				; and return
+cptchr	endp
+
+cptdmp	proc	near			; empty the capture buffer
+	push	ax
+	push	dx
+	mov	ah,setdma
+	mov	dx,offset capbuf	; the capture routine buffer
+	int	dos
+	mov	ah,writef
+	mov	dx,offset cptfcb
+	int	dos			; write out the block
+;*** must be fixed... check error returns, disable capturing,
+;*** figure out how to put dma address back
+	mov	dx,offset buff
+	mov	ah,setdma
+	int	dos			; put dma back
+	pop	dx
+	pop	ax
+	ret
+cptdmp	endp
+
+clscpt	proc	near
+	test	flags.capflg,0FFH	; doing capture
+	jnz	clscp1			; yes, go ahead
+	mov	dx,offset erms22
+	mov	ah,prstr
+	int	dos
+	jmp	rskp
+clscp1:	mov	ah,cmcfm
+	call	comnd
+	 jmp	r
+clscpi:	mov	al,'Z'-64		; control-z for eof...
+	call	cptchr			; output to file
+	mov	al,caplft
+	cmp	al,128			; is buffer empty?
+	je	clscp2			; yes, forget this stuff
+	call	cptdmp			; dump buffer (preserves registers)
+clscp2:	mov	ah,0
+	sub	word ptr cptfcb+16,ax	; subtract remaining from low filsize
+	sbb	word ptr cptfcb+18,0	; and from high size (with borrow)
+	mov	ah,closf
+	mov	dx,offset cptfcb
+	int	dos			; close up file
+	mov	flags.capflg,0		; no longer capturing...
+	jmp	rskp			; and return
+clscpt	endp
+
+; enter with ax/scan code to define, si/ pointer to definition, cx/ length
+; of definition.  Defines it in definition table.
+;*** somewhere should check for overflow etc of defbuf, and of scntab
+defkey	proc	near
+	push	ax		; save scan code
+	mov	ax,ds
+	mov	es,ax		; address data segment
+	mov	di,defptr	; this is where the def gets built
+	inc	di		; leave a byte for length
+defk1:	lodsb			; get a byte from the source
+	cmp	al,'\'		; escape?
+	jne	defk2		; no, just deposit him
+	dec	cx		; count available is one less
+	call	trnesc		; translate the escape sequence
+	inc	cx		; account for '\' (loop will decrement again).
+defk2:	stosb			; drop off character
+	loop	defk1		; and keep going while we have more
+	mov	ax,di		; get ptr to end
+	dec	ax		; back up pointer to end
+	mov	si,defptr	; pick up old ptr value
+	sub	ax,si		; this is actual length used
+	mov	byte ptr [si],al ; fill in length of entry
+	mov	defptr,di	; this is next free byte
+; definition address is in si
+	pop	ax		; recover scan code
+	mov	cx,targ.klen	; length of scan table
+	jcxz	defk4		; not there, just go add it
+	mov	di,offset scntab ; the scan code table
+	repne	scasw		; look for this one
+	jne	defk4		; not defined already
+	sub	di,offset scntab + 2 ; compute index into table
+	mov	deftab[di],si	; fill in address
+	ret			; and return
+defk4:	mov	di,targ.klen	; get length again
+	inc	di
+	cmp	di,scntlen
+	ja	defk5		;** ignore def if over size
+	mov	targ.klen,di	; update length
+	shl	di,1		; double for word index
+	mov	scntab[di-2],ax	; put scan code into table
+	mov	deftab[di-2],si	; and fill in definition
+defk5:	ret			; that's it
+defkey	endp
+
+; enter with si/ source pointer, cx/ count
+; converts an escape sequence, updates all pointers
+trnesc	proc	near
+	push	bx
+	push	dx		; preserve these
+	mov	al,0		; this is current accumulation
+	jcxz	trnes2		; empty string, forget it
+	mov	bl,3		; this is max # of digits to use
+	mov	bh,8		; this is radix
+trnes1:	mov	dl,[si]
+	cmp	dl,'0'
+	jb	trnes2		; out of range, stop here
+	cmp	dl,'7'
+	ja	trnes2
+	inc	si		; accept character
+	sub	dl,'0'		; convert to binary
+	mul	bh		; shift accumulation
+	add	al,dl		; add to accumulation
+	dec	bl		; decrement digit counter
+	loopnz	trnes1		; and keep trying
+trnes2:	pop	dx
+	pop	bx
+	ret			; and return
+trnesc	endp
+
+; Jumping to this location is like retskp.  It assumes the instruction
+;   after the call is a jmp addr.
+ 
+RSKP	PROC	NEAR
+	pop bp
+	add bp,3
+	push bp
+	ret
+RSKP	ENDP
+ 
+; Jumping here is the same as a ret.
+ 
+R	PROC	NEAR
+	ret
+R	ENDP
+
+code	ends 
+	end
+
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msterm.asm
+	/bin/echo -n '	'; /bin/ls -ld msterm.asm
+fi
+/bin/echo 'Extracting msapc.hlp'
+sed 's/^X//' <<'//go.sysin dd *' >msapc.hlp
+
+This note describes the capabilities of MS-DOS MSKermit as implemented for
+the NEC Advanced Personal Computer (APC).  The APC system dependent portion of
+the code (both port and terminal handlers) resides in the file MSXAPC.ASM.
+This is the only module required in addition to those that all implementations
+need.
+
+MSKermit on the APC supports both the standard serial port (as port 1) and
+the optional (H14) add-on serial port (as port 2).  Port selection is
+performed using the SET PORT command.  Any baud rate up to 38400 is legal
+although 38400 has never been tested and may not work well.  The port is
+always configured as 8 data bits, no parity, and 1 stop bit.  Any necessary
+parity is supplied by Kermit.
+
+The interrupt vector used by the optional port is jumper-selectable.  Kermit
+is set up to use IR8 by default, so if another vector is required the
+MSXAPC.ASM file must be altered and reassembled.  The changes are well
+commented, and only amount to changing the value of a conditional.
+
+Terminal mode support on the APC is relatively primitive.  The only provisions
+that have been made for emulation are in the operating system firmware, which
+supports a limited subset of both VT100/ANSI and ADM-3A commands.
+
+Two pages of screen memory and rollback are also provided by the firmware.
+Control-uparrow scrolls back one line, while control-downarrow scrolls forward
+a line.
+
+Screen printing is performed by the CRTDUMP resident extension to MS-DOS
+using the control-print command.  The print (or control-P) key alone causes
+Kermit to toggle echoing of the screen display to the printer.
+
+Key redefinition is provided, but only for the keyboard keys.  The function
+keys must be defined using the system's KEY program.  There is no direct
+access to the keyboard's scan codes on the APC, so instead each key is
+redefined by its ASCII value, limiting the usefulness of this function.
+
+The default escape character is control-].  Bugs in the firmware prevent
+this control sequence from being returned to the program, however, so it
+is necessary to instead use the left arrow key which sends the control-]
+code.  Another alternative is to redefine the escape character in your
+MSKERMIT.INI initialization file.
+
+
+Despite these limitations, MSKermit for the APC is being released so that
+the benefits of its file transfer capability are available to APC MS-DOS
+users.  It is to be hoped that these users will take it on themselves to
+enhance the capabilities.
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msapc.hlp
+	/bin/echo -n '	'; /bin/ls -ld msapc.hlp
+fi
+/bin/echo 'Extracting mskermit.hlp'
+sed 's/^X//' <<'//go.sysin dd *' >mskermit.hlp
+
+
+               KERMIT VERSION 2.26 FOR MS-DOS AND PC-DOS
+
+                             July 26, 1984
+
+Kermit-MS is a program that provides terminal emulation and file trans-
+fer for Intel 8088- and 8086-based microcomputers running the MS-DOS or
+PC-DOS operating system.  The Kermit file transfer protocol was
+developed and the Kermit-MS program were developed at the Columbia
+University Center for Computing Activities.
+
+
+* Program Operation
+
+Kermit-MS can be run interactively, from a batch file, or as an
+"external" DOS command.  Commands consist of one or more fields,
+separated by "whitespace" -- one or more spaces or tabs.  Upon startup,
+the program executes any commands found in the file MSKERMIT.INI in the
+current path.
+
+X. Interactive Operation:
+
+To run Kermit-MS interactively, invoke the program from DOS command
+level by typing its name.  When you see the command's prompt,
+"Kermit-MS>", you may type Kermit commands repeatedly until you are
+ready to exit the program.  You can use these special characters while
+typing commands.
+
+BACKSPACE  Delete the character most recently typed.  May be typed
+        repeatedly to delete backwards.  You may also use DELETE,
+        RUBOUT, or equivalent keys.
+
+CTRL-W  Delete the most recent "word", or field, on the command line.
+        May be typed repeatedly.
+
+CTRL-U  Delete the entire command line.
+
+CTRL-C  Cancel the current command and return to the "Kermit-MS>"
+        prompt.
+
+?       Type a brief message describing what you are expected to type in
+        the current field.
+
+ESC     If enough characters have been supplied in the current field
+        (keyword or file name) to uniquely identify it, supply the
+        remainder of the field and position to the next field of the
+        command.  Otherwise, sound a beep.
+
+=       Wildcard character for matching single characters in filenames,
+        equivalent to MS-DOS "?".
+
+X. Command Line Invocation:
+
+Kermit-MS may also be invoked with command line arguments from DOS com-
+mand level, for instance:
+
+    A>kermit send foo.bar
+or
+    A>kermit set port 1, set baud 9600, connect
+
+When invoked with command line arguments, Kermit-MS will behave as if it
+were an external DOS command, like MODE.  Note that several commands may
+be given on the command line, separated by commas.
+
+
+* Kermit-MS Commands
+
+Kermit-MS V2.26 has the following commands:
+
+          BYE  to remote server.
+        CLOSE  log file and stop logging remote session.
+      CONNECT  as terminal to remote system.
+       DEFINE  macros of Kermit-MS commands.
+       DELETE  local files.
+    DIRECTORY  listing of local files.
+           DO  a macro expansion.
+         EXIT  from Kermit-MS.
+       FINISH  Shut down remote server.
+          GET  remote files from server.
+         HELP  about Kermit-MS.
+        LOCAL  prefix for local file management commands.
+          LOG  remote terminal session.
+       LOGOUT  remote server.
+         PUSH  to MS-DOS command level.
+         QUIT  from Kermit-MS
+      RECEIVE  files from remote Kermit.
+       REMOTE  prefix for remote file management commands.
+          RUN  an MS-DOS program.
+         SEND  files to remote Kermit.
+       SERVER  mode of remote operation.
+          SET  various parameters.
+         SHOW  various parameters.
+        SPACE  inquiry.
+       STATUS  inquiry.
+         TAKE  commands from file.
+
+The following SET commands are available in Kermit-MS:
+
+                BAUD  Communications port line speed
+                BELL  Whether to beep at the end of a transaction
+    BLOCK-CHECK-TYPE  Level of error checking for file transfer
+               DEBUG  Display packet contents during file transfer
+        DEFAULT-DISK  Default disk drive for file i/o
+         DESTINATION  Default destination device for incoming files
+         END-OF-LINE  Packet terminator
+                 EOF  Method for determining or marking end of file
+              ESCAPE  Escape character for CONNECT
+        FLOW-CONTROL  Enable or disable XON/XOFF
+           HANDSHAKE  Half-duplex line turnaround option
+             HEATH19  Heath/Zenith-19 terminal emulation
+          INCOMPLETE  What to do with an incompletely received file
+                 KEY  Specify key redefinitions, or "keystroke macros"
+          LOCAL-ECHO  Specify which host does the echoing during CONNECT
+              PARITY  Character parity to use
+                PORT  Select a communications port
+              PROMPT  Change the "Kermit-MS>" prompt to something else
+             RECEIVE  Request remote Kermit to use specified parameters
+              REMOTE  For running Kermit-MS interactively from back port
+                SEND  Use the specified parameters during file transfer
+           TAKE-ECHO  Control echoing of commands from TAKE files
+               TIMER  Enable/disable timeouts during file transfer
+             WARNING  Specify how to handle filename collisions
+
+The STATUS command shows the values of parameters which may be SET.
+
+
+* Command Macros
+
+Kermit-MS provides a facility for combining commands into "macros."
+Command macro definitions may be included in your MSKERMIT.INI file,
+TAKEn explicitly from a specified file, or typed interactively, and may
+be invoked with the DO command.
+
+
+* Command Macros
+
+Kermit-MS command macros are constructed with the DEFINE command.  The
+syntax is 
+
+    DEFINE macro-name  [command [, command [, ...]]]
+
+Any Kermit-MS commands may be included.  Example:
+
+    define telenet set parity mark, set baud 1200, connect
+
+A Kermit-MS command macro is invoked using the DO command.  For in-
+stance, Kermit-MS comes with a predefined macro to allow convenient
+setup for IBM communications; to invoke it, you would type 
+
+    do ibm
+
+The IBM macro is defined as "parity mark, handshake xon, local-echo on,
+timer on".  You can delete or replace this definition by adding a new
+(perhaps null) definition, such as
+
+    define ibm parity even, handshake cr, local-echo on, timer on]
+or
+    define ibm
+
+Command macro definitions can be displayed with the SHOW MACROS command.
+
+
+* Terminal Emulation
+
+Here are the terminal emulation options for the systems presently sup-
+ported by Kermit-MS:
+
+  System         EscChar   Cabilities   Terminal Service
+  IBM PC, XT       ^]      R M P K      Heath19 emulation
+  DEC Rainbow      ^]      R   P K      VT102 firmware
+  HP-150           ^]      R            HP-2623 firmware
+  Wang PC          ^A                   Wang firmware
+  Generic DOS      ^]                   Depends on system
+
+Under Capabilities, R means rollback, M means mode line, P means printer
+control, and K means key redefinition.
+
+IBM PC/XT Kermit can disable Heath-19 emulation and use an external con-
+sole device driver like ANSI.SYS instead.
+
+The escape character is used to regain the attention of Kermit-MS.  When
+you type the escape character, Kermit-MS waits for you to follow it with
+a single character command:
+
+  ?   Help -- prints the available single-character commands.
+  C   Close the connection and return to Kermit-MS prompt level.
+  S   Show the status of the connection.
+  B   Send a BREAK signal to the port.
+  0   (the digit zero) Send a NUL (ASCII 0) to the port.
+  Q   Temporarily quit logging the remote session.
+  R   Resume logging the remote session.
+  M   Toggle the mode line, i.e. turn it off if it is on & vice versa.
+  ^]  (or whatever you have set the escape character to be)
+      Typing the escape character twice sends one copy of it to the con-
+      nected host.
+
+Typing any other character (except the space bar, which is the "null
+command") after the escape character will cause Kermit-MS to beep, but
+will do no harm.  The escape character can be changed to something other
+than Control-Rightbracket by using the SET ESCAPE command.
+
+Kermit-MS includes several advanced features for use during terminal
+emulation, including screen scroll, printer control, and key redefini-
+tions.
+
+X. Screen Scroll
+
+Kermit-MS provides several pages of screen memory, which may be scrolled
+up and down using keys as follows:
+
+  Function            IBM PC/XT   Rainbow           HP-150
+  Screen Down         PgDn        PrevScreen        Prev
+  Line Down           Ctrl-PgDn   Ctrl-PrevScreen   Shift-UpArrow
+  Screen Up           PgUp        NextScreen        Next
+  Line Up             Ctrl-PgUp   Ctrl-NextScreen   Shift-DownArrow
+  Top of Memory       Home
+  Bottom of Memory    End
+
+X. Printer Control
+
+A locally attached printer may be controlled in the normal manner, on
+most systems.  Pushing the "Print Screen" key (shifted on some systems)
+will cause the current contents of the screen to be printed or spooled;
+holding down CTRL while depressing Print Screen will start or stop the
+spooling of incoming characters to the printer.
+
+CTRL-Print-Screen can be simulated with the Kermit-MS LOG PRN and CLOSE
+commands.
+
+X. Key Redefinitions
+
+Use SHOW KEY to find out the scan code of the key you want to redefine,
+then use SET KEY SCAN xxx to define the new value.  Control characters
+are entered in the definition string as \ooo (a backslash followed by 2
+or 3 octal digits denoting the ASCII value of the character).
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 mskermit.hlp
+	/bin/echo -n '	'; /bin/ls -ld mskermit.hlp
+fi
+/bin/echo 'Extracting msmkboo.c'
+sed 's/^X//' <<'//go.sysin dd *' >msmkboo.c
+X/* MSNKBOO.C
+ *
+ * This program takes a file and encodes it into printable characters.
+ * These printable files can then be decoded by the programs MSPCBOOT.BAS
+ * or MSPCTRAN.BAS as the need may be.  The file is encoded by taking
+ * three consecutive eight bit bytes and dividing them into four six bit
+ * bytes.  An ASCII zero was then added to the resulting four characters.
+ * to make them all printable ASCII characters in the range of the
+ * character zero to the character underscore.  In order to reduce the
+ * size of the file null repeat count was used.  The null repeat count
+ * compresses up to 78 consecutive nulls into only two characters.  This
+ * is done by using the character tilde (~) as an indication that a group
+ * of repetitive nulls has occured.  The character following the tilde is
+ * number of nulls in the group.  The number is also converted in to a
+ * printable character by adding an ASCII zero.  The highest number of
+ * nulls is therefore the highest printable character tilde.  This is
+ * equal to tilde minus zero nulls or 78 nulls.  Because of the three
+ * byte to four byte encoding the repeat counting can only start with
+ * the first character of a three byte triplet.
+ *
+ * This C program was written specifically for the DEC-20 and as such
+ * will not easily be transported to another system.  The main problem
+ * lies in the file I/O routines.  It is necessary to make sure that
+ * untranslated eight bit bytes are input from the input file.  The 
+ * main change would be to make the OPEN statement reflect this for 
+ * your particular system and brand of UNIX and C.  The rest of the
+ * program should be transportable with little or no problems.
+ *
+ */
+
+
+#include <stdio.h>		/* Standard UNIX i/o definitions */
+#include <file.h>
+
+X/* Symbol Definitions */
+
+#define MAXPACK		80	/* Maximum packet size */
+
+#define MYRPTQ		'~'	/* Repeat count prefix I will use */
+#define DATALEN		78	/* Length of data buffer */
+
+#define TRUE		-1	/* Boolean constants */
+#define FALSE		0
+
+X/* Macros */
+
+#define tochar(ch)  ((ch) + '0')
+
+X/* Global Variables */
+
+int	size,			/* Size of present data */
+	maxsize,		/* Max size for data field */
+        nc,			/* Number of input chars */
+        oc,			/* Number of output chars */
+	fd,			/* File pointer of file to read/write */
+	ofd,
+	rpt,			/* repeat count */
+	rptq,			/* repeat quote */
+	rptflg,			/* repeat processing flag */
+	eoflag,			/* Set when file is empty. */
+	otot;			/* What char number we are processing. */
+
+char	t,			/* Current character */
+	one,
+	two,
+	three,
+	*filnam,		/* Current file name */
+        *ofile,
+	packet[MAXPACK];	/* Packet buffer */
+
+main(argc,argv)				/* Main program */
+int argc;				/* Command line argument count */
+char **argv;				/* Pointers to args */
+{
+    char sfile();		        /* Send file routine & ret code */
+    if (--argc != 2) usage();		/* Make sure there's a command line. */
+    rptq = MYRPTQ;			/* Repeat Quote */
+    rptflg = TRUE;			/* Repeat Count Processing Flag */
+
+    filnam = *++argv;			/* Get file to send */
+    ofile = *++argv;			/* Output file to create */
+    sfile();
+    printf("Done, in: %d, out: %d, efficiency: %.2f%%\n",nc,oc,(100.0*nc)/oc);
+}
+
+X/*
+   S F I L E - Send a whole file
+*/
+
+char sfile()				/* Send a file */
+{
+    char *i;
+
+    fd = open(filnam,FATT_RDONLY|FATT_BINARY|FATT_DEFSIZE);
+    if (fd < 0)				/* Report any errors */
+    {
+        printf("\n?Error opening file \"%s\"\n",filnam);
+        exit(1);
+    }
+
+    ofd = open(ofile,FATT_WRONLY|FATT_CREATE|FATT_BINARY);
+    if (ofd < 0)
+    {
+        printf("\n?error opening file \"%s\"\n",ofile);
+        exit(1);
+    }
+
+    oc = strlen(filnam);		/* Get the string length. */
+    for (i=filnam; *i != '\0'; i++)	/* Uppercase the file name. */
+	if (*i >= 'a' && *i <= 'z') *i ^= 040;
+    write(ofd,filnam,oc);	 	/* Write the file name in the file. */
+    write(ofd,"\r\n",2);
+
+    maxsize = DATALEN - 5;
+    rpt = 0;				/* Zero the repeat count. */
+    oc = nc = 0;			/* Output & input character counts. */
+    otot = 1;				/* Start with first char of triplet. */
+    while (getbuf() > 0)		/* While not EOF, get a packet. */
+    {
+	while (size < DATALEN - 1) packet[size++] = ' ';
+	packet[size++] = '\r';		/* Explicit CRLF. */
+	packet[size++] = '\n';
+	packet[size] = '\0';
+        oc += size;			/* Count output size. */
+        write(ofd,packet,size);		/* Write the packet to the file. */
+        printf("%d: %s",size,packet);	/* Print on the screen for testing. */
+    }
+}
+X/*
+   G E T B U F -- Do one packet.
+*/
+
+getbuf()				/* Fill one packet buffer. */
+{
+    if (eoflag != 0) return(-1);	/* If at the end of file, stop. */
+    size = 0;
+    while((t = getch()) >= 0)		/* t == -1 means EOF. */
+    {
+	nc++;				/* Count the character. */
+        process(t);			/* Process the character. */
+	if (size >= maxsize)		/* If the packet is full, */
+	{
+            packet[size] = '\0';	/*  terminate the string. */
+            return(size);
+        }
+    }
+    eoflag = -1;			/* Say we hit the end of the file. */
+    process(0);				/* Clean out any remaining chars. */
+    process(0);
+    process(' ');
+    packet[size] = '\0';		/* Return any partial final buffer. */
+    return(size);
+}
+
+X/* P R O C E S S -- Do one character. */
+
+process(a)
+char a;
+{
+    if (otot == 1)			/* Is this the first of three chars? */
+    {
+        if (a == 0)			/* Is it a null? */
+        {
+	    if (++rpt < 78)		/* Below max nulls, just count. */
+                return;
+	    else if (rpt == 78)		/* Reached max number, must output. */
+	    {
+                packet[size++] = rptq;	/* Put in null repeat char and */
+                packet[size++] = tochar(rpt); /* number of nulls. */
+                packet[size] = '\0';
+                rpt = 0;
+	        return;
+	    }
+        }
+	else
+        {
+	    if (rpt == 1)		/* Just one null? */
+	    {
+		one = 0;		/* Say the first char was a null. */
+		two = a;		/* This char is the second one. */
+		otot = 3;		/* Look for the third char. */
+		rpt = 0;		/* Restart null count. */
+		return;
+	    }
+	    if (rpt > 1)		/* Some number of nulls? */
+	    {
+                packet[size++] = rptq;	/* Insert the repeat prefix */
+                packet[size++] = tochar(rpt); /* and count. */
+                packet[size] = '\0';
+                rpt = 0;		/* Reset repeat counter. */
+ 	    }
+	    one = a;			/* Set first character. */
+	    otot = 2;			/* Say we are at the second char. */
+	}
+    }
+    else if (otot == 2)
+    {
+	two = a;			/* Set second character. */
+	otot = 3;			/* Say we are at the third char. */
+    }
+    else
+    {
+        three = a;
+	otot = 1;			/* Start over at one. */
+	pack(one,two,three);		/* Pack in the three characters. */
+    }
+}
+
+X/* This routine does the actual three character to four character encoding.
+ * The concept is relatively straight forward.  The first output character
+ * consists of the first (high order or most significant) six bits of the
+ * first input character.  The second output character is made from the
+ * remaining two low order bits of the first input character and the first
+ * four high order bits of the second input character.  The third output
+ * character is built from the last four low order bits of the second input
+ * character and the two high order bits of the third input character.  The
+ * fourth and last output character consists of the six low order bit of
+ * the third input character.  In this way the three eight bit input char-
+ * acters (for a total of 24 bits) are divided into four six bit output
+ * characters (also for a total of 24 bits).  In order to make the four
+ * output characters printable an ASCII zero is then added to each of them.
+ *
+ */
+
+pack(x,y,z)
+char x,y,z;
+{
+    packet[size++] = tochar((x >> 2) & 077);
+    packet[size++] = tochar(((x & 003) << 4) | ((y >> 4) & 017));
+    packet[size++] = tochar(((y & 017) << 2) | ((z >> 6) & 003));
+    packet[size++] = tochar(z & 077);
+    packet[size] = '\0';
+}
+
+getch()					/* Get next (or pushed) char. */
+{
+   char a;
+
+   return((read(fd,&a,1) > 0) ? a : -1); /* (or -1 if EOF) */
+}
+
+usage()					/* Give message if user makes */
+{					/* a mistake in the command. */
+    fprintf(stderr,"usage: msmkboo inputfile outputfile\n");
+    exit(1);
+}//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msmkboo.c
+	/bin/echo -n '	'; /bin/ls -ld msmkboo.c
+fi
+/bin/echo 'Extracting mspctran.bas'
+sed 's/^X//' <<'//go.sysin dd *' >mspctran.bas
+1    'Use this BASIC program on the PC if you have the printable file 
+2    'MSKERMIT.BOO already on the PC to convert it to an executable
+3    'file.  This program takes about 30 minutes to run on a PC with
+4    'floppy disks.
+5    ' Bill Catchings, June 1984
+6    ' Columbia University Center for Computing Activities
+
+10   t$ = time$				' Save the time.
+20   defint a-z				' Integer to gain some speed.
+30   n$ = chr$(0)
+40   z = asc("0")
+50   t = asc("~")-z
+60   def fnuchr%(a$)=asc(a$)-z
+70   open "MSKERMIT.BOO" for input as #1
+
+100  input#1,f$				' Is this the right file?
+110  if len(f$) > 20 then goto 900
+120  open f$ for output as #2
+130  print "Outputting to "+f$
+
+200  if eof(1) then goto 800		' Exit nicely on end of file.
+210  input#1,x$				' Get a line.
+220  y$ = ""				' Clear the output buffer.
+230  goto 400
+
+300  print#2,y$;			' Print output buffer to file.
+310  goto 200				' Get another line.
+
+400  if len(x$) < 4 goto 300		' Is the input buffer empty?
+410  a = fnuchr%(x$)
+420  if a = t then goto 700		' Null repeat character?
+430  q$=mid$(x$,2,3)			' Get the quadruplet to decode.
+440  x$=mid$(x$,5)
+450  b = fnuchr%(q$)
+460  q$ = mid$(q$,2)
+470  c = fnuchr%(q$)
+480  q$ = mid$(q$,2)
+490  d = fnuchr%(q$)
+
+500  y$ = y$ + chr$(((a * 4) + (b \ 16)) and 255) ' Decode the quad.
+510  y$ = y$ + chr$(((b * 16) + (c \ 4)) and 255)
+520  y$ = y$ + chr$(((c * 64) + d) and 255)
+530  goto 400				' Get another quad.
+
+700  x$ = mid$(x$,2)			' Expand the nulls.
+710  r = fnuchr%(x$)			' Get the number of nulls.
+715 print " Null: ",r
+720  x$ = mid$(x$,2)
+730   for i=1 to r			' Loop, adding nulls to string.
+740   y$ = y$ + n$
+750   next
+760  print#2,y$;			' Output the nulls to the file.
+770  y$ = ""				' Clear the output buffer.
+780  goto 400
+
+800  print "Processing complete, elapsed time: "+t$+" to "+time$
+810  print "Output in "+f$
+820  close #1,#2
+830  goto 9999
+
+900  print "?The version of the MSKERMIT.BOO file is incorrect"
+910  goto 820
+
+9999 end//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 mspctran.bas
+	/bin/echo -n '	'; /bin/ls -ld mspctran.bas
+fi
+/bin/echo 'Extracting msrbboo.bas'
+sed 's/^X//' <<'//go.sysin dd *' >msrbboo.bas
+1 DEFINT A-Z:ZRUBOUT$=CHR$(8)+" "+CHR$(8):ZESCAPE$=CHR$(27):'Sreen utility definitions B.E.
+2 ZLEADIN$=ZESCAPE$+"[":ZCLEAR$=ZLEADIN$+"J":ZHOME$=ZLEADIN$+"0;0H"
+3 ZDOUBLE1$=ZESCAPE$+"#3":ZDOUBLE2$=ZESCAPE$+"#4":WIDTH 255
+4 ZBOLD$=ZLEADIN$+"1m":ZBLINK$=ZLEADIN$+"5m":ZSAVE$=ZESCAPE$+"7"
+5 ZREVERSE$=ZLEADIN$+"7m":ZOFF$=ZLEADIN$+"0m":ZREST$=ZESCAPE$+"8"
+6 ZGRAPHON$=ZESCAPE$+"(0":ZGRAPHOFF$=ZESCAPE$+"(B":ZBACKER$=ZLEADIN$+"0K"
+7 ZKEYPAD$=ZESCAPE$+"=":ZBELL$=CHR$(7):ZCLRLIN$=ZLEADIN$+"2K"
+8 DEF FNXY$(ZX,ZY)=ZLEADIN$+MID$(STR$(INT(ZX)),2)+";"+MID$(STR$(INT(ZY)),2)+"H":'Cursor Adressing function (ZX=Line[1..24],ZY=Column[1..80])
+9 GOTO 25:'This to be modified to GOTO Start of program <===================
+10 ZSTRING$="":ZORGL=ZLENGTH:PRINT ZSAVE$+ZREVERSE$+STRING$(ZORGL,95)+ZOFF$+STRING$(ZORGL,8);:'General Input-GOSUB (Input:ZLENGTH, OUTPUT:ZLENGTH,ZSTRING,ZNUMBER,ZRANDOM)
+11 ZTEMP$=INKEY$:ZRANDOM=(ZRANDOM MOD 2000)+1:IF LEN(ZTEMP$)=0 THEN 11'Wait for Char
+12 IF ASC(ZTEMP$)=127 OR ASC(ZTEMP$)=8 THEN 17 ELSE IF ASC(ZTEMP$)=21 THEN PRINT ZREST$+ZBACKER$;:ZLENGTH=ZORGL:GOTO 10 ELSE PRINT ZTEMP$;'RUBOUT
+13 IF ASC(ZTEMP$)=3 THEN GOTO 9999 ELSE IF ZTEMP$ >= "a" THEN ZTEMP$=CHR$(ASC(ZTEMP$)-32)'Uppercase Modify GOTO xx to Control-C intercept <=====================
+14 IF ASC(ZTEMP$)=13 THEN PRINT:GOTO 16'RETURN finishes
+15 ZSTRING$=ZSTRING$+ZTEMP$:ZLENGTH=ZLENGTH-1:IF ZLENGTH >0 THEN 11
+16 ZLENGTH=LEN(ZSTRING$):ZNUMBER=VAL(ZSTRING$): RETURN
+17 IF LEN(ZSTRING$)>0 THEN ZLENGTH=ZLENGTH +1:ZSTRING$=LEFT$(ZSTRING$,(LEN(ZSTRING$)-1)):PRINT ZRUBOUT$;:GOTO 11 ELSE PRINT ZBELL$;: GOTO 11'Cleanup after RUBOUT
+18 'End of VT100 definitions *****
+
+19	'Use this BASIC program on the CP/M side of the Rainbow (with
+20	'Microsoft MBasic-86) to translate the MSRB100.BOO file on
+21	'your CP/M disk to binary .EXE format, then from the MS-DOS
+22	'side use RDCPM to transfer the result to the MS-DOS file
+23	'system.  This program takes about 30 minutes to run on a Rainbow
+24	'with floppy disks.
+25	'- Bill Catchings, CU; modified for Rainbow by Bernie Eiben, DEC.
+26	PRINT ZHOME$+ZCLEAR$;"Rainbow 4for3 Code Expander Version 1"
+30	PRINT:PRINT: N$ = CHR$(0)
+40	Z = ASC("0")
+50	T = ASC("~")-Z
+60	DEF FNUCHR%(A$)=ASC(A$)-Z
+61	PRINT "FILE-NAME to Expand : ";:ZLENGTH=13:GOSUB 10:'Get Input
+70	OPEN "I",1,ZSTRING$
+100	INPUT#1,F$			' Is this the right file?
+110	IF LEN(F$) > 20 THEN GOTO 900
+120	OPEN "O",2,F$			' Ouput-name from file
+130	PRINT "Outputting to "+F$
+200	IF EOF(1) THEN GOTO 800		' Exit nicely on end of file.
+210	INPUT#1,X$			' Get a line.
+220	Y$ = ""				' Clear the output buffer.
+230	GOTO 400
+300	PRINT#2,Y$;			' Print output buffer to file.
+310	GOTO 200			' Get another line.
+400	IF LEN(X$) < 4 GOTO 300		' Is the input buffer empty?
+410	A = FNUCHR%(X$)
+420	IF A = T THEN GOTO 700		' Null repeat character?
+430	Q$=MID$(X$,2,3)			' Get the quadruplet to decode.
+440	X$=MID$(X$,5)
+450	B = FNUCHR%(Q$)
+460	Q$ = MID$(Q$,2)
+470	C = FNUCHR%(Q$)
+480	Q$ = MID$(Q$,2)
+490	D = FNUCHR%(Q$)
+500	Y$ = Y$ + CHR$(((A * 4) + (B \ 16)) AND 255) ' Decode the quad.
+510	Y$ = Y$ + CHR$(((B * 16) + (C \ 4)) AND 255)
+520	Y$ = Y$ + CHR$(((C * 64) + D) AND 255)
+530	GOTO 400			' Get another quad.
+700	X$ = MID$(X$,2)			' Expand the nulls.
+710	R = FNUCHR%(X$)			' Get the number of nulls.
+715	PRINT FNXY$(6,5)+ZCLRLIN$;" Null: ",R
+720	X$ = MID$(X$,2)
+730	FOR I=1 TO R			' Loop, adding nulls to string.
+740	Y$ = Y$ + N$
+750	NEXT
+760	PRINT#2,Y$;			' Output the nulls to the file.
+770	Y$ = ""				' Clear the output buffer.
+780	GOTO 400
+800	PRINT "Processing complete"
+810	PRINT "Output in "+F$
+820	CLOSE #1,#2
+830	GOTO 9999
+900	PRINT "?The FORMAT of the ",ZSTRING$," file is incorrect"
+910	GOTO 820
+9999	END
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msrbboo.bas
+	/bin/echo -n '	'; /bin/ls -ld msrbboo.bas
+fi
+/bin/echo 'Extracting msrbboo.hlp'
+sed 's/^X//' <<'//go.sysin dd *' >msrbboo.hlp
+Date: Thu 13 Sep 84 16:32:44-EDT
+From: Frank da Cruz <SY.FDC@CU20B.ARPA>
+Subject: Rainbow MS-DOS Kermit Bootstrapping
+To: Info-Kermit@CU20B
+
+Users of DEC Rainbow 100s have complained that there's no bootstrapping
+procedure they can use for getting the new MS-DOS Kermit onto the Rainbow
+over the communication line.  The problem was that Basic was not available
+for MS-DOS on the Rainbow (or else it was so new that no one had it yet),
+so the Microsoft Basic program we provided for decoding the .BOO (4-for-3
+encoded) binary file could not be used on the Rainbow.
+
+Now, thanks to Bernie Eiben at DEC, we have a version of the Basic program
+that will run on the CP/M-86 side of the Rainbow.  It's a reworking of
+MSPCTRAN.BAS, which assumes that you already have the .BOO file on your
+CP/M disk.  It builds an .EXE file, which you can then move to the MS-DOS
+side of your Rainbow by booting MS-DOS and then using RDCPM to get the
+file from the CP/M-format disk.  How you get the .BOO file onto the CP/M
+disk in the first place is another question.  Either you use some file
+capture utility -- commercial or otherwise -- or else you go through the
+DDT bootstrap procedure given for CP/M-80 Kermit (since the Rainbow is
+also a CP/M-80 system).
+
+Bernie's program is in KER:MSRBBOO.BAS.
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msrbboo.hlp
+	/bin/echo -n '	'; /bin/ls -ld msrbboo.hlp
+fi
+/bin/echo 'Extracting msrbemacs.ini'
+sed 's/^X//' <<'//go.sysin dd *' >msrbemacs.ini
+; EMACS function key setup for Kermit-MS/Rainbow
+;
+; C-@ (set mark) on SELECT
+set key select
+\00
+;
+; M-h (select region) on CTRL-SELECT
+set key scan 1313
+\33h
+;
+; C-U 12 C-X C-I (rigidly indent region 12 spaces) on TAB
+set key scan 9
+\25\61\62\30\11
+; C-X C-I (rigidly indent region) on SHIFT-TAB
+set key scan 521
+\30\11
+;
+; C-S (forward search) on FIND
+set key find
+\23
+;
+; C-R (reverse search) on CTRL-FIND
+set key scan 1307
+\22
+;
+; M-D (delete word) on REMOVE
+set key remove
+\33d
+;
+; M-K (delete sentence) on CTRL-REMOVE
+set key scan 1311
+\33k
+;
+; C-P (up line) on uparrow
+set key scan 295
+\20
+;
+; M-[ (up paragraph) on CTRL-uparrow
+set key scan 1319
+\33[
+;
+; C-X [ (up page) on SHIFT-uparrow
+set key scan 807
+\30[
+;
+; M-< (top of file) on CTRL-SHIFT-uparrow
+set key scan 1831
+\33<
+;
+; C-B (back character) on leftarrow
+set key scan 301
+\02
+;
+; C-A (beginning of line) on CTRL-leftarrow
+set key scan 1325
+\01
+;
+; M-A (back sentence) on SHIFT-leftarrow
+set key scan 813
+\33a
+;
+; C-N (next line) on downarrow
+set key scan 297
+\16
+; M-] (down paragraph) on CTRL-downarrow
+set key scan 1321
+\33]
+;
+; C-X ] (down page) on SHIFT-downarrow
+set key scan 809
+\30]
+;
+; M-> (end of file) on CTRL-SHIFT-downarrow
+set key scan 1833
+\30>
+;
+; C-F (forward character) on rightarrow
+set key scan 299
+\06
+;
+; C-E (end of line) on CTRL-rightarrow
+set key scan 1323
+\05
+;
+; M-E (end of sentence) on SHIFT-rightarrow
+set key scan 811
+\33e
+;
+; C-X E (do keyboard macro) on DO
+set key scan 257
+\30e
+;
+; C-U C-X E (do keyboard macro 4x) on CTRL-DO
+set key scan 1281
+\25\30e
+;
+; C-U 8 C-X E (do keyboard macro 8x) on SHIFT-DO
+set key scan 769
+\25\70\30e
+;
+; C-U C-U C-X E (do keyboard macro 16x) on CTRL-SHIFT-DO
+set key scan 1793
+\25\25\30e
+;
+; ^_ on HELP
+set key scan 256
+\37
+;
+; C-X C-Z on EXIT
+set key scan 271
+\30\32//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msrbemacs.ini
+	/bin/echo -n '	'; /bin/ls -ld msrbemacs.ini
+fi
+/bin/echo 'Extracting msxapc.asm'
+sed 's/^X//' <<'//go.sysin dd *' >msxapc.asm
+; Kermit system dependent module for NEC Advanced Personal Computer (APC)
+; Ron Blanford, University of Washington, August 1984
+
+	public	serini, serrst, clrbuf, outchr, coms, vts, dodel,
+	public	ctlu, cmblnk, locate, lclini, prtchr, dobaud, clearl,
+	public	dodisk, getbaud, beep,
+	public	count, xofsnt, puthlp, putmod, clrmod, poscur
+	public	sendbr, term, machnam, setktab, setkhlp, showkey
+	include msdefs.h
+
+false	equ	0
+true	equ	1
+
+; port assignments for 8251 serial controllers
+
+;		Standard interface
+
+mndata	equ	30H		; Data port (read/write)
+mnst1a	equ	32H		; Status port (when read)
+mncmda	equ	32H		; Command port (when written)
+mnst2a	equ	34H		; Alternate status port (when read)
+mnmska	equ	34H		; Mask port (when written)
+mntdca	equ	36H		; Transmit disable port (write only)
+
+;		Optional (H14) interface
+
+mndatb	equ	31H		; Data port (read/write)
+mnst1b	equ	33H		; Status port (when read)
+mncmdb	equ	33H		; Command port (when written)
+mnst2b	equ	35H		; Alternate status port (when read)
+mnmskb	equ	35H		; Mask port (when written)
+mntdcb	equ	37H		; Transmit disable port (write only)
+
+; Status bits from mnst1
+
+txrdy	equ	01H		; Bit for output ready.
+rxrdy	equ	02H		; Bit for input ready.
+
+; Command values for mncmd
+
+ccmd	equ	37H		; RTS & DTR high, RX & TX enabled, reset ERR
+cbrk	equ	08H		; break enabled
+cmode	equ	40H		; enable mode reset
+mmode	equ	4EH		; 16x rate, 8 data, no parity, 1 stop
+
+; Mask values for mnmsk
+
+txmsk	equ	01H		; disables transmit ready interrupt
+rxmsk	equ	02H		; disables receive ready interrupt
+tbemsk	equ	04H		; disables transmit buffer empty interrupt
+
+
+; port assignments for 8253 timers
+
+;		Standard interface
+
+tmdata	equ	2BH		; data port
+tmcmda	equ	27H		; command port
+
+;		Optional (H14) interface
+
+tmdatb	equ	61H		; data port
+tmcmdb	equ	67H		; command port
+
+; values for tmcmd which select timer channel and mode
+
+tmsela	equ	76H		; Channel 1, mode 3 (standard port)
+tmselb	equ	36H		; Channel 0, mode 3 (optional port)
+
+; Timer information for current port selection
+
+tmrinfo	struc
+tmdat	dw	0		; data port
+tmcmd	dw	0		; command port
+tmsel	db	0		; byte which selects channel and mode
+tmrinfo	ends
+
+
+; port assignments for 8259 interrupt controllers
+
+;		Standard interface
+
+intcmda	equ	20H		; Command port (master controller)
+intmska	equ	22H		; Mask port
+ictmsk	equ	08H		; Timer interrupt mask (to master)
+icsmska	equ	02H		; Standard serial interrupt mask (to master)
+icsvcta equ	11H		; Interrupt vector for standard interface
+
+;		Optional (H14) interface
+
+; The interrupt request vector for the optional (H14) serial interface is
+; jumper-selectable to any of vectors IR2, IR5, IR8, or IR12.  NEC recommends
+; that IR8 be used, so that has been selected as the default here.  To use
+; any of the other vectors, set the following conditionals appropriately.
+; Only one of the following should be true:
+
+IR2	equ	false		; interrupt vector 2
+IR5	equ	false		; interrupt vector 5
+IR8	equ	true		; interrupt vector 8
+IR12	equ	false		; interrupt vector 12
+
+	IF IR2
+intcmdb equ	20H		; Command port (master controller)
+intmskb equ	22H		; Mask port
+icsmskb equ	04H		; Interrupt mask
+icsvctb equ	12H		; Interrupt table index
+	ENDIF
+
+	IF IR5
+intcmdb equ	20H		; Command port (master controller)
+intmskb equ	22H		; Mask port
+icsmskb equ	20H		; Interrupt mask
+icsvctb equ	15H		; Interrupt table index
+	ENDIF
+
+	IF IR8
+intcmdb equ	28H		; Command port (slave controller)
+intmskb equ	2AH		; Mask port
+icsmskb equ	02H		; Interrupt mask
+icsvctb equ	19H		; Interrupt table index
+	ENDIF
+
+	IF IR12
+intcmdb equ	28H		; Command port (slave controller)
+intmskb equ	2AH		; Mask port
+icsmskb equ	20H		; Interrupt mask
+icsvctb equ	1DH		; Interrupt table index
+	ENDIF
+
+; generic end of interrupt for intcmd
+
+icEOI	equ	20H
+
+
+; miscellaneous constants
+
+ctrlP	equ	10H		; Key that toggles printer echo
+mntrgh	equ	bufsiz*3/4	; High XON/XOFF trigger = 3/4 of buffer full.
+
+; external variables used:
+; drives - # of disk drives on system
+; flags - global flags as per flginfo structure defined in pcdefs
+; trans - global transmission parameters, trinfo struct defined in pcdefs
+; portval - pointer to current portinfo structure (currently either port1
+;    or port2)
+; port1, port2 - portinfo structures for the corresponding ports
+
+; global variables defined in this module:
+; xofsnt, xofrcv - tell whether we saw or sent an xoff.
+
+datas 	segment	public 'datas'
+	extrn	drives:byte,flags:byte, trans:byte
+	extrn	portval:word, port1:byte, port2:byte
+
+machnam	db	'NEC APC$'
+nyimsg	db	cr,lf,'Not yet implemented$'
+badbd	db	cr,lf,'Unimplemented baud rate$'
+lstpos	dw	0		; column position for printer echoing
+crlf	db	cr,lf,'$'
+delstr  db      BS,' ',BS,'$'	; Delete string.
+clrlin  db      cr,'$'		; Clear line (just the cr part).
+ceolseq	db	esc,'[K$'	; Clear to end of line
+cpseq	db	esc,'=rc'	; rc replaced by row and column before display
+clrseq	db	01EH,01AH,'$'	; Home cursor and clear screen
+
+; The following color values were selected to look well on both monochrome
+; and color monitors.  In particular, the normal color should be at normal
+; intensity on the monochrome monitor (green, blue, or cyan), and the bold
+; color should be at bold intensity (red, purple, yellow, or white).
+
+nrmseq	db	esc,'[0m$'	; reset to normal video (green)
+invseq	db	esc,'[7m$'	; start reverse video (green)
+bldseq	db	esc,'[19m$'	; start bold video (purple)
+
+ourarg	termarg	<>
+modem	mdminfo	<mndata,mnst1a,mncmda,0,0,0,0>
+timer	tmrinfo	<tmdata,tmcmda,tmsela>
+ourflgs	db	0		; flags for telnet options
+fprint	equ	80H		;   echo screen output to printer
+
+oldsera	dw	?		; old serial handler for standard port
+oldsega	dw	?		; segment of above
+oldmska	db	?		; old interrupt controller mask
+portina	db	0		; Has comm port been initialized.
+
+oldserb	dw	?		; old serial handler for optional port
+oldsegb	dw	?		; segment of same.
+oldmskb	db	?		; old interrupt controller mask
+portinb	db	0		; Has comm port been initialized.
+
+xofsnt	db	0		; Say if we sent an XOFF.
+xofrcv	db	0		; Say if we received an XOFF.
+
+; variables for serial interrupt handler
+source	db	bufsiz DUP (?)	; Buffer for data from port.
+srcpnt	dw	0		; Pointer in buffer (DI).
+count	dw	0		; Number of chars in int buffer.
+savesi	dw	0		; Save SI register here.	
+	dw	80 DUP (?)	; local stack for interrupt processing
+mnstk	dw	?
+mnsp	dw	?		; remote stack info
+mnsseg	dw	?
+
+shkbuf	db	300 dup (?)	; room to display key definition
+shkmsg	db	'  Scan code: '
+shkmln	equ	$-shkmsg
+shkms1	db	cr,lf,'  Definition: '
+shkm1ln	equ	$-shkms1
+
+setktab	db	2
+	mkeyw	'BACKSPACE',08H
+	mkeyw	'SCAN',-1
+
+setkhlp	db	cr,lf,'BACKSPACE, or SCAN followed by decimal ASCII code$'
+
+comptab	db	7
+	mkeyw	'1',1
+	mkeyw	'2',0
+	mkeyw	'COM1',1
+	mkeyw	'COM2',0
+	mkeyw	'H14',0
+	mkeyw	'OPTIONAL',0
+	mkeyw	'STANDARD',1
+
+bddat	label	word
+	dw	0D30H		; 45.5 baud
+	dw	0C00H		; 50 baud
+	dw	0800H		; 75 baud
+	dw	0574H		; 110 baud
+	dw	0476H		; 134.5 baud
+	dw	0400H		; 150 baud
+	dw	0200H		; 300 baud
+	dw	0100H		; 600 baud
+	dw	0080H		; 1200 baud
+	dw	0055H		; 1800 baud
+	dw	004DH		; 2000 baud
+	dw	0040H		; 2400 baud
+	dw	0020H		; 4800 baud
+	dw	0010H		; 9600 baud
+	dw	0008H		; 19200 baud
+	dw	0004H		; 38400 baud (not tested - may not work)
+
+datas	ends
+
+code	segment	public
+	extrn	comnd:near, dopar:near
+	assume	cs:code,ds:datas
+
+; local initialization routine, called by Kermit initialization.
+
+LCLINI	PROC	NEAR
+	cld
+	mov flags.vtflg,0	; turn off heath emulation
+	mov dx,offset nrmseq	; set to our normal background color
+	call tmsg
+	ret
+LCLINI	ENDP
+
+; this is called by Kermit initialization.  It checks the
+; number of disks on the system, sets the drives variable
+; appropriately.  The only problem is that a value of two
+; is returned for single drive systems to be consistent
+; with the idea of the system having logical drives A and
+; B.  Returns normally.  
+
+DODISK	PROC	NEAR
+	mov ah,gcurdsk		; current disk value to AL.
+	int dos
+	mov dl,al		; put current disk in DL.
+	mov ah,seldsk		; select current disk.
+	int dos			; get number of drives in AL.
+	mov drives,al
+	ret
+DODISK	ENDP
+
+; show the definition of a key.  The terminal argument block (which contains
+; the address and length of the definition tables) is passed in ax.
+; Returns a string to print in AX, length of same in CX.
+; Returns normally.
+
+; On the APC there is no direct access to the keyboard; the best we
+; can do is use direct console I/O to get a key value which has already
+; been translated to some extent by the operating system.
+
+SHOWKEY	PROC	NEAR
+	push es
+	push ax			; save the terminal argument block
+	mov bx,ds
+	mov es,bx		; address data segment
+	cld
+showk1:	mov ah,dconio		; get scan value
+	mov dx,0FFH
+	int dos
+	jz showk1
+	mov ah,0
+	push ax			; save scan code
+	mov di,offset shkbuf	; move 'Scan code' message to buffer
+	mov si,offset shkmsg
+	mov cx,shkmln
+	rep movsb
+	call nout		; add scan code to buffer
+	mov si,offset shkms1	; move 'Definition' message to buffer
+	mov cx,shkm1ln
+	rep movsb
+	pop ax			; retrieve scan code
+	pop bx			; and terminal argument block
+	mov cx,[bx].klen	; length of translation table
+	jcxz showk3		; no table, key not defined
+	push di
+	mov di,[bx].ktab	; get table address
+	repne scasw		; look for scan code
+	mov si,di
+	pop di
+	jne showk3		; not defined
+	sub si,[bx].ktab	; compute entry offset in table
+	sub si,2
+	add si,[bx].krpl	; index to replacement
+	mov si,[si]		; get its address
+	mov cl,[si]		; get its length
+	mov ch,0
+	inc si
+	rep movsb		; transfer replacement to display buffer
+showk3:	mov ax,offset shkbuf	; return address of buffer in ax
+	mov cx,di		; and length in cx
+	sub cx,ax
+	pop es
+	ret
+SHOWKEY	ENDP
+
+; copy numeric value from AX to ASCII buffer indicated by DI.  DI is updated.
+
+NOUT	PROC	NEAR
+	mov dx,0		; zero high word
+	mov bx,10		; divide
+	div bx
+	push dx			; save remainder digit
+	or ax,ax		; anything left?
+	jz nout1		; no, start output phase
+	call nout
+nout1:	pop ax			; retrieve a digit
+	add al,'0'		; make it ASCII
+	stosb			; put it in buffer
+	ret
+NOUT	ENDP
+
+; skip returns if no character available at port,
+; otherwise returns with char in al, # of chars in buffer in dx.
+
+PRTCHR  PROC    NEAR
+	call chkxon		; see if we have to xon the host.
+	cmp count,0
+	jnz prtch2
+	jmp rskp		; No data - check console.
+prtch2:	pushf			; save current interrupt value
+	cli			; disable interrupts while manipulating pointers
+	mov si,savesi
+	lodsb			; get a byte
+	cmp si,offset source + bufsiz	; bigger than buffer?
+	jb prtch1		; no, keep going
+	mov si,offset source	; yes, wrap around
+prtch1:	dec count
+	mov savesi,si 
+	mov dx,count		; return # of chars in buffer
+	popf			; restore original interrupt flag
+	ret
+PRTCHR  ENDP
+
+; local routine to see if we have to transmit an xon
+
+CHKXON	PROC	NEAR
+	push bx
+	mov bx,portval
+	cmp [bx].floflg,0	; doing flow control?
+	je chkxo1		; no, skip all this
+	cmp xofsnt,false	; have we sent an xoff?
+	je chkxo1		; no, forget it
+	cmp count,mntrgh	; below trigger?
+	jae chkxo1		; no, forget it
+	mov ax,[bx].flowc	; ah gets xon
+	call outchr		; send it
+	 nop			;  ignore failure
+	 nop
+	 nop
+	mov xofsnt,false	; remember we've sent an xon.
+chkxo1:	pop bx			; restore register
+	ret			; and return
+CHKXON	ENDP
+
+; Put the char in AH to the serial port.  This assumes the
+; port has been initialized.  Should honor xon/xoff.  Skip returns on
+; success, returns normally if the character cannot be written.
+
+OUTCHR	PROC	NEAR
+	mov bp,portval
+	cmp ds:[bp].floflg,0	; Are we doing flow control.
+	je outch2		; No, just continue.
+	sub cx,cx		; clear counter
+outch1:	cmp xofrcv,true		; Are we being held?
+	jne outch2		; No - it's OK to go on.
+	loop outch1		; held, try for a while
+	mov xofrcv,false	; timed out, force it off and fall thru.
+outch2:	push dx			; Save register.
+	sub cx,cx
+	mov al,ah		; Parity routine works on AL.
+	call dopar		; Set parity appropriately.
+	mov ah,al		; Don't overwrite character with status.
+	mov dx,modem.mdstat	; port status register
+outch3:	in al,dx
+	test al,txrdy		; Transmitter ready?
+	jnz outch4		; Yes
+	loop outch3
+	 jmp outch5		; Timeout
+outch4:	mov al,ah		; Now send it out
+	mov dx,modem.mddat
+	out dx,al
+	pop dx
+	jmp rskp
+outch5:	pop dx
+	ret
+OUTCHR	ENDP
+
+; Send a break out the current serial port.  Returns normally.
+
+SENDBR	PROC	NEAR
+	mov dx,modem.mdcom	; send to command port
+	mov al,cbrk+ccmd	; add break to normal command
+	out dx,al
+	sub cx,cx		; wait a while
+sndbr1:	loop sndbr1
+	mov al,ccmd		; restore normal command
+	out dx,al
+	ret			; and return.
+SENDBR	ENDP
+
+; Clear the input buffer. This throws away all the characters in the
+; serial interrupt buffer.  This is particularly important when
+; talking to servers, since NAKs can accumulate in the buffer.
+; Returns normally.
+
+CLRBUF	PROC	NEAR
+	pushf			; save current interrupt value
+	cli			; disable interrupts
+	mov ax,offset source	; reset pointers to beginning of buffer
+	mov srcpnt,ax
+	mov savesi,ax
+	mov count,0
+	popf			; restore original interrupt value
+	ret
+CLRBUF	ENDP
+
+; Set the baud rate for the current port, based on the value in the
+; portinfo structure.  On entry, previous value of baud rate is saved in AX.
+; Returns normally.
+
+DOBAUD	PROC	NEAR
+	mov bp,portval
+	mov bx,ds:[bp].baud	;make sure new value is valid
+	shl bx,1
+	add bx,offset bddat
+	cmp word ptr [bx],0FFH
+	jne dobd0
+	mov ds:[bp].baud,ax	;replace bad rate with previous value
+	mov dx,offset badbd
+	jmp tmsg
+dobd0:	mov dx,timer.tmcmd	;timer command port
+	mov al,timer.tmsel	;select proper channel and mode
+	out dx,al
+	mov ax,[bx]		;get timer initializer for this rate
+	mov dx,timer.tmdat	;timer data port
+	out dx,al		;output low byte
+	mov al,ah
+	out dx,al		;output high byte
+	ret
+DOBAUD	ENDP
+
+; Get the current baud rate from the serial card and set it
+; in the portinfo structure for the current port.  Returns normally.
+; This is used during initialization.
+
+GETBAUD	PROC	NEAR
+	mov bx,portval		; no way to determine baud rate on APC
+	mov [bx].baud,B1200	;  so set default baud rate to 1200
+	ret
+GETBAUD	ENDP
+
+; Set the mode for the current port.  This is part of the serial
+; initialization routine.
+
+DOMODE	PROC	NEAR
+	mov dx,modem.mdcom	;send 3 zeros to command port to reset chip
+	mov al,0
+	out dx,al
+	mov al,0
+	out dx,al
+	mov al,0
+	out dx,al
+	mov al,cmode		;enable mode setting
+	out dx,al
+	push ax			;allow 8251 time to reset
+	pop ax
+	push ax
+	pop ax
+	mov al,mmode		;mode: 16x rate, 8 data, no parity, 1 stop
+	out dx,al
+	mov al,ccmd		;RTS & DTR high, RX & TX enabled, reset errors
+	out dx,al
+	ret
+DOMODE	ENDP
+
+; set the current port.
+
+COMS	PROC	NEAR
+	mov dx,offset comptab	;get port selection
+	mov bx,0
+	mov ah,cmkey
+	call comnd
+	 jmp r
+	push bx
+	mov ah,cmcfm		;get a confirmation
+	call comnd
+	 jmp comx
+	 nop
+	pop bx
+	mov flags.comflg,bl	;save port selection
+	cmp flags.comflg,1
+	jne coms2
+	mov ax,offset port1	;set to run on port 1
+	mov portval,ax
+	call resetb		;reset port 2, if in use
+	call inita		;set up port 1
+	ret
+coms2:	mov ax,offset port2	;set to run on port 2
+	mov portval,ax
+	call reseta		;reset port 1, if in use
+	call initb		;set up port 2
+	ret
+comx:	pop bx
+	ret
+COMS	ENDP
+
+; initialization for using serial port.  This routine performs
+; any initialization necessary for using the serial port, including
+; setting up interrupt routines, setting buffer pointers, etc.
+; Doing this twice in a row should be harmless (this version checks
+; a flag and returns if initialization has already been done).
+; SERRST below should restore any interrupt vectors that this changes.
+; Returns normally.
+
+SERINI	PROC	NEAR
+	cmp flags.comflg,1
+	jne seri2
+	call resetb
+	call inita
+	ret
+seri2:	call reseta
+	call initb
+	ret
+SERINI	ENDP
+
+; Reset the serial port.  This is the opposite of serini.  Calling
+; this twice without intervening calls to serini should be harmless.
+; Returns normally.
+
+SERRST	PROC	NEAR
+	call reseta		;reset port 1
+	call resetb		;reset port 2
+	ret
+SERRST	ENDP
+
+; Local routine to initialize the standard serial port
+
+INITA	PROC	NEAR
+	cmp portina,1		; Did we initialize port already? [21c]
+	je inita0		; Yes, so just leave. [21c]
+	push es
+	cli			; Disable interrupts
+	mov ax,offset port1
+	mov portval,ax
+	xor ax,ax		; Address low memory
+	mov es,ax
+	mov ax,es:[4*icsvcta]	; save standard port interrupt vector
+	mov oldsera,ax
+	mov ax,es:[4*icsvcta+2]
+	mov oldsega,ax
+	mov ax,offset serint	; point to our routine
+	mov es:[4*icsvcta],ax	; point at our serial routine
+	mov es:[4*icsvcta+2],cs	; our segment
+	mov dx,intmska		; set up standard port...
+	in al,dx
+	mov oldmska,al		; save old master controller mask
+
+;	NEC recommends that the timer interrupt be disabled during interrupt-
+;	driven serial I/O, but this disables the clock display and keyboard
+;	repeat.  I have not had any problems leaving it enabled, so I will
+;	leave it alone here.  If problems develop, uncomment the following
+;	line to disable timer interrupts. -- RonB
+
+;	or al,ictmsk		; disable timer interrupt
+	and al,not icsmska	; enable serial interrupt at master controller
+	out dx,al
+	mov dx,mnmska		; enable serial interrupt at port
+	mov al,txmsk+tbemsk	; disable tx and tbe interrupts (enable rx)
+	out dx,al
+	mov dx,mntdca		; enable operation of serial port
+	mov al,0
+	out dx,al
+	mov modem.mddat,mndata
+	mov modem.mdstat,mnst1a
+	mov modem.mdcom,mncmda
+	mov timer.tmdat,tmdata
+	mov timer.tmcmd,tmcmda
+	mov timer.tmsel,tmsela
+	call domode
+	call dobaud
+	mov portina,1		; Remember port has been initialized.
+	call clrbuf		; Clear input buffer. 
+	sti			; Allow interrupts
+	pop es
+inita0:	ret
+INITA	ENDP
+
+; Local routine to initialize the optional (H14) serial port
+
+INITB	PROC	NEAR
+	cmp portinb,1		; Did we initialize port already? [21c]
+	je initb0		; Yes, so just leave. [21c]
+	push es
+	cli			; Disable interrupts
+	mov ax,offset port2
+	mov portval,ax
+	xor ax,ax		; Address low memory
+	mov es,ax
+	mov ax,es:[4*icsvctb]	; save optional port interrupt vector
+	mov oldserb,ax
+	mov ax,es:[4*icsvctb+2]
+	mov oldsegb,ax
+	mov ax,offset serint	; point to our routine
+	mov es:[4*icsvctb],ax	; point at our serial routine
+	mov es:[4*icsvctb+2],cs	; our segment
+	mov dx,intmskb		; set up optional port...
+	in al,dx
+	mov oldmskb,al		; save old master or slave controller mask
+	and al,not icsmskb	; enable serial interrupt at controller
+	out dx,al
+	mov dx,mnmskb		; enable serial interrupt at port
+	mov al,txmsk+tbemsk	; disable tx and tbe interrupts (enable rx)
+	out dx,al
+	mov dx,mntdcb		; enable operation of serial port
+	mov al,0
+	out dx,al
+	mov modem.mdstat,mnst1b
+	mov modem.mddat,mndatb
+	mov modem.mdcom,mncmdb
+	mov timer.tmdat,tmdatb
+	mov timer.tmcmd,tmcmdb
+	mov timer.tmsel,tmselb
+	call domode
+	call dobaud
+	mov portinb,1		; Remember port has been initialized.
+	call clrbuf		; Clear input buffer. 
+	sti			; Allow interrupts
+	pop es
+initb0:	ret
+INITB	ENDP
+
+; Reset standard serial port
+
+RESETA	PROC	NEAR
+	cmp portina,0		; Did we reset port already?
+	je rsta0		; Yes, so just leave.
+	push es
+	cli			; Disable interrupts
+	xor ax,ax		; Address low memory
+	mov es,ax
+	mov ax,oldsera		; Restore interrupt vector
+	mov es:[4*icsvcta],ax
+	mov ax,oldsega
+	mov es:[4*icsvcta+2],ax
+	mov dx,intmska		; restore old master controller mask
+	mov al,oldmska
+	out dx,al
+	mov dx,mnmska		; disable serial interrupts at port
+	mov al,txmsk+rxmsk+tbemsk
+	out dx,al
+	mov portina,0		; Remember port has been reset
+	sti			; Allow interrupts
+	pop es
+rsta0:	ret
+RESETA	ENDP
+
+; Reset optional (H14) serial port
+
+RESETB	PROC	NEAR
+	cmp portinb,0		; Did we reset port already?
+	je rstb0		; Yes, so just leave.
+	push es
+	cli			; Disable interrupts
+	xor ax,ax		; Address low memory
+	mov es,ax
+	mov ax,oldserb		; Restore interrupt vector
+	mov es:[4*icsvctb],ax
+	mov ax,oldsegb
+	mov es:[4*icsvctb+2],ax
+	mov dx,intmskb		; restore old slave controller mask
+	mov al,oldmskb
+	out dx,al
+	mov dx,mnmskb		; disable serial interrupts at port
+	mov al,txmsk+rxmsk+tbemsk
+	out dx,al
+	mov portinb,0		; Remember port has been reset
+	sti			; Allow interrupts
+	pop es
+rstb0:	ret
+RESETB	ENDP
+
+
+; serial port interrupt routine.  This is not accessible outside this
+; module, handles serial port receiver interrupts.
+
+SERINT	PROC  NEAR
+	push ds			; save these on remote stack
+	push ax
+	mov ax,seg datas	; get our own data segment
+	mov ds,ax
+	mov mnsp,sp		; save remote stack information
+	mov mnsseg,ss
+	mov sp,offset mnstk	; switch to local stack
+	mov ss,ax
+	push es			; and save remaining registers
+	push bp
+	push di
+	push si
+	push dx
+	push cx
+	push bx
+	mov es,ax
+	call mnproc		; process the interrupt
+	mov al,icEOI
+	cmp flags.comflg,1	; If using standard port
+	je intr1
+	mov dx,intcmdb		;    or H14 vectored to master
+	cmp dx,intcmda
+	je intr1		;    only signal End of Interrupt to master,
+	out dx,al		; otherwise signal to both slave and master.
+intr1:	mov dx,intcmda
+	out dx,al
+	pop bx			; restore registers from stack
+	pop cx
+	pop dx
+	pop si
+	pop di
+	pop bp
+	pop es
+	mov ax,mnsseg		; switch back to remote stack
+	mov ss,ax
+	mov ax,mnsp
+	mov sp,ax
+	pop ax
+	pop ds
+	iret
+
+; handler for serial input
+
+mnproc:	cld
+	mov di,srcpnt		; get buffer pointer
+	mov dx,modem.mdstat	; is data available?
+	in al,dx
+	test al,rxrdy
+	jz mnpro7
+	mov dx,modem.mddat	; read data
+	in al,dx
+	or al,al
+	jz mnpro7		; Ignore nulls.
+	cmp al,7FH		; Ignore rubouts, too.
+	jz mnpro7
+	mov ah,al
+	and ah,7fH		; only consider low-order 7 bits for flow ctl.
+	mov bp,portval
+	cmp ds:[bp].floflg,0	; Doing flow control?
+	je mnpro4		; Nope.
+	mov bx,ds:[bp].flowc	; Flow control char (BH = XON, BL = XOFF).
+	cmp ah,bl		; Is it an XOFF?
+	jne mnpro3		; Nope, go on.
+	mov xofrcv,true		; Set the flag.
+	jmp short mnpro7
+mnpro3:	cmp ah,bh		; Get an XON?
+	jne mnpro4		; No, go on.
+	mov xofrcv,false	; Clear our flag.
+	jmp mnpro7
+mnpro4:	stosb
+	cmp di,offset source + bufsiz
+	jb mnpro5		; not past end...
+	mov di,offset source	; wrap buffer around
+mnpro5:	mov srcpnt,di		; update ptr
+	inc count
+	cmp ds:[bp].floflg,0	; Doing flow control?
+	je mnpro7		; No, just leave.
+	cmp xofsnt,true		; Have we sent an XOFF?
+	je mnpro7		; Yes.
+	cmp count,mntrgh	; Past the high trigger point?
+	jbe mnpro7		; No, we're within our limit.
+	mov ah,bl		; Get the XOFF.
+	call outchr		; Send it.
+	 nop			;   ignore failure.
+	 nop
+	 nop
+	mov xofsnt,true		; Remember we sent it.
+mnpro7:	ret
+
+SERINT	ENDP
+
+; Dumb terminal emulator.  Anyone wishing to enhance it is encouraged
+; to do so.
+
+TERM	PROC	NEAR
+	mov si,ax		; save argument block locally
+	mov di,offset ourarg
+	mov ax,ds
+	mov es,ax
+	mov cx,size termarg
+	rep movsb
+
+term1:	call prtchr		; Serial port input processor
+	 jmp short term2	;  ...have a char
+	 nop
+	jmp termk		; no char, continue
+term2:	and al,7FH		; only use ASCII in terminal mode
+	push ax
+	mov dl,al
+	mov ah,conout
+	int dos			; display char
+	pop ax
+	test ourarg.flgs,capt	; are we capturing output?
+	jz term3
+	push ax
+	call ourarg.captr
+	pop ax
+term3:	test ourflgs,fprint	; are we echoing to printer?
+	jz termk
+	call lstchr
+
+termk:	mov ah,dconio		; Keyboard input processor
+	mov dl,0FFH
+	int dos			; check console
+	jz term1		; no char, continue
+	cmp al,ourarg.escc	; is it the escape char?
+	je termx
+	cmp al,ctrlP		; is it the print toggle?
+	jne term6
+	xor ourflgs,fprint
+	jmp term1
+term6:	call trnout		; translate key and send it out
+	jmp term1
+termx:	ret
+
+; do appropriate translations on input key, and transmit
+
+trnout:	mov ah,0
+	test ourarg.flgs,havtt	; is there a translation table?
+	jz trnou2
+	mov cx,ourarg.klen	; get table length and origin
+	mov di,ourarg.ktab
+	repne scasw		; look for key
+	jne trnou2		; if not found, just send it
+	sub di,ourarg.ktab	; reset to offset of replacement
+	sub di,2
+	add di,ourarg.krpl
+	mov si,[di]
+	mov cl,[si]		; get length of replacement
+	mov ch,0
+	jcxz trnou3		; if length is zero, send nothing
+	inc si
+trnou1:	lodsb			; get replacement character
+	push si
+	push cx
+	call sndhst		; send it to port
+	pop cx
+	pop si
+	loop trnou1		; continue until translation complete
+	ret
+trnou2:	call sndhst		; plain characters go out as they are
+trnou3:	ret
+
+; send character in AL to port, with possible local echo
+
+sndhst:	push ax
+	mov ah,al
+	call outchr		; send char to port
+	 nop			;  ...don't care if it fails
+	 nop
+	 nop
+	pop ax
+	test ourarg.flgs,lclecho ; doing local echo?
+	jz sndhs2
+	mov dl,al
+	mov ah,conout
+	int dos			;  if so, display char
+sndhs2:	ret
+
+; send character to printer.  The only special case is the tab, which must
+; be expanded to spaces because MS-DOS doesn't.
+
+lstchr:	cmp al,tab
+	jne lstch2
+	mov ax,lstpos		; current column position
+	mov cx,8		; # of spaces = 8 - (column % 8)
+	div cl
+	sub cl,ah
+	add lstpos,cx		; update the column position
+	mov al,' '
+lstch1:	call lstch4		; print all the spaces
+	loop lstch1
+	ret
+lstch2:	cmp al,cr		; CR returns column count to zero
+	jne lstch3
+	mov lstpos,0
+lstch3:	cmp al,' '		; only printable characters are counted
+	jb lstch4
+	cmp al,del
+	je lstch4
+	inc lstpos
+lstch4: mov dl,al		; print the character in any case
+	mov ah,lstout
+	int dos
+	ret
+
+TERM	ENDP
+
+; Set heath emulation on/off.
+
+VTS	PROC	NEAR
+	mov dx,offset nyimsg
+	jmp tmsg
+VTS	ENDP
+
+; Position the cursor according to contents of DX:
+; DH contains row, DL contains column.  Returns normally.
+
+POSCUR	PROC	NEAR
+	push si
+	cmp dh,25		; out of range just assumes high value
+	jb poscu1
+	mov dh,24
+poscu1:	cmp dl,80
+	jb poscu2
+	mov dl,79
+poscu2:	add dx,2020H		; add offset for ADM cursor addressing
+	mov cpseq+2,dh
+	mov cpseq+3,dl
+	mov si,offset cpseq	; print sequence (ESC=rc)
+	mov cx,4
+posc1:	lodsb
+	mov dl,al
+	mov ah,conout
+	int dos
+	loop posc1
+	pop si
+	ret
+POSCUR	ENDP
+
+; Locate; homes the cursor.  Returns normally.
+
+LOCATE  PROC	NEAR
+	mov dx,0		; Go to top left corner of screen.
+	jmp poscur
+LOCATE  ENDP
+
+; Delete a character from the terminal.  This works by printing
+; backspaces and spaces.  Returns normally.
+
+DODEL	PROC	NEAR
+	cmp al,del		; Del character needs extra backspace
+	jne dodel1
+	mov dl,bs
+	mov ah,conout
+	int dos
+dodel1:	mov dx,offset delstr	; Erase weird character.
+	jmp tmsg
+DODEL	ENDP
+
+; Move the cursor to the left margin, then clear to end of line.
+; Returns normally.
+
+CTLU	PROC	NEAR
+	mov dx,offset clrlin	; this just goes to left margin...
+	call tmsg
+	jmp clearl		; now clear line
+CTLU	ENDP
+
+; Clear to the end of the current line.  Returns normally.
+
+CLEARL	PROC	NEAR
+	mov dx,offset ceolseq	; clear sequence
+	jmp tmsg
+CLEARL	ENDP
+
+; This routine blanks the screen.  Returns normally.
+
+CMBLNK	PROC	NEAR
+	mov dx,offset clrseq	; clear screen sequence
+	jmp tmsg
+CMBLNK  ENDP
+
+; write a line in inverse video at the bottom of the screen...
+; the line is passed in dx, terminated by a $.  Returns normally.
+
+PUTMOD	PROC	NEAR
+	push dx			; preserve message
+	mov dx,24*100H		; line 24
+	call poscur
+	mov dx,offset invseq	; put into inverse video
+	call tmsg
+	pop dx			; print the message
+	call tmsg
+	mov dx,offset nrmseq	; normal video
+	jmp tmsg
+PUTMOD	ENDP
+
+; clear the mode line written by putmod.  Returns normally.
+
+CLRMOD	PROC	NEAR
+	mov dx,24*100H
+	call poscur
+	jmp clearl
+CLRMOD	ENDP
+
+; Put a help message on the screen.  This one uses bold video...
+; pass the message in ax, terminated by a null.  Returns normally.
+
+PUTHLP	PROC	NEAR
+	push ax			; save pointer to message
+	mov dx,offset crlf
+	call tmsg
+	mov dx,offset bldseq	; set to bold video
+	call tmsg
+	pop si			; retrieve pointer to message
+puth1:	lodsb			; get a character
+	cmp al,0
+	je puth2		; stop if terminator
+	mov dl,al		; otherwise display the character
+	mov ah,conout
+	int dos
+	jmp puth1
+puth2:	mov dx,offset nrmseq	; reset to normal video
+	call tmsg
+	mov dx,offset crlf
+	call tmsg
+	ret
+PUTHLP	ENDP
+
+; Produce a short beep.  Returns normally.
+
+BEEP	PROC	NEAR
+	mov dl,bell
+	mov ah,conout
+	int dos
+	ret
+BEEP	ENDP 
+ 
+; Prints $-terminated message in dx, for local use only
+
+TMSG	PROC	NEAR
+	mov ah,prstr
+	int dos
+	ret
+TMSG	ENDP
+
+; Jumping to this location is like retskp.  It assumes the instruction
+;   after the call is a jmp addr.
+ 
+RSKP    PROC    NEAR
+	pop bp
+	add bp,3
+	push bp
+        ret
+RSKP    ENDP
+ 
+; Jumping here is the same as a ret.
+ 
+R       PROC    NEAR
+        ret
+R       ENDP
+
+code	ends 
+	end
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msxapc.asm
+	/bin/echo -n '	'; /bin/ls -ld msxapc.asm
+fi
+/bin/echo 'Extracting msxdmb.asm'
+sed 's/^X//' <<'//go.sysin dd *' >msxdmb.asm
+code	segment	public
+code	ends
+datas	segment	public 'datas'
+datas	ends
+stack	segment	stack 'stack'
+stack	ends
+	end
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msxdmb.asm
+	/bin/echo -n '	'; /bin/ls -ld msxdmb.asm
+fi
+/bin/echo 'Extracting msxdmb.hlp'
+sed 's/^X//' <<'//go.sysin dd *' >msxdmb.hlp
+MSXDMB.ASM is a dummy file to make the segments come out in the right order
+on the Rainbow version of Kermit-MS.  It must be included with the other
+modules, as the first one.
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msxdmb.hlp
+	/bin/echo -n '	'; /bin/ls -ld msxdmb.hlp
+fi
+/bin/echo 'Extracting msxgen.asm'
+sed 's/^X//' <<'//go.sysin dd *' >msxgen.asm
+; Generic MS DOS Kermit module
+
+	public	serini, serrst, clrbuf, outchr, coms, vts, dodel,
+	public	ctlu, cmblnk, locate, lclini, prtchr, dobaud, clearl,
+	public	dodisk, getbaud, beep
+	public	count, xofsnt, puthlp, putmod, clrmod, poscur
+	public	sendbr, term, machnam, setktab, setkhlp, showkey
+	include msdefs.h
+
+false	equ	0
+true	equ	1
+instat	equ	6
+rddev	equ	3fH
+open	equ	3dH
+
+; external variables used:
+; drives - # of disk drives on system
+; flags - global flags as per flginfo structure defined in pcdefs
+; trans - global transmission parameters, trinfo struct defined in pcdefs
+; portval - pointer to current portinfo structure (currently either port1
+;    or port2)
+; port1, port2 - portinfo structures for the corresponding ports
+
+; global variables defined in this module:
+; xofsnt, xofrcv - tell whether we saw or sent an xoff.
+
+datas 	segment	public 'datas'
+	extrn	drives:byte,flags:byte, trans:byte
+	extrn	portval:word, port1:byte, port2:byte
+
+machnam	db	'Generic MS-DOS 2.0$'
+erms20	db	cr,lf,'?Warning: System has no disk drives$' ; [21a]
+erms40	db	cr,lf,'?Warning: Unrecognized baud rate$'
+erms41	db	cr,lf,'?Warning: Cannot open com port$'
+erms50	db	cr,lf,'Error reading from device$'
+hnd1	db	cr,lf,'Enter a file handle.  Check your DOS manual if you are '
+	db	cr,lf,'not certain what value to supply (generally 3).$'
+hnd2	db	cr,lf,'Handle: $'
+hnderr	db	cr,lf,'Warning: Handle not known.  Any routine using the '
+	db	cr,lf,'communications port will probably not work.$'
+hndhlp	db	cr,lf,'A four digit file handle $'
+badbd	db	cr,lf,'Unimplemented baud rate$'
+noimp	db	cr,lf,'Command not implemented.$'
+shkmsg	db	'Not implemented.'
+shklen	equ	$-shkmsg
+setktab	db	0
+setkhlp	db	0
+crlf    db      cr,lf,'$'
+delstr  db      BS,BS,'  ',BS,BS,'$' 	; Delete string. [21d]
+clrlin  db      cr,'$'			; Clear line (just the cr part).
+clreol	db	'^U',cr,lf,'$'		; Clear line.
+telflg	db	0		; non-zero if we're a terminal.
+xofsnt	db	0		; Say if we sent an XOFF.
+xofrcv	db	0		; Say if we received an XOFF.
+count	dw	0		; Number of chars in int buffer.
+prthnd	dw	0		; Port handle.
+prttab	dw	com2,com1
+com1	db	'COM1',0
+com2	db	'COM2',0
+tmp	db	?,'$'
+temp	dw	0
+temp1   dw      ?               ; Temporary storage.
+temp2   dw      ?               ; Temporary storage.
+rdbuf	db	20 dup(?)	; Buffer for input.
+
+; Entries for choosing communications port. [19b]
+comptab	db	04H
+	db	01H,'1$'
+	dw	01H
+	db	01H,'2$'
+	dw	00H
+	db	04H,'COM1$'
+	dw	01H
+ 	db	04H,'COM2$'
+	dw	00H
+
+ourarg	termarg	<>
+
+datas	ends
+
+code	segment	public
+	extrn	comnd:near, dopar:near, prserr:near, atoi:near, prompt:near
+	assume	cs:code,ds:datas
+
+; this is called by Kermit initialization.  It checks the
+; number of disks on the system, sets the drives variable
+; appropriately.  Returns normally.  
+
+DODISK	PROC	NEAR
+	mov ah,gcurdsk			; Current disk value to AL.
+	int dos
+	mov dl,al			; Put current disk in DL.
+	mov ah,seldsk			; Select current disk.
+	int dos				; Get number of drives in AL.
+	mov drives,al
+	ret
+DODISK	ENDP
+
+; Clear the input buffer. This throws away all the characters in the
+; serial interrupt buffer.  This is particularly important when
+; talking to servers, since NAKs can accumulate in the buffer.
+; Do nothing since we are not interrupt driven.  Returns normally.
+
+CLRBUF	PROC	NEAR
+	ret
+CLRBUF	ENDP
+
+; Clear to the end of the current line.  Returns normally.
+
+CLEARL	PROC	NEAR
+	mov ah,prstr
+	mov dx,offset clreol
+	int dos
+	ret
+CLEARL	ENDP
+
+; Put the char in AH to the serial port.  This assumes the
+; port has been initialized.  Should honor xon/xoff.  Skip returns on
+; success, returns normally if the character cannot be written.
+
+outchr:	mov bp,portval
+	cmp ds:[bp].floflg,0	; Are we doing flow control.
+	je outch2		; No, just continue.
+	xor cx,cx		; clear counter
+outch1:	cmp xofrcv,true		; Are we being held?
+	jne outch2		; No - it's OK to go on.
+	loop outch1		; held, try for a while
+	mov xofrcv,false	; timed out, force it off and fall thru.
+outch2:	push dx			; Save register.
+	mov al,ah		; Parity routine works on AL.
+	call dopar		; Set parity appropriately.
+	mov dl,al
+	mov ah,punout		; Output char in DL to comm port.
+	int dos
+	pop dx
+	jmp rskp
+
+; This routine blanks the screen.  Returns normally.
+
+CMBLNK	PROC	NEAR
+	mov ah,prstr
+	mov dx,offset crlf	; Can't do anything else.
+	int dos
+	ret
+CMBLNK  ENDP
+
+; Homes the cursor.  Returns normally.
+
+LOCATE  PROC	NEAR
+	mov dx,0		; Go to top left corner of screen.
+	jmp poscur
+LOCATE  ENDP
+
+; Write a line at the bottom of the screen...  
+; the line is passed in dx, terminated by a $.  Returns normally.
+putmod	proc	near
+	push	dx		; preserve message
+	mov	dx,1800h	; now address line 24
+	call	poscur
+	pop	dx		; get message back
+	mov	ah,prstr
+	int	dos		; write it out
+	ret			; and return
+putmod	endp
+
+; clear the mode line written by putmod.  Returns normally.
+clrmod	proc	near
+	mov	dx,1800h
+	call	poscur		; Go to bottom row.
+	call	clearl		; Clear to end of line.
+	ret
+clrmod	endp
+
+; Put a help message on the screen.  
+; Pass the message in ax, terminated by a null.  Returns normally.
+puthlp	proc	near
+	push	ax		; preserve this
+	mov 	ah,prstr
+	mov 	dx,offset crlf
+	int 	dos
+	pop	si		; point to string again
+puthl3:	lodsb			; get a byte
+	cmp	al,0		; end of string?
+	je	puthl4		; yes, stop
+	mov 	dl,al
+	mov	ah,dconio
+	int	dos		; else write to screen
+	jmp	puthl3		; and keep going
+puthl4:	mov 	ah,prstr
+	mov 	dx,offset crlf
+	int 	dos
+	ret
+puthlp	endp
+
+; Set the baud rate for the current port, based on the value
+; in the portinfo structure.  Returns normally.
+
+DOBAUD	PROC	NEAR
+	mov ah,prstr
+	mov dx,offset noimp	; Say it's not implemented.
+	int dos
+	mov bx,portval
+	mov [bx].baud,0FFFFH	; So it's not a recognized value.
+	ret			; Must be set before starting Kermit.
+DOBAUD	ENDP
+
+; Get the current baud rate from the serial card and set it
+; in the portinfo structure for the current port.  Returns normally.
+; This is used during initialization.
+
+GETBAUD	PROC	NEAR
+	ret			; Can't do this.
+GETBAUD	ENDP
+
+
+; Use for DOS 2.0 and above.  Check the port status.  If no data, skip
+; return.  Else, read in a char and return.
+PRTCHR	PROC    NEAR
+	push bx
+	push cx
+	push si
+	push bp
+	call chkxon
+	mov bx,prthnd
+	mov al,instat
+	mov ah,ioctl
+	int dos
+	or al,al
+	jz prtch4		; not ready...
+	mov bx,prthnd
+	mov ah,rddev
+	mov cx,1
+	mov dx,offset temp
+	int dos
+	cmp al,5		; Error condition.
+	je prt3x
+	cmp al,6		; Error condition
+	je prt3x
+	mov al,byte ptr temp
+	mov bp,portval
+	cmp ds:[bp].parflg,PARNON	; no parity?
+	je prtch3		; then don't strip
+	and al,7fh		; else turn off parity
+prtch3:	pop bp
+	pop si
+	pop cx
+	pop bx
+	ret
+prt3x:	mov ah,prstr
+	mov dx,offset erms50
+	int dos
+prtch4:	pop bp
+	pop si
+	pop cx
+	pop bx
+	jmp rskp		; no chars...
+PRTCHR  ENDP
+
+; Local routine to see if we have to transmit an xon
+chkxon	proc	near
+	push	bx
+	mov	bx,portval
+	cmp	[bx].floflg,0	; doing flow control?
+	je	chkxo1		; no, skip all this
+	cmp	xofsnt,false	; have we sent an xoff?
+	je	chkxo1		; no, forget it
+	mov	ax,[bx].flowc	; ah gets xon
+	call	outchr		; send it
+	nop
+	nop
+	nop			; in case it skips
+	mov	xofsnt,false	; remember we've sent the xon.
+chkxo1:	pop	bx		; restore register
+	ret			; and return
+chkxon	endp
+
+; Send a break out the current serial port.  Returns normally.
+SENDBR	PROC	NEAR
+	ret
+SENDBR	ENDP
+
+; Position the cursor according to contents of DX:
+; DH contains row, DL contains column.  Returns normally.
+POSCUR	PROC	NEAR
+	ret
+POSCUR	ENDP
+
+; Delete a character from the terminal.  This works by printing
+; backspaces and spaces.  Returns normally.
+
+DODEL	PROC	NEAR
+	mov ah,prstr
+	mov dx,offset delstr	; Erase weird character.
+	int dos			
+	ret
+DODEL	ENDP
+
+; Move the cursor to the left margin, then clear to end of line.
+; Returns normally.
+
+CTLU	PROC	NEAR
+	mov ah,prstr
+	mov dx,offset clrlin
+	int dos
+	call clearl
+	ret
+CTLU	ENDP
+
+; Set the current port.  
+
+COMS	PROC	NEAR
+        mov dx,offset comptab
+        mov bx,0
+        mov ah,cmkey
+        call comnd
+         jmp r
+        push bx
+        mov ah,cmcfm
+        call comnd              ; Get a confirm.
+         jmp comx		;  Didn't get a confirm.
+	 nop
+        pop bx
+        mov flags.comflg,bl     ; Set the comm port flag.
+	cmp flags.comflg,1	; Using Com 1?
+	jne coms0		; Nope.
+	mov ax,offset port1
+	mov portval,ax
+	ret
+coms0:	mov ax,offset port2
+	mov portval,ax
+	ret
+comx:	pop bx
+	ret
+COMS	ENDP
+
+; Set heath emulation on/off.
+
+VTS	PROC	NEAR
+	jmp notimp
+VTS	ENDP
+
+notimp:	mov ah,prstr
+	mov dx,offset noimp
+	int dos
+	jmp prserr
+
+; Initialize variables to values used by the generic MS DOS version.
+
+lclini:	mov flags.vtflg,0	; Don't to terminal emulation.
+	call opnprt		; Get file handle for comm port.
+	ret
+
+; Get a file handle for the communications port.  Use DOS call to get the
+; next available handle.  If it fails, ask user what value to use (there
+; should be a predefined handle for the port, generally 3).  The open
+; will fail if the system uses names other than "COM1" or "COM2".
+opnprt:	mov al,flags.comflg
+	mov ah,0
+	mov si,ax
+	shl si,1		; double index
+	mov dx,prttab[si]
+	mov ah,open
+	mov al,2
+	int dos
+	jnc opnpr2
+	mov ah,prstr		; It didn't like the string.
+	mov dx,offset erms41
+	int dos
+	mov dx,offset hnd1
+	int dos
+opnpr0:	mov dx,offset hnd2	; Ask user to supply the handle.
+	call prompt
+	mov ah,cmtxt
+	mov bx,offset rdbuf	; Where to put input.
+	mov dx,offset hndhlp	; In case user wants help.
+	call comnd
+	 jmp opnpr3		; Maybe user typed a ^C.
+	 nop
+	mov si,offset rdbuf
+	call atoi		; Convert to real number
+	 jmp opnpr0		; Keep trying. 
+	 nop
+	mov prthnd,ax		; Value returned in AX
+	ret
+opnpr2:	mov prthnd,ax		; Call succeeded.
+	ret
+opnpr3:	cmp flags.cxzflg,'C'	; Did user type a ^C?
+	jne opnpr4		; No, don't say anything.
+	mov ah,prstr		; Else, issue a warning.
+	mov dx,offset hnderr
+	int dos
+opnpr4:	ret			; Yes, fail.
+
+showkey:
+	mov ax,offset shkmsg
+	mov cx,shklen
+	ret
+
+; Initialization for using serial port.  Returns normally.
+SERINI	PROC	NEAR
+	cld			; Do increments in string operations
+	call clrbuf		; Clear input buffer. 
+	ret			; We're done.
+SERINI	ENDP
+
+; Reset the serial port.  This is the opposite of serini.  Calling
+; this twice without intervening calls to serini should be harmless.
+; Returns normally.
+
+SERRST	PROC	NEAR
+	ret			; All done.
+SERRST	ENDP
+
+; Produce a short beep.  The PC DOS bell is long enough to cause a loss
+; of data at the port.  Returns normally.
+
+BEEP	PROC	NEAR
+	mov dl,bell
+	mov ah,dconio
+	int dos
+	ret
+BEEP	ENDP 
+ 
+; Dumb terminal emulator.  Doesn't work too well above 1200 baud (and
+; even at 1200 baud you sometimes lose the first one or two characters
+; on a line).  
+term	proc	near
+	mov si,ax		; this is source
+	mov di,offset ourarg	; place to store arguments
+	mov ax,ds
+	mov es,ax		; address destination segment
+	mov cx,size termarg
+	rep movsb		; copy into our arg blk
+term1:	call prtchr
+	jmp short term2		; have a char...
+	nop
+	nop
+	jmp short term3		; no char, go on
+term2:	push ax
+	and al,7fh		; mask off parity for terminal
+	mov dl,al
+	mov ah,conout
+	int dos			; go print it
+	pop ax
+	test ourarg.flgs,capt	; capturing output?
+	jz term3		; no, forget it
+	call ourarg.captr	; else call the routine
+term3:	mov ah,dconio
+	mov dl,0ffh
+	int dos
+	jz term1		; no character, go on
+	cmp al,ourarg.escc	; escape char?
+	je term4		; yes, exit
+	push ax			; save char
+	mov ah,al
+	or ah,80H		; turn on hi bit so DOS doesn't interfere
+	call outchr		; output the character
+	nop
+	nop
+	nop
+	pop ax
+	test ourarg.flgs,lclecho ; echoing?
+	jz term1		; no, continue loop
+	mov dl,al
+	mov ah,dconio
+	int dos
+	jmp term1		; else echo and keep going
+term4:	ret
+term	endp
+
+; Jumping to this location is like retskp.  It assumes the instruction
+;   after the call is a jmp addr.
+ 
+RSKP    PROC    NEAR
+	pop bp
+	add bp,3
+	push bp
+        ret
+RSKP    ENDP
+ 
+; Jumping here is the same as a ret.
+ 
+R       PROC    NEAR
+        ret
+R       ENDP
+
+code	ends 
+	end//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 640 msxgen.asm
+	/bin/echo -n '	'; /bin/ls -ld msxgen.asm
+fi
+
+
