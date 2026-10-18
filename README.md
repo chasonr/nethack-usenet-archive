@@ -28,12 +28,9 @@ threads, or for which no other post in the thread is available.
 # Format of posts
 All posts are encoded as in the original mbox files. No effort is made to convert to UTF-8, deal with HTML or quoted-printable brain damage, or to unmangle whitespace.
 
-# Quarantine
+# "HipCrime" and other misdeeds
 A major denial of service attack hit Usenet from August 2007 to February 2008. rec.games.roguelike.nethack was specifically targeted. The perpetrator used the name "Hipcrime", and remains unknown.
 
-Posts dated from 21 August 2007 to 6 February 2008 are placed in subdirectories called "quarantine", from where they would otherwise be placed. The intention is to sort through these posts and remove the
-"Hipcrime" flood, so that rec.games.roguelike.nethack will actually be useful for this period.
+Posts dated from 21 August 2007 to 6 February 2008 have been reviewed and the "Hipcrime" flood removed, along with some garden-variety spam, so that rec.games.roguelike.nethack will actually be useful for this period.
 
 No other efforts have yet been made to remove spam from the archive.
-
-Those who wish to link to posts in a "quarantine" directory are asked to raise an issue on this repository, that the desired posts can be promoted to the permanent directory.
