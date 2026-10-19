@@ -1,0 +1,2909 @@
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!mnetor!seismo!columbia!caip!clyde!cbatt!cbosgd!ucbvax!ucdavis!deneb!u566393908ea
+From: u566393908ea@ucdavis.UUCP (u566393908ea)
+Newsgroups: net.sources.games
+Subject: VMS Larn 12.0 is here!  (part 3 of 6)
+Message-ID: <496@ucdavis.UUCP>
+Date: Sat, 30-Aug-86 18:03:40 EDT
+Article-I.D.: ucdavis.496
+Posted: Sat Aug 30 18:03:40 1986
+Date-Received: Sun, 31-Aug-86 09:45:21 EDT
+Distribution: net
+Organization: University of California, Davis
+Lines: 2895
+
+Hello all!  This is a port of Larn v12.0 to VAX/VMS.  Now everyone can save
+his/her daughter!!  Just unpack using /bin/sh and read readme.txt.
+
+                                                - Mark Nagel
+
+P.S.  Thanks to Lord Kahless for letting me post this!
+
+
+
+-------------------------------cut here-------------------------------------
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#	io.c
+#	keysense.c
+#	larn.c
+#	larn12.ftn
+#	larn12.hdy
+# This archive created: Sat Aug 30 14:47:38 1986
+export PATH; PATH=/bin:$PATH
+echo shar: extracting "'io.c'" '(22021 characters)'
+if test -f 'io.c'
+then
+	echo shar: will not over-write existing file "'io.c'"
+else
+cat << \SHAR_EOF > 'io.c'
+
+/* io.c			 Larn is copyrighted 1986 by Noah Morgan.
+ *
+ *	Below are the functions in this file:
+ *
+ *	setupvt100() 	Subroutine to set up terminal in correct mode for game
+ *	clearvt100()  	Subroutine to clean up terminal when the game is over
+ *	readchar() 	Routine to read in one character from the terminal
+ *	scbr()		Function to set cbreak -echo for the terminal
+ *	sncbr()		Function to set -cbreak echo for the terminal
+ *	newgame() 	Subroutine to save the initial time and seed rnd()
+ *
+ *	FILE OUTPUT ROUTINES
+ *
+ *	lprintf(format,args . . .)	printf to the output buffer
+ *	lprint(integer)			send binary integer to output buffer
+ *	lwrite(buf,len)			write a buffer to the output buffer
+ *	lprcat(str)			sent string to output buffer
+ *
+ *	FILE OUTPUT MACROS(in header.h)
+ *
+ *	lprc(character)			put the character into the output buffer
+ *
+ *	FILE INPUT ROUTINES
+ *
+ *	long lgetc()			read one character from input buffer
+ *	long lrint()			read one integer from input buffer
+ *	lrfill(address,number)		put input bytes into a buffer
+ *	char *lgetw()			get a whitespace ended word from input
+ *	char *lgetl()			get a \n or EOF ended line from input
+ *
+ *	FILE OPEN / CLOSE ROUTINES
+ *
+ *	lcreat(filename)		create a new file for write
+ *	lopen(filename)			open a file for read
+ *	lappend(filename)		open for append to an existing file
+ *	lrclose()			close the input file
+ *	lwclose()			close output file
+ *	lflush()			flush the output buffer
+ *
+ *	Other Routines
+ *
+ *	cursor(x,y)		position cursor at [x,y]
+ *	cursors()		position cursor at [1,24](saves memory)
+ *	cl_line(x,y)        	Clear line at [1,y] and leave cursor at [x,y]
+ *	cl_up(x,y)    		Clear screen from [x,1] to current line.
+ *	cl_dn(x,y)		Clear screen from [1,y] to end of display. 
+ *	standout(str)		Print the string in standout mode.
+ *	set_score_output() 	Called when output should be literally printed.
+ ** writechar(ch)			Print one character in decoded output buffer.
+ ** flush_buf()			Flush buffer with decoded output.
+ ** init_term()			Terminal initialization -- setup termcap info
+ *	char *tmcapcnv(sd,ss)	Routine to convert VT100 \33's to termcap format
+ *	beep()		Routine to emit a beep if enabled(see no-beep in .larnopts)
+ *
+ * Note: ** entries are available only in termcap mode.
+ */
+
+#include "header.h"
+
+#include <stdio.h>
+#include <file.h>
+#include <varargs.h>
+
+#define LINBUFSIZE 128		/* size of the lgetw() and lgetl() buffer */
+
+globaldef int	lfd,		/* output file numbers */
+		fd;		/* input file numbers */
+
+static int ipoint = MAXIBUF, iepoint = MAXIBUF;  /* input buffering pointers */
+static char lgetwbuf[LINBUFSIZE];	/* get line(word) buffer */
+
+/*
+ * setupvt100() 	Subroutine to set up terminal in correct mode for game
+ *
+ * Attributes off, clear screen, set scrolling region, set tty mode 
+ */
+setupvt100()
+{
+    clear();
+    setscroll();
+    scbr();			/* system("stty cbreak -echo"); */
+}
+
+/*
+ * clearvt100() 	Subroutine to clean up terminal when the game is over
+ *
+ * Attributes off, clear screen, unset scrolling region, restore tty mode 
+ */
+clearvt100()
+{
+    resetscroll();
+    clear();
+    sncbr();			/* system("stty -cbreak echo"); */
+}
+
+/*
+ * readchar()		Routine to read in one character from the terminal
+ */
+readchar()
+{
+#ifdef EXTRA
+    c[BYTESIN]++;
+#endif
+    lflush();			/* be sure output buffer is flushed */
+    if (Check_KeySense())
+	return(KeySense(1));	/* get byte from terminal */
+    else
+	return(getchar());
+}
+
+/*
+ *	scbr()		Function to set cbreak -echo for the terminal
+ *
+ *	like: system("SET TERM/NOECHO/PASTHRU")
+ */
+scbr()
+{
+    KeySense_On();
+}
+
+/*
+ *	sncbr()		Function to set -cbreak echo for the terminal
+ *
+ *	like: system("SET TERM/ECHO/NOPASTHRU")
+ */
+sncbr()
+{
+    KeySense_Off();
+}
+
+/*
+ *	newgame()	Subroutine to save the initial time and seed rnd()
+ */
+newgame()
+{
+    register long  *p, *pe;
+
+    for(p = c, pe = c + 100; p < pe; *p++ = 0);
+    time(&initialtime);
+    srand(initialtime);
+    lcreat((char *) 0);	/* open buffering for output to terminal */
+}
+
+
+/*
+ *	lprintf(format,args . . .)	printf to the output buffer
+ *	char *format;
+ *	{args . . .}
+ *
+ *	Enter with the format string in "format", as per printf() usage
+ *    and any needed arguments following it
+ *	Note: lprintf() only supports %s, %c and %d, with width modifier and
+ *    left or right justification.
+ *	No correct checking for output buffer overflow is done, but flushes 
+ *    are done beforehand if needed.
+ *    Returns nothing of value.
+ */
+lprintf(va_alist)
+va_dcl
+{
+    va_list ap;			/* pointer for variable argument list */
+    register char *fmt;
+    register char *outb,*tmpb;
+    register long wide,left,cont,n;		/* data for lprintf */
+    char db[12];		/* %d buffer in lprintf	 */
+
+    va_start(ap);		/* initialize the var args pointer */
+    fmt = va_arg(ap, char *);	/* pointer to format string */
+    if (lpnt >= lpend)
+	lflush();
+    outb = lpnt;
+    for(;;) {
+	while(*fmt != '%')
+	    if (*fmt)
+		*outb++ = *fmt++;
+	    else {
+		lpnt = outb;
+		return;
+	    }
+	wide = 0;
+	left = 1;
+	cont = 1;
+	while(cont)
+	    switch(*(++fmt)) {
+		case 'd': 
+		    n = va_arg(ap, long);
+		    if (n < 0) {
+			n = -n;
+			*outb++ = '-';
+			if (wide)
+			    --wide;
+		    }
+		    tmpb = db + 11;
+		    *tmpb =(char)(n % 10 + '0');
+		    while(n > 9)
+			*(--tmpb) =(char)((n /= 10) % 10 + '0');
+		    if (wide == 0)
+			while(tmpb < db + 12)
+			    *outb++ = *tmpb++;
+		    else {
+			wide -= db - tmpb + 12;
+			if (left)
+			    while(wide-- > 0)
+				*outb++ = ' ';
+			while(tmpb < db + 12)
+			    *outb++ = *tmpb++;
+			if (left == 0)
+			    while(wide-- > 0)
+				*outb++ = ' ';
+		    }
+		    cont = 0;
+		    break;
+
+		case 's': 
+		    tmpb = va_arg(ap, char *);
+		    if (wide == 0) {
+			while(*outb++ = *tmpb++);
+			--outb;
+		    } else {
+			n = wide - strlen(tmpb);
+			if (left)
+			    while(n-- > 0)
+				*outb++ = ' ';
+			while(*outb++ = *tmpb++);
+			--outb;
+			if (left == 0)
+			    while(n-- > 0)
+				*outb++ = ' ';
+		    }
+		    cont = 0;
+		    break;
+
+		case 'c': 
+		    *outb++ = va_arg(ap, int);
+		    cont = 0;
+		    break;
+
+		case '0': 
+		case '1': 
+		case '2': 
+		case '3': 
+		case '4': 
+		case '5': 
+		case '6': 
+		case '7': 
+		case '8': 
+		case '9': 
+		    wide = 10 * wide + *fmt - '0';
+		    break;
+
+		case '-': 
+		    left = 0;
+		    break;
+
+		default: 
+		    *outb++ = *fmt;
+		    cont = 0;
+		    break;
+	    };
+	fmt++;
+    }
+    va_end(ap);
+}
+
+
+/*
+ *	lprint(long-integer)	send binary integer to output buffer
+ *	long integer;
+ *
+ *	+---------+---------+---------+---------+
+ *	|   high  |	    |	      |	  low	|
+ *	|  order  |	    |	      |  order	|
+ *	|   byte  |	    |	      |	  byte	|
+ *	+---------+---------+---------+---------+
+ *	31  ---  24 23 --- 16 15 ---  8 7  ---   0
+ *
+ *	The save order is low order first, to high order(4 bytes total)
+ *    and is written to be system independent.
+ *	No checking for output buffer overflow is done, but flushes if needed!
+ *	Returns nothing of value.
+ */
+lprint(x)
+register long   x;
+{
+    if (lpnt >= lpend)
+	lflush();
+    *lpnt++ = 255 & x;
+    *lpnt++ = 255 &(x >> 8);
+    *lpnt++ = 255 &(x >> 16);
+    *lpnt++ = 255 &(x >> 24);
+}
+
+/*
+ *	lwrite(buf,len)		write a buffer to the output buffer
+ *	char *buf;
+ *	int len;
+ *	
+ *	Enter with the address and number of bytes to write out
+ *	Returns nothing of value
+ */
+lwrite(buf, len)
+register char  *buf;
+int len;
+{
+    register char *str;
+    register int num2;
+
+    if (len > 399) {		/* don't copy data if can just write it */
+#ifdef EXTRA
+	c[BYTESOUT] += len;
+#endif
+
+#ifndef VT100
+	for(str = buf; len > 0; --len)
+	    lprc(*str++);
+#else VT100
+	lflush();
+	write(lfd, buf, len);
+#endif VT100
+    }
+    else
+	while(len) {
+	    if (lpnt >= lpend)
+		lflush();	/* if buffer is full flush it */
+	    num2 = lpbuf + BUFBIG - lpnt;  /* # bytes left in output buffer */
+	    if (num2 > len)
+		num2 = len;
+	    str = lpnt;
+	    len -= num2;
+	    while(num2--)
+		*str++ = *buf++;  /* copy in the bytes */
+	    lpnt = str;
+	}
+}
+
+
+/*
+ *  long lgetc()	Read one character from input buffer
+ *
+ *  Returns 0 if EOF, otherwise the character
+ */
+long lgetc()
+{
+    register int i;
+
+    if (ipoint != iepoint)
+	return(inbuffer[ipoint++]);
+    /* NOTE: VAX/VMS reads only one line */
+    if ((i = read(fd, inbuffer, MAXIBUF)) <= 0) {
+	if (i != 0)
+	    write(1, "error reading from input file\n", 30);
+	iepoint = ipoint = 0;
+	return(0);
+    }
+    ipoint = 1;
+    iepoint = i;
+    return(*inbuffer);
+}
+
+
+/*
+ *	long lrint()	Read one integer from input buffer
+ *
+ *	+---------+---------+---------+---------+
+ *	|   high  |	    |	      |	  low	|
+ *	|  order  |	    |	      |  order	|
+ *	|   byte  |	    |	      |	  byte	|
+ *	+---------+---------+---------+---------+
+ *	31  ---  24 23 --- 16 15 ---  8 7  ---   0
+ *
+ *	The save order is low order first, to high order(4 bytes total)
+ *	Returns the int read
+ */
+long lrint()
+{
+    register unsigned long  i;
+
+    i = 255 & lgetc();
+    i |=(255 & lgetc()) << 8;
+    i |=(255 & lgetc()) << 16;
+    i |=(255 & lgetc()) << 24;
+    return(i);
+}
+
+
+/*
+ *  lrfill(address,number)		put input bytes into a buffer
+ *  char *address;
+ *  int number;
+ *
+ *  Reads "number" bytes into the buffer pointed to by "address".
+ *  Returns nothing of value
+ */
+lrfill(adr, num)
+register char *adr;
+int num;
+{
+    register char  *pnt;
+    register int    num2;
+
+    while(num) {
+	if (iepoint == ipoint) {
+	    if (num > 5) {	/* fast way */
+		if (read(fd, adr, num) != num)
+		    write(2, "error reading from input file\n", 30);
+		num = 0;
+	    } else {
+		*adr++ = lgetc();
+		--num;
+	    }
+	} else {
+	    num2 = iepoint - ipoint;/* 	# of bytes left in the buffer	 */
+	    if (num2 > num)
+		num2 = num;
+	    pnt = inbuffer + ipoint;
+	    num -= num2;
+	    ipoint += num2;
+	    while(num2--)
+		*adr++ = *pnt++;
+	}
+    }
+}
+
+
+/*
+ *  char *lgetw()		Get a whitespace ended word from input
+ *
+ *  Returns pointer to a buffer that contains word.  If EOF, returns a NULL
+ */
+char *lgetw()
+{
+    register char *lgp,cc;
+    register int n = LINBUFSIZE, quote = 0;
+
+    lgp = lgetwbuf;
+    do
+	cc = lgetc();
+    while((cc <= 32) &&(cc > NULL));	/* eat whitespace */
+    for(;; --n, cc = lgetc()) {
+	if ((cc == NULL) &&(lgp == lgetwbuf))
+	    return(NULL);	/* EOF */
+	if ((n <= 1) ||((cc <= 32) &&(quote == 0))) {
+	    *lgp = NULL;
+	    return(lgetwbuf);
+	}
+	if (cc != '"')
+	    *lgp++ = cc;
+	else
+	    quote ^= 1;
+    }
+}
+
+
+/*
+ *  char *lgetl()	Function to read in a line ended by newline or EOF
+ *
+ *  Returns pointer to a buffer that contains the line.  If EOF,
+ *  Returns NULL
+ */
+char *lgetl()
+{
+    register int i = LINBUFSIZE,ch;
+    register char *str = lgetwbuf;
+
+    for(;; --i) {
+	if ((*str++ = ch = lgetc()) == NULL) {
+	    if (str == lgetwbuf + 1)
+		return(NULL);	/* EOF */
+    ot: 
+	    *str = NULL;
+	    return(lgetwbuf);	/* line ended by EOF */
+	}
+	if ((ch == '\n') ||(i <= 1))
+	    goto ot;		/* line ended by \n */
+    }
+}
+
+
+/*
+ *  lcreat(filename)	Create a new file for write
+ *  char *filename;
+ *
+ *  lcreat((char*)0); means to the terminal
+ *  Returns -1 if error, otherwise the file descriptor opened.
+ */
+lcreat(str)
+char   *str;
+{
+    lpnt = lpbuf;
+    lpend = lpbuf + BUFBIG;
+    if (str == NULL)
+	return(lfd = 1);
+    if ((lfd = creat(str, 0644)) < 0) {
+	lfd = 1;
+	lprintf("error creating file <%s>\n", str);
+	lflush();
+	return(-1);
+    }
+    return(lfd);
+}
+
+
+/*
+ *  lopen(filename)		Open a file for read
+ *  char *filename;
+ *
+ *  lopen(0) means from the terminal
+ *  Returns -1 if error, otherwise the file descriptor opened.
+ */
+lopen(str)
+char   *str;
+{
+    ipoint = iepoint = MAXIBUF;
+    if (str == NULL)
+	return(fd = 0);
+    if ((fd = open(str, 0)) < 0) {
+	lwclose();
+	lfd = 1;
+	lpnt = lpbuf;
+	return(-1);
+    }
+    return(fd);
+}
+
+
+/*
+ *	lappend(filename)	Open for append to an existing file
+ *	char *filename;
+ *
+ *	lappend(0) means to the terminal
+ *	Returns -1 if error, otherwise the file descriptor opened.
+ */
+lappend(str)
+char   *str;
+{
+    lpnt = lpbuf;
+    lpend = lpbuf + BUFBIG;
+    if (str == NULL)
+	return(lfd = 1);
+    if ((lfd = open(str, O_RDWR|O_APPEND)) < 0) {
+	lfd = 1;
+	return(-1);
+    }
+    lseek(lfd,0,2);		/* go to the end-of-file */
+    return(lfd);
+}
+
+
+/*
+ *	lrclose()		close the input file
+ *
+ *	Returns nothing of value.
+ */
+lrclose()
+{
+    if (fd > 0)
+	close(fd);
+}
+
+
+/*
+ *	lwclose()		close output file flushing if needed
+ *
+ *	Returns nothing of value.
+ */
+lwclose()
+{
+    lflush();
+    if (lfd > 2)
+	close(lfd);
+}
+
+
+/*
+ *	lprcat(string)		append a string to the output buffer
+ *				avoids calls to lprintf(time consuming)
+ */
+lprcat(str)
+register char  *str;
+{
+    register char  *str2;
+
+    if (lpnt >= lpend)
+	lflush();
+    str2 = lpnt;
+    while(*str2++ = *str++);
+    lpnt = str2 - 1;
+}
+
+#ifdef VT100
+/*
+ *	cursor(x,y) 		Subroutine to set the cursor position
+ *
+ *	x and y are the cursor coordinates, and lpbuff is the output buffer where
+ *	escape sequence will be placed. 
+ */
+static char *y_num[] = {
+    "\33[", "\33[", "\33[2", "\33[3", "\33[4", "\33[5", "\33[6",
+    "\33[7", "\33[8", "\33[9", "\33[10", "\33[11", "\33[12", "\33[13", "\33[14",
+    "\33[15", "\33[16", "\33[17", "\33[18", "\33[19", "\33[20", "\33[21", "\33[22",
+    "\33[23", "\33[24"
+};
+
+static char *x_num[] = {
+    "H", "H", ";2H", ";3H", ";4H", ";5H", ";6H", ";7H", ";8H", ";9H",
+    ";10H", ";11H", ";12H", ";13H", ";14H", ";15H", ";16H", ";17H", ";18H", ";19H",
+    ";20H", ";21H", ";22H", ";23H", ";24H", ";25H", ";26H", ";27H", ";28H", ";29H",
+    ";30H", ";31H", ";32H", ";33H", ";34H", ";35H", ";36H", ";37H", ";38H", ";39H",
+    ";40H", ";41H", ";42H", ";43H", ";44H", ";45H", ";46H", ";47H", ";48H", ";49H",
+    ";50H", ";51H", ";52H", ";53H", ";54H", ";55H", ";56H", ";57H", ";58H", ";59H",
+    ";60H", ";61H", ";62H", ";63H", ";64H", ";65H", ";66H", ";67H", ";68H", ";69H",
+    ";70H", ";71H", ";72H", ";73H", ";74H", ";75H", ";76H", ";77H", ";78H", ";79H",
+    ";80H"
+};
+
+
+cursor(x, y)
+int x,y;
+{
+    register char  *p;
+
+    if (lpnt >= lpend)
+	lflush();
+
+    p = y_num[y];		/* get the string to print */
+    while(*p)
+	*lpnt++ = *p++;		/* print the string */
+
+    p = x_num[x];		/* get the string to print */
+    while(*p)
+	*lpnt++ = *p++;		/* print the string */
+}
+#else VT100
+/*
+ * cursor(x,y)	  Put cursor at specified coordinates starting at [1,1](termcap)
+ */
+cursor(x, y)
+int x,y;
+{
+    if (lpnt >= lpend)
+	lflush();
+
+    *lpnt++ = CURSOR;
+    *lpnt++ = x;
+    *lpnt++ = y;
+}
+#endif VT100
+
+
+/*
+ *	Routine to position cursor at beginning of 24th line
+ */
+cursors() {
+    cursor(1, 24);
+}
+
+#ifndef VT100
+/*
+ * Warning: ringing the bell is control code 7. Don't use in defines.
+ * Don't change the order of these defines.
+ * Also used in helpfiles. Codes used in helpfiles should be \E[1 to \E[7 with
+ * obvious meanings.
+ */
+
+static char cap[256];
+char   *CM,
+       *CE,
+       *CD,
+       *CL,
+       *SO,
+       *SE,
+       *AL,
+       *DL;			/* Termcap capabilities */
+static char *outbuf = 0;	/* translated output buffer */
+
+int writechar();
+
+/*
+ * init_term()		Terminal initialization -- setup termcap info
+ */
+init_term()
+{
+    char    termbuf[1024];
+    char   *capptr = cap + 10;
+    char   *term;
+
+    switch(tgetent(termbuf, term = getenv("TERM"))) {
+	case -1: 
+	    write(2, "Cannot open termcap file.\n", 26);
+	    exit();
+	case 0: 
+	    write(2, "Cannot find entry of ", 21);
+	    write(2, term, strlen(term));
+	    write(2, " in termcap\n", 12);
+	    exit();
+    };
+
+    CM = tgetstr("cm", &capptr);/* Cursor motion */
+    CE = tgetstr("ce", &capptr);/* Clear to eoln */
+    CL = tgetstr("cl", &capptr);/* Clear screen */
+
+ /* OPTIONAL */
+    AL = tgetstr("al", &capptr);/* Insert line */
+    DL = tgetstr("dl", &capptr);/* Delete line */
+    SO = tgetstr("so", &capptr);/* Begin standout mode */
+    SE = tgetstr("se", &capptr);/* End standout mode */
+    CD = tgetstr("cd", &capptr);/* Clear to end of display */
+
+    if (!CM) {			/* can't find cursor motion entry */
+	write(2, "Sorry, for a ", 13);
+	write(2, term, strlen(term));
+	write(2, ", I can't find the cursor motion entry in termcap\n", 50);
+	exit();
+    }
+    if (!CE) {			/* can't find clear to end of line entry */
+	write(2, "Sorry, for a ", 13);
+	write(2, term, strlen(term));
+	write(2, ", I can't find the clear to end of line entry in termcap\n", 57);
+	exit();
+    }
+    if (!CL) {			/* can't find clear entire screen entry */
+	write(2, "Sorry, for a ", 13);
+	write(2, term, strlen(term));
+	write(2, ", I can't find the clear entire screen entry in termcap\n", 56);
+	exit();
+    }
+    /* get memory for decoded output buffer */
+    if ((outbuf = malloc(BUFBIG + 16)) == 0) {
+	write(2, "Error malloc'ing memory for decoded output buffer\n", 50);
+	died(-285);		/* malloc() failure */
+    }
+}
+#endif VT100
+
+/*
+ * cl_line(x,y)  Clear the whole line indicated by 'y' and leave cursor at [x,y]
+ */
+cl_line(x, y)
+int x,y;
+{
+#ifdef VT100
+    cursor(x, y);
+    lprcat("\33[2K");
+#else VT100
+    cursor(1, y);
+    *lpnt++ = CL_LINE;
+    cursor(x, y);
+#endif VT100
+}
+
+
+/*
+ * cl_up(x,y) Clear screen from [x,1] to current position. Leave cursor at [x,y]
+ */
+cl_up(x, y)
+register int x,y;
+{
+#ifdef VT100
+    cursor(x, y);
+    lprcat("\33[1J\33[2K");
+#else VT100
+    register int i;
+
+    cursor(1, 1);
+    for(i = 1; i <= y; i++) {
+	*lpnt++ = CL_LINE;
+	*lpnt++ = '\n';
+    }
+    cursor(x, y);
+#endif VT100
+}
+
+/*
+ * cl_dn(x,y) 	Clear screen from [1,y] to end of display. Leave cursor at [x,y]
+ */
+cl_dn(x, y)
+register int x,y;
+{
+#ifdef VT100
+    cursor(x, y);
+    lprcat("\33[J\33[2K");
+#else VT100
+    register int i;
+
+    cursor(1, y);
+    if (!CD) {
+	*lpnt++ = CL_LINE;
+	for(i = y; i <= 24; i++) {
+	    *lpnt++ = CL_LINE;
+	    if (i != 24)
+		*lpnt++ = '\n';
+	}
+	cursor(x, y);
+    } else
+	*lpnt++ = CL_DOWN;
+    cursor(x, y);
+#endif VT100
+}
+
+
+/*
+ * standout(str)    Print the argument string in inverse video(standout mode).
+ */
+standout(str)
+register char *str;
+{
+#ifdef VT100
+    setbold();
+    while(*str)
+	*lpnt++ = *str++;
+    resetbold();
+#else VT100
+    *lpnt++ = ST_START;
+    while(*str)
+	*lpnt++ = *str++;
+    *lpnt++ = ST_END;
+#endif VT100
+}
+
+
+/*
+ * set_score_output() 	Called when output should be literally printed.
+ */
+set_score_output()
+{
+    enable_scroll = -1;
+}
+
+/*
+ *  lflush()			Flush the output buffer
+ *
+ *  Returns nothing of value.
+ *  For termcap version: Flush output in output buffer according to output
+ *			 status as indicated by `enable_scroll'
+ */
+#ifndef VT100
+static int scrline = 18;  /* line # for wraparound instead of scrolling if no DL */
+lflush()
+{
+    register int lpoint;
+    register char *str;
+    static int curx = 0;
+    static int cury = 0;
+
+    if ((lpoint = lpnt - lpbuf) > 0) {
+#ifdef EXTRA
+	c[BYTESOUT] += lpoint;
+#endif
+	if (enable_scroll <= -1) {
+	    flush_buf();
+	    if (write(lfd, lpbuf, lpoint) != lpoint)
+		write(2, "error writing to output file\n", 29);
+	    lpnt = lpbuf;	/* point back to beginning of buffer */
+	    return;
+	}
+	for(str = lpbuf; str < lpnt; str++) {
+	    if (*str >= 32) {
+		writechar(*str);
+		curx++;
+	    } else
+		switch(*str) {
+		    case CLEAR: 
+			tputs(CL, 0, writechar);
+			curx = cury = 0;
+			break;
+
+		    case CL_LINE: 
+			tputs(CE, 0, writechar);
+			break;
+
+		    case CL_DOWN: 
+			tputs(CD, 0, writechar);
+			break;
+
+		    case ST_START: 
+			tputs(SO, 0, writechar);
+			break;
+
+		    case ST_END: 
+			tputs(SE, 0, writechar);
+			break;
+
+		    case CURSOR: 
+			curx = *++str - 1;
+			cury = *++str - 1;
+			tputs(tgoto(CM, curx, cury), 0, writechar);
+			break;
+
+		    case '\n': 
+			if ((cury == 23) && enable_scroll) {
+			    if (!DL || !AL) {/* wraparound or scroll? */
+				if (++scrline > 23)
+				    scrline = 19;
+
+				if (++scrline > 23)
+				    scrline = 19;
+				tputs(tgoto(CM, 0, scrline), 0, writechar);
+				tputs(CE, 0, writechar);
+
+				if (--scrline < 19)
+				    scrline = 23;
+				tputs(tgoto(CM, 0, scrline), 0, writechar);
+				tputs(CE, 0, writechar);
+			    } else {
+				tputs(tgoto(CM, 0, 19), 0, writechar);
+				tputs(DL, 0, writechar);
+				tputs(tgoto(CM, 0, 23), 0, writechar);
+			    /* 	tputs(AL, 0, writechar); */
+			    }
+			} else {
+			    writechar('\n');
+			    cury++;
+			}
+			curx = 0;
+			break;
+
+		    default: 
+			writechar(*str);
+			curx++;
+		};
+	}
+    }
+    lpnt = lpbuf;
+    flush_buf();		/* flush real output buffer now */
+}
+#else VT100
+/*
+ *  lflush()				flush the output buffer
+ *
+ *  Returns nothing of value.
+ */
+lflush()
+{
+    register int lpoint;
+
+    if ((lpoint = lpnt - lpbuf) > 0) {
+#ifdef EXTRA
+	c[BYTESOUT] += lpoint;
+#endif
+	if (write(lfd, lpbuf, lpoint) != lpoint)
+	    write(2, "error writing to output file\n", 29);
+    }
+    lpnt = lpbuf;		/* point back to beginning of buffer */
+}
+#endif VT100
+
+#ifndef VT100
+static int index = 0;
+/*
+ * writechar(ch)		Print one character in decoded output buffer.
+ */
+int writechar(c)
+int c;
+{
+    outbuf[index++] = c;
+    if (index >= BUFBIG)
+	flush_buf();
+}
+
+/*
+ * flush_buf()			Flush buffer with decoded output.
+ */
+flush_buf()
+{
+    if (index)
+	write(lfd, outbuf, index);
+    index = 0;
+}
+
+
+/*
+ * char *tmcapcnv(sd,ss)  Routine to convert VT100 escapes to termcap format
+ *
+ * Processes only the \33[#m sequence(converts . files for termcap use)
+ */
+char *tmcapcnv(sd, ss)
+register char *sd,*ss;
+{
+    register int tmstate = 0;	/* 0=normal, 1=\33 2=[ 3=# */
+    char *sdptr,tmdigit = 0;	/* the # in \33[#m */
+
+    sdptr = sd;
+    while(*ss) {
+	switch(tmstate) {
+	    case 0: 
+		if (*ss == '\33') {
+		    tmstate++;
+		    break;
+		}
+	ign: 
+		*sdptr++ = *ss;
+	ign2: 
+		tmstate = 0;
+		break;
+	    case 1: 
+		if (*ss != '[')
+		    goto ign;
+		tmstate++;
+		break;
+	    case 2: 
+		if (isdigit(*ss)) {
+		    tmdigit = *ss - '0';
+		    tmstate++;
+		    break;
+		}
+		if (*ss == 'm') {
+		    *sdptr++ = ST_END;
+		    goto ign2;
+		}
+		goto ign;
+	    case 3: 
+		if (*ss == 'm') {
+		    if (tmdigit)
+			*sdptr++ = ST_START;
+		    else
+			*sdptr++ = ST_END;
+		    goto ign2;
+		}
+	    default: 
+		goto ign;
+	};
+	ss++;
+    }
+    *sdptr = 0;			/* NULL terminator */
+    return(sd);
+}
+#endif VT100
+
+
+/*
+ *   beep()	Routine to emit a beep if enabled(see no-beep in larn.opt)
+ */
+beep()
+{
+    if (!nobeep)
+	*lpnt++ = '\7';
+}
+SHAR_EOF
+if test 22021 -ne "`wc -c < 'io.c'`"
+then
+	echo shar: error transmitting "'io.c'" '(should have been 22021 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'keysense.c'" '(7755 characters)'
+if test -f 'keysense.c'
+then
+	echo shar: will not over-write existing file "'keysense.c'"
+else
+cat << \SHAR_EOF > 'keysense.c'
+
+/*
+ *  MODULE NAME   : KEYSENSE
+ *  MODULE TYPE   : Implementation
+ *
+ *  DESCRIPTION:
+ *    This module declares three functions that, together, make it possible to
+ *    to sense single keypresses in VAX/VMS.  There is an enable routine, a
+ *    disable routine, and the actual sensing routine.  The sensing routine is
+ *    synchronous - that is, it waits until a key is pressed before continuing
+ *    with the program.
+ *
+ *  IMPLEMENTED BY:
+ *    Mark D. Nagel  (Original code by Dave Conroy)
+ *    Department of Internal Medicine
+ *    Section of Infectious and Immunologic Diseases
+ *    University of California, Davis
+ *    Davis, CA  95616
+ *
+ *  LAST MODIFIED : 27 May 1986
+ *
+ *  REVISION HISTORY - Version 1.00
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+#include <stsdef.h>
+#include <ssdef.h>
+#include <descrip.h>
+#include <iodef.h>
+#include <ttdef.h>
+#include <tt2def.h>
+
+#define EOS	'\0'
+#define ESC	'\33'
+#define TRUE	1
+#define FALSE	0
+
+/*
+ *  GLOBAL VARIABLES
+ *
+ *  DESCRIPTION:
+ *    The variables declared here are used globally throughout this module.
+ *    They relate to I/O buffering and channel information.
+ */
+
+#define	NIBUF	128			/* Size of input buffer */
+#define	EFN	0			/* Event flag number */
+
+char	ibuf[NIBUF];			/* Input buffer */
+int	nibuf = 0;			/* # of bytes in above */
+int	ibufi = 0;			/* Read index */
+int	oldmode[3];			/* Old TTY mode bits */
+int	newmode[3];			/* New TTY mode bits */
+short	iochan;				/* TTY I/O channel */
+
+static short keysense_on = FALSE;
+
+/*
+ *  FUNCTION NAME: KeySense_On()
+ *
+ *  DESCRIPTION:
+ *    This function assigns a channel to SYS$COMMAND on VAX/VMS and sets it
+ *    to raw mode so that single keypresses may be sensed.
+ *
+ *  RETURN VALUE: None.
+ */
+
+void KeySense_On()
+{
+    struct dsc$descriptor	idsc;
+    struct dsc$descriptor	odsc;
+    char			oname[40];
+    int				iosb[2];
+    int				status;
+
+    if (!keysense_on) {
+	odsc.dsc$a_pointer = "SYS$COMMAND";
+	odsc.dsc$w_length  = strlen(odsc.dsc$a_pointer);
+	odsc.dsc$b_dtype   = DSC$K_DTYPE_T;
+	odsc.dsc$b_class   = DSC$K_CLASS_S;
+	idsc.dsc$b_dtype   = DSC$K_DTYPE_T;
+	idsc.dsc$b_class   = DSC$K_CLASS_S;
+	do {
+	    idsc.dsc$a_pointer = odsc.dsc$a_pointer;
+	    idsc.dsc$w_length  = odsc.dsc$w_length;
+	    odsc.dsc$a_pointer = &oname[0];
+	    odsc.dsc$w_length  = sizeof(oname);
+	    status = LIB$SYS_TRNLOG(&idsc, &odsc.dsc$w_length, &odsc);
+	    if (status != SS$_NORMAL && status != SS$_NOTRAN)
+		exit(status);
+	    if (oname[0] == 0x1B) {
+		odsc.dsc$a_pointer += 4;
+		odsc.dsc$w_length  -= 4;
+	    }
+	} while (status == SS$_NORMAL);
+	status = SYS$ASSIGN(&odsc, &iochan, 0, 0);
+	if (status != SS$_NORMAL)
+	exit(status);
+	status = SYS$QIOW(EFN, iochan, IO$_SENSEMODE, iosb, 0, 0, oldmode, sizeof(oldmode), 0, 0, 0, 0);
+	if (status != SS$_NORMAL || (iosb[0] & 0xFFFF) != SS$_NORMAL)
+	    exit(status);
+	newmode[0] = oldmode[0];		/* Only in version 4.	*/
+	newmode[1] = oldmode[1] | TT$M_NOECHO | TT$M_TTSYNC;
+	newmode[2] = oldmode[2] | TT2$M_PASTHRU;
+	status = SYS$QIOW(EFN, iochan, IO$_SETMODE, iosb, 0, 0, newmode, sizeof(newmode), 0, 0, 0, 0);
+	if (status != SS$_NORMAL || (iosb[0] & 0xFFFF) != SS$_NORMAL)
+	    exit(status);
+	keysense_on = TRUE;
+    }
+}
+
+
+/*
+ *  FUNCTION NAME: KeySense(wait)
+ *
+ *  DESCRIPTION:
+ *    This function will return the next key typed at the terminal if the 
+ *    function 'KeySense_On' has been executed.  The character is returned
+ *    synchronously - that is, the program will hang until a key is pressed if
+ *    the parameter 'wait' is TRUE.  Otherwise, the routine will return the
+ *    last key presses or -1 if no key was pressed.
+ *
+ *  RETURN VALUE: Single character or -1.
+ */
+
+char KeySense(wait)
+int wait;
+{
+    int status;
+    int iosb[2];
+    int term[2];
+
+    if (keysense_on) {
+	term[0] = 0;
+	term[1] = 0;
+	while (ibufi >= nibuf) {
+	    ibufi = 0;
+	    status = SYS$QIOW(EFN, iochan, IO$_READLBLK|IO$M_TIMED, iosb, 0, 0, ibuf, NIBUF, 0, term, 0, 0);
+	    if (status != SS$_NORMAL)
+		continue;
+	    status = iosb[0] & 0xFFFF;
+	    if (status != SS$_NORMAL && status != SS$_TIMEOUT)
+		continue;
+	    nibuf = (iosb[0]>>16) + (iosb[1]>>16);
+	    if (nibuf == 0) {
+		if (wait) {
+		    status = SYS$QIOW(EFN, iochan, IO$_READLBLK, iosb, 0, 0, ibuf, 1, 0, term, 0, 0);
+		    if (status != SS$_NORMAL)
+			continue;
+		    if ((iosb[0] & 0xFFFF) != SS$_NORMAL)
+			continue;
+		    nibuf = (iosb[0]>>16) + (iosb[1]>>16);
+	        } else {
+		    lib$wait(&0.10);
+		    return (-1);
+		}
+	    }
+	}
+	if (ibuf[ibufi] == 0x0A || ibuf[ibufi] == 0x0D)
+	    ibuf[ibufi] = '\n';
+	return (ibuf[ibufi++] & 0xFF);
+    }
+}
+
+
+/*
+ *  FUNCTION NAME: Check_KeySense()	
+ *
+ *  DESCRIPTION:
+ *    This function will return TRUE if keysense is currently on and FALSE
+ *    if it is not.
+ *
+ *  RETURN VALUE: Boolean.
+ */
+
+int Check_KeySense()
+{
+    return(keysense_on);
+}
+
+
+/*
+ *  FUNCTION NAME: KeySense_Off()
+ *
+ *  DESCRIPTION:
+ *    This function disables the single keypress input mode.  
+ *
+ *  RETURN VALUE: None.
+ */
+
+void KeySense_Off()
+{
+    int status;
+    int iosb[1];
+
+    if (keysense_on) {
+	status = SYS$QIOW(EFN, iochan, IO$_SETMODE, iosb, 0, 0, oldmode, sizeof(oldmode), 0, 0, 0, 0);
+	if (status != SS$_NORMAL || (iosb[0]&0xFFFF) != SS$_NORMAL)
+	    exit(status);
+	status = SYS$DASSGN(iochan);
+	if (status != SS$_NORMAL)
+	    exit(status);
+	keysense_on = FALSE;
+    }
+}
+
+
+/*
+ *  FUNCTION NAME: system(cmd)
+ *
+ *  DESCRIPTION:
+ *    Run a command. The "cmd" is a pointer to a command string, or NULL if
+ *    you want to run a copy of DCL in the subjob (this is how the standard
+ *    routine LIB$SPAWN works. You have to do weird stuff with the terminal
+ *    on the way in and the way out if KeySense is on, because DCL does not
+ *    want the channel to be in raw mode.
+ *
+ *  RETURN VALUE: None.
+ */
+
+system(cmd)
+register char *cmd;
+{
+    struct  dsc$descriptor  cdsc;
+    struct  dsc$descriptor  *cdscp;
+    long    status;
+    long    substatus;
+    long    iosb[2];
+
+    if (keysense_on) {
+	status = SYS$QIOW(EFN, iochan, IO$_SETMODE, iosb, 0, 0, oldmode, sizeof(oldmode), 0, 0, 0, 0);
+	if (status != SS$_NORMAL || (iosb[0]&0xFFFF) != SS$_NORMAL)
+	    return (FALSE);
+    }
+    cdscp = NULL;			/* Assume DCL.       */
+    if (cmd != NULL) {			/* Build descriptor. */
+	cdsc.dsc$a_pointer = cmd;
+	cdsc.dsc$w_length  = strlen(cmd);
+	cdsc.dsc$b_dtype   = DSC$K_DTYPE_T;
+	cdsc.dsc$b_class   = DSC$K_CLASS_S;
+	cdscp = &cdsc;
+    }
+    status = LIB$SPAWN(cdscp, 0, 0, 0, 0, 0, &substatus, 0, 0, 0);
+    if (status != SS$_NORMAL)
+	substatus = status;
+    if (keysense_on) {
+	status = SYS$QIOW(EFN, iochan, IO$_SETMODE, iosb, 0, 0, newmode, sizeof(newmode), 0, 0, 0, 0);
+	if (status != SS$_NORMAL || (iosb[0]&0xFFFF) != SS$_NORMAL)
+	    return (FALSE);
+    }
+    if ((substatus & STS$M_SUCCESS) == 0)     /* Command failed. */
+	return (FALSE);
+    return (TRUE);
+}
+
+
+/*
+ *  FUNCTION NAME: getpass(prompt)
+ *
+ *  DESCRIPTION:
+ *    Read a password from the keyboard with echoing turned off.  The password
+ *    must be terminated by a CR.  This CR will become a NUL.  The password
+ *    is stored statically, so if it is necessary to keep it you must copy
+ *    it.
+ *
+ *  RETURN VALUE: pointer to string or NULL if this is an invalid device.
+ */
+
+#define MAXBUF	100
+
+char *getpass(prompt)
+char *prompt;
+{
+    static char inbuf[MAXBUF+1];
+    char ch, KeySense();
+    int i = 0, was_on;
+
+    was_on = keysense_on;
+    if (isatty(stdin)) {
+	puts(prompt);
+	KeySense_On();
+	while (1) {
+	    ch = KeySense(1);
+	    if ((ch == 0x7F || ch == 0x08) && i > 0)
+		--i;
+	    else if (ch == 0x0A || ch == 0x0D)
+		break;
+	    else if (i >= MAXBUF - 1)
+		continue;
+	    else if (isprint(ch))
+		inbuf[i++] = ch;
+	}
+	inbuf[i] = '\0';
+	if (!was_on)
+	    KeySense_Off();
+	return(inbuf);
+    }
+    return(NULL);
+}
+SHAR_EOF
+if test 7755 -ne "`wc -c < 'keysense.c'`"
+then
+	echo shar: error transmitting "'keysense.c'" '(should have been 7755 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'larn.c'" '(28359 characters)'
+if test -f 'larn.c'
+then
+	echo shar: will not over-write existing file "'larn.c'"
+else
+cat << \SHAR_EOF > 'larn.c'
+
+/*	main.c		*/
+
+#include "header.h"
+#include <times.h>
+
+#ifndef LARNHOME
+#define LARNHOME "SYS$GAMES:"	/* normally supplied by a Makefile */
+#endif
+
+#ifndef WIZID
+#define WIZID	0
+#endif
+
+#define MAXFILENAMESIZE	128
+
+/*
+ * All these strings will be appended to in main() to be complete filenames
+ */
+
+/* the game save filename */
+globaldef char savefilename[SAVEFILENAMESIZE];
+
+/* the score file */
+globaldef char scorefile[255];
+
+/* the logging file */
+globaldef char logfile[255];
+
+/* the help text file */
+globaldef char helpfile[255];
+
+/* the maze data file */
+globaldef char larnlevels[255];
+
+/* the fortune data file */
+globaldef char fortfile[255];
+
+/* the larn.opt filename */
+globaldef char optsfile[255];
+
+/* the player id datafile name */
+globaldef char playerids[255];
+
+/* the holiday datafile */
+globaldef char holifile[255];
+
+globaldef char diagfile[] = "LARN12.DBG";	/* the diagnostic filename */
+globaldef char ckpfile[]  = "LARN12.CKP";	/* the checkpoint filename */
+globaldef char *password  = "pvnert(x)";	/* the wizards password <=32 */
+
+#if WIZID == -1
+globaldef int wisid = 0;	/* the user id of the only person who can be wizard */
+#else
+globaldef int wisid = WIZID;	/* the user id of the only person who can be wizard */
+#endif
+
+static char copyright[] = "\nLarn is copyrighted 1986 by Noah Morgan.\n";
+
+globaldef int srcount = 0;	/* line counter for showstr() */
+globaldef int dropflag = 0;	/* if 1 then don't lookforobject() next round */
+int rmst = 80;			/* random monster creation counter */
+globaldef int userid;		/* the players login user id number */
+globaldef char nowelcome = 0;
+globaldef char nomove = 0;	/* if (nomove) then don't count next iteration as a move */
+globaldef long start_cpu;
+
+static char viewflag = 0;
+/* if viewflag then we have done a 99 stay here and don't showcell in the main loop */
+globaldef char restorflag = 0;		/* 1 means restore has been done */
+
+static char cmdhelp[] = "\
+Cmd line format: larn [-slicnh] [-o<optsifle>] [-##] [++]\n\
+  -s   show the scoreboard\n\
+  -l   show the logfile\n\
+  -i   show scoreboard with inventory of checkpoint file\n\
+  -c   clear the scoreboard file (requires password)\n\
+  -h   print this help message\n\
+  -o<optsfile> specify option filename to be used instead of LARN12.OPT\n\
+  -##  set the difficulty level to ##\n\
+  ++   restore a checkpointed game\n\
+";
+
+#ifdef VT100
+static char *termtypes[] = {
+    "vt100-80", "vt100","vt101", "vt102", "vt103",
+    "vt125", "vt131", "vt140"
+};
+#endif VT100
+
+main(argc, argv)
+int argc;
+char **argv;
+{
+    register int i,j;
+    int hard;
+    char *ptr = 0, *ttype;
+    struct tms cputime;
+
+/*
+ *	first task is to identify the player
+ */
+#ifndef VT100
+    init_term();	/* setup the terminal(find out what type) for termcap */
+#endif VT100
+    if ((ptr = getenv("USER")) == 0)
+	if ((ptr = getenv("LOGNAME")) == 0) {
+	    write(2, "Can't find your logname.  Who Are You?\n", 39);
+	    exit();
+	}
+
+    times(&cputime);		/* need to know what it was */
+    start_cpu = cputime.tms_utime + cputime.tms_stime;
+
+/*
+ *	now malloc the memory for the buffers 
+ */
+    lpbuf = malloc((5 * BUFBIG) >> 2);/* output buffer */
+    inbuffer = malloc((5 * MAXIBUF) >> 2);/* output buffer */
+    if ((lpbuf == 0) ||(inbuffer == 0))
+	died(-285);	/* malloc() failure */
+
+    lcreat((char *) 0);
+    newgame();		/* set the initial clock  */
+    for (i = 0; i < MAXLEVEL+MAXVLEVEL; beenhere[i++] = 0);
+    hard = -1;
+
+/*
+ *	second task is to prepare the pathnames the player will need
+ */
+    strcpy(loginname, ptr);/* save loginname of the user for logging purposes */
+    strcpy(logname, ptr);	/* this will be overwritten with the players name */
+    if ((ptr = getenv("HOME")) == 0)
+	ptr = "[]";
+#ifdef SAVEINHOME
+    sprintf(savefilename,"%sLARN12.SAV",ptr);
+#else
+    sprintf(savefilename,%s%s.SAV",LARNHOME,logname);	/* prepare savefile name */
+#endif
+    sprintf(optsfile, "%sLARN12.OPT", ptr);		/* the larn.opt filename */
+    sprintf(scorefile,"%s%s",LARNHOME,SCORENAME);	/* the larn scoreboard filename */
+    sprintf(logfile,"%s%s",LARNHOME,LOGFNAME);		/* larn activity logging filename */
+    sprintf(helpfile,"%s%s",LARNHOME,HELPNAME);		/* the larn on-line help file */
+    sprintf(larnlevels,"%s%s",LARNHOME,LEVELSNAME);	/* the pre-made cave level data file */
+    sprintf(fortfile,"%s%s",LARNHOME,FORTSNAME);	/* the fortune data file name */
+    sprintf(playerids,"%s%s",LARNHOME,PLAYERIDS);	/* the playerid data file name */
+    sprintf(holifile,"%s%s",LARNHOME,HOLIFILE);		/* the holiday data file name */
+
+#ifdef VT100
+/*
+ *	check terminal type to avoid users who have not vt100 type terminals
+ */
+    ttype = getenv("TERM");
+    for (j = 1, i = 0; i < sizeof(termtypes) / sizeof(char *); i++)
+	if (strcmp(ttype, termtypes[i]) == 0) {
+	    j = 0;
+	    break;
+	}
+    if (j)  {
+	lprcat("Sorry, Larn needs a VT100 family terminal for all it's features.\n");
+	lflush();
+	exit();
+    }
+#endif VT100
+
+/*
+ *	now make scoreboard if it is not there (don't clear) 
+ */
+    if (access(scorefile, 0) == -1)/* not there */
+	makeboard();
+
+/*
+ *	now process the command line arguments 
+ */
+    for (i = 1; i < argc; i++) {
+	if (argv[i][0] == '-')
+	    switch(argv[i][1]) {
+		case 's':	/* show scoreboard */
+		    showscores();
+		    exit();
+
+		case 'l': 	/* show log file */
+		    diedlog();
+		    exit();
+
+		case 'i':	/* show all scoreboard */
+		    showallscores();
+		    exit();
+
+		case 'c': 	/* anyone with password can create scoreboard */
+		    lprcat("Preparing to initialize the scoreboard.\n");
+		    if (getpassword() != 0) {	/* make new scoreboard */
+			makeboard();
+			lprc('\n');
+			showscores();
+		    }
+		    exit();
+
+		case 'n': 	/* no welcome msg	 */
+		    nowelcome = 1;
+		    argv[i][0] = 0;
+		    break;
+
+		case '0': 
+		case '1': 
+		case '2': 
+		case '3': 
+		case '4': 
+		case '5': 
+		case '6': 
+		case '7': 
+		case '8': 
+		case '9': 	/* for hardness */
+		    sscanf(&argv[i][1], "%d", &hard);
+		    break;
+
+		case 'h': 	/* print out command line arguments */
+		    write(1, cmdhelp, sizeof(cmdhelp));
+		    exit();
+
+		case 'o': 	/* specify a larn.opt filename */
+		    strncpy(optsfile, argv[i] + 2, 127);
+		    break;
+
+		default: 
+		    printf("Unknown option <%s>\n", argv[i]);
+		    exit();
+	    };
+
+	if (argv[i][0] == '+') {
+	    clear();
+	    restorflag = 1;
+	    if (argv[i][1] == '+') {
+		hitflag = 1;
+		restoregame(ckpfile);/* restore checkpointed game */
+	    }
+	    i = argc;
+	}
+    }
+
+    readopts();	/* read the options file if there is one */
+
+#ifdef UIDSCORE
+    userid = (getegid()<<16) | geteuid();    /* obtain the user's id number */
+#else UIDSCORE
+    userid = getplid(logname);	/* obtain the players id number */
+    if (userid < 0) {
+	write(2, "Can't obtain playerid\n", 22);
+	exit(1);
+    }
+#endif UIDSCORE
+
+#ifdef TIMECHECK
+/*
+ *  this section of code checks to see if larn is allowed during working hours
+ */
+    if (dayplay == 0)	/* check for not-during-daytime-hours */
+	if (playable()) {
+	    write(2, "Sorry, Larn can not be played during working hours.\n", 52);
+	    exit();
+	}
+#endif TIMECHECK
+
+    if (access(savefilename, 0) == 0) {	/* restore game if need to */
+	clear();
+	restorflag = 1;
+	hitflag = 1;
+	restoregame(savefilename);/* restore last game	 */
+    }
+    sigsetup();		/* trap all needed signals */
+    sethard(hard);		/* set up the desired difficulty */
+    setupvt100();		/* setup the terminal special mode */
+    if (c[HP] == 0) {		/* create new game */
+	makeplayer();		/* make the character that will play */
+	newcavelevel(0);	/* make the dungeon */
+	predostuff = 1;		/* tell signals that we are in the welcome screen */
+	if (nowelcome == 0)
+	    welcome();		/* welcome the player to the game */
+    }
+    drawscreen();		/* show the initial dungeon */
+    predostuff = 2;		/* tell the trap functions that they must do a showplayer() from here on */
+    nice(1);			/* games should be run niced */
+    yrepcount = hit2flag = 0;
+    while (1) {
+	if (dropflag == 0)
+	    lookforobject();	/* see if there is an object here */
+	else
+	    dropflag = 0;	/* don't show it just dropped an item */
+	if (hitflag == 0) {
+	    if (c[HASTEMONST])
+		movemonst();
+	    movemonst();
+	}			/* move the monsters */
+	if (viewflag == 0)
+	    showcell(playerx, playery);
+	else
+	    viewflag = 0;	/* show stuff around player */
+	if (hit3flag)
+	    flushall();
+	hitflag = hit3flag = 0;
+	nomove = 1;
+	bot_linex();	/* update bottom line */
+	while (nomove) {
+	    if (hit3flag)
+		flushall();
+	    nomove = 0;
+	    parse();
+	}			/* get commands and make moves */
+	regen();		/* regenerate hp and spells */
+	if (c[TIMESTOP] == 0)
+	    if (--rmst <= 0) {
+		rmst = 120 - (level << 2);
+		fillmonst(makemonst(level));
+	    }
+    }
+}
+
+
+/*
+	showstr()
+
+	show character's inventory
+ */
+showstr()
+{
+    register int i,number;
+
+    for (number = 3, i = 0; i < 26; i++)
+	if (iven[i])
+	    number++;	/* count items in inventory */
+    t_setup(number);
+    qshowstr();
+    t_endup(number);
+}
+
+qshowstr()
+{
+    register int i,j,k,sigsav;
+
+    srcount = 0;
+    sigsav = nosignal;
+    nosignal = 1;		/* don't allow ^C etc */
+    if (c[GOLD]) {
+	lprintf(".)   %d gold pieces",(long) c[GOLD]);
+	srcount++;
+    }
+    for (k = 26; k >= 0; k--)
+	if (iven[k]) {
+	    for (i = 22; i < 84; i++)
+		for (j = 0; j <= k; j++)
+		    if (i == iven[j])
+			show3(j);
+	    k = 0;
+	}
+
+    lprintf("\nElapsed time is %d.  You have %d mobuls left",(long)((gtime + 99) / 100 + 1),(long)((TIMELIMIT - gtime) / 100));
+    more();
+    nosignal = sigsav;
+}
+
+
+/*
+ *	subroutine to clear screen depending on # lines to display
+ */
+t_setup(count)
+register int count;
+{
+    if (count < 20) {	/* how do we clear the screen? */
+	cl_up(79, count);
+	cursor(1, 1);
+    } else {
+	resetscroll();
+	clear();
+    }
+}
+
+/*
+ *	subroutine to restore normal display screen depending on t_setup()
+ */
+t_endup(count)
+register int count;
+{
+    if (count < 18)		/* how did we clear the screen? */
+	draws(0, MAXX, 0,(count > MAXY) ? MAXY : count);
+    else {
+	drawscreen();
+	setscroll();
+    }
+}
+
+/*
+	function to show the things player is wearing only
+ */
+showwear()
+{
+    register int i,j,sigsav,count;
+
+    sigsav = nosignal;
+    nosignal = 1;		/* don't allow ^c etc */
+    srcount = 0;
+
+    for (count = 2, j = 0; j <= 26; j++)/* count number of items we will display */
+	if (i = iven[j])
+	    switch(i) {
+		case OLEATHER: 
+		case OPLATE: 
+		case OCHAIN: 
+		case ORING: 
+		case OSTUDLEATHER: 
+		case OSPLINT: 
+		case OPLATEARMOR: 
+		case OSSPLATE: 
+		case OSHIELD: 
+		    count++;
+	    };
+
+    t_setup(count);
+
+    for (i = 22; i < 84; i++)
+	for (j = 0; j <= 26; j++)
+	    if (i == iven[j])
+		switch(i) {
+		    case OLEATHER: 
+		    case OPLATE: 
+		    case OCHAIN: 
+		    case ORING: 
+		    case OSTUDLEATHER: 
+		    case OSPLINT: 
+		    case OPLATEARMOR: 
+		    case OSSPLATE: 
+		    case OSHIELD: 
+			show3(j);
+		};
+    more();
+    nosignal = sigsav;
+    t_endup(count);
+}
+
+/*
+	function to show the things player can wield only 
+ */
+showwield()
+{
+    register int i,j,sigsav,count;
+
+    sigsav = nosignal;
+    nosignal = 1;		/* don't allow ^c etc */
+    srcount = 0;
+
+    for (count = 2, j = 0; j <= 26; j++)/* count how many items */
+	if (i = iven[j])
+	    switch(i) {
+		case ODIAMOND: 
+		case ORUBY: 
+		case OEMERALD: 
+		case OSAPPHIRE: 
+		case OBOOK: 
+		case OCHEST: 
+		case OLARNEYE: 
+		case ONOTHEFT: 
+		case OSPIRITSCARAB: 
+		case OCUBEofUNDEAD: 
+		case OPOTION: 
+		case OSCROLL: 
+		    break;
+		default: 
+		    count++;
+	    };
+
+    t_setup(count);
+
+    for (i = 22; i < 84; i++)
+	for (j = 0; j <= 26; j++)
+	    if (i == iven[j])
+		switch(i) {
+		    case ODIAMOND: 
+		    case ORUBY: 
+		    case OEMERALD: 
+		    case OSAPPHIRE: 
+		    case OBOOK: 
+		    case OCHEST: 
+		    case OLARNEYE: 
+		    case ONOTHEFT: 
+		    case OSPIRITSCARAB: 
+		    case OCUBEofUNDEAD: 
+		    case OPOTION: 
+		    case OSCROLL: 
+			break;
+		    default: 
+			show3(j);
+		};
+    more();
+    nosignal = sigsav;
+    t_endup(count);
+}
+
+/*
+ *	function to show the things player can read only
+ */
+showread()
+{
+    register int i,j,sigsav,count;
+
+    sigsav = nosignal;
+    nosignal = 1;		/* don't allow ^c etc */
+    srcount = 0;
+
+    for (count = 2, j = 0; j <= 26; j++)
+	switch(iven[j]) {
+	    case OBOOK: 
+	    case OSCROLL: 
+		count++;
+	};
+    t_setup(count);
+
+    for (i = 22; i < 84; i++)
+	for (j = 0; j <= 26; j++)
+	    if (i == iven[j])
+		switch(i) {
+		    case OBOOK: 
+		    case OSCROLL: 
+			show3(j);
+		};
+    more();
+    nosignal = sigsav;
+    t_endup(count);
+}
+
+/*
+ *	function to show the things player can eat only
+ */
+showeat()
+{
+    register int i,j,sigsav,count;
+
+    sigsav = nosignal;
+    nosignal = 1;		/* don't allow ^c etc */
+    srcount = 0;
+
+    for (count = 2, j = 0; j <= 26; j++)
+	switch(iven[j]) {
+	    case OCOOKIE: 
+		count++;
+	};
+    t_setup(count);
+
+    for (i = 22; i < 84; i++)
+	for (j = 0; j <= 26; j++)
+	    if (i == iven[j])
+		switch(i) {
+		    case OCOOKIE: 
+			show3(j);
+		};
+    more();
+    nosignal = sigsav;
+    t_endup(count);
+}
+
+/*
+	function to show the things player can quaff only
+ */
+showquaff()
+{
+    register int i,j,sigsav,count;
+
+    sigsav = nosignal;
+    nosignal = 1;		/* don't allow ^c etc */
+    srcount = 0;
+
+    for (count = 2, j = 0; j <= 26; j++)
+	switch(iven[j]) {
+	    case OPOTION: 
+		count++;
+	};
+    t_setup(count);
+
+    for (i = 22; i < 84; i++)
+	for (j = 0; j <= 26; j++)
+	    if (i == iven[j])
+		switch(i) {
+		    case OPOTION: 
+			show3(j);
+		};
+    more();
+    nosignal = sigsav;
+    t_endup(count);
+}
+
+show1(idx, str2)
+register int idx;
+register char *str2[];
+{
+    if (str2 == 0)
+	lprintf("\n%c)   %s", idx + 'a', objectname[iven[idx]]);
+    else
+	if (*str2[ivenarg[idx]] == 0)
+	    lprintf("\n%c)   %s", idx + 'a', objectname[iven[idx]]);
+	else
+	    lprintf("\n%c)   %s of%s", idx + 'a', objectname[iven[idx]], str2[ivenarg[idx]]);
+}
+
+show3(index)
+register int index;
+{
+    switch(iven[index]) {
+	case OPOTION: 
+	    show1(index, potionname);
+	    break;
+	case OSCROLL: 
+	    show1(index, scrollname);
+	    break;
+
+	case OLARNEYE: 
+	case OBOOK: 
+	case OSPIRITSCARAB: 
+	case ODIAMOND: 
+	case ORUBY: 
+	case OCUBEofUNDEAD: 
+	case OEMERALD: 
+	case OCHEST: 
+	case OCOOKIE: 
+	case OSAPPHIRE: 
+	case ONOTHEFT: 
+	    show1(index,(char **) 0);
+	    break;
+
+	default: 
+	    lprintf("\n%c)   %s", index + 'a', objectname[iven[index]]);
+	    if (ivenarg[index] > 0)
+		lprintf(" + %d",(long) ivenarg[index]);
+	    else
+		if (ivenarg[index] < 0)
+		    lprintf(" %d",(long) ivenarg[index]);
+	    break;
+    }
+    if (c[WIELD] == index)
+	lprcat("(weapon in hand)");
+    if ((c[WEAR] == index) ||(c[SHIELD] == index))
+	lprcat("(being worn)");
+    if (++srcount >= 22) {
+	srcount = 0;
+	more();
+	clear();
+    }
+}
+
+/*
+	subroutine to randomly create monsters if needed
+ */
+randmonst()
+{
+    if (c[TIMESTOP])
+	return;		/* 	don't make monsters if time is stopped	 */
+    if (--rmst <= 0) {
+	rmst = 120 - (level << 2);
+	fillmonst(makemonst(level));
+    }
+}
+
+
+/*
+    parse()
+
+    get and execute a command
+ */
+parse()
+{
+    register int i,j,k,flag;
+
+    while (1) {
+	k = yylex();
+	switch(k) {	/*  get the token from the input and switch on it */
+	    case 'h': 
+		moveplayer(4);
+		return;		/* west */
+	    case 'H': 
+		run(4);
+		return;		/* west */
+	    case 'l': 
+		moveplayer(2);
+		return;		/* east */
+	    case 'L': 
+		run(2);
+		return;		/* east */
+	    case 'j': 
+		moveplayer(1);
+		return;		/* south */
+	    case 'J': 
+		run(1);
+		return;		/* south */
+	    case 'k': 
+		moveplayer(3);
+		return;		/* north */
+	    case 'K': 
+		run(3);
+		return;		/* north */
+	    case 'u': 
+		moveplayer(5);
+		return;		/* northeast */
+	    case 'U': 
+		run(5);
+		return;		/* northeast */
+	    case 'y': 
+		moveplayer(6);
+		return;		/* northwest */
+	    case 'Y': 
+		run(6);
+		return;		/* northwest */
+	    case 'n': 
+		moveplayer(7);
+		return;		/* southeast */
+	    case 'N': 
+		run(7);
+		return;		/* southeast */
+	    case 'b': 
+		moveplayer(8);
+		return;		/* southwest */
+	    case 'B': 
+		run(8);
+		return;		/* southwest */
+
+	    case '.': 		/* stay here */
+		if (yrepcount)
+		    viewflag = 1;
+		return;
+
+	    case 'w': 		/* wield a weapon */
+		yrepcount = 0;
+		wield();
+		return;
+
+	    case 'W':	 	/* wear armor */
+		yrepcount = 0;
+		wear();
+		return;
+
+	    case 'r':	 	/* to read a scroll */
+		yrepcount = 0;
+		if (c[BLINDCOUNT]) {
+		    cursors();
+		    lprcat("\nYou can't read anything when you're blind!");
+		} else if (c[TIMESTOP] == 0)
+		    readscr();
+		return;
+
+	    case 'q':	 	/* quaff a potion */
+		yrepcount = 0;
+		if (c[TIMESTOP] == 0)
+		    quaff();
+		return;
+
+	    case 'd':		/* to drop an object */
+		yrepcount = 0;
+		if (c[TIMESTOP] == 0)
+		    dropobj();
+		return;
+
+	    case 'c':		/* cast a spell */
+		yrepcount = 0;
+		cast();
+		return;
+
+	    case 'i':		/* status */
+		yrepcount = 0;
+		nomove = 1;
+		showstr();
+		return;
+
+	    case 'e':		/* to eat a fortune cookie */
+		yrepcount = 0;
+		if (c[TIMESTOP] == 0)
+		    eatcookie();
+		return;
+
+	    case 'D':		/* list spells and scrolls */
+		yrepcount = 0;
+		seemagic(0);
+		nomove = 1;
+		return;
+
+	    case '?': 		/* give the help screen */
+		yrepcount = 0;
+		help();
+		nomove = 1;
+		return;
+
+	    case 'S':   	/* save the game - doesn't return */
+		clear();
+		lprcat("Saving . . .");
+		lflush();
+		savegame(savefilename);
+		wizard = 1;
+		died(-257);
+
+	    case 'Z': 
+		yrepcount = 0;
+		if (c[LEVEL] > 9) {
+		    oteleport(1);
+		    return;
+		}
+		cursors();
+		lprcat("\nAs yet, you don't have enough experience to use teleportation");
+		return;	/* teleport yourself */
+
+	    case '^': 	/* identify traps */
+		flag = yrepcount = 0;
+		cursors();
+		lprc('\n');
+		for (j = playery - 1; j < playery + 2; j++) {
+		    if (j < 0)
+			j = 0;
+		    if (j >= MAXY)
+			break;
+		    for (i = playerx - 1; i < playerx + 2; i++) {
+			if (i < 0)
+			    i = 0;
+			if (i >= MAXX)
+			    break;
+			switch(item[i][j]) {
+			    case OTRAPDOOR: 
+			    case ODARTRAP: 
+			    case OTRAPARROW: 
+			    case OTELEPORTER: 
+				lprcat("\nIts ");
+				lprcat(objectname[item[i][j]]);
+				flag++;
+			};
+		    }
+		}
+		if (flag == 0)
+		    lprcat("\nNo traps are visible");
+		return;
+
+#if WIZID
+	    case '_': 	/* this is the fudge player password for wizard mode */
+		yrepcount = 0;
+		cursors();
+		nomove = 1;
+		if (userid != wisid) {
+		    lprcat("Sorry, you are not empowered to be a wizard.\n");
+		    scbr();	/* system("stty -echo cbreak"); */
+		    lflush();
+		    return;
+		}
+		if (getpassword() == 0) {
+		    scbr();	/* system("stty -echo cbreak"); */
+		    return;
+		}
+		wizard = 1;
+		scbr();		/* system("stty -echo cbreak"); */
+		for (i = 0; i < 6; i++)
+		    c[i] = 70;
+		iven[0] = iven[1] = 0;
+		take(OPROTRING, 50);
+		take(OLANCE, 25);
+		c[WIELD] = 1;
+		c[LANCEDEATH] = 1;
+		c[WEAR] = c[SHIELD] = -1;
+		raiseexperience(6000000L);
+		c[AWARENESS] += 25000;
+		{
+		    register int i,j;
+
+		    for (i = 0; i < MAXY; i++)
+			for (j = 0; j < MAXX; j++)
+			    know[j][i] = 1;
+		    for (i = 0; i < SPNUM; i++)
+			spelknow[i] = 1;
+		    for (i = 0; i < MAXSCROLL; i++)
+			scrollname[i][0] = ' ';
+		    for (i = 0; i < MAXPOTION; i++)
+			potionname[i][0] = ' ';
+		}
+		for (i = 0; i < MAXSCROLL; i++)
+		    if (strlen(scrollname[i]) > 2) {	/* no null items */
+			item[i][0] = OSCROLL;
+			iarg[i][0] = i;
+		    }
+		for (i = MAXX - 1; i > MAXX - 1 - MAXPOTION; i--)
+		    if (strlen(potionname[i - MAXX + MAXPOTION]) > 2) {/* no null items */
+			item[i][0] = OPOTION;
+			iarg[i][0] = i - MAXX + MAXPOTION;
+		    }
+		for (i = 1; i < MAXY; i++) {
+		    item[0][i] = i;
+		    iarg[0][i] = 0;
+		}
+		for (i = MAXY; i < MAXY + MAXX; i++) {
+		    item[i - MAXY][MAXY - 1] = i;
+		    iarg[i - MAXY][MAXY - 1] = 0;
+		}
+		for (i = MAXX + MAXY; i < MAXX + MAXY + MAXY; i++) {
+		    item[MAXX - 1][i - MAXX - MAXY] = i;
+		    iarg[MAXX - 1][i - MAXX - MAXY] = 0;
+		}
+		c[GOLD] += 250000;
+		drawscreen();
+		return;
+#endif
+
+	    case 'T': 
+		yrepcount = 0;
+		cursors();
+		if (c[SHIELD] != -1) {
+		    c[SHIELD] = -1;
+		    lprcat("\nYour shield is off");
+		    bottomline();
+		} else if (c[WEAR] != -1) {
+		    c[WEAR] = -1;
+		    lprcat("\nYour armor is off");
+		    bottomline();
+		} else
+		    lprcat("\nYou aren't wearing anything");
+		return;
+
+	    case 'g': 
+		cursors();
+		lprintf("\nThe stuff you are carrying presently weighs %d pounds",(long) packweight());
+	    case ' ': 
+		yrepcount = 0;
+		nomove = 1;
+		return;
+
+	    case 'v': 
+		yrepcount = 0;
+		cursors();
+		lprintf("\nCaverns of Larn, Version %d.%d, Diff=%d",(long) VERSION,(long) SUBVERSION,(long) c[HARDGAME]);
+		if (wizard)
+		    lprcat(" Wizard");
+		nomove = 1;
+		if (cheat)
+		    lprcat(" Cheater");
+		lprcat(copyright);
+		return;
+
+	    case 'Q': 		/* quit */
+	    case 'Y'-64:
+	    case 'C'-64:
+		yrepcount = 0;
+		quit();
+		nomove = 1;
+		return;
+
+	    case 'L' - 64:	/* look */ 
+		yrepcount = 0;
+		drawscreen();
+		nomove = 1;
+		return;
+
+#if WIZID
+#ifdef EXTRA
+	    case 'A': 		/* create diagnostic file */
+		yrepcount = 0;
+		nomove = 1;
+		if (wizard) {
+		    diag();
+		    return;
+		}
+		return;
+#endif
+#endif
+	    case 'P': 
+		cursors();
+		if (outstanding_taxes > 0)
+		    lprintf("\nYou presently owe %d gp in taxes.",(long) outstanding_taxes);
+		else
+		    lprcat("\nYou do not owe any taxes.");
+		return;
+	};
+    }
+}
+
+
+parse2()
+{
+    if (c[HASTEMONST])
+	movemonst();
+    movemonst();		/* move the monsters */
+    randmonst();
+    regen();
+}
+
+run(dir)
+int dir;
+{
+    register int i = 1;
+
+    while (i) {
+	i = moveplayer(dir);
+	if (i > 0) {
+	    if (c[HASTEMONST])
+		movemonst();
+	    movemonst();
+	    randmonst();
+	    regen();
+	}
+	if (hitflag)
+	    i = 0;
+	if (i != 0)
+	    showcell(playerx, playery);
+    }
+}
+
+
+/*
+	function to wield a weapon
+ */
+wield()
+{
+    register int i;
+
+    while (1) {
+	if ((i = whatitem("wield")) == '\33')
+	    return;
+	if (i != '.') {
+	    if (i == '*')
+		showwield();
+	    else
+		if (iven[i - 'a'] == 0) {
+		    ydhi(i);
+		    return;
+		} else
+		    if (iven[i - 'a'] == OPOTION) {
+			ycwi(i);
+			return;
+		    } else
+			if (iven[i - 'a'] == OSCROLL) {
+			    ycwi(i);
+			    return;
+			} else
+			    if ((c[SHIELD] != -1) &&(iven[i - 'a'] == O2SWORD)) {
+				lprcat("\nBut one arm is busy with your shield!");
+				return;
+			    } else {
+				c[WIELD] = i - 'a';
+				if (iven[i - 'a'] == OLANCE)
+				    c[LANCEDEATH] = 1;
+				else
+				    c[LANCEDEATH] = 0;
+				bottomline();
+				return;
+			    }
+	}
+    }
+}
+
+/*
+	common routine to say you don't have an item
+ */
+ydhi(x)
+int x;
+{
+    cursors();
+    lprintf("\nYou don't have item %c!", x);
+}
+
+ycwi(x)
+int     x;
+{
+    cursors();
+    lprintf("\nYou can't wield item %c!", x);
+}
+
+/*
+	function to wear armor
+ */
+wear()
+{
+    register int    i;
+
+    while (1) {
+	if ((i = whatitem("wear")) == '\33')
+	    return;
+	if (i != '.') {
+	    if (i == '*')
+		showwear();
+	    else
+		switch(iven[i - 'a']) {
+		    case 0: 
+			ydhi(i);
+			return;
+		    case OLEATHER: 
+		    case OCHAIN: 
+		    case OPLATE: 
+		    case OSTUDLEATHER: 
+		    case ORING: 
+		    case OSPLINT: 
+		    case OPLATEARMOR: 
+		    case OSSPLATE: 
+			if (c[WEAR] != -1) {
+			    lprcat("\nYou're already wearing some armor");
+			    return;
+			}
+			c[WEAR] = i - 'a';
+			bottomline();
+			return;
+		    case OSHIELD: 
+			if (c[SHIELD] != -1) {
+			    lprcat("\nYou are already wearing a shield");
+			    return;
+			}
+			if (iven[c[WIELD]] == O2SWORD) {
+			    lprcat("\nYour hands are busy with the two handed sword!");
+			    return;
+			}
+			c[SHIELD] = i - 'a';
+			bottomline();
+			return;
+		    default: 
+			lprcat("\nYou can't wear that!");
+		};
+	}
+    }
+}
+
+/*
+	function to drop an object
+ */
+dropobj()
+{
+    register int i;
+    register char *p;
+    long amt;
+
+    p = &item[playerx][playery];
+    while (1) {
+	if ((i = whatitem("drop")) == '\33')
+	    return;
+	if (i == '*')
+	    showstr();
+	else {
+	    if (i == '.') {	/* drop some gold */
+		if (*p) {
+		    lprcat("\nThere's something here already!");
+		    return;
+		}
+		lprcat("\n\n");
+		cl_dn(1, 23);
+		lprcat("How much gold do you drop? ");
+		if ((amt = readnum((long) c[GOLD])) == 0)
+		    return;
+		if (amt > c[GOLD]) {
+		    lprcat("\nYou don't have that much!");
+		    return;
+		}
+		if (amt <= 32767) {
+		    *p = OGOLDPILE;
+		    i = amt;
+		} else if (amt <= 327670L) {
+		    *p = ODGOLD;
+		    i = amt / 10;
+		    amt = 10 * i;
+		} else if (amt <= 3276700L) {
+		    *p = OMAXGOLD;
+		    i = amt / 100;
+		    amt = 100 * i;
+		} else if (amt <= 32767000L) {
+		    *p = OKGOLD;
+		    i = amt / 1000;
+		    amt = 1000 * i;
+		} else {
+		    *p = OKGOLD;
+		    i = 32767;
+		    amt = 32767000L;
+		}
+		c[GOLD] -= amt;
+		lprintf("You drop %d gold pieces",(long) amt);
+		iarg[playerx][playery] = i;
+		bottomgold();
+		know[playerx][playery] = 0;
+		dropflag = 1;
+		return;
+	    }
+	    drop_object(i - 'a');
+	    return;
+	}
+    }
+}
+
+/*
+ *	readscr()		Subroutine to read a scroll one is carrying
+ */
+readscr()
+{
+    register int i;
+
+    while (1) {
+	if ((i = whatitem("read")) == '\33')
+	    return;
+	if (i != '.') {
+	    if (i == '*')
+		showread();
+	    else {
+		if (iven[i - 'a'] == OSCROLL) {
+		    read_scroll(ivenarg[i - 'a']);
+		    iven[i - 'a'] = 0;
+		    return;
+		}
+		if (iven[i - 'a'] == OBOOK) {
+		    readbook(ivenarg[i - 'a']);
+		    iven[i - 'a'] = 0;
+		    return;
+		}
+		if (iven[i - 'a'] == 0) {
+		    ydhi(i);
+		    return;
+		}
+		lprcat("\nThere's nothing on it to read");
+		return;
+	    }
+	}
+    }
+}
+
+/*
+ *	subroutine to eat a cookie one is carrying
+ */
+eatcookie()
+{
+    register int i;
+    char *p;
+
+    while (1) {
+	if ((i = whatitem("eat")) == '\33')
+	    return;
+	if (i != '.')
+	    if (i == '*')
+		showeat();
+	    else {
+		if (iven[i - 'a'] == OCOOKIE) {
+		    lprcat("\nThe cookie was delicious.");
+		    iven[i - 'a'] = 0;
+		    if (!c[BLINDCOUNT]) {
+			if (p = fortune(fortfile)) {
+			    lprcat("  Inside you find a scrap of paper that says:\n");
+			    lprcat(p);
+			}
+		    }
+		    return;
+		}
+		if (iven[i - 'a'] == 0) {
+		    ydhi(i);
+		    return;
+		}
+		lprcat("\nYou can't eat that!");
+		return;
+	    }
+    }
+}
+
+/*
+ *	subroutine to quaff a potion one is carrying
+ */
+quaff()
+{
+    register int i;
+
+    while (1) {
+	if ((i = whatitem("quaff")) == '\33')
+	    return;
+	if (i != '.') {
+	    if (i == '*')
+		showquaff();
+	    else {
+		if (iven[i - 'a'] == OPOTION) {
+		    quaffpotion(ivenarg[i - 'a']);
+		    iven[i - 'a'] = 0;
+		    return;
+		}
+		if (iven[i - 'a'] == 0) {
+		    ydhi(i);
+		    return;
+		}
+		lprcat("\nYou wouldn't want to quaff that, would you? ");
+		return;
+	    }
+	}
+    }
+}
+
+/*
+	function to ask what player wants to do
+ */
+whatitem(str)
+char *str;
+{
+    int i;
+
+    cursors();
+    lprintf("\nWhat do you want to %s [* for all] ? ", str);
+    i = 0;
+    while (i > 'z' ||(i < 'a' && i != '*' && i != '\33' && i != '.'))
+	i = readchar();
+    if (i == '\33')
+	lprcat(" aborted");
+    return(i);
+}
+
+/*
+	subroutine to get a number from the player
+	and allow * to mean return amt, else return the number entered
+ */
+unsigned long readnum(mx)
+long mx;
+{
+    register int i;
+    register unsigned long amt = 0;
+
+    sncbr();
+    if ((i = readchar()) == '*')
+	amt = mx;		/* allow him to say * for all gold */
+    else
+	while (i != '\n') {
+	    if (i == '\033') {
+		scbr();
+		lprcat(" aborted");
+		return(0);
+	    }
+	    if ((i <= '9') && (i >= '0') && (amt < 999999999))
+		amt = amt * 10 + i - '0';
+	    i = readchar();
+	}
+    scbr();
+    return(amt);
+}
+
+
+#ifdef TIMECHECK
+/*
+ *	routine to check the time of day and return 1 if its during work hours
+ *	checks the file ".holidays" for forms like "mmm dd comment..."
+ */
+int playable()
+{
+    long g_time,time();
+    int hour,day,year;
+    char *date,*month,*p;
+
+    time(&g_time);		/* get the time and date */
+    date = ctime(&g_time);	/* format: Fri Jul  4 00:27:56 EDT 1986 */
+    year = atoi(date + 20);
+    hour = (date[11] - '0') * 10 + date[12] - '0';
+    day = (date[8] != ' ') ?((date[8] - '0') * 10 + date[9] - '0') :(date[9] - '0');
+    month = date + 4;
+    date[7] = 0;		/* point to and NULL terminate month */
+
+    if (((hour >= 8 && hour < 17))/* 8AM - 5PM */
+	&& strncmp("Sat", date, 3) != 0		/* not a Saturday */
+	&& strncmp("Sun", date, 3) != 0) {	/* not a Sunday */
+	/* now check for a .holidays datafile */
+	lflush();
+	if (lopen(holifile) >= 0)
+	    for (;;) {
+		if ((p = lgetw()) == 0)
+		    break;
+		if (strlen(p) < 6)
+		    continue;
+		if ((strncmp(p, month, 3) == 0) &&(day == atoi(p + 4)) &&(year == atoi(p + 7)))
+		    return(0);/* a holiday */
+	    }
+	lrclose();
+	lcreat((char *) 0);
+	return(1);
+    }
+    return(0);
+}
+#endif TIMECHECK
+SHAR_EOF
+if test 28359 -ne "`wc -c < 'larn.c'`"
+then
+	echo shar: error transmitting "'larn.c'" '(should have been 28359 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'larn12.ftn'" '(1324 characters)'
+if test -f 'larn12.ftn'
+then
+	echo shar: will not over-write existing file "'larn12.ftn'"
+else
+cat << \SHAR_EOF > 'larn12.ftn'
+gem value = gem * 2 ^ perfection
+sitting down can have unexpected results
+don't pry into the affairs of others
+drinking can be hazardous to your health
+beware of the gusher!
+some monsters are greedy
+nymphs have light fingers
+try kissing a disenchantress!
+hammers and brains don't mix
+what does a potion of cure dianthroritis taste like?
+hit point gain/loss when raising a level depends on constitution
+healing a mighty wizard can be exhilarating
+be sure to pay your taxes
+are Vampires afraid of something?
+some dragons can fly
+dos thou strive for perfection?
+patience is a virtue, unless your daughter dies
+what does the Eye of Larn see in its guardian?
+a level 25 player casts like crazy!
+energy rings affect spell regeneration
+difficulty affects regeneration
+control of the pesty spirits is most helpful
+don't fall into a bottomless pit
+dexterity allows you to carry more
+you can get 2 points of WC for the price of one
+never enter the dungeon naked!  the monsters will laugh at you!
+did someone put itching powder in your armor?
+you klutz!
+avoid opening doors.  you never know whats on the other side.
+infinite regeneration ---> temptation
+the greatest weapon in the game has not the highest Weapon Class
+you can't buy the most powerful scroll
+identify things before you use them
+there's more than one way through a wall
+SHAR_EOF
+if test 1324 -ne "`wc -c < 'larn12.ftn'`"
+then
+	echo shar: error transmitting "'larn12.ftn'" '(should have been 1324 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'larn12.hdy'" '(2304 characters)'
+if test -f 'larn12.hdy'
+then
+	echo shar: will not over-write existing file "'larn12.hdy'"
+else
+cat << \SHAR_EOF > 'larn12.hdy'
+"Jan 01 1986 New Years Day.  Any comment goes here.  Dont forget 01 not 1"
+"Feb 17 1986 Washingtons Birthday (Presidents Day)"
+"May 26 1986 Memorial Day"
+"Jul 04 1986 Independence Day"
+"Sep 01 1986 Labor Day"
+"Oct 13 1986 Columbus Day"
+"Nov 27 1986 Thanksgiving"
+"Dec 25 1986 Christmas"
+
+"Jan 01 1987 New Years Day.  Any comment goes here.  Dont forget 01 not 1"
+"Feb 16 1987 Washingtons Birthday (Presidents Day)"
+"May 25 1987 Memorial Day"
+"Jul 04 1987 Independence Day"
+"Sep 07 1987 Labor Day"
+"Oct 12 1987 Columbus Day"
+"Nov 26 1987 Thanksgiving"
+"Dec 25 1987 Christmas"
+
+"Jan 01 1988 New Years Day.  Any comment goes here.  Dont forget 01 not 1"
+"Feb 15 1988 Washingtons Birthday (Presidents Day)"
+"May 30 1988 Memorial Day"
+"Jul 04 1988 Independence Day"
+"Sep 05 1988 Labor Day"
+"Oct 10 1988 Columbus Day"
+"Nov 24 1988 Thanksgiving"
+"Dec 25 1988 Christmas"
+
+"Jan 01 1989 New Years Day.  Any comment goes here.  Dont forget 01 not 1"
+"Feb 13 1989 Washingtons Birthday (Presidents Day)"
+"May 28 1989 Memorial Day"
+"Jul 04 1989 Independence Day"
+"Sep 03 1989 Labor Day"
+"Oct 15 1989 Columbus Day"
+"Nov 29 1989 Thanksgiving"
+"Dec 25 1989 Christmas"
+
+"Jan 01 1990 New Years Day.  Any comment goes here.  Dont forget 01 not 1"
+"Feb 12 1990 Washingtons Birthday (Presidents Day)"
+"May 27 1990 Memorial Day"
+"Jul 04 1990 Independence Day"
+"Sep 02 1990 Labor Day"
+"Oct 14 1990 Columbus Day"
+"Nov 28 1990 Thanksgiving"
+"Dec 25 1990 Christmas"
+
+"Jan 01 1991 New Years Day.  Any comment goes here.  Dont forget 01 not 1"
+"Feb 11 1991 Washingtons Birthday (Presidents Day)"
+"May 26 1991 Memorial Day"
+"Jul 04 1991 Independence Day"
+"Sep 01 1991 Labor Day"
+"Oct 10 1991 Columbus Day"
+"Nov 27 1991 Thanksgiving"
+"Dec 25 1991 Christmas"
+
+"Jan 01 1992 New Years Day.  Any comment goes here.  Dont forget 01 not 1"
+"Feb 10 1992 Washingtons Birthday (Presidents Day)"
+"May 25 1992 Memorial Day"
+"Jul 04 1992 Independence Day"
+"Sep 07 1992 Labor Day"
+"Oct 12 1992 Columbus Day"
+"Nov 26 1992 Thanksgiving"
+"Dec 25 1992 Christmas"
+
+"Jan 01 1993 New Years Day.  Any comment goes here.  Dont forget 01 not 1"
+"Feb 15 1993 Washingtons Birthday (Presidents Day)"
+"May 30 1993 Memorial Day"
+"Jul 04 1993 Independence Day"
+"Sep 05 1993 Labor Day"
+"Oct 10 1993 Columbus Day"
+"Nov 24 1993 Thanksgiving"
+"Dec 25 1993 Christmas"
+
+SHAR_EOF
+if test 2304 -ne "`wc -c < 'larn12.hdy'`"
+then
+	echo shar: error transmitting "'larn12.hdy'" '(should have been 2304 characters)'
+fi
+fi # end of overwriting check
+#	End of shell archive
+exit 0
