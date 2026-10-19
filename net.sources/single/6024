@@ -1,0 +1,417 @@
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 9/18/84; site watcgl.UUCP
+Path: utzoo!watmath!watcgl!dmmartindale
+From: dmmartindale@watcgl.UUCP (Dave Martindale)
+Newsgroups: net.sources
+Subject: dbcopy: simple double-buffered block copy
+Message-ID: <894@watcgl.UUCP>
+Date: Sun, 6-Jan-85 11:50:28 EST
+Article-I.D.: watcgl.894
+Posted: Sun Jan  6 11:50:28 1985
+Date-Received: Mon, 7-Jan-85 02:31:05 EST
+Distribution: net
+Organization: U of Waterloo, Ontario
+Lines: 402
+
+Here is a fairly simple double-buffered raw copy program.  It is intended
+to be installed in /etc/dbcopy.  It started out life intending to be used
+as a disk-to-disk raw copy that could be told what buffer size to use
+and how many bytes to copy in order to copy one filesystem a track at
+a time.  Because it is truly double-buffered, it is quite a bit faster
+than dd.  Because it uses two processes communicating by pipes for
+synchronization, it requires no kernel modifications and should work on
+most if not all versions of UNIX (but has never been compiled on anything
+but a VAX, so caveat emptor).  Because both reads and writes are interlocked
+to occur in the "proper" sequence, head movement is minimized on a disk,
+and a tape drive can be either the input or output device.
+
+Since it was written, some special code was added to do some additional
+things specific to fast copying of magtapes - the ability to copy multiple
+files, check for incorrect block size on tape, etc.  This makes the
+program more useful but less clear.
+
+If you want to see how the locking for the double-buffering is done, look
+for the calls to waitfor() and release().  It's very simple.
+
+	Dave Martindale
+	{decvax,clyde,ihnp4,allegra}!watmath!dmmartindale
+
+
+--------------------------------------------------------------------------
+/*
+ * dbcopy [-t] [-o] [-v] [-b bufsize] [-l length] [-c count] input output
+ * Uses two processes to do double-buffered I/O.
+ */
+
+#include <stdio.h>
+#include <sys/param.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/mtio.h>
+
+#define	DEFSECT	32
+
+off_t bufsize = DEFSECT*512;
+off_t nbytes = 0;
+off_t nrec = 0;
+int untileof = 1;		/* copy until input EOF reached */
+int setsize = 0;
+
+/*
+ * Pipes are used for synchronizing the two copying processes
+ * and for passing status information between them.
+ * In each process, "hislock" is the write descriptor of the
+ * pipe going to the other process, and "mylock" is the read
+ * descriptor of the pipe being read by this process.
+ */
+enum status { S_OK, S_EOF, S_ERR, S_TM };
+enum status waitfor();
+int mylock, hislock;
+int childpid = 0;
+
+/* pipe units */
+#define	RD	0
+#define	WR	1
+
+main(argc, argv)
+char **argv;
+{
+	int output, input;
+	off_t offset, nwant, ngot, v;
+	char *buffer, *malloc();
+	int toparent[2], tochild[2];
+	int dontwait;
+	int istape = 0, blockno = 0, tfno = 1, offline = 1;
+	int verbose = 0;
+
+	for (--argc,++argv; argc > 1 && argv[0][0] == '-'; ) {
+		switch (argv[0][1]) {
+		case 't':
+			istape++;
+			argc--; argv++;
+			continue;
+		case 'o':
+			offline = 0;
+			argc--; argv++;
+			continue;
+		case 'v':
+			verbose = 1;
+			argc--; argv++;
+			continue;
+		}
+
+		if (argc < 2) {
+			fprintf(stderr, "dbcopy: missing value after %s\n",
+				argv[0]);
+			exit(2);
+		}
+		if ((v = atoi(argv[1])) <= 0) {
+			fprintf(stderr, "dbcopy: bad parameter %s\n", argv[1]);
+			exit(2);
+		}
+
+		switch (argv[0][1]) {
+
+			/* buffer size in bytes */
+		case 'b':
+			bufsize = v;
+			setsize = 1;
+			break;
+
+			/* total length to copy in bytes */
+		case 'l':
+			nbytes = v;
+			untileof = 0;
+			break;
+
+			/* total length to copy in units of the buffer size */
+		case 'c':
+			nrec = v;
+			untileof = 0;
+			break;
+
+		default:
+			fprintf(stderr, "dbcopy: option %c?\n", argv[0][1]);
+			exit(1);
+		}
+		argc -= 2, argv += 2;
+	}
+
+	if (argc != 2) {
+		fprintf(stderr, "Usage: dbcopy [-o] [-v] [-t] [-b bufsize] [-l length] [-c count] input output\n");
+		exit(2);
+	}
+	if (nbytes == 0 && nrec != 0)
+		nbytes = nrec * bufsize;
+	if (istape){
+		if( untileof == 0) {
+			fprintf(stderr, "dbcopy: Can't yet copy anything but whole tape\n");
+			exit(2);
+		}
+		if(setsize) ++bufsize;	/* +1 for overflow check */
+		else bufsize=0x7FF1;	/* 32k less malloc's overhead and 1 for check */
+	}
+
+	input = setup(argv[0], 0);
+	output = setup(argv[1], 1);
+	
+	if (pipe(toparent) || pipe(tochild)) {
+		fprintf(stderr, "dbcopy: cannot create pipes\n");
+		exit(1);
+	}
+
+	switch(childpid = fork()) {
+
+	case 0:			/* child */
+		offset = bufsize;
+		blockno = 1;
+		mylock = tochild[RD];
+		hislock = toparent[WR];
+		/*
+		 * We don't close the pipe descriptors which are unused
+		 * in each process.  This prevents getting "pipe broken"
+		 * signals if we release a lock and the other process has
+		 * already exited.
+		 */
+		dontwait = 0;
+		break;
+
+	default:		/* parent */
+		offset = 0;
+		blockno = 0;
+		mylock = toparent[RD];
+		hislock = tochild[WR];
+		dontwait = 1;
+		break;
+	
+	case -1:
+		fprintf(stderr, "dbcopy: cannot fork\n");
+		exit(3);
+	}
+
+
+	/* allocate buffer after fork to avoid copying it during fork */
+	if ((buffer = malloc(bufsize)) == NULL) {
+		fprintf(stderr, "dbcopy: cannot get buffer\n");
+		xxit(1);
+	}
+	if(istape) --bufsize; /* for overflow checking */
+
+	while (untileof || offset < nbytes) {
+		enum status status;
+
+		if (untileof || nbytes-offset > bufsize)
+			nwant = bufsize;
+		else
+			nwant = nbytes-offset;
+		if (!dontwait)
+			switch(status = waitfor()) {
+			case S_OK:
+				break;
+			case S_TM:
+				++tfno;
+				blockno = 0;
+				break;
+			case S_ERR:
+				done( 1 );
+			case S_EOF:
+				done( 0 );
+			default:
+				fprintf( stderr, "dbcopy: unknown status\n" );
+				done( 1 );
+			}
+		/*
+		 * This lseek should never be necessary because of
+		 * the way the reads of the two processes are interlocked.
+		 * But if something messes up, try adding it.
+		 *
+		 * lseek(input, offset, 0);
+		 */
+		if(istape){
+			ngot=read(input,buffer,nwant+1);
+			if(ngot>nwant){
+				fprintf(stderr,"Tape block was more than %d bytes,\n", nwant);
+				fprintf(stderr,"at file %d, block %d.\n", tfno,blockno);
+				release(S_ERR);
+				break;
+			}
+		}
+		else ngot=read(input,buffer,nwant);
+		if( (ngot==nwant) ||
+		    (istape && ngot >= 0))
+			if(istape && ngot == 0)
+				if(status == S_TM) {
+					if(verbose)
+						printf("%d files\n", tfno-1);
+					release(S_EOF);
+				} else {
+					if(verbose)
+						printf("file %d, %d blocks\n",
+							tfno, blockno);
+					++tfno;
+					blockno = -1;
+					release(S_TM);
+				}
+			else
+				release(S_OK);
+		else {
+			fprintf(stderr, "dbcopy: ");
+			if (ngot<0) {
+				if(istape)
+					fprintf(stderr, "file %d, block %d ",
+						tfno, blockno);
+				else
+					fprintf(stderr, "(at seek %ld) ", offset);
+				perror("read");
+				release(S_ERR);
+				break;
+			} else if (ngot == 0) {
+				if (!untileof)
+					fprintf(stderr, "Premature ");
+				if (verbose || !untileof)
+					fprintf(untileof? stdout:stderr,
+						"EOF at %ld bytes\n", offset);
+				release(S_EOF);
+				break;
+			} else {
+				fprintf(stderr, "short read at %ld, wanted %ld got %ld\n",
+					offset, nwant, ngot);
+				release(S_ERR);
+			}
+		}
+		if (!dontwait)
+			switch(waitfor()) {
+			case S_OK:
+				break;
+			case S_TM:
+				fprintf(stderr, "dbcopy: Out of synch (software error)\n");
+				done( 1 );
+			case S_ERR:
+				done( 1 );
+			case S_EOF:
+				done( 0 );
+			default:
+				fprintf( stderr, "dbcopy: unknown status\n" );
+				done( 1 );
+			}
+		dontwait = 0;
+		/*
+		 * An lseek should not be necessary here either.
+		 *
+		 * lseek(output, offset, 0);
+		 */
+		if (istape && ngot == 0) {
+			struct mtop mtop;
+			mtop.mt_op = MTWEOF;
+			mtop.mt_count = 1;
+			if(ioctl(output, MTIOCTOP, &mtop) < 0) {
+				fprintf(stderr, "dbcopy: ");
+				perror("write eof");
+				release(S_ERR);
+				break;
+			}
+			if(status == S_TM) {
+				if(offline) {
+					mtop.mt_op = MTOFFL;
+					ioctl(input, MTIOCTOP, &mtop);
+					ioctl(output, MTIOCTOP, &mtop);
+				}
+				/* Already did release of S_EOF */
+				break;
+			} else
+				release(S_OK);
+		} else if (write(output, buffer, ngot) == ngot)
+			release(S_OK);
+		else {
+			fprintf(stderr, "dbcopy: ");
+			if(istape)
+				fprintf(stderr, "file %d, block %d ",
+					tfno, blockno);
+			perror("write");
+			release(S_ERR);
+			break;
+		}
+		if (istape == 0 && ngot != nwant)	/* short read */
+			break;
+
+		offset += 2*bufsize;
+		blockno += 2;
+	}
+
+	done( 0 );
+}
+
+err(s)
+char *s;
+{
+	fprintf(stderr, "dbcopy: ");
+	perror(s);
+	xxit(1);
+}
+
+setup(s, mode)
+char *s;
+{
+	struct stat statb;
+	int i;
+
+	if ((i = open(s, mode))<0)
+		err(s);
+	if (stat(s, &statb)<0) {
+		fprintf(stderr, "dbcopy: can't stat %s\n", s);
+		xxit(1);
+	}
+#if 0
+	if ((statb.st_mode&S_IFMT)!=S_IFCHR) {
+		fprintf(stderr, "dbcopy: %s is not a raw device\n", s);
+		xxit(1);
+	}
+#endif
+	return(i);
+}
+
+xxit(code)
+{
+	int stat;
+
+	if (childpid) {
+		kill(childpid, SIGTERM);
+		wait(&stat);
+	}
+	exit(code);
+}
+
+
+done( code )
+{
+	int stat;
+
+	if (childpid) {
+		stat = -1;
+		if (wait(&stat) != childpid) {
+			fprintf(stderr, "dbcopy: wait error\n");
+			exit(1);
+		} else if (stat != 0)
+			exit(1);
+	}
+	exit( code );
+}
+
+	enum status
+waitfor()
+{
+	char c;
+
+	if (read(mylock, &c, 1) != 1)
+		err("pipe read");
+	return (enum status) c;
+}
+
+release(stat)
+	enum status stat;
+{
+	char c = (char) stat;
+
+	if (write(hislock, &c, 1) != 1)
+		err("pipe write");
+}

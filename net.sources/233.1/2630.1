@@ -1,0 +1,340 @@
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.2 8/23/84; site ucbcad.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!genrad!decvax!ucbvax!ucbcad!faustus
+From: faustus@ucbcad.UUCP
+Newsgroups: net.sources
+Subject: Re: posting DPY
+Message-ID: <183@ucbcad.UUCP>
+Date: Thu, 11-Apr-85 16:06:37 EST
+Article-I.D.: ucbcad.183
+Posted: Thu Apr 11 16:06:37 1985
+Date-Received: Sat, 13-Apr-85 04:08:15 EST
+References: <268@tilt.FUN>
+Distribution: net
+Organization: UC Berkeley CAD Group, Berkeley, CA
+Lines: 324
+
+Here is a simple package for doing dynamic loading of object files into
+running processes. I haven't used it that much, so I would appreciate
+any bug reports.
+
+	Wayne
+-----
+# The rest of this file is a shell script which will extract:
+# Makefile dload.c foo.c foo2.c test.c
+echo x - Makefile
+cat >Makefile <<'!Funky!Stuff!'
+#
+# Makefile for a.out
+#
+
+CFLAGS =	-g
+
+CFILES =	dload.c test.c
+
+OFILES =	dload.o test.o
+
+HFILES =	
+
+a.out:          $(OFILES)
+		$(CC) $(CFLAGS) $(OFILES)  -o a.out
+
+ctags:
+		ctags $(CFILES) $(HFILES)
+
+!Funky!Stuff!
+echo x - dload.c
+cat >dload.c <<'!Funky!Stuff!'
+
+
+/* RCS Info: $Revision: $ on $Date: $
+ *           $Source: $
+ * Copyright (c) 1985 Wayne A. Christopher, U. C. Berkeley CAD Group
+ *
+ * These routines are used for dynamically loading routines into a running
+ * program, using the -A option to ld. It is simpler and shorter than DynLoad.
+ * Usage is as follows:
+ * dl_init(argv0) finds the executable file for the current program, and must
+ *	be called before any files are loaded. This means that the executable
+ *	must be readable and cannot be stripped. The argument to dl_init should
+ *	be the program name in argv[0] -- if it isn't a full path name
+ *	then dl_init will look in the directories in PATH for it.
+ * dl_load(lib, filename, nlist) loads in the file and fills in the slots in
+ *	nlist, an array of struct nlist (see nlist(3) and a.out(5)). If
+ *	the lib argument is non-NULL then the file is first extracted from
+ *	the named library.
+ * Some things that this package does not do -- it doesn't search for symbols
+ * loaded -- when it fills in the nlist structures, it's up to
+ * you from then on to keep track of what's what.
+ */
+
+#include <stdio.h>
+#include <a.out.h>
+#include <strings.h>
+#include <sys/types.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+
+#define BLOCKALIGN 1024	/* For VAX - should be enough for other machines. */
+
+static char execfile[512] = "";	/* The path name to the current program. */
+
+/* Set execfile to the path name of the current program. (Hope you don't
+ * get hit by rdists in the meantime... Return value 1 is things went
+ * ok, 0 if there was an error.
+ */
+
+dl_init(pname)
+	char *pname;
+{
+	char *path, *try, buf[512], pbuf[512], *s, *t, *getenv();
+	struct stat stbuf;
+
+	if (pname == NULL) {
+		fprintf(stderr, "dl_init error: NULL executable name.\n");
+		return (0);
+	}
+	if (index(pname, '/') == NULL) {
+		path = getenv("PATH");
+		if (path == NULL) {
+			fprintf(stderr, 
+				"dl_init error: PATH not in environment.\n");
+			return (0);
+		}
+		t = strcpy(buf, path);
+		for (;;) {
+			s = index(t, ':');
+			if (s)
+				*s = '\0';
+			strcpy(pbuf, t);
+			strcat(pbuf, "/");
+			strcat(pbuf, pname);
+			if (access(pbuf, R_OK | X_OK) == 0) {
+				stat(pbuf, &stbuf);
+				if (stbuf.st_mode & S_IFREG) {
+					strcpy(execfile, pbuf);
+					break;
+				}
+			}
+			if (s)
+				t = s + 1;
+			else
+				break;
+		}
+	} else {
+		if (access(pname, R_OK | X_OK) == 0) {
+			stat(pname, &stbuf);
+			if (stbuf.st_mode & S_IFREG) {
+				strcpy(execfile, pname);
+			}
+		}
+	}
+	if (execfile[0] == '\0') {
+		fprintf(stderr, "dl_init error: can't access executable %s.\n",
+			pname);
+		return (0);
+	}
+	return (1);
+}
+
+/* Load in a file and set the proper values in the namelist. Return 0 if
+ * there were problems loading the file, but not if some nlist values
+ * didn't get filled. (Set them to NULL if the file was loaded but the
+ * symbol wasn't found). Note that if the lib argument is given, it
+ * must be a full path name, because we chdir to /tmp before extracting
+ * the file. There might be synch problems here if two people do this
+ * at exactly the same time... File file does get moved quickly, but
+ * we should do file locking...
+ */
+
+dl_load(lib, filename, nl)
+	char *lib, *filename;
+	struct nlist nl[];
+{
+	char path[512], buf[512], *sbrk();
+	extern char *environ;
+	static char *loadfile = "/tmp/DlXXXXXX";
+	long status, top, offset;
+	int lfd;
+	struct exec header;
+	union u {
+		char *u_cp;
+		long u_i;
+	} u;
+
+	if (execfile[0] == '\0') {
+		fprintf(stderr, "dl_load error: not initialized.\n");
+		return (0);
+	}
+
+	/* Get the file. If it is in a library then extract it and
+	 * stick it in /tmp.
+	 */
+	
+	if (lib) {
+		sprintf(path, "/tmp/%d%s", getpid(), filename);
+		if (vfork() == 0) {
+			chdir("/tmp");
+			execle("/bin/ar", "ar", "x", lib, filename, 0,
+				environ);
+			fprintf(stderr, "Can't exec /bin/ar\n");
+			exit (1);
+		} else {
+			wait(status);
+			if (status != 0) {
+				fprintf(stderr, 
+					"dl_load error: can't extract %s from",
+					filename);
+				fprintf(stderr,"%s (exit %ld)\n", lib, status);
+				return (0);
+			}
+			(void) rename(filename, path);
+		}
+	} else
+		strcpy(path, filename);
+
+	/* Now get some space to load the stuff into. Can't use malloc
+	 * between now and after the file is loaded, or the break may
+	 * change.
+	 */
+	u.u_cp = sbrk(0);
+	top = u.u_i;
+	if (top % BLOCKALIGN)
+		top = (top / BLOCKALIGN + 1) * BLOCKALIGN;
+	if (brk(top) < 0) {
+		perror("dl_load error: out of space");
+		return (0);
+	}
+
+	mktemp(loadfile);
+	sprintf(buf, "%x", top);
+	if (vfork() == 0) {
+		execle("/bin/ld", "ld", "-X", "-A", execfile, "-T", buf,
+			"-o", loadfile, path, 0, environ);
+		fprintf(stderr, "Can't exec /bin/ld\n");
+		exit (1);
+	} else {
+		wait(&status);
+	if (status != 0) {
+			fprintf(stderr,"dl_load error: ld -X -A %s -T %d -o %s",
+				execfile, top, loadfile);
+			fprintf(stderr, " %s failed (exit %d)\n", path, status);
+			return (0);
+		}
+	}
+
+	/* Now figure out how much room we need. */
+	if ((lfd = open(loadfile, O_RDONLY)) == -1) {
+		fprintf(stderr, "ld_load error ");
+		perror(loadfile);
+		return (0);
+	}
+	if ((read(lfd, &header, sizeof (struct exec)) < sizeof (struct exec))
+			|| N_BADMAG(header)) {
+		fprintf(stderr, "ld_load error: bad exec structure in %s\n",
+			loadfile);
+		return (0);
+	}
+	offset = header.a_text + header.a_data + header.a_bss;
+	if (offset % BLOCKALIGN)
+		offset = (offset / BLOCKALIGN + 1) * BLOCKALIGN;
+	if (brk(top + offset) < 0) {
+		perror("dl_load error");
+		fprintf(stderr, "Can't allocate %d bytes.\n", offset);
+		return (0);
+	}
+
+	/* Load the stuff into memory. */
+	offset = header.a_text + header.a_data;
+	lseek(lfd, (long) N_TXTOFF(header), 0);
+	if (read(lfd, (char *) top, offset) < offset) {
+		fprintf(stderr, 
+		    "ld_load error: unexpected EOF while reading %d bytes.\n",
+		    offset);
+		return (0);
+	}
+
+	/* Now, read in the namelist. This is easy... */
+	nlist(loadfile, nl);
+
+	/* All done. Get rid of temp files... */
+	if (lib)
+		unlink(path);
+	unlink(loadfile);
+	return (1);
+}
+
+!Funky!Stuff!
+echo x - foo.c
+cat >foo.c <<'!Funky!Stuff!'
+char *string1 = "string 1 here... ";
+char *string2 = "string 2 here... ";
+
+func1() { printf("Here we are in func1...\n"); }
+!Funky!Stuff!
+echo x - foo2.c
+cat >foo2.c <<'!Funky!Stuff!'
+int int1 = 1;
+int int2 = 2;
+func2() { printf("Here we are in func2...\n"); }
+!Funky!Stuff!
+echo x - test.c
+cat >test.c <<'!Funky!Stuff!'
+/* Test ndload. */
+
+#include <nlist.h>
+
+struct nlist nl[] = {	{ "_string1" } ,
+			{ "_string2" } ,
+			{ "_func1" } ,
+			{ "_main" } ,
+			{ (char *) 0 }
+} ;
+
+struct nlist nl2[] = {	{ "_func2" } ,
+			{ "_int1" } ,
+			{ "_int2" } ,
+			{ "_base" } ,
+			{ (char *) 0 }
+};
+
+main(ac, av)
+	char **av;
+{
+	union u {
+		int u_i;
+		char **u_cp;
+		int (*u_func) ();
+		int *u_ip;
+	} u;
+
+	dl_init(av[0]);
+	dl_load((char *) 0, "foo.o", nl);
+
+	u.u_i = nl[0].n_value;
+	printf("string 0 is --- %s \n", *u.u_cp);
+	u.u_i = nl[1].n_value;
+	printf("string 1 is --- %s \n", *u.u_cp);
+	u.u_i = nl[2].n_value;
+	(*u.u_func) ();
+	u.u_i = nl[3].n_value;
+	printf("main: %x...\n", u.u_i);
+
+	dl_load((char *) 0, "foo2.o", nl2);
+	u.u_i = nl2[0].n_value;
+	(*u.u_func) ();
+	u.u_i = nl2[1].n_value;
+	printf("int 1 is --- %d \n", *u.u_ip);
+	u.u_i = nl2[2].n_value;
+	printf("int 2 is --- %d \n", *u.u_ip);
+	u.u_i = nl2[3].n_value;
+	(*u.u_func) ();
+
+	exit(0);
+}
+
+base()
+{
+	printf("Hey dude...\n");
+}
+!Funky!Stuff!

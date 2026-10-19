@@ -1,0 +1,2311 @@
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site umcp-cs.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!allegra!mit-eddie!godot!harvard!seismo!umcp-cs!chris
+From: chris@umcp-cs.UUCP (Chris Torek)
+Newsgroups: net.sources
+Subject: kernel and dump mods (1 of 2) for mass driver and fast dumps
+Message-ID: <2262@umcp-cs.UUCP>
+Date: Sat, 5-Jan-85 04:12:22 EST
+Article-I.D.: umcp-cs.2262
+Posted: Sat Jan  5 04:12:22 1985
+Date-Received: Sun, 6-Jan-85 00:58:51 EST
+Distribution: net
+Organization: U of Maryland, Computer Science Dept., College Park, MD
+Lines: 2296
+
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting README'
+sed 's/^X//' <<'//go.sysin dd *' >README
+[README: 4.2 changes to kernel & dump for mass driver: 5 Jan 1984,
+Chris Torek, University of Maryland.]
+
+Before you do ANYTHING ELSE, read this file CAREFULLY!
+
+This is the set of kernel changes needed to install the mass driver.
+The mass driver itself consists of two files, sys/h/drivio.h and
+sys/sys/dev_driv.c.  What the mass driver *does* is allow asynchronous
+transfers.  (See the manual page for more information.)
+
+Installing drivio.h and dev_driv.c is trivial; just plunk them down
+and edit conf/files to include ``sys/dev_driv.c optional driv''.  (I
+put it in at the end, but it doesn't really matter where it is.)
+
+Modifying the existing source files to make the mass driver *work*
+and *be useful* is more difficult.  First, SAVE COPIES OF ALL THE
+FILES THAT WILL BE MODIFIED.  These are (if you don't bother deleting
+extraneous ``#include "../h/conf.h"''s):
+
+	h/conf.h		sys/vm_mem.c		vaxmba/ht.c
+	h/fs.h			vax/conf.c		vaxmba/mba.c
+	h/param.h		vax/machdep.c		vaxmba/mt.c
+	h/vmparam.h		vax/ufs_machdep.c	vaxuba/ts.c
+
+(Note that I have no changes for the tm driver.  If you have a tm,
+you're on your own.  The changes should be similar to (if not exactly
+the same as) those for the ts driver.)
+
+Some of these changes are ``frills''; that is, they aren't essential to
+the mass driver, but they sure don't hurt, and I think they are
+useful.
+
+Following the advice of a fellow netlander, I have provided context
+diffs from 4.2 distribution sources.  HOWEVER, the diffs cannot be
+applied by machine (e.g., by Larry Wall's patch program), because SOME
+of the changes CANNOT be installed on a vanilla 4.2 system.  (In fact,
+the mass driver source given here some two minor differences from mine:
+my csleep()s have been edited back to sleep()s for this copy; the
+bp->b_offset fields have been commented out.)
+
+In particular, unless you have the BRL ``csleep'' routine in your
+kernel, avoid changing any ``sleep'' calls to ``csleep''s.  (Csleep is
+just ``commented sleep'', with an additional ``char *'' argument which
+is stuck into the p_slmsg field of a struct proc.  You don't have this
+field, of course . . . .)
+
+I have tried to mark each set of changes as to which are necessary and
+which are not.  However, a short description of the changes I made will
+probably be helpful.
+
+Basically, two things have been added to every character device:  an
+optional ``d_mass'' routine and an optional ``d_bstrat'' routine.  If
+the former is set, then the device is usable with the mass driver.  For
+each transfer, the d_mass routine will be called on a buffer containing
+the setup information which would normally be given to the block
+device's strategy routine.  The d_mass routine should perform any
+special actions required, and should trim the b_bcount field if
+necessary.  (See the tsmass, htmass, or mtmass routines for examples of
+what needs to be done on a tape drive.)  Right after the d_mass routine
+returns, the d_bstrat routine (which is presumably the same as the
+block device strategy routine) will be called to start the transfer.
+
+Buffers in use for asynchronous transfers will be set up such that
+the biodone() routine in ufs_bio.c will call the routine driviodone().
+This examines the return information in the buffer and, if there is
+more work to do, calls the d_mass and d_bstrat routines again.  This
+creates a problem for the existing UNIBUS and MASSBUSS drivers.  Let's
+look at the ts driver as a specific example.
+
+When tsintr() is called, it sets um->um_tab.b_active to zero to
+indicate that the device is no longer active.  After reading the device
+registers and doing any necessary buffer cleanup, it will (if there is
+another buffer in the queue) start another transfer right away by
+calling tsstart(), then returns.  tsstart() sets um->um_tab.b_active,
+calling the device active.  This works well enough in most cases.
+
+However, now that we have the mass driver doing its thing, the
+following sequence of events will occur.
+
+	1. tsintr() sets um->um_tab.b_active = 0
+	2. tsintr() calls biodone()
+	3. biodone() calls driviodone()
+	4. driviodone() calls tsstrategy()
+	5. tsstrategy() puts the transfer at the end of the queue and
+	   sees um->um_tab.b_active == 0, so calls tsstart()
+	6. We return back to tsintr(), which sees that the queue is
+	   not empty and calls tsstart(), clobbering the in-progress
+	   transfer and having other disastrous effects.
+
+Two solutions came immediately to mind: either have tsintr() check
+um->um_tab.b_active before doing its last tsstart(), or have tsintr()
+keep better track of the device activity.  In other words, if the
+interupt service code isn't done yet, the device can be considered
+active, since any requests placed on the device queue will be serviced
+before tsintr() returns.  (Actually only the first will, but it has the
+same effect.)  I prefer the latter solution, for various reasons, so
+that is what I have done.
+
+Interestingly, this code is centralized for massbuss devices (with the
+interrupt code residing in vaxmba/mba.c) because there is only one
+global massbuss interrupt vector, rather than lots of little vectors
+for each device.  Nearly the same changes as were made to tsintr() had
+to be made to mbaintr(), with some extra work required in mbstart() and
+mbustart().
+
+Well, now we have a working mass driver, but there is still one
+problem:  dump can't use it, because dump wants to write 10240 byte
+records on tapes, and the biggest buffers we can get from the buffer
+cache are 8192 bytes.  This is easily fixed; just increase MAXBSIZE.
+(I set it to 16384.)  But---that creates more problems of its own.
+First of all, it cuts the number of buffers, making them too scarce.
+After all, the ``average'' file system block is only about 4096 bytes
+long anyway; we should have enough buffers for those, rather than for
+16384 byte blocks.  Solution:  create an AVGBSIZE define in param.h,
+and make the buffer allocation code use this.  Of course, that made
+me look at the virtual memory setup code in vax/machdep.c, which I
+just HAD to change all around :-), which led to making changes in
+sys/vm_mem.c.
+
+It turns out that as distributed, both 4.1 and 4.2 will not run on a
+system with ``lots'' of memory, panic("sys pt too small")ing.  This is
+silly.  If there is enough memory to map the kernel and SOME user area,
+then that should be done, with the system in ``limp mode'' until the
+kernel is recompiled with a bigger SYSPTSIZE.  I've changed the startup
+code to notice slightly small or ridiculously large SYSPTSIZEs and
+complain.  Of course, with all that extra virtual memory needed to
+map 16384 byte buffers, I had to increase SYSPTSIZE (in vax/vmparam.h).
+
+That covers every file but one: vax/ufs_machdep.c.  All I did there was
+add a panic if the buffer size requested is > MAXBSIZE.  I made that
+mistake the first time . . . .  (The change to h/fs.h is merely to fix
+a comment; vax/conf.c needs to be changed because all the character
+devices need two more entries.  Ok, so it covered every file but two.)
+
+There is one other thing you can do while you're editing half your
+kernel, though it's not important.  Far too many files needlessly
+include ../h/conf.h.  A partial list of these files is given in the file
+``needless_conf.h''.  If you're feeling particularly ambitious, now is
+a good time to remove those includes, since everything is going to get
+recompiled anyway.
+
+Now that you've read all that,
+
+	1) Install the drivio.h and dev_driv.c files and edit conf/files.
+	2) Make kernel modifications as indicated in kernel_mods.
+	   Don't forget to add the entry for the mass driver in
+	   vax/conf.c, and do remember what it's major device number
+	   is.
+	3) Put a ``pseudo-device driv'' in your config file.
+	4) Configure and compile a new kernel.
+	5) Test the kernel to make sure it still works at all.
+
+And for dump:
+
+	1) Install the changes given in dump_mods.  (I'm sorry it's so
+	   long; I fixed the formatting of lots of ``if(x) {''s or
+	   ``while (y){''s which makes the diff listing a lot longer
+	   than it really needs to be.)
+
+	   All the non-mass-driver related changes in dump are from the
+	   net (one from M. Kirk McKusick @ Berkeley, one from Donn
+	   Seely @ Utah-CS, and one from ?(I forget) @ U of Waterloo,
+	   as I recall).
+	2) Compile, fix typos :-).  (Actually, I bet patch would work.)
+	3) Make a /dev/driv0 with the right major device number (minor
+	   == 0).  You may want to restrict access to it.
+	4) Try ``dump <dump_options>m <regular dump stuff>'', e.g.,
+	   dump 0m /, to make sure the mass driver works.
+	5) Edit the manual entry to note the new ``m'' key for invoking
+	   the mass driver.
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 README
+	/bin/echo -n '	'; /bin/ls -ld README
+fi
+/bin/echo 'Extracting dev_driv.c'
+sed 's/^X//' <<'//go.sysin dd *' >dev_driv.c
+#ifndef lint
+static char rcsid[] = "$Header: /usr/sys/sys/RCS/dev_driv.c,v 1.3 85/01/03 12:27:49 chris Exp $";
+#endif lint
+
+X/*
+ * dev_driv.c ("mass driver")
+ * Chris Torek, U of Maryland
+ * Pseudo-driver for running other devices asynchronously
+ *
+ * Copyright (c) 1985, all rights reserved.  The right to distribute this
+ * code is explicitly granted if and only if 1) no changes are made, or
+ * 2) all changes are clearly marked (e.g., via #ifdef/#endif).  (All I'm
+ * trying to do here is make sure my name doesn't get sent around on some
+ * piece of code I never wrote.  OK?  PLEEEEZE???  :-) )
+ *
+ * This pseudo driver allows one to read and write a device without
+ * waiting for the transfer(s) to complete.  It calls the device's (block)
+ * strategy routine directly.  We only run with specially-prepared
+ * drivers, however: there is a new routine (d_mass) we use as a
+ * combination of "minphys" and a catch-all for anything else that must be
+ * done before starting a transfer, and there must be a strategy routine
+ * in the character switch entry.  Note that we also deal in transfers of
+ * other than BLKDEV_IOSIZE bytes.
+ *
+ * An initial ioctl() sets up the maximum number and size of transfers.
+ * Space is stolen from the buffer pool (but never more than half
+ * of the real buffer pool may be in use).  When the pseudo-driver
+ * is read or written, the data is copied in to kernel space and
+ * we start (but do not wait for) the real transfer.
+ *
+ * (READ IS NOT DONE YET)
+ * For read()s, an ioctl() can be used to start a transfer.  Later
+ * (when select() says it's OK) a read() will grab the data.
+ *
+ * For write()s, the transfer is started after copying from user
+ * space.  Select() will succeed when the write is done.
+ *
+ * In any case, an ioctl() is used to get the final return value
+ * (consisting of a real return value and an error code).  Another
+ * ioctl() can be used to wait for all pending transfers to complete.
+ *
+ * We shamelessly use the (otherwise useless to us) b_proc field of the
+ * buffers to hold the info we need when our iodone routine is called.
+ *
+ * Problem: since kernel buffer space is allocated based on MAXBSIZE
+ * as the maximum amount of kernel space in any one ``struct buf'',
+ * that is the largest transfer size we can handle as well.
+ *
+ * TODO:
+ *	- Write read() code
+ *	- Stop transfers at error (provide ioctl to clear error condition?)
+ *	- Learn why we sometimes hang before closing when using MAX_XFERS
+ */
+
+#include "driv.h"
+#if NDRIV > 0
+
+#include "../h/param.h"
+#include "../h/systm.h"
+#include "../h/buf.h"
+#include "../h/inode.h"
+#include "../h/file.h"
+#include "../h/dir.h"
+#include "../h/user.h"
+#include "../h/proc.h"
+#include "../h/uio.h"
+#include "../h/ioctl.h"
+#include "../h/conf.h"
+#include "../h/errno.h"
+
+#include "../h/drivio.h"
+
+X/* one of the hard limits (the other is MAXBSIZE) */
+#define MAX_XFERS	25	/* max # of pending transfers */
+
+X/*
+ * The xfer structure is used to hold all the info needed about ongoing
+ * and completed transfers.
+ * N.B.: Assumes MAXBSIZE fits in an "int".
+ */
+struct xfer {
+	struct	buf *xf_buf;	/* buffer */
+	struct	driv_softc *xf_sc;/* backpointer to driver info */
+	caddr_t	xf_addr;	/* base of original transfer */
+	short	xf_rw;		/* B_READ or B_WRITE */
+	short	xf_error;	/* error number (if any) */
+	off_t	xf_offset;	/* position at start of transfer */
+	int	xf_bcount;	/* original byte count */
+	int	xf_resid;	/* remaining byte count */
+	int	xf_xcount;	/* bp->b_bcount, in case it gets munched */
+	int	xf_rval;	/* return value */
+};
+
+struct driv_softc {
+	short	sc_flags;	/* state info */
+	dev_t	sc_dev;		/* device to which to refer */
+	struct	file *sc_fp;	/* user file descriptor to manipulate */
+	int	sc_xsize;	/* amount of memory allocated per xfer */
+	short	sc_max_xfers;	/* max # of pending transfers */
+	short	sc_pend;	/* number of pending transfers */
+	short	sc_nxx;		/* index of next transfer */
+	short	sc_rxx;		/* index of next return val */
+	short	sc_valid;	/* number of valid return values */
+	struct	xfer sc_xf[MAX_XFERS];/* transfer info */
+	struct	proc *sc_sel;	/* process selecting */
+} driv_softc[NDRIV];
+
+#define DRIV_OPEN	0x01	/* open */
+#define DRIV_DEV	0x02	/* have sc_dev info etc. */
+#define DRIV_WANT	0x04	/* wakeup() when I/O is done */
+#define DRIV_SELCOLL	0x08	/* select() collision */
+
+#define PDRIV (PZERO-1)		/* priority for sleep() on buffers */
+
+extern int bufpages;		/* tells us how big the buffer pool is */
+int drivpages;			/* total number of pages stolen from the
+				   buffer pool at the moment */
+extern int nbuf;		/* how many buffers are there? */
+int drivbufs;			/* how many do we have? */
+
+X/*
+ * Open the pseudo-driver
+ */
+X/*ARGSUSED*/
+drivopen(dev, flag)
+dev_t dev;
+int flag;
+{
+	register struct driv_softc *sc = &driv_softc[minor(dev)];
+
+	if (sc->sc_flags & DRIV_OPEN)
+		return (EBUSY);
+	sc->sc_flags = DRIV_OPEN;
+	sc->sc_max_xfers = 0;
+	sc->sc_xsize = 0;
+	sc->sc_pend = 0;
+	sc->sc_nxx = 0;
+	sc->sc_rxx = 0;
+	sc->sc_valid = 0;
+	return (0);
+}
+
+X/*
+ * Close the pseudo-driver
+ */
+X/*ARGSUSED*/
+drivclose(dev, flag)
+dev_t dev;
+int flag;
+{
+	register struct driv_softc *sc = &driv_softc[minor(dev)];
+
+	if (sc->sc_flags & DRIV_DEV) {
+		drivfree(sc);
+		closef(sc->sc_fp);
+	}
+	sc->sc_flags = 0;
+}
+
+X/*
+ * Read.  We don't do this yet...
+ */
+X/*ARGSUSED*/
+drivread(dev, uio)
+dev_t dev;
+struct uio *uio;
+{
+
+	return (EOPNOTSUPP);	/* XXX */
+}
+
+X/*
+ * Write.  Dump the user's write stuff into our buffer, then start
+ * things rolling.
+ */
+drivwrite(dev, uio)
+dev_t dev;
+register struct uio *uio;
+{
+	register struct driv_softc *sc = &driv_softc[minor(dev)];
+	register struct xfer *xf;
+	int s, error;
+
+	if ((sc->sc_flags & DRIV_DEV) == 0)
+		return (EINVAL);
+	if ((sc->sc_fp->f_flag & FWRITE) == 0)
+		return (EBADF);
+	if (sc->sc_xsize < uio->uio_resid)
+		return (ENOMEM);
+
+	s = spl6();
+	while (sc->sc_pend >= sc->sc_max_xfers) {
+		sc->sc_flags |= DRIV_WANT;
+		sleep((caddr_t)sc, PDRIV);
+	}
+	splx(s);
+	xf = &sc->sc_xf[sc->sc_nxx++];
+	if (sc->sc_nxx >= sc->sc_max_xfers)
+		sc->sc_nxx = 0;
+	if (xf->xf_addr == NULL)
+		panic("drivwrite");
+	xf->xf_offset = uio->uio_offset;
+	error = uiomove(xf->xf_addr, xf->xf_bcount = uio->uio_resid,
+	    UIO_WRITE, uio);
+	if (error)
+		return (error);
+	drivstart(xf, B_WRITE);
+	return (0);
+}
+
+X/*
+ * Handle an ioctl.
+ */
+drivioctl(dev, cmd, data, flag)
+dev_t dev;
+int cmd;
+register caddr_t data;
+int flag;
+{
+	register struct driv_softc *sc = &driv_softc[minor(dev)];
+
+	switch (cmd) {
+
+	case DIOCSETINFO: {	/* set device info */
+		register struct file *fp;
+		register struct inode *ip;
+		int nxfer;
+#define d ((struct diocinfo *)data)
+
+		if (sc->sc_flags & DRIV_DEV)
+			return (EINVAL);/* EEXIST? */
+		nxfer = d->dioc_nxfer > MAX_XFERS ? MAX_XFERS : d->dioc_nxfer;
+		if (d->dioc_xsize < 1 || nxfer < 1)
+			return (EINVAL);
+		if (d->dioc_xsize > MAXBSIZE)
+			return (ENOSPC);/* sort of */
+		fp = getf(d->dioc_fd);
+		if (fp == NULL)
+			return (EBADF);
+		if (fp->f_type != DTYPE_INODE)
+			return (EINVAL);
+		ip = (struct inode *)fp->f_data;
+		if ((ip->i_mode & IFMT) != IFCHR ||
+		    cdevsw[major((dev_t)ip->i_rdev)].d_mass == NULL)
+			return (EINVAL);
+		fp->f_count++;	/* prevent user from close()ing */
+		if (drivalloc(sc, d->dioc_xsize, nxfer)) {
+			closef(fp);
+			return (ENOMEM);
+		}
+		sc->sc_flags |= DRIV_DEV;
+		sc->sc_fp = fp;
+		sc->sc_dev = (dev_t)ip->i_rdev;
+		sc->sc_xsize = d->dioc_xsize;
+		sc->sc_max_xfers = nxfer;
+		break;
+#undef d
+	}
+
+	case DIOCREAD:		/* start a read */
+		return (EOPNOTSUPP);/* XXX */
+
+	case DIOCGETRET: {	/* get return value */
+		register struct xfer *xf;
+#define d ((struct diocret *)data)
+
+		if (sc->sc_valid == 0)
+			return (ENOENT);/* well, sorta */
+		xf = &sc->sc_xf[sc->sc_rxx++];
+		if (sc->sc_rxx >= sc->sc_max_xfers)
+			sc->sc_rxx = 0;
+		sc->sc_valid--;
+		d->dioc_rval = xf->xf_rval;
+		d->dioc_error = xf->xf_error;
+		break;
+#undef d
+	}
+
+	case DIOCWAIT: {	/* wait for pending transfers */
+		register int s = spl6();
+
+		while (sc->sc_pend) {
+			sc->sc_flags |= DRIV_WANT;
+			sleep((caddr_t)sc, PZERO+1);
+		}
+		splx(s);	/* == spl0()? */
+		break;
+	}
+
+	case DIOCGMAXX:		/* get max # transfers */
+		*(int *)data =
+		    (sc->sc_flags & DRIV_DEV) ? sc->sc_max_xfers : MAX_XFERS;
+		break;
+
+	default:
+		return (ENOTTY);
+	}
+	return (0);
+}
+
+X/*
+ * Select.
+ */
+drivselect(dev, rw)
+dev_t dev;
+int rw;
+{
+	register struct driv_softc *sc = &driv_softc[minor(dev)];
+	int s = spl6();
+
+	switch (rw) {
+
+	case FREAD:
+		return (1);	/* XXX */
+
+	case FWRITE:
+		if (sc->sc_valid) {
+			splx(s);
+			return (1);
+		}
+		if (sc->sc_sel && sc->sc_sel->p_wchan == (caddr_t)&selwait)
+			sc->sc_flags |= DRIV_SELCOLL;
+		else
+			sc->sc_sel = u.u_procp;
+		splx(s);
+		return (0);
+
+	default:
+		splx(s);
+		return (0);
+	}
+	/*NOTREACHED*/
+}
+
+X/*
+ * Start a transfer.  Fill in all the buffer fields and some of the xf
+ * fields, and make sure the device is active.
+ */
+drivstart(xf, rw)
+register struct xfer *xf;
+int rw;
+{
+	register struct driv_softc *sc = xf->xf_sc;
+	register struct buf *bp = xf->xf_buf;
+	int s, driviodone();
+
+	if (bp == NULL)		/* just in case... */
+		panic("drivstart bp");
+	if (sc == NULL)
+		panic("drivstart sc");
+	if (bp->b_flags & B_BUSY)
+		panic("drivstart B_BUSY");
+	bp->b_un.b_addr = xf->xf_addr;/* set buffer address */
+	xf->xf_resid = xf->xf_bcount;
+	xf->xf_rw = rw;
+	s = spl6();
+	if (sc->sc_pend++) {	/* already active */
+		splx(s);
+		return;
+	}
+	splx(s);
+	drivgo(sc->sc_dev, bp, xf);
+}
+
+X/*
+ * Fill in the buffer fields and call the strategy routine.
+ */
+drivgo(dev, bp, xf)
+dev_t dev;
+register struct buf *bp;
+register struct xfer *xf;
+{
+	register struct cdevsw *d = &cdevsw[major(dev)];
+	int driviodone();
+
+	bp->b_proc = (struct proc *)xf;/* ick */
+	bp->b_error = 0;
+	bp->b_iodone = driviodone;
+	bp->b_flags = B_BUSY | B_CALL | xf->xf_rw;
+	bp->b_dev = dev;
+X/*	bp->b_offset = xf->xf_offset;			/* BRL */
+	bp->b_blkno = btodb(xf->xf_offset);
+	bp->b_bcount = xf->xf_resid;
+	(*d->d_mass)(bp);
+	xf->xf_xcount = bp->b_bcount;
+	(*d->d_bstrat)(bp);
+}
+
+X/*
+ * The transfer involving this buffer is done.  If there is more work
+ * to do, fill in the buffer info and restart the transfer.  Otherwise,
+ * wake up anyone sleeping on the buffer or the transfer, and wake up
+ * anyone doing select()s, then if there are more transfers pending,
+ * fire up the next one.
+ */
+driviodone(bp)
+register struct buf *bp;
+{
+	register struct xfer *xf = (struct xfer *)bp->b_proc;/* ick */
+	register struct driv_softc *sc;
+	register int c;
+
+	sc = xf->xf_sc;
+	c = xf->xf_xcount - bp->b_resid;
+	xf->xf_resid -= c;
+	xf->xf_offset += c;
+	if (xf->xf_resid > 0) {	/* more to do */
+		/* temp kludge for tape drives */
+		if (bp->b_resid || (bp->b_flags&B_ERROR))
+			goto done;
+		bp->b_un.b_addr += c;	/* advance */
+		drivgo(sc->sc_dev, bp, xf);
+		return;
+	}
+done:
+	if (bp->b_flags & B_WANTED)
+		wakeup((caddr_t)bp);
+	bp->b_flags &= ~(B_BUSY|B_WANTED);
+	if (sc->sc_flags & DRIV_WANT) {
+		wakeup((caddr_t)sc);
+		sc->sc_flags &= ~DRIV_WANT;
+	}
+	xf->xf_rval = xf->xf_bcount - xf->xf_resid;
+	xf->xf_error = geterror(bp);
+	sc->sc_valid++;
+	if (sc->sc_valid > sc->sc_max_xfers) {/* user just lost a return val */
+		sc->sc_valid--;
+		if (++sc->sc_rxx >= sc->sc_max_xfers)
+			sc->sc_rxx = 0;
+	}
+	if (sc->sc_sel) {
+		selwakeup(sc->sc_sel, sc->sc_flags & DRIV_SELCOLL);
+		sc->sc_sel = NULL;
+	}
+	if (--sc->sc_pend > 0) {	/* start the next one */
+		c = (xf - sc->sc_xf) + 1;
+		if (c >= sc->sc_max_xfers)
+			c = 0;
+		xf = &sc->sc_xf[c];
+		bp = xf->xf_buf;
+		if (bp == NULL)
+			panic("driviodone bp");
+		drivgo(sc->sc_dev, bp, xf);
+	}
+}
+
+X/*
+ * Allocate enough buffer space for the given totals, but not if
+ * it would take too many buffers or too much memory.  Fill in the
+ * xf_addr fields.  To be nice to the paging system, we round up
+ * to CLBYTES, though it's not supposed to be necessary.
+ */
+drivalloc(sc, xsize, nxfer)
+register struct driv_softc *sc;
+register int xsize, nxfer;
+{
+	register int i;
+	register struct xfer *xf;
+
+	if ((drivbufs + nxfer) >= (nbuf >> 1))
+		return (-1);
+	xsize = roundup(xsize, CLBYTES);
+	i = xsize / CLBYTES * nxfer + drivpages;
+	if (i >= (bufpages >> 1))
+		return (-1);
+	drivbufs += nxfer;
+	drivpages = i;
+	for (i = 0, xf = sc->sc_xf; i < nxfer; i++, xf++) {
+		xf->xf_buf = geteblk(xsize);
+		xf->xf_buf->b_flags &= ~B_BUSY;	/* tyke it awye! */
+		xf->xf_addr = xf->xf_buf->b_un.b_addr;/* save buffer addr */
+		xf->xf_sc = sc;
+	}
+	return (0);
+}
+
+X/*
+ * Free the attached buffers, zapping the xf pointers so as to detect
+ * bugs early.
+ */
+drivfree(sc)
+register struct driv_softc *sc;
+{
+	register int i;
+	register struct xfer *xf;
+	register struct buf *bp;
+
+	i = spl6();
+	while (sc->sc_pend) {
+		sc->sc_flags |= DRIV_WANT;
+		sleep((caddr_t)sc, PDRIV);
+	}
+	splx(i);
+	for (i = 0, xf = sc->sc_xf; i < sc->sc_max_xfers; i++, xf++) {
+		if ((bp = xf->xf_buf) == NULL)
+			panic("drivfree");
+		drivpages -= bp->b_bufsize / CLBYTES;
+		drivbufs--;
+
+		/* return it in its original condition */
+		bp->b_dev = NODEV;
+		bp->b_flags = B_BUSY|B_INVAL;
+		bp->b_un.b_addr = xf->xf_addr;
+		bp->b_bcount = bp->b_bufsize;
+		brelse(bp);
+
+		xf->xf_buf = NULL;
+		xf->xf_addr = NULL;
+		xf->xf_sc = NULL;
+	}
+}
+#endif NDRIV > 0
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 dev_driv.c
+	/bin/echo -n '	'; /bin/ls -ld dev_driv.c
+fi
+/bin/echo 'Extracting drivio.h'
+sed 's/^X//' <<'//go.sysin dd *' >drivio.h
+X/* $Header: /usr/sys/h/RCS/drivio.h,v 1.1 85/01/02 09:44:05 chris Exp $ */
+
+X/*
+ * diocinfo contains the information needed to initialize the hyperdriver
+ */
+struct diocinfo {
+	int	dioc_fd;	/* file descriptor */
+	int	dioc_xsize;	/* max size of any one transfer */
+	int	dioc_nxfer;	/* max number of uncompleted transfers */
+};
+
+X/*
+ * diocret contains the return status information for completed transfers
+ */
+struct diocret {
+	int	dioc_rval;	/* return value */
+	int	dioc_error;	/* error number */
+};
+
+#define DIOCSETINFO _IOW(D, 0, struct diocinfo)	/* set info */
+#define DIOCREAD    _IO(D, 1)			/* start a read */
+#define DIOCGETRET  _IOR(D, 2, struct diocret)	/* get return info */
+#define DIOCWAIT    _IO(D, 3)			/* wait for I/O to finish */
+#define DIOCGMAXX   _IOR(D, 4, int)		/* get max # xfers */
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 drivio.h
+	/bin/echo -n '	'; /bin/ls -ld drivio.h
+fi
+/bin/echo 'Extracting dump_mods'
+sed 's/^X//' <<'//go.sysin dd *' >dump_mods
+RCS file: RCS/dump.h,v
+retrieving revision 1.1
+diff -c1 -r1.1 dump.h
+*** /tmp/,RCSt1005006	Sat Jan  5 03:22:00 1985
+--- dump.h	Sun Dec 30 07:34:11 1984
+***************
+*** 69,70
+  int	dump();
+  int	tapsrec();
+
+--- 69,71 -----
+  int	dump();
++ int	dirdump();
+  int	tapsrec();
+RCS file: RCS/dumpitime.c,v
+retrieving revision 1.1
+diff -c1 -r1.1 dumpitime.c
+*** /tmp/,RCSt1005011	Sat Jan  5 03:22:06 1985
+--- dumpitime.c	Sun Dec 30 07:34:12 1984
+***************
+*** 206,209
+   * This is an estimation of the number of TP_BSIZE blocks in the file.
+!  * It assumes that there are no unallocated blocks; hence
+!  * the estimate may be high
+   */
+
+--- 206,209 -----
+   * This is an estimation of the number of TP_BSIZE blocks in the file.
+!  * WARNING: it uses the di_blocks field of the inode, which is not
+!  * maintained in 4.1c BSD.
+   */
+***************
+*** 212,214
+  {
+! 	long s;
+  
+
+--- 212,214 -----
+  {
+! 	long s, t;
+  
+***************
+*** 215,218
+  	esize++;
+! 	/* calc number of TP_BSIZE blocks */
+! 	s = howmany(ip->di_size, TP_BSIZE);
+  	if (ip->di_size > sblock->fs_bsize * NDADDR) {
+
+--- 215,236 -----
+  	esize++;
+! 
+! 	/*
+! 	 * ip->di_size is the size of the file in bytes.
+! 	 * ip->di_blocks stores the number of sectors actually in the file.
+! 	 * If there are more sectors than the size would indicate, this just
+! 	 *	means that there are unused sectors in the last file block;
+! 	 *	we can safely ignore these (s = t below).
+! 	 * If the file is bigger than the number of sectors would indicate,
+! 	 *	then the file has holes in it.  In this case we must use the
+! 	 *	block count for keeping track of actual blocks used, but we
+! 	 *	use the actual size for estimating the number of indirect
+! 	 *	blocks (t vs. s in the indirect block calculations) -- this
+! 	 *	is simply because dump fills in holes in indirect blocks,
+! 	 *	so the di_blocks field (which already counts the indirect
+! 	 *	blocks) can't be used directly.
+! 	 */
+! 	 s = howmany(dbtob(ip->di_blocks), TP_BSIZE);
+! 	 t = howmany(ip->di_size, TP_BSIZE);
+! 	 if (s > t)
+! 		s = t;
+  	if (ip->di_size > sblock->fs_bsize * NDADDR) {
+***************
+*** 218,221
+  	if (ip->di_size > sblock->fs_bsize * NDADDR) {
+! 		/* calc number of indirect blocks on the dump tape */
+! 		s += howmany(s - NDADDR * sblock->fs_bsize / TP_BSIZE,
+  			TP_NINDIR);
+
+--- 236,239 -----
+  	if (ip->di_size > sblock->fs_bsize * NDADDR) {
+! 		/* calculate the number of indirect blocks on the dump tape */
+! 		s += howmany(t - NDADDR * sblock->fs_bsize / TP_BSIZE,
+  			TP_NINDIR);
+RCS file: RCS/dumpmain.c,v
+retrieving revision 1.1
+diff -c1 -r1.1 dumpmain.c
+*** /tmp/,RCSt1005016	Sat Jan  5 03:22:14 1985
+--- dumpmain.c	Mon Dec 31 23:06:55 1984
+***************
+*** 9,10
+  int	cartridge = 0;	/* Assume non-cartridge tape */
+  #ifdef RDUMP
+
+--- 9,11 -----
+  int	cartridge = 0;	/* Assume non-cartridge tape */
++ int	mass_driver = 0;/* use mass driver */
+  #ifdef RDUMP
+***************
+*** 36,38
+  	arg = "u";
+! 	if(argc > 1) {
+  		argv++;
+
+--- 37,39 -----
+  	arg = "u";
+! 	if (argc > 1) {
+  		argv++;
+***************
+*** 43,45
+  	}
+! 	while(*arg)
+  	switch (*arg++) {
+
+--- 44,46 -----
+  	}
+! 	while (*arg)
+  	switch (*arg++) {
+***************
+*** 55,57
+  	case 'f':			/* output file */
+! 		if(argc > 1) {
+  			argv++;
+
+--- 56,58 -----
+  	case 'f':			/* output file */
+! 		if (argc > 1) {
+  			argv++;
+***************
+*** 71,73
+  	case 's':			/* tape size, feet */
+! 		if(argc > 1) {
+  			argv++;
+
+--- 72,74 -----
+  	case 's':			/* tape size, feet */
+! 		if (argc > 1) {
+  			argv++;
+***************
+*** 80,82
+  	case 'b':			/* blocks per tape write */
+! 		if(argc > 1) {
+  			argv++;
+
+--- 81,83 -----
+  	case 'b':			/* blocks per tape write */
+! 		if (argc > 1) {
+  			argv++;
+***************
+*** 112,113
+  
+  	default:
+
+--- 113,118 -----
+  
++ 	case 'm':
++ 		mass_driver++;		/* the accelerator... */
++ 		break;
++ 
+  	default:
+***************
+*** 116,118
+  	}
+! 	if(argc > 1) {
+  		argv++;
+
+--- 121,123 -----
+  	}
+! 	if (argc > 1) {
+  		argv++;
+***************
+*** 267,269
+  	msg("dumping (Pass III) [directories]\n");
+! 	pass(dump, dirmap);
+  
+
+--- 272,274 -----
+  	msg("dumping (Pass III) [directories]\n");
+! 	pass(dirdump, dirmap);
+  
+RCS file: RCS/dumptape.c,v
+retrieving revision 1.1
+diff -c1 -r1.1 dumptape.c
+*** /tmp/,RCSt1005040	Sat Jan  5 03:23:00 1985
+--- dumptape.c	Mon Dec 31 23:40:23 1984
+***************
+*** 2,3
+  #include "dump.h"
+  
+
+--- 2,6 -----
+  #include "dump.h"
++ #include <sys/ioctl.h>
++ #include <sys/drivio.h>
++ #include <errno.h>
+  
+***************
+*** 7,8
+  extern int ntrec;		/* blocking factor on tape */
+  
+
+--- 10,12 -----
+  extern int ntrec;		/* blocking factor on tape */
++ extern int mass_driver;		/* true => should use mass driver */
+  
+***************
+*** 8,9
+  
+  /*
+
+--- 12,19 -----
+  
++ int	wr_pend;		/* number of pending writes */
++ int	wr_maxpend;		/* max allowable # of pending writes */
++ int	WR_MAX = 0;		/* patchable, can set max we will use */
++ int	drivfd = -1;		/* driver fd */
++ extern int errno;
++ 
+  /*
+***************
+*** 29,31
+  {
+- 	register i;
+  
+
+--- 39,40 -----
+  {
+  
+***************
+*** 31,34
+  
+! 	for (i=0; i < TP_BSIZE; i++)
+! 		tblock[trecno][i] = *dp++;
+  	trecno++;
+
+--- 40,42 -----
+  
+! 	bcopy(dp, tblock[trecno], TP_BSIZE);
+  	trecno++;
+***************
+*** 35,38
+  	spcl.c_tapea++;
+! 	if(trecno >= ntrec)
+! 		flusht();
+  }
+
+--- 43,46 -----
+  	spcl.c_tapea++;
+! 	if (trecno >= ntrec)
+! 		t_flusht(1, 0);
+  }
+***************
+*** 40,42
+  dmpblk(blkno, size)
+! 	daddr_t blkno;
+  	int size;
+
+--- 48,50 -----
+  dmpblk(blkno, size)
+! 	register daddr_t blkno;
+  	int size;
+***************
+*** 43,45
+  {
+! 	int avail, tpblks, dblkno;
+  
+
+--- 51,53 -----
+  {
+! 	register int avail, tpblks, dblkno;
+  
+***************
+*** 53,55
+  		spcl.c_tapea += avail;
+! 		flusht();
+  		dblkno += avail * (TP_BSIZE / DEV_BSIZE);
+
+--- 61,63 -----
+  		spcl.c_tapea += avail;
+! 		t_flusht(1, 0);
+  		dblkno += avail * (TP_BSIZE / DEV_BSIZE);
+***************
+*** 61,64
+  	spcl.c_tapea += tpblks;
+! 	if(trecno >= ntrec)
+! 		flusht();
+  }
+
+--- 69,72 -----
+  	spcl.c_tapea += tpblks;
+! 	if (trecno >= ntrec)
+! 		t_flusht(1, 0);
+  }
+***************
+*** 67,69
+  
+! flusht()
+  {
+
+--- 75,81 -----
+  
+! /*
+!  * Write and/or wait for previous writes.
+!  */
+! t_flusht(dowrite, dowait)
+! 	int dowrite, dowait;
+  {
+***************
+*** 69,71
+  {
+! 	register i, si;
+  	daddr_t d;
+
+--- 81,83 -----
+  {
+! 	register int i, si;
+  	daddr_t d;
+***************
+*** 72,73
+  
+  	trecno = 0;
+
+--- 84,91 -----
+  
++ 	if (dowait && mass_driver && !pipeout) {
++ 		if (wrwait())
++ 			goto tape_err;
++ 	}
++ 	if (!dowrite)
++ 		return;
+  	trecno = 0;
+***************
+*** 73,100
+  	trecno = 0;
+! 	if (write(to, tblock[0], writesize) != writesize){
+! 		if (pipeout) {
+! 			msg("Tape write error on %s\n", tape);
+! 			msg("Cannot recover\n");
+! 			dumpabort();
+! 			/* NOTREACHED */
+! 		}
+! 		msg("Tape write error on tape %d\n", tapeno);
+! 		broadcast("TAPE ERROR!\n");
+! 		if (query("Do you want to restart?")){
+! 			msg("This tape will rewind.  After it is rewound,\n");
+! 			msg("replace the faulty tape with a new one;\n");
+! 			msg("this dump volume will be rewritten.\n");
+! 			/*
+! 			 *	Temporarily change the tapeno identification
+! 			 */
+! 			tapeno--;
+! 			nogripe = 1;
+! 			close_rewind();
+! 			nogripe = 0;
+! 			tapeno++;
+! 			Exit(X_REWRITE);
+! 		} else {
+! 			dumpabort();
+! 			/*NOTREACHED*/
+! 		}
+  	}
+
+--- 91,95 -----
+  	trecno = 0;
+! 	if (mass_driver && !pipeout) {
+! 		if (wrrec(tblock[0]))
+! 			goto tape_err;
+  	}
+***************
+*** 100,102
+  	}
+! 
+  	asize += writesize/density;
+
+--- 95,100 -----
+  	}
+! 	else {
+! 		if (write(to, tblock[0], writesize) != writesize)
+! 			goto tape_err;
+! 	}
+  	asize += writesize/density;
+***************
+*** 109,110
+  	timeest();
+  }
+
+--- 107,138 -----
+  	timeest();
++ 	return;
++ 
++ tape_err:
++ 	if (nogripe)		/* already handling an error, continue */
++ 		return;
++ 	if (pipeout) {
++ 		msg("Tape write error on %s\n", tape);
++ 		msg("Cannot recover\n");
++ 		dumpabort();
++ 		/* NOTREACHED */
++ 	}
++ 	msg("Tape write error on tape %d\n", tapeno);
++ 	broadcast("TAPE ERROR!\n");
++ 	if (query("Do you want to restart?")) {
++ 		msg("This tape will rewind.  After it is rewound,\n");
++ 		msg("replace the faulty tape with a new one;\n");
++ 		msg("this dump volume will be rewritten.\n");
++ 		/*
++ 		 *	Temporarily change the tapeno identification
++ 		 */
++ 		tapeno--;
++ 		nogripe = 1;
++ 		close_rewind();
++ 		nogripe = 0;
++ 		tapeno++;
++ 		Exit(X_REWRITE);
++ 	}
++ 	else
++ 		dumpabort();
++ 	/*NOTREACHED*/
+  }
+***************
+*** 111,112
+  
+  rewind()
+
+--- 139,143 -----
+  
++ /*
++  * Rewind the tape
++  */
+  rewind()
+***************
+*** 125,126
+  	 */
+  	msg("Tape rewinding\n", secs);
+
+--- 156,159 -----
+  	 */
++ 	if (drivfd >= 0)
++ 		t_flusht(0, 1);
+  	msg("Tape rewinding\n", secs);
+***************
+*** 126,127
+  	msg("Tape rewinding\n", secs);
+  	close(to);
+
+--- 159,164 -----
+  	msg("Tape rewinding\n", secs);
++ 	if (drivfd >= 0) {
++ 		close(drivfd);
++ 		drivfd = -1;
++ 	}
+  	close(to);
+***************
+*** 138,139
+  		return;
+  	close(to);
+
+--- 175,181 -----
+  		return;
++ 	if (drivfd >= 0) {
++ 		t_flusht(0, 1);
++ 		close(drivfd);
++ 		drivfd = -1;
++ 	}
+  	close(to);
+***************
+*** 139,141
+  	close(to);
+! 	if (!nogripe){
+  		rewind();
+
+--- 181,183 -----
+  	close(to);
+! 	if (!nogripe) {
+  		rewind();
+***************
+*** 144,146
+  	}
+! 	do{
+  		if (query ("Is the new tape mounted and ready to go?"))
+
+--- 186,188 -----
+  	}
+! 	for (;;) {
+  		if (query ("Is the new tape mounted and ready to go?"))
+***************
+*** 147,149
+  			break;
+! 		if (query ("Do you want to abort?")){
+  			dumpabort();
+
+--- 189,191 -----
+  			break;
+! 		if (query ("Do you want to abort?")) {
+  			dumpabort();
+***************
+*** 151,153
+  		}
+! 	} while (1);
+  }
+
+--- 193,195 -----
+  		}
+! 	}
+  }
+***************
+*** 177,178
+  	 */
+  	close(to);
+
+--- 219,225 -----
+  	 */
++ 	if (drivfd >= 0) {
++ 		t_flusht(0, 1);
++ 		close(drivfd);
++ 		drivfd = -1;
++ 	}
+  	close(to);
+***************
+*** 186,188
+  	childpid = fork();
+! 	if (childpid < 0){
+  		msg("Context save fork fails in parent %d\n", parentpid);
+
+--- 233,235 -----
+  	childpid = fork();
+! 	if (childpid < 0) {
+  		msg("Context save fork fails in parent %d\n", parentpid);
+***************
+*** 190,192
+  	}
+! 	if (childpid != 0){
+  		/*
+
+--- 237,239 -----
+  	}
+! 	if (childpid != 0) {
+  		/*
+***************
+*** 202,204
+  #endif TDEBUG
+! 		for (;;){
+  			waitpid = wait(&status);
+
+--- 249,251 -----
+  #endif TDEBUG
+! 		for (;;) {
+  			waitpid = wait(&status);
+***************
+*** 204,206
+  			waitpid = wait(&status);
+! 			if (waitpid != childpid){
+  				msg("Parent %d waiting for child %d has another child %d return\n",
+
+--- 251,253 -----
+  			waitpid = wait(&status);
+! 			if (waitpid != childpid) {
+  				msg("Parent %d waiting for child %d has another child %d return\n",
+***************
+*** 210,212
+  		}
+! 		if (status & 0xFF){
+  			msg("Child %d returns LOB status %o\n",
+
+--- 257,259 -----
+  		}
+! 		if (status & 0xFF) {
+  			msg("Child %d returns LOB status %o\n",
+***************
+*** 216,218
+  #ifdef TDEBUG
+! 		switch(status){
+  			case X_FINOK:
+
+--- 263,265 -----
+  #ifdef TDEBUG
+! 		switch (status) {
+  			case X_FINOK:
+***************
+*** 231,233
+  #endif TDEBUG
+! 		switch(status){
+  			case X_FINOK:
+
+--- 278,280 -----
+  #endif TDEBUG
+! 		switch (status) {
+  			case X_FINOK:
+***************
+*** 249,251
+  #endif
+! 		do{
+  			if (pipeout)
+
+--- 296,298 -----
+  #endif
+! 		for (;;) {
+  			if (pipeout)
+***************
+*** 254,257
+  				to = creat(tape, 0666);
+! 			if (to < 0) {
+! 				if (!query("Cannot open tape. Do you want to retry the open?"))
+  					dumpabort();
+
+--- 301,314 -----
+  				to = creat(tape, 0666);
+! 			if (to >= 0)
+! 				break;
+! 			if (!query("Cannot open tape. Do you want to retry the open?")) {
+! 				dumpabort();
+! 				/*NOTREACHED*/
+! 			}
+! 		}
+! 		if (mass_driver && !pipeout) {
+! 			for (;;) {
+! 				if (open_driver(to) == 0)
+! 					break;
+! 				if (!query("Cannot open mass driver. Do you want to retry the open?")) {
+  					dumpabort();
+***************
+*** 257,260
+  					dumpabort();
+! 			} else break;
+! 		} while (1);
+  
+
+--- 314,319 -----
+  					dumpabort();
+! 					/*NOTREACHED*/
+! 				}
+! 			}
+! 		}
+  
+***************
+*** 293,294
+  	exit(status);
+  }
+
+--- 352,493 -----
+  	exit(status);
++ }
++ 
++ /*
++  * Routines for dealing with the mass driver
++  */
++ 
++ /*
++  * Wait for all pending I/O to complete, then check the return
++  * values for each.
++  */
++ wrwait()
++ {
++ 	struct diocret rval;
++ 
++ 	while (ioctl(drivfd, DIOCWAIT, 0)) {
++ 		if (errno == EINTR)
++ 			continue;
++ 		perror("ioctl(DIOCWAIT)");
++ 		msg("Bug! DIOCWAIT fails\n");
++ 		return (-1);
++ 	}
++ 	while (wr_pend > 0) {
++ 		if (ioctl(drivfd, DIOCGETRET, &rval) == 0) {
++ 			wr_pend--;
++ 			if (rval.dioc_error) {
++ 				errno = rval.dioc_error;
++ 				perror("wrwait");
++ 				return (-1);
++ 			}
++ 			if (rval.dioc_rval != writesize)
++ 				return (-1);
++ 			continue;
++ 		}
++ 		if (errno == EINTR)
++ 			continue;
++ 		perror("ioctl(DIOCGETRET)");
++ 		return (-1);
++ 	}
++ 	return (0);
++ }
++ 
++ /*
++  * Write one record, waiting for one previous write to complete
++  * if necessary.
++  */
++ wrrec(addr)
++ 	char *addr;
++ {
++ 	int n, outbits;
++ 	struct diocret rval;
++ 	struct timeval tv;
++ 
++ 	tv.tv_sec = tv.tv_usec = 0;
++ 	while (wr_pend > 0) {
++ 		outbits = 1 << drivfd;
++ 		n = select(drivfd + 1, (int *)0, &outbits, (int *)0,
++ 		    wr_pend >= wr_maxpend ? (struct timeval *)0 : &tv);
++ 		if (n < 0) {
++ 			if (errno == EINTR)
++ 				continue;
++ 			perror("select");
++ 			return (-1);
++ 		}
++ 		if (n == 0) {
++ 			if (wr_pend < wr_maxpend)
++ 				break;
++ 			msg("Bogus zero return from select\n");
++ 			return (-1);
++ 		}
++ 		if (ioctl(drivfd, DIOCGETRET, &rval)) {
++ 			perror("ioctl(DIOCGETRET)");
++ 			return (-1);
++ 		}
++ 		wr_pend--;
++ 		if (rval.dioc_error) {
++ 			errno = rval.dioc_error;
++ 			perror("wrrec");
++ 			return (-1);
++ 		}
++ 		if (rval.dioc_rval != writesize)
++ 			return (-1);
++ 	}
++ 	if (write(drivfd, addr, writesize) != writesize) {
++ 		perror("write");
++ 		return (-1);
++ 	}
++ 	wr_pend++;
++ 	return (0);
++ }
++ 
++ /*
++  * Find and open /dev/drivX, and connect it to the tape (to).
++  * Set wr_maxpend according to the maximum allowable pending operations.
++  */
++ open_driver(to)
++ 	int to;
++ {
++ 	int i;
++ 	char driv_name[40];
++ 	struct stat st;
++ 	struct diocinfo di;
++ 	char *sprintf();
++ 
++ 	for (i = 0;; i++) {
++ 		(void) sprintf(driv_name, "/dev/driv%d", i);
++ 		if ((drivfd = open(driv_name, 2)) >= 0)
++ 			break;
++ 		if (stat(driv_name, &st))
++ 			return (-1);
++ 	}
++ 	if (ioctl (drivfd, DIOCGMAXX, &i)) {
++ 		perror("ioctl(DIOCGMAXX)");
++ 		goto out;
++ 	}
++ 	if (i < 3) {
++ 		msg("This kernel' driver's max_pend is too small\n");
++ 		goto out;
++ 	}
++ 	wr_maxpend = i - 2;	/* safety margin (?) */
++ 	if (WR_MAX && wr_maxpend > WR_MAX)
++ 		wr_maxpend = WR_MAX;
++ 
++ 	di.dioc_fd = to;
++ 	di.dioc_xsize = writesize;
++ again:
++ 	di.dioc_nxfer = wr_maxpend;
++ 	if (ioctl(drivfd, DIOCSETINFO, &di)) {
++ 		if (errno == ENOMEM && wr_maxpend > 1) {
++ 			wr_maxpend--;
++ 			goto again;
++ 		}
++ 		perror("ioctl(DIOCSETINFO)");
++ 		goto out;
++ 	}
++ 	msg("[wr_maxpend set to %d]\n", wr_maxpend);/* debug */
++ 	return (0);
++ 
++ out:
++ 	close(drivfd);
++ 	return (-1);
+  }
+RCS file: RCS/dumptraverse.c,v
+retrieving revision 1.1
+diff -c1 -r1.1 dumptraverse.c
+*** /tmp/,RCSt1005046	Sat Jan  5 03:23:21 1985
+--- dumptraverse.c	Mon Dec 31 23:06:24 1984
+***************
+*** 5,8
+  pass(fn, map)
+! 	int (*fn)();
+! 	char *map;
+  {
+
+--- 5,8 -----
+  pass(fn, map)
+! 	register int (*fn)();
+! 	register char *map;
+  {
+***************
+*** 8,12
+  {
+! 	struct dinode *dp;
+! 	int bits;
+! 	ino_t maxino;
+  
+
+--- 8,11 -----
+  {
+! 	register int bits;
+! 	register ino_t maxino;
+  
+***************
+*** 14,16
+  	for (ino = 0; ino < maxino; ) {
+! 		if((ino % NBBY) == 0) {
+  			bits = ~0;
+
+--- 13,19 -----
+  	for (ino = 0; ino < maxino; ) {
+! #if NBBY == 8
+! 		if ((ino & 7) == 0) {
+! #else
+! 		if ((ino % NBBY) == 0) {
+! #endif
+  			bits = ~0;
+***************
+*** 16,18
+  			bits = ~0;
+! 			if(map != NULL)
+  				bits = *map++;
+
+--- 19,21 -----
+  			bits = ~0;
+! 			if (map != NULL)
+  				bits = *map++;
+***************
+*** 20,25
+  		ino++;
+! 		if(bits & 1) {
+! 			dp = getino(ino);
+! 			(*fn)(dp);
+! 		}
+  		bits >>= 1;
+
+--- 23,26 -----
+  		ino++;
+! 		if (bits & 1)
+! 			(*fn)(getino(ino));
+  		bits >>= 1;
+***************
+*** 31,33
+  {
+! 	register f;
+  
+
+--- 32,34 -----
+  {
+! 	register int f;
+  
+***************
+*** 34,36
+  	f = ip->di_mode & IFMT;
+! 	if(f == 0)
+  		return;
+
+--- 35,37 -----
+  	f = ip->di_mode & IFMT;
+! 	if (f == 0)
+  		return;
+***************
+*** 37,39
+  	BIS(ino, clrmap);
+! 	if(f == IFDIR)
+  		BIS(ino, dirmap);
+
+--- 38,40 -----
+  	BIS(ino, clrmap);
+! 	if (f == IFDIR)
+  		BIS(ino, dirmap);
+***************
+*** 51,53
+  add(ip)
+! 	register struct	dinode	*ip;
+  {
+
+--- 52,54 -----
+  add(ip)
+! 	register struct	dinode *ip;
+  {
+***************
+*** 56,58
+  
+! 	if(BIT(ino, nodmap))
+  		return;
+
+--- 57,59 -----
+  
+! 	if (BIT(ino, nodmap))
+  		return;
+***************
+*** 70,72
+  	}
+! 	if(dadded) {
+  		nadded++;
+
+--- 71,73 -----
+  	}
+! 	if (dadded) {
+  		nadded++;
+***************
+*** 77,80
+  	}
+! 	if(nsubdir == 0)
+! 		if(!BIT(ino, nodmap))
+  			BIC(ino, dirmap);
+
+--- 78,81 -----
+  	}
+! 	if (nsubdir == 0)
+! 		if (!BIT(ino, nodmap))
+  			BIC(ino, dirmap);
+***************
+*** 86,88
+  {
+! 	register i;
+  	daddr_t	idblk[MAXNINDIR];
+
+--- 87,89 -----
+  {
+! 	register int i;
+  	daddr_t	idblk[MAXNINDIR];
+***************
+*** 90,93
+  	bread(fsbtodb(sblock, d), (char *)idblk, sblock->fs_bsize);
+! 	if(n <= 0) {
+! 		for(i=0; i < NINDIR(sblock); i++) {
+  			d = idblk[i];
+
+--- 91,94 -----
+  	bread(fsbtodb(sblock, d), (char *)idblk, sblock->fs_bsize);
+! 	if (n <= 0) {
+! 		for (i=0; i < NINDIR(sblock); i++) {
+  			d = idblk[i];
+***************
+*** 93,95
+  			d = idblk[i];
+! 			if(d != 0)
+  				dsrch(d, sblock->fs_bsize, *filesize);
+
+--- 94,96 -----
+  			d = idblk[i];
+! 			if (d != 0)
+  				dsrch(d, sblock->fs_bsize, *filesize);
+***************
+*** 99,101
+  		n--;
+! 		for(i=0; i < NINDIR(sblock); i++) {
+  			d = idblk[i];
+
+--- 100,102 -----
+  		n--;
+! 		for (i=0; i < NINDIR(sblock); i++) {
+  			d = idblk[i];
+***************
+*** 101,103
+  			d = idblk[i];
+! 			if(d != 0)
+  				indir(d, n, filesize);
+
+--- 102,104 -----
+  			d = idblk[i];
+! 			if (d != 0)
+  				indir(d, n, filesize);
+***************
+*** 107,109
+  
+! dump(ip)
+  	struct dinode *ip;
+
+--- 108,116 -----
+  
+! /*
+!  * Like dump, but checks for inodes that aren't directories.  This is
+!  * really not right, but prevents restore from believing that this inode
+!  * entry (which has changed into a file while we were doing other stuff)
+!  * is the end of the list of directories.
+!  */
+! dirdump(ip)
+  	struct dinode *ip;
+***************
+*** 110,111
+  {
+  	register int i;
+
+--- 117,129 -----
+  {
++ 	if ((ip->di_mode & IFMT) != IFDIR) {
++ 		msg("WARNING: active file system; directory vanished\n");
++ 		msg("(you aren't supposed to dump active file systems.)\n");
++ 		return;
++ 	}
++ 	dump(ip);
++ }
++ 
++ dump(ip)
++ 	register struct dinode *ip;
++ {
+  	register int i;
+***************
+*** 113,115
+  
+! 	if(newtape) {
+  		newtape = 0;
+
+--- 131,133 -----
+  
+! 	if (newtape) {
+  		newtape = 0;
+***************
+*** 122,123
+  	i = ip->di_mode & IFMT;
+  	if ((i != IFDIR && i != IFREG && i != IFLNK) || ip->di_size == 0) {
+
+--- 140,146 -----
+  	i = ip->di_mode & IFMT;
++ 	if (i == 0) {		/* free inode */
++ 		msg("WARNING: active file system; file vanished\n");
++ 		msg("(you aren't supposed to dump active file systems.)\n");
++ 		return;
++ 	}
+  	if ((i != IFDIR && i != IFREG && i != IFLNK) || ip->di_size == 0) {
+***************
+*** 171,173
+  blksout(blkp, frags)
+! 	daddr_t *blkp;
+  	int frags;
+
+--- 194,196 -----
+  blksout(blkp, frags)
+! 	register daddr_t *blkp;
+  	int frags;
+***************
+*** 174,176
+  {
+! 	int i, j, count, blks, tbperdb;
+  
+
+--- 197,199 -----
+  {
+! 	register int i, j, count, blks, tbperdb;
+  
+***************
+*** 205,208
+  {
+! 	register i, n;
+! 	char *cp;
+  
+
+--- 228,231 -----
+  {
+! 	register int i;
+! 	register char *cp;
+  
+***************
+*** 208,216
+  
+- 	n = -1;
+- 	for (i = 0; i < msiz; i++)
+- 		if(map[i])
+- 			n = i;
+- 	if (n < 0)
+- 		return;
+- 	n++;
+  	spcl.c_type = typ;
+
+--- 231,232 -----
+  
+  	spcl.c_type = typ;
+***************
+*** 216,218
+  	spcl.c_type = typ;
+! 	spcl.c_count = howmany(n * sizeof(map[0]), TP_BSIZE);
+  	spclrec();
+
+--- 232,234 -----
+  	spcl.c_type = typ;
+! 	spcl.c_count = howmany(msiz * sizeof(map[0]), TP_BSIZE);
+  	spclrec();
+***************
+*** 231,233
+  	s = 0;
+! 	for(i = 0; i < sizeof(union u_spcl)/sizeof(int); i++)
+  		s += *ip++;
+
+--- 247,249 -----
+  	s = 0;
+! 	for (i = 0; i < sizeof(union u_spcl)/sizeof(int); i++)
+  		s += *ip++;
+***************
+*** 239,241
+  	daddr_t d;
+! 	int size, filesize;
+  {
+
+--- 255,258 -----
+  	daddr_t d;
+! 	int size;
+! 	register int filesize;
+  {
+***************
+*** 242,244
+  	register struct direct *dp;
+! 	long loc;
+  	char dblk[MAXBSIZE];
+
+--- 259,261 -----
+  	register struct direct *dp;
+! 	register long loc;
+  	char dblk[MAXBSIZE];
+***************
+*** 245,247
+  
+! 	if(dadded)
+  		return;
+
+--- 262,264 -----
+  
+! 	if (dadded)
+  		return;
+***************
+*** 257,259
+  		loc += dp->d_reclen;
+! 		if(dp->d_ino == 0)
+  			continue;
+
+--- 274,276 -----
+  		loc += dp->d_reclen;
+! 		if (dp->d_ino == 0)
+  			continue;
+***************
+*** 259,262
+  			continue;
+! 		if(dp->d_name[0] == '.') {
+! 			if(dp->d_name[1] == '\0')
+  				continue;
+
+--- 276,279 -----
+  			continue;
+! 		if (dp->d_name[0] == '.') {
+! 			if (dp->d_name[1] == '\0')
+  				continue;
+***************
+*** 262,264
+  				continue;
+! 			if(dp->d_name[1] == '.' && dp->d_name[2] == '\0')
+  				continue;
+
+--- 279,281 -----
+  				continue;
+! 			if (dp->d_name[1] == '.' && dp->d_name[2] == '\0')
+  				continue;
+***************
+*** 265,267
+  		}
+! 		if(BIT(dp->d_ino, nodmap)) {
+  			dadded++;
+
+--- 282,284 -----
+  		}
+! 		if (BIT(dp->d_ino, nodmap)) {
+  			dadded++;
+***************
+*** 269,271
+  		}
+! 		if(BIT(dp->d_ino, dirmap))
+  			nsubdir++;
+
+--- 286,288 -----
+  		}
+! 		if (BIT(dp->d_ino, dirmap))
+  			nsubdir++;
+***************
+*** 296,298
+  	char *ba;
+! 	int	cnt;	
+  {
+
+--- 313,315 -----
+  	char *ba;
+! 	int cnt;
+  {
+***************
+*** 301,303
+  loop:
+! 	if (lseek(fi, (long)(da * DEV_BSIZE), 0) < 0){
+  		msg("bread: lseek fails\n");
+
+--- 318,320 -----
+  loop:
+! 	if (lseek(fi, (long)(da * DEV_BSIZE), 0) < 0)
+  		msg("bread: lseek fails\n");
+***************
+*** 303,305
+  		msg("bread: lseek fails\n");
+- 	}
+  	n = read(fi, ba, cnt);
+
+--- 320,321 -----
+  		msg("bread: lseek fails\n");
+  	n = read(fi, ba, cnt);
+***************
+*** 311,313
+  		 *
+! 		 * NB - dump only works in TP_BSIZE blocks, hence
+  		 * rounds DEV_BSIZE fragments up to TP_BSIZE pieces.
+
+--- 327,329 -----
+  		 *
+! 		 * N.B. - dump only works in TP_BSIZE blocks, hence
+  		 * rounds DEV_BSIZE fragments up to TP_BSIZE pieces.
+***************
+*** 323,325
+  		disk, da, cnt, n);
+! 	if (++breaderrors > BREADEMAX){
+  		msg("More than %d block read errors from %d\n",
+
+--- 339,341 -----
+  		disk, da, cnt, n);
+! 	if (++breaderrors > BREADEMAX) {
+  		msg("More than %d block read errors from %d\n",
+***************
+*** 328,330
+  		msg("This is an unrecoverable error.\n");
+! 		if (!query("Do you want to attempt to continue?")){
+  			dumpabort();
+
+--- 344,346 -----
+  		msg("This is an unrecoverable error.\n");
+! 		if (!query("Do you want to attempt to continue?")) {
+  			dumpabort();
+***************
+*** 331,333
+  			/*NOTREACHED*/
+! 		} else
+  			breaderrors = 0;
+
+--- 347,350 -----
+  			/*NOTREACHED*/
+! 		}
+! 		else
+  			breaderrors = 0;
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 dump_mods
+	/bin/echo -n '	'; /bin/ls -ld dump_mods
+fi
+/bin/echo 'Extracting md.4'
+sed 's/^X//' <<'//go.sysin dd *' >md.4
+X.TH DRIV 4L "U of Maryland"
+X.UC 4
+X.SH NAME
+driv \- ``mass driver'' asynchronous device
+X.SH SYNOPSIS
+X.B "pseudo-device driv"
+X.br
+or
+X.br
+X.B "pseudo-device driv"
+X.I N
+X.SH DESCRIPTION
+\fI/dev/driv0\fP \- \fI/dev/driv\fP\|(N-1)
+are special files that allow asynchronous raw I/O on other devices.  They
+work by stealing memory from the system buffer pool, reserving it for
+the user of the pseudo driver for asynchronous transfers.  This driver
+does nothing by itself; it
+X.I must
+be used in conjunction with another device.  Due to system limitations,
+it generally operates only with mass storage devices (tapes and disks).
+X.PP
+The mass driver is controlled by means of
+X.I ioctl
+commands defined in the file
+X.RI < sys/drivio.h >,
+as follows:
+X.PP
+X.nf
+X/* $Header: /usr/sys/h/RCS/drivio.h,v 1.1 85/01/02 09:44:05 chris Exp $ */
+
+X/*
+ * diocinfo contains the information needed to initialize the mass driver
+ */
+struct diocinfo {
+	int	dioc_fd;	/* file descriptor */
+	int	dioc_xsize;	/* max size of any one transfer */
+	int	dioc_nxfer;	/* max number of uncompleted transfers */
+};
+
+X/*
+ * diocret contains the return status information for completed transfers
+ */
+struct diocret {
+	int	dioc_rval;	/* return value */
+	int	dioc_error;	/* error number */
+};
+
+#define DIOCSETINFO _IOW(D, 0, struct diocinfo)	/* set info */
+#define DIOCREAD    _IO(D, 1)			/* read (NOT DONE YET) */
+#define DIOCGETRET  _IOR(D, 2, struct diocret)	/* get return info */
+#define DIOCWAIT    _IO(D, 3)			/* wait for I/O to finish */
+#define DIOCGMAXX   _IOR(D, 4, int)		/* get max # xfers */
+X.PP
+X.fi
+X.PP
+X.B DIOCSETINFO
+is used to initialize the mass driver.  It connects the mass driver to
+the file opened as
+X.IR dioc_fd ,
+which must be a character (raw) device (most likely a tape drive) and
+must support the mass driver.
+At the same time, space for holding transfers is allocated based on
+X.I dioc_xsize
+and
+X.IR dioc_nxfer .
+The first is the maximum size allowed in
+X.I read
+or
+X.I write
+system calls on the mass driver.  (Note that the raw device may
+be used to perform larger transfers, if necessary.)  There is an
+absolute limit of
+X.B MAXBSIZE
+bytes, which can never be exceeded (short of recompiling the kernel).
+X.RB ( MAXBSIZE
+may be found in the file
+X.RI < sys/param.h >).
+There is also an implementation-dependent limit on the number of transfers
+X.IR dioc_nxfer ;
+this can be found
+X.RI ( before
+the mass driver is connected) via the
+X.B DIOCGMAXX
+ioctl.  (Once the driver is successfully connected,
+X.B DIOCGMAXX
+will return the value given as
+X.IR dioc_nxfer .)
+X.PP
+Once the mass driver has been successfully connected to the I/O device,
+asynchronous writes can be initiated with the
+X.I write
+system call.  When a write occurs, the driver first waits if necessary
+so that no more than
+X.I dioc_nxfer
+asynchronous transfers are still pending, then starts but does not wait
+for the given transfer.  When the
+X.I write
+system call returns, the data has been copied someplace safe, so the
+buffer passed to
+X.I write
+may be immediately reused.
+X.PP
+X.IR Write s
+on the mass driver always succeed immediately (assuming they are not
+too large), moving the mass driver file's seek pointer (but not that
+of the true device; this is important on devices that use the file
+offset, e.g., disk drives).  Return values are computed, and errors
+are detected, after the mass driver write has succeeded.  These values
+should be retrieved with the
+X.B DIOCGETRET
+ioctl and examined.  The
+X.I select
+system call will succeed for writing whenever a return value
+is available (yes, it's odd, but what the heck).  The value that
+X.I would
+have been returned from a
+X.I write
+on the raw device is given back in
+X.IR dioc_rval ,
+with
+X.I dioc_error
+containing the system error number, if any (see
+X.RI < errno.h >),
+or zero for no error.  (Note that it is possible to have a nonzero
+return value and an error, if a transfer succeeds partially.)
+Transfers are always done in order, thus the return value applies to
+the oldest write for which no value has been returned yet.
+X.PP
+The
+X.B DIOCWAIT
+command waits for all pending transfers to complete, after which their
+return values may be obtained.
+X.PP
+Currently,
+X.B DIOCREAD
+and read transfers are not supported (sorry!).  The current idea for
+these is to have
+X.B DIOCREAD
+take a transfer size (and an offset?) and start a transfer,
+with select for read returning when the read is complete.
+X.SH ERRORS
+There are a large number of error codes that can be returned, some
+probably inappropriate.
+The following errors can be returned by the mass driver (and are
+additional to errors from the standard system call interface).
+X.PP
+X.TP 15
+[ENOENT]
+A
+X.B DIOCGETRET
+ioctl was attempted but there were no return values.
+X.TP 15
+[EBADF]
+Either of the following:
+X.br
+\(bu The
+X.I dioc_fd
+given to
+X.B DIOCSETINFO
+did not refer to an open file.
+X.br
+\(bu A
+X.I write
+was attempted when the true device was only opened for reading.
+X.TP 15
+[ENOMEM]
+Either of the following:
+X.br
+\(bu Not enough buffer space was available to allocate
+X.I dioc_nxfer
+transfer buffers of size
+X.IR dioc_xsize .
+X.br
+\(bu A
+X.I write
+of more than
+X.I dioc_xsize
+bytes was attempted.
+X.TP 15
+[EBUSY]
+The driver is in use by another program.
+X.TP 15
+[EINVAL]
+Any of the following:
+X.br
+\(bu A
+X.B DIOCSETINFO
+command was done but the mass driver was already connected.
+X.br
+\(bu The
+X.I dioc_nxfer
+or
+X.I dioc_xsize
+value given to
+X.B DIOCSETINFO
+was negative.
+X.br
+\(bu The
+X.I dioc_fd
+file descriptor did not refer to a character special device, or the
+device does not support the mass driver.
+X.br
+\(bu A
+X.I write
+was attempted without connecting the mass driver to a real device.
+X.TP 15
+[ENOTTY]
+An unsupported ioctl was attempted.
+X.TP 15
+[ENOSPC]
+The value of
+X.I dioc_xsize
+given to
+X.B DIOCSETINFO
+was greater than
+X.BR MAXBSIZE .
+X.TP 15
+[EOPNOTSUPP]
+A
+X.I read
+or
+X.B DIOCREAD
+was attempted.  This is probably the wrong error number.
+It may change to ENXIO (or it may go away (wish wish)).
+X.SH AUTHOR
+Chris Torek, University of Maryland
+X.br
+<chris@maryland.ARPA>
+X.br
+<chris@umcp-cs.UUCP>
+X.SH FILES
+X/dev/driv*
+X.SH BUGS
+Reads should be supported.
+X.PP
+Half of the buffer cache is reserved for the normal block I/O system
+and cannot be used by the mass driver.  However, it is still possible
+for a malicious user to steal half the system buffer space, adversely
+affecting system performance.  (So restrict the /dev entry, silly!)
+X.PP
+The method of obtaining return values is ugly.
+X.PP
+The effect of select is odd.
+X.PP
+While the mass driver is open, the ``true'' (raw) device is held open.  The
+correct procedure for shutting things down is to close the mass
+driver, then the raw device.  Simply closing a raw tape drive will
+not cause it to rewind, for example.
+X.PP
+The error returns are weird.
+X.PP
+There should be ioctls to get the current number of pending transfers
+and valid return values and any other interesting goodies.
+X.PP
+Errors are not handled gracefully.  If an error occurs on the true
+device, the mass driver barrels on ahead with the rest of the pending
+transfers.  Probably, it should suspend them, allowing a later ioctl
+to restart or cancel the pending transfers.
+X.PP
+The
+X.B MAXBSIZE
+limit is annoying.
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 md.4
+	/bin/echo -n '	'; /bin/ls -ld md.4
+fi
+/bin/echo 'Extracting needless_conf.h'
+sed 's/^X//' <<'//go.sysin dd *' >needless_conf.h
+Here is a PARTIAL list of files that needlessly include ../h/conf.h:
+
+sys/kern_descrip.c
+sys/kern_prot.c
+sys/kern_sig.c
+sys/subr_prf.c
+sys/tty_bk.c
+sys/tty_subr.c
+sys/tty_tb.c
+sys/ufs_alloc.c
+sys/ufs_bmap.c
+sys/ufs_fio.c
+sys/ufs_inode.c
+sys/ufs_nami.c
+sys/ufs_subr.c
+sys/ufs_xxx.c
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 needless_conf.h
+	/bin/echo -n '	'; /bin/ls -ld needless_conf.h
+fi
+-- 
+(This line accidently left nonblank.)
+
+In-Real-Life: Chris Torek, Univ of MD Comp Sci Dept (301) 454-7690
+UUCP:	{seismo,allegra,brl-bmd}!umcp-cs!chris
+CSNet:	chris@umcp-cs		ARPA:	chris@maryland

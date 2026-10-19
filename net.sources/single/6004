@@ -1,0 +1,1635 @@
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83; site eneevax.UUCP
+Path: utzoo!watmath!clyde!burl!ulysses!mhuxl!ihnp4!zehntel!hplabs!hao!seismo!rlgvax!cvl!umcp-cs!eneevax!chris
+From: chris@eneevax.UUCP
+Newsgroups: net.sources
+Subject: Printer spooler program (sort of for Versatec plot routines)
+Message-ID: <114@eneevax.UUCP>
+Date: Sun, 22-Apr-84 19:07:58 EST
+Article-I.D.: eneevax.114
+Posted: Sun Apr 22 19:07:58 1984
+Date-Received: Thu, 26-Apr-84 01:09:11 EST
+Organization: Univ. of Maryland, EE Dept.
+Lines: 1621
+
+Here's a handy-neato-semi-frobic printer spooler for 4.1BSD.  (It will
+probably run on other versions of Unix(tm), as long as you've got a
+directory library.  By the way, <4.2/dir.h> is where I've got the
+header file for the 4.2-directory-compatibility library.)
+
+Anyway, we use this on Enee-Vax to run the Versatec(tm).  It's quite
+easy to run various different programs from this spooler; all that's
+required is a change to the configuration file in /etc/spool_devices.
+You can even run other devices (although I've never tested that), each
+independently.
+
+People running 4.2 probably won't care about this spooler, since 4.2
+already has a handy-neato-frobic spooler.  (Not just semi-frobic
+either... networking even).
+
+Or if you have MDQS, use that; it's probably the best of the three.
+
+(Especially since this one doesn't have a "vpq" and "vprm" (yet?).
+But we haven't needed them so far...)
+
+N.B.  There are a few #defines in spool.h that you may want to change.
+Oh yes, and I changed vtroff and vpr (vpr is a shell script that says
+"spool -d versatec"; vtroff ends with "spool -d versatec -nrvcat") to
+call this spooler instead of the old one.
+
+-------tear on dashed line as usual---don't forget the signature-------
+: Run this shell script with "sh" not "csh"
+PATH=:/bin:/usr/bin:/usr/ucb
+export PATH
+all=FALSE
+if [ $1x = -ax ]; then
+	all=TRUE
+fi
+/bin/echo 'Extracting spool.c'
+sed 's/^X//' <<'//go.sysin dd *' >spool.c
+#ifndef lint
+static char rcsid[] = "$Header: /usr/enee/chris/sys/spool/RCS/spool.c,v 1.5 84/04/22 04:38:45 chris Exp $";
+#endif
+
+/* Copyright (c) 1984 Chris Torek / University of Maryland */
+
+#include <stdio.h>
+#include <signal.h>
+#include <pwd.h>
+#include "spool.h"
+
+X/*
+ * $Header: /usr/enee/chris/sys/spool/RCS/spool.c,v 1.5 84/04/22 04:38:45 chris Exp $
+ *
+ * $Log:	spool.c,v $
+ * Revision 1.5  84/04/22  04:38:45  chris
+ * Security hacking; new 'R' control card for removing files; use jobs
+ * library on 4.1
+ * 
+ * Revision 1.4  83/12/22  21:19:41  chris
+ * Fixed file-left-open bug
+ * 
+ * Revision 1.3  83/12/14  23:16:32  chris
+ * Fixed security bug in spooler ... was creating the control file
+ * according to the mode in the user's umask; if this was 0, anyone
+ * could write the file.  Now does a chmod 0644.
+ * 
+ * Revision 1.2  83/12/10  01:10:26  chris
+ * Fixed geteuid call
+ * 
+ * Revision 1.1  83/12/10  01:04:04  chris
+ * Initial revision
+ * 
+ *
+ * Spooler
+ *
+ * The general workings are as follows:
+ *	interpret options and generate control & data files for the despooler
+ * The despooler reads the control files to decide what to print, and how.
+ */
+
+char	*CFName,		/* Control file */
+	*DFName,		/* Data file (if any) */
+	*TFName,		/* Temporary control file */
+	*PrintProgram,		/* Program (-p, -<foo>, or default) */
+	*UserName,		/* User's login name */
+	*Title,			/* Title (-t) */
+	*ProgName;		/* argv[0], for errors */
+int	CopyFlag,		/* Use a copy instead of the original (-c) */
+	MailFlag,		/* Send mail back to user when done (-m) */
+	UserID,			/* User's UID */
+	GroupID;		/* User's GID */
+struct SpoolDevice
+	*Device;		/* Device */
+
+char *malloc (),
+     *sprintf (),
+     *LookUpType ();
+struct passwd *getpwuid ();
+
+#ifdef BSD41
+int (*sigset ())();
+#define set(sig)	if (sigset (sig, SIG_IGN) == SIG_DFL) \
+				(void) sigset (sig, cleanup)
+#else BSD41
+#define	set(sig)	if (signal (sig, SIG_IGN) == SIG_DFL) \
+				(void) signal (sig, cleanup)
+#endif BSD41
+
+main (argc, argv)
+int argc;
+register char **argv;
+{
+    register char  *cp;
+    char   *generic_type,
+	   *fname;
+    int     file,
+	    got_prog,
+	    do_stdin = 1;
+    int     cleanup ();
+
+    set (SIGINT);
+    set (SIGQUIT);
+    set (SIGHUP);
+    set (SIGTERM);
+
+    argc--;
+    ProgName = *argv++;
+#ifndef	DEBUG
+    if (geteuid ())
+	error ("panic: not setuid\n");
+#endif	DEBUG
+    GetDevices ();
+    UserID = getuid ();
+    GroupID = getgid ();
+    {
+	register struct passwd *p;
+
+	if ((p = getpwuid (UserID)) == NULL)
+	    error ("intruder alert\n");
+	UserName = p -> pw_name;
+	endpwent ();
+    }
+    generic_type = 0;
+    got_prog = 0;
+    while (--argc >= 0 || do_stdin) {
+	if (argc < 0) {		/* got here for do_stdin then */
+	    file = 0;		/* fileno (stdin) */
+	    fname = (char *) 0;
+	    goto dofile;
+	}
+	if (**argv == '-') {
+	    cp = *argv++ + 1;
+	    if (*cp == 0) {	/* "-" => stdin */
+		file = 0;
+		fname = (char *) 0;
+		goto dofile;
+	    }
+	    if (cp[1] == 0) {	/* -<x>\0 */
+		switch (*cp) {
+		    case 'd': 
+			if (--argc < 0)
+			    error ("-d requires an argument\n");
+			Device = FindDevice (*argv++);
+			if (Device == (struct SpoolDevice *) 0) {
+			    fprintf (stderr, "%s: %s: no such spool device\n",
+						ProgName, argv[-1]);
+			    cleanup ();
+			    /* NOTREACHED */
+			}
+			break;
+		    case 'p': 
+			if (got_prog)
+			    error ("use only one -p per file\n");
+			if (--argc < 0)
+			    error ("-p requires an argument\n");
+			PrintProgram = *argv++;
+			got_prog++;
+			do_stdin++;
+			break;
+		    case 't':
+			if (--argc < 0)
+			    error ("-t requires an argument\n");
+			Title = *argv++;
+			break;
+		    case 'c': 
+			CopyFlag++;
+			break;
+		    case 'm': 
+			MailFlag++;
+			break;
+		    default:
+			fprintf (stderr, "%s: unknown option -%c\n",
+						ProgName, *cp);
+			cleanup ();
+			/* NOTREACHED */
+		}
+	    }
+	    else {		/* -<xyz> */
+		if (generic_type)
+		    error ("use only one generic type per file\n");
+		generic_type = cp;
+		do_stdin++;
+	    }
+	}
+	else {			/* argument not starting with "-" */
+	    /* Must be a file to print.  Ensure that the guy has read access,
+	       and get a file descriptor */
+	    if (access (*argv, 4) || ((file = open (*argv++, 0)) < 0)) {
+		fprintf (stderr, "%s: ", ProgName);
+		perror (argv[-1]);
+		cleanup ();
+		/* NOTREACHED */
+	    }
+dofile: 
+	    if (Device == (struct SpoolDevice *) 0)
+		error ("must specify a device name\n");
+	    if (got_prog) {
+		if (Device -> sd_restricted)
+		    error ("restricted device (-p invalid)\n");
+		if (generic_type)
+		    error ("use only one of -p and generic type\n");
+		got_prog = 0;
+	    }
+	    else {
+		if (generic_type || PrintProgram == (char *) 0) {
+		    PrintProgram = LookUpType (generic_type);
+		    generic_type = 0;
+		}
+	    }
+	    CopyFile (fname, file);
+	    if (file != 0)
+		(void) close (file);
+	    do_stdin = 0;
+	    Title = (char *) 0;
+	}
+    }
+    cleanup ();
+    /* NOTREACHED */
+}
+
+X/* Make a unique name by filling in the last 7 characters of the given
+   string. */
+UniqueName (name)
+char *name;
+{
+    register int    i,
+                    pid;
+    register char  *s = name;
+
+    pid = getpid ();
+    while (*s)
+	s++;
+    s -= 5;
+    for (i = 5; --i >= 0; ) {
+	s[i] = pid % 10 + '0';
+	pid /= 10;
+    }
+    *--s = 'a';
+    s[-1] = 'a';
+    while (access (name, 0) == 0) {
+	if (++*s > '~') {
+	    *s = 'a';
+	    if (++s[-1] > '~')
+		error ("panic: can't get unique name\n");
+	}
+    }
+}
+
+StartDeSpool ()
+{
+    switch (vfork ()) {
+	case 0:			/* child */
+	    execl (DeSpoolDaemon, DeSpoolDaemon, Device -> sd_dev, 0);
+	    fprintf (stderr, "%s: ", ProgName);
+	    perror ("can't exec despooler");
+	    _exit (0);
+	case -1:	    /* Leave file to be despooled later */
+	    fprintf (stderr, "%s: ", ProgName);
+	    perror ("can't fork");
+    }
+}
+
+cleanup () {
+    if (CFName)
+	(void) unlink (CFName);
+    if (DFName)
+	(void) unlink (DFName);
+    if (TFName)
+	(void) unlink (TFName);
+    exit (0);
+}
+
+X/* Copy the user's data file whose name is 'name' and is already opened as fd
+   'f'.  Basic task is to generate the control cards and make a link to the
+   data file (if possible) or copy the data file (if CopyFlag is set).  Care
+   is taken to make sure that the control file is secure.  NOTE:  the 200
+   character buffer size is the same as in the despooler.  If you change one,
+   change the other too!  Here we mercilessly truncate excessively long names
+   (more security hacking). */
+CopyFile (name, f)
+char *name;
+int f;
+{
+    char cnbuf[200], dnbuf[200], tnbuf[200], dirname[200];
+    int  islink = 0;
+    register FILE *cf;
+
+    /* Generate file names.  There are 7 Xs in each string below. */
+    (void) sprintf (dirname, SpoolDirectory, Device -> sd_namelist.nl_name);
+    (void) sprintf (cnbuf, "%s/C.XXXXXXX", dirname);
+    (void) sprintf (dnbuf, "%s/D.XXXXXXX", dirname);
+    (void) sprintf (tnbuf, "%s/T.XXXXXXX", dirname);
+    UniqueName (cnbuf);
+    UniqueName (dnbuf);
+    UniqueName (tnbuf);
+    CFName = cnbuf;
+    TFName = tnbuf;
+    DFName = dnbuf;
+    /* If possible, link to the named file, or as a second alternative put
+       the file name right into the control card */
+    if (!CopyFlag && name != (char *) 0)
+	if (link (name, DFName) == 0)
+	    islink++;
+    /* Build temporary command file */
+    if ((cf = fopen (TFName, "w")) == NULL) {
+	fprintf (stderr, "%s: can't create ", ProgName);
+	perror (TFName);
+	cleanup ();
+	/* NOTREACHED */
+    }
+    /* Make it rw-r--r--... very important!! */
+    if (chmod (TFName, 0644)) {
+	fprintf (stderr, "%s: can't chmod 0644 ", ProgName);
+	perror (TFName);
+	cleanup ();
+	/* NOTREACHED */
+    }
+    fprintf (cf, "u %d %d\n", UserID, GroupID);
+    fprintf (cf, "D %s\n", Device -> sd_namelist.nl_name);
+#ifdef	DEBUG
+    if (CopyFlag)
+	fprintf (cf, "# -c\n");
+    if (islink)
+	fprintf (cf, "# link\n");
+#endif	DEBUG
+    if (MailFlag)
+	fprintf (cf, "M\n");
+    fprintf (cf, "U %s\n", UserName);
+    if (Title)
+	fprintf (cf, "T %.*s\n", sizeof dnbuf, Title);
+    fprintf (cf, "< %s\n", DFName);
+    fprintf (cf, "X %.*s\n", sizeof dnbuf, PrintProgram);
+    fprintf (cf, "R %s\n", DFName);
+    if (ferror (cf)) {
+	fprintf (stderr, "%s: error making control file: ", ProgName);
+	perror ("");
+	cleanup ();
+	/* NOTREACHED */
+    }
+    (void) fclose (cf);
+    /* Copy data */
+    if (!islink) {
+#ifdef	VMUNIX
+	char buf[BUFSIZ * 10];
+#else	VMUNIX
+	char buf[BUFSIZ];
+#endif	VMUNIX
+	register int n, of;
+
+	of = creat (DFName, 0666);
+	if (of < 0) {
+	    fprintf (stderr, "%s: can't create ", ProgName);
+	    perror (DFName);
+	    cleanup ();
+	    /* NOTREACHED */
+	}
+	(void) chown (DFName, UserID, GroupID);
+	while ((n = read (f, buf, sizeof buf)) > 0) {
+	    if (write (of, buf, n) != n) {
+		fprintf (stderr, "%s: write error on ", ProgName);
+		perror (DFName);
+		cleanup ();
+		/* NOTREACHED */
+	    }
+	}
+	(void) close (of);
+	if (n < 0) {
+	    fprintf (stderr, "%s: read error on ", ProgName);
+	    perror (name ? name : "[stdin]");
+	    cleanup ();
+	    /* NOTREACHED */
+	}
+    }
+    /* Finally, move the temporary control file to a real control file */
+    if (link (TFName, CFName)) {
+	fprintf (stderr, "%s: can't link %s to ", ProgName, TFName);
+	perror (CFName);
+	cleanup ();
+	/* NOTREACHED */
+    }
+    (void) unlink (TFName);
+    StartDeSpool ();
+    CFName = 0, DFName = 0, TFName = 0;
+}
+
+X/* Look up a type name and convert to a program name */
+char *
+LookUpType (type)
+register char *type;
+{
+    register struct proglist *p;
+
+    if (type == (char *) 0) {
+	for (p = Device -> sd_proglist; p; p = p -> pr_next)
+	    if (p -> pr_shortname == (char *) 0)
+		return p -> pr_longname;
+	goto bad;
+    }
+    for (p = Device -> sd_proglist; p; p = p -> pr_next) {
+	if (p -> pr_shortname == (char *) 0)
+	    continue;
+	if (*p -> pr_shortname == *type)
+	    if (strcmp (p -> pr_shortname, type) == 0)
+		return p -> pr_longname;
+    }
+bad:
+    fprintf (stderr, "%s: generic ", ProgName);
+    if (type == (char *) 0)
+	fprintf (stderr, "default");
+    else
+	fprintf (stderr, "type %s ", type);
+    fprintf (stderr, "not defined for device %s\n",
+				Device -> sd_namelist.nl_name);
+    cleanup ();
+    /* NOTREACHED */
+}
+
+X/* Must be a function -- called from readdev.c */
+error (msg) char *msg; {
+    fprintf (stderr, "%s: %s", ProgName, msg);
+    cleanup ();
+    /* NOTREACHED */
+}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 spool.c
+	/bin/echo -n '	'; /bin/ls -ld spool.c
+fi
+/bin/echo 'Extracting despool.c'
+sed 's/^X//' <<'//go.sysin dd *' >despool.c
+#ifndef lint
+static char rcsid[] = "$Header: /usr/enee/chris/sys/spool/RCS/despool.c,v 1.5 84/04/22 03:32:55 chris Exp $";
+#endif
+
+/* Copyright (c) 1984 Chris Torek / University of Maryland */
+
+X/*
+ * $Header: /usr/enee/chris/sys/spool/RCS/despool.c,v 1.5 84/04/22 03:32:55 chris Exp $
+ *
+ * Despool the spooled files in a spool directory
+ *
+ * Usage: despool [ device-name ]
+ *
+ * $Log:	despool.c,v $
+ * Revision 1.5  84/04/22  03:32:55  chris
+ * Security hacking; new 'R' control card for removing D. files
+ * 
+ * Revision 1.4  84/01/24  21:17:33  chris
+ * Rewrote large portions of DeSpool; opening the device is now delayed
+ * until after a control file is found.  Locking might be fixed (I hope).
+ * 
+ * Revision 1.3  83/12/10  02:45:31  chris
+ * Versatec hacking:  checks for EIO after failed open; if so,
+ * prints "offline: device <dev>" and sleeps for 60 seconds, then
+ * tries again.
+ * 
+ * Revision 1.2  83/12/10  01:12:25  chris
+ * Fixed geteuid call
+ * 
+ * Revision 1.1  83/12/10  01:03:01  chris
+ * Initial revision
+ * 
+ */
+
+#include <stdio.h>
+#include <errno.h>
+#include <sys/param.h>		/* for NOFILE */
+#include <4.2/dir.h>		/* 4.2 dir library */
+#include "spool.h"
+
+int	IsLocked;		/* True => we have locked spool dir */
+char	*ProgName;		/* Program name, for errors */
+char	*ErrDev;		/* Device name, for errors */
+
+long	lseek ();
+char	*strcpy (),
+	*sprintf ();
+
+#define	warn(msg)	err (0, msg)
+
+X/* Need an external name called "error" for readdev.c */
+error (msg)
+char *msg;
+{
+    err (1, msg);
+}
+
+err (doexit, msg)
+int doexit;
+char *msg;
+{
+    register FILE *console;
+
+    fputs (msg, stderr);
+    if (ErrDev)
+	fprintf (stderr, "\tdevice %s\n", ErrDev);
+    if (console = fopen ("/dev/console", "w")) {
+	fputs (msg, console);
+	if (ErrDev)
+	    fprintf (console, "\tdevice %s\n", ErrDev);
+	(void) fclose (console);
+    }
+    if (doexit) {
+	if (IsLocked)
+	    UnLock ();
+	exit (1);
+	/* NOTREACHED */
+    }
+}
+
+X/* If we are invoked with arguments, despool each argument directory (fork
+   off all but the last one).  Otherwise despool all devices (again fork off
+   all but the last). */
+
+main (argc, argv)
+int argc;
+char **argv;
+{
+    register struct SpoolDevice *sd;
+
+    argc--;
+    ProgName = *argv++;
+#ifndef	DEBUG
+    if (geteuid ())
+	error ("panic: not setuid\n");
+#endif	DEBUG
+
+    umask (022);
+    GetDevices ();
+
+    if (argc) {
+	while (--argc >= 0) {
+	    if (argc > 0 && fork () > 0) {
+		if ((sd = FindDevice (*argv++)) == 0)
+		    error ("invalid device name\n");
+		DeSpool (sd);
+		exit (0);
+	    }
+	    else {
+		if ((sd = FindDevice (*argv++)) == 0)
+		    error ("invalid device name\n");
+		DeSpool (sd);
+		ErrDev = 0;
+	    }
+	}
+	exit (0);
+    }
+
+    for (sd = DevList; sd; sd = sd -> sd_next) {
+    	if (sd -> sd_next && fork () > 0)
+	    DeSpool (sd), exit (0);
+	else
+	    DeSpool (sd);
+    }
+    exit (0);
+}
+
+X/* 9 is strlen("C.aa12345") */
+#define	IsCFile(p) (p->d_namlen==9 && p->d_name[0]=='C' && p->d_name[1]=='.')
+
+X/* Scan the directory looking for C. files.  If we find one, try to lock this
+   device.  If someone else has it locked, then we're done; just return.
+   Otherwise, try to open the device.  If this fails, unlock and return.
+   At this point we have the device on stdout and a control file.  Run the
+   control file and continue.  After the directory is finished, unlock the
+   device, and if we ran any control files, start the whole thing all over
+   again in case more stuff got spooled. */
+
+DeSpool (dev)
+register struct SpoolDevice *dev;
+{
+    register DIR   *dirf;
+    register struct direct *dp;
+    char     dirname[200],	/* hardcoded pathname lengths again *sigh* */
+	     msg[100];
+    int      IsOpen;
+    extern   errno;
+
+    IsOpen = 0;			/* dev not connected to stdout yet */
+    (void) sprintf (dirname, SpoolDirectory, dev -> sd_namelist.nl_name);
+    if (chdir (dirname)) {
+	(void) sprintf (msg, "panic: can't chdir to %s\n", dirname);
+	error (msg);
+    }
+    if ((dirf = opendir (".")) == NULL)
+	error ("panic: can't open \".\"\n");
+rescan:
+    while (dp = readdir (dirf)) {
+	if (!IsCFile (dp))
+	    continue;
+	if (!IsLocked) {
+	    if (Lock ())
+		break;		/* someone else is doing this dir */
+	}
+	if (!IsOpen) {
+	    int fd;
+	    ErrDev = dev -> sd_namelist.nl_name;
+	    fd = DevOpen (dev -> sd_dev);
+	    if (fd != 1) {
+		(void) sprintf (msg, "panic: got fd %d (should be 1)\n", fd);
+		error (msg);
+	    }
+	    IsOpen++;
+	}
+	DoFile (dp -> d_name, dev);
+#ifdef	DEBUG
+	strcpy (msg, dp -> d_name);
+	*msg = 'B';
+	(void) link (dp -> d_name, msg);
+#endif	DEBUG
+	(void) unlink (dp -> d_name);
+    }
+    closedir (dirf);
+    if (IsLocked) {		/* Then we did at least one C. file */
+	UnLock ();
+	if (dirf = opendir ("."))
+	    goto rescan;
+    }
+}
+
+X/* Open the named device; try hard to make it stdout (fd 1) */
+DevOpen (name)
+char *name;
+{
+    int fd;
+    static unsigned int sleepy;
+
+    /* In order to get stdout we must have stdin tied somewhere, so we
+       open /dev/null and close it only if it's not stdout. */
+    fd = open ("/dev/null", 0);	/* ensure fd 0 used */
+    (void) close (1);		/* get rid of stdout */
+    if (fd > 1)			/* don't need it & didn't just close it */
+	(void) close (fd);
+
+    /* The EIO (''Old MacDonald Had A Farm, E I E I O...'') stuff is a
+       Versatec hack.  The versatec gives back EIO if offline, ENXIO for
+       already open. */
+    sleepy = 60;
+reopen:
+    fd = open (name, 1);	/* BOGUS!  Should be per-dev! */
+    if (fd < 0 && (errno == EIO || errno == ENXIO)) {
+	warn (errno == EIO ? "offline:" : "busy:");
+	(void) sleep (sleepy);	/* Wait for someone to fix. */
+	sleepy += 30;		/* Gradually slow down too, */
+	if (sleepy >= 600)	/* but not more than 10 minutes apart */
+	    sleepy = 600;	/* so that we don't doze off. */
+	goto reopen;
+    }
+    if (fd < 0) {
+	char msg[100];
+	(void) sprintf (msg, "can't open %s\n", name);
+	error (msg);
+    }
+    return fd;
+}
+
+X/* For now, we lock using links.  When 4.2 rolls around we'll use the
+   fancy file locking stuff. */
+Lock () {
+    register int n;
+    char lname[10];
+
+    (void) sprintf (lname, "l.%d", getpid ());
+    (void) unlink (lname);
+    if ((n = creat (lname, 0)) < 0) {
+	warn ("can't create lock temp\n");
+	return 1;
+    }
+    (void) close (n);
+    if ((n = link (lname, "lock")) == 0)
+	IsLocked++;
+    (void) unlink (lname);
+    return n;
+}
+
+UnLock () {
+    if (unlink ("lock"))
+	warn ("can't unlink lock\n");
+    IsLocked = 0;
+}
+
+X/* Perform all work indicated by the C. file.  NOTE:  the size of 'buf'
+   matches the size restrictions enforced by the spooler, to ensure that
+   long names don't overrun important variables and wreak havoc (after
+   all, we *are* setuid...). */
+DoFile (file, dev)
+char *file;
+struct SpoolDevice *dev;
+{
+    register FILE  *f;
+    register char  *cp;
+    register int    c;
+    int     uid,
+            gid,
+            mailflag,
+            in_fd,
+	    DidHeader;
+    char    user[50],
+            title[200],
+            buf[200],
+            msg[300];
+
+    if ((f = fopen (file, "r")) == NULL) {
+	(void) sprintf (msg, "can't open control file %s\n", file);
+	warn (msg);
+	return;
+    }
+    uid = -1;			/* none yet */
+    gid = -1;
+    mailflag = 0;
+    user[0] = 0;
+    title[0] = 0;
+    in_fd = -1;
+    DidHeader = 0;
+    while (fgets (buf, sizeof buf, f)) {
+	cp = buf + strlen (buf);
+	if (cp > buf && *--cp == '\n')
+	    *cp = 0;
+	cp = buf;
+	c = *cp++;
+	if (*cp == ' ')
+	    cp++;
+	switch (c) {
+	case '#':
+	case 'D':
+	case 0:
+	    break;
+	case 'u':
+	    if (sscanf (cp, "%d %d", &uid, &gid) != 2) {
+		(void) sprintf (msg, "bad format control file [u card] %s\n",
+			file);
+		warn (msg);
+		uid = gid = -1;
+	    }
+	    break;
+	case 'M':
+	    mailflag++;
+	    break;
+	case 'U':
+	    strcpy (user, cp);
+	    break;
+	case 'T':
+	    strcpy (title, cp);
+	    break;
+	case '<':		/* input file */
+	    if (in_fd >= 0)
+		(void) close (in_fd);
+	    if ((in_fd = open (cp, 0)) < 0) {
+		(void) sprintf (msg, "(%s) can't open %s\n", file, cp);
+		warn (msg);
+	    }
+	    break;
+	case 'X':		/* execute program */
+	    if (uid < 0 || gid < 0 || *user == 0) {
+		(void) sprintf (msg, "bad format control file %s\n", file);
+		warn (msg);
+		break;
+	    }
+	    if (in_fd < 0)
+		break;
+	    if (DidHeader == 0 && dev -> sd_header) {
+		DidHeader++;
+		ForkExec (uid, gid, fileno (f), dev -> sd_header);
+	    }
+	    ForkExec (uid, gid, in_fd, cp);
+	    break;
+	case 'R':		/* remove file */
+	    if (unlink (cp)) {
+		(void) sprintf (msg, "can't remove file \"%s\"\n", cp);
+		warn (msg);
+	    }
+	    break;
+	default: 
+	    cp = buf;
+	    if (c & 0200) {
+		c &= 0177;
+		*cp++ = 'M', *cp++ = '-';
+	    }
+	    if (c == 0177)
+		*cp++ = '^', *cp++ = '?';
+	    else if (c < ' ')
+		*cp++ = '^', *cp++ = c + '@';
+	    else
+		*cp++ = c;
+	    *cp = 0;
+	    (void) sprintf (msg, "odd character (%s) in %s\n", buf, file);
+	    warn (msg);
+	    break;
+	}
+    }
+    if (in_fd > 0)
+	(void) close (in_fd);
+#ifdef lint
+    in_fd = mailflag;		/* ...for now */
+#endif
+}
+
+X/* Execute "prog" as user (uid, gid).  If fd is nonzero move it to fd 0. */
+ForkExec (uid, gid, fd, prog)
+int uid, gid, fd;
+char *prog;
+{
+    register int    pid,
+                    w;
+    int     status;
+
+#ifdef	DEBUG
+    fprintf (stderr, "about to exec \"%s\"\n", prog);
+    fprintf (stderr, "uid = %d gid = %d fd = %d\n", uid, gid, fd);
+#endif	DEBUG
+    for (w = 0; w < 10 && (pid = fork ()) < 0; )
+	sleep ((unsigned) ++w);
+    if (pid < 0) {
+	warn ("can't fork\n");
+	return;
+    }
+    if (pid) {			/* parent */
+	while ((w = wait (&status)) != pid && w != -1)
+	    ;
+	return;
+    }
+    /* child */
+    (void) setgid (gid);
+    (void) setuid (uid);
+    if (fd) {
+	dup2 (fd, 0);
+	(void) close (fd);
+    }
+    (void) lseek (0, 0L, 0);	/* rewind stdin */
+    for (w = 3; w < NOFILE; w++)
+	(void) close (w);
+    execl ("/bin/sh", "sh", "-c", prog, 0);
+    error ("can't execl /bin/sh ?!\n");
+    /* NOTREACHED */
+}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 despool.c
+	/bin/echo -n '	'; /bin/ls -ld despool.c
+fi
+/bin/echo 'Extracting header.c'
+sed 's/^X//' <<'//go.sysin dd *' >header.c
+#ifndef lint
+static char rcsid[] = "$Header: /usr/enee/chris/sys/spool/RCS/header.c,v 1.2 84/01/24 21:16:26 chris Exp $";
+#endif
+
+/* Copyright (c) 1984 Chris Torek / University of Maryland */
+
+X/*
+ * $Header: /usr/enee/chris/sys/spool/RCS/header.c,v 1.2 84/01/24 21:16:26 chris Exp $
+ *
+ * Generate a printout header
+ *
+ * Usage: header (stdin from control file, stdout to output device)
+ *
+ * $Log:	header.c,v $
+ * Revision 1.2  84/01/24  21:16:26  chris
+ * Added ARGSUSED comment to main() to keep lint quieter.
+ * 
+ * Revision 1.1  83/12/10  01:03:36  chris
+ * Initial revision
+ * 
+ */
+
+#include <stdio.h>
+#include "spool.h"
+#include <sys/types.h>
+
+char *ProgName;
+char  user[BUFSIZ],
+      title[BUFSIZ];
+struct SpoolDevice *sd;
+int   devline;
+
+extern char chrtab[][16];
+
+time_t  time ();
+char   *ctime (),
+       *strcpy ();
+
+X/* ARGSUSED */
+main (argc, argv) char **argv; {
+    register char  *cp;
+    time_t tm;
+    char    buf[BUFSIZ];
+
+    ProgName = *argv;
+    GetDevices ();
+    while (fgets (buf, sizeof buf, stdin)) {
+	cp = &buf[strlen (buf)];
+	if (*--cp == '\n')
+	    *cp = 0;
+	switch (*buf) {
+	    case 'D': 
+		if (sd)
+		    error ("bad format control file\n");
+		cp = buf + 1;
+		while (*cp == ' ')
+		    cp++;
+		sd = FindDevice (cp);
+		if (sd == 0)
+		    error ("invalid device in control file\n");
+		break;
+	    case 'U': 
+		cp = buf + 1;
+		while (*cp == ' ')
+		    cp++;
+		strcpy (user, cp);
+		break;
+	    case 'T': 
+		cp = buf + 1;
+		while (*cp == ' ')
+		    cp++;
+		strcpy (title, cp);
+	}
+    }
+    if (sd == 0)
+	error ("no device in control file\n");
+    if (*user == 0)
+	error ("missing user name\n");
+    SkipTo (sd -> sd_pagelen / 2 - 16);
+    GenTitle (user);
+    SkipTo (sd -> sd_pagelen / 2);
+    Column (sd -> sd_linelen / 2 - 13);
+    (void) time (&tm);
+    printf ("%.25s\n", ctime (&tm));
+    devline++;
+    SkipTo (sd -> sd_pagelen / 2 + 2);
+    if (*title)
+	GenTitle (title);
+    if (sd -> sd_ff)
+	fputs (sd -> sd_ff, stdout);
+    else {
+	if (devline > sd -> sd_pagelen)
+	    devline %= sd -> sd_pagelen;
+	SkipTo (sd -> sd_pagelen);
+    }
+    exit (0);
+}
+
+error (s)
+char *s;
+{
+    fprintf (stderr, "%s: %s", ProgName, s);
+    exit (1);
+}
+
+SkipTo (row) {
+    if (row <= devline || row > sd -> sd_pagelen)
+	return;
+    while (devline < row) {
+	putchar ('\n');
+	devline++;
+    }
+}
+
+Column (n) register n; {
+    if (n < 1 || n >= sd -> sd_linelen - 13)
+	return;
+    while (--n >= 0)
+	putchar (' ');
+}
+
+GenTitle (str)
+char *str;
+{
+    register int    c,
+		    i,
+		    j,
+		    t;
+    register char  *s,
+		   *p;
+    int		len,
+		nblank;
+    char       *pend;
+    static char buf[BUFSIZ];
+
+    *buf = 'x';
+    len = strlen (str);
+    if (sd -> sd_linelen) {
+	nblank = (sd -> sd_linelen - 8 * len) / 2;
+	pend = &buf[sd -> sd_linelen - 7];
+    }
+    else
+	nblank = 0, pend = &buf[sizeof buf];
+    for (i = 0; i < 16; i++) {
+	s = str;
+	p = &buf[1];
+	t = nblank;
+	while (--t >= 0)
+	    *p++ = ' ';
+	while (c = *s++ & 0177) {
+	    if (p >= pend)
+		break;
+	    t = c < ' ' || c >= 0177 ? 0 : chrtab[c - ' '][i];
+	    j = 8;
+	    while (--j >= 0) {
+		*p++ = t & 128 ? c : ' ';
+		t <<= 1;
+	    }
+	}
+	while (*--p == ' ')
+	    ;
+	p++;
+	*p++ = '\n';
+	*p = 0;
+	fputs (&buf[1], stdout);
+	devline++;
+    }
+}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 header.c
+	/bin/echo -n '	'; /bin/ls -ld header.c
+fi
+/bin/echo 'Extracting readdev.c'
+sed 's/^X//' <<'//go.sysin dd *' >readdev.c
+#include <stdio.h>
+#include "spool.h"
+
+/* Copyright (c) 1984 Chris Torek / University of Maryland */
+
+X/*
+ * $Header: /usr/enee/chris/sys/spool/RCS/readdev.c,v 1.2 83/12/10 02:36:48 chris Exp $
+ *
+ * Routines for reading /etc/spool_devices and looking up device names
+ *
+ * $Log:	readdev.c,v $
+ * Revision 1.2  83/12/10  02:36:48  chris
+ * Fixed \ decoding
+ * 
+ * Revision 1.1  83/12/10  01:03:44  chris
+ * Initial revision
+ * 
+ */
+
+char *malloc (),
+     *strcpy ();
+
+char *
+strsave (s) char *s; {
+    register int len;
+    static char *pool;
+    static int   size;
+
+    len = strlen (s) + 1;
+    if (size < len) {		/* sigh, potentially wasting space here */
+	size = len > BUFSIZ/2 ? len + BUFSIZ : BUFSIZ;
+	pool = malloc ((unsigned) size);
+	if (pool == 0)
+	    error ("out of memory\n");
+    }
+    strcpy (pool, s);
+    size -= len;
+    pool += len;
+    return pool - len;
+}
+
+X/* classify string s according to list l */
+X/* (i.e., l[class(s)-1] matches s) */
+static
+class (s, l)
+register char *s;
+char **l;
+{
+    register char *p, **lp = l;
+
+    while (p = *lp++) {
+	if (*p == *s && strcmp (p, s) == 0)
+	    return lp - l;
+    }
+    return 0;
+}
+
+X/* Make an arg vector, interpreting ' " and \ along the way */
+static
+MakeArgV (s, v, b)
+register char	*s,		/* source */
+		**v,		/* vector base */
+		*b;		/* canon buf */
+{
+    register quote = 0;
+
+    while (*s) {
+	while (*s == ' ' || *s == '\t')
+	    s++;
+	if (*s == 0)
+	    break;
+	*v++ = b;
+	while (*s) {
+	    if (*s == quote) {	/* out of quotes */
+		quote = 0;
+		s++;
+		continue;
+	    }
+	    if (quote == 0 && (*s == '\'' || *s == '"')) {
+		quote = *s++;	/* into quotes */
+		continue;
+	    }
+	    if (*s == '\\') {	/* \ escapes */
+		if (*++s == 0)
+		    break;
+		switch (*s) {
+		case '0': case '1': case '2': case '3':
+		case '4': case '5': case '6': case '7':
+		    *b = *s++ - '0';
+		    if (*s >= '0' && *s <= '7') {
+			*b <<= 3, *b += *s++ - '0';
+			if (*s >= '0' && *s <= '7')
+			    *b <<= 3, *b += *s++ - '0';
+		    }
+		    b++;
+		    break;
+		case 'r':
+		    *b++ = '\r';
+		    break;
+		case 'n':
+		    *b++ = '\n';
+		    break;
+		case 'f':
+		    *b++ = '\014';
+		    break;
+		case 't':
+		    *b++ = '\t';
+		    break;
+		case 'b':
+		    *b++ = '\b';
+		    break;
+		default:
+		    *b++ = *s++;
+		    break;
+		}
+		continue;
+	    }
+	    if (quote || (*s != ' ' && *s != '\t'))
+		*b++ = *s++;	/* keep adding it on... */
+	    else {
+		*b++ = 0;	/* end of this arg */
+		break;
+	    }
+	}
+    }
+    *b = 0;
+    *v = 0;			/* end of argv list */
+}
+
+X/*
+ * Read the DevFile
+ */
+
+GetDevices () {
+    register struct SpoolDevice *s;
+    register char  *cp,
+		  **vp;
+    static char     line[BUFSIZ],
+		   *vec[BUFSIZ],
+		    canonbuf[BUFSIZ];
+    register FILE  *sf;
+    int		    c;
+
+ /* Types for "class" to pick out: device=1, exec=2, ... */
+    static char *ty[] = {
+	"device", "exec", "restricted", "pagelen",
+	"linelen", "header", "formfeed", 0
+    };
+
+    s = 0;
+    if ((sf = fopen (DevFile, "r")) == NULL)
+	error ("panic: open devfile\n");
+    for (;;) {
+	(void) fgets (line, sizeof line, sf);
+	if (ferror (sf))
+	    error ("panic: devfile read\n");
+	if (feof (sf))
+	    break;
+	cp = line + strlen (line);
+	if (cp > line && *--cp == '\n')
+	    *cp = 0;
+	cp = line;
+	while (*cp == ' ' || *cp == '\t')
+	    cp++;
+	if (*cp == '#' || *cp == 0)
+	    continue;
+	MakeArgV (cp, vec, canonbuf);
+	vp = vec;		/* for fast access... */
+	c = class (*vec, ty);
+	if (c != 1 && s == 0)
+	    error ("panic: devfile bad format\n");
+	switch (c) {
+	case 0: 		/* not in ty[] */
+	    continue;
+	case 1: 		/* device */
+	    if (vp[1] == (char *) 0 || vp[2] == (char *) 0)
+		error ("panic: device name\n");
+	    s = (struct SpoolDevice *) malloc (sizeof (*s));
+	    if (s == 0)
+		error ("out of memory\n");
+	    s -> sd_dev = strsave (vp[1]);
+	    s -> sd_namelist.nl_name = strsave (vp[2]);
+	    s -> sd_namelist.nl_next = 0;
+	    s -> sd_proglist = 0;
+	    s -> sd_linelen = 0;
+	    s -> sd_pagelen = 0;
+	    s -> sd_header = 0;
+	    s -> sd_ff = 0;
+	    s -> sd_next = DevList;
+	    DevList = s;
+	    for (vp = &vec[3]; *vp; vp++) {
+		register struct namelist *n;
+
+		n = (struct namelist *) malloc (sizeof *n);
+		if (n == 0)
+		    error ("out of memory\n");
+		n -> nl_name = strsave (*vp);
+		n -> nl_next = s -> sd_namelist.nl_next;
+		s -> sd_namelist.nl_next = n;
+	    }
+	    break;
+	case 2: 		/* exec */
+	    if (vp[1] == 0)
+		error ("panic: exec name\n");
+	    {
+		register struct proglist *p;
+		register char  *lp;
+
+		p = (struct proglist *) malloc (sizeof *p);
+		if (p == 0)
+		    error ("out of memory\n");
+		if (vp[2]) {
+		    p -> pr_shortname = strsave (vp[1]);
+		    vp = &vec[2];
+		    lp = line;
+		    while (cp = *vp++) {
+			while (*lp++ = *cp++)
+			    ;
+			lp[-1] = ' ';
+		    }
+		    *--lp = 0;	/* ASSUMES AT LEAST ONE *vp NONEMPTY */
+		    if ((p -> pr_longname = strsave (line)) == 0)
+			error ("out of memory\n");
+		}
+		else {
+		    p -> pr_shortname = 0;
+		    p -> pr_longname = strsave (vp[1]);
+		}
+		p -> pr_next = s -> sd_proglist;
+		s -> sd_proglist = p;
+	    }
+	    break;
+	case 3: 		/* restricted */
+	    s -> sd_restricted++;
+	    break;
+	case 4: 		/* pagelen */
+	    if (vp[1] == 0)
+		error ("panic: bad pagelen\n");
+	    s -> sd_pagelen = atoi (vp[1]);
+	    break;
+	case 5: 		/* linelen */
+	    if (vp[1] == 0)
+		error ("panic: bad linelen\n");
+	    s -> sd_linelen = atoi (vp[1]);
+	    break;
+	case 6: 		/* header */
+	    if (vp[1])
+		s -> sd_header = strsave (vp[1]);
+	    break;
+	case 7: 		/* formfeed */
+	    if (vp[1])
+		s -> sd_ff = strsave (vp[1]);
+	    else
+		s -> sd_ff = "\014";/* control-L */
+	    break;
+	default: 
+	    error ("panic: bad case in switch\n");
+	    break;
+	}
+    }
+    (void) fclose (sf);
+}
+
+X/* Given a name, return the device for it, or 0 for no such device.  Any of
+   the aliases are legal, and so is the physical device (why not?). */
+struct SpoolDevice *
+FindDevice (name)
+register char *name;
+{
+    register struct SpoolDevice *s;
+    register struct namelist *n;
+
+    for (s = DevList; s; s = s -> sd_next) {
+	if (*s -> sd_dev == *name && strcmp (s -> sd_dev, name) == 0)
+	    return s;
+	n = &s -> sd_namelist;
+	while (n) {
+	    if (*n -> nl_name == *name && strcmp (n -> nl_name, name) == 0)
+		return s;
+	    n = n -> nl_next;
+	}
+    }
+    return 0;
+}
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 readdev.c
+	/bin/echo -n '	'; /bin/ls -ld readdev.c
+fi
+/bin/echo 'Extracting spool.h'
+sed 's/^X//' <<'//go.sysin dd *' >spool.h
+/* Copyright (c) 1984 Chris Torek / University of Maryland */
+
+X/*
+ * $Header: /usr/enee/chris/sys/spool/RCS/spool.h,v 1.1 83/12/10 01:06:09 chris Exp $
+ *
+ * Definitions for spooler
+ *
+ * $Log:	spool.h,v $
+ * Revision 1.1  83/12/10  01:06:09  chris
+ * Initial revision
+ * 
+ */
+
+#define	DeSpoolDaemon	"/usr/lib/despool"	/* Name of despooler daemon.
+						   It is run with the device
+						   name as an argument. */
+#define	DevFile		"/etc/spool_devices"	/* File which describes the
+						   available devices */
+#define	SpoolDirectory	"/usr/spool/%s"		/* Used with printf to make
+						   directory name for a given
+						   device */
+
+X/* The format for DevFile is a set of lines beginning with one of "device" or
+   "exec".  "Device" specifies a list of device names; the first of these is
+   the spool device, the second is the official name, and the remainder are
+   aliases.  The official name is used to generate the spool directory name.
+   The device name is passed to the despooler to be used as the standard
+   output of the programs executed.  "Exec" specifies a program to execute,
+   or the user may explicitly name a program.  (Security is assured by having
+   the daemon carefully run all files as the spooling user, and all control
+   files owned by root.  This will not work across machines, but....) */
+
+X/* This contains the in-core version of the stuff in DevFile */
+struct SpoolDevice {
+	char	*sd_dev;	/* "/dev/foo" */
+	struct namelist {
+		char		*nl_name;
+		struct namelist	*nl_next;
+	} sd_namelist;		/* official name, and aliases */
+	struct proglist {
+		char		*pr_shortname;
+		char		*pr_longname;
+		struct proglist	*pr_next;
+	} *sd_proglist;		/* List of -<xyz> programs */
+	int	sd_restricted;	/* True => disallow -p */
+	int	sd_pagelen;	/* page length (lines) */
+	int	sd_linelen;	/* line length (chars) */
+	char	*sd_ff;		/* form feed sequence (if any) */
+	char	*sd_header;	/* header-printer program */
+	struct SpoolDevice *sd_next;
+} *DevList;
+
+struct SpoolDevice *FindDevice ();
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 spool.h
+	/bin/echo -n '	'; /bin/ls -ld spool.h
+fi
+/bin/echo 'Extracting spool.1l'
+sed 's/^X//' <<'//go.sysin dd *' >spool.1l
+X.TH SPOOL 1L
+X.SH NAME
+spool \- printer spooler
+X.SH SYNOPSIS
+X.B "spool -d"
+device
+[
+X.B \-c
+] [
+X.B \-m
+] [
+X.B \-p
+prog ] [
+X.B \-t
+title ]
+[ name ... ]
+X.SH DESCRIPTION
+X.I Spool
+queues the named files for printing on the specified
+X.IR device .
+If no files are named, the standard input is read.
+X.PP
+The
+X.B \-c
+option forces
+X.I spool
+to make a copy of the named files, rather than using links.  This
+may be useful when the file is a temporary file that gets rewritten
+immedately after the call to
+X.IR spool .
+The option
+X.B \-m
+causes notification via
+X.IR mail (1)
+to be sent when the job completes.  The
+X.B \-t
+option allows a title specification for the header page.
+X.PP
+X.I Spool
+looks up the device in /etc/spool_devices to see how to print things.
+It also handles special arguments.
+For example, on the Versatec\(rg  we recognize
+X.B \-rtroff
+as rotated troff output to be printed via /usr/lib/rvcat.  Other
+programs may be specified with the
+X.B \-p
+option.
+X.SH FILES
+X/usr/spool/\fIdevice\fR/C.*
+X.SH AUTHOR
+Chris Torek
+X.SH SEE\ ALSO
+spool(5L), despool(8L), std_header(8L)
+X.SH BUGS
+The
+X.B \-m
+option isn't implemented yet.
+X.sp
+There is no easy way to remove a queue entry or look at the queue yet.
+X.sp
+Jobs are printed in directory order.  They ought to be printed in
+queueing order.
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 spool.1l
+	/bin/echo -n '	'; /bin/ls -ld spool.1l
+fi
+/bin/echo 'Extracting spool.5l'
+sed 's/^X//' <<'//go.sysin dd *' >spool.5l
+X.TH SPOOL 5L
+X.DA "10 Dec 83"
+X.SH NAME
+spool \- spooler device description file
+X.SH DESCRIPTION
+The spooler device description file /etc/spool_devices controls
+the operation of the spooler /usr/bin/spool and its associated
+programs.  This file is read one line at a time.  A new device
+is introduced with the
+X.B device
+keyword.  All other keywords refer to the most recent device named.
+The file may also contain comments and blank lines.  A comment is
+denoted by making the first nonblank character a pound sign (#).
+X.PP
+Each line is divided into an argument vector for processing.  Quoting
+conventions are similar to those of the Bourne shell (sh), except that
+there are no shell variables and backquotes do nothing.
+X.SH KEYWORDS
+X.PP
+The following keywords are currently recognized.
+X.TP 
+\fBdevice\fP \fIdevname name alias1 alias2 ...\fP
+Introduces a device name.  The first argument
+(\fIdevname\fP) should be the name of
+the device itself (as in /dev/lp or /dev/vp0); this is opened by the
+despooler before executing anything else.  The second argument
+(\fIname\fP) is the ``official'' name of the device.  It is used
+to generate the spool directory
+name (usually \fB/usr/spool/\fP\fIname\fP).  The remaining arguments,
+if any, are aliases for the official name, which any of the spooling
+programs will recognize.  (The device name \fIdevname\fP is also legal.)
+X.TP
+\fBpagelen\fP \fIn\fP
+Sets the page length to
+X.IR n .
+The standard header program uses this to center the header in the page.
+X.TP
+\fBlinelen\fP \fIn\fP
+Sets the line length to
+X.IR n .
+The standard header program uses this to center each line of the header.
+X.TP
+\fBformfeed\fP [ \fIstring\fP ]
+Sets the formfeed character to
+X.I string
+(if specified) or control-L (if no argument is given).  If the device
+is incapable of doing formfeeds, this should be left unspecified.
+Don't forget to quote the string if it contains spaces.
+X.TP
+X.B restricted
+The
+X.B restricted
+keyword prevents people from running any program they want on the
+output device at despooling time.  This is useful for systems doing
+accounting, to keep users from bypassing the accounting system.  If you
+aren't doing accounting and want to avoid using up large amounts of
+disk space for spooling raster graphics and such, then you can leave
+the device unrestricted so that users don't have to pre-expand their
+output.  If the device is restricted, the only commands that may be run
+are those listed in the device description file.
+X.TP
+\fBheader\fP \fIprog\fP
+Specifies a header program to be executed before despooling files.
+Typically this will call /usr/lib/std_header to print the spool
+file owner's name and the date, and the optional title, but may be
+left out or changed to another program if desired.  The program is
+invoked with stdin connected to the spool control file and stdout
+to the output device.
+X.TP
+\fBexec\fP \fIkey prog\fP ; \fBexec\fP \fIprog\fP
+For restricted devices, this lists the only programs that may be
+used for device output.  For unrestricted devices, this provides a
+shorthand for often-used programs.
+The first format tells the spooler that when the
+X.I key
+option is given, it should place an execution request for the
+specified
+X.IR prog ram.
+The second format gives the spooler a default program in case none
+is specified.  The
+X.I prog
+argument is passed to the Bourne shell for execution so you may need
+to quote things twice.  As a free bonus the first format concatenates
+any additional arguments to the end of the program name, separated by
+blanks, to make things easier.
+X.SH AUTHOR
+Chris Torek
+X.SH SEE ALSO
+spool(1L), spool(5L), despool(8L), std_header(8L)
+X.SH BUGS
+The only way to pass user-defined arguments to a predefined despooling
+program is to put them into the spooled file itself.  There ought to
+be a more flexible method.
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 spool.5l
+	/bin/echo -n '	'; /bin/ls -ld spool.5l
+fi
+/bin/echo 'Extracting spool_devices'
+sed 's/^X//' <<'//go.sysin dd *' >spool_devices
+# This is an example /etc/spool_devices file
+
+# Entry for the versatec, taken from a real live working description
+# file.  We will use the standard header, make it unrestricted, and
+# give a 66-line 132-col size.  /usr/lib/std_header writes a header
+# naming the user, date, time, and title.
+
+# This is the only actual entry in use here at eneevax.
+
+device /dev/vp0 versatec vp vp0 va va0 varian vers
+pagelen 66
+linelen 132
+formfeed
+header /usr/lib/std_header
+# old troff
+exec troff /usr/lib/vcat -t
+# rotated troff
+exec rtroff /usr/lib/rvcat -t
+# new troff, rotated, couple of bug fixes, new vtroff shell script
+exec ntroff /usr/lib/nrvcat
+# plot
+exec plot /usr/lib/vpplot
+# rotated plot
+exec rplot /usr/lib/rvpplot
+# another name for the same
+exec vpplot /usr/lib/vpplot
+exec rvpplot /usr/lib/rvpplot
+# CIFPLOT stuff
+exec vdmp /usr/lib/vdmp
+# default to /usr/ucb/expand, plus pagefeed, if nothing else
+exec "/usr/ucb/expand; /bin/echo \014"
+
+# line printer
+# can do formfeeds
+device /dev/lp printer lp lp0 lineprinter
+pagelen 66
+linelen 80
+unrestricted
+formfeed
+header /usr/lib/std_header
+exec pr /bin/pr
+exec /bin/cat
+
+# Imagen
+# we don't really have one, but this illustrates some other stuff
+# no header
+# we'll just suppose that it can't do formfeeds (even though I think it can)
+device /dev/imagen imagen imprint imprint-10 laser
+restricted
+exec foo "bar baz \"xyzzy plugh\""
+exec /usr/lib/imagen_stuff
+//go.sysin dd *
+made=TRUE
+if [ $made = TRUE ]; then
+	/bin/chmod 644 spool_devices
+	/bin/echo -n '	'; /bin/ls -ld spool_devices
+fi
+-- 
+In-Real-Life: Chris Torek, Univ of MD Comp Sci (301) 454-7690
+UUCP:	{seismo,allegra,brl-bmd}!umcp-cs!chris
+CSNet:	chris@umcp-cs		ARPA:	chris@maryland

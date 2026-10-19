@@ -1,0 +1,575 @@
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Posting-Version: version B 2.10.1 6/24/83 (MC840302); site mcvax.UUCP
+Path: utzoo!linus!decvax!bellcore!petrus!scherzo!allegra!mit-eddie!think!harvard!seismo!mcvax!piet
+From: piet@mcvax.UUCP (Piet Beertema)
+Newsgroups: net.sources,net.bugs.uucp
+Subject: new version of uucp f-proto
+Message-ID: <834@mcvax.UUCP>
+Date: Tue, 8-Oct-85 06:48:39 EDT
+Article-I.D.: mcvax.834
+Posted: Tue Oct  8 06:48:39 1985
+Date-Received: Fri, 11-Oct-85 07:45:20 EDT
+Reply-To: piet@mcvax.UUCP (Piet Beertema)
+Organization: CWI, Amsterdam
+Lines: 559
+Xref: linus net.sources:3239 net.bugs.uucp:570
+
+<>
+
+Here's a new version of the f-proto for uucp. Compared to the one I posted
+quite some time ago the major differences are:
+- it has been adapted to run cost-effective on X.25 hosts; the old version
+  produced too many short packets on such hosts;
+- a few minor bugs have been fixed (hence the posting to net.bugs.uucp too).
+If you're already running 4.3bsd uucp, you can replace the fio.c by this one
+without modifications.
+
+-----------------------------------------------------------
+#This is a shell archive; extract with /bin/sh
+echo -n 'Extracting n.fio.c... '
+sed 's/^M//' >n.fio.c <<\SHAREND
+M/*	fio.c	3.3	85/10/08	(CWI)	*/
+M
+M/*
+M * flow control protocol.
+M *
+M * This protocol relies on flow control of the data stream.
+M * It is meant for working over links that can (almost) be
+M * guaranteed to be errorfree, specifically X.25/PAD links.
+M * A sumcheck is carried out over a whole file only. If a
+M * transport fails the receiver can request retransmission(s).
+M * This protocol uses a 7-bit datapath only, so it can be
+M * used on links that are not 8-bit transparent.
+M *
+M * When using this protocol with an X.25 PAD:
+M * Although this protocol uses no control chars except CR,
+M * control chars NULL and ^P are used before this protocol
+M * is started; since ^P is the default char for accessing
+M * PAD X.28 command mode, be sure to disable that access
+M * (PAD par 1). Also make sure both flow control pars
+M * (5 and 12) are set. The CR used in this proto is meant
+M * to trigger packet transmission, hence par 3 should be 
+M * set to 2; a good value for the Idle Timer (par 4) is 10.
+M * All other pars should be set to 0.
+M *
+M * Normally a calling site will take care of setting the
+M * local PAD pars via an X.28 command and those of the remote
+M * PAD via an X.29 command, unless the remote site has a
+M * special channel assigned for this protocol with the proper
+M * par settings.
+M *
+M * Additional comments for hosts with direct X.25 access:
+M * - the global variable IsTcpIp, when set, excludes ioctl's,
+M *   so the same binary can run on X.25 and non-X.25 hosts;
+M * - reads are done in small chunks, which can be smaller than
+M *   the packet size; your X.25 driver must support that.
+M *
+M *
+M * Author:
+M *	Piet Beertema, CWI, Amsterdam, Sep 1984
+M * Modified for X.25 hosts:
+M *	Robert Elz, Melbourne Univ, Mar 1985
+M */
+M
+M#include "uucp.h"
+M#include <signal.h>
+M#ifdef USG
+M#include <termio.h>
+M#else !USG
+M#include <sgtty.h>
+M#endif !USG
+M#include <setjmp.h>
+M
+M#define FIBUFSIZ	256	/* for X.25 interfaces: set equal to packet size,
+M				 * but see comment above
+M				 */
+M
+M#define FOBUFSIZ	1024	/* for X.25 interfaces: set equal to packet size;
+M				 * otherwise make as large as feasible to reduce
+M				 * number of write system calls 
+M				 */
+M
+M#ifndef MAXMSGLEN
+M#define MAXMSGLEN	BUFSIZ
+M#endif MAXMSGLEN
+M
+Mstatic int fchksum;
+Mstatic jmp_buf Ffailbuf;
+M
+Mstatic
+Mfalarm()
+M{
+M	signal(SIGALRM, falarm);
+M	longjmp(Ffailbuf, 1);
+M}
+M
+Mstatic int (*fsig)();
+M
+M#ifndef USG
+M#define TCGETA	TIOCGETP
+M#define TCSETA	TIOCSETP
+M#define termio	sgttyb
+M#endif USG
+M
+Mfturnon()
+M{
+M	int ret;
+M	struct termio ttbuf;
+M
+M	if (!IsTcpIp) {
+M		ioctl(Ifn, TCGETA, &ttbuf);
+M#ifdef USG
+M		ttbuf.c_iflag = IXOFF|IXON|ISTRIP;
+M		ttbuf.c_cc[VMIN] = FIBUFSIZ > 64 ? 64 : FIBUFSIZ;
+M		ttbuf.c_cc[VTIME] = 5;
+M#else !USG
+M		ttbuf.sg_flags = ANYP|CBREAK|TANDEM;
+M#endif USG
+M		ret = ioctl(Ifn, TCSETA, &ttbuf);
+M		ASSERT(ret >= 0, "STTY FAILED", "", ret);
+M	}
+M	fsig = signal(SIGALRM, falarm);
+M	/* give the other side time to perform its ioctl;
+M	 * otherwise it may flush out the first data this
+M	 * side is about to send.
+M	 */
+M	sleep(2);
+M	return SUCCESS;
+M}
+M
+Mfturnoff()
+M{
+M	(void) signal(SIGALRM, fsig);
+M	return SUCCESS;
+M}
+M
+Mfwrmsg(type, str, fn)
+Mregister char *str;
+Mint fn;
+Mchar type;
+M{
+M	register char *s;
+M	char bufr[MAXMSGLEN];
+M
+M	s = bufr;
+M	*s++ = type;
+M	while (*str)
+M		*s++ = *str++;
+M	if (*(s-1) == '\n')
+M		s--;
+M	*s++ = '\r';
+M	*s = 0;
+M	(void) write(fn, bufr, s - bufr);
+M	return SUCCESS;
+M}
+M
+Mfrdmsg(str, fn)
+Mregister char *str;
+Mregister int fn;
+M{
+M	register char *smax;
+M
+M	if (setjmp(Ffailbuf))
+M		return FAIL;
+M	smax = str + MAXMSGLEN - 1;
+M	(void) alarm(2*MAXMSGTIME);
+M	for (;;) {
+M		if (read(fn, str, 1) <= 0)
+M			goto msgerr;
+M		*str &= 0177;
+M		if (*str == '\r')
+M			break;
+M		if (*str < ' ') {
+M			continue;
+M		}
+M		if (str++ >= smax)
+M			goto msgerr;
+M	}
+M	*str = '\0';
+M	(void) alarm(0);
+M	return SUCCESS;
+Mmsgerr:
+M	(void) alarm(0);
+M	return FAIL;
+M}
+M
+Mfwrdata(fp1, fn)
+MFILE *fp1;
+Mint fn;
+M{
+M	register int alen, ret;
+M	register char *obp;
+M	char ack, ibuf[MAXMSGLEN];
+M	int flen, mil, retries = 0;
+M	long abytes, fbytes;
+M	struct timeb t1, t2;
+M
+M	ret = FAIL;
+Mretry:
+M	fchksum = 0xffff;
+M	abytes = fbytes = 0L;
+M	ack = '\0';
+M#ifdef USG
+M	time(&t1.time);
+M	t1.millitm = 0;
+M#else !USG
+M	ftime(&t1);
+M#endif !USG
+M	do {
+M		alen = fwrblk(fn, fp1, &flen);
+M		fbytes += flen;
+M		if (alen <= 0) {
+M			abytes -= alen;
+M			goto acct;
+M		}
+M		abytes += alen;
+M	} while (!feof(fp1) && !ferror(fp1));
+M	DEBUG(8, "\nchecksum: %04x\n", fchksum);
+M	if (frdmsg(ibuf, fn) != FAIL) {
+M		if ((ack = ibuf[0]) == 'G')
+M			ret = SUCCESS;
+M		DEBUG(4, "ack - '%c'\n", ack);
+M	}
+Macct:
+M#ifdef USG
+M	time(&t2.time);
+M	t2.millitm = 0;
+M#else !USG
+M	ftime(&t2);
+M#endif !USG
+M	Now = t2;
+M	t2.time -= t1.time;
+M	mil = t2.millitm - t1.millitm;
+M	if (mil < 0) {
+M		--t2.time;
+M		mil += 1000;
+M	}
+M	sprintf(ibuf, "sent data %ld bytes %ld.%02d secs",
+M		fbytes, (long)t2.time, mil / 10);
+M	sysacct(abytes, t2.time - t1.time);
+M	if (retries > 0)
+M		sprintf(&ibuf[strlen(ibuf)], ", retry #%d", retries);
+M	DEBUG(1, "%s\n", ibuf);
+M	syslog(ibuf);
+M	if (ack == 'R') {
+M		DEBUG(4, "RETRY:\n", 0);
+M		fseek(fp1, 0L, 0);
+M		retries++;
+M		goto retry;
+M	}
+M#ifdef SYSACCT
+M	if (ret == FAIL)
+M		sysaccf(NULL);		/* force accounting */
+M#endif SYSACCT
+M	return ret;
+M}
+M
+M/* max. attempts to retransmit a file: */
+M#define MAXRETRIES	(fbytes < 10000L ? 2 : 1)
+M
+Mfrddata(fn, fp2)
+Mregister int fn;
+Mregister FILE *fp2;
+M{
+M	register int flen;
+M	register char eof;
+M	char ibuf[FIBUFSIZ];
+M	int ret, mil, retries = 0;
+M	long alen, abytes, fbytes;
+M	struct timeb t1, t2;
+M
+M	ret = FAIL;
+Mretry:
+M	fchksum = 0xffff;
+M	abytes = fbytes = 0L;
+M#ifdef USG
+M	time(&t1.time);
+M	t1.millitm = 0;
+M#else !USG
+M	ftime(&t1);
+M#endif !USG
+M	do {
+M		flen = frdblk(ibuf, fn, &alen);
+M		abytes += alen;
+M		if (flen < 0)
+M			goto acct;
+M		if (eof = flen > FIBUFSIZ)
+M			flen -= FIBUFSIZ + 1;
+M		fbytes += flen;
+M		if (fwrite(ibuf, sizeof (char), flen, fp2) != flen)
+M			goto acct;
+M	} while (!eof);
+M	ret = SUCCESS;
+Macct:
+M#ifdef USG
+M	time(&t2.time);
+M	t2.millitm = 0;
+M#else !USG
+M	ftime(&t2);
+M#endif !USG
+M	Now = t2;
+M	t2.time -= t1.time;
+M	mil = t2.millitm - t1.millitm;
+M	if (mil < 0) {
+M		--t2.time;
+M		mil += 1000;
+M	}
+M	sprintf(ibuf, "received data %ld bytes %ld.%02d secs",
+M		fbytes, (long)t2.time, mil/10);
+M	sysacct(abytes, t2.time - t1.time);
+M	DEBUG(1, "%s\n", ibuf);
+M	syslog(ibuf);
+M	if (ret == FAIL) {
+M		if (retries++ < MAXRETRIES) {
+M			DEBUG(8, "send ack: 'R'\n", 0);
+M			fwrmsg('R', "", fn);
+M			fseek(fp2, 0L, 0);
+M			DEBUG(4, "RETRY:\n", 0);
+M			goto retry;
+M		}
+M		DEBUG(8, "send ack: 'Q'\n", 0);
+M		fwrmsg('Q', "", fn);
+M#ifdef SYSACCT
+M		sysaccf(NULL);		/* force accounting */
+M#endif SYSACCT
+M	}
+M	else {
+M		DEBUG(8, "send ack: 'G'\n", 0);
+M		fwrmsg('G', "", fn);
+M	}
+M	return ret;
+M}
+M
+Mstatic
+Mfrdbuf(blk, len, fn)
+Mregister char *blk;
+Mregister int len;
+Mregister int fn;
+M{
+M	static int ret = FIBUFSIZ / 2;
+M
+M	if (setjmp(Ffailbuf))
+M		return FAIL;
+M	(void) alarm(MAXMSGTIME);
+M	ret = read(fn, blk, len);
+M	alarm(0);
+M	return ret <= 0 ? FAIL : ret;
+M}
+M
+M/* call ultouch every TC calls to either frdblk or fwrblk  */
+M#define TC	20
+Mstatic int tc = TC;
+M
+M/* Byte conversion:
+M *
+M *   from	 pre	   to
+M * 000-037	 172	 100-137
+M * 040-171		 040-171
+M * 172-177	 173	 072-077
+M * 200-237	 174	 100-137
+M * 240-371	 175	 040-171
+M * 372-377	 176	 072-077
+M */
+M
+Mstatic
+Mfwrblk(fn, fp, lenp)
+Mint fn;
+Mregister FILE *fp;
+Mint *lenp;
+M{
+M	register char *op;
+M	register int c, sum, nl, len;
+M	char obuf[FOBUFSIZ + 8];
+M	int ret;
+M
+M	/* call ultouch occasionally */
+M	if (--tc < 0) {
+M		tc = TC;
+M		ultouch();
+M	}
+M	op = obuf;
+M	nl = 0;
+M	len = 0;
+M	sum = fchksum;
+M	while ((c = getc(fp)) != EOF) {
+M		len++;
+M		if (sum & 0x8000) {
+M			sum <<= 1;
+M			sum++;
+M		} else
+M			sum <<= 1;
+M		sum += c;
+M		sum &= 0xffff;
+M		if (c & 0200) {
+M			c &= 0177;
+M			if (c < 040) {
+M				*op++ = '\174';
+M				*op++ = c + 0100;
+M			} else
+M			if (c <= 0171) {
+M				*op++ = '\175';
+M				*op++ = c;
+M			}
+M			else {
+M				*op++ = '\176';
+M				*op++ = c - 0100;
+M			}
+M			nl += 2;
+M		} else {
+M			if (c < 040) {
+M				*op++ = '\172';
+M				*op++ = c + 0100;
+M				nl += 2;
+M			} else
+M			if (c <= 0171) {
+M				*op++ = c;
+M				nl++;
+M			} else {
+M				*op++ = '\173';
+M				*op++ = c - 0100;
+M				nl += 2;
+M			}
+M		}
+M		if (nl >= FOBUFSIZ - 1) {
+M			/*
+M			 * peek at next char, see if it will fit
+M			 */
+M			c = getc(fp);
+M			if (c == EOF)
+M				break;
+M			(void) ungetc(c, fp);
+M			if (nl >= FOBUFSIZ || c < 040 || c > 0171)
+M				goto writeit;
+M		}
+M	}
+M	/*
+M	 * At EOF - append checksum, there is space for it...
+M	 */
+M	sprintf(op, "\176\176%04x\r", sum);
+M	nl += strlen(op);
+Mwriteit:
+M	*lenp = len;
+M	fchksum = sum;
+M	DEBUG(8, "%d/", len);
+M	DEBUG(8, "%d ", nl);
+M	ret = write(fn, obuf, nl);
+M	return ret == nl ? nl : ret < 0 ? 0 : -ret;
+M}
+M
+Mstatic
+Mfrdblk(ip, fn, rlen)
+Mregister char *ip;
+Mint fn;
+Mlong *rlen;
+M{
+M	register char *op, c;
+M	register int sum, len, nl;
+M	char buf[5], *erbp = ip;
+M	int i;
+M	static char special = 0;
+M
+M	/* call ultouch occasionally */
+M	if (--tc < 0) {
+M		tc = TC;
+M		ultouch();
+M	}
+M	if ((len = frdbuf(ip, FIBUFSIZ, fn)) == FAIL) {
+M		*rlen = 0;
+M		goto dcorr;
+M	}
+M	*rlen = len;
+M	DEBUG(8, "%d/", len);
+M	op = ip;
+M	nl = 0;
+M	sum = fchksum;
+M	do {
+M		if ((*ip &= 0177) >= '\172') {
+M			if (special) {
+M				DEBUG(8, "%d", nl);
+M				special = 0;
+M				op = buf;
+M				if (*ip++ != '\176' || (i = --len) > 5)
+M					goto dcorr;
+M				while (i--)
+M					*op++ = *ip++ & 0177;
+M				while (len < 5) {
+M					i = frdbuf(&buf[len], 5 - len, fn);
+M					if (i == FAIL) {
+M						len = FAIL;
+M						goto dcorr;
+M					}
+M					DEBUG(8, ",%d", i);
+M					len += i;
+M					*rlen += i;
+M					while (i--)
+M						*op++ &= 0177;
+M				}
+M				if (buf[4] != '\r')
+M					goto dcorr;
+M				sscanf(buf, "%4x", &fchksum);
+M				DEBUG(8, "\nchecksum: %04x\n", sum);
+M				if (fchksum == sum)
+M					return FIBUFSIZ + 1 + nl;
+M				else {
+M					DEBUG(8, "\n", 0);
+M					DEBUG(4, "Bad checksum\n", 0);
+M					return FAIL;
+M				}
+M			}
+M			special = *ip++;
+M		} else {
+M			if (*ip < '\040') {
+M				/* error: shouldn't get control chars */
+M				goto dcorr;
+M			}
+M			switch (special) {
+M			case 0:
+M				c = *ip++;
+M				break;
+M			case '\172':
+M				c = *ip++ - 0100;
+M				break;
+M			case '\173':
+M				c = *ip++ + 0100;
+M				break;
+M			case '\174':
+M				c = *ip++ + 0100;
+M				break;
+M			case '\175':
+M				c = *ip++ + 0200;
+M				break;
+M			case '\176':
+M				c = *ip++ + 0300;
+M				break;
+M			}
+M			*op++ = c;
+M			if (sum & 0x8000) {
+M				sum <<= 1;
+M				sum++;
+M			} else
+M				sum <<= 1;
+M			sum += c & 0377;
+M			sum &= 0xffff;
+M			special = 0;
+M			nl++;
+M		}
+M	} while (--len);
+M	fchksum = sum;
+M	DEBUG(8, "%d ", nl);
+M	return nl;
+Mdcorr:
+M	DEBUG(8, "\n", 0);
+M	DEBUG(4, "Data corrupted\n", 0);
+M	while (len != FAIL) {
+M		if ((len = frdbuf(erbp, FIBUFSIZ, fn)) != FAIL)
+M			*rlen += len;
+M	}
+M	return FAIL;
+M}
+SHAREND
+echo done
+exit
+
+-- 
+	Piet Beertema, CWI, Amsterdam
+	(piet@mcvax.UUCP)

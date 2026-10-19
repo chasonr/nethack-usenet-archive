@@ -1,0 +1,334 @@
+Relay-Version: version B 2.10 5/3/83; site utzoo.UUCP
+Path: utzoo!mnetor!seismo!sundc!rlgvax!dennis
+From: dennis@rlgvax.UUCP (Dennis Bednar)
+Newsgroups: net.sources
+Subject: rclock.c when to reset clocks
+Message-ID: <337@rlgvax.UUCP>
+Date: Thu, 15-Jan-87 18:45:52 EST
+Article-I.D.: rlgvax.337
+Posted: Thu Jan 15 18:45:52 1987
+Date-Received: Fri, 16-Jan-87 03:53:57 EST
+Organization: Computer Consoles Inc, Reston VA
+Lines: 320
+Keywords: time, clock, standard time, daylight savings time
+
+Here's a not too practical program that tells you when to
+reset your watch because of the switch between standard and
+daylight savings time.  It should be useful in about 3 months
+around april though.
+
+One unresolved question, in 1974 and 1975, it outputs months
+that are not April and October.  I don't know if this is a
+bug or what.  Anybody know?
+
+Usage:
+
+rclock [-d] [[year] [... year]]
+
+switches
+	-d = debug (useful to see rclocks strategy)
+
+rclock tells you when you have to reset your clocks for a given year after 1969.
+If no year is given as an argument, then the current year is used.
+
+This information is given assuming UNIX is configured so that the daylight
+savings flag is true (DSTFLG = 1).
+
+
+/*
+ * f=rclock.c
+ * author - dennis bednar (dennis@rlgvax.uucp) nov 20 83
+ *
+ * this routine finds out when you must reset your clocks for the given year.
+ *
+ * calling format
+ *	rclock [-d] [year [...year]]
+ *
+ *	-d = debug
+ *
+ * In absense of year, defaults to current year.
+ *
+ * how it works -
+ *
+ * It does NOT compute, according to the old rule "last Sunday in April",
+ * and the "last Sunday in October", which is what the dates should be.
+ * I noticed that CCI's UNIX is not in jive with this rule-of-thumb for the
+ * years 1974 and 1975.  Why, I don't know.
+ *
+ * It takes your year, and converts to the number of secs past jan 1, 1970,
+ * in GMT time format.
+ * It then gets the broken down local time for this given gmt starting time.
+ * It saves the broken down hour for reference.
+ * It loops through the year on a hourly basis:
+ *	{
+ *	It calls localtime to get the broken down time (adjusted for DST)
+ *	It compares its reference against the returned broken down time:
+ *	If they are different, it means that we have changed our time
+ *	because of dailight savings time going into or out of effect.
+ * 		so we print our reference time, and the adjusted local time;
+ *		and we reset our hour reference time to be the same as the
+ *		broken down time;
+ *	}
+ *
+ * The big loop starts and the beginning of the year, and ends at the
+ * end of the current year.
+ *
+ * The hourly loop is conceptual only.  The first implementation ran too
+ * painfully slow, so the following technique was used to speed it up
+ * by an order of magnitude.  To see rclock's trial-and-error operation
+ * you may invoke rclock with the debug switch (-d).
+ *
+ * We actually loop on a monthly basis
+ * until we find that our time doesn't match UNIX's.  Then we backup 1 month
+ * and loop on a weekly basis until we find that our time doesn't match
+ * UNIX's.  Then we backup 7 days and loop on a daily basis until we find
+ * that our time doesn't match UNIX's.  Then we backup 23 hours and loop
+ * on an hourly basis until we find that our time doesn't match UNIX's.
+ * When this happens, we have found the "leap forward" or "fall backward"
+ * time when your clock must be reset.  We then print the old time according
+ * to what we think it should be, and print UNIX's as the new time,
+ * and then adjust our time to UNIX's.  Then we again start at the top
+ * of the loop, looping on an hourly basis.
+ */
+
+
+#include <stdio.h>
+#include <sys/types.h>	/* for time(2) */
+#include <sys/timeb.h>	/* for time(2) */
+#include <time.h>	/* for ctime(3) */
+
+
+/* library functions that don't return ints */
+long time();	/* time(2), return an long secs past jan 1, 1970 */
+char *ctime ();	/* ctime(3), convert long secs to ascii string */
+struct tm *localtime ();	/* ctime(3) */
+struct tm *gmtime ();		/* ctime(3) */
+char *asctime ();		/* ctime(3) */
+
+
+/* forward reference.  Maybe belongs in the library in the future. */
+long btl ();		/* convert broken down time to long */
+
+
+/* global variables */
+struct tm ourtime;	/* where we store the time as we know it */
+char runflag [26];	/* all initially false */
+
+
+
+
+main (argc, argv)
+int argc;
+char **argv;
+
+{
+int year;		/* which year to work on */
+struct tm *tmptr;	/* pointer to a tm structure returned by gtmtime */
+long tloc;		/* time(2) returns GMT time since jan 1 '70 here */
+int i;			/* loop thru argv array */
+
+/* get switch arguments from command line, change runflag array */
+setrun (argc, argv, runflag);
+
+/* if no year is supplied, then derive it from the current time */
+if ((argc == 1) || ((argc ==2) && (*argv[1] == '-')))
+	{
+	/* use current year */
+	time (&tloc);	/* get current time */
+	tmptr = gmtime (&tloc);	/* break down the time into structure */
+	year = tmptr->tm_year + 1900;
+	rclock (year);
+	}
+
+/* otherwise process the requested years */
+else for (i = 1; i < argc; ++i)
+	{
+	if (*argv[i] == '-')
+		continue;		/* skip switch options */
+	year = atoi (argv[i]);		/* get the year from cmd line */
+	if (year < 1970)
+		{
+		/* conversion routines expect this */
+		fprintf (stderr, "%s: year must be after 1969\n", argv[0]);
+		exit (2);
+		}
+	else rclock (year);
+	}
+}
+
+
+
+/*
+ * prints the time when you must reset your clocks for the given year
+ */
+
+rclock (year)
+int year;
+
+{
+
+struct tm *tmptr;	/* pointer to a tm structure returned by gtmtime */
+long startsecs, cursecs, endsecs;	/* seconds thru the year */
+int hours;		/* number of hours marching ahead */
+
+
+setup (year);	/* setup our broken down time structure to beginning of year */
+
+startsecs = btl (&ourtime);	/* convert to long gmttime */
+
+tmptr = localtime(&startsecs);	/* get broken down local time */
+
+ourtime.tm_hour = tmptr->tm_hour;	/* get in sync */
+
+/* determine the year's end time in seconds assuming its a leap year */
+endsecs = startsecs + (long) 366 * 24 * 60 * 60;
+
+/* roughly speaking, the value of hours serves as a state flag to tell
+ * the current time increment.
+ */
+for (cursecs = startsecs, hours=24*31; cursecs < endsecs; cursecs += (hours*60*60))
+	{
+	tmptr = localtime (&cursecs);
+	if (debug ())
+		printf ("%s", asctime (tmptr));
+	if (tmptr->tm_hour != ourtime.tm_hour)
+		{
+		int newhour;	/* save the new hour */
+		if (hours == 24*31)
+			{
+			/* backup 31+7 days so next time evalutation at top
+			 * of loop will be exactly 31 days before.
+			 */
+			cursecs -= ((31+7) * 24 * 60 * 60);
+			hours = 24*7;		/* increment by weeks */
+			if (debug ())
+				printf ("backup 1 month.  Forward by 1 week now.\n");
+			}
+		else if (hours == 24*7)
+			{
+			/* backup 8 days so next time will be 7 days before */
+			cursecs -= (8 * 24 * 60 * 60);	/* backup 7 days */
+			hours = 24;		/* increment by days */
+			if (debug ())
+				printf ("backup 1 week. Foward by 1 day now.\n");
+			}
+		else if (hours == 24)	/* found diff when jumping by days */
+			{
+			/* 24 hours ago we matched, so only go back 23 hours */
+			cursecs -= (24 * 60 * 60);	/* backup 23 hours */
+			hours = 1;	/* new increment to find difference */
+			if (debug ())
+				printf ("backup 23 hours. Foward by hours now.\n");
+			}
+		else
+			{
+			/* hour hops must be 1, so found a time difference */
+			newhour = tmptr->tm_hour;	/* the new time it should be */
+			tmptr->tm_hour = ourtime.tm_hour;	/* print our old time */
+			printf ("on %.24s change clock to %.2d:00\n",
+				asctime(tmptr), newhour);
+			/* have switched from DST to EST or vice versa */
+			/* lets get back into synch */
+			ourtime.tm_hour = tmptr->tm_hour = newhour;
+			hours = 24*31;		/* go fast again */
+			if (debug ())
+				printf ("Jumping one month.  Forward by 1 month now.\n");
+			}
+		}
+
+	/* adjust our hourly time only if we are stepping in units of 1 hour.
+	 * Otherwise our hourly clock stays the same.
+	 */
+	if (hours == 1)			/* hopping by 1 hour */
+		{
+		if (ourtime.tm_hour == 23) /* if end of day */
+			/* then wrap around to begin of nxt day */
+			ourtime.tm_hour = 0;
+		else
+			++ourtime.tm_hour;
+		}
+	}
+}
+
+
+/*
+ * setup ourtime structure to jan 1 , xxxx 00:00:00,
+ * where xxxx is the year
+ */
+
+setup (year)
+int year;
+{
+ourtime.tm_sec = 0;
+ourtime.tm_min = 0;
+ourtime.tm_hour = 0;
+ourtime.tm_mday = 1;	/* 1=1st of month */
+ourtime.tm_mon = 0;	/* 0=jan */
+ourtime.tm_year = year-1900;
+/* forget tm_wday */
+ourtime.tm_yday = 0;	/* 0..365 */
+/* forget tm_isdst */
+}
+
+
+
+/*
+ * broken down time to long secs past 00:00:00 jan 1 1970
+ */
+
+long btl (t)
+struct tm *t;
+
+{
+long secs;
+long days;
+#define SECSPERDAY 24 * 60 * 60
+
+days = (t->tm_year - 70) * 365 + numleapdays(t->tm_year+1900) + (t->tm_yday);
+secs = days * (long) SECSPERDAY;
+secs += ( (t->tm_hour * (long)3600) + (t->tm_min * (long)60) + t->tm_sec );
+return (secs);
+}
+
+
+
+/*
+ * tell if this is a leap year, code stolen from K&R pg 37
+ */
+ifleap (year)
+int year;
+
+{
+if (year % 4 == 0 && year % 100 != 0 || year % 400 == 0)
+	return (1);
+else
+	return (0);
+}
+
+/* this will return the number of leap days in years from 1970
+ * up to the previous year, inclusive.
+ */
+numleapdays (year)
+{
+int sum = 0;
+int yi;		/* year index for loop */
+
+for (yi=1970; yi < year; ++yi)
+	sum += ifleap(yi);
+
+return (sum);
+}
+
+
+/*
+ * return true iff debug enabled (-d flag).
+ */
+
+debug ()
+
+{
+return (runflag ['d' - 'a']);
+}
+-- 
+-Dennis Bednar
+{decvax,ihnp4,harpo,allegra}!seismo!rlgvax!dennis	UUCP
