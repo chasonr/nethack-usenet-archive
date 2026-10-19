@@ -1,0 +1,2363 @@
+Path: utzoo!attcan!uunet!mailrus!cornell!uw-beaver!zephyr.ens.tek.com!tekred!saab!billr
+From: billr@saab.CNA.TEK.COM (Bill Randle)
+Newsgroups: comp.sources.games
+Subject: v10i073:  nethack3p9 -  display oriented dungeons & dragons (Ver. 3.0i), Part28/56
+Message-ID: <5931@tekred.CNA.TEK.COM>
+Date: 12 Jul 90 16:04:03 GMT
+Sender: news@tekred.CNA.TEK.COM
+Lines: 2353
+Approved: billr@saab.CNA.TEK.COM
+
+Submitted-by: Izchak Miller <izchak@linc.cis.upenn.edu>
+Posting-number: Volume 10, Issue 73
+Archive-name: nethack3p9/Part28
+Supersedes: NetHack3: Volume 7, Issue 56-93
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 28 (of 56)."
+# Contents:  src/do.c src/options.c
+# Wrapped by billr@saab on Wed Jul 11 17:11:34 1990
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'src/do.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'src/do.c'\"
+else
+echo shar: Extracting \"'src/do.c'\" \(25176 characters\)
+sed "s/^X//" >'src/do.c' <<'END_OF_FILE'
+X/*	SCCS Id: @(#)do.c	3.0	89/11/20
+X/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+X/* NetHack may be freely redistributed.  See license for details. */
+X
+X/* Contains code for 'd', 'D' (drop), '>', '<' (up, down) */
+X
+X#include "hack.h"
+X#ifndef STUPID_CPP
+X/* fortunately, only errno is used from <errno.h> and all known STUPID_CPPs
+X * are on UNIX SYSV and will thus all be using the extern int errno; declared
+X * below 
+X */
+X#include <errno.h>
+X#endif
+X
+X#if defined(DGK)
+Xextern struct finfo fileinfo[];
+X#else
+Xextern boolean level_exists[];
+X#endif
+X
+X#ifdef SINKS
+X# ifdef OVLB
+Xstatic void FDECL(trycall, (struct obj *));
+X# endif /* OVLB */
+XSTATIC_DCL void FDECL(dosinkring, (struct obj *));
+X#endif /* SINKS */
+XSTATIC_PTR int FDECL(drop, (struct obj *));
+XSTATIC_DCL void NDECL(litter);
+XSTATIC_PTR int NDECL(wipeoff);
+Xboolean NDECL(drag_down);
+X
+X#ifdef OVLB
+X
+Xstatic const char NEARDATA drop_types[] = { '0', GOLD_SYM, '#', 0 };
+X
+Xint
+Xdodrop() {
+X	return(drop(getobj(drop_types, "drop")));
+X}
+X
+X#endif /* OVLB */
+X#ifdef OVL0
+X
+X/* Used for objects which sometimes do special things when dropped; must be
+X * called with the object not in any chain.  Returns 1 if the object is
+X * gone.
+X */
+Xboolean
+Xflooreffects(obj,x,y)
+Xstruct obj *obj;
+Xint x,y;
+X{
+X	struct trap *t = t_at(x,y);
+X	boolean pool = is_pool(x,y);
+X
+X	if(obj->otyp == BOULDER && (pool ||
+X	  (t && (t->ttyp==PIT || t->ttyp==SPIKED_PIT || t->ttyp==TRAPDOOR)))) {
+X	    if (pool) {
+X#ifdef STRONGHOLD
+X		if(levl[x][y].typ == DRAWBRIDGE_UP)
+X		    levl[x][y].drawbridgemask |= DB_FLOOR;
+X		else
+X#endif
+X		    levl[x][y].typ = ROOM;
+X		if (cansee(x,y))
+X		  pline("There is a large splash as the boulder fills the %s.",
+X			(levl[x][y].typ==POOL) ? "pool" : "moat");
+X		else if (flags.soundok)
+X		    You("hear a splash.");
+X	    } else if (t) {
+X		if(is_maze_lev
+X#ifdef STRONGHOLD
+X		 	&& (dlevel > stronghold_level)
+X#endif
+X			&& t->ttyp == TRAPDOOR) return FALSE;
+X		if (Blind) You("hear the boulder roll.");
+X		else pline("The boulder %sfills a %s.",
+X			t->tseen ? "" : "triggers and ",
+X			t->ttyp == TRAPDOOR ? "trap door" : "pit");
+X		deltrap(t);
+X		if (u.utrap && x==u.ux && y==u.uy) {
+X		    u.utrap = 0;
+X#ifdef POLYSELF
+X		    if (!passes_walls(uasmon)) {
+X#endif
+X			pline("Unfortunately, you were still in it.");
+X			losehp(rnd(15),
+X			  self_pronoun("dropped a boulder onto %sself","him"),
+X			  NO_KILLER_PREFIX);
+X#ifdef POLYSELF
+X		    }
+X#endif
+X		}
+X	    }
+X	    obfree(obj, (struct obj *)0);
+X	    mnewsym(x,y);
+X	    if (!vism_at(x,y) && (x != u.ux || y != u.uy || Invisible) && !Blind)
+X		newsym(x,y);
+X	    return TRUE;
+X	}
+X	return FALSE;
+X}
+X
+X#endif /* OVL0 */
+X#ifdef OVLB
+X
+X#ifdef ALTARS
+Xvoid
+Xdoaltarobj(obj)  /* obj is an object dropped on an altar */
+X	register struct obj *obj;
+X{
+X	if (Blind) return;
+X	if (obj->blessed || obj->cursed) {
+X		pline("There is %s flash as %s hit%s the altar.",
+X		      an(Hallucination ? hcolor() :
+X			 obj->blessed ? amber : black),
+X		      doname(obj),
+X		      (obj->quan==1) ? "s" : "");
+X		if (!Hallucination) obj->bknown = 1;
+X	} else {
+X		pline("%s land%s on the altar.", Doname2(obj),
+X			(obj->quan==1) ? "s" : "");
+X		obj->bknown = 1;
+X	}
+X}
+X#endif
+X
+X#ifdef SINKS
+Xstatic
+Xvoid
+Xtrycall(obj)
+Xregister struct obj *obj;
+X{
+X	if(!objects[obj->otyp].oc_name_known &&
+X	   !objects[obj->otyp].oc_uname)
+X	   docall(obj);
+X}
+X
+XSTATIC_OVL
+Xvoid
+Xdosinkring(obj)  /* obj is a ring being dropped over a kitchen sink */
+Xregister struct obj *obj;
+X{
+X	register struct obj *otmp,*otmp2;
+X	register boolean ideed = TRUE;
+X
+X	You("drop %s down the drain.", doname(obj));
+X	switch(obj->otyp) {	/* effects that can be noticed without eyes */
+X	    case RIN_SEARCHING:
+X		You("thought your %s got lost in the sink, but there it is!",
+X			xname(obj));
+X		dropx(obj);
+X		trycall(obj);
+X		return;
+X	    case RIN_LEVITATION:
+X		pline("The sink quivers upward for a moment.");
+X		break;
+X	    case RIN_POISON_RESISTANCE:
+X#ifdef TUTTI_FRUTTI
+X		You("smell rotten %s.", makeplural(pl_fruit));
+X#else
+X		You("smell rotten fruit.");
+X#endif
+X		break;
+X	    case RIN_AGGRAVATE_MONSTER:
+X		pline("Several flies buzz angrily around the sink.");
+X		break;
+X	    case RIN_SHOCK_RESISTANCE:
+X		pline("Static electricity surrounds the sink.");
+X		break;
+X	    case RIN_CONFLICT:
+X		You("hear loud noises coming from the drain.");
+X		break;
+X	    case RIN_GAIN_STRENGTH:
+X		pline("The water flow seems %ser now.",
+X			(obj->spe<0) ? "weak" : "strong");
+X		break;
+X	    case RIN_INCREASE_DAMAGE:
+X		pline("The water's force seems %ser now.",
+X			(obj->spe<0) ? "small" : "great");
+X		break;
+X	    default:
+X		ideed = FALSE;
+X		break;
+X	}
+X	if(!Blind && !ideed) {
+X	    ideed = TRUE;
+X	    switch(obj->otyp) {		/* effects that need eyes */
+X		case RIN_ADORNMENT:
+X		    pline("The faucets flash brightly for a moment.");
+X		    break;
+X		case RIN_REGENERATION:
+X		    pline("The sink looks as good as new.");
+X		    break;
+X		case RIN_INVISIBILITY:
+X		    You("don't see anything happen to the sink.");
+X		    break;
+X		case RIN_SEE_INVISIBLE:
+X		    You("see some air in the sink.");
+X		    break;
+X		case RIN_STEALTH:
+X		pline("The sink seems to blend into the floor for a moment.");
+X		    break;
+X		case RIN_HUNGER:
+X		    ideed = FALSE;
+X		    for(otmp = level.objects[u.ux][u.uy]; otmp; otmp = otmp2) {
+X			otmp2 = otmp->nexthere;
+X			if(otmp != uball && otmp != uchain) {
+X			    pline("Suddenly, %s vanishes from the sink!",
+X							doname(otmp));
+X			    delobj(otmp);
+X			    ideed = TRUE;
+X			}
+X		    }
+X		    break;
+X		case RIN_FIRE_RESISTANCE:
+X		pline("The hot water faucet flashes brightly for a moment.");
+X		    break;
+X		case RIN_COLD_RESISTANCE:
+X		pline("The cold water faucet flashes brightly for a moment.");
+X		    break;
+X		case RIN_PROTECTION_FROM_SHAPE_CHAN:
+X		    pline("The sink looks nothing like a fountain.");
+X		    break;
+X		case RIN_PROTECTION:
+X		    pline("The sink glows %s for a moment.",
+X			    Hallucination ? hcolor() :
+X			    (obj->spe<0) ? black : silver);
+X		    break;
+X		case RIN_WARNING:
+X		    pline("The sink glows %s for a moment.",
+X			    Hallucination ? hcolor() : white);
+X		    break;
+X		case RIN_TELEPORTATION:
+X		    pline("The sink momentarily vanishes.");
+X		    break;
+X		case RIN_TELEPORT_CONTROL:
+X	    pline("The sink looks like it is being beamed aboard somewhere.");
+X		    break;
+X#ifdef POLYSELF
+X		case RIN_POLYMORPH:
+X		    pline("The sink momentarily looks like a fountain.");
+X		    break;
+X		case RIN_POLYMORPH_CONTROL:
+X	pline("The sink momentarily looks like a regularly erupting geyser.");
+X		    break;
+X#endif
+X	    }
+X	}
+X	if(ideed)
+X	    trycall(obj);
+X	else
+X	    You("hear the ring bouncing down the drainpipe.");
+X	if (!rn2(20)) {
+X		pline("The sink backs up, leaving %s.", doname(obj));
+X		dropx(obj);
+X	}
+X	else
+X		useup(obj);
+X}
+X#endif
+X
+X#endif /* OVLB */
+X#ifdef OVL0
+X
+X/* some common tests when trying to drop or throw items */
+Xboolean
+Xcanletgo(obj,word)
+Xregister struct obj *obj;
+Xregister const char *word;
+X{
+X	if(obj->owornmask & (W_ARMOR | W_RING | W_AMUL | W_TOOL)){
+X	       if (*word)
+X			You("cannot %s something you are wearing.",word);
+X		return(FALSE);
+X	}
+X	if (obj->otyp == LOADSTONE && obj->cursed) {
+X		if (*word)
+X			pline("For some reason, you cannot %s the stone%s!",
+X				word,
+X		      		plur((long)obj->quan));
+X		/* Kludge -- see invent.c */
+X		if (obj->corpsenm) {
+X			struct obj *otmp;
+X
+X			otmp = obj;
+X			obj = obj->nobj;
+X			obj->quan += otmp->quan;
+X			obj->owt = weight(obj);
+X			freeinv(otmp);
+X			obfree(otmp, obj);
+X		}
+X		obj->bknown = 1;
+X		return(FALSE);
+X	}
+X#ifdef WALKIES
+X	if (obj->otyp == LEASH && obj->leashmon != 0) {
+X	       if (*word)
+X			pline ("The leash is tied around your %s.",
+X					body_part(HAND));
+X		return(FALSE);
+X	}
+X#endif
+X	return(TRUE);
+X}
+X
+XSTATIC_PTR
+Xint
+Xdrop(obj) register struct obj *obj; {
+X	if(!obj) return(0);
+X	if(obj->olet == GOLD_SYM) {		/* pseudo object */
+X		register long amount = OGOLD(obj);
+X
+X/* Fix bug with dropping huge amounts of gold read as negative    KAA */
+X		if(amount < 0) {
+X			u.ugold += amount;
+X	pline("The LRS would be very interested to know you have that much.");
+X		} else {
+X			/* uswallow test added by GAN 01/29/87 */
+X			if(flags.verbose)
+X			    You("drop %ld gold piece%s.",
+X				   amount, plur(amount));
+X			if(u.uswallow)
+X				(u.ustuck)->mgold += amount;
+X			else {
+X				mkgold(amount, u.ux, u.uy);
+X				if(Invisible) newsym(u.ux, u.uy);
+X			}
+X		}
+X		free((genericptr_t) obj);
+X		return(1);
+X	}
+X	if(!canletgo(obj,"drop"))
+X		return(0);
+X	if(obj == uwep) {
+X		if(welded(uwep)) {
+X			weldmsg(obj, FALSE);
+X			return(0);
+X		}
+X		setuwep((struct obj *)0);
+X		if(uwep) return 0; /* lifesaved and rewielded */
+X	}
+X#ifdef SINKS
+X	if((obj->olet == RING_SYM) && IS_SINK(levl[u.ux][u.uy].typ)
+X							&& !u.uswallow) {
+X		dosinkring(obj);
+X		return(1);
+X	}
+X#endif
+X#ifdef ALTARS
+X	if (IS_ALTAR(levl[u.ux][u.uy].typ) && !u.uswallow) {
+X		/* turn water into [(un)holy] water */
+X		if (obj->otyp == POT_WATER) {
+X			obj->blessed = !!(levl[u.ux][u.uy].altarmask & A_LAW);
+X			obj->cursed =
+X			    !(levl[u.ux][u.uy].altarmask & (A_LAW | A_NEUTRAL));
+X		}
+X		doaltarobj(obj);	/* set bknown */
+X	} else
+X#endif
+X	if(flags.verbose) You("drop %s.", doname(obj));
+X	dropx(obj);
+X	return(1);
+X}
+X
+X/* Called in several places - should not produce texts */
+Xvoid
+Xdropx(obj)
+Xregister struct obj *obj;
+X{
+X	freeinv(obj);
+X	dropy(obj);
+X}
+X
+Xvoid
+Xdropy(obj)
+Xregister struct obj *obj;
+X{
+X	if (flooreffects(obj,u.ux,u.uy)) return;
+X#ifdef WORM
+X	if(obj->otyp == CRYSKNIFE)
+X		obj->otyp = WORM_TOOTH;
+X#endif
+X	/* uswallow check done by GAN 01/29/87 */
+X	if(u.uswallow)
+X		mpickobj(u.ustuck,obj);
+X	else  {
+X		obj->nobj = fobj;
+X		fobj = obj;
+X		place_object(obj, u.ux, u.uy);
+X		if(Invisible) newsym(u.ux,u.uy);
+X		if(obj != uball) sellobj(obj);
+X		stackobj(obj);
+X	}
+X}
+X
+X/* drop several things */
+Xint
+Xdoddrop() {
+X	return(ggetobj("drop", drop, 0));
+X}
+X
+X#endif /* OVL0 */
+X#ifdef OVL2
+X
+X#ifdef STRONGHOLD
+Xstatic boolean NEARDATA at_ladder = FALSE;	/* on a ladder, used in goto_level */
+X#endif
+X
+Xint
+Xdodown()
+X{
+X	struct trap *trap = 0;
+X
+X	if((u.ux != xdnstair || u.uy != ydnstair)
+X#ifdef STRONGHOLD
+X	   && (!xdnladder || u.ux != xdnladder || u.uy != ydnladder)
+X#endif
+X	  ) {
+X		if (!(trap = t_at(u.ux,u.uy)) || trap->ttyp != TRAPDOOR
+X			|| (is_maze_lev
+X#ifdef STRONGHOLD
+X				&& (dlevel > stronghold_level)
+X#endif
+X								)
+X							|| !trap->tseen) {
+X			You("can't go down here.");
+X			return(0);
+X		}
+X	}
+X	if(u.ustuck) {
+X		You("are being held, and cannot go down.");
+X		return(1);
+X	}
+X	if(Levitation) {
+X		pline("You're floating high above the %s.",
+X			levl[u.ux][u.uy].typ == STAIRS ? "stairs" :
+X#ifdef STRONGHOLD
+X			levl[u.ux][u.uy].typ == LADDER ? "ladder" :
+X#endif
+X			"trap door");
+X		return(0);
+X	}
+X
+X#ifdef WALKIES
+X	if(!next_to_u()) {
+X		You("are held back by your pet!");
+X		return(0);
+X	} else {
+X#endif
+X		unsee();
+X#ifdef STRONGHOLD
+X		if (levl[u.ux][u.uy].typ == LADDER) at_ladder = TRUE;
+X#endif
+X		if (trap)
+X#ifdef POLYSELF
+X			You("%s into the trap door.",
+X				locomotion(uasmon, "jump"));
+X#else
+X			You("jump into the trap door.");
+X#endif
+X		goto_level(dlevel+1, !trap, TRUE);
+X#ifdef STRONGHOLD
+X		at_ladder = FALSE;
+X#endif
+X#ifdef WALKIES
+X	}
+X#endif
+X	return(1);
+X}
+X
+Xint
+Xdoup()
+X{
+X	if((u.ux != xupstair || u.uy != yupstair)
+X#ifdef STRONGHOLD
+X	   && (!xupladder || u.ux != xupladder || u.uy != yupladder)
+X#endif
+X	  ) {
+X		You("can't go up here.");
+X		return(0);
+X	}
+X	if(u.ustuck) {
+X		You("are being held, and cannot go up.");
+X		return(1);
+X	}
+X#ifdef POLYSELF
+X	/* Some monsters have carrying capacities less than 5, and we don't
+X	 * want to totally keep them from going upstairs.
+X	 */
+X	if((invent || u.ugold) && inv_weight() + 5 > 0) {
+X#else
+X	if(inv_weight() + 5 > 0) {
+X#endif
+X		/* No levitation check; inv_weight() already allows for it */
+X#ifdef STRONGHOLD
+X		Your("load is too heavy to climb the %s.",
+X		      levl[u.ux][u.uy].typ == STAIRS ? "stairs" : "ladder");
+X#else
+X		Your("load is too heavy to climb the stairs.");
+X#endif
+X		return(1);
+X	}
+X	if (dlevel == 1) {
+X#ifdef MACOS
+X		if(!flags.silent) SysBeep(20);
+X		if(UseMacAlertText(128,
+X		    "Beware, there will be no return!  Still climb?") != 1) {
+X			return 0;
+X		}
+X#else
+X		pline("Beware, there will be no return!  Still climb? ");
+X		if (yn() != 'y') return(0);
+X#endif /* MACOS */
+X	}
+X#ifdef WALKIES
+X	if(!next_to_u()) {
+X		You("are held back by your pet!");
+X		return(0);
+X	} else {
+X#endif
+X		unsee();
+X#ifdef STRONGHOLD
+X		if (levl[u.ux][u.uy].typ == LADDER) at_ladder = TRUE;
+X		goto_level(dlevel-1, 
+X		    (dlevel-1 < stronghold_level || (at_ladder && 
+X		       dlevel-1 >= tower_level && dlevel-1 < tower_level+2)),
+X			   FALSE);
+X		at_ladder = FALSE;
+X#else
+X		goto_level(dlevel-1, (dlevel-1 <= medusa_level), FALSE);
+X#endif
+X#ifdef WALKIES
+X	}
+X#endif
+X	return(1);
+X}
+X
+X#endif /* OVL2 */
+X#ifdef OVLB
+X
+XSTATIC_OVL
+Xvoid
+Xlitter()
+X{
+X	struct obj *otmp = invent, *nextobj;
+X	int capacity = weight_cap();
+X
+X	while (otmp) {
+X		nextobj = otmp->nobj;
+X		if ((otmp != uball) && (rnd(capacity) <= otmp->owt)) {
+X			if (otmp == uwep)
+X				setuwep((struct obj *)0);
+X			if ((otmp != uwep) && (canletgo(otmp, ""))) {
+X				Your("%s you down the stairs.",
+X				     aobjnam(otmp, "follow"));
+X				dropx(otmp);
+X			}
+X		}
+X		otmp = nextobj;
+X	}
+X}
+X
+Xboolean
+Xdrag_down()
+X{
+X	boolean forward;
+X	uchar dragchance = 3;
+X
+X
+X	/* 
+X		Assume that the ball falls forward if:
+X
+X		a) the character is wielding it, or
+X		b) the character has both hands available to hold it (i.e. is 
+X		   not wielding any weapon), or 
+X		c) (perhaps) it falls forward out of his non-weapon hand
+X	*/
+X
+X	forward = (!(carried(uball))? 
+X		  FALSE : ((uwep == uball) || (!uwep))? 
+X			  TRUE : (boolean)(rn2(3) / 2));
+X
+X	if (carried(uball)) 
+X		You("lose your grip on the iron ball.");
+X
+X	if(forward) {
+X		if(rn2(6)) {
+X			You("get dragged downstairs by the iron ball.");
+X			losehp(rnd(6), "dragged downstairs by an iron ball",
+X				NO_KILLER_PREFIX);
+X			return(TRUE);
+X		}
+X	} else {
+X		if(rn2(2)) {
+X			pline("The iron ball smacks into you!");
+X			losehp(rnd(20), "iron ball collision", KILLED_BY_AN);
+X			dragchance -= 2;
+X		} 
+X		if(dragchance >= rnd(6)) {
+X			You("get dragged downstairs by the iron ball.");
+X			losehp(rnd(3), "dragged downstairs by an iron ball",
+X				NO_KILLER_PREFIX);
+X			return(TRUE);
+X		}
+X	}
+X	return(FALSE);
+X}
+X
+X#endif /* OVLB */
+X#ifdef OVL2
+X
+Xint save_dlevel = 0;
+X
+Xvoid
+Xgoto_level(newlevel, at_stairs, falling)
+Xregister int newlevel;
+Xregister boolean at_stairs, falling;
+X{
+X	register int fd;
+X	register boolean up = (newlevel < dlevel);
+X
+X#ifdef ENDGAME
+X	if(dlevel == ENDLEVEL) return;	/* To be on the safe side.. */
+X#endif
+X	if(newlevel > MAXLEVEL) newlevel = MAXLEVEL;
+X	if(newlevel <= 0)
+X#ifdef ENDGAME
+X	    if(u.uhave_amulet)
+X		newlevel = ENDLEVEL;	/* Endgame Level !!! */
+X	    else
+X#endif
+X		done(ESCAPED);		/* in fact < 0 is impossible */
+X
+X#ifdef MACOS
+X	freeSegs(&segments);
+X#endif
+X/*	If you have the amulet and are trying to get out of Hell, going
+X *	up a set of stairs sometimes does some very strange things!
+X */
+X#ifdef HARD
+X	if(Inhell && up && !at_ladder &&
+X			(dlevel < MAXLEVEL-3) && u.uhave_amulet) {
+X	    int olev = newlevel;
+X
+X	    newlevel = (rn2(4) ? newlevel :
+X/* neutral */	     !u.ualigntyp ? (rn2(2) ? dlevel : dlevel + (rnd(5) - 2)) :
+X/* lawful */	     (u.ualigntyp == U_LAWFUL) ? dlevel + (rnd(5) - 2) :
+X/* chaotic */	     dlevel);
+X	    if(newlevel < 1) newlevel = dlevel;
+X	    if(newlevel != olev)
+X	        pline("A mysterious force momentarily surrounds you...");
+X	    if(newlevel == dlevel) {
+X		(void) dotele();
+X		return;
+X	    }
+X	}
+X#endif /* HARD /* */
+X	if(newlevel == dlevel) return;	      /* this can happen */
+X#ifdef STRONGHOLD
+X	/* In Nethack 3.0, Hell starts after the stronghold.  Moreover,
+X	 * there are traps in the stronghold, that can send the player
+X	 * to hell (gnark, gnark)!  So we have to test here:
+X	 */
+X	if(!Inhell && newlevel > stronghold_level && !up && !at_ladder
+X# ifdef ENDGAME
+X	&& newlevel < ENDLEVEL
+X# endif
+X	) {
+X#else
+X	if(!Inhell && newlevel >= HELLLEVEL && !up) {
+X#endif /* STRONGHOLD /**/
+X	    You("arrive at the center of the earth...");
+X	    pline("Unfortunately, it is here that hell is located.");
+X#ifdef MSDOS
+X	    (void) fflush(stdout);
+X#endif
+X	    if(Fire_resistance) {
+X		pline("But the fire doesn't seem to harm you.");
+X	    } else {
+X		save_dlevel = dlevel;
+X		You("burn to a crisp.");
+X		You("die...");
+X		dlevel = maxdlevel = newlevel;
+X		killer_format = KILLED_BY_AN;
+X		killer = "visit to hell";
+X		done(BURNING);
+X		dlevel = newlevel = save_dlevel; /* in case they survive */
+X		save_dlevel = 0;
+X	    }
+X	}
+X
+X	glo(dlevel);
+X#ifdef MSDOS
+X	/* Use O_TRUNC to force the file to be shortened if it already
+X	 * exists and is currently longer.
+X	 */
+X	fd = open(lock, O_WRONLY | O_BINARY | O_CREAT | O_TRUNC, FCMASK);
+X#else
+X# ifdef MACOS
+X	{
+X		Str255	fileName;
+X		OSErr	er;
+X		short	refNum;
+X		struct term_info	*t;
+X		extern WindowPtr	HackWindow;
+X		
+X		t = (term_info *)GetWRefCon(HackWindow);
+X		fileName[0] = (char)strlen(lock);
+X		Strcpy((char *)&fileName[1],lock);
+X		if (FSOpen(fileName, t->system.sysVRefNum, &refNum)) {
+X				if (er = Create(&fileName,t->system.sysVRefNum,
+X							CREATOR,LEVEL_TYPE))
+X					SysBeep(20);
+X		} else {
+X			(void)SetEOF(refNum,0L);
+X			(void)FSClose(refNum);
+X		}
+X		SetVol(0L,t->system.sysVRefNum);
+X		fd = open(lock,O_WRONLY | O_BINARY | ((er) ? O_CREAT : 0));
+X	}
+X# else
+X	fd = creat(lock, FCMASK);
+X# endif /* MACOS */
+X#endif
+X	if(fd < 0) {
+X		/*
+X		 * This is not quite impossible: e.g., we may have
+X		 * exceeded our quota. If that is the case then we
+X		 * cannot leave this level, and cannot save either.
+X		 * Another possibility is that the directory was not
+X		 * writable.
+X		 */
+X#ifdef DGK
+X		pline("Cannot create level file '%s'.", lock);
+X#else
+X		pline("A mysterious force prevents you from going %s.",
+X			up ? "up" : "down");
+X#endif
+X		return;
+X	}
+X
+X#ifdef DGK
+X	if (!savelev(fd, dlevel, COUNT)) {
+X# ifdef ZEROCOMP
+X		bflush(fd);
+X# endif
+X		(void) close(fd);
+X		(void) unlink(lock);
+X		pline("NetHack is out of disk space for making levels!");
+X		You("can save, quit, or continue playing.");
+X		return;
+X	}
+X#endif
+X	if(Punished) unplacebc();
+X	u.utrap = 0;				/* needed in level_tele */
+X	u.ustuck = 0;				/* idem */
+X	keepdogs();
+X	seeoff(1);
+X	if(u.uswallow)				/* idem */
+X		u.uswldtim = u.uswallow = 0;
+X	flags.nscrinh = 1;
+X	u.ux = u.ux0 = FAR;				/* hack */
+X	(void) inshop();			/* probably was a trap door */
+X
+X#ifdef DGK
+X# ifdef ZEROCOMP
+X	bflush(fd);	/* forget buffer */
+X# endif
+X	savelev(fd,dlevel, WRITE);
+X#else
+X	savelev(fd,dlevel);
+X#endif
+X#ifdef ZEROCOMP
+X	bflush(fd);	/* flush buffer */
+X#endif
+X	(void) close(fd);
+X#ifdef REINCARNATION
+X	if (newlevel == rogue_level || dlevel == rogue_level) {
+X		/* No graphics characters on Rogue levels */
+X		if (dlevel != rogue_level) {
+X			(void) memcpy((genericptr_t)savesyms,
+X				      (genericptr_t)showsyms, sizeof savesyms);
+X			(void) memcpy((genericptr_t)showsyms,
+X				      (genericptr_t)defsyms, sizeof showsyms);
+X			showsyms[S_vodoor] = showsyms[S_hodoor] = 
+X			    showsyms[S_ndoor] = '+';
+X		}
+X		if (newlevel != rogue_level)
+X			(void) memcpy((genericptr_t)showsyms,
+X				      (genericptr_t)savesyms, sizeof showsyms);
+X	}
+X#endif
+X	dlevel = newlevel;
+X	if(maxdlevel < dlevel)
+X		maxdlevel = dlevel;
+X	glo(dlevel);
+X	if(
+X# ifdef ENDGAME
+X	   dlevel == ENDLEVEL ||
+X# endif
+X#if defined(DGK)
+X	/* If the level has no .where yet, it hasn't been made */
+X	   !fileinfo[dlevel].where)
+X#else
+X	   !level_exists[dlevel])
+X#endif
+X		mklev();
+X	else {
+X#if defined(DGK)
+X		/* If not currently accessible, swap it in. */
+X		if (fileinfo[dlevel].where != ACTIVE)
+X			swapin_file(dlevel);
+X#endif
+X#if (defined(MSDOS) && !defined(TOS)) || defined(MACOS)
+X		if((fd = open(lock, O_RDONLY | O_BINARY)) < 0) {
+X#else
+X		if((fd = open(lock,0)) < 0) {
+X#endif
+X			extern int errno;
+X			pline("Cannot open \"%s\" (errno %d).", lock, errno);
+X			pline("Probably someone removed it.");
+X			done(TRICKED);
+X		}
+X#ifdef ZEROCOMP
+X		minit();
+X#endif
+X		getlev(fd, hackpid, dlevel, FALSE);
+X		(void) close(fd);
+X	}
+X
+X#ifdef MACOS
+X	{
+X		OSErr	er;
+X		struct term_info	*t;
+X		extern WindowPtr	HackWindow;
+X		
+X		t = (term_info *)GetWRefCon(HackWindow);
+X		SetVol(0L,t->system.sysVRefNum);
+X	}
+X#endif
+X#ifdef ENDGAME
+X	if(dlevel != ENDLEVEL)
+X#endif
+X	if(at_stairs) {
+X	    if(up) {
+X#ifdef STRONGHOLD
+X		if (!at_ladder) {
+X#endif
+X		    u.ux = xdnstair;
+X		    u.uy = ydnstair;
+X#ifdef STRONGHOLD
+X		} else {
+X		    u.ux = xdnladder;
+X		    u.uy = ydnladder;
+X		}
+X#endif
+X/* Remove bug which crashes with levitation/punishment  KAA */
+X		if(Punished) {
+X		    if(!Levitation)
+X#ifdef STRONGHOLD
+X			pline("With great effort you climb the %s.",
+X			      !at_ladder ? "stairs" : "ladder");
+X#else
+X			pline("With great effort you climb the stairs.");
+X#endif
+X		    placebc(1);
+X		}
+X	    } else {
+X#ifdef STRONGHOLD
+X		if (!at_ladder) {
+X#endif
+X		    u.ux = xupstair;
+X		    u.uy = yupstair;
+X#ifdef STRONGHOLD
+X		} else {
+X		    u.ux = xupladder;
+X		    u.uy = yupladder;
+X		}
+X#endif
+X		if(at_stairs && !up && ((inv_weight() + 5 > 0) || 
+X					Punished || Fumbling)) {
+X#ifdef STRONGHOLD
+X			You("fall down the %s.",
+X			    !at_ladder ? "stairs" : "ladder");
+X#else
+X			You("fall down the stairs.");
+X#endif
+X			if (Punished) {
+X				if (drag_down())
+X					litter();
+X				if (carried(uball)) {
+X					if (uwep == uball)
+X						setuwep((struct obj *)0);
+X					if (uwep != uball)
+X						freeinv(uball);
+X				}
+X				placebc(1);
+X			} 
+X			losehp(rnd(3), "falling downstairs", KILLED_BY);
+X			selftouch("Falling, you");
+X		}
+X	    }
+X	} else {	/* trap door or level_tele */
+X	    register int tryct = 0;
+X	    do {
+X#ifdef STRONGHOLD
+X		/* Prevent teleport-landing inside the castle */
+X		if(dlevel == stronghold_level) {
+X			if(up) u.ux = (COLNO - rnd(8));
+X			else u.ux = rnd(6);
+X		}
+X		else
+X		/* Prevent teleport-landing inside Vlad's tower */
+X		if(dlevel >= tower_level && dlevel <= tower_level+2) {
+X			do {
+X			    u.ux = rnd(COLNO-1);
+X			} while (u.ux > 29 && u.ux < 47); 
+X		}
+X		else
+X#endif
+X		u.ux = rnd(COLNO-1);
+X		u.uy = rn2(ROWNO);
+X	    } while(tryct++ < 100 && (levl[u.ux][u.uy].typ != ROOM &&
+X		     levl[u.ux][u.uy].typ != CORR) || MON_AT(u.ux, u.uy));
+X	    if(tryct >= 100)
+X		panic("goto_level: could not relocate player!");
+X	    if(Punished) {
+X		if(falling) {
+X			boolean gets_hit;
+X
+X			gets_hit = (uwep == uball)? FALSE : (boolean)rn2(5);
+X			if (carried(uball)) {
+X				pline("Startled, you drop the iron ball.");
+X				if (uwep == uball)
+X					setuwep((struct obj *)0);
+X				if (uwep != uball)
+X					freeinv(uball);
+X			} 
+X			if(gets_hit){
+X					pline("The iron ball falls on your %s.",
+X					body_part(HEAD));
+X				if (uarmh)
+X					Your("helmet doesn't help too much...");
+X				losehp(rnd(25),
+X					"Crunched in the head by an iron ball",
+X					NO_KILLER_PREFIX);
+X			}
+X		}
+X		placebc(1);
+X	    }
+X	    if(falling)
+X		selftouch("Falling, you");
+X	}
+X	(void) inshop();
+X	initrack();
+X
+X	losedogs();
+X	if(MON_AT(u.ux, u.uy)) mnexto(m_at(u.ux, u.uy));
+X	if(MON_AT(u.ux, u.uy)) {
+X		impossible("mnexto failed (do.c)?");
+X		rloc(m_at(u.ux, u.uy));
+X	}
+X	flags.nscrinh = 0;
+X	setsee();
+X	seeobjs();	/* make old cadavers disappear - riv05!a3 */
+X	docrt();
+X	if(!flags.nopick && (OBJ_AT(u.ux, u.uy) || levl[u.ux][u.uy].gmask))
+X	    pickup(1);
+X	else read_engr_at(u.ux,u.uy);
+X#ifdef HARD
+X	/* Final confrontation */
+X	if (dlevel == 1 && u.uhave_amulet && flags.no_of_wizards == 0)
+X	    resurrect();
+X#endif
+X	is_maze_lev = (rooms[0].hx < 0
+X#ifdef STRONGHOLD
+X		|| dlevel == stronghold_level
+X		|| (dlevel >= tower_level && dlevel <= tower_level + 2)
+X#endif
+X#ifdef ENDGAME
+X		|| dlevel == ENDLEVEL
+X#endif
+X		);
+X#ifdef MACOS
+X	freeSegs(&segments);
+X	segments = SEG_DO;
+X#endif
+X}
+X
+X#endif /* OVL2 */
+X#ifdef OVL3
+X
+Xint
+Xdonull() {
+X	return(1);	/* Do nothing, but let other things happen */
+X}
+X
+X#endif /* OVL3 */
+X#ifdef OVLB
+X
+XSTATIC_PTR int
+Xwipeoff() {
+X	if(u.ucreamed < 4)	u.ucreamed = 0;
+X	else			u.ucreamed -= 4;
+X	if (Blinded < 4)	Blinded = 0;
+X	else			Blinded -= 4;
+X	if (!Blinded) {
+X		pline("You've got the glop off.");
+X		u.ucreamed = 0;
+X		make_blinded(0L,TRUE);
+X		return(0);
+X	} else if (!u.ucreamed) {
+X		Your("%s feels clean now.", body_part(FACE));
+X		return(0);
+X	}
+X	return(1);		/* still busy */
+X}
+X
+Xint
+Xdowipe()
+X{
+X	if(u.ucreamed)  {
+X		static char NEARDATA buf[39];
+X
+X		Sprintf(buf, "wiping off your %s", body_part(FACE));
+X		set_occupation(wipeoff, buf, 0);
+X		/* Not totally correct; what if they change back after now
+X		 * but before they're finished wiping?
+X		 */
+X		return(1);
+X	}
+X	Your("%s is already clean.", body_part(FACE));
+X	return(1);
+X}
+X
+X#endif /* OVLB */
+X#ifdef OVL1
+X
+X/* split obj so that it gets size num */
+X/* remainder is put in the object structure delivered by this call */
+Xstruct obj *
+Xsplitobj(obj, num) register struct obj *obj; register int num; {
+Xregister struct obj *otmp;
+X	otmp = newobj(obj->onamelth);
+X	*otmp = *obj;		/* copies whole structure */
+X	otmp->o_id = flags.ident++;
+X	obj->quan = num;
+X	obj->owt = weight(obj);
+X	otmp->quan -= num;
+X	otmp->owt = weight(otmp);	/* -= obj->owt ? */
+X	obj->nobj = obj->nexthere = otmp;
+X	if (obj->onamelth)
+X		(void)strncpy(ONAME(otmp), ONAME(obj), (int)obj->onamelth);
+X	if(obj->unpaid) splitbill(obj,otmp);
+X	return(otmp);
+X}
+X
+X#endif /* OVL1 */
+X#ifdef OVLB
+X
+Xvoid
+Xset_wounded_legs(side, timex)
+Xregister long side;
+Xregister int timex;
+X{
+X	if(!Wounded_legs) {
+X		ATEMP(A_DEX)--;
+X		flags.botl = 1;
+X	}
+X
+X	if(!Wounded_legs || (Wounded_legs & TIMEOUT))
+X		Wounded_legs |= side + timex;
+X	else
+X		Wounded_legs |= side;
+X}
+X
+Xvoid
+Xheal_legs()
+X{
+X	if(Wounded_legs) {
+X		if (ATEMP(A_DEX) < 0) ATEMP(A_DEX)++;
+X
+X		if((Wounded_legs & BOTH_SIDES) == BOTH_SIDES) {
+X			Your("%s feel somewhat better.",
+X				makeplural(body_part(LEG)));
+X		} else {
+X			Your("%s feels somewhat better.",
+X				body_part(LEG));
+X		}
+X		Wounded_legs = 0;
+X	}
+X}
+X
+X#endif /* OVLB */
+END_OF_FILE
+if test 25176 -ne `wc -c <'src/do.c'`; then
+    echo shar: \"'src/do.c'\" unpacked with wrong size!
+fi
+# end of 'src/do.c'
+fi
+if test -f 'src/options.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'src/options.c'\"
+else
+echo shar: Extracting \"'src/options.c'\" \(30155 characters\)
+sed "s/^X//" >'src/options.c' <<'END_OF_FILE'
+X/*	SCCS Id: @(#)options.c	3.0	89/11/15
+X/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1985. */
+X/* NetHack may be freely redistributed.  See license for details. */
+X
+X#include "hack.h"
+X#include "termcap.h"
+X
+Xstatic boolean NEARDATA set_order;
+X
+Xstatic void FDECL(nmcpy, (char *, const char *, int));
+Xvoid FDECL(escapes,(const char *, char *));
+X
+X#ifdef AMIGA_WBENCH
+Xextern int FromWBench;
+X#endif
+X
+Xvoid
+Xinitoptions()
+X{
+X	register char *opts;
+X
+X	flags.time = flags.nonews = flags.notombstone = flags.end_own =
+X	flags.standout = flags.nonull = flags.ignintr = FALSE;
+X	flags.no_rest_on_space = flags.invlet_constant = TRUE;
+X	flags.end_top = 3;
+X	flags.end_around = 2;
+X	flags.female = FALSE;			/* players are usually male */
+X	flags.sortpack = TRUE;
+X	flags.soundok = TRUE;
+X	flags.verbose = TRUE;
+X	flags.confirm = TRUE;
+X	flags.safe_dog = TRUE;
+X	flags.silent = 	flags.pickup = TRUE;
+X#ifdef TUTTI_FRUTTI
+X	nmcpy(pl_fruit, objects[SLIME_MOLD].oc_name, PL_FSIZ);
+X#endif
+X	flags.num_pad = FALSE;
+X	flags.help = TRUE;
+X	flags.IBMgraphics = FALSE;
+X	flags.DECgraphics = FALSE;
+X#ifdef TEXTCOLOR
+X	flags.use_color = TRUE;
+X#endif
+X#ifdef AMIFLUSH
+X	flags.amiflush = FALSE;	/* default to original behaviour */
+X#endif
+X#ifdef MSDOS
+X#ifdef DGK
+X	flags.IBMBIOS =
+X#ifdef TOS
+X	TRUE;			/* BIOS might as well always be on for TOS */
+X#endif
+X	flags.rawio = FALSE;
+X#endif
+X	read_config_file();
+X#endif /* MSDOS */
+X#ifdef MACOS
+X	read_config_file();
+X	flags.standout = TRUE;	
+X#endif
+X	if(opts = getenv("NETHACKOPTIONS"))
+X		parseoptions(opts,TRUE);
+X#ifdef TUTTI_FRUTTI
+X	(void)fruitadd(pl_fruit);
+X	objects[SLIME_MOLD].oc_name = "\033";
+X	/* Put something untypable in there */
+X	/* We cannot just use NULL because that marks the end of objects */
+X#endif
+X}
+X
+Xstatic void
+Xnmcpy(dest, src, maxlen)
+X	char	*dest;
+X	const char *src;
+X	int	maxlen;
+X{
+X	int	count;
+X
+X	for(count = 1; count < maxlen; count++) {
+X		if(*src == ',' || *src == '\0') break; /*exit on \0 terminator*/
+X		*dest++ = *src++;
+X	}
+X	*dest = 0;
+X}
+X
+X/*
+X * escapes: escape expansion for showsyms. C-style escapes understood include
+X * \n, \b, \t, \r, \xnnn (hex), \onnn (octal), \nnn (decimal). The ^-prefix
+X * for control characters is also understood, and \[mM] followed by any of the
+X * previous forms or by a character has the effect of 'meta'-ing the value (so
+X * that the alternate character set will be enabled).
+X */
+Xvoid
+Xescapes(cp, tp)
+Xconst char	*cp;
+Xchar *tp;
+X{
+X    while (*cp)
+X    {
+X	int	cval = 0, meta = 0;
+X
+X	if (*cp == '\\' && index("mM", cp[1])) {
+X		meta = 1;
+X		cp += 2;
+X	}
+X	if (*cp == '\\' && index("0123456789xXoO", cp[1]))
+X	{
+X	    const char *dp, *hex = "00112233445566778899aAbBcCdDeEfF";
+X	    int dcount = 0;
+X
+X	    cp++;
+X	    if (*cp == 'x' || *cp == 'X')
+X		for (++cp; (dp = index(hex, *cp)) && (dcount++ < 2); cp++)
+X		    cval = (cval * 16) + (dp - hex) / 2;
+X	    else if (*cp == 'o' || *cp == 'O')
+X		for (++cp; (index("01234567",*cp)) && (dcount++ < 3); cp++)
+X		    cval = (cval * 8) + (*cp - '0');
+X	    else
+X		for (; (index("0123456789",*cp)) && (dcount++ < 3); cp++)
+X		    cval = (cval * 10) + (*cp - '0');
+X	}
+X	else if (*cp == '\\')		/* C-style character escapes */
+X	{
+X	    switch (*++cp)
+X	    {
+X	    case '\\': cval = '\\'; break;
+X	    case 'n': cval = '\n'; break;
+X	    case 't': cval = '\t'; break;
+X	    case 'b': cval = '\b'; break;
+X	    case 'r': cval = '\r'; break;
+X	    default: cval = *cp;
+X	    }
+X	    cp++;
+X	}
+X	else if (*cp == '^')		/* expand control-character syntax */
+X	{
+X	    cval = (*++cp & 0x1f);
+X	    cp++;
+X	}
+X	else
+X	    cval = *cp++;
+X	if (meta)
+X	    cval |= 0x80;
+X	*tp++ = cval;
+X    }
+X    *tp = '\0';
+X}
+X
+Xvoid
+Xassign_graphics(graph_ints,glth)
+Xregister unsigned int *graph_ints;
+Xregister int glth;
+X{
+X	register int i;
+X
+X	if (glth > MAXPCHARS) glth = MAXPCHARS;		/* sanity check */
+X	for (i = 0; i < glth; i++)
+X		showsyms[i] = graph_ints[i];
+X	for (i = glth; i < MAXPCHARS; i++)
+X		showsyms[i] = defsyms[i];
+X}
+X
+X/*
+X * Use the nice IBM Extended ASCII line-drawing characters (codepage 437).
+X *
+X * OS/2 defaults to a multilingual character set (codepage 850, corresponding
+X * to the ISO 8859 character set.  We should probably do a VioSetCp() call to
+X * set the codepage to 437.
+X */
+Xvoid
+Xassign_ibm_graphics()
+X{
+X#ifdef ASCIIGRAPH
+X	flags.IBMgraphics = TRUE;	/* not set from command line */
+X
+X	showsyms[S_vwall] = 0xb3;	/* meta-3, vertical rule */
+X	showsyms[S_hwall] = 0xc4;	/* meta-D, horizontal rule */
+X	showsyms[S_tlcorn] = 0xda;	/* meta-Z, top left corner */
+X	showsyms[S_trcorn] = 0xbf;	/* meta-?, top right corner */
+X	showsyms[S_blcorn] = 0xc0;	/* meta-@, bottom left */
+X	showsyms[S_brcorn] = 0xd9;	/* meta-Y, bottom right */
+X	showsyms[S_crwall] = 0xc5;	/* meta-E, cross */
+X	showsyms[S_tuwall] = 0xc1;	/* meta-A, T up */
+X	showsyms[S_tdwall] = 0xc2;	/* meta-B, T down */
+X	showsyms[S_tlwall] = 0xb4;	/* meta-4, T left */
+X	showsyms[S_trwall] = 0xc3;	/* meta-C, T right */
+X	showsyms[S_vbeam] = 0xb3;	/* meta-3, vertical rule */
+X	showsyms[S_hbeam] = 0xc4;	/* meta-D, horizontal rule */
+X	showsyms[S_ndoor] = 0xfa;
+X	showsyms[S_vodoor] = 0xfe;	/* meta-~, small centered square */
+X	showsyms[S_hodoor] = 0xfe;	/* meta-~, small centered square */
+X	showsyms[S_room] = 0xfa;	/* meta-z, centered dot */
+X	showsyms[S_pool] = 0xf7;	/* meta-w, approx. equals */
+X#endif  /* ASCIIGRAPH */
+X}
+X
+X/* Use VT100 graphics for terminals that have them */
+Xvoid
+Xassign_dec_graphics()
+X{
+X#ifdef TERMLIB
+X	flags.DECgraphics = TRUE;	/* not set from command line */
+X
+X	showsyms[S_vwall] = 0xf8;	/* vertical rule */
+X	showsyms[S_hwall] = 0xf1;	/* horizontal rule */
+X	showsyms[S_tlcorn] = 0xec;	/* top left corner */
+X	showsyms[S_trcorn] = 0xeb;	/* top right corner */
+X	showsyms[S_blcorn] = 0xed;	/* bottom left */
+X	showsyms[S_brcorn] = 0xea;	/* bottom right */
+X	showsyms[S_crwall] = 0xee;	/* cross */
+X	showsyms[S_tuwall] = 0xf6;	/* T up */
+X	showsyms[S_tdwall] = 0xf7;	/* T down */
+X	showsyms[S_tlwall] = 0xf5;	/* T left */
+X	showsyms[S_trwall] = 0xf4;	/* T right */
+X	showsyms[S_vbeam] = 0xf8;	/* vertical rule */
+X	showsyms[S_hbeam] = 0xf1;	/* horizontal rule */
+X	showsyms[S_ndoor] = 0xfe;
+X	showsyms[S_vodoor] = 0xe1;	/* small centered square */
+X	showsyms[S_hodoor] = 0xe1;	/* small centered square */
+X	showsyms[S_room] = 0xfe;	/* centered dot */
+X	showsyms[S_pool] = 0xe0;	/* diamond */
+X#endif  /* TERMLIB */
+X}
+X
+Xvoid
+Xparseoptions(opts, from_env)
+Xregister char *opts;
+Xboolean from_env;
+X{
+X#ifndef MACOS
+X	register char *op;
+X	unsigned num;
+X	boolean negated;
+X
+X	if(op = index(opts, ',')) {
+X		*op++ = 0;
+X		parseoptions(op, from_env);
+X	}
+X
+X	if(!*opts) return;
+X	negated = FALSE;
+X	while((*opts == '!') || !strncmp(opts, "no", 2)) {
+X		if(*opts == '!') opts++; else opts += 2;
+X		negated = !negated;
+X	}
+X	
+X#ifndef MSDOS
+X	if (!strncmp(opts, "stan", 4)) {
+X		flags.standout = !negated;
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "null", 4)) {
+X		flags.nonull = negated;
+X		return;
+X	}
+X#endif
+X
+X	if (!strncmp(opts, "ign", 3)) {
+X		flags.ignintr = !negated;
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "tomb", 4)) {
+X		flags.notombstone = negated;
+X		return;
+X	}
+X
+X#ifdef NEWS
+X	if (!strncmp(opts, "news", 4)) {
+X		flags.nonews = negated;
+X		return;
+X	}
+X#endif
+X
+X	if (!strncmp(opts, "conf", 4)) {
+X		flags.confirm = !negated;
+X		return;
+X	}
+X	if (!strncmp(opts, "safe", 4)) {
+X		flags.safe_dog = !negated;
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "sil", 3)) {
+X		flags.silent = !negated;
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "verb", 4)) {
+X		flags.verbose = !negated;
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "pick", 4)) {
+X		flags.pickup = !negated;
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "num", 3)) {
+X		flags.num_pad = !negated;
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "hel", 3)) {
+X		flags.help = !negated;
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "IBMg", 4)) {
+X		if(from_env) {
+X		    flags.IBMgraphics = !negated;
+X		    if(flags.IBMgraphics) assign_ibm_graphics();
+X		} else {
+X#ifdef MSDOS
+X		  pline("\"IBMgraphics\" settable only from %s.", configfile);
+X#else
+X		  pline("IBMgraphics can be set only from NETHACKOPTIONS.");
+X#endif
+X		}
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "DEC", 3)) {
+X		if(from_env) {
+X		    flags.DECgraphics = !negated;
+X		    if(flags.DECgraphics) assign_dec_graphics();
+X		} else {
+X#ifdef MSDOS
+X		  pline("\"DECgraphics\" settable only from %s.", configfile);
+X#else
+X		  pline("DECgraphics can be set only from NETHACKOPTIONS.");
+X#endif
+X		}
+X		return;
+X	}
+X
+X#ifdef TEXTCOLOR
+X	if (!strncmp(opts, "col", 3)) {
+X		flags.use_color = !negated;
+X		return;
+X	}
+X#endif
+X#ifdef AMIFLUSH
+X	if (!strncmp(opts, "flus", 4)) {
+X		flags.amiflush = !negated;
+X		return;
+X	}
+X#endif
+X#ifdef DGK
+X	if (!strncmp(opts, "IBM_", 4)) {
+X		flags.IBMBIOS = !negated;
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "raw", 3)) {
+X		if (from_env)
+X			flags.rawio = !negated;
+X		else
+X			pline("\"rawio\" settable only from %s.", configfile);
+X		return;
+X	}
+X#endif
+X
+X	if (!strncmp(opts, "sort", 4)) {
+X		flags.sortpack = !negated;
+X		return;
+X	}
+X
+X	/*
+X	 * the order to list the pack
+X	 */
+X	if (!strncmp(opts, "pack", 4)) {
+X		register char	*sp, *tmp;
+X		int tmpend;
+X
+X		op = index(opts,':');
+X		if(!op) goto bad;
+X		op++;			/* skip : */
+X
+X		/* Missing characters in new order are filled in at the end 
+X		 * from inv_order.
+X		 */
+X		for (sp = op; *sp; sp++)
+X			if (!index(inv_order, *sp))
+X				goto bad;		/* bad char in order */
+X			else if (index(sp + 1, *sp))
+X				goto bad;		/* dup char in order */
+X		tmp = (char *) alloc((unsigned)(strlen(inv_order)+1));
+X		Strcpy(tmp, op);
+X		for (sp = inv_order, tmpend = strlen(tmp); *sp; sp++)
+X			if (!index(tmp, *sp)) {
+X				tmp[tmpend++] = *sp;
+X				tmp[tmpend] = 0;
+X			}
+X		Strcpy(inv_order, tmp);
+X		free((genericptr_t)tmp);
+X		set_order = TRUE;
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "time", 4)) {
+X		flags.time = !negated;
+X		flags.botl = 1;
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "rest", 4)) {
+X		flags.no_rest_on_space = negated;
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "fix", 3)) {
+X		flags.invlet_constant = !negated;
+X		if(!from_env && flags.invlet_constant) reassign ();
+X		return;
+X	}
+X
+X	if (!strncmp(opts, "male", 4)) {
+X		if(!from_env && flags.female != negated)
+X			pline("That is not anatomically possible.");
+X		else
+X			flags.female = negated;
+X		return;
+X	}
+X	if (!strncmp(opts, "fem", 3)) {
+X		if(!from_env && flags.female == negated)
+X			pline("That is not anatomically possible.");
+X		else
+X			flags.female = !negated;
+X		return;
+X	}
+X
+X	/* name:string */
+X	if (!strncmp(opts, "name", 4)) {
+X		if(!from_env) {
+X#ifdef MSDOS
+X# ifdef AMIGA_WBENCH
+X		 if(FromWBench){
+X		  pline("\"name\" settable only from %s or in icon.",
+X			configfile);
+X		 } else
+X# endif
+X		  pline("\"name\" settable only from %s.", configfile);
+X#else
+X		  pline("The playername can be set only from NETHACKOPTIONS.");
+X#endif
+X		  return;
+X		}
+X		op = index(opts,':');
+X		if(!op) goto bad;
+X		nmcpy(plname, op+1, sizeof(plname)-1);
+X		return;
+X	}
+X
+X	/* graphics:string */
+X	if (!strncmp(opts, "gr", 2)) {
+X		unsigned int translate[MAXPCHARS+1];
+X		int i, lth;
+X
+X		if(!from_env) {
+X#ifdef MSDOS
+X		  pline("\"graphics\" settable only from %s.", configfile);
+X#else
+X		  pline("The graphics string can be set only from NETHACKOPTIONS.");
+X#endif
+X		  return;
+X		}
+X		op = index(opts,':');
+X		if(!op)
+X		    goto bad;
+X		else
+X		    opts = op + 1;
+X		escapes(opts, opts);
+X
+X		lth = strlen(opts);
+X		if(lth > MAXPCHARS) lth = MAXPCHARS;
+X		/* match the form obtained from PC configuration files */
+X		for(i = 0; i < lth; i++)
+X			translate[i] = opts[i];
+X		assign_graphics(translate,lth);
+X		return;
+X	}
+X
+X	/* endgame:5t[op] 5a[round] o[wn] */
+X	if (!strncmp(opts, "end", 3)) {
+X		op = index(opts,':');
+X		if(!op) goto bad;
+X		op++;
+X		while(*op) {
+X			num = 1;
+X			if(digit(*op)) {
+X				num = atoi(op);
+X				while(digit(*op)) op++;
+X			} else if(*op == '!') {
+X				negated = !negated;
+X				op++;
+X			}
+X			while(*op == ' ') op++;
+X
+X			switch(*op) {
+X				case 't':
+X					flags.end_top = num;
+X					break;
+X				case 'a':
+X					flags.end_around = num;
+X					break;
+X				case 'o':
+X					flags.end_own = !negated;
+X					break;
+X				default:
+X					goto bad;
+X			}
+X			while(letter(*++op) || *op == ' ') ;
+X			if(*op == '/') op++;
+X		}
+X		return;
+X	}
+X	if (!strncmp(opts, "dog", 3)) {
+X		if(!from_env) {
+X#ifdef MSDOS
+X# ifdef AMIGA_WBENCH
+X		if(FromWBench){
+X		 pline("\"dogname\" settable only from %s or in icon.",
+X			configfile);
+X		} else
+X# endif
+X		  pline("\"dogname\" settable only from %s.", configfile);
+X#else
+X		  Your("dog's name can be set only from NETHACKOPTIONS.");
+X#endif
+X		  return;
+X		}
+X		op = index(opts, ':');
+X		if (!op) goto bad;
+X		nmcpy(dogname, ++op, 62);
+X		return;
+X	}
+X	if (!strncmp(opts, "cat", 3)) {
+X		if(!from_env) {
+X#ifdef MSDOS
+X# ifdef AMIGA_WBENCH
+X		if(FromWBench){
+X		 pline("\"catname\" settable only from %s or in icon.",
+X			configfile);
+X		} else
+X# endif
+X		  pline("\"catname\" settable only from %s.", configfile);
+X#else
+X		  Your("cat's name can be set only from NETHACKOPTIONS.");
+X#endif
+X		  return;
+X		}
+X		op = index(opts, ':');
+X		if (!op) goto bad;
+X		nmcpy(catname, ++op, 62);
+X		return;
+X	}
+X#ifdef TUTTI_FRUTTI
+X	if (!strncmp(opts, "fr", 2)) {
+X		op = index(opts, ':');
+X		if (!op++) goto bad;
+X		if (!from_env) {
+X		    struct fruit *f;
+X		    int numfruits = 0;
+X
+X		    for(f=ffruit; f; f=f->nextf) {
+X			if (!strcmp(op, f->fname)) goto goodfruit;
+X			numfruits++;
+X		    }
+X		    if (numfruits >= 100) {
+X			pline("Doing that so many times isn't very fruitful.");
+X			return;
+X		    }
+X		}
+Xgoodfruit:
+X		nmcpy(pl_fruit, op, PL_FSIZ);
+X		if (!from_env)
+X		    (void)fruitadd(pl_fruit);
+X		/* If from_env, then initoptions is allowed to do it instead
+X		 * of here (initoptions always has to do it even if there's
+X		 * no fruit option at all.  Also, we don't want people
+X		 * setting multiple fruits in their options.)
+X		 */
+X		return;
+X	}
+X#endif
+Xbad:
+X	if(!from_env) {
+X		if(!strncmp(opts, "h", 1) ||
+X		   !strncmp(opts, "?", 1)) {
+X			option_help();
+X			return;
+X		}
+X		pline("Unknown option: %s.  Enter \"O?\" for help.", opts);
+X		return;
+X	}
+X#ifdef MSDOS
+X# ifdef AMIGA_WBENCH
+X	if(ami_wbench_badopt(opts))
+X# endif
+X	Printf("Bad syntax in OPTIONS in %s: %s.", configfile, opts);
+X#else
+X	Printf("Bad syntax in NETHACKOPTIONS: %s.", opts);
+X	(void) puts("Use for example:");
+X	(void) puts(
+X"NETHACKOPTIONS=\"!rest_on_space,notombstone,endgame:own/5 topscorers/4 around me\""
+X	);
+X#endif
+X	getret();
+X#endif /* MACOS */
+X}
+X
+Xint
+Xdoset()
+X{
+X#ifdef MACOS
+X#define	OPTIONS			"Nethack prefs"
+X#define OK_BUTTON 1
+X#define SAVE_BUTTON 2
+X#define CANCEL_BUTTON 3
+X#define MIN_CHECKBOX 4
+X#define EXPLORE_BOX 4
+X#define FEM_BOX 5
+X#define NEWS_BOX 6
+X#define MIN_OK_CHECKBOX 7
+X#define FIXINV_BOX 7
+X#define TOMB_BOX 8
+X#define TIME_BOX 9
+X#define VERBOSE_BOX 10
+X#define SILENT_BOX 11
+X#define AUTOZOOM_BOX 12
+X#define INVERSE_BOX 13
+X#define SORT_BOX 14
+X#define COLOR_BOX 15
+X#define PICKUP_BOX 16
+X#define CONFIRM_BOX 17
+X#define SAFE_BOX 18
+X#define REST_SPACE_BOX 19
+X#define MAX_CHECKBOX 19
+X#define PLAYER_NAME 20
+X#define CAT_NAME 21
+X#define DOG_NAME 22
+X#define FRUIT_NAME 23
+X#define PACKORDER 24
+X#define END_TOP 26
+X#define END_AROUND 27
+X#define FRUIT_TEXT 35
+X#define PACK_TEXT 34
+X#define ENABLE_INFO_BOX 38
+X#define ALT_CURS_BOX 41
+X#define ITEMTEXT(item,text) {GetDItem(optionDlg,item,&type,&ItemHndl,&box); \
+X					         (void)CtoPstr(text); \
+X					         SetIText(ItemHndl,text);\
+X					         (void)PtoCstr(text);}
+X#define HIDEITEM(item) {GetDItem(optionDlg,item,&type,&ItemHndl,&box); \
+X				        HideControl(ItemHndl);\
+X				        SetDItem(optionDlg,item,type+128,ItemHndl,&box);}
+X#define HIDETEXT(item) {GetDItem(optionDlg,item,&type,&ItemHndl,&box);\
+X						SetDItem(optionDlg,item,128+statText,ItemHndl,&box);\
+X						SetIText(ItemHndl,"\0");}
+X#define SHOWITEM(item) {GetDItem(optionDlg,item,&type,&ItemHndl,&box);\
+X						SetDItem(optionDlg,item,type-128,ItemHndl,&box);\
+X						ShowControl(ItemHndl);}
+X#define GETTEXT(item,maxsize) {GetDItem(optionDlg,item,&type,&ItemHndl,&box);\
+X					GetIText (ItemHndl, &tmp_name);\
+X					tmp_name[tmp_name[0]+1] = 0;\
+X					if (tmp_name[0] > maxsize)\
+X						tmp_name[0] = maxsize;}
+X	static boolean NEARDATA *flag_ptrs[20] = {0, 0, 0, 0, &flags.explore,
+X			&flags.female, &flags.nonews,&flags.invlet_constant,
+X			&flags.notombstone, &flags.time, &flags.verbose,
+X			&flags.silent, 0, &flags.standout, &flags.sortpack,
+X#ifdef TEXTCOLOR
+X			&flags.use_color,
+X#else
+X			0,
+X#endif
+X			&flags.pickup, &flags.confirm,
+X			&flags.safe_dog, &flags.no_rest_on_space};
+X	extern short macflags;
+X	extern short altCurs;
+X	short dlgItem, type;
+X	Rect box;
+X	extern WindowPtr	HackWindow;
+X	Handle ItemHndl;
+X	unsigned num;
+X	char *op;
+X	char tmp_name[256];
+X	DialogPtr optionDlg;
+X	DialogTHndl	th, centreDlgBox();
+X	boolean done = FALSE;
+X    short savemacflags = macflags;
+X	register char	*sp, *tmp;
+X	char a_k_a[PL_NSIZ];
+X	boolean fairsex, debugger, explorer;
+X
+X/* Option handling:
+X	Startup: read options from Prefs (making changes!)
+X	Save exit: write current options to prefs
+X	Cancel exit: revert to options as defined in Prefs
+X	Use exit: allow changes. erased at next dialog
+X*/
+X	strncpy(a_k_a, plname, strlen(plname));
+X	a_k_a[(int)strlen(plname)] = '\0';
+X	fairsex = flags.female;
+X	debugger = flags.debug;
+X	explorer = flags.explore;
+X	read_config_file();
+X	macflags = savemacflags;
+X	SetCursor(&ARROW_CURSOR);
+X	
+X	th = centreDlgBox(130, FALSE);
+X
+X	optionDlg = GetNewDialog(130, (Ptr)NULL, (WindowPtr)-1);
+X/* set initial values of text items */
+X	ITEMTEXT(PLAYER_NAME,plname);
+X	if(*dogname) ITEMTEXT(DOG_NAME,dogname);
+X	if(*catname) ITEMTEXT(CAT_NAME,catname);
+X#ifdef TUTTI_FRUTTI
+X	if(*pl_fruit) ITEMTEXT(FRUIT_NAME,pl_fruit);
+X#else
+X	HIDETEXT(FRUIT_NAME);
+X	HIDETEXT(FRUIT_TEXT);
+X#endif
+X	ITEMTEXT(PACKORDER,inv_order);
+X/* set initial values of record items */
+X	Sprintf(tmp_name,"%u",flags.end_top);
+X	ITEMTEXT(END_TOP,tmp_name);
+X	Sprintf(tmp_name,"%u",flags.end_around);
+X	ITEMTEXT(END_AROUND,tmp_name);
+X/* set initial values of checkboxes */
+X	for(dlgItem = MIN_CHECKBOX; dlgItem <= MAX_CHECKBOX; dlgItem++) {
+X		GetDItem(optionDlg, dlgItem, &type, &ItemHndl, &box);
+X		switch (dlgItem){
+X			case NEWS_BOX:
+X#ifndef NEWS
+X				HIDEITEM(NEWS_BOX);
+X				break;
+X#endif
+X			case AUTOZOOM_BOX:
+X				SetCtlValue(ItemHndl,macflags & fZoomOnContextSwitch);
+X				break;
+X#ifndef TEXTCOLOR
+X			case COLOR_BOX:
+X				HIDEITEM(COLOR_BOX);
+X				break;
+X#endif
+X			default:
+X				SetCtlValue(ItemHndl,*(flag_ptrs[dlgItem]));
+X		}
+X	}
+X	GetDItem(optionDlg, ENABLE_INFO_BOX, &type, &ItemHndl, &box);
+X	SetCtlValue(ItemHndl, (int)flags.help);
+X	GetDItem(optionDlg, ALT_CURS_BOX, &type, &ItemHndl, &box);
+X 	SetCtlValue(ItemHndl, (short)altCurs);
+X
+X	SelIText(optionDlg, PLAYER_NAME, 0, 32767);
+X	ShowWindow(optionDlg);
+X	GetDItem(optionDlg, OK_BUTTON, &type, &ItemHndl, &box);
+X	SetPort (optionDlg);
+X	PenSize(3, 3);
+X	InsetRect (&box, -4, -4);
+X	FrameRoundRect (&box, 16, 16);
+X	
+X	while(!done) {
+X		ModalDialog((ProcPtr)0, &dlgItem);
+X		GetDItem(optionDlg, dlgItem, &type, &ItemHndl, &box);
+X		if ((dlgItem >= MIN_CHECKBOX && dlgItem <= MAX_CHECKBOX)
+X			|| dlgItem == ENABLE_INFO_BOX || dlgItem == ALT_CURS_BOX) {
+X			SetCtlValue(ItemHndl, ! GetCtlValue (ItemHndl));
+X		}
+X		else switch(dlgItem){
+X			case SAVE_BUTTON:
+X				for(dlgItem = MIN_CHECKBOX; dlgItem <= MAX_CHECKBOX; dlgItem++) {
+X					GetDItem(optionDlg, dlgItem, &type, &ItemHndl, &box);
+X					if (dlgItem == AUTOZOOM_BOX) {
+X						if ((boolean)GetCtlValue(ItemHndl)) {
+X							macflags |= fZoomOnContextSwitch;
+X						} else {
+X							macflags &= ~fZoomOnContextSwitch;
+X						}
+X					} else {
+X						*(flag_ptrs[dlgItem]) = GetCtlValue(ItemHndl);
+X					}
+X				}
+X				GetDItem(optionDlg, ENABLE_INFO_BOX, &type, &ItemHndl, &box);
+X				flags.help = GetCtlValue(ItemHndl);
+X				GetDItem(optionDlg, ALT_CURS_BOX, &type, &ItemHndl, &box);
+X				altCurs = (short)GetCtlValue(ItemHndl);
+X				GETTEXT(PLAYER_NAME,PL_NSIZ-1);
+X				strncpy(plname, tmp_name, tmp_name[0]+1);
+X				(void)PtoCstr (plname);
+X			
+X				GETTEXT(DOG_NAME,62);
+X				strncpy(dogname, tmp_name, tmp_name[0]+1);
+X				(void)PtoCstr (dogname);
+X			
+X				GETTEXT(CAT_NAME,62);
+X				strncpy(catname, tmp_name, tmp_name[0]+1);
+X				(void)PtoCstr (catname);
+X
+X#ifdef TUTTI_FRUTTI
+X				GETTEXT(FRUIT_NAME,PL_FSIZ-1);
+X				strncpy(pl_fruit, tmp_name, tmp_name[0]+1);
+X				(void)PtoCstr (pl_fruit);
+X#endif
+X
+X				GETTEXT(PACKORDER,19);
+X				op = tmp_name+1;
+X				/* Missing characters in new order are filled in at the end 
+X				 * from inv_order.
+X				 */
+X				for (sp = op; *sp; sp++)
+X					if ((!index(inv_order, *sp))||(index(sp+1, *sp))){
+X						for(tmp = sp; *tmp;tmp++)
+X							tmp[0]=tmp[1];
+X						sp--;
+X					}			/* bad or duplicate char in order - remove it*/
+X				tmp = (char *) alloc((unsigned)(strlen(inv_order)+1));
+X				Strcpy(tmp, op);
+X				for (sp = inv_order, num = strlen(tmp); *sp; sp++)
+X					if (!index(tmp, *sp)) {
+X						tmp[num++] = *sp;
+X						tmp[num] = 0;
+X					}
+X				Strcpy(inv_order, tmp);
+X				free((genericptr_t)tmp);
+X
+X				GETTEXT(END_TOP,5);
+X				op = tmp_name+1;
+X				while(*op) {
+X					num = 1;
+X					if(digit(*op)) {
+X						num = atoi(op);
+X						while(digit(*op)) op++;
+X					} else op++;
+X				}
+X				flags.end_top=num;
+X				GETTEXT(END_AROUND,5);
+X				op = tmp_name+1;
+X				while(*op) {
+X					num = 1;
+X					if(digit(*op)) {
+X						num = atoi(op);
+X						while(digit(*op)) op++;
+X					} else op++;
+X				}
+X				flags.end_around = num;
+X				
+X				write_opts();
+X				done = TRUE;
+X				break;
+X			case CANCEL_BUTTON:
+X				done = TRUE;
+X				break;
+X			case OK_BUTTON:
+X				for (dlgItem = MIN_OK_CHECKBOX; dlgItem <= MAX_CHECKBOX; dlgItem++) {
+X					GetDItem(optionDlg, dlgItem, &type, &ItemHndl, &box);
+X					if (dlgItem == AUTOZOOM_BOX) {
+X						if ((boolean)GetCtlValue(ItemHndl)) {
+X							macflags |= fZoomOnContextSwitch;
+X						} else {
+X							macflags &= ~fZoomOnContextSwitch;
+X						}
+X					} else {
+X						*(flag_ptrs[dlgItem]) = GetCtlValue(ItemHndl);
+X					}
+X				}
+X				GetDItem(optionDlg, ENABLE_INFO_BOX, &type, &ItemHndl, &box);
+X				flags.help = GetCtlValue(ItemHndl);
+X				GetDItem(optionDlg, ALT_CURS_BOX, &type, &ItemHndl, &box);
+X				altCurs = (short)GetCtlValue(ItemHndl);
+X				GETTEXT(END_TOP,5);
+X				op = tmp_name+1;
+X				while(*op) {
+X					num = 1;
+X					if(digit(*op)) {
+X						num = atoi(op);
+X						while(digit(*op)) op++;
+X					} else op++;
+X				}
+X				flags.end_top=num;
+X				GETTEXT(END_AROUND,5);
+X				op = tmp_name+1;
+X				while(*op) {
+X					num = 1;
+X					if(digit(*op)) {
+X						num = atoi(op);
+X						while(digit(*op)) op++;
+X					} else op++;
+X				}
+X				flags.end_around = num;
+X#ifdef TUTTI_FRUTTI
+X				GETTEXT(FRUIT_NAME,PL_FSIZ-1);
+X				(void)PtoCstr (tmp_name);
+X				(void)fruitadd(tmp_name);
+X				nmcpy(pl_fruit,tmp_name,PL_FSIZ-1);
+X#endif
+X				GETTEXT(PACKORDER,19);
+X				op = tmp_name+1;
+X				/* Missing characters in new order are filled in at the end 
+X				 * from inv_order.
+X				 */
+X				for (sp = op; *sp; sp++)
+X					if ((!index(inv_order, *sp))||(index(sp+1, *sp))){
+X						for (tmp = sp; *tmp;tmp++)
+X							tmp[0]=tmp[1];
+X						sp--;
+X					}			/* bad or duplicate char in order - remove it*/
+X				tmp = (char *) alloc((unsigned)(strlen(inv_order)+1));
+X				Strcpy(tmp, op);
+X				for (sp = inv_order, num = strlen(tmp); *sp; sp++)
+X					if (!index(tmp, *sp)) {
+X						tmp[num++] = *sp;
+X						tmp[num] = 0;
+X					}
+X				Strcpy(inv_order, tmp);
+X				free((genericptr_t)tmp);
+X				done = TRUE;
+X				break;
+X			default:;
+X		}
+X	} 
+X	flags.explore = explorer;
+X	flags.debug = debugger;
+X	flags.female = fairsex;
+X	strncpy(plname, a_k_a, strlen(a_k_a));
+X	plname[(int)strlen(a_k_a)] = '\0';
+X	HideWindow(optionDlg);
+X	DisposDialog (optionDlg);
+X	SetPort (HackWindow);
+X	return 0; 
+X#else
+X	char buf[BUFSZ];
+X
+X	pline("What options do you want to set? ");
+X	getlin(buf);
+X	if(!buf[0] || buf[0] == '\033') {
+X#ifdef MSDOS
+X	    Strcpy(buf,"OPTIONS=");
+X#ifdef DGK
+X	    if (flags.rawio) Strcat(buf,"rawio,");
+X	    if (flags.IBMBIOS) Strcat(buf,"IBM_BIOS,");
+X#endif /* DGK */
+X#else /* MSDOS */
+X	    Strcpy(buf,"NETHACKOPTIONS=");
+X	    if(flags.standout) Strcat(buf,"standout,");
+X	    if(flags.nonull) Strcat(buf,"nonull,");
+X#endif /* MSDOS */
+X	    if(flags.ignintr) Strcat(buf,"ignintr,");
+X	    if(flags.num_pad) Strcat(buf,"number_pad,");
+X#ifdef NEWS
+X	    if(flags.nonews) Strcat(buf,"nonews,");
+X#endif
+X	    if(flags.notombstone) Strcat(buf,"notombstone,");
+X	    Strcat(buf, flags.female ? "female," : "male,");
+X	    if(flags.no_rest_on_space)	Strcat(buf,"!rest_on_space,");
+X	    if (flags.invlet_constant) Strcat(buf,"fixinv,");
+X	    if (flags.sortpack) Strcat(buf,"sortpack,");
+X	    if (set_order){
+X		Strcat(buf, "packorder: ");
+X		Strcat(buf, inv_order);
+X		Strcat(buf, ",");
+X	    }
+X#ifdef TEXTCOLOR
+X	    if (flags.use_color) Strcat(buf, "color,");
+X#endif
+X#ifdef AMIFLUSH
+X	    if (flags.amiflush) Strcat(buf, "flush,");
+X#endif
+X	    if (!flags.help) Strcat(buf, "nohelp,");
+X	    if (flags.IBMgraphics) Strcat(buf,"IBMgraphics,");
+X	    if (flags.DECgraphics) Strcat(buf,"DECgraphics,");
+X	    if (flags.confirm) Strcat(buf,"confirm,");
+X	    if (flags.safe_dog) Strcat(buf,"safe_pet,");
+X	    if (flags.pickup) Strcat(buf,"pickup,");
+X	    if (flags.silent) Strcat(buf,"silent,");
+X	    if (flags.time) Strcat(buf,"time,");
+X	    if (flags.verbose) Strcat(buf,"verbose,");
+X#ifdef TUTTI_FRUTTI
+X	    Sprintf(eos(buf), "fruit:%s,", pl_fruit);
+X#endif
+X	    if(flags.end_top != 3 || flags.end_around != 2 || flags.end_own){
+X		Sprintf(eos(buf), "endgame: %u top scores/%u around me",
+X			flags.end_top, flags.end_around);
+X		if(flags.end_own) Strcat(buf, "/own scores");
+X	    } else {
+X		register char *eop = eos(buf);
+X		if(*--eop == ',') *eop = 0;
+X	    }
+X	    pline(buf);
+X	} else {
+X	    clrlin();
+X	    parseoptions(buf, FALSE);
+X	}
+X
+X	return 0;
+X#endif /* MACOS */
+X}
+X
+Xint
+Xdotogglepickup() {
+X	flags.pickup = !flags.pickup;
+X	pline("Pickup: %s.", flags.pickup ? "ON" : "OFF");
+X	return 0;
+X}
+X
+X#define Page_line(x)	if(page_line(x)) goto quit
+X#define Next_opt(x)	if (next_opt(x)) goto quit
+X
+Xvoid
+Xoption_help() {
+X	char	buf[BUFSZ];
+X
+X	set_pager(0);
+X	Sprintf(buf, "                 NetHack Options Help:");
+X	if(page_line("") || page_line(buf) || page_line(""))	 goto quit;
+X
+X#ifdef MSDOS
+X# ifdef AMIGA_WBENCH
+X	if(FromWBench){
+X	 Sprintf(buf,"Set options as OPTIONS= in %s or in icon;",configfile);
+X	} else
+X# endif
+X	Sprintf(buf, "To set options use OPTIONS=<options> in %s;", configfile);
+X	Page_line(buf);
+X#else
+X	Page_line("To set options use `NETHACKOPTIONS=\"<options>\"' in your environment;");
+X#endif
+X
+X	Page_line("or press \"O\" while playing, and type your <options> at the prompt.");
+X	Page_line("In either case, <options> is a list of options separated by commas.");
+X	Page_line("");
+X
+X	Page_line("Boolean options (which can be negated by prefixing them with '!' or \"no\"):");
+X	Next_opt("DECgraphics, ");
+X#ifdef MSDOS
+X	Next_opt("IBM_BIOS, ");
+X#endif
+X	Next_opt("IBMgraphics, ");
+X#ifdef AMIFLUSH
+X	Next_opt("flush, ");
+X#endif
+X#ifdef TEXTCOLOR
+X	Next_opt("color, ");
+X#endif
+X	Next_opt("confirm, ");
+X	Next_opt("(fe)male, "); Next_opt("fixinv, ");
+X#ifdef UNIX
+X	Next_opt("ignintr, ");
+X#endif
+X	Next_opt("help, ");
+X#ifdef NEWS
+X	Next_opt("news, ");
+X#endif
+X#ifdef UNIX
+X	Next_opt("null, ");
+X#endif
+X	Next_opt("number_pad, ");
+X	Next_opt("pickup, ");
+X#ifdef MSDOS
+X	Next_opt("rawio, ");
+X#endif
+X	Next_opt("rest_on_space, "); Next_opt("safe_pet, ");
+X	Next_opt("silent, "); Next_opt("sortpack, ");
+X#ifdef UNIX
+X	Next_opt("standout, ");
+X#endif
+X	Next_opt("time, "); Next_opt("tombstone, ");
+X	Next_opt("and verbose.");
+X	Next_opt("");
+X
+X	Page_line("Compound options:");
+X	Page_line("`name'      - your character's name (e.g., name:Merlin-W),");
+X	Page_line("`dogname'   - the name of your (first) dog (e.g., dogname:Fang),");
+X	Page_line("`catname'   - the name of your (first) cat (e.g., catname:Tabby),");
+X
+X	Page_line("`packorder' - the inventory order of the items in your pack");
+X	Sprintf(buf, "              (currently, packorder:%s ),", inv_order);
+X	Page_line(buf);
+X#ifdef TUTTI_FRUTTI
+X	Page_line("`fruit'     - the name of a fruit you enjoy eating,");
+X#endif
+X
+X	Page_line("`endgame'   - the parts of the score list you wish to see,");
+X
+X	Page_line("`graphics'  - defines the symbols to use in drawing the dungeon map.");
+X	Page_line("");
+X	Page_line("Some of the options can be set only before the game is started.  You will");
+X	Page_line("be so informed, if you attempt to set them while in the game.");
+X	set_pager(1);
+X	return;
+Xquit:
+X	(void) next_opt("\033");
+X	set_pager(2);
+X	return;
+X}
+X
+X/*
+X * prints the next boolean option, on the same line if possible, on a new
+X * line if not. End with next_opt(""). Note that next_opt("\033") may be
+X * used to abort.
+X */
+Xint
+Xnext_opt(str)
+Xconst char *str;
+X{
+X	static char buf[121];
+X	static int i = 0;
+X	int r = 0;
+X
+X	if (*str == '\033') {
+X		i = 0; buf[0] = 0; return 0;
+X	}
+X	i += strlen(str);
+X	if (i > min(CO - 2, 120) || !*str) {
+X		r = page_line(buf);
+X		buf[0] = 0;
+X		i = strlen(str);
+X	}
+X	if (*str)
+X		Strcat(buf, str);
+X	else
+X		(void) page_line(str);	/* always returns 0 on "" */
+X	return r;
+X}
+X
+X#ifdef TUTTI_FRUTTI
+X/* Returns the fid of the fruit type; if that type already exists, it
+X * returns the fid of that one; if it does not exist, it adds a new fruit
+X * type to the chain and returns the new one.
+X */
+Xint
+Xfruitadd(str)
+Xchar *str;
+X{
+X	register int i,j;
+X	register struct fruit *f;
+X#ifdef __GNULINT__
+X	struct fruit *lastf = 0;
+X#else
+X	struct fruit *lastf;
+X#endif
+X	int highest_fruit_id = 0;
+X	char buf[PL_FSIZ];
+X	boolean user_specified = (str == pl_fruit);
+X	/* if not user-specified, then it's a fruit name for a fruit on
+X	 * a bones level...
+X	 */
+X
+X	/* Note: every fruit has an id (spe for fruit objects) of at least
+X	 * 1; 0 is an error.
+X	 */
+X	if (user_specified) {
+X		/* disallow naming after other foods (since it'd be impossible
+X		 * to tell the difference)
+X		 */
+X
+X		boolean found = FALSE;
+X
+X		for(i = bases[j=letindex(FOOD_SYM)]; i < bases[j+1]; i++) {
+X			if (!strcmp(objects[i].oc_name, pl_fruit)) {
+X				found = TRUE;
+X				break;
+X			}
+X		}
+X		if (found ||
+X		    (!strncmp(buf, "tin of ", 7) && name_to_mon(buf+7) > -1) ||
+X		    !strcmp(buf, "empty tin") ||
+X		    !strcmp(buf, "tin of spinach") ||
+X		    ((!strncmp(eos(buf)-6," corpse",7) ||
+X						!strncmp(eos(buf)-3, " egg",4))
+X			&& name_to_mon(buf) > -1))
+X			{
+X				Strcpy(buf, pl_fruit);
+X				Strcpy(pl_fruit, "candied ");
+X				nmcpy(pl_fruit+8, buf, PL_FSIZ-8);
+X		}
+X	}
+X	for(f=ffruit; f; f = f->nextf) {
+X		lastf = f;
+X		if(f->fid > highest_fruit_id) highest_fruit_id = f->fid;
+X		if(!strncmp(str, f->fname, PL_FSIZ))
+X			goto nonew;
+X	}
+X	/* if adding another fruit would overflow spe, use a random
+X	   fruit instead... we've got a lot to choose from. */
+X	if (highest_fruit_id >= 127) return rnd(127);
+X	highest_fruit_id++;
+X	f = newfruit();
+X	if (ffruit) lastf->nextf = f;
+X	else ffruit = f;
+X	Strcpy(f->fname, str);
+X	f->fid = highest_fruit_id;
+X	f->nextf = 0;
+Xnonew:
+X	if (user_specified) current_fruit = highest_fruit_id;
+X	return f->fid;
+X}
+X#endif
+END_OF_FILE
+if test 30155 -ne `wc -c <'src/options.c'`; then
+    echo shar: \"'src/options.c'\" unpacked with wrong size!
+fi
+# end of 'src/options.c'
+fi
+echo shar: End of archive 28 \(of 56\).
+cp /dev/null ark28isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 56 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
