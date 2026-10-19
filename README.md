@@ -9,6 +9,8 @@ Groups archived here are:
 * rec.games.hack
 * rec.games.roguelike.nethack
 
+About 540 posts from the UTZOO archive, not found in the mbox files, are also included.
+
 # Where this came from
 The file wget-list has the links to the original files on the [Internet Archive](https://www.archive.org). split-news.rb split them into individual posts and organized them into threads.
 To get the initial state of this archive:
